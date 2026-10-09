@@ -15,8 +15,6 @@ pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const GIB: u64 = 1024 * 1024 * 1024;
 const FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 8 * GIB;
-const MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 2 * GIB;
-const MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 64 * GIB;
 const MEMORY_BUDGET_MODE_KEY: &str = "nativeMemoryBudgetMode";
 const COMPILED_DEFAULT_MODEL_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MODEL_PATH");
 const COMPILED_DEFAULT_MMPROJ_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MMPROJ_PATH");
@@ -181,12 +179,7 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "showThoughtInProgress",
     "renderUserContentAsMarkdown",
     "disableAutoScroll",
-    "alwaysShowSidebarOnDesktop",
     "fullHeightCodeBlocks",
-    "showRawModelNames",
-    "showModelQuantization",
-    "showModelTags",
-    "showBuildVersion",
     "showSystemMessage",
     "renderThinkingAsMarkdown",
     "temperature",
@@ -316,7 +309,7 @@ fn default_resident_memory_budget_bytes() -> u64 {
     automatic_resident_memory_budget(physical_memory_bytes())
 }
 
-fn physical_memory_bytes() -> Option<u64> {
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
     static PHYSICAL_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
     *PHYSICAL_MEMORY.get_or_init(|| {
         let system = System::new_with_specifics(
@@ -329,10 +322,7 @@ fn physical_memory_bytes() -> Option<u64> {
 
 fn automatic_resident_memory_budget(physical_memory_bytes: Option<u64>) -> u64 {
     match physical_memory_bytes {
-        Some(bytes) => (bytes / 2).clamp(
-            MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-            MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-        ),
+        Some(bytes) => bytes - bytes.div_ceil(3),
         None => FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES,
     }
 }
@@ -355,8 +345,9 @@ fn reconcile_resident_memory_budget(settings: &mut Settings, physical_memory: Op
     if mode == ResidentMemoryBudgetMode::Auto {
         settings.resident_memory_budget_bytes = automatic_resident_memory_budget(physical_memory);
     } else {
-        settings.resident_memory_budget_bytes =
-            settings.resident_memory_budget_bytes.max(256 * 1024 * 1024);
+        settings.resident_memory_budget_bytes = settings
+            .resident_memory_budget_bytes
+            .min(automatic_resident_memory_budget(physical_memory));
     }
     let bytes = settings.resident_memory_budget_bytes;
     write_resident_memory_budget_projection(&mut settings.upstream_settings, mode, bytes);
@@ -400,11 +391,6 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("renderUserContentAsMarkdown".to_string(), json!(false)),
         ("fullHeightCodeBlocks".to_string(), json!(false)),
         ("disableAutoScroll".to_string(), json!(false)),
-        ("alwaysShowSidebarOnDesktop".to_string(), json!(false)),
-        ("showRawModelNames".to_string(), json!(false)),
-        ("showModelQuantization".to_string(), json!(true)),
-        ("showModelTags".to_string(), json!(true)),
-        ("showBuildVersion".to_string(), json!(false)),
         ("showSystemMessage".to_string(), json!(true)),
         ("renderThinkingAsMarkdown".to_string(), json!(true)),
         ("temperature".to_string(), json!(0.7)),
@@ -438,7 +424,10 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("agenticMaxToolPreviewLines".to_string(), json!(25)),
         ("mcpNativeEnabled".to_string(), json!(false)),
         ("mmprojPath".to_string(), json!("")),
-        ("nativeModelSlots".to_string(), json!(1)),
+        (
+            "nativeModelSlots".to_string(),
+            json!(default_parallel_sequences()),
+        ),
         ("nativeMemoryBudgetMiB".to_string(), json!(8192)),
         (MEMORY_BUDGET_MODE_KEY.to_string(), json!("auto")),
         ("nativeDevice".to_string(), json!("auto")),
@@ -498,8 +487,18 @@ pub(crate) fn settings_from_document(
     if settings.model_path.is_none() && data_dir_override().is_none() {
         let cached = desktop_model_defaults::hugging_face_hub_cache_dir()
             .and_then(|cache| desktop_model_defaults::cached_default_model(&cache));
+        let cached = cached.filter(|candidate| {
+            physical_memory_bytes().is_some_and(|ram| {
+                crate::memory_policy::weights_fit(
+                    &candidate.model,
+                    candidate.projector.as_deref(),
+                    ram,
+                )
+            })
+        });
         apply_cached_default_model(&mut settings, cached);
     }
+    crate::memory_policy::reconcile_context(&mut settings);
     Ok(settings)
 }
 
@@ -544,6 +543,12 @@ fn settings_from_document_with_model_sources(
     settings.mmproj_path = normalize_optional_path(settings.mmproj_path);
     reconcile_resident_memory_budget_for_runtime(&mut settings);
     merge_missing_setting_defaults(&mut settings);
+    // The typed value is authoritative when loading persisted settings. Keep
+    // its UI projection coherent before an unrelated settings update can sync it.
+    settings.upstream_settings.insert(
+        "nativeModelSlots".to_string(),
+        json!(settings.max_parallel_sequences),
+    );
     let cache_policy = settings.kv_cache_policy;
     set_cache_policy(&mut settings, cache_policy);
     if let Some(model) = normalize_optional_path(runtime_model) {
@@ -799,6 +804,8 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     {
         settings.theme = Some(theme.to_string());
     }
+    reconcile_resident_memory_budget_for_runtime(&mut settings);
+    crate::memory_policy::reconcile_context(&mut settings);
     let path = save_settings(&settings)?;
     Ok(CommandResult::passed(
         "mom_llama.settings_update",
@@ -1116,6 +1123,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_update_preserves_native_slots_and_explicit_slot_update_applies() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-slot-settings-{}", uuid::Uuid::new_v4()));
+        set_data_dir_override_for_tests(Some(data_dir.clone()));
+        let outcome = (|| -> Result<()> {
+            let initial = resolve_settings()?;
+            assert_eq!(initial.max_parallel_sequences, default_parallel_sequences());
+            assert_eq!(
+                initial.upstream_settings["nativeModelSlots"],
+                json!(initial.max_parallel_sequences)
+            );
+            // Reproduce an existing store whose UI projection contradicted its
+            // typed native configuration, then change only presentation.
+            let mut stored = initial.clone();
+            stored
+                .upstream_settings
+                .insert("nativeModelSlots".into(), json!(1));
+            save_settings(&stored)?;
+            settings_update(SettingsUpdate {
+                upstream_settings: Some(BTreeMap::from([("theme".into(), json!("dark"))])),
+                ..Default::default()
+            })?;
+            let after = resolve_settings()?;
+            assert_eq!(after.max_parallel_sequences, initial.max_parallel_sequences);
+            assert_eq!(
+                after.resident_memory_budget_bytes,
+                initial.resident_memory_budget_bytes
+            );
+            assert_eq!(after.kv_cache_policy, initial.kv_cache_policy);
+            settings_update(SettingsUpdate {
+                upstream_settings: Some(BTreeMap::from([("nativeModelSlots".into(), json!(2))])),
+                ..Default::default()
+            })?;
+            assert_eq!(resolve_settings()?.max_parallel_sequences, 2);
+            Ok(())
+        })();
+        set_data_dir_override_for_tests(None);
+        if data_dir.exists() {
+            fs::remove_dir_all(data_dir)?;
+        }
+        outcome
+    }
+
+    #[test]
     fn adjacent_settings_file_is_not_imported_or_rewritten() -> Result<()> {
         let data_dir =
             std::env::temp_dir().join(format!("mom-plaintext-settings-{}", uuid::Uuid::new_v4()));
@@ -1154,7 +1205,7 @@ mod tests {
     #[test]
     fn supported_upstream_setting_registry_is_complete_and_distinct_from_extensions() {
         let defaults = upstream_settings_defaults();
-        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 48);
+        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 43);
         for key in UPSTREAM_SETTING_KEYS {
             assert!(
                 defaults.contains_key(*key),
@@ -1249,15 +1300,27 @@ mod tests {
     }
 
     #[test]
-    fn automatic_memory_budget_is_half_of_ram_with_conservative_bounds() {
+    fn automatic_memory_budget_is_at_most_two_thirds_of_ram() {
         assert_eq!(
             automatic_resident_memory_budget(None),
             FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES
         );
-        assert_eq!(automatic_resident_memory_budget(Some(GIB)), 2 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(128 * GIB)), 64 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(512 * GIB)), 64 * GIB);
+        assert_eq!(
+            automatic_resident_memory_budget(Some(GIB)),
+            GIB - GIB.div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(16 * GIB)),
+            16 * GIB - (16 * GIB).div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(128 * GIB)),
+            128 * GIB - (128 * GIB).div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(512 * GIB)),
+            512 * GIB - (512 * GIB).div_ceil(3)
+        );
     }
 
     #[test]
@@ -1285,7 +1348,10 @@ mod tests {
 
         let mut automatic = Settings::defaults_for_data_dir(std::env::temp_dir());
         reconcile_resident_memory_budget(&mut automatic, Some(128 * GIB));
-        assert_eq!(automatic.resident_memory_budget_bytes, 64 * GIB);
+        assert_eq!(
+            automatic.resident_memory_budget_bytes,
+            128 * GIB - (128 * GIB).div_ceil(3)
+        );
         assert_eq!(
             automatic.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
             Some(&json!("auto"))

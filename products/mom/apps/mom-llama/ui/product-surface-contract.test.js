@@ -20,6 +20,7 @@ const personasRuntime = read("crates/mom-llama-runtime/src/personas.rs");
 const cli = read("crates/mom-llama-cli/src/main.rs");
 
 const backendOnlyCommandIds = [
+  "mom_llama.conversation_new",
   "mom_llama.engine_check",
   "mom_llama.engine_configure",
   "mom_llama.kv_cache_clear",
@@ -103,8 +104,8 @@ test("model choice is a scoped searchable picker with automatic projector pairin
   ]) {
     assert.ok(!viewProduction.includes(marker), `obsolete model UI remains: ${marker}`);
   }
-  assert.ok(composer.includes('"Model for this chat"'));
-  assert.ok(composer.includes("effective_conversation_model_path(active, settings)"));
+  assert.ok(!composer.includes("model_picker("));
+  assert.ok(!composer.includes("effective_conversation_model_path(active, settings)"));
 
   for (const marker of [
     "const selectAndLoadModel",
@@ -155,12 +156,15 @@ test("the sidebar exposes only the compact authoritative Persona menu", () => {
     'id="sidebar-persona-list"',
     'class="sidebar-persona-row"',
     'data-persona-menu-target="true"',
-    'aria-haspopup="menu" aria-expanded="false"',
-    'aria-controls="persona-context-menu"',
-    'data-action="persona-menu-open"',
+    'data-action="persona-draft-open"',
   ]) {
     assert.ok(sidebar.includes(marker), `missing compact Persona marker: ${marker}`);
   }
+  assert.ok(!sidebar.includes('data-action="persona-menu-open"'));
+  assert.ok(!sidebar.includes('data-action="settings-section"'));
+  assert.ok(sidebar.includes('class="sidebar-resizer"'));
+  assert.ok(bridge.includes('await Menu.new({ items })'));
+  assert.ok(bridge.includes('data-conversation-menu-target'));
   assert.ok(viewProduction.includes("fn persona_projection()"));
   assert.ok(!sidebar.includes("mom_llama_runtime::persona_list()"));
 

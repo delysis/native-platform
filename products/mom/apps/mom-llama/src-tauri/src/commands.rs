@@ -532,28 +532,126 @@ pub async fn mom_llama_chat_dispatch(
     window: Window,
     conversation: String,
     message: String,
+    client_request: Option<String>,
 ) -> Result<Value, String> {
+    if client_request.as_ref().is_some_and(|request| {
+        request.is_empty()
+            || request.len() > 64
+            || !request
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
+    }
+    let stream_conversation = conversation.clone();
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
-    let operations = runtime.operation_scope();
     let runtime = runtime.inner().clone();
     let events = window.clone();
+    let result = dispatch_typed(
+        runtime,
+        lease,
+        mom_llama_runtime::MentionDispatchInput {
+            conversation_id: conversation,
+            message,
+        },
+        Some(move |event| {
+            events
+                .emit("mom_llama_chat_dispatch_stream", &event)
+                .map_err(anyhow::Error::new)?;
+            if let Some(request) = &client_request {
+                events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
+                    "client_request": request, "conversation_id": stream_conversation, "event": event,
+                })).map_err(anyhow::Error::new)?;
+            }
+            Ok(())
+        }),
+    )
+    .await?;
+    command_value(Ok(result))
+}
+
+/// Preserve the structured command receipt until the caller chooses its
+/// presentation. Both embedding and Tauri use the same supervised execution.
+pub(crate) async fn dispatch_typed<F>(
+    runtime: AppRuntimeHandle,
+    lease: AppWorkLease,
+    input: mom_llama_runtime::MentionDispatchInput,
+    on_event: Option<F>,
+) -> Result<mom_llama_runtime::CommandResult<ChatDispatchOutput>, String>
+where
+    F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+{
+    let operations = runtime.operation_scope();
+    dispatch_typed_in_scope(runtime, lease, operations, input, None, on_event).await
+}
+
+pub(crate) async fn dispatch_typed_in_scope<F>(
+    runtime: AppRuntimeHandle,
+    lease: AppWorkLease,
+    operations: mom_llama_runtime::OperationScope,
+    input: mom_llama_runtime::MentionDispatchInput,
+    context: Option<Vec<String>>,
+    on_event: Option<F>,
+) -> Result<mom_llama_runtime::CommandResult<ChatDispatchOutput>, String>
+where
+    F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+{
+    lease
+        .run_blocking_with_cancellation_evidence(move || {
+            if let Some(context) = context {
+                mom_llama_runtime::prepare_document_chat_in_scope(
+                    &operations,
+                    &input.conversation_id,
+                    input.message.clone(),
+                    context,
+                )
+                .map_err(to_error)?;
+            }
+            let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+                &operations,
+                input,
+                ChatSendOptions::default(),
+                on_event,
+            )
+            .map_err(to_error)?;
+            observe_dispatch_approvals(&runtime, &result).map_err(to_error)?;
+            let cancelled = result.has_authoritative_cancellation_evidence();
+            Ok((result, cancelled))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_consult_sources(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    target: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_consult_sources"))?;
     blocking_command(lease, move || {
-        let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
-            &operations,
-            mom_llama_runtime::MentionDispatchInput {
-                conversation_id: conversation,
-                message,
-            },
-            ChatSendOptions::default(),
-            Some(move |event| {
-                events
-                    .emit("mom_llama_chat_dispatch_stream", &event)
-                    .map_err(anyhow::Error::new)?;
-                Ok(())
-            }),
-        )?;
-        observe_dispatch_approvals(&runtime, &result)?;
-        Ok(result)
+        mom_llama_runtime::consult_sources(&invocation, &target)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_consult_source_open(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    target: String,
+    conversation: String,
+    message: String,
+    attachment: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_consult_source_open"))?;
+    blocking_command(lease, move || {
+        mom_llama_runtime::consult_source_open(
+            &invocation,
+            &target,
+            &conversation,
+            &message,
+            &attachment,
+        )
     })
     .await
 }
@@ -866,6 +964,38 @@ pub async fn mom_llama_chat_continue(
         }
     })
     .await
+}
+
+#[tauri::command]
+pub fn mom_llama_conversation_draft_open(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_open"))?;
+    command_value(mom_llama_runtime::conversation_draft_open(persona))
+}
+
+#[tauri::command]
+pub fn mom_llama_conversation_draft_recipients_update(
+    runtime: State<'_, AppRuntimeHandle>,
+    recipient_ids: Vec<String>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec(
+        "mom_llama_conversation_draft_recipients_update",
+    ))?;
+    command_value(mom_llama_runtime::conversation_draft_recipients_update(
+        recipient_ids,
+        name,
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_conversation_draft_submit(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_submit"))?;
+    command_value(mom_llama_runtime::conversation_draft_submit())
 }
 
 #[tauri::command]

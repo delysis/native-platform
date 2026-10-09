@@ -27,6 +27,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod application;
+pub use application::{
+    ApplicationHost, ApplicationNativeFinalizer, ApplicationNativeOwner, JoinedApplicationNative,
+    NativeClient, ProcessExitJoinedApplicationNative,
+};
+
 pub trait HostClock: Send + Sync {
     fn now_ms(&self) -> u128;
 }
@@ -696,28 +702,32 @@ impl NativeHost {
     }
 
     pub fn slots(&self) -> Vec<HostSlotStatus> {
-        self.state
-            .lock()
-            .map(|state| {
-                state
-                    .slots
-                    .iter()
-                    .map(|(slot_id, entry)| HostSlotStatus {
-                        slot_id: *slot_id,
-                        model_path: entry.key.model_path.clone(),
-                        model_bytes: entry.model_bytes,
-                        reserved_bytes: entry.reserved_bytes,
-                        status: entry.owner.status(),
-                    })
-                    .collect()
+        self.try_slots().unwrap_or_default()
+    }
+
+    pub fn try_slots(&self) -> Result<Vec<HostSlotStatus>, NativeError> {
+        let state = self.state.lock().map_err(host_poisoned)?;
+        Ok(state
+            .slots
+            .iter()
+            .map(|(slot_id, entry)| HostSlotStatus {
+                slot_id: *slot_id,
+                model_path: entry.key.model_path.clone(),
+                model_bytes: entry.model_bytes,
+                reserved_bytes: entry.reserved_bytes,
+                status: entry.owner.status(),
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     pub fn handle(&self, slot_id: usize) -> Option<NativeModelHandle> {
-        let state = self.state.lock().ok()?;
-        ensure_host_running(&state).ok()?;
-        state.slots.get(&slot_id).map(|entry| entry.owner.handle())
+        self.try_handle(slot_id).ok().flatten()
+    }
+
+    pub fn try_handle(&self, slot_id: usize) -> Result<Option<NativeModelHandle>, NativeError> {
+        let state = self.state.lock().map_err(host_poisoned)?;
+        ensure_host_running(&state)?;
+        Ok(state.slots.get(&slot_id).map(|entry| entry.owner.handle()))
     }
 
     /// Compatibility wrapper around joined slot shutdown.

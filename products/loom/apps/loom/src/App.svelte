@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { convertFileSrc } from '@tauri-apps/api/core';
+  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
@@ -12,10 +12,16 @@
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { visibleWorkspaceDocuments, readPinnedOutputs, rememberPinnedOutputs } from './lib/workspaceRetention';
   import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
-  import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
+  import { readWorkspaceFolders, rememberWorkspaceFolder, forgetWorkspaceFolder, renameWorkspaceFolder,
+    workspaceFolderGroups, workspaceFolderLabels, type WorkspaceFolder } from './lib/workspaceFolders';
+  import { captureSidebarTarget, sidebarItemKey, sidebarCapabilities, sidebarKeyAction, sidebarScopeIsCurrent,
+    sidebarTargetIsCurrent, type CapturedSidebarTarget, type RootSidebarTarget, type MaterialSidebarTarget, type SidebarCapability, type SidebarLiveState } from './lib/sidebarInteractions';
+  import { createRenameCompositionGuard, handleInlineRenameKey } from './lib/interactionPrimitives';
+  import { compositionOwnsKey, createTextCompositionBoundary, nativeEditingCommand, textEditingElement } from './lib/textEditingInteractions';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import MaterialView from './lib/MaterialView.svelte';
-  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence } from './lib/ipc';
+  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence, pinMaterial, removeMaterial, renameMaterial } from './lib/ipc';
+  import { canEditMaterialMetadata, materialMetadataRevision, materialDisplayNameError, materialSourceIsUnchanged, sameMaterialObservation, materialRenameReceiptMatches } from './lib/materialMetadata';
   import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
@@ -235,7 +241,6 @@
     capturedDocumentIdentityIsCurrent,
     clampDocumentMenuPoint,
     createDocumentRenameCompositionGuard,
-    documentDeleteMenuIndex,
     documentMenuKeyAction,
     documentRevealLabel,
     isDocumentContextTriggerKey,
@@ -411,8 +416,37 @@
   let workspaceDropActive = false;
   let workspaceDropFolder: string | null = null;
   let outlineElement: HTMLElement | undefined;
-  $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
-    ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
+  $: visibleWorkspaceFolders = workspaceFolderGroups(workspaceFolders, project?.root ?? null);
+  $: workspaceLabels = workspaceFolderLabels(workspaceFolders);
+  let sidebarSelection: string | null = null;
+  let sidebarSelectionScope = '';
+  let sidebarContextTarget: CapturedSidebarTarget | null = null;
+  let sidebarMenuCapabilities: readonly SidebarCapability[] = [];
+  let sidebarActionInFlight = false;
+  let renamingWorkspaceRoot: RootSidebarTarget | null = null;
+  let renameWorkspaceTitle = '';
+  let renameWorkspaceInput: HTMLInputElement | undefined;
+  const renameWorkspaceComposition = createRenameCompositionGuard();
+  let renamingMaterialTarget: MaterialSidebarTarget | null = null;
+  let renameMaterialName = '';
+  let renameMaterialInput: HTMLInputElement | undefined;
+  let renameMaterialInFlight = false;
+  const renameMaterialComposition = createRenameCompositionGuard();
+  const textCompositionBoundary = createTextCompositionBoundary();
+  $: if (sidebarSelectionScope !== JSON.stringify([project?.project_id, project?.session_id])) {
+    sidebarSelectionScope = JSON.stringify([project?.project_id, project?.session_id]);
+    sidebarSelection = null;
+    closeDocumentContextMenu(false);
+    cancelWorkspaceLabelRename(false);
+    cancelMaterialRename(false);
+  }
+  $: if (sidebarContextTarget && !sidebarTargetIsCurrent(sidebarContextTarget,
+    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) closeDocumentContextMenu(false);
+  $: if (renamingWorkspaceRoot && !sidebarTargetIsCurrent(renamingWorkspaceRoot,
+    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) cancelWorkspaceLabelRename(false);
+  // A refreshed row does not authorize rebasing an in-progress rename. Keep its
+  // exact input visible, but its original native revision must still match.
+  $: if (renamingMaterialTarget && !materialEntries.some(item => item.id === renamingMaterialTarget?.material.id)) cancelMaterialRename(false);
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
@@ -480,6 +514,7 @@
   let materialsOpen = false;
   let addMenuOpen = false;
   let materialEntries: MaterialEntry[] = [];
+  let materialRefreshSerial = 0;
   let materialScope = '';
   let activeMaterial: MaterialEntry | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
@@ -501,10 +536,19 @@
   async function refreshMaterials(): Promise<void> {
     if (!project) return;
     const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const request = ++materialRefreshSerial;
     try {
       const entries = await listMaterials(captured.projectId, captured.sessionId);
-      if (project?.project_id === captured.projectId && project.session_id === captured.sessionId) materialEntries = entries;
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+      if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
+        const existing = new Map(materialEntries.map(item => [item.id, item]));
+        materialEntries = entries.map(item => {
+          const previous = existing.get(item.id);
+          return previous && sameMaterialObservation(previous, item) ? previous : item;
+        });
+        // Refresh display metadata without remounting the source/evidence view.
+        if (activeMaterial) activeMaterial = materialEntries.find(item => item.id === activeMaterial?.id) ?? activeMaterial;
+      }
+    } catch (error) { if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) recordFailure(error); }
   }
   function captureMaterialOrigin(): void {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
@@ -546,14 +590,22 @@
     if (inserted) closeMaterial();
     return inserted;
   }
-  function materialRemoved(id: string, sessionId: string): void {
-    if (project?.session_id !== sessionId) return;
+  function materialRemoved(id: string, sessionId: string, expected?: MaterialEntry): void {
+    if (!componentMounted || project?.session_id !== sessionId) return;
+    if (expected && materialEntries.find(item => item.id === id) !== expected) { void refreshMaterials(); return; }
+    materialRefreshSerial += 1;
     materialEntries = materialEntries.filter(item => item.id !== id);
     if (activeMaterial?.id === id) closeMaterial();
+    void refreshMaterials();
   }
   function materialChanged(item: MaterialEntry): void {
+    if (!componentMounted) return;
+    materialRefreshSerial += 1;
+    const refreshOtherObservations = item.metadata_revision && materialEntries.some(existing =>
+      existing.id !== item.id && existing.metadata_revision !== item.metadata_revision);
     materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
     if (activeMaterial?.id === item.id) activeMaterial = item;
+    if (refreshOtherObservations) void refreshMaterials();
   }
   async function chooseMaterialLibrary(): Promise<void> {
     if (!project || fileCommandInFlight || opening) return;
@@ -2609,6 +2661,8 @@
       })();
     }
     const loompadIdleTimer = window.setInterval(() => void prefetchLoompad(), 5_000);
+    window.addEventListener('compositionstart', textCompositionBoundary.start, true);
+    window.addEventListener('compositionend', textCompositionBoundary.end, true);
     window.addEventListener('keydown', handleGlobalKeydownCapture, true);
     window.addEventListener('click', handleAttachmentLink, true);
     window.addEventListener('keydown', handleGlobalKeydown);
@@ -2622,9 +2676,12 @@
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       projectFilesystemRefreshSerial += 1;
+      materialRefreshSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
+      window.removeEventListener('compositionstart', textCompositionBoundary.start, true);
+      window.removeEventListener('compositionend', textCompositionBoundary.end, true);
       window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
       window.removeEventListener('click', handleAttachmentLink, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
@@ -4822,6 +4879,370 @@
     return window.document.activeElement === target;
   }
 
+  function sidebarLiveState(): SidebarLiveState {
+    return { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries };
+  }
+
+  function sidebarCapabilitiesFor(target: CapturedSidebarTarget): readonly SidebarCapability[] {
+    return sidebarCapabilities(target, {
+      idle: componentMounted && applicationClosePhase === 'running' && transition === 'idle' &&
+        !fileCommandInFlight && !opening && !documentContextActionInFlight && !sidebarActionInFlight &&
+        !renamingWorkspaceRoot && !renamingMaterialTarget && !renamingDocumentId && !deleteDocumentTarget,
+      editable: !editorReadonly,
+      activeRoot: target.kind === 'root' && target.bookmark.root === project?.root,
+      expanded: target.kind === 'root' ? workspaceRootExpanded : target.kind === 'folder' && (!collapsedFolders.has(target.path) || Boolean(search.trim())),
+      revealLabel: documentContextRevealLabel,
+      searching: Boolean(search.trim())
+    });
+  }
+
+  // Svelte's legacy dependency analysis cannot see through the live policy
+  // helper. List its inputs here; the same helper rechecks synchronously before
+  // execution, including a second event arriving before the next render tick.
+  $: {
+    void [componentMounted, applicationClosePhase, transition, fileCommandInFlight, opening,
+      documentContextActionInFlight, sidebarActionInFlight, renamingWorkspaceRoot, renamingMaterialTarget, renamingDocumentId,
+      deleteDocumentTarget, editorReadonly, project, workspaceRootExpanded, collapsedFolders,
+      search, documentContextRevealLabel];
+    sidebarMenuCapabilities = sidebarContextTarget ? sidebarCapabilitiesFor(sidebarContextTarget) : [];
+  }
+
+  $: {
+    void [visibleWorkspaceFolders, fileRows, visibleMaterials, workspaceRootExpanded,
+      renamingDocumentId, renamingWorkspaceRoot, renamingMaterialTarget];
+    void reconcileSidebarSelection(sidebarSelection, project);
+  }
+
+  async function reconcileSidebarSelection(expectedKey: string | null, expectedProject: ProjectSnapshot | null): Promise<void> {
+    if (!expectedKey || !expectedProject) return;
+    await tick();
+    if (sidebarSelection !== expectedKey || renamingDocumentId || renamingWorkspaceRoot || renamingMaterialTarget ||
+      !sidebarScopeIsCurrent({ projectId: expectedProject.project_id, sessionId: expectedProject.session_id }, project)) return;
+    // Filtering/collapse can remove the selected row. Leave a Tab entry point
+    // without focusing another surface or manufacturing another selection.
+    if (!sidebarButtons().some(button => button.dataset.sidebarRow === expectedKey)) sidebarSelection = null;
+  }
+
+  function sidebarParentKey(path = ''): string | undefined {
+    if (!project) return undefined;
+    const components = path.replace(/\/$/u, '').split('/');
+    components.pop();
+    if (components.length) return sidebarItemKey({ projectId: project.project_id, sessionId: project.session_id },
+      { kind: 'folder', path: `${components.join('/')}/`, title: '' });
+    const bookmark = workspaceFolders.find(folder => folder.root === project?.root);
+    return bookmark ? sidebarItemKey({ projectId: project.project_id, sessionId: project.session_id }, { kind: 'root', bookmark }) : undefined;
+  }
+
+  function sidebarButtons(): HTMLButtonElement[] {
+    return Array.from(outlineElement?.querySelectorAll<HTMLButtonElement>('[data-sidebar-row]') ?? []);
+  }
+
+  function focusSidebarButton(button: HTMLButtonElement | undefined): void {
+    if (!button?.isConnected) return;
+    sidebarSelection = button.dataset.sidebarRow ?? null;
+    button.focus();
+    button.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function restoreSidebarFocus(target: CapturedSidebarTarget, trigger: HTMLButtonElement | null, previousIndex = 0): Promise<void> {
+    await tick();
+    if (!componentMounted || applicationClosePhase !== 'running' || !sidebarScopeIsCurrent(target.scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
+    const buttons = sidebarButtons();
+    const row = buttons.find(button => button.dataset.sidebarRow === target.key);
+    if (row) { focusSidebarButton(row); return; }
+    if (focusConnectedControl(trigger)) return;
+    if (buttons.length) focusSidebarButton(buttons[Math.min(previousIndex, buttons.length - 1)]);
+    else focusConnectedControl(outlineToggle);
+  }
+
+  function selectSidebarRow(event: MouseEvent, target: CapturedSidebarTarget): void {
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    sidebarSelection = target.key;
+    // A label click selects; only the disclosure or a double click opens.
+    // In particular a click on the current document is not an implicit rename.
+    if (event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]')) {
+      void activateSidebarRow(target, event.currentTarget as HTMLButtonElement);
+    }
+  }
+
+  function handleSidebarContextPointer(event: MouseEvent, target: CapturedSidebarTarget): void {
+    event.preventDefault();
+    event.stopPropagation();
+    openSidebarContextMenu(target, event.currentTarget as HTMLButtonElement, { x: event.clientX, y: event.clientY });
+  }
+
+  function handleSidebarRowKeydown(event: KeyboardEvent, target: CapturedSidebarTarget): void {
+    if (compositionOwnsKey(event)) { event.stopPropagation(); return; }
+    const action = sidebarKeyAction(event);
+    if (action === 'none') return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    sidebarSelection = target.key;
+    if (action === 'context') {
+      const bounds = trigger.getBoundingClientRect();
+      openSidebarContextMenu(target, trigger, { x: bounds.left + 12, y: bounds.bottom });
+      return;
+    }
+    const buttons = sidebarButtons();
+    const index = buttons.indexOf(trigger);
+    if (action === 'previous' || action === 'next' || action === 'first' || action === 'last') {
+      const next = action === 'first' ? 0 : action === 'last' ? buttons.length - 1 : index + (action === 'previous' ? -1 : 1);
+      focusSidebarButton(buttons[Math.max(0, Math.min(buttons.length - 1, next))]);
+      return;
+    }
+    if (action === 'expand' || action === 'collapse') {
+      const expanded = target.kind === 'root' ? target.bookmark.root === project?.root && workspaceRootExpanded
+        : target.kind === 'folder' && (!collapsedFolders.has(target.path) || Boolean(search.trim()));
+      if ((target.kind === 'root' || (target.kind === 'folder' && !search.trim())) &&
+        ((action === 'expand' && !expanded) || (action === 'collapse' && expanded))) {
+        void activateSidebarRow(target, trigger);
+      } else if (action === 'expand') {
+        focusSidebarButton(buttons.find(button => button.dataset.sidebarParent === target.key));
+      } else {
+        focusSidebarButton(buttons.find(button => button.dataset.sidebarRow === trigger.dataset.sidebarParent));
+      }
+      return;
+    }
+    if (action === 'open') { void activateSidebarRow(target, trigger); return; }
+    const capability = sidebarCapabilitiesFor(target).find(item => action === 'rename'
+      ? item.action === 'rename' || item.action === 'rename_label'
+      : item.action === 'forget' || item.action === 'delete' || item.action === 'remove');
+    if (capability) void executeSidebarCapability(capability, trigger);
+  }
+
+  async function activateSidebarRow(target: CapturedSidebarTarget, trigger: HTMLButtonElement): Promise<void> {
+    const capability = sidebarCapabilitiesFor(target).find(item => item.action === 'open' || item.action === 'toggle');
+    if (capability) await executeSidebarCapability(capability, trigger);
+  }
+
+  function openSidebarContextMenu(target: CapturedSidebarTarget, trigger: HTMLButtonElement, point: MenuPoint): void {
+    if (!trigger.isConnected || !sidebarTargetIsCurrent(target, sidebarLiveState()) ||
+      applicationClosePhase !== 'running' || transition !== 'idle' || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId || deleteDocumentTarget) return;
+    closeFormatMenu(false);
+    closeDocumentContextMenu(false);
+    sidebarSelection = target.key;
+    sidebarContextTarget = target;
+    documentContextTarget = target.kind === 'document' ? target.document : null;
+    documentContextTrigger = trigger;
+    documentContextPoint = point;
+    documentContextFocusIndex = 0;
+    void focusDocumentContextMenu(target);
+  }
+
+  async function runSidebarContextAction(capability: SidebarCapability): Promise<void> {
+    // A detached menu button retains its original closure, never the next menu's
+    // target. This also rejects late keyboard activation after a workspace switch.
+    if (sidebarContextTarget !== capability.target) return;
+    await executeSidebarCapability(capability, documentContextTrigger);
+  }
+
+  async function executeSidebarCapability(capability: SidebarCapability, trigger: HTMLButtonElement | null): Promise<void> {
+    const target = capability.target;
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState()) ||
+      !sidebarCapabilitiesFor(target).some(item => item.action === capability.action && item.enabled)) return;
+    const action = capability.action;
+    if (target.kind === 'document' && action !== 'copy_path') {
+      if (!target.document || !(['open', 'rename', 'export_text', 'delete', 'reveal'] as const).some(value => value === action)) return;
+      // The existing owning path keeps its captured revision, flush, lock,
+      // confirmation, idempotent retry and receipt checks. No path authority.
+      documentContextTarget = target.document;
+      documentContextTrigger = trigger;
+      await runDocumentContextAction(action as DocumentContextAction);
+      return;
+    }
+    const previousIndex = Math.max(0, sidebarButtons().findIndex(button => button.dataset.sidebarRow === target.key));
+    closeDocumentContextMenu(false);
+    if (target.kind === 'root' && action === 'rename_label') { await beginWorkspaceLabelRename(target); return; }
+    if (target.kind === 'root' && action === 'open') { await doOpenProject(target.bookmark.root); return; }
+    if (target.kind === 'material' && action === 'open') { openMaterial(target.materialLease); return; }
+    if (target.kind === 'material' && action === 'rename') { await beginMaterialRename(target); return; }
+    sidebarActionInFlight = true;
+    try {
+      if (action === 'copy_path' && target.displayPath !== null) {
+        await navigator.clipboard.writeText(target.displayPath);
+      } else if (target.kind === 'root' && action === 'forget') {
+        // Deliberately no close/save/open/native IPC. The active session and all
+        // unsaved surfaces stay mounted; its tree survives without a bookmark.
+        workspaceFolders = forgetWorkspaceFolder(workspaceFolders, target.bookmark.root, window.localStorage);
+        if (project?.root === target.bookmark.root) workspaceRootExpanded = true;
+        announce(`Removed ${target.title} from the sidebar`);
+      } else if (target.kind === 'root' && action === 'toggle') {
+        workspaceRootExpanded = !workspaceRootExpanded;
+      } else if (target.kind === 'folder' && action === 'toggle') {
+        // A search reveals matches independently of the user's collapsed set.
+        if (!search.trim()) {
+          const next = new Set(collapsedFolders);
+          if (next.has(target.path)) next.delete(target.path); else next.add(target.path);
+          collapsedFolders = next;
+        }
+      } else if (target.kind === 'material' && action === 'copy_reference') {
+        await navigator.clipboard.writeText(materialReferenceMarkdown(target.material));
+      } else if (target.kind === 'material' && (action === 'pin' || action === 'remove')) {
+        fileCommandInFlight = true;
+        const { projectId, sessionId } = target.scope;
+        if (action === 'pin') {
+          const changed = await pinMaterial(projectId, sessionId, target.material.id, !target.material.pinned, materialMetadataRevision(target.material));
+          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+          if (!materialSourceIsUnchanged(target.material, changed) || changed.name !== target.material.name || !canEditMaterialMetadata(changed) ||
+            changed.pinned !== !target.material.pinned || changed.metadata_revision === target.material.metadata_revision) throw new Error('The source pin receipt did not match its captured target.');
+          if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialChanged(changed);
+          else await refreshMaterials();
+        } else {
+          await removeMaterial(projectId, sessionId, target.material.id, materialMetadataRevision(target.material));
+          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+          if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialRemoved(target.material.id, sessionId);
+          else await refreshMaterials();
+        }
+      }
+    } catch (error) {
+      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+        recordFailure(error);
+        if (target.kind === 'material' && (action === 'pin' || action === 'remove')) await refreshMaterials();
+      }
+    } finally {
+      sidebarActionInFlight = false;
+      if (target.kind === 'material' && (action === 'pin' || action === 'remove')) fileCommandInFlight = false;
+      await restoreSidebarFocus(target, trigger, previousIndex);
+    }
+  }
+
+  async function beginMaterialRename(target: MaterialSidebarTarget): Promise<void> {
+    if (!componentMounted || !sidebarTargetIsCurrent(target, sidebarLiveState()) || !canEditMaterialMetadata(target.material)) return;
+    renameMaterialComposition.reset();
+    renamingMaterialTarget = target;
+    renameMaterialName = target.material.name;
+    await tick();
+    if (!componentMounted || renamingMaterialTarget !== target || !sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    renameMaterialInput?.focus(); renameMaterialInput?.select();
+  }
+
+  function cancelMaterialRename(refocus = true): void {
+    if (renameMaterialInFlight) return;
+    const target = renamingMaterialTarget;
+    renamingMaterialTarget = null;
+    renameMaterialName = '';
+    renameMaterialComposition.reset();
+    if (refocus && target) void restoreSidebarFocus(target, null);
+  }
+
+  async function commitMaterialRename(refocus = true): Promise<void> {
+    const target = renamingMaterialTarget;
+    if (!target || renameMaterialInFlight || renameMaterialComposition.active || !componentMounted ||
+      applicationClosePhase !== 'running' || transition !== 'idle' || opening || fileCommandInFlight) return;
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) {
+      recordFailure(new Error('The source changed. Cancel this rename and select the source again.'));
+      return;
+    }
+    const nameError = materialDisplayNameError(renameMaterialName);
+    if (nameError) { recordFailure(new Error(nameError)); return; }
+    if (renameMaterialName === target.material.name) { cancelMaterialRename(refocus); return; }
+    const request = Object.freeze({ ...target.scope, id: target.material.id,
+      expectedMetadataRevision: materialMetadataRevision(target.material), requestId: newUlid(), name: renameMaterialName });
+    renameMaterialInFlight = true; fileCommandInFlight = true;
+    materialRefreshSerial += 1;
+    let succeeded = false;
+    try {
+      const receipt = await renameMaterial(request);
+      if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+      if (!materialRenameReceiptMatches(request, target.material, receipt)) throw new Error('The source rename receipt did not match its captured target.');
+      if (renamingMaterialTarget === target && sidebarTargetIsCurrent(target, sidebarLiveState())) {
+        materialChanged(receipt.material);
+        succeeded = true;
+      } else if (renamingMaterialTarget === target && materialEntries.some(item => sameMaterialObservation(item, receipt.material))) {
+        // A read may already have published this exact acknowledged generation.
+        // Close this owner without replaying a mutation or rebasing its lease.
+        succeeded = true;
+      } else {
+        await refreshMaterials();
+      }
+    } catch (error) {
+      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+        recordFailure(error);
+        await refreshMaterials();
+      }
+    } finally {
+      renameMaterialInFlight = false; fileCommandInFlight = false;
+      if (renamingMaterialTarget === target) {
+        if (succeeded || !componentMounted || !sidebarScopeIsCurrent(target.scope, project) ||
+          !materialEntries.some(item => item.id === target.material.id)) cancelMaterialRename(succeeded && refocus && componentMounted);
+        else {
+          await tick();
+          if (componentMounted && applicationClosePhase === 'running' && renamingMaterialTarget === target && sidebarScopeIsCurrent(target.scope, project)) renameMaterialInput?.focus();
+        }
+      }
+    }
+  }
+
+  function handleMaterialRenameInput(event: Event): void {
+    if (!renameMaterialInput || event.currentTarget !== renameMaterialInput || renameMaterialInFlight) return;
+    renameMaterialName = renameMaterialInput.value;
+  }
+  function handleMaterialRenameCompositionEnd(event: CompositionEvent): void {
+    if (!renameMaterialInput || event.currentTarget !== renameMaterialInput || renameMaterialInFlight) return;
+    const commitAfterBlur = renameMaterialComposition.finish();
+    handleMaterialRenameInput(event);
+    if (commitAfterBlur) void commitMaterialRename(false);
+  }
+  function handleMaterialRenameKeydown(event: KeyboardEvent): void {
+    if (event.currentTarget !== renameMaterialInput) return;
+    handleInlineRenameKey(event, renameMaterialComposition, () => void commitMaterialRename(), () => cancelMaterialRename());
+  }
+  function handleMaterialRenameBlur(event: FocusEvent): void {
+    if (event.currentTarget === renameMaterialInput && !renameMaterialInFlight && renameMaterialComposition.blurShouldCommit()) void commitMaterialRename(false);
+  }
+
+  async function beginWorkspaceLabelRename(target: RootSidebarTarget): Promise<void> {
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    renameWorkspaceComposition.reset();
+    renamingWorkspaceRoot = target;
+    renameWorkspaceTitle = target.title;
+    await tick();
+    if (renamingWorkspaceRoot !== target || !sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    renameWorkspaceInput?.focus();
+    renameWorkspaceInput?.select();
+  }
+
+  function cancelWorkspaceLabelRename(refocus = true): void {
+    const target = renamingWorkspaceRoot;
+    renamingWorkspaceRoot = null;
+    renameWorkspaceTitle = '';
+    renameWorkspaceComposition.reset();
+    if (refocus && target) void restoreSidebarFocus(target, null);
+  }
+
+  function commitWorkspaceLabelRename(refocus = true): void {
+    const target = renamingWorkspaceRoot;
+    if (!target || renameWorkspaceComposition.active) return;
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) { cancelWorkspaceLabelRename(false); return; }
+    try {
+      workspaceFolders = renameWorkspaceFolder(workspaceFolders, target.bookmark.root, renameWorkspaceTitle, window.localStorage);
+      cancelWorkspaceLabelRename(refocus);
+    } catch (error) {
+      recordFailure(error);
+      void tick().then(() => {
+        if (renamingWorkspaceRoot === target && sidebarTargetIsCurrent(target, sidebarLiveState())) {
+          renameWorkspaceInput?.focus(); renameWorkspaceInput?.select();
+        }
+      });
+    }
+  }
+
+  function handleWorkspaceRenameInput(event: Event): void {
+    if (event.currentTarget !== renameWorkspaceInput) return;
+    const input = event.currentTarget as HTMLInputElement;
+    renameWorkspaceTitle = renameWorkspaceComposition.active ? input.value : boundedDocumentTitleInput(input.value);
+    if (!renameWorkspaceComposition.active && input.value !== renameWorkspaceTitle) input.value = renameWorkspaceTitle;
+  }
+
+  function handleWorkspaceRenameCompositionEnd(event: CompositionEvent): void {
+    if (event.currentTarget !== renameWorkspaceInput) return;
+    const commitAfterBlur = renameWorkspaceComposition.finish();
+    handleWorkspaceRenameInput(event);
+    if (commitAfterBlur && event.currentTarget === renameWorkspaceInput) commitWorkspaceLabelRename(false);
+  }
+
   function clearDocumentContextLongPress(): void {
     if (documentContextLongPressTimer !== undefined) {
       window.clearTimeout(documentContextLongPressTimer);
@@ -4837,11 +5258,15 @@
   function closeDocumentContextMenu(refocus = true): void {
     clearDocumentContextLongPress();
     const trigger = documentContextTrigger;
+    const scope = sidebarContextTarget?.scope ?? (documentContextTarget ?
+      { projectId: documentContextTarget.projectId, sessionId: documentContextTarget.sessionId } : null);
     documentContextTarget = null;
+    sidebarContextTarget = null;
     documentContextTrigger = null;
     documentContextFocusIndex = 0;
     if (!refocus) return;
     void tick().then(() => {
+      if (!scope || !sidebarScopeIsCurrent(scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
       if (focusConnectedControl(trigger)) return;
       if (focusConnectedControl(outlineToggle)) return;
       focusCurrentWritingSurfaceAtEnd();
@@ -4856,11 +5281,11 @@
   }
 
   async function focusDocumentContextMenu(
-    target: CapturedDocumentTarget,
+    target: CapturedSidebarTarget,
     requestedIndex = 0
   ): Promise<void> {
     await tick();
-    if (documentContextTarget !== target || !documentContextMenu) return;
+    if (sidebarContextTarget !== target || !documentContextMenu) return;
     const bounds = documentContextMenu.getBoundingClientRect();
     documentContextPoint = clampDocumentMenuPoint(
       documentContextPoint,
@@ -4870,90 +5295,27 @@
       window.innerHeight
     );
     await tick();
-    if (documentContextTarget !== target) return;
+    if (sidebarContextTarget !== target) return;
     const items = documentContextMenuItems();
     if (items.length === 0) return;
     documentContextFocusIndex = Math.min(Math.max(requestedIndex, 0), items.length - 1);
     items[documentContextFocusIndex]?.focus();
   }
 
-  function openDocumentContextMenu(
-    target: CapturedDocumentTarget,
-    trigger: HTMLButtonElement,
-    point: MenuPoint
-  ): void {
-    if (
-      documentContextActionInFlight ||
-      fileCommandInFlight ||
-      applicationClosePhase !== 'running' ||
-      transition !== 'idle'
-    ) return;
-    closeFormatMenu(false);
-    closeDocumentContextMenu(false);
-    closeDocumentDeleteConfirmation(false);
-    documentContextTarget = target;
-    documentContextTrigger = trigger;
-    documentContextPoint = point;
-    documentContextFocusIndex = 0;
-    void focusDocumentContextMenu(target);
+  function openDocumentContextMenu(target: CapturedDocumentTarget, trigger: HTMLButtonElement, point: MenuPoint): void {
+    if (!project || !capturedDocumentIdentityIsCurrent(target, project)) return;
+    const summary = project.documents.find(candidate => candidate.document_id === target.documentId);
+    if (!summary) return;
+    openSidebarContextMenu({ ...captureSidebarTarget(project, { kind: 'document', summary }), kind: 'document', summary, document: target }, trigger, point);
   }
 
   function captureDocumentContextTarget(summary: DocumentSummary): CapturedDocumentTarget | null {
     if (!project) return null;
-    activeMaterialEvidence = null; activeMaterial = null; materialsOpen = false; materialOrigin = null;
     const target = captureDocumentTarget(project, summary);
     if (!target) {
       announce(`${summary.title} does not expose a complete active revision yet`);
     }
     return target;
-  }
-
-  function handleDocumentContextPointer(
-    event: MouseEvent,
-    summary: DocumentSummary
-  ): void {
-    event.preventDefault();
-    event.stopPropagation();
-    clearDocumentContextLongPress();
-    const target = captureDocumentContextTarget(summary);
-    if (!target) return;
-    openDocumentContextMenu(target, event.currentTarget as HTMLButtonElement, {
-      x: event.clientX,
-      y: event.clientY
-    });
-  }
-
-  function handleDocumentContextKey(
-    event: KeyboardEvent,
-    summary: DocumentSummary
-  ): void {
-    if (!isDocumentContextTriggerKey(event)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const target = captureDocumentContextTarget(summary);
-    if (!target) return;
-    const trigger = event.currentTarget as HTMLButtonElement;
-    const bounds = trigger.getBoundingClientRect();
-    openDocumentContextMenu(target, trigger, {
-      x: bounds.left + 12,
-      y: bounds.top + Math.min(bounds.height, 28)
-    });
-  }
-
-  function handleVisibleDocumentActions(
-    event: MouseEvent,
-    summary: DocumentSummary
-  ): void {
-    event.preventDefault();
-    event.stopPropagation();
-    const target = captureDocumentContextTarget(summary);
-    if (!target) return;
-    const trigger = event.currentTarget as HTMLButtonElement;
-    openDocumentContextMenu(
-      target,
-      trigger,
-      visibleDocumentActionsMenuPoint(trigger.getBoundingClientRect())
-    );
   }
 
   function beginDocumentContextLongPress(
@@ -5014,29 +5376,15 @@
     }
   }
 
-  function handleDocumentRowClick(event: MouseEvent, summary: DocumentSummary): void {
-    if (activeMaterial || materialsOpen) { closeMaterial(); if (summary.document_id === document?.summary.document_id) return; }
-    if (documentContextSuppressClickId === summary.document_id) {
+  function handleDocumentRowClick(event: MouseEvent, target: CapturedSidebarTarget): void {
+    if (target.kind === 'document' && documentContextSuppressClickId === target.summary.document_id) {
       documentContextSuppressClickId = null;
-      if (documentContextSuppressClickTimer !== undefined) {
-        window.clearTimeout(documentContextSuppressClickTimer);
-        documentContextSuppressClickTimer = undefined;
-      }
+      if (documentContextSuppressClickTimer !== undefined) window.clearTimeout(documentContextSuppressClickTimer);
+      documentContextSuppressClickTimer = undefined;
       event.preventDefault();
       return;
     }
-    if (
-      summary.document_id === document?.summary.document_id &&
-      event.target instanceof Element &&
-      event.target.closest('[data-document-title]')
-    ) {
-      event.preventDefault();
-      const target = captureDocumentContextTarget(summary);
-      if (target) void beginDocumentRename(target, event.currentTarget as HTMLElement);
-      return;
-    }
-    if (activeMaterial || materialsOpen) { closeMaterial(); if (summary.document_id === document?.summary.document_id) return; }
-    void selectDocument(summary, true);
+    selectSidebarRow(event, target);
   }
 
   async function beginDocumentRename(
@@ -5090,28 +5438,32 @@
     renameDocumentTarget = refreshedTarget;
     renameDocumentTrigger = trigger;
     await tick();
+    if (renameDocumentTarget !== refreshedTarget || !capturedDocumentBelongsToSession(refreshedTarget, project)) return;
     renameDocumentInput?.focus();
     renameDocumentInput?.select();
   }
 
   function synchronizeDocumentRenameTitle(input: HTMLInputElement): void {
-    const bounded = boundedDocumentTitleInput(input.value);
+    const bounded = renameDocumentComposition.active ? input.value : boundedDocumentTitleInput(input.value);
     if (input.value !== bounded) input.value = bounded;
     renameDocumentTitle = bounded;
   }
 
   function handleDocumentRenameInput(event: Event): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     synchronizeDocumentRenameTitle(event.currentTarget as HTMLInputElement);
   }
 
-  function handleDocumentRenameCompositionStart(): void {
+  function handleDocumentRenameCompositionStart(event: CompositionEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     renameDocumentComposition.start();
   }
 
   function handleDocumentRenameCompositionEnd(event: CompositionEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     const input = event.currentTarget as HTMLInputElement;
-    synchronizeDocumentRenameTitle(input);
     const commitAfterBlur = renameDocumentComposition.finish();
+    synchronizeDocumentRenameTitle(input);
     if (
       commitAfterBlur &&
       input === renameDocumentInput &&
@@ -5120,12 +5472,14 @@
     ) void commitDocumentRename(false);
   }
 
-  function handleDocumentRenameBlur(): void {
+  function handleDocumentRenameBlur(event: FocusEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     if (renameDocumentInFlight || !renameDocumentComposition.blurShouldCommit()) return;
     void commitDocumentRename(false);
   }
 
   function cancelDocumentRename(refocus = true): void {
+    const target = renameDocumentTarget;
     const documentId = renamingDocumentId;
     const trigger = renameDocumentTrigger;
     renamingDocumentId = null;
@@ -5135,6 +5489,7 @@
     renameDocumentEditorLocked = false;
     renameDocumentComposition.reset();
     if (refocus) void tick().then(() => {
+      if (!target || !capturedDocumentBelongsToSession(target, project) || sidebarContextTarget || renamingDocumentId || renamingWorkspaceRoot || renamingMaterialTarget) return;
       const row = Array.from(
         window.document.querySelectorAll<HTMLButtonElement>('[data-document-row]')
       ).find((candidate) => candidate.dataset.documentRow === documentId);
@@ -5190,7 +5545,7 @@
             renameDocumentInFlight = false;
           },
           tick,
-          () => renameDocumentInput
+          () => renameDocumentTarget === target && capturedDocumentBelongsToSession(target, project) ? renameDocumentInput : null
         );
       } else {
         fileCommandInFlight = false;
@@ -5200,26 +5555,8 @@
   }
 
   function handleDocumentRenameKeydown(event: KeyboardEvent): void {
-    const compositionOwnsCommand = renameDocumentComposition.ownsCommandKey(event);
-    if (
-      compositionOwnsCommand &&
-      (event.key === 'Escape' || event.key === 'Enter')
-    ) {
-      // Keep the event's default behavior available to the IME, but prevent a
-      // rename-owned composition command from reaching global Shuttle/menu
-      // routing.
-      event.stopPropagation();
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      cancelDocumentRename();
-      return;
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      void commitDocumentRename(true);
-    }
+    if (event.currentTarget !== renameDocumentInput) return;
+    handleInlineRenameKey(event, renameDocumentComposition, () => void commitDocumentRename(true), () => cancelDocumentRename());
   }
 
   function openDocumentDeleteConfirmation(
@@ -5397,6 +5734,8 @@
   }
 
   function handleDocumentContextMenuKeydown(event: KeyboardEvent): void {
+    if (compositionOwnsKey(event)) return;
+    if (event.key === 'Tab') { closeDocumentContextMenu(false); return; }
     const items = documentContextMenuItems();
     const action = documentMenuKeyAction(event, documentContextFocusIndex, items.length);
     switch (action.kind) {
@@ -6348,6 +6687,8 @@
 
   async function doOpenProject(path?: string): Promise<boolean> {
     if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
+    closeDocumentContextMenu(false);
+    cancelWorkspaceLabelRename(false);
     opening = true;
     fileCommandInFlight = true;
     let preparationId: string | null = null;
@@ -6379,7 +6720,7 @@
         onHeld: holdWorkspaceForApplicationClose
       });
       if (!opened) return false;
-      if (await finishOpeningProject(opened, restoreSerial)) {
+      if (await finishOpeningProject(opened, restoreSerial, true)) {
         const captured = currentWorkspaceCapture();
         if (!captured || !workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
@@ -6520,7 +6861,8 @@
 
   async function finishOpeningProject(
     opened: ProjectSnapshot,
-    restoreSerial: number
+    restoreSerial: number,
+    rememberBookmark = false
   ): Promise<boolean> {
     const captured: WorkspaceRestoreCapture = {
       restoreSerial,
@@ -6562,9 +6904,6 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
-    let folderStorage: Storage | undefined;
-    try { folderStorage = window.localStorage; } catch { /* Workspace navigation does not require storage. */ }
-    workspaceFolders = rememberWorkspaceFolder(workspaceFolders, { root: opened.root, title: opened.title }, folderStorage);
     workspaceRootExpanded = true;
     hiddenPaneSlots = new Set();
     paneSelection = {};
@@ -6623,6 +6962,20 @@
       saveMessage = 'Project is ready';
     }
     if (!workspaceRestoreIsCurrent(captured)) return false;
+    // Only an explicitly opened, restored workspace adds a bookmark. Startup
+    // and reattachment must not resurrect a deliberately forgotten live root.
+    // Persist after document navigation, which clears its previous failure;
+    // otherwise a storage refusal would be silently erased by selectDocument.
+    if (rememberBookmark) {
+      const bookmark = { root: opened.root, title: opened.title };
+      try { workspaceFolders = rememberWorkspaceFolder(workspaceFolders, bookmark, window.localStorage); }
+      catch (error) {
+        // Native opening succeeded. Keep that live session/tree even when the
+        // convenience bookmark could not be persisted, and report the refusal.
+        workspaceFolders = rememberWorkspaceFolder(workspaceFolders, bookmark);
+        recordFailure(error);
+      }
+    }
     // Close the listener/snapshot handoff gap: a watcher hint emitted before
     // this project became current was correctly ignored, so pull once now.
     scheduleProjectFilesystemRefresh(0);
@@ -8338,11 +8691,12 @@
   }
 
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
+    if (textCompositionBoundary.owns(event)) return;
     if (!shouldCaptureFormatMenuEscape(event, {
       formatMenuOpen: formatMenu?.isOpen() ?? false,
       compositionActive,
-      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null,
-      documentMenuOwnsEscape: documentContextTarget !== null,
+      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null || renamingWorkspaceRoot !== null || renamingMaterialTarget !== null,
+      documentMenuOwnsEscape: sidebarContextTarget !== null,
       modelManagerOwnsEscape: modelManagerOpen
     })) return;
     event.preventDefault();
@@ -8351,7 +8705,9 @@
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
-    if (event.defaultPrevented) return;
+    if (event.defaultPrevented || textCompositionBoundary.owns(event)) return;
+    if (textEditingElement(event.target) && nativeEditingCommand(event)) return;
+    if (event.key === 'Escape' && sidebarContextTarget) { event.preventDefault(); closeDocumentContextMenu(); return; }
     if (event.key === 'Escape' && addMenuOpen) { event.preventDefault(); addMenuOpen = false; return; }
     if (event.key === 'Escape' && (activeMaterial || materialsOpen)) { event.preventDefault(); closeMaterial(); return; }
     if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
@@ -8439,7 +8795,7 @@
       !coWriterTrigger?.contains(event.target)
     ) coWriterOpen = false;
     if (
-      documentContextTarget &&
+      sidebarContextTarget &&
       event.target instanceof Node &&
       !documentContextMenu?.contains(event.target)
     ) closeDocumentContextMenu(false);
@@ -9842,15 +10198,25 @@
     paneSelection = { ...paneSelection, [position]: id };
   }
 
-  async function preparePaneRun(): Promise<OpenDocument | null> {
+  async function preparePaneRun(chat = false): Promise<OpenDocument | null> {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
     const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
     const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
     cancelSuggestionTimer();
     await cancelActiveBranches();
     if (!current() || !await flushCurrentDocument() || !current()) return null;
-    if (!currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
-    if (!current() || !currentModel) return null;
+    // Match the actual native route, not the pane's visual kind. Ordinary Loom
+    // chat uses the selected Loom writer; explicit Mom opt-in retains Persona
+    // model authority. An unavailable/unknown capability must not waive admission.
+    let requireWritingModel = true;
+    if (chat) {
+      const route = await invoke<unknown>('plugin:loom|workspace_chat_route');
+      if (!current()) return null;
+      if (route !== 'loom' && route !== 'mom_experimental') throw new Error('Loom could not verify the chat execution route.');
+      requireWritingModel = route === 'loom';
+    }
+    if (requireWritingModel && !currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
+    if (!current() || (requireWritingModel && !currentModel)) return null;
     return document;
   }
 
@@ -9875,7 +10241,7 @@
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
-        {#if project.documents.length > 0 || folderWarnings.length > 0}
+        {#if project.documents.length > 0 || folderWarnings.length > 0 || workspaceFolders.length > 0}
           <button
             bind:this={outlineToggle}
             class="titlebar-button outline-toggle"
@@ -10001,85 +10367,105 @@
           <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
         <nav class="document-list" aria-label="Workspace folders">
-          {#each visibleWorkspaceFolders as folder (folder.root)}
-            {@const active = folder.root === project.root}
-            <button class="folder-row workspace-root" class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.root}
-              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
-              aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
-              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
-              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>
-            </button>
-            {#if active && workspaceRootExpanded}
+          {#each visibleWorkspaceFolders as folder (folder ? JSON.stringify(['root', folder.root]) : JSON.stringify(['session', project.session_id]))}
+            {@const active = folder === null || folder.root === project.root}
+            {#if folder}
+              {@const target = captureSidebarTarget(project, { kind: 'root', bookmark: folder })}
+              {#if renamingWorkspaceRoot?.bookmark === folder}
+                <div class="folder-row workspace-root editing workspace-label-edit" data-copy-folder={active ? '' : undefined}>
+                  <input bind:this={renameWorkspaceInput} value={renameWorkspaceTitle} type="text" maxlength="256"
+                    aria-label={`Sidebar label for ${target.title}`} title={folder.root}
+                    on:input={handleWorkspaceRenameInput}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameWorkspaceInput) renameWorkspaceComposition.start(); }}
+                    on:compositionend={handleWorkspaceRenameCompositionEnd}
+                    on:keydown={(event) => { if (event.currentTarget === renameWorkspaceInput) handleInlineRenameKey(event, renameWorkspaceComposition, () => commitWorkspaceLabelRename(), () => cancelWorkspaceLabelRename()); }}
+                    on:blur={(event) => { if (event.currentTarget === renameWorkspaceInput && renameWorkspaceComposition.blurShouldCommit()) commitWorkspaceLabelRename(false); }} />
+                </div>
+              {:else}
+                <button class="folder-row workspace-root" class:selected={sidebarSelection === target.key}
+                  class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined}
+                  data-sidebar-row={target.key} data-sidebar-kind="root" type="button" title={folder.root}
+                  aria-label={workspaceLabels.get(folder.root) ?? target.title} aria-haspopup="menu"
+                  aria-expanded={active && workspaceRootExpanded} aria-current={sidebarSelection === target.key ? 'true' : undefined}
+                  tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+                  on:focus={() => sidebarSelection = target.key}
+                  on:click={(event) => selectSidebarRow(event, target)}
+                  on:dblclick={(event) => { if (!(event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]'))) void activateSidebarRow(target, event.currentTarget); }}
+                  on:contextmenu={(event) => handleSidebarContextPointer(event, target)}
+                  on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
+                  <span data-sidebar-disclosure aria-hidden="true"></span><span>{workspaceLabels.get(folder.root) ?? target.title}</span>
+                </button>
+              {/if}
+            {/if}
+            {#if active && (folder === null || workspaceRootExpanded)}
             <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
-              <button class="folder-row" class:drop-target={workspaceDropFolder === row.path} data-copy-folder={row.path} type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
-                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              {@const target = captureSidebarTarget(project, { kind: 'folder', path: row.path, title: row.title })}
+              <button class="folder-row" class:selected={sidebarSelection === target.key} class:drop-target={workspaceDropFolder === row.path}
+                data-copy-folder={row.path} data-sidebar-row={target.key} data-sidebar-kind="folder" data-sidebar-parent={sidebarParentKey(row.path)}
+                type="button" title={target.displayPath ?? undefined} style={`padding-left: ${8 + row.depth * 14}px`}
+                aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} aria-haspopup="menu"
+                aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+                on:focus={() => sidebarSelection = target.key}
+                on:click={(event) => selectSidebarRow(event, target)}
+                on:dblclick={(event) => { if (!(event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]'))) void activateSidebarRow(target, event.currentTarget); }}
+                on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
+                <span data-sidebar-disclosure aria-hidden="true"></span><span>{row.title}</span>
               </button>
             {:else if 'material' in row}
-              <button class="folder-row material-row" class:active={activeMaterial?.id === row.material.id} type="button" title={row.path}
-                style={`padding-left: ${8 + row.depth * 14}px`} on:click={() => openMaterial(row.material)}>
+              {@const target = captureSidebarTarget(project, { kind: 'material', material: row.material })}
+              {#if renamingMaterialTarget?.key === target.key}
+                <div class="folder-row material-row editing" style={`padding-left: ${8 + row.depth * 14}px`}>
+                  <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
+                    aria-label={`Rename ${target.title}`} title={target.displayPath ?? target.title} disabled={renameMaterialInFlight}
+                    on:input={handleMaterialRenameInput}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameMaterialInput) renameMaterialComposition.start(); }}
+                    on:compositionend={handleMaterialRenameCompositionEnd} on:keydown={handleMaterialRenameKeydown}
+                    on:blur={handleMaterialRenameBlur} />
+                </div>
+              {:else}
+              <button class="folder-row material-row" class:selected={sidebarSelection === target.key} class:active={activeMaterial?.id === row.material.id}
+                type="button" title={target.displayPath ?? row.material.reference} data-sidebar-row={target.key} data-sidebar-kind="material" data-sidebar-parent={sidebarParentKey(row.path)}
+                aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined}
+                tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+                style={`padding-left: ${8 + row.depth * 14}px`} on:focus={() => sidebarSelection = target.key}
+                on:click={(event) => selectSidebarRow(event, target)} on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
+                on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
                 <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
+              {/if}
             {:else}
             {@const candidate = row.document}
+            {@const target = captureSidebarTarget(project, { kind: 'document', summary: candidate })}
             {#if renamingDocumentId === candidate.document_id}
               <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
-
                 <span class="document-label">
-                  <input
-                    bind:this={renameDocumentInput}
-                    bind:value={renameDocumentTitle}
-                    type="text"
-                    maxlength="256"
-                    aria-label={`Rename ${candidate.title}`}
-                    disabled={renameDocumentInFlight}
-                    on:input={handleDocumentRenameInput}
-                    on:compositionstart={handleDocumentRenameCompositionStart}
-                    on:compositionend={handleDocumentRenameCompositionEnd}
-                    on:keydown={handleDocumentRenameKeydown}
-                    on:blur={handleDocumentRenameBlur}
-                  />
-
+                  <input bind:this={renameDocumentInput} value={renameDocumentTitle} type="text" maxlength="256"
+                    aria-label={`Rename ${candidate.title}`} title={target.displayPath ?? undefined} disabled={renameDocumentInFlight}
+                    on:input={handleDocumentRenameInput} on:compositionstart={handleDocumentRenameCompositionStart}
+                    on:compositionend={handleDocumentRenameCompositionEnd} on:keydown={handleDocumentRenameKeydown} on:blur={handleDocumentRenameBlur} />
                 </span>
               </div>
             {:else}
-            <div
-              class="document-row-group"
-              class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
-              style={`padding-left: ${row.depth * 14}px`}
-              class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
-            >
-              <button
-                class="document-row"
-                data-document-row={candidate.document_id}
-                type="button"
-                disabled={editorReadonly}
-                aria-haspopup="menu"
-                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
-                on:click={(event) => handleDocumentRowClick(event, candidate)}
-                on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
-                on:keydown={(event) => handleDocumentContextKey(event, candidate)}
-                on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
-                on:pointermove={updateDocumentContextLongPress}
-                on:pointerup={finishDocumentContextLongPress}
-                on:pointercancel={finishDocumentContextLongPress}
-              >
-
-                <span class="document-label">
-                  <strong data-document-title>{candidate.title}</strong>
-
-                </span>
+            <div class="document-row-group" class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
+              style={`padding-left: ${row.depth * 14}px`} class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}>
+              <button class="document-row" class:selected={sidebarSelection === target.key}
+                data-document-row={candidate.document_id} data-sidebar-row={target.key} data-sidebar-kind="document" data-sidebar-parent={sidebarParentKey(row.path)}
+                type="button" title={target.displayPath ?? undefined} aria-haspopup="menu" aria-expanded={sidebarContextTarget?.key === target.key}
+                aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+                on:focus={() => sidebarSelection = target.key}
+                on:click={(event) => handleDocumentRowClick(event, target)} on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
+                on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}
+                on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)} on:pointermove={updateDocumentContextLongPress}
+                on:pointerup={finishDocumentContextLongPress} on:pointercancel={finishDocumentContextLongPress}>
+                <span class="document-label"><strong data-document-title>{candidate.title}</strong></span>
               </button>
-              <button
-                class="document-row-actions"
-                type="button"
-                aria-label={`Actions for ${candidate.title}`}
-                aria-haspopup="menu"
-                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
-                title={`Actions for ${candidate.title}`}
-                disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
-                on:click={(event) => handleVisibleDocumentActions(event, candidate)}
+              <button class="document-row-actions" type="button" aria-label={`Actions for ${candidate.title}`} aria-haspopup="menu"
+                aria-expanded={sidebarContextTarget?.key === target.key} title={`Actions for ${candidate.title}`}
+                on:click={(event) => openSidebarContextMenu(target, event.currentTarget, visibleDocumentActionsMenuPoint(event.currentTarget.getBoundingClientRect()))}
+                on:contextmenu={(event) => handleSidebarContextPointer(event, target)}
+                on:keydown={(event) => { if (isDocumentContextTriggerKey(event)) handleSidebarRowKeydown(event, target); }}
               ><span aria-hidden="true">•••</span></button>
             </div>
             {/if}
@@ -10088,11 +10474,26 @@
             {#if !visibleMaterials.length}<p class="empty-copy">No notes.</p>{/if}
           {/each}
           {#each visibleMaterials as item (item.id)}
-            <button class="folder-row material-row" class:active={activeMaterial?.id === item.id} type="button" title={item.name}
-              on:click={() => openMaterial(item)}>
-              <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
+            {@const target = captureSidebarTarget(project, { kind: 'material', material: item })}
+              {#if renamingMaterialTarget?.key === target.key}
+                <div class="folder-row material-row editing">
+                  <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
+                    aria-label={`Rename ${target.title}`} title={target.displayPath ?? target.title} disabled={renameMaterialInFlight}
+                    on:input={handleMaterialRenameInput}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameMaterialInput) renameMaterialComposition.start(); }}
+                    on:compositionend={handleMaterialRenameCompositionEnd} on:keydown={handleMaterialRenameKeydown}
+                    on:blur={handleMaterialRenameBlur} />
+                </div>
+              {:else}
+            <button class="folder-row material-row" class:selected={sidebarSelection === target.key} class:active={activeMaterial?.id === item.id}
+              type="button" title={target.displayPath ?? item.reference} data-sidebar-row={target.key} data-sidebar-kind="material" data-sidebar-parent={sidebarParentKey()}
+              aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+              on:focus={() => sidebarSelection = target.key} on:click={(event) => selectSidebarRow(event, target)}
+              on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
+              on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
             </button>
+              {/if}
           {/each}
             </div>
             {/if}
@@ -10104,61 +10505,23 @@
             <ul>{#each folderWarnings as warning}<li>{warning}</li>{/each}</ul>
           </details>
         {/if}
-        {#if documentContextTarget}
-          <div
-            bind:this={documentContextMenu}
-            class="document-context-menu"
-            role="menu"
-            tabindex="-1"
-            aria-label={`Actions for ${documentContextTarget.title}`}
+        {#if sidebarContextTarget}
+          {#key sidebarContextTarget}
+          {@const actions = sidebarMenuCapabilities}
+          <div bind:this={documentContextMenu} class="document-context-menu" role="menu" tabindex="-1"
+            aria-label={`Actions for ${sidebarContextTarget.title}`}
             style={`left: ${documentContextPoint.x}px; top: ${documentContextPoint.y}px;`}
-            on:keydown={handleDocumentContextMenuKeydown}
-            on:contextmenu|preventDefault={() => {}}
-          >
-            <button
-              type="button"
-              role="menuitem"
-              tabindex={documentContextFocusIndex === 0 ? 0 : -1}
-              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
-              on:focus={() => documentContextFocusIndex = 0}
-              on:click={() => void runDocumentContextAction('open')}
-            >Open</button>
-            <button
-              type="button"
-              role="menuitem"
-              tabindex={documentContextFocusIndex === 1 ? 0 : -1}
-              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
-              on:focus={() => documentContextFocusIndex = 1}
-              on:click={() => void runDocumentContextAction('rename')}
-            >Rename…</button>
-            <button
-              type="button"
-              role="menuitem"
-              tabindex={documentContextFocusIndex === 2 ? 0 : -1}
-              disabled={fileCommandInFlight || documentContextActionInFlight}
-              on:focus={() => documentContextFocusIndex = 2}
-              on:click={() => void runDocumentContextAction('export_text')}
-            >Export Text…</button>
-            {#if documentContextRevealLabel}
-              <button
-                type="button"
-                role="menuitem"
-                tabindex={documentContextFocusIndex === 3 ? 0 : -1}
-                disabled={fileCommandInFlight || documentContextActionInFlight}
-                on:focus={() => documentContextFocusIndex = 3}
-                on:click={() => void runDocumentContextAction('reveal')}
-              >{documentContextRevealLabel}</button>
-            {/if}
-            <button
-              class="document-delete-menu-item"
-              type="button"
-              role="menuitem"
-              tabindex={documentContextFocusIndex === documentDeleteMenuIndex(Boolean(documentContextRevealLabel)) ? 0 : -1}
-              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
-              on:focus={() => documentContextFocusIndex = documentDeleteMenuIndex(Boolean(documentContextRevealLabel))}
-              on:click={() => void runDocumentContextAction('delete')}
-            >Delete Manuscript…</button>
+            on:keydown={handleDocumentContextMenuKeydown} on:contextmenu|preventDefault={() => {}}>
+            {#each actions as capability, index (capability.action)}
+              {@const enabledIndex = actions.slice(0, index).filter(item => item.enabled).length}
+              <button type="button" role="menuitem" disabled={!capability.enabled}
+                class:document-delete-menu-item={capability.destructive}
+                tabindex={capability.enabled && documentContextFocusIndex === enabledIndex ? 0 : -1}
+                on:focus={() => documentContextFocusIndex = enabledIndex}
+                on:click={() => void runSidebarContextAction(capability)}>{capability.label}</button>
+            {/each}
           </div>
+          {/key}
         {/if}
       </aside>
 
@@ -10544,7 +10907,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={() => preparePaneRun(paneConfig.kind === 'chat')} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>

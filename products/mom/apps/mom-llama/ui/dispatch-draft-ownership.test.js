@@ -16,7 +16,9 @@ for (const switchAt of ["persistence", "dispatch"]) {
       const calls = [];
       const switchToB = () => { selected = "B"; textarea.value = "precious B"; };
       const context = {
-        document: { addEventListener: (_, handler) => { submit = handler; } },
+        document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null },
+        recipientMutation: Promise.resolve(),
+        activeDispatchStreamLeases: new Set(),
         autocompleteAccepting: false, cancelComposerAutocomplete() {},
         formValue: () => textarea.value, draftAttachmentIds: () => [],
         acquireChatBusy: () => "lease", releaseChatBusy() {},
@@ -48,3 +50,82 @@ for (const switchAt of ["persistence", "dispatch"]) {
     });
   }
 }
+
+test("an unresolved To entry cannot create or dispatch a conversation", async () => {
+  let submit;
+  let focused = false;
+  let invalid = false;
+  const context = {
+    document: {
+      addEventListener: (_, handler) => { submit = handler; },
+      getElementById: () => ({ value: "gab", focus: () => { focused = true; }, setAttribute: (key) => { invalid = key === "aria-invalid"; } }),
+    },
+    autocompleteAccepting: false,
+    filterRecipientOptions() {},
+    reportError(error) { throw error; },
+    invoke: () => { throw new Error("Unselected contact must not reach native dispatch"); },
+  };
+  vm.createContext(context);
+  const start = source.indexOf('  document.addEventListener("submit"');
+  const end = start + source.slice(start).indexOf('\n  });') + 7;
+  vm.runInContext(source.slice(start, end), context);
+  await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
+  assert.equal(focused, true);
+  assert.equal(invalid, true);
+});
+
+for (const outcome of ["blocked", "throw"]) {
+  test(`native ${outcome} without a terminal event releases only this dispatch's stream leases`, async () => {
+    let submit;
+    const leases = new Set();
+    const released = [];
+    const textarea = { value: "Hello" };
+    const context = {
+      document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null },
+      recipientMutation: Promise.resolve(), activeDispatchStreamLeases: leases,
+      autocompleteAccepting: false, cancelComposerAutocomplete() {},
+      formValue: () => textarea.value, draftAttachmentIds: () => [],
+      acquireChatBusy: () => "dispatch", releaseChatBusy: (lease) => released.push(lease),
+      selectedConversation: () => "A", selectedConversationKind: () => "chat",
+      formField: () => textarea, closeMentions() {}, appendLiveMessage() {}, sizeComposer() {},
+      report() {}, reportError(error) { assert.equal(error.message, "rejected"); },
+      releaseMentionInvocationBusy() {}, refreshChat: async () => {}, refreshConversationProjection: async () => {},
+      persistDraftNow: async () => {},
+      invoke: async () => {
+        leases.add("mention-request:failed:contact");
+        if (outcome === "throw") throw new Error("rejected");
+        return { status: "blocked" };
+      },
+    };
+    vm.createContext(context);
+    const start = source.indexOf('  document.addEventListener("submit"');
+    const end = start + source.slice(start).indexOf('\n  });') + 7;
+    vm.runInContext(`let activeDispatchConversation = null;\n${source.slice(start, end)}`, context);
+    await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
+    assert.deepEqual(released, ["mention-request:failed:contact", "dispatch"]);
+    assert.equal(leases.size, 0);
+    assert.equal(textarea.value, "Hello");
+  });
+}
+
+test("a send rejection remains visible while the user repairs or retries it", () => {
+  const classes = new Set(["is-hidden"]);
+  const timers = [];
+  const status = { classList: {
+    add: (c) => classes.add(c), remove: (c) => classes.delete(c),
+    toggle: (c, enabled) => enabled ? classes.add(c) : classes.delete(c),
+  } };
+  const context = {
+    document: { getElementById: () => status }, recordCommandResult() {},
+    window: { clearTimeout() {}, setTimeout: (callback) => { timers.push(callback); return timers.length; } },
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const report =");
+  const end = source.indexOf("\n  const reportError =", start);
+  vm.runInContext(`${source.slice(start, end)}\nthis.report = report;`, context);
+  context.report({ status: "blocked", blocker: { message: "The model rejected this request" } });
+  timers.forEach((timer) => timer());
+  assert.equal(status.textContent, "The model rejected this request");
+  assert.equal(classes.has("is-hidden"), false);
+  assert.equal(classes.has("blocked"), true);
+});

@@ -10,6 +10,7 @@
 </script>
 
 <script lang="ts">
+  import { compositionOwnsKey } from './textEditingInteractions';
   import { afterUpdate, onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import LoomEditor from './LoomEditor.svelte';
@@ -309,8 +310,8 @@
     return convertFileSrc(`v1-${project}-${session}-${summary.document_id}-${summary.revision_id}-${summary.active_blob_id}`, 'loom-preview');
   }
   function keydown(event: KeyboardEvent): void {
-    if (event.isComposing) return;
-    if (event.key === 'Enter' && ((event.metaKey || event.ctrlKey) || (config.kind === 'chat' && !event.shiftKey))) {
+    if (compositionOwnsKey(event, composing)) return;
+    if (!event.altKey && event.key === 'Enter' && ((event.metaKey || event.ctrlKey) || (config.kind === 'chat' && !event.shiftKey))) {
       event.preventDefault(); event.stopPropagation(); void submit();
     }
   }
@@ -374,7 +375,7 @@
   .composer-actions { display:flex; align-items:center; gap:5px; }
   .composer-actions button { min-height:26px; padding:2px 6px; }
   .send { margin-left:auto; width:28px; }
-  textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:7px 9px; resize:vertical; background:var(--paper-deep); color:inherit; font:inherit; border:1px solid var(--line-soft); border-radius:8px; }
+  textarea { width:100%; box-sizing:border-box; min-width:0; height:36px; min-height:28px; max-height:120px; padding:7px 9px; resize:vertical; background:var(--paper-deep); color:inherit; font:inherit; border:1px solid var(--line-soft); border-radius:8px; }
   button { min-height:30px; padding:4px 8px; cursor:pointer; }
   .error { color:var(--danger); font-size:.8rem; padding:4px 8px; }
   .empty { opacity:.65; }

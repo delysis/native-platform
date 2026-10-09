@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { compositionOwnsKey } from './textEditingInteractions';
   import { onMount } from 'svelte';
   import type { CompletionCandidate } from './completionSession';
   import { emptyLoompadChord, LOOMPAD_KEYS, loompadKey, loompadPrefix, loompadWordKey, type LoompadLength } from './loompad';
@@ -63,7 +64,7 @@
   function reset(): void { chord = emptyLoompadChord(); modifierHeld = false; }
   function keydown(event: KeyboardEvent): void {
     const target = event.target;
-    if (!focused || blocked || event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey ||
+    if (!focused || blocked || event.defaultPrevented || compositionOwnsKey(event) || event.metaKey || event.ctrlKey ||
         !(target instanceof Element) || !target.closest('.editor-stage') || target.closest('input,button,select')) return;
     if (event.key === 'Alt') { modifierHeld = true; return; }
     if (!event.altKey) return;

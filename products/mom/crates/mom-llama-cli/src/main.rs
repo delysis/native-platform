@@ -331,6 +331,34 @@ enum PersonaGroupCommand {
 
 #[derive(Debug, Subcommand)]
 enum MentionCommand {
+    History {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Sources {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SourceOpen {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        attachment: String,
+        #[arg(long)]
+        json: bool,
+    },
     Dispatch {
         #[arg(long)]
         conversation: String,
@@ -451,6 +479,24 @@ enum ConversationCommand {
     Siblings {
         #[arg(long)]
         conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
+    DraftOpen {
+        #[arg(long)]
+        persona: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    DraftRecipients {
+        #[arg(long = "recipient")]
+        recipient_ids: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    DraftSubmit {
         #[arg(long)]
         json: bool,
     },
@@ -1178,6 +1224,9 @@ fn run() -> Result<()> {
             }
         },
         Command::Mention { command } => match command {
+            MentionCommand::History { conversation, json } => {
+                print_result(mom_llama_runtime::mention_history(&conversation)?, json)
+            }
             MentionCommand::Dispatch {
                 conversation,
                 message,
@@ -1190,6 +1239,31 @@ fn run() -> Result<()> {
                         message,
                     },
                     ChatSendOptions::default(),
+                )?,
+                json,
+            ),
+            MentionCommand::Sources {
+                invocation,
+                target,
+                json,
+            } => print_result(
+                mom_llama_runtime::consult_sources(&invocation, &target)?,
+                json,
+            ),
+            MentionCommand::SourceOpen {
+                invocation,
+                target,
+                conversation,
+                message,
+                attachment,
+                json,
+            } => print_result(
+                mom_llama_runtime::consult_source_open(
+                    &invocation,
+                    &target,
+                    &conversation,
+                    &message,
+                    &attachment,
                 )?,
                 json,
             ),
@@ -1386,6 +1460,20 @@ fn run() -> Result<()> {
                 mom_llama_runtime::conversation_siblings(&conversation)?,
                 json,
             ),
+            ConversationCommand::DraftOpen { persona, json } => {
+                print_result(mom_llama_runtime::conversation_draft_open(persona)?, json)
+            }
+            ConversationCommand::DraftRecipients {
+                recipient_ids,
+                name,
+                json,
+            } => print_result(
+                mom_llama_runtime::conversation_draft_recipients_update(recipient_ids, name)?,
+                json,
+            ),
+            ConversationCommand::DraftSubmit { json } => {
+                print_result(mom_llama_runtime::conversation_draft_submit()?, json)
+            }
             ConversationCommand::DraftGet { conversation, json } => {
                 print_result(mom_llama_runtime::draft_get(conversation.as_deref())?, json)
             }
@@ -1710,7 +1798,11 @@ fn command_uses_native(command: &Command) -> bool {
         ),
         Command::Mention { command } => !matches!(
             command,
-            MentionCommand::Candidates { .. } | MentionCommand::ApprovalList { .. }
+            MentionCommand::Candidates { .. }
+                | MentionCommand::History { .. }
+                | MentionCommand::Sources { .. }
+                | MentionCommand::SourceOpen { .. }
+                | MentionCommand::ApprovalList { .. }
         ),
         Command::ToolLoop { command } => matches!(
             command,

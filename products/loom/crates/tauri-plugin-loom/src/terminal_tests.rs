@@ -77,6 +77,17 @@ impl TerminalFixture {
         presentation: Option<TerminalPresentation>,
         boundary: Option<TerminalTurnBoundary>,
     ) -> Result<TerminalRun, IpcFailure> {
+        self.run_with_context(id, expression, presentation, boundary, None)
+    }
+
+    fn run_with_context(
+        &self,
+        id: CommandId,
+        expression: &str,
+        presentation: Option<TerminalPresentation>,
+        boundary: Option<TerminalTurnBoundary>,
+        context: Option<Vec<String>>,
+    ) -> Result<TerminalRun, IpcFailure> {
         tauri::async_runtime::block_on(terminal_run(
             self.project_id.clone(),
             self.session_id.clone(),
@@ -88,7 +99,7 @@ impl TerminalFixture {
             0,
             expression.into(),
             presentation,
-            None,
+            context,
             boundary,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
@@ -785,4 +796,451 @@ fn chat_turn_boundary_binds_sampling_and_command_replay() {
         )
         .expect_err("chat boundaries cannot silently change function expressions");
     assert!(invalid.message.contains("plain prompt"));
+}
+
+#[test]
+fn ordinary_chat_capability_requires_a_loom_writer_before_retaining_a_run() {
+    let fixture = TerminalFixture::new();
+    assert_eq!(
+        crate::WorkspaceChatRoute::default(),
+        crate::WorkspaceChatRoute::Loom
+    );
+    assert_eq!(
+        crate::workspace_chat::workspace_chat_route(fixture.app.handle().clone()),
+        crate::WorkspaceChatRoute::Loom
+    );
+    assert_eq!(
+        serde_json::to_string(&crate::WorkspaceChatRoute::Loom).unwrap(),
+        "\"loom\""
+    );
+    let id = CommandId::new();
+    let error = fixture
+        .run_with_context(
+            id,
+            "User: Previous question\nAssistant: Retained answer\n\nUser: Continue\nAssistant:",
+            Some(TerminalPresentation {
+                pane_id: "chat".into(),
+                input: "Continue".into(),
+            }),
+            Some(TerminalTurnBoundary::Chat),
+            Some(vec![]),
+        )
+        .expect_err("pane kind alone cannot exempt ordinary chat from model admission");
+    assert_eq!(error.code, "model_not_loaded");
+    assert!(fixture.list().is_empty());
+    assert!(
+        read_receipt(&fixture.root(), &id.to_string(), false)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Exercises the real command, store, receipt and route selection with injected
+/// model metadata/executor. There is deliberately NO loaded native engine.
+/// These are admission/retention checks, not native writer or shared-owner acceptance.
+#[test]
+fn ordinary_chat_retains_pre_mom_history_edits_and_loom_model_in_both_ab_directions() {
+    for (loom_model, mom_model) in [
+        ("component-A", "component-B"),
+        ("component-B", "component-A"),
+    ] {
+        let fixture = TerminalFixture::new();
+        let legacy_id = CommandId::new();
+        fixture
+            .run_with_presentation(
+                legacy_id,
+                "=\"Original pre-Mom answer\"",
+                Some(TerminalPresentation {
+                    pane_id: "chat".into(),
+                    input: "Pre-Mom question".into(),
+                }),
+            )
+            .expect("create pre-Mom retained history, without a chat executor");
+        let legacy = fixture.wait(legacy_id);
+        assert_eq!(legacy.status, "completed");
+        let legacy_receipt =
+            crate::terminal_receipts::read(&fixture.root(), &legacy_id.to_string(), true)
+                .unwrap()
+                .expect("immutable pre-Mom receipt");
+        let (old, edited) = fixture.with_store(|store| {
+            let path = legacy.output_relative_path.as_deref().unwrap();
+            let old = store.read_document(path).unwrap();
+            store
+                .save_document(
+                    path,
+                    DocumentContent::Prose("Edited retained answer α".into()),
+                    "author edit",
+                )
+                .unwrap();
+            (old, store.read_document(path).unwrap())
+        });
+        assert_eq!(old.document_id, edited.document_id);
+        assert_ne!(old.revision_id, edited.revision_id);
+        assert_ne!(old.blob_id, edited.blob_id);
+
+        // Holding a Mom executor/profile is not an installation capability.
+        // This models the normal root retaining Mom without opting the pane in.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _retained_mom: crate::WorkspaceChatService<tauri::test::MockRuntime> =
+            crate::WorkspaceChatService::new(Arc::new(ParityMomExecutor {
+                model: mom_model.into(),
+                calls: calls.clone(),
+            }));
+        let state = fixture.app.state::<PluginState>();
+        *state.model.lock().unwrap() =
+            ModelRegistry::Loaded(Box::new(crate::tests::test_loaded_model(
+                &fixture.directory.path().join("not-a-native-model.gguf"),
+                loom_model,
+            )));
+        let expression = format!(
+            "User: Pre-Mom question\nAssistant: {}\n\nUser: Continue\nAssistant:",
+            edited.text
+        );
+        let id = CommandId::new();
+        fixture
+            .run_with_context(
+                id,
+                &expression,
+                Some(TerminalPresentation {
+                    pane_id: "chat".into(),
+                    input: "Continue".into(),
+                }),
+                Some(TerminalTurnBoundary::Chat),
+                Some(vec![]),
+            )
+            .expect("admit against the selected Loom descriptor");
+        let receipt = read_receipt(&fixture.root(), &id.to_string(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.run.expression, expression);
+        assert_eq!(receipt.model.as_ref().unwrap().stable_model_id, loom_model);
+        assert!(receipt.workspace_chat.is_none());
+        // The deliberately absent engine must not produce a success witness.
+        assert_eq!(fixture.wait(id).status, "failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            crate::terminal_receipts::read(&fixture.root(), &legacy_id.to_string(), true)
+                .unwrap()
+                .unwrap(),
+            legacy_receipt
+        );
+        fixture.with_store(|store| {
+            assert_eq!(
+                store
+                    .read_document(legacy.output_relative_path.as_deref().unwrap())
+                    .unwrap()
+                    .revision_id,
+                edited.revision_id
+            );
+            assert_eq!(store.read_blob(old.blob_id).unwrap(), old.text.as_bytes());
+        });
+        // No native slot was loaded: retire the injected registry before drop.
+        *state.model.lock().unwrap() = ModelRegistry::Empty;
+    }
+}
+
+struct ParityMomExecutor {
+    model: String,
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::WorkspaceChatExecutor<tauri::test::MockRuntime> for ParityMomExecutor {
+    fn dispatch(
+        &self,
+        _app: AppHandle<tauri::test::MockRuntime>,
+        request: crate::WorkspaceChatRequest,
+        _cancelled: Arc<AtomicBool>,
+    ) -> crate::WorkspaceChatFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let model = self.model.clone();
+        Box::pin(async move {
+            assert_eq!(request.message, "Continue");
+            Ok(crate::WorkspaceChatOutput {
+                conversation_id: "component-only-mom".into(),
+                text: "Component reply, not native inference".into(),
+                receipt: serde_json::json!({"model_id": model, "fake_fixture": true}),
+            })
+        })
+    }
+}
+
+#[test]
+fn explicit_mom_chat_keeps_its_profile_despite_a_different_loom_writer() {
+    for (loom_model, mom_model) in [
+        ("component-A", "component-B"),
+        ("component-B", "component-A"),
+    ] {
+        let fixture = TerminalFixture::new();
+        let state = fixture.app.state::<PluginState>();
+        *state.model.lock().unwrap() =
+            ModelRegistry::Loaded(Box::new(crate::tests::test_loaded_model(
+                &fixture.directory.path().join("not-a-native-model.gguf"),
+                loom_model,
+            )));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            fixture
+                .app
+                .manage(crate::WorkspaceChatService::new(Arc::new(
+                    ParityMomExecutor {
+                        model: mom_model.into(),
+                        calls: calls.clone(),
+                    }
+                )))
+        );
+        assert_eq!(
+            crate::workspace_chat::workspace_chat_route(fixture.app.handle().clone()),
+            crate::WorkspaceChatRoute::MomExperimental
+        );
+        assert_eq!(
+            serde_json::to_string(&crate::WorkspaceChatRoute::MomExperimental).unwrap(),
+            "\"mom_experimental\""
+        );
+        let id = CommandId::new();
+        fixture
+            .run_with_context(
+                id,
+                "Explicit experimental route; not ordinary history reconciliation",
+                Some(TerminalPresentation {
+                    pane_id: "chat".into(),
+                    input: "Continue".into(),
+                }),
+                Some(TerminalTurnBoundary::Chat),
+                Some(vec![]),
+            )
+            .expect("explicit native executor owns its model profile");
+        assert_eq!(fixture.wait(id).status, "completed");
+        let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+            .unwrap()
+            .unwrap();
+        assert!(receipt.model.is_none());
+        assert_eq!(
+            receipt.workspace_chat.unwrap().receipt["model_id"],
+            mom_model
+        );
+        assert_eq!(
+            loaded_model(&state).unwrap().descriptor.stable_model_id,
+            loom_model
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        *state.model.lock().unwrap() = ModelRegistry::Empty;
+    }
+}
+
+#[test]
+fn workspace_chat_retains_a_real_document_and_replays_without_dispatching_again() {
+    struct Executor(Arc<AtomicUsize>);
+    impl crate::WorkspaceChatExecutor<tauri::test::MockRuntime> for Executor {
+        fn dispatch(
+            &self,
+            _app: AppHandle<tauri::test::MockRuntime>,
+            request: crate::WorkspaceChatRequest,
+            _cancelled: Arc<AtomicBool>,
+        ) -> crate::WorkspaceChatFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                assert_eq!(request.pane_id, "chat");
+                assert_eq!(request.message, "@mom Original human input");
+                assert_eq!(request.context.len(), 1);
+                let context: serde_json::Value =
+                    serde_json::from_str(&request.context[0]).expect("text snapshot");
+                assert_eq!(context["reference"], "Draft.md");
+                assert_eq!(
+                    context["text"],
+                    "The first idea is α. @Unresolved stays literal.\n"
+                );
+                Ok(crate::WorkspaceChatOutput {
+                    conversation_id: "component-only-conversation".into(),
+                    text: "Component fixture response α\n".into(),
+                    receipt: serde_json::json!({"fake_fixture": true}),
+                })
+            })
+        }
+    }
+    let fixture = TerminalFixture::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        fixture
+            .app
+            .manage(crate::WorkspaceChatService::new(Arc::new(Executor(
+                calls.clone()
+            ))))
+    );
+    let id = CommandId::new();
+    let presentation = Some(TerminalPresentation {
+        pane_id: "chat".into(),
+        input: "@mom Original human input".into(),
+    });
+    fixture
+        .run_with_context(
+            id,
+            "An obsolete flat transcript is never executed",
+            presentation.clone(),
+            Some(TerminalTurnBoundary::Chat),
+            Some(vec!["Draft.md".into()]),
+        )
+        .expect("admit chat without a Loom model");
+    let run = fixture.wait(id);
+    assert_eq!(run.status, "completed");
+    assert!(run.output_document_id.is_some());
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .expect("receipt")
+        .expect("committed receipt");
+    assert!(receipt.model.is_none());
+    assert_eq!(
+        receipt
+            .workspace_chat
+            .as_ref()
+            .expect("native metadata")
+            .conversation_id,
+        "component-only-conversation"
+    );
+    fixture.with_store(|store| {
+        let output = store
+            .read_document(
+                run.output_relative_path
+                    .as_ref()
+                    .expect("ordinary Markdown path"),
+            )
+            .expect("output document");
+        assert_eq!(output.text, "Component fixture response α\n");
+        assert_eq!(
+            store.read_document("Draft.md").expect("source").text,
+            fixture.source.text
+        );
+    });
+    let replay = fixture
+        .run_with_context(
+            id,
+            "An obsolete flat transcript is never executed",
+            presentation,
+            Some(TerminalTurnBoundary::Chat),
+            Some(vec!["Draft.md".into()]),
+        )
+        .expect("replay");
+    assert_eq!(replay.output_document_id, run.output_document_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn workspace_chat_retained_links_are_context_not_participant_labels() {
+    let hash = "0123456789abcdef".repeat(4);
+    let material = format!("material-{hash}");
+    let link = format!("[@mom](loom-material:{material})");
+    let input = format!("@mom Read {link} and [@notes](loom-evidence:{hash}).");
+    let configured = vec!["Draft.md".to_owned(), material.clone()];
+    assert_eq!(
+        workspace_chat_reference_names(&input, Some(&configured)).unwrap(),
+        BTreeSet::from(["Draft.md".into(), material, format!("evidence/{hash}")])
+    );
+    assert!(
+        workspace_chat_reference_names(&format!("@mom `{link}`\n> {link}"), Some(&[]))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn workspace_chat_missing_retained_source_blocks_before_dispatch() {
+    struct MustNotDispatch(Arc<AtomicUsize>);
+    impl crate::WorkspaceChatExecutor<tauri::test::MockRuntime> for MustNotDispatch {
+        fn dispatch(
+            &self,
+            _app: AppHandle<tauri::test::MockRuntime>,
+            _request: crate::WorkspaceChatRequest,
+            _cancelled: Arc<AtomicBool>,
+        ) -> crate::WorkspaceChatFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("missing source reached dispatch".into()) })
+        }
+    }
+    let fixture = TerminalFixture::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        fixture
+            .app
+            .manage(crate::WorkspaceChatService::new(Arc::new(MustNotDispatch(
+                calls.clone()
+            ))))
+    );
+    let input = format!("Read [@source](loom-material:material-{})", "a".repeat(64));
+    fixture
+        .run_with_context(
+            CommandId::new(),
+            &input,
+            Some(TerminalPresentation {
+                pane_id: "chat".into(),
+                input: input.clone(),
+            }),
+            Some(TerminalTurnBoundary::Chat),
+            Some(Vec::new()),
+        )
+        .expect_err("a missing retained source must not be silently omitted");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        fixture.list().is_empty(),
+        "no admitted turn or cleared draft"
+    );
+}
+
+#[test]
+fn workspace_chat_retained_text_link_reaches_executor_as_exact_context() {
+    struct Executor {
+        reference: String,
+        text: String,
+        calls: Arc<AtomicUsize>,
+    }
+    impl crate::WorkspaceChatExecutor<tauri::test::MockRuntime> for Executor {
+        fn dispatch(
+            &self,
+            _app: AppHandle<tauri::test::MockRuntime>,
+            request: crate::WorkspaceChatRequest,
+            _cancelled: Arc<AtomicBool>,
+        ) -> crate::WorkspaceChatFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reference = self.reference.clone();
+            let text = self.text.clone();
+            Box::pin(async move {
+                assert_eq!(request.context.len(), 1);
+                let context: serde_json::Value =
+                    serde_json::from_str(&request.context[0]).expect("text snapshot");
+                assert_eq!(context["reference"], reference);
+                assert_eq!(context["text"], text);
+                Ok(crate::WorkspaceChatOutput {
+                    conversation_id: "component-only-retained-source".into(),
+                    text: "Component fixture response".into(),
+                    receipt: serde_json::json!({"fake_fixture": true}),
+                })
+            })
+        }
+    }
+    let fixture = TerminalFixture::new();
+    let text = "Only this retained source says violet. @Missing stays literal.\n";
+    let material = imported_source(&fixture, text);
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        fixture
+            .app
+            .manage(crate::WorkspaceChatService::new(Arc::new(Executor {
+                reference: material.id.clone(),
+                text: text.into(),
+                calls: calls.clone(),
+            })))
+    );
+    let input = format!("@mom Read [@friendly-label](loom-material:{})", material.id);
+    let id = CommandId::new();
+    fixture
+        .run_with_context(
+            id,
+            &input,
+            Some(TerminalPresentation {
+                pane_id: "chat".into(),
+                input: input.clone(),
+            }),
+            Some(TerminalTurnBoundary::Chat),
+            Some(Vec::new()),
+        )
+        .expect("admit exact retained text without a loaded model");
+    assert_eq!(fixture.wait(id).status, "completed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

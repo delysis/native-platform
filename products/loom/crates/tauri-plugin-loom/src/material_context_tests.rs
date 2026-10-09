@@ -290,3 +290,36 @@ fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     assert_eq!(retrieval.query, "nightjar");
     assert!(retrieval.hits.is_empty());
 }
+
+#[test]
+fn renaming_display_metadata_preserves_retained_consult_and_full_id_markdown() {
+    let (_directory, store) = project();
+    let original = attachment(&store, "Old display name", "Original café 🦉 evidence");
+    let snapshot = resolve(&store, &original.id).unwrap();
+    let exact_before = exact(&snapshot).unwrap();
+    let retained = consult(&store, &snapshot, "Original").unwrap();
+    let retained_before = exact(&retained).unwrap();
+    let entry = materials::observed_entry(&store, &original.id).unwrap();
+    materials::change_metadata(
+        &store,
+        &entry.id,
+        entry.metadata_revision.as_deref().unwrap(),
+        materials::MetadataChange::Rename("New display name"),
+    )
+    .unwrap();
+    attachment(&store, "Old display name", "Unrelated name reuse");
+    let Value::Material { material: frozen } = &snapshot else {
+        panic!("material snapshot")
+    };
+    require_current_media_source(&store, frozen).unwrap();
+    assert_eq!(exact(&snapshot).unwrap(), exact_before);
+    assert_eq!(exact(&retained).unwrap(), retained_before);
+    assert_eq!(
+        exact(&consult(&store, &snapshot, "Original").unwrap()).unwrap(),
+        retained_before
+    );
+    let old_link = format!("[@Old display name](loom-material:{})", original.id);
+    let plan = markdown_plan(&store, &old_link, "Original").unwrap();
+    assert!(plan.text.contains("Original café 🦉 evidence"));
+    assert!(!plan.text.contains("Unrelated name reuse"));
+}

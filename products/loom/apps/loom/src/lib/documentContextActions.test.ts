@@ -8,7 +8,6 @@ import {
   capturedDocumentIdentityIsCurrent,
   clampDocumentMenuPoint,
   createDocumentRenameCompositionGuard,
-  documentDeleteMenuIndex,
   documentMenuKeyAction,
   documentRevealLabel,
   isDocumentContextTriggerKey,
@@ -227,10 +226,6 @@ describe('captured document context target', () => {
     });
   });
 
-  it('keeps delete last when the optional reveal action is present', () => {
-    expect(documentDeleteMenuIndex(false)).toBe(3);
-    expect(documentDeleteMenuIndex(true)).toBe(4);
-  });
 });
 
 describe('document title byte contract', () => {

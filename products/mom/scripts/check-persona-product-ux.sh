@@ -50,7 +50,8 @@ jq -e '
 cargo run -q -p mom-llama-app -- --dump-html > "$acceptance_dir/app.html"
 rg -q 'data-persona-menu-target="true" data-persona="persona-judith_herman"' \
   "$acceptance_dir/app.html"
-rg -q 'data-action="persona-menu-open"' "$acceptance_dir/app.html"
+rg -q 'data-persona-menu-target="true"' "$acceptance_dir/app.html"
+rg -q 'await Menu.new({ items })' apps/mom-llama/ui/coop-hx.js
 rg -q 'id="persona-context-menu"' "$acceptance_dir/app.html"
 test "$(rg -o 'role="menuitem"' "$acceptance_dir/app.html" | wc -l | tr -d ' ')" = "3"
 for action in persona-menu-start persona-menu-edit persona-menu-removal-preview; do

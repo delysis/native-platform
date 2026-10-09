@@ -143,6 +143,7 @@ fn attributed_history_fixture(id: &str) -> Conversation {
         source_message_id: None,
         branch_root_message_id: None,
         active_leaf_message_id: Some("5-host-answer".to_string()),
+        recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: vec![
             message("1-user", None, MessageRole::User, "Ask both", None),
@@ -1662,6 +1663,7 @@ fn system_and_tool_messages_reject_edits_without_mutating_the_conversation() -> 
         source_message_id: None,
         branch_root_message_id: None,
         active_leaf_message_id: Some(tool.id.clone()),
+        recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: vec![system.clone(), tool.clone()],
     };

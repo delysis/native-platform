@@ -21,6 +21,52 @@ Before tagging a stable release, use that candidate to exercise an active local
 operation and the applicable backup/restore rollback. These are product checks,
 not fields to rubber-stamp in a manifest.
 
+## Keychain review
+
+Use a consistent Apple Development or Developer ID signing identity for local
+Keychain review. Candidate packaging already accepts this identity:
+
+```sh
+export DELYSIS_SIGNING_IDENTITY='Apple Development: Your Name (TEAMID)'
+scripts/release-macos.sh mom candidate
+```
+
+Ad hoc signatures bind authorization to one executable version; rebuilding
+changes that identity. They do not qualify prompt counts across builds. Preserve
+the same data directory and signing identity when testing first access, reopen
+and a subsequent build. Do not replace credentials or relax access controls to
+suppress prompts. Apple describes this identity behavior in
+[TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+### Existing ad hoc Mom credential
+
+If an existing Mom item was created by an ad hoc build, its partition can remain
+bound to the old code hash after moving to a signed app. macOS then asks for
+both ordinary item authorization and partition authorization. Inspect the
+`securityd` ACL/partition diagnostic first; a fresh-store reset is not a repair.
+
+For that confirmed case, repair only the existing credential's signer partition:
+
+```sh
+scripts/repair-mom-keychain.sh /absolute/path/to/Mom\ Llama.app /exact/data/directory --check
+scripts/repair-mom-keychain.sh /absolute/path/to/Mom\ Llama.app /exact/data/directory
+```
+
+The script validates the bundle identity and stable TeamIdentifier, hashes the
+exact data-directory spelling used by the runtime, and addresses one generic
+password item by service and account in the default user keychain. It changes
+only that item's partition guard to the app's team identity. Its trusted-app
+ACL remains in force; other apps still need ordinary item authorization. It
+never retrieves or replaces key bytes, deletes credentials, changes the login
+keychain password, or updates other items. Apple requests the Keychain password
+interactively; do not supply it through arguments, environment variables or a
+file. See Apple's
+[security tool manual](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/security.1).
+
+After repair, check the original encrypted store with the signed app and count
+actual dialogs. The remaining ordinary authorization should require at most
+one dialog; verify this before claiming acceptance.
+
 ## Stable package
 
 Stable packaging requires an exact annotated component tag at `HEAD`:

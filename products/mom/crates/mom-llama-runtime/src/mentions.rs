@@ -1,4 +1,10 @@
-use crate::attachments::{commit_generated_exchange_with_journal, prepare_chat_attachments};
+use crate::attachments::{StaleConsultSource, commit_generated_exchange_with_journal};
+mod execution;
+mod handoff;
+mod sources;
+pub use sources::{ConsultSourcePreview, consult_source_open, consult_sources};
+mod target_resolution;
+use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{
     ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, native_context_messages,
 };
@@ -6,7 +12,7 @@ use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
     ConversationKind, Message, MessageAttribution, MessageRole, MessageSpeakerKind, active_leaf_id,
-    active_path_messages, load_db, strip_reserved_attribution_prefix, upsert_conversation,
+    load_db, strip_reserved_attribution_prefix, upsert_conversation,
 };
 use crate::kv_cache::ensure_persona_prefix;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -31,9 +37,9 @@ use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use crate::tool_loop::{ToolPermissionPolicy, tool_permission_policy, validate_tool_arguments};
 use anyhow::{Result, anyhow};
-use crossbeam_channel::TryRecvError;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use fs2::FileExt;
+use handoff::handoff_messages;
 use llama_native_engine::{ControlledGenerationSubmission, NativeModelHandle};
 use llama_native_types::{
     BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, ConstraintArtifactReference,
@@ -620,6 +626,42 @@ fn resume_lease_is_live_for_recovery(
     Ok(false)
 }
 
+fn failed_target_message(results: &[MentionTargetResult]) -> String {
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|result| result.state == GenerationState::Failed && !result.text.trim().is_empty())
+        .map(|result| format!("@{}: {}", result.handle, result.text.trim()))
+        .collect();
+    if failures.is_empty() {
+        "None of the invited local models completed a response.".to_string()
+    } else {
+        failures.join("\n")
+    }
+}
+
+/// Read retained consultation attempts without changing drafts or retrying work.
+pub fn mention_history(conversation_id: &str) -> Result<CommandResult<Vec<MentionInvocation>>> {
+    let journal: MentionInvocationDb = RuntimeStore::current()?
+        .get(INVOCATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let invocations = journal
+        .invocations
+        .into_iter()
+        .filter(|stored| stored.host_conversation_id == conversation_id)
+        .take(8)
+        .map(|stored| stored.invocation)
+        .collect();
+    Ok(CommandResult::passed(
+        "mom_llama.mention_history",
+        "contracted",
+        invocations,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
 pub fn mention_candidates(
     query: &str,
     current_conversation_id: Option<&str>,
@@ -728,6 +770,8 @@ pub fn chat_dispatch_stream_in_scope<F>(
 where
     F: FnMut(ChatDispatchStreamEvent) -> Result<()>,
 {
+    // Parse before creating/instantiating any conversation or admitting work.
+    let handles = parse_handles(&input.message)?;
     let (_, selected) =
         crate::conversation_store::get_or_create_conversation(&input.conversation_id)?;
     if selected.kind == ConversationKind::PersonaTemplate {
@@ -747,8 +791,30 @@ where
         };
         input.conversation_id = conversation.id;
     }
-    let handles = parse_handles(&input.message);
-    let resolution = resolve_targets(&handles, &input.conversation_id)?;
+    let mut resolution = resolve_targets(&handles, &input.conversation_id)?;
+    if !selected.recipient_ids.is_empty() {
+        let contacts = crate::conversation_store::load_db()?.conversations;
+        let recipients = match resolve_recipient_targets(&selected.recipient_ids, &contacts) {
+            Ok(recipients) => recipients,
+            Err(blocker) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.chat_dispatch",
+                    "blocked_recipient",
+                    blocker,
+                ));
+            }
+        };
+        let mut targets = recipients;
+        for target in resolution.targets {
+            if !targets
+                .iter()
+                .any(|recipient| recipient.conversation.id == target.conversation.id)
+            {
+                targets.push(target);
+            }
+        }
+        resolution.targets = targets;
+    }
     if let Some(blocker) = ambiguous_resolution_blocker(&resolution) {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_dispatch",
@@ -3012,18 +3078,21 @@ where
             ),
         ));
     };
-    let host_snapshot = active_path_messages(&db.conversations[host_index]);
-    let attachment_context =
-        match prepare_chat_attachments(&input.conversation_id, &host_snapshot, None)? {
-            Ok(context) => context,
-            Err(blocked) => {
-                return Ok(CommandResult::blocked(
-                    "mom_llama.chat_dispatch",
-                    &blocked.readiness,
-                    blocked.blocker,
-                ));
-            }
-        };
+    let host_snapshot = crate::document::checked_active_messages(&db.conversations[host_index])?;
+    let attachment_context = match prepare_scoped_chat_attachments(
+        &input.conversation_id,
+        &host_snapshot,
+        CurrentAttachmentSelection::Draft,
+    )? {
+        Ok(context) => context,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.chat_dispatch",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
     if attachment_context
         .draft_snapshot
         .as_ref()
@@ -3036,17 +3105,6 @@ where
                 "draft_changed_before_send",
                 "The saved draft changed before this exact Persona message could be admitted.",
                 vec!["Refresh the composer and send the current draft.".to_string()],
-            ),
-        ));
-    }
-    if !attachment_context.media.is_empty() {
-        return Ok(CommandResult::blocked(
-            "mom_llama.chat_dispatch",
-            "stub_blocked",
-            Blocker::new(
-                "mention_multimodal_attachment_unsupported",
-                "Image and audio attachments are not yet accepted by the shared-prefix mention dispatcher.",
-                vec!["Send the attachment to one chat directly, or remove it before invoking Personas.".to_string()],
             ),
         ));
     }
@@ -3177,6 +3235,7 @@ where
             &attachment_context.staged_ids,
             &user_message_id,
             attachment_context.draft_snapshot.as_ref(),
+            &[],
             INVOCATIONS_NAMESPACE,
             MentionInvocationDb::default,
             |invocations| {
@@ -3199,7 +3258,7 @@ where
     }
 
     let addressed = append_attachment_context(
-        &strip_handles(&input.message, &targets),
+        &strip_handles(&input.message, &targets)?,
         &attachment_context.current_text,
     );
     let participant_names = targets
@@ -3208,6 +3267,7 @@ where
         .collect::<Vec<_>>()
         .join(", ");
     let mut planned = Vec::new();
+    let mut selected_sources = Vec::new();
     for (order, target) in targets.iter().enumerate() {
         let snapshot = &snapshots[order];
         let model_path = snapshot
@@ -3250,7 +3310,7 @@ where
                 continue;
             }
         };
-        let tools = match resolve_mention_tools(&snapshot.profile.tool_bindings) {
+        let tools = match resolve_mention_tools(&[]) {
             Ok(tools) => tools,
             Err(blocker) => {
                 invocation.results.push(blocked_target_result(
@@ -3266,6 +3326,9 @@ where
             &settings,
             snapshot,
             &host_snapshot,
+            &attachment_context,
+            &input.conversation_id,
+            &user_message_id,
             &addressed,
             &participant_names,
             &tools,
@@ -3280,16 +3343,30 @@ where
                 continue;
             }
         };
-        let cache_use = match snapshot.profile.chat_template {
-            crate::conversation_store::ChatTemplatePolicy::ModelDefault => ensure_persona_prefix(
-                &handle,
-                &cache_owner(snapshot),
-                &format!("Invited context for @{}", snapshot.handle),
-                &handoff.stable_prefix,
-                &handoff.messages,
-            )?,
-            crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
+        let cache_use = if handoff.media.is_empty() {
+            match snapshot.profile.chat_template {
+                crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
+                    ensure_persona_prefix(
+                        &handle,
+                        &cache_owner(snapshot),
+                        &format!("Invited context for @{}", snapshot.handle),
+                        &handoff.stable_prefix,
+                        &handoff.messages,
+                    )?
+                }
+                crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
+            }
+        } else {
+            None
         };
+        handoff::retain_input_receipt(
+            &settings.data_dir,
+            &invocation_id,
+            &input.conversation_id,
+            &user_message_id,
+            &handoff.receipt,
+        )?;
+        selected_sources.extend(handoff.receipt.attachment_sources.iter().cloned());
         planned.push(PlannedTarget {
             snapshot: snapshot.clone(),
             model_path: model_path.to_path_buf(),
@@ -3297,152 +3374,19 @@ where
             handle,
             messages: handoff.messages,
             cache_id: cache_use.as_ref().map(|cache| cache.cache_id.clone()),
-            cache_reused: cache_use.as_ref().is_some_and(|cache| cache.reused),
+            media: handoff.media,
+            model_fingerprint: handoff.receipt.model_fingerprint,
+            text_prompt_tokens: handoff.text_prompt_tokens,
             cached_prefix: cache_use.map(|cache| cache.sequence),
             tools,
         });
     }
 
-    let mut groups = BTreeMap::<String, Vec<PlannedTarget>>::new();
-    for target in planned {
-        let template_hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&target.snapshot.profile.chat_template)?)
-        );
-        let key = format!(
-            "{}|{}|{}",
-            target.model_path.display(),
-            target
-                .snapshot
-                .profile
-                .mmproj_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            template_hash
-        );
-        groups.entry(key).or_default().push(target);
-    }
-    let mut tickets = Vec::new();
     let mut pending_continuations = Vec::new();
-    for targets in groups.into_values() {
-        for target in &targets {
-            emit(
-                on_event,
-                MentionStreamEvent {
-                    schema: "mom_llama.mention_stream_event.v1".to_string(),
-                    invocation_id: invocation_id.clone(),
-                    target_id: target.snapshot.target_id.clone(),
-                    handle: target.snapshot.handle.clone(),
-                    label: target.snapshot.label.clone(),
-                    event: "started".to_string(),
-                    delta: None,
-                    state: Some(GenerationState::Queued),
-                    real_engine_invoked: false,
-                    fake_fixture: false,
-                },
-            )?;
-        }
-        let handle = targets[0].handle.clone();
-        let status = handle.status();
-        let branches = targets
-            .iter()
-            .map(|target| BranchRequest {
-                branch_id: target.snapshot.target_id.clone(),
-                label: target.snapshot.label.clone(),
-                instruction: String::new(),
-                sampling: target
-                    .snapshot
-                    .profile
-                    .sampling
-                    .clone()
-                    .unwrap_or_else(|| settings.sampling_config()),
-                messages: target.messages.clone(),
-                cached_prefix: target.cached_prefix.clone(),
-            })
-            .collect();
-        let ticket = handle
-            .generate_shared_prefix(SharedPrefixBatchRequest {
-                request_id: invocation_id.clone(),
-                model_id: status.model_id,
-                common_messages: Vec::new(),
-                chat_template: match &targets[0].snapshot.profile.chat_template {
-                    crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
-                        ChatTemplateChoice::ModelDefault
-                    }
-                    crate::conversation_store::ChatTemplatePolicy::FrozenSource(template) => {
-                        ChatTemplateChoice::Override(template.clone())
-                    }
-                },
-                branches,
-                cached_prefix: None,
-            })
-            .map_err(|error| anyhow!(error))?;
-        tickets.push((ticket, targets));
-    }
-    let started = Instant::now();
-    let timeout = Duration::from_secs_f64(options.timeout_s.max(0.001));
-    let mut disconnected = vec![false; tickets.len()];
-    while disconnected.iter().any(|done| !done) {
-        if started.elapsed() >= timeout {
-            for (ticket, _) in &tickets {
-                ticket.cancel_all();
-            }
-        }
-        let mut progress = false;
-        for (index, (ticket, targets)) in tickets.iter().enumerate() {
-            if disconnected[index] {
-                continue;
-            }
-            loop {
-                match ticket.events.try_recv() {
-                    Ok(event) => {
-                        progress = true;
-                        let target = targets
-                            .iter()
-                            .find(|target| target.snapshot.target_id == event.branch_id);
-                        if let Some(target) = target {
-                            let (name, delta, state) = match event.event {
-                                GenerationEventKind::Delta { text } => ("delta", Some(text), None),
-                                GenerationEventKind::State { state } => {
-                                    ("state", None, Some(state))
-                                }
-                                GenerationEventKind::Warning { message, .. } => {
-                                    ("warning", Some(message), None)
-                                }
-                            };
-                            emit(
-                                on_event,
-                                MentionStreamEvent {
-                                    schema: "mom_llama.mention_stream_event.v1".to_string(),
-                                    invocation_id: invocation_id.clone(),
-                                    target_id: target.snapshot.target_id.clone(),
-                                    handle: target.snapshot.handle.clone(),
-                                    label: target.snapshot.label.clone(),
-                                    event: name.to_string(),
-                                    delta,
-                                    state,
-                                    real_engine_invoked: name == "delta"
-                                        || state == Some(GenerationState::Completed),
-                                    fake_fixture: false,
-                                },
-                            )?;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected[index] = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !progress {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    for (ticket, targets) in tickets {
-        match ticket.wait() {
+    let completions =
+        execution::execute_groups(scope, &invocation_id, planned, &settings, options, on_event)?;
+    for (outcome, targets) in completions {
+        match outcome {
             Ok(outputs) => {
                 for output in outputs {
                     if let Some(target) = targets
@@ -3497,17 +3441,33 @@ where
                         } else {
                             (output, Vec::new())
                         };
+                        let cancelled = execution::terminal_cancelled(
+                            scope,
+                            &invocation_id,
+                            &target.snapshot.target_id,
+                        )?;
+                        let cache_reused = execution::cache_was_reused(&output.metrics.cache);
+                        // Retained native output remains immutable; cancellation only
+                        // removes its authority to become a new conversation message.
                         invocation.results.push(MentionTargetResult {
                             target_id: target.snapshot.target_id.clone(),
                             handle: target.snapshot.handle.clone(),
                             label: target.snapshot.label.clone(),
-                            state: output.state,
-                            text: strip_reserved_attribution_prefix(&output.text),
+                            state: if cancelled {
+                                GenerationState::Cancelled
+                            } else {
+                                output.state
+                            },
+                            text: if cancelled {
+                                String::new()
+                            } else {
+                                strip_reserved_attribution_prefix(&output.text)
+                            },
                             model_id: output.model_id,
                             message_id: None,
                             metrics: output.metrics,
                             cache_id: target.cache_id.clone(),
-                            cache_reused: target.cache_reused,
+                            cache_reused,
                             tool_receipt_ids,
                             real_engine_invoked: output.real_engine_invoked,
                             fake_fixture: output.fake_fixture,
@@ -3519,7 +3479,11 @@ where
                 for target in targets {
                     invocation.results.push(blocked_target_result(
                         &target.snapshot,
-                        GenerationState::Failed,
+                        if error.code == llama_native_types::NativeErrorCode::Cancelled {
+                            GenerationState::Cancelled
+                        } else {
+                            GenerationState::Failed
+                        },
                         &error.message,
                     ));
                 }
@@ -3542,7 +3506,7 @@ where
         invocation_state(&invocation.results)
     };
     invocation.updated_at = now_ms().to_string();
-    let real_engine_invoked = invocation.results.iter().any(|result| {
+    let has_completed_response = invocation.results.iter().any(|result| {
         result.real_engine_invoked
             && !result.fake_fixture
             && result.state == GenerationState::Completed
@@ -3552,19 +3516,27 @@ where
             && !continuation.provisional_output.fake_fixture
             && continuation.provisional_output.state == GenerationState::Completed
     });
-    if !real_engine_invoked {
+    let real_engine_invoked = invocation
+        .results
+        .iter()
+        .any(|result| result.real_engine_invoked && !result.fake_fixture)
+        || pending_continuations.iter().any(|continuation| {
+            continuation.provisional_output.real_engine_invoked
+                && !continuation.provisional_output.fake_fixture
+        });
+    if !has_completed_response {
         save_invocation(&invocation)?;
         return Ok(CommandResult::blocked_with_evidence(
             "mom_llama.chat_dispatch",
             "blocked_native_runtime",
             Blocker::new(
                 "mention_targets_failed",
-                "None of the invited local models completed a response.",
-                vec!["Check the target Personas' model profiles and context budgets.".to_string()],
+                failed_target_message(&invocation.results),
+                Vec::new(),
             ),
             vec![RuntimeStore::current()?.path().display().to_string()],
             Vec::new(),
-            false,
+            real_engine_invoked,
             false,
         ));
     }
@@ -3599,7 +3571,7 @@ where
         )
         .collect::<Vec<_>>();
     let host = host.clone();
-    let (conversation_path, ()) = commit_generated_exchange_with_journal(
+    let (conversation_path, ()) = match commit_generated_exchange_with_journal(
         commit_db,
         host,
         expected_active_leaf.as_deref(),
@@ -3607,13 +3579,28 @@ where
         &attachment_context.staged_ids,
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
+        &selected_sources,
         INVOCATIONS_NAMESPACE,
         MentionInvocationDb::default,
         |invocations| {
             upsert_invocation_with_continuations(invocations, &invocation, pending_continuations)
         },
         write_active_approval_index,
-    )?;
+    ) {
+        Ok(committed) => committed,
+        Err(error) if error.is::<StaleConsultSource>() => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.chat_dispatch",
+                "stub_blocked",
+                Blocker::new(
+                    "consult_source_stale",
+                    "A selected consultation source changed before the response could be saved.",
+                    vec!["Reopen the source and retry the consultation.".to_string()],
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     Ok(CommandResult::passed(
         "mom_llama.chat_dispatch",
         "real_prompt_smoke_passed",
@@ -3667,7 +3654,9 @@ struct PlannedTarget {
     handle: NativeModelHandle,
     messages: Vec<ChatMessage>,
     cache_id: Option<String>,
-    cache_reused: bool,
+    media: Vec<llama_native_types::MediaInput>,
+    model_fingerprint: ModelFingerprint,
+    text_prompt_tokens: usize,
     cached_prefix: Option<llama_native_types::SequenceStateBlob>,
     tools: Vec<BoundMentionTool>,
 }
@@ -3830,6 +3819,37 @@ struct BoundMentionTool {
     tool_schema_sha256: String,
 }
 
+fn resolve_recipient_targets(
+    ids: &[String],
+    contacts: &[Conversation],
+) -> std::result::Result<Vec<ResolvedTarget>, Blocker> {
+    let rejected = || {
+        Blocker::new(
+            "recipient_unavailable",
+            "A contact is unavailable",
+            Vec::new(),
+        )
+    };
+    if ids.len() > MAX_TARGETS {
+        return Err(rejected());
+    }
+    let mut targets = Vec::<ResolvedTarget>::new();
+    for id in ids {
+        if targets.iter().any(|target| target.conversation.id == *id) {
+            return Err(rejected());
+        }
+        let contact = contacts
+            .iter()
+            .find(|contact| contact.id == *id && contact.kind == ConversationKind::PersonaTemplate)
+            .ok_or_else(rejected)?;
+        targets.push(ResolvedTarget {
+            kind: MentionTargetKind::Persona,
+            conversation: contact.clone(),
+        });
+    }
+    Ok(targets)
+}
+
 fn resolve_targets(handles: &[String], host_id: &str) -> Result<TargetResolution> {
     let (conversations, groups) = conversation_and_group_handles()?;
     Ok(resolve_targets_from_registry(
@@ -3840,100 +3860,19 @@ fn resolve_targets(handles: &[String], host_id: &str) -> Result<TargetResolution
     ))
 }
 
+use target_resolution::checked_resolve_targets_from_registry;
+
 fn resolve_targets_from_registry(
     handles: &[String],
     host_id: &str,
     conversations: &[Conversation],
     groups: &[crate::personas::PersonaGroup],
 ) -> TargetResolution {
-    let mut by_handle = BTreeMap::<String, Vec<&Conversation>>::new();
-    for conversation in conversations {
-        by_handle
-            .entry(
-                conversation
-                    .execution_profile
-                    .mention_handle
-                    .to_ascii_lowercase(),
-            )
-            .or_default()
-            .push(conversation);
-    }
-    let mut groups_by_handle = BTreeMap::<String, Vec<&crate::personas::PersonaGroup>>::new();
-    for group in groups {
-        groups_by_handle
-            .entry(group.mention_handle.to_ascii_lowercase())
-            .or_default()
-            .push(group);
-    }
-    let by_id = conversations
-        .iter()
-        .map(|conversation| (conversation.id.as_str(), conversation))
-        .collect::<BTreeMap<_, _>>();
-    let mut resolved = Vec::new();
-    let mut unresolved = Vec::new();
-    let mut ambiguous = Vec::new();
-    let mut seen = BTreeSet::new();
-    for handle in handles {
-        let conversation_matches = by_handle.get(handle).map(Vec::as_slice).unwrap_or_default();
-        let group_matches = groups_by_handle
-            .get(handle)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if conversation_matches.len() + group_matches.len() > 1 {
-            ambiguous.push(handle.clone());
-            continue;
-        }
-        if let Some(group) = group_matches.first() {
-            let mut group_targets = Vec::new();
-            let mut group_seen = BTreeSet::new();
-            let mut valid = !group.persona_ids.is_empty();
-            for id in &group.persona_ids {
-                if let Some(conversation) = by_id.get(id.as_str())
-                    && conversation.kind == ConversationKind::PersonaTemplate
-                    && group_seen.insert(conversation.id.clone())
-                {
-                    group_targets.push(ResolvedTarget {
-                        kind: MentionTargetKind::Persona,
-                        conversation: (*conversation).clone(),
-                    });
-                } else {
-                    valid = false;
-                }
-            }
-            if valid {
-                for target in group_targets {
-                    if seen.insert(target.conversation.id.clone()) {
-                        resolved.push(target);
-                    }
-                }
-            } else {
-                unresolved.push(handle.clone());
-            }
-        } else if let Some(conversation) = conversation_matches.first()
-            && conversation.id != host_id
-            && seen.insert(conversation.id.clone())
-        {
-            resolved.push(ResolvedTarget {
-                kind: if conversation.kind == ConversationKind::PersonaTemplate {
-                    MentionTargetKind::Persona
-                } else {
-                    MentionTargetKind::LiveChat
-                },
-                conversation: (*conversation).clone(),
-            });
-        } else {
-            unresolved.push(handle.clone());
-        }
-    }
-    TargetResolution {
-        targets: resolved,
-        unresolved,
-        ambiguous,
-    }
+    checked_resolve_targets_from_registry(handles, host_id, conversations, groups)
 }
 
 fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
-    let source_messages = active_path_messages(&target.conversation);
+    let source_messages = crate::document::checked_active_messages(&target.conversation)?;
     let encoded = serde_json::to_vec(&(
         &target.conversation.id,
         &target.conversation.execution_profile,
@@ -3951,12 +3890,6 @@ fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
         source_messages,
         snapshot_sha256: format!("{:x}", Sha256::digest(encoded)),
     })
-}
-
-#[derive(Debug)]
-struct HandoffMessages {
-    stable_prefix: Vec<ChatMessage>,
-    messages: Vec<ChatMessage>,
 }
 
 fn resolve_mention_tools(
@@ -4682,207 +4615,6 @@ fn authorize_bound_tool<'a>(
     }
 }
 
-fn handoff_messages(
-    handle: &NativeModelHandle,
-    settings: &Settings,
-    snapshot: &MentionTargetSnapshot,
-    host: &[Message],
-    addressed: &str,
-    participants: &str,
-    tools: &[BoundMentionTool],
-) -> std::result::Result<HandoffMessages, Blocker> {
-    let system = snapshot
-        .profile
-        .system_message
-        .as_deref()
-        .filter(|message| !message.trim().is_empty())
-        .map(|content| ChatMessage {
-            role: ChatRole::System,
-            content: content.to_string(),
-        });
-    let source_messages =
-        attachment_enriched_messages(&snapshot.target_id, &snapshot.source_messages)?;
-    let host_conversation_id = host
-        .first()
-        .map(|message| message.conversation_id.as_str())
-        .unwrap_or_default();
-    let host_messages = attachment_enriched_messages(host_conversation_id, host)?;
-    let source_candidates = source_messages
-        .iter()
-        .flat_map(|message| native_context_messages(message, false))
-        .collect::<Vec<_>>();
-    let host_candidates = host_messages
-        .iter()
-        .flat_map(|message| native_context_messages(message, false))
-        .collect::<Vec<_>>();
-    let template = profile_chat_template(&snapshot.profile);
-    let source = recent_within_budget(
-        handle,
-        source_candidates,
-        snapshot.profile.source_history_tokens,
-        &template,
-    );
-    let mut host = recent_within_budget(
-        handle,
-        host_candidates,
-        snapshot.profile.host_context_tokens,
-        &template,
-    );
-    let boundary = ChatMessage {
-        role: ChatRole::System,
-        content: format!(
-            "You are @{}, temporarily invited from a separate local conversation. Your source history above is an immutable snapshot and will not be changed by this reply. Recent host context follows. Reply directly to the final addressed message as your established perspective. Do not claim access to omitted history. Addressed participants: {}.{}",
-            snapshot.handle,
-            participants,
-            mention_tool_instructions(tools)
-        ),
-    };
-    let final_message = ChatMessage {
-        role: ChatRole::User,
-        content: addressed.trim().to_string(),
-    };
-    let mut messages = Vec::new();
-    if let Some(system) = system {
-        messages.push(system);
-    }
-    messages.extend(source.clone());
-    messages.push(boundary.clone());
-    messages.append(&mut host);
-    messages.push(final_message.clone());
-    let output_reserve = snapshot
-        .profile
-        .sampling
-        .as_ref()
-        .map(|sampling| sampling.max_tokens)
-        .unwrap_or(settings.default_max_tokens) as usize;
-    fit_handoff_to_context(
-        messages,
-        &boundary,
-        output_reserve,
-        settings.context_tokens as usize,
-        |candidate| {
-            handle
-                .tokenize_messages_with_template(candidate.to_vec(), template.clone())
-                .map(|tokens| tokens.token_ids.len())
-                .map_err(|error| {
-                    Blocker::new(
-                        "mention_context_tokenization_failed",
-                        error.message,
-                        vec!["Check the target model's chat template.".to_string()],
-                    )
-                })
-        },
-    )
-}
-
-fn attachment_enriched_messages(
-    conversation_id: &str,
-    messages: &[Message],
-) -> std::result::Result<Vec<Message>, Blocker> {
-    if conversation_id.is_empty()
-        || messages
-            .iter()
-            .all(|message| message.attachment_ids.is_empty())
-    {
-        return Ok(messages.to_vec());
-    }
-    let context = prepare_chat_attachments(conversation_id, messages, Some("__snapshot__"))
-        .map_err(|_| {
-            Blocker::new(
-                "mention_attachment_context_failed",
-                "An invited conversation's attachment context could not be loaded.",
-                vec!["Open the source chat and inspect its attachments.".to_string()],
-            )
-        })?
-        .map_err(|blocked| blocked.blocker)?;
-    if !context.media.is_empty() {
-        return Err(Blocker::new(
-            "mention_source_multimodal_attachment_unsupported",
-            "An invited source contains image or audio context that the shared-prefix mention dispatcher cannot preserve yet.",
-            vec!["Use a text-only source branch for this Persona invocation.".to_string()],
-        ));
-    }
-    Ok(messages
-        .iter()
-        .cloned()
-        .map(|mut message| {
-            if let Some(attachment_text) = context.text_by_message_id.get(&message.id) {
-                message.content = append_attachment_context(&message.content, attachment_text);
-            }
-            message
-        })
-        .collect())
-}
-
-fn fit_handoff_to_context(
-    mut messages: Vec<ChatMessage>,
-    boundary: &ChatMessage,
-    output_reserve: usize,
-    context_tokens: usize,
-    mut token_count: impl FnMut(&[ChatMessage]) -> std::result::Result<usize, Blocker>,
-) -> std::result::Result<HandoffMessages, Blocker> {
-    loop {
-        let tokens = token_count(&messages)?;
-        if tokens.saturating_add(output_reserve) <= context_tokens {
-            let boundary_index = messages
-                .iter()
-                .position(|message| message == boundary)
-                .unwrap_or_default();
-            return Ok(HandoffMessages {
-                stable_prefix: messages[..boundary_index].to_vec(),
-                messages,
-            });
-        }
-        let boundary_index = messages
-            .iter()
-            .position(|message| message == boundary)
-            .unwrap_or_default();
-        if messages.len() > boundary_index + 2 {
-            messages.remove(boundary_index + 1);
-            continue;
-        }
-        let first_non_system = usize::from(
-            messages
-                .first()
-                .is_some_and(|message| message.role == ChatRole::System),
-        );
-        if boundary_index > first_non_system {
-            messages.remove(first_non_system);
-            continue;
-        }
-        return Err(Blocker::new(
-            "mention_context_too_large",
-            "The persona instructions and addressed message do not fit the target model context.",
-            vec!["Reduce the persona system message or output-token setting.".to_string()],
-        ));
-    }
-}
-
-fn recent_within_budget(
-    handle: &NativeModelHandle,
-    messages: Vec<ChatMessage>,
-    budget: u32,
-    chat_template: &ChatTemplateChoice,
-) -> Vec<ChatMessage> {
-    if budget == 0 {
-        return Vec::new();
-    }
-    let mut selected = Vec::new();
-    for message in messages.into_iter().rev() {
-        let mut candidate = vec![message];
-        candidate.extend(selected.clone());
-        let fits = handle
-            .tokenize_messages_with_template(candidate.clone(), chat_template.clone())
-            .map(|tokens| tokens.token_ids.len() <= budget as usize)
-            .unwrap_or(false);
-        if !fits {
-            break;
-        }
-        selected = candidate;
-    }
-    selected
-}
-
 fn profile_chat_template(profile: &ConversationExecutionProfile) -> ChatTemplateChoice {
     match &profile.chat_template {
         crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
@@ -5154,125 +4886,16 @@ fn invocation_state(results: &[MentionTargetResult]) -> MentionInvocationState {
     }
 }
 
-fn parse_handles(message: &str) -> Vec<String> {
-    let mut handles = Vec::new();
-    for token in mention_tokens(message) {
-        let handle = token.handle.to_ascii_lowercase();
-        if !handles.contains(&handle) {
-            handles.push(handle);
-        }
-    }
-    handles
+fn parse_handles(message: &str) -> Result<Vec<String>> {
+    Ok(workspace_document::references::participant_handles(
+        message,
+    )?)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MentionToken<'a> {
-    start: usize,
-    end: usize,
-    handle: &'a str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CodeDelimiter {
-    marker: char,
-    width: usize,
-}
-
-fn mention_tokens(message: &str) -> Vec<MentionToken<'_>> {
-    let chars = message.char_indices().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut code_delimiter: Option<CodeDelimiter> = None;
-    let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index].1;
-        if character == '`' || character == '~' {
-            let marker = character;
-            let mut width = 1;
-            while index + width < chars.len() && chars[index + width].1 == marker {
-                width += 1;
-            }
-            match code_delimiter {
-                Some(open) if open.marker == marker && open.width == width => {
-                    code_delimiter = None;
-                }
-                None if marker == '`' || width >= 3 => {
-                    code_delimiter = Some(CodeDelimiter { marker, width });
-                }
-                _ => {}
-            }
-            index += width;
-            continue;
-        }
-        let explicit_boundary = index == 0 || chars[index - 1].1.is_whitespace();
-        if code_delimiter.is_none()
-            && character == '@'
-            && explicit_boundary
-            && !is_indented_code_position(message, chars[index].0)
-        {
-            let start = chars[index].0 + 1;
-            let mut end = start;
-            index += 1;
-            while index < chars.len()
-                && (chars[index].1.is_ascii_alphanumeric() || chars[index].1 == '-')
-            {
-                end = chars[index].0 + chars[index].1.len_utf8();
-                index += 1;
-            }
-            if end > start {
-                tokens.push(MentionToken {
-                    start: start - 1,
-                    end,
-                    handle: &message[start..end],
-                });
-            }
-        } else {
-            index += 1;
-        }
-    }
-    tokens
-}
-
-fn is_indented_code_position(message: &str, byte_index: usize) -> bool {
-    let line_start = message[..byte_index]
-        .rfind('\n')
-        .map_or(0, |position| position + 1);
-    let prefix = &message[line_start..byte_index];
-    prefix.starts_with('\t') || (prefix.len() >= 4 && prefix.bytes().all(|byte| byte == b' '))
-}
-
-fn strip_handles(message: &str, targets: &[ResolvedTarget]) -> String {
-    let target_handles = targets
-        .iter()
-        .map(|target| {
-            target
-                .conversation
-                .execution_profile
-                .mention_handle
-                .to_ascii_lowercase()
-        })
-        .collect::<BTreeSet<_>>();
-    let removals = mention_tokens(message)
-        .into_iter()
-        .filter(|token| target_handles.contains(&token.handle.to_ascii_lowercase()))
-        .map(|token| {
-            let mut end = token.end;
-            for (offset, character) in message[token.end..].char_indices() {
-                if character.is_whitespace() || character.is_ascii_alphanumeric() {
-                    break;
-                }
-                end = token.end + offset + character.len_utf8();
-            }
-            token.start..end
-        })
-        .collect::<Vec<_>>();
-    let mut stripped = String::with_capacity(message.len());
-    let mut cursor = 0;
-    for removal in removals {
-        stripped.push_str(&message[cursor..removal.start]);
-        cursor = removal.end;
-    }
-    stripped.push_str(&message[cursor..]);
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+fn strip_handles(message: &str, _targets: &[ResolvedTarget]) -> Result<String> {
+    // Resolution already admitted every explicit address, including group
+    // aliases. Expanded member handles are not the address spans in the text.
+    Ok(workspace_document::references::remove_participant_addresses(message)?)
 }
 
 fn append_attachment_context(message: &str, attachment_text: &str) -> String {
@@ -5324,8 +4947,8 @@ mod tests {
         MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
         MentionToolApprovalState, PersonaToolCallIdentity, PersonaToolDecision,
         StoredMentionInvocation, active_approval_index, ambiguous_resolution_blocker,
-        authorize_bound_tool, finish_stored_mention_invocation, fit_handoff_to_context,
-        mention_tool_instructions, mention_tool_manifest, parse_handles, persona_tool_call_sha256,
+        authorize_bound_tool, finish_stored_mention_invocation, mention_tool_instructions,
+        mention_tool_manifest, parse_handles, persona_tool_call_sha256,
         persona_tool_decision_schema, reconcile_stored_persona_tool_approvals,
         resolve_targets_from_registry, sha256_json_value, unknown_persona_tool_effect_receipt,
         unregister_exact_mentions, validate_resolved_mention_tools,
@@ -5346,8 +4969,8 @@ mod tests {
     use crate::store::RuntimeStore;
     use crate::tool_loop::ToolPermissionPolicy;
     use llama_native_types::{
-        ChatMessage, ChatRole, ChatTemplateChoice, GenerationMetrics, GenerationOutput,
-        GenerationState, ModelFingerprint, NativeModelConfig, NativeTransport, SamplingConfig,
+        ChatTemplateChoice, GenerationMetrics, GenerationOutput, GenerationState, ModelFingerprint,
+        NativeModelConfig, NativeTransport, SamplingConfig,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -5362,11 +4985,33 @@ mod tests {
         }
     }
 
-    fn handoff_message(role: ChatRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: content.to_string(),
-        }
+    #[test]
+    fn contact_routing_preserves_order_and_identity_after_handle_changes() {
+        let mut first = mention_conversation("first-id", "original");
+        first.kind = ConversationKind::PersonaTemplate;
+        first.execution_profile.mention_handle = "renamed".into();
+        let mut second = mention_conversation("second-id", "second");
+        second.kind = ConversationKind::PersonaTemplate;
+        let contacts = vec![first, second];
+        let ids = vec!["second-id".to_string(), "first-id".to_string()];
+        let targets = super::resolve_recipient_targets(&ids, &contacts)
+            .unwrap_or_else(|_| panic!("valid recipients"));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second-id", "first-id"]
+        );
+        assert_eq!(
+            targets[1].conversation.execution_profile.mention_handle,
+            "renamed"
+        );
+        assert!(super::resolve_recipient_targets(&["missing".into()], &contacts).is_err());
+        assert!(
+            super::resolve_recipient_targets(&["first-id".into(), "first-id".into()], &contacts)
+                .is_err()
+        );
     }
 
     fn mention_conversation(id: &str, handle: &str) -> Conversation {
@@ -5385,6 +5030,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         }
@@ -5544,6 +5190,24 @@ mod tests {
                 resume_lease_id: None,
             }],
         }
+    }
+
+    #[test]
+    fn failed_consult_reports_the_retained_target_cause() {
+        let stored = frozen_approval_record(u128::MAX);
+        let result = super::blocked_target_result(
+            &stored.invocation.targets[0],
+            GenerationState::Failed,
+            "Host-level native settings changed; restart Mom Llama to apply them.",
+        );
+        assert_eq!(
+            super::failed_target_message(std::slice::from_ref(&result)),
+            format!("@{}: {}", result.handle, result.text)
+        );
+        assert_eq!(
+            super::failed_target_message(&[]),
+            "None of the invited local models completed a response."
+        );
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -5899,6 +5563,7 @@ mod tests {
                     source_message_id: None,
                     branch_root_message_id: None,
                     active_leaf_message_id: Some("turn".to_string()),
+                    recipient_ids: Vec::new(),
                     current_skill_ids: Vec::new(),
                     messages: vec![Message {
                         id: "turn".to_string(),
@@ -6606,7 +6271,8 @@ mod tests {
     #[test]
     fn mention_parser_is_stable_and_deduplicates_handles() {
         assert_eq!(
-            parse_handles("Ask @evidence-lens and @whole-person, then @evidence-lens."),
+            parse_handles("Ask @evidence-lens and @whole-person, then @evidence-lens.")
+                .expect("bounded addresses"),
             vec!["evidence-lens", "whole-person"]
         );
     }
@@ -6614,10 +6280,15 @@ mod tests {
     #[test]
     fn mention_parser_requires_the_explicit_composer_boundary() {
         assert_eq!(
-            parse_handles("@leading then\t@after-tab and\n@after-newline"),
+            parse_handles("@leading then\t@after-tab and\n@after-newline")
+                .expect("bounded addresses"),
             vec!["leading", "after-tab", "after-newline"]
         );
-        assert!(parse_handles("mail@example.com prefix@embedded (@parenthesized)").is_empty());
+        assert!(
+            parse_handles("mail@example.com prefix@embedded (@parenthesized)")
+                .expect("inert text")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6626,6 +6297,7 @@ mod tests {
             parse_handles(
                 "`@inline` and ``@wide-inline``\n```text\n@fenced\n```\n~~~\n@tilde-fenced\n~~~\n    @indented"
             )
+            .expect("inert code")
             .is_empty()
         );
     }
@@ -6874,40 +6546,5 @@ mod tests {
                 .code,
             "mention_tool_manifest_too_large"
         );
-    }
-
-    #[test]
-    fn context_trimming_removes_whole_messages_and_never_drops_the_addressed_message() {
-        let boundary = handoff_message(ChatRole::System, "invitation-boundary");
-        let final_message = handoff_message(ChatRole::User, "mandatory-addressed-message");
-        let messages = vec![
-            handoff_message(ChatRole::System, "persona-system"),
-            handoff_message(ChatRole::User, "older-source"),
-            handoff_message(ChatRole::Assistant, "newer-source"),
-            boundary.clone(),
-            handoff_message(ChatRole::User, "older-host"),
-            handoff_message(ChatRole::Assistant, "newer-host"),
-            final_message.clone(),
-        ];
-        let fitted = fit_handoff_to_context(messages.clone(), &boundary, 2, 5, |candidate| {
-            Ok(candidate.len())
-        })
-        .expect("the mandatory handoff should fit after whole-message trimming");
-        assert_eq!(
-            fitted.messages,
-            vec![messages[0].clone(), boundary.clone(), final_message.clone()],
-            "host context is trimmed before source context and no message is split"
-        );
-        assert_eq!(fitted.messages.last(), Some(&final_message));
-
-        let blocker = fit_handoff_to_context(
-            vec![messages[0].clone(), boundary.clone(), final_message.clone()],
-            &boundary,
-            2,
-            4,
-            |candidate| Ok(candidate.len()),
-        )
-        .expect_err("mandatory system, boundary, addressed message, and reserve cannot be trimmed");
-        assert_eq!(blocker.code, "mention_context_too_large");
     }
 }

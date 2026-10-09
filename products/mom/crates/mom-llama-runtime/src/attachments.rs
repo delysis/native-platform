@@ -7,7 +7,9 @@ use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
-use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
+use attachment_native_host::{
+    AttachmentHost, AttachmentHostConfig, CanonicalizedAttachment, ProvidedAttachment,
+};
 use attachment_native_types::{
     ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt, BlobValidationGrade,
     CanonicalArtifact, Coverage, DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
@@ -349,7 +351,7 @@ impl ActiveAttachmentBudget {
 
 struct AttachmentResolution<'a> {
     store: &'a RuntimeStore,
-    emitted_media: &'a mut BTreeSet<String>,
+    emitted_media: &'a mut llama_native_types::media_identity::MediaIdentityLedger,
     budget: &'a mut ActiveAttachmentBudget,
     current_policy_fingerprint: &'a str,
 }
@@ -472,20 +474,20 @@ pub fn attachment_import_pasted_text(
     )
 }
 
-fn canonicalize_and_stage(
-    scope: &crate::OperationScope,
-    conversation_id: &str,
-    source_path: String,
-    provided: ProvidedAttachment,
-    command: &str,
+struct CanonicalAttachmentRecord {
+    record: AttachmentRecord,
+    manifest: AttachmentManifest,
+    blobs: Vec<(String, Vec<u8>)>,
+}
+
+fn canonical_attachment_record(
+    canonicalized: CanonicalizedAttachment,
     host: &AttachmentHost,
+    conversation_id: &str,
+    file_name: String,
+    source_path: String,
     attachment_id: Option<&str>,
-) -> Result<CommandResult<AttachmentImportOutput>> {
-    let file_name = provided.display_name.clone();
-    let canonicalized = match host.inspect_and_canonicalize(provided) {
-        Ok(canonicalized) => canonicalized,
-        Err(error) => return Ok(attachment_error_result(command, error)),
-    };
+) -> Result<CanonicalAttachmentRecord> {
     let root_id = canonicalized.bundle.graph.root.clone();
     let root = canonicalized
         .bundle
@@ -533,6 +535,48 @@ fn canonicalize_and_stage(
         policy_fingerprint: host.policy_fingerprint().to_string(),
         receipt: Some(canonicalized.receipt),
     };
+    let blobs = canonicalized
+        .bundle
+        .blobs
+        .into_iter()
+        .map(|(id, bytes)| (object_namespace(&id), bytes.as_ref().to_vec()))
+        .collect();
+    Ok(CanonicalAttachmentRecord {
+        record,
+        manifest,
+        blobs,
+    })
+}
+
+fn canonicalize_and_stage(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    source_path: String,
+    provided: ProvidedAttachment,
+    command: &str,
+    host: &AttachmentHost,
+    attachment_id: Option<&str>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let file_name = provided.display_name.clone();
+    let canonicalized = match host.inspect_and_canonicalize(provided) {
+        Ok(canonicalized) => canonicalized,
+        Err(error) => return Ok(attachment_error_result(command, error)),
+    };
+    let prepared = canonical_attachment_record(
+        canonicalized,
+        host,
+        conversation_id,
+        file_name,
+        source_path,
+        attachment_id,
+    )?;
+    let record = prepared.record;
+    let id = record.id.clone();
+    let manifest_namespace = record
+        .manifest_namespace
+        .clone()
+        .expect("canonical record manifest");
+    let manifest = prepared.manifest;
     let _lifecycle = lock_attachment_lifecycle()?;
     let mut attachment_db = load_attachment_db()?;
     attachment_db.attachments.insert(0, record.clone());
@@ -548,9 +592,7 @@ fn canonicalize_and_stage(
         (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&draft_db)?),
         (manifest_namespace, serde_json::to_vec(&manifest)?),
     ];
-    for (object_id, bytes) in canonicalized.bundle.blobs {
-        documents.push((object_namespace(&object_id), bytes.as_ref().to_vec()));
-    }
+    documents.extend(prepared.blobs);
     store.put_documents_atomically(documents)?;
     let settings = resolve_settings()?;
     let (multimodal_ready, multimodal_blocker) = multimodal_readiness(
@@ -922,94 +964,31 @@ fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
     store.get_bytes(&format!("attachment.blob.{attachment_id}"))
 }
 
+mod bindings;
+mod scoped_context;
+pub use bindings::{AttachmentContextSource, SelectedAttachmentSource};
+pub(crate) use bindings::{
+    AttachmentMediaReference, SelectedAttachmentMedia, SelectedMediaBuilder, native_media_id,
+    validate_selected_attachment_budget,
+};
+pub(crate) use scoped_context::{
+    CurrentAttachmentSelection, ScopedChatAttachmentContext, prepare_scoped_chat_attachments,
+};
+
 pub(crate) fn prepare_chat_attachments(
     conversation_id: &str,
     active_messages: &[Message],
     regenerate_user_id: Option<&str>,
 ) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
-    let current_policy_fingerprint = attachment_host()?.policy_fingerprint().to_string();
-    let attachment_db = load_attachment_db()?;
-    let records = attachment_db
-        .attachments
-        .iter()
-        .map(|record| (record.id.as_str(), record))
-        .collect::<HashMap<_, _>>();
-    let draft_snapshot = if regenerate_user_id.is_none() {
-        load_drafts()?
-            .drafts
-            .into_iter()
-            .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
-    } else {
-        None
-    };
-    let draft_ids = if regenerate_user_id.is_none() {
-        draft_snapshot
-            .as_ref()
-            .map(|draft| draft.attachment_ids.clone())
-            .unwrap_or_default()
-    } else {
-        active_messages
-            .iter()
-            .find(|message| message.id == regenerate_user_id.unwrap_or_default())
-            .map(|message| message.attachment_ids.clone())
-            .unwrap_or_default()
-    };
-    let store = RuntimeStore::current()?;
-    let mut text_by_message_id = HashMap::new();
-    let mut media = Vec::new();
-    let mut emitted_media = BTreeSet::new();
-    let mut budget = ActiveAttachmentBudget::default();
-    let mut resolution = AttachmentResolution {
-        store: &store,
-        emitted_media: &mut emitted_media,
-        budget: &mut budget,
-        current_policy_fingerprint: &current_policy_fingerprint,
-    };
-    for message in active_messages {
-        if message.attachment_ids.is_empty() {
-            continue;
+    let selection = match regenerate_user_id {
+        Some(id) if active_messages.iter().any(|message| message.id == id) => {
+            CurrentAttachmentSelection::ExistingUser(id)
         }
-        let resolved = match resolve_attachment_set(
-            conversation_id,
-            &message.attachment_ids,
-            AttachmentState::Committed,
-            &records,
-            &mut resolution,
-        )? {
-            Ok(resolved) => resolved,
-            Err(blocked) => return Ok(Err(blocked)),
-        };
-        if !resolved.text.is_empty() {
-            text_by_message_id.insert(message.id.clone(), resolved.text);
-        }
-        media.extend(resolved.media);
-    }
-    let current = match resolve_attachment_set(
-        conversation_id,
-        &draft_ids,
-        if regenerate_user_id.is_some() {
-            AttachmentState::Committed
-        } else {
-            AttachmentState::Staged
-        },
-        &records,
-        &mut resolution,
-    )? {
-        Ok(resolved) => resolved,
-        Err(blocked) => return Ok(Err(blocked)),
+        Some(_) => CurrentAttachmentSelection::HistoryOnly,
+        None => CurrentAttachmentSelection::Draft,
     };
-    media.extend(current.media);
-    Ok(Ok(ChatAttachmentContext {
-        staged_ids: if regenerate_user_id.is_none() {
-            draft_ids
-        } else {
-            Vec::new()
-        },
-        draft_snapshot,
-        text_by_message_id,
-        current_text: current.text,
-        media,
-    }))
+    prepare_scoped_chat_attachments(conversation_id, active_messages, selection)
+        .map(|result| result.map(|scoped| scoped.context))
 }
 
 pub(crate) fn commit_generated_exchange(
@@ -1086,6 +1065,7 @@ pub(crate) fn commit_generated_exchange_with_journal<T, R>(
     staged_ids: &[String],
     user_message_id: &str,
     expected_draft: Option<&DraftMessage>,
+    selected_sources: &[SelectedAttachmentSource],
     journal_namespace: &str,
     journal_default: impl FnOnce() -> T,
     journal_mutation: impl FnOnce(&mut T) -> Result<R>,
@@ -1104,6 +1084,7 @@ where
     let conversation_snapshot = load_db().unwrap_or(fallback_db);
     let attachment_snapshot = load_attachment_db()?;
     let draft_snapshot = load_drafts()?;
+    let current_policy_fingerprint = attachment_host()?.policy_fingerprint().to_string();
     let result =
         store.mutate_documents(journal_namespace, journal_default, |journal, documents| {
             let mut conversation_db = documents
@@ -1146,6 +1127,14 @@ where
                 record.message_id = user_message_id.to_string();
             }
 
+            validate_selected_sources_in_documents(
+                documents,
+                &conversation_db,
+                &attachment_db,
+                selected_sources,
+                &current_policy_fingerprint,
+            )?;
+
             let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(draft_snapshot);
             consume_exact_draft(&mut drafts, expected_draft, staged_ids);
 
@@ -1160,6 +1149,168 @@ where
             Ok(result)
         })?;
     Ok((store.path().to_path_buf(), result))
+}
+
+#[derive(Debug)]
+pub(crate) struct StaleConsultSource {
+    detail: String,
+}
+
+impl std::fmt::Display for StaleConsultSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "selected consultation source is stale: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for StaleConsultSource {}
+
+fn stale_consult_source(detail: impl Into<String>) -> anyhow::Error {
+    StaleConsultSource {
+        detail: detail.into(),
+    }
+    .into()
+}
+
+fn validate_selected_sources_in_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    conversations: &ConversationDb,
+    attachments: &AttachmentDb,
+    selected_sources: &[SelectedAttachmentSource],
+    current_policy_fingerprint: &str,
+) -> Result<()> {
+    validate_selected_sources(
+        |namespace| documents.get::<AttachmentManifest>(namespace),
+        conversations,
+        attachments,
+        selected_sources,
+        current_policy_fingerprint,
+    )
+}
+
+fn validate_selected_sources(
+    read_manifest: impl Fn(&str) -> Result<Option<AttachmentManifest>>,
+    conversations: &ConversationDb,
+    attachments: &AttachmentDb,
+    selected_sources: &[SelectedAttachmentSource],
+    current_policy_fingerprint: &str,
+) -> Result<()> {
+    for source in selected_sources {
+        let mut owners = conversations
+            .conversations
+            .iter()
+            .filter(|conversation| conversation.id == source.conversation_id);
+        let Some(owner) = owners.next() else {
+            return Err(stale_consult_source("the owning conversation was removed"));
+        };
+        if owners.next().is_some() {
+            return Err(stale_consult_source(
+                "the owning conversation identity is ambiguous",
+            ));
+        }
+        let mut messages = owner
+            .messages
+            .iter()
+            .filter(|message| message.id == source.message_id);
+        let Some(message) = messages.next() else {
+            return Err(stale_consult_source("the owning message was removed"));
+        };
+        if messages.next().is_some()
+            || message.conversation_id != source.conversation_id
+            || message
+                .attachment_ids
+                .iter()
+                .filter(|id| *id == &source.representation.attachment_id)
+                .count()
+                != 1
+        {
+            return Err(stale_consult_source("the attachment occurrence changed"));
+        }
+        let mut records = attachments
+            .attachments
+            .iter()
+            .filter(|record| record.id == source.representation.attachment_id);
+        let Some(record) = records.next() else {
+            return Err(stale_consult_source("the attachment was removed"));
+        };
+        if records.next().is_some()
+            || record.conversation_id != source.conversation_id
+            || record.message_id != source.message_id
+            || record.state != AttachmentState::Committed
+            || record.sha256 != source.representation.root_sha256
+        {
+            return Err(stale_consult_source(
+                "the attachment identity or ownership changed",
+            ));
+        }
+        let Some(namespace) = record.manifest_namespace.as_deref() else {
+            return Err(stale_consult_source(
+                "the canonical representation was removed",
+            ));
+        };
+        let Some(manifest) = read_manifest(namespace)? else {
+            return Err(stale_consult_source(
+                "the canonical representation was removed",
+            ));
+        };
+        validate_preview_manifest(record, &manifest)
+            .map_err(|problem| stale_consult_source(problem.message))?;
+        if manifest.policy_fingerprint != current_policy_fingerprint {
+            return Err(stale_consult_source("the attachment safety policy changed"));
+        }
+        let text = canonical_text(record, &manifest);
+        let current = AttachmentContextSource::from_verified(record, &manifest, &text)
+            .map_err(|blocked| stale_consult_source(blocked.blocker.message))?;
+        if current != source.representation {
+            return Err(stale_consult_source("the selected representation changed"));
+        }
+    }
+    Ok(())
+}
+
+/// Reopen only the server-retained occurrence, with the same validation used at
+/// commit. Deletion leaves the citation evidence intact but makes opening stale.
+pub(crate) fn open_selected_source_in_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    source: &SelectedAttachmentSource,
+) -> Result<String> {
+    let conversations = snapshot
+        .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let attachments = snapshot
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    let policy = attachment_host()?.policy_fingerprint().to_string();
+    validate_selected_sources(
+        |namespace| snapshot.get::<AttachmentManifest>(namespace),
+        &conversations,
+        &attachments,
+        std::slice::from_ref(source),
+        &policy,
+    )?;
+    let record = attachments
+        .attachments
+        .iter()
+        .find(|record| record.id == source.representation.attachment_id)
+        .ok_or_else(|| stale_consult_source("the attachment was removed"))?;
+    let manifest = snapshot
+        .get::<AttachmentManifest>(
+            record
+                .manifest_namespace
+                .as_deref()
+                .ok_or_else(|| stale_consult_source("the canonical representation was removed"))?,
+        )?
+        .ok_or_else(|| stale_consult_source("the canonical representation was removed"))?;
+    let text = canonical_text(record, &manifest);
+    if text.len() > MAX_ATTACHMENT_PREVIEW_TEXT_BYTES {
+        return Err(anyhow!(
+            "the exact source exceeds the canonical text preview limit"
+        ));
+    }
+    Ok(text)
 }
 
 fn consume_exact_draft(
@@ -1202,6 +1353,30 @@ pub(crate) fn snapshot_message_attachments(
             )
         },
     )
+}
+
+/// Move only the submitted new-chat draft's staged occurrences. Caller holds
+/// the attachment lifecycle lock and the encrypted store transaction.
+pub(crate) fn transfer_new_draft_attachments(
+    documents: &mut crate::store::DocumentMutations<'_, '_, '_>,
+    ids: &[String],
+    conversation: &str,
+) -> Result<()> {
+    let mut db: AttachmentDb = documents.get(ATTACHMENTS_NAMESPACE)?.unwrap_or_default();
+    for id in ids {
+        let record = db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == *id)
+            .ok_or_else(|| anyhow!("Draft attachment no longer exists"))?;
+        anyhow::ensure!(
+            record.conversation_id == "default" && record.state == AttachmentState::Staged,
+            "Draft attachment ownership changed"
+        );
+        record.conversation_id = conversation.to_string();
+    }
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&db)?)?;
+    Ok(())
 }
 
 pub(crate) fn snapshot_message_attachments_from_documents(
@@ -1274,6 +1449,8 @@ enum AttachmentGcMode {
 struct AttachmentGcState<'a> {
     conversations_to_write: Option<&'a ConversationDb>,
     drafts_to_write: Option<&'a DraftDb>,
+    expected_conversations: Option<&'a ConversationDb>,
+    expected_drafts: Option<&'a DraftDb>,
     effective_conversations: &'a ConversationDb,
     effective_drafts: &'a DraftDb,
     removed_attachment_ids: &'a BTreeSet<String>,
@@ -1481,6 +1658,8 @@ pub(crate) fn persist_drafts_with_attachment_gc(
     persist_state_with_attachment_gc(AttachmentGcState {
         conversations_to_write: None,
         drafts_to_write: Some(drafts),
+        expected_conversations: Some(&conversations),
+        expected_drafts: None,
         effective_conversations: &conversations,
         effective_drafts: drafts,
         removed_attachment_ids,
@@ -1494,10 +1673,16 @@ pub(crate) fn persist_drafts_with_attachment_gc(
 /// replacement lets conversation deletion remove its staged chips atomically.
 pub(crate) fn persist_conversations_with_attachment_gc(
     conversations: &ConversationDb,
+    expected_conversations: &ConversationDb,
     drafts: Option<&DraftDb>,
+    expected_drafts: Option<&DraftDb>,
     removed_attachment_ids: &BTreeSet<String>,
     deleted_conversation_ids: &BTreeSet<String>,
 ) -> Result<PathBuf> {
+    anyhow::ensure!(
+        drafts.is_some() == expected_drafts.is_some(),
+        "draft replacement requires its pre-mutation snapshot"
+    );
     let _lifecycle = lock_attachment_lifecycle()?;
     let current_drafts;
     let effective_drafts = if let Some(drafts) = drafts {
@@ -1509,6 +1694,8 @@ pub(crate) fn persist_conversations_with_attachment_gc(
     persist_state_with_attachment_gc(AttachmentGcState {
         conversations_to_write: Some(conversations),
         drafts_to_write: drafts,
+        expected_conversations: Some(expected_conversations),
+        expected_drafts: Some(expected_drafts.unwrap_or(effective_drafts)),
         effective_conversations: conversations,
         effective_drafts,
         removed_attachment_ids,
@@ -1530,6 +1717,22 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
         ATTACHMENTS_NAMESPACE,
         || attachment_snapshot,
         |attachment_db: &mut AttachmentDb, documents| {
+            if let Some(expected) = state.expected_conversations
+                && documents
+                    .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+                    .unwrap_or_default()
+                    != *expected
+            {
+                anyhow::bail!("conversation state changed before attachment GC commit");
+            }
+            if let Some(expected) = state.expected_drafts
+                && documents
+                    .get::<DraftDb>(DRAFTS_NAMESPACE)?
+                    .unwrap_or_default()
+                    != *expected
+            {
+                anyhow::bail!("draft state changed before attachment GC commit");
+            }
             let mut removed_manifests = BTreeSet::new();
             let mut removed_objects = BTreeSet::new();
             let mut retained = Vec::with_capacity(attachment_db.attachments.len());
@@ -2503,164 +2706,8 @@ struct ResolvedAttachmentSet {
     media: Vec<MediaInput>,
 }
 
-fn resolve_attachment_set(
-    conversation_id: &str,
-    ids: &[String],
-    expected_state: AttachmentState,
-    records: &HashMap<&str, &AttachmentRecord>,
-    resolution: &mut AttachmentResolution<'_>,
-) -> Result<std::result::Result<ResolvedAttachmentSet, AttachmentContextBlocker>> {
-    let mut text = Vec::new();
-    let mut media = Vec::new();
-    for id in ids {
-        let Some(record) = records.get(id.as_str()).copied() else {
-            return Ok(Err(context_blocker(
-                "attachment_reference_missing",
-                format!("Attachment {id} no longer exists."),
-            )));
-        };
-        if record.conversation_id != conversation_id {
-            return Ok(Err(context_blocker(
-                "attachment_ownership_mismatch",
-                "An attachment belongs to another conversation.".to_string(),
-            )));
-        }
-        if record.state != expected_state {
-            return Ok(Err(context_blocker(
-                "attachment_state_invalid",
-                format!(
-                    "Attachment {} is not {:?}.",
-                    record.file_name, expected_state
-                ),
-            )));
-        }
-        if record.policy_fingerprint.as_deref() != Some(resolution.current_policy_fingerprint) {
-            return Ok(Err(policy_mismatch_blocker(record)));
-        }
-        if let Err(blocked) = resolution.budget.reserve_reference() {
-            return Ok(Err(blocked));
-        }
-        let Some(namespace) = record.manifest_namespace.as_deref() else {
-            return Ok(Err(context_blocker(
-                "attachment_manifest_missing",
-                "The attachment has no canonical manifest and cannot enter a model prompt."
-                    .to_string(),
-            )));
-        };
-        let manifest = resolution
-            .store
-            .get::<AttachmentManifest>(namespace)?
-            .ok_or_else(|| anyhow!("attachment manifest {namespace} is missing"))?;
-        if manifest.schema != ATTACHMENT_MANIFEST_SCHEMA || manifest.attachment_id != record.id {
-            return Ok(Err(context_blocker(
-                "attachment_manifest_invalid",
-                "Attachment metadata did not match its canonical manifest.".to_string(),
-            )));
-        }
-        if manifest.policy_fingerprint != resolution.current_policy_fingerprint
-            || manifest.artifacts.iter().any(|artifact| {
-                artifact.processor.policy_fingerprint != resolution.current_policy_fingerprint
-            })
-        {
-            return Ok(Err(policy_mismatch_blocker(record)));
-        }
-        if !matches!(manifest.graph.coverage, Coverage::Complete) {
-            return Ok(Err(context_blocker(
-                "attachment_coverage_incomplete",
-                format!(
-                    "Attachment {} could not be inspected completely within the configured safety limits.",
-                    record.file_name
-                ),
-            )));
-        }
-        let canonical = canonical_text(record, &manifest);
-        let has_canonical_text = !canonical.is_empty();
-        if !canonical.is_empty() {
-            if let Err(blocked) = resolution.budget.reserve_text(canonical.len()) {
-                return Ok(Err(blocked));
-            }
-            text.push(canonical);
-        }
-        let media_before = media.len();
-        let mut contains_video = false;
-        for artifact in &manifest.artifacts {
-            let ArtifactPayload::Media {
-                family,
-                blob,
-                metadata: _,
-                validation,
-            } = &artifact.payload
-            else {
-                continue;
-            };
-            let kind = match family {
-                MediaFamily::Image => {
-                    if !validation.grade.permits_direct_media() {
-                        return Ok(Err(media_transform_blocker(record, *family)));
-                    }
-                    MediaKind::Image
-                }
-                MediaFamily::Audio => return Ok(Err(media_transform_blocker(record, *family))),
-                MediaFamily::Video => {
-                    if !validation.grade.permits_direct_media() {
-                        return Ok(Err(media_transform_blocker(record, *family)));
-                    }
-                    contains_video = true;
-                    continue;
-                }
-            };
-            if resolution.emitted_media.contains(&blob.object_id.0) {
-                continue;
-            }
-            if let Err(blocked) = resolution.budget.reserve_media(blob.byte_len) {
-                return Ok(Err(blocked));
-            }
-            resolution.emitted_media.insert(blob.object_id.0.clone());
-            let bytes =
-                match load_verified_object(resolution.store, &manifest.graph, &blob.object_id) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(Err(context_blocker(
-                            "attachment_content_mismatch",
-                            format!(
-                                "Attachment {} no longer matches its inspected content hash.",
-                                record.file_name
-                            ),
-                        )));
-                    }
-                };
-            media.push(MediaInput {
-                id: format!("{}:{}", record.id, artifact.id.0),
-                kind,
-                mime: blob.media_type.clone(),
-                sha256: blob.sha256.clone(),
-                bytes,
-            });
-        }
-        if contains_video {
-            return Ok(Err(context_blocker(
-                "attachment_video_pipeline_required",
-                format!(
-                    "Attachment {} contains video. Configure a native-video target or an explicit frame-and-transcription pipeline before sending it.",
-                    record.file_name
-                ),
-            )));
-        }
-        if !has_canonical_text && media.len() == media_before {
-            return Ok(Err(context_blocker(
-                "attachment_no_model_representation",
-                format!(
-                    "Attachment {} has no canonical text or media representation accepted by the selected model.",
-                    record.file_name
-                ),
-            )));
-        }
-    }
-    Ok(Ok(ResolvedAttachmentSet {
-        text: text.join("\n\n"),
-        media,
-    }))
-}
+mod media_context;
+use media_context::resolve_attachment_set;
 
 fn canonical_text(record: &AttachmentRecord, manifest: &AttachmentManifest) -> String {
     let body = manifest
@@ -2848,19 +2895,20 @@ fn merge_generated_conversation(
     if active_branch_is_unchanged {
         existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
     }
-    if is_placeholder_title(&existing.title, &existing.id)
-        && !is_placeholder_title(&conversation.title, &conversation.id)
-    {
-        existing.title = conversation.title.clone();
+    if crate::conversation_store::is_placeholder_title(&existing.title, &existing.id) {
+        existing.title = if crate::conversation_store::is_placeholder_title(
+            &conversation.title,
+            &conversation.id,
+        ) {
+            crate::conversation_store::display_title(existing)
+        } else {
+            conversation.title.clone()
+        };
     }
     if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
         existing.updated_at = conversation.updated_at.clone();
     }
     Ok(())
-}
-
-fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
-    matches!(title, "New chat" | "Default chat") || title == conversation_id
 }
 
 fn timestamp_value(value: &str) -> u128 {
@@ -3716,6 +3764,8 @@ mod tests {
             .expect("commit source fixture");
 
         let mut messages = vec![message("snapshot-message", vec![source.id.clone()])];
+        // Production forks remap message ownership before snapshotting.
+        messages[0].conversation_id = "persona".to_string();
         snapshot_message_attachments("persona", &mut messages).expect("snapshot attachment");
         let snapshot_id = messages[0].attachment_ids[0].clone();
         assert_ne!(snapshot_id, source.id);
@@ -3749,6 +3799,16 @@ mod tests {
                 .text_by_message_id
                 .get("snapshot-message")
                 .is_some_and(|text| text.contains("stable source notes"))
+        );
+
+        let mut foreign = messages.clone();
+        foreign[0].conversation_id = "source".to_string();
+        let blocked = prepare_chat_attachments("persona", &foreign, Some("__snapshot__"))
+            .expect("ownership check")
+            .expect_err("a foreign message cannot borrow the snapshot");
+        assert_eq!(
+            blocked.blocker.code,
+            "attachment_message_ownership_mismatch"
         );
     }
 
@@ -4079,6 +4139,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: Some(concurrent_branch.id.clone()),
+            recipient_ids: Vec::new(),
             current_skill_ids: vec!["concurrent-skill".to_string()],
             messages: vec![base.clone(), concurrent_branch.clone()],
         };
@@ -4152,6 +4213,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: Some(generated_assistant.id.clone()),
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: vec![
                 base.clone(),
@@ -4333,6 +4395,7 @@ mod tests {
             std::slice::from_ref(&staged.id),
             &user.id,
             None,
+            &[],
             "test.mention-journal",
             Journal::default,
             |journal| {
@@ -4371,6 +4434,291 @@ mod tests {
                 .expect("derived projection read")
                 .is_none()
         );
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct ConsultJournal {
+        committed: bool,
+    }
+
+    fn selected_source(
+        conversation: &Conversation,
+        attachment_id: &str,
+    ) -> SelectedAttachmentSource {
+        let owner = conversation
+            .messages
+            .iter()
+            .find(|message| message.attachment_ids.iter().any(|id| id == attachment_id))
+            .expect("source message owns the attachment");
+        let active = crate::document::checked_active_messages(conversation)
+            .expect("validated source history");
+        let context = prepare_scoped_chat_attachments(
+            &conversation.id,
+            &active,
+            CurrentAttachmentSelection::HistoryOnly,
+        )
+        .expect("prepare source attachments")
+        .expect("source attachment context");
+        let representation = context
+            .sources_by_message_id
+            .get(&owner.id)
+            .expect("selected source representation")
+            .iter()
+            .find(|source| source.attachment_id == attachment_id)
+            .expect("exact attachment source")
+            .clone();
+        SelectedAttachmentSource {
+            conversation_id: conversation.id.clone(),
+            message_id: owner.id.clone(),
+            representation,
+        }
+    }
+
+    fn commit_host_with_selected_source(
+        mut host: Conversation,
+        source: &SelectedAttachmentSource,
+        staged_ids: &[String],
+        expected_draft: Option<&DraftMessage>,
+    ) -> Result<(PathBuf, ())> {
+        let mut user = message("consult-user", staged_ids.to_vec());
+        user.conversation_id = host.id.clone();
+        host.messages.push(user.clone());
+        host.active_leaf_message_id = Some(user.id.clone());
+        commit_generated_exchange_with_journal(
+            load_db()?,
+            host,
+            None,
+            std::slice::from_ref(&user.id),
+            staged_ids,
+            &user.id,
+            expected_draft,
+            std::slice::from_ref(source),
+            "test.consult-source-journal",
+            ConsultJournal::default,
+            |journal| {
+                journal.committed = true;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )
+    }
+
+    #[test]
+    fn unchanged_consult_source_commits_with_the_generated_message() {
+        let _session = TestDataDir::new("consult-source-unchanged");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+
+        commit_host_with_selected_source(host, &selected, &[], None).expect("exact source commit");
+        let committed = crate::conversation_store::conversation_select(&host_id)
+            .expect("read committed host")
+            .result
+            .expect("host conversation");
+        assert_eq!(committed.messages.len(), 1);
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<ConsultJournal>("test.consult-source-journal")
+                .expect("read journal")
+                .is_some_and(|journal| journal.committed)
+        );
+    }
+
+    #[test]
+    fn citation_reopen_rechecks_occurrence_and_preserves_evidence_after_deletion() {
+        let _session = TestDataDir::new("consult-source-reopen");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let store = RuntimeStore::current().expect("store");
+        store
+            .put("test.retained-consult-source", &selected)
+            .expect("retain source evidence");
+        let opened = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &selected))
+            .expect("open exact occurrence");
+        assert!(opened.contains("exact source text"));
+        let mut changed = selected.clone();
+        changed.representation.manifest_sha256 = "0".repeat(64);
+        let changed_error = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &changed))
+            .expect_err("changed representation must fail");
+        assert!(changed_error.is::<StaleConsultSource>());
+        crate::conversation_store::conversation_delete(&source.id).expect("delete source later");
+        let error = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &selected))
+            .expect_err("deleted occurrence must remain stale");
+        assert!(error.is::<StaleConsultSource>());
+        assert_eq!(
+            store
+                .get::<SelectedAttachmentSource>("test.retained-consult-source")
+                .expect("read retained evidence"),
+            Some(selected)
+        );
+    }
+
+    #[test]
+    fn removed_consult_source_fails_in_the_real_commit_transaction() {
+        let _session = TestDataDir::new("consult-source-removed");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+        let store = RuntimeStore::current().expect("store");
+        store
+            .put(
+                "test.consult-input-receipt",
+                &serde_json::json!({ "planned": true }),
+            )
+            .expect("retain pre-generation evidence");
+
+        crate::conversation_store::conversation_delete(&source.id)
+            .expect("concurrent source removal");
+        let error = commit_host_with_selected_source(host, &selected, &[], None)
+            .expect_err("removed source must abort the transaction");
+        assert!(error.is::<StaleConsultSource>());
+        assert!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read unchanged host")
+                .result
+                .expect("host conversation")
+                .messages
+                .is_empty()
+        );
+        assert!(
+            store
+                .get::<ConsultJournal>("test.consult-source-journal")
+                .expect("read rolled-back journal")
+                .is_none()
+        );
+        assert!(
+            store
+                .get::<serde_json::Value>("test.consult-input-receipt")
+                .expect("read retained input evidence")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_source_deletion_cannot_erase_a_committed_consultation() {
+        let _session = TestDataDir::new("consult-stale-source-deletion");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+        let expected = load_db().expect("read state before source deletion");
+        let mut stale_deletion = expected.clone();
+        stale_deletion
+            .conversations
+            .retain(|conversation| conversation.id != source.id);
+        let removed_ids = BTreeSet::from([attachment.id.clone()]);
+
+        commit_host_with_selected_source(host, &selected, &[], None)
+            .expect("consultation commits before the stale deletion reaches storage");
+        let error = persist_conversations_with_attachment_gc(
+            &stale_deletion,
+            &expected,
+            None,
+            None,
+            &removed_ids,
+            &BTreeSet::from([source.id.clone()]),
+        )
+        .expect_err("stale deletion must not overwrite the committed consultation");
+        assert!(error.to_string().contains("conversation state changed"));
+        assert_eq!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read committed host")
+                .result
+                .expect("host conversation")
+                .messages
+                .len(),
+            1
+        );
+        assert!(
+            crate::conversation_store::conversation_select(&source.id)
+                .expect("read retained source")
+                .result
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn same_id_consult_source_replacement_fails_before_publication() {
+        let _session = TestDataDir::new("consult-source-replaced");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+
+        RuntimeStore::current()
+            .expect("store")
+            .mutate_documents(ATTACHMENTS_NAMESPACE, AttachmentDb::default, |db, _| {
+                db.attachments
+                    .iter_mut()
+                    .find(|record| record.id == attachment.id)
+                    .expect("exact source record")
+                    .file_name = "same-id replacement.txt".to_string();
+                Ok(())
+            })
+            .expect("replace representation under the same attachment ID");
+        let error = commit_host_with_selected_source(host, &selected, &[], None)
+            .expect_err("changed representation must abort the transaction");
+        assert!(error.is::<StaleConsultSource>());
+        assert!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read unchanged host")
+                .result
+                .expect("host conversation")
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn newly_staged_consult_source_is_validated_after_its_atomic_message_binding() {
+        let _session = TestDataDir::new("consult-current-staged-source");
+        let host = new_conversation("Host");
+        let staged = stage_text(&host.id, "current attached notes");
+        let context =
+            prepare_scoped_chat_attachments(&host.id, &[], CurrentAttachmentSelection::Draft)
+                .expect("prepare current attachment")
+                .expect("current attachment context");
+        let source = SelectedAttachmentSource {
+            conversation_id: host.id.clone(),
+            message_id: "consult-user".to_string(),
+            representation: context
+                .current_sources
+                .iter()
+                .find(|source| source.attachment_id == staged.id)
+                .expect("exact current source")
+                .clone(),
+        };
+        commit_host_with_selected_source(
+            host,
+            &source,
+            std::slice::from_ref(&staged.id),
+            context.draft_snapshot.as_ref(),
+        )
+        .expect("current source commits only with the new message and attachment");
+        let record = load_attachment_db()
+            .expect("committed attachment index")
+            .attachments
+            .into_iter()
+            .find(|record| record.id == staged.id)
+            .expect("retained current attachment");
+        assert_eq!(record.state, AttachmentState::Committed);
+        assert_eq!(record.message_id, "consult-user");
     }
 
     #[test]
@@ -4529,3 +4877,6 @@ mod tests {
         assert_eq!(blocked.blocker.code, "attachment_content_mismatch");
     }
 }
+
+mod document_chat;
+pub use document_chat::prepare_document_chat_in_scope;

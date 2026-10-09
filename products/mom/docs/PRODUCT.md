@@ -7,11 +7,25 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
 
 ## Product behavior
 
+- New Chat and Persona clicks reuse one encrypted unsent draft. Text and attachments
+  survive navigation and restart. The first submission atomically creates a chat
+  and transfers the draft; empty drafts never enter the conversation list.
 - Chat, generation, streaming and cancellation use the exact model profile of
   the active conversation.
 - A Persona is a versioned conversation branch plus an execution profile:
-  model, optional system message/projector, sampler, template policy, context
-  budgets and allowlisted tools.
+  model, optional system message/projector, sampler and template policy.
+  Personas do not grant MCP tools or override context length.
+- Context length is global and planned from physical host RAM and supported GGUF
+  metadata. Model and projector weights must fit within half of RAM. Weights,
+  estimated KV, backend workspace, sequence metadata and prefix copies together
+  must fit within two thirds of RAM, rounded down. The context also cannot exceed
+  the model's declared capacity. Admission rejects models without a supported
+  attention memory plan. This is conservative admission planning, not an OS RSS
+  limit; native allocation and supported hardware still require qualification.
+- Chat titles derive from the first submitted message until renamed. Clicking
+  the selected chat opens Rename; native chat menus also expose Rename, Delete
+  and Save as Persona. Branch at a message before saving a partial chat as a
+  Persona.
 - Persona templates remain editable. Sending from one instantiates a normal
   chat; the template never silently accumulates ordinary traffic.
 - Consult groups are ordered Settings records containing one to four Persona

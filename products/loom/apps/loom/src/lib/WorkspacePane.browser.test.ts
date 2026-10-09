@@ -219,3 +219,14 @@ describe('workspace panes', () => {
   });
 
 });
+
+it('chat input preserves IME confirmation, Alt-Return and native editing context-menu ownership', async () => {
+  await render();
+  const field = page.getByRole('textbox', { name: 'Message' }); await field.fill('Draft');
+  const input = field.element();
+  for (const init of [{ key: 'Enter', keyCode: 229 }, { key: 'Enter', altKey: true }]) {
+    const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true }); input.dispatchEvent(event); expect(event.defaultPrevented).toBe(false);
+  }
+  expect(ipc.run).not.toHaveBeenCalled();
+  const menu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true }); input.dispatchEvent(menu); expect(menu.defaultPrevented).toBe(false);
+});

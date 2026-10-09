@@ -24,6 +24,11 @@ mod speech_input;
 mod terminal;
 mod terminal_media;
 mod terminal_receipts;
+mod workspace_chat;
+pub use workspace_chat::{
+    WorkspaceChatExecutor, WorkspaceChatFuture, WorkspaceChatOutput, WorkspaceChatRequest,
+    WorkspaceChatRoute, WorkspaceChatService,
+};
 mod workspace_copy;
 mod workspace_preview;
 mod workspace_template;
@@ -538,7 +543,21 @@ impl PluginState {
         isolate_model_discovery: bool,
         build_model_policy: BuildModelPolicy,
     ) -> Self {
-        let native_runtime = Arc::new(NativeHostRuntime::default());
+        Self::with_app_local_data_root_and_runtime(
+            app_local_data_root,
+            isolate_model_discovery,
+            build_model_policy,
+            None,
+        )
+    }
+
+    fn with_app_local_data_root_and_runtime(
+        app_local_data_root: Option<PathBuf>,
+        isolate_model_discovery: bool,
+        build_model_policy: BuildModelPolicy,
+        runtime: Option<Arc<NativeHostRuntime>>,
+    ) -> Self {
+        let native_runtime = runtime.unwrap_or_else(|| Arc::new(NativeHostRuntime::default()));
         let backend = Arc::new(LlamaBackend::with_default_native_runtime(Arc::clone(
             &native_runtime,
         )));
@@ -2058,12 +2077,19 @@ pub struct Builder {
     build_model_policy: BuildModelPolicy,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
+    application_native_runtime: Option<Arc<NativeHostRuntime>>,
 }
 
 impl Builder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_application_native_runtime(mut self, runtime: Arc<NativeHostRuntime>) -> Self {
+        self.application_native_runtime = Some(runtime);
+        self
     }
 
     #[must_use]
@@ -2090,6 +2116,7 @@ impl Builder {
         let build_model_policy = self.build_model_policy;
         let app_local_data_root = self.app_local_data_root;
         let isolate_model_discovery = self.isolate_model_discovery;
+        let application_native_runtime = self.application_native_runtime;
         PluginBuilder::new("loom")
             .register_uri_scheme_protocol(LOOM_ASSET_SCHEME, |context, request| {
                 let Some(state) = context.app_handle().try_state::<PluginState>() else {
@@ -2120,6 +2147,7 @@ impl Builder {
                 material_commands::material_read_evidence,
                 material_commands::material_bind_attachment,
                 material_commands::material_set_pinned,
+                material_commands::material_rename,
                 material_commands::material_remove,
                 material_commands::material_add_library,
                 material_commands::material_add_library_path,
@@ -2189,6 +2217,7 @@ impl Builder {
                 branch_body,
                 weave_status,
                 weave_start,
+                workspace_chat::workspace_chat_route,
                 terminal_run,
                 terminal_list,
                 terminal_cancel,
@@ -2206,10 +2235,11 @@ impl Builder {
                 let app_local_data_root = app_local_data_root
                     .clone()
                     .or_else(|| app.path().app_local_data_dir().ok());
-                let mut state = PluginState::with_app_local_data_root(
+                let mut state = PluginState::with_app_local_data_root_and_runtime(
                     app_local_data_root,
                     isolate_model_discovery,
                     build_model_policy,
+                    application_native_runtime,
                 );
                 let inference_path = if isolate_model_discovery {
                     state
@@ -11930,7 +11960,7 @@ mod tests {
         }
     }
 
-    fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
+    pub(super) fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
         let expectation = test_policy_expectation(stable_model_id.as_bytes());
         LoadedModel {
             selected_path: path.to_path_buf(),

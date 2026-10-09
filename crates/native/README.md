@@ -3,12 +3,15 @@
 Reusable, product-neutral Rust crates for loading GGUF models through llama.cpp
 inside the caller's process.
 
-This repository is deliberately **not an application**. Mom Llama was
-history-preservingly extracted to the private
-[`delysis/mom-llama`](https://github.com/delysis/mom-llama) repository. Routing,
-hosted providers, compatibility APIs, loopback listeners, STT and TTS live in
-[`delysis/free-token-energy`](https://github.com/delysis/free-token-energy).
-The old Mom Llama experiment in capability-system-compiler is non-canonical.
+These product-neutral crates are part of the `delysis/native-platform`
+monorepo, not a separate application or the active standalone repository.
+Mom's retained chat implementation lives in `products/mom`; the canonical Loom
+executable selects that chat shell or the normal Tauri document shell.
+`products/fte` owns hosted routing and compatibility APIs. Shared Speech lives
+in `crates/services/speech`; it is not owned by FTE. Mom calls Native directly
+for local generation, and its application root composes Speech and Information.
+The old standalone repositories and capability-system-compiler experiment are
+historical, not the source of current product ownership.
 
 The runtime does not use `llama-server`, `llama-cli`, localhost, HTTP, TCP or
 SSE for inference. It owns only model loading, scheduling, tokenization,
@@ -56,16 +59,18 @@ calling the native state parser.
   budgeting, cancellation, lifecycle, and injected cache persistence.
 
 [`docs/FREE_TOKEN_ENERGY_INTEGRATION.md`](docs/FREE_TOKEN_ENERGY_INTEGRATION.md)
-documents the typed adapter boundary. See [`docs/MODULE_BOUNDARIES.md`](docs/MODULE_BOUNDARIES.md)
-for the authoritative repository and dependency map.
+records the typed FTE adapter boundary. Imported documents may retain historical
+standalone paths; the root workspace manifest, root architecture checks and
+actual product composition roots determine current ownership. Native remains
+usable without FTE, HTTP or a loopback listener.
 
 ## Gates
 
 Run the required local gates:
 
 ```sh
+# From the native-platform repository root:
 cargo fmt --all --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-./scripts/check-architecture.sh
+cargo test --offline --locked -p llama-native-types -p llama-native-cache -p llama-native-engine -p llama-native-host
+cargo clippy --offline --locked -p llama-native-types -p llama-native-cache -p llama-native-engine -p llama-native-host --all-targets -- -D warnings
 ```

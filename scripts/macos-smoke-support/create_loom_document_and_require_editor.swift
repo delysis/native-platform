@@ -31,7 +31,11 @@ func descendants() -> [AXUIElement] {
 func controls(named needle: String) -> [AXUIElement] {
     descendants().filter { element in
         let role = stringAttribute(element, kAXRoleAttribute as CFString)
-        guard role == kAXButtonRole as String || role == kAXMenuItemRole as String else {
+        // WebKit exposes the Add button as a pop-up button when aria-haspopup
+        // is a menu, even though the DOM element is still a button.
+        guard role == kAXButtonRole as String ||
+              role == kAXPopUpButtonRole as String ||
+              role == kAXMenuItemRole as String else {
             return false
         }
         let labels = [

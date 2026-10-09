@@ -1,10 +1,21 @@
 [package]
 name = "mom-llama-app"
+autobins = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+# Keep the historical source path: source-bound lifecycle/command tests read it.
+[lib]
+name = "mom_llama_app"
+path = "src/main.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "mom-llama-app"
+path = "src/launcher.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,6 +37,7 @@ information-native-attachment-bridge.workspace = true
 information-native-backend-sqlite.workspace = true
 chrono.workspace = true
 maud = "0.26"
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true

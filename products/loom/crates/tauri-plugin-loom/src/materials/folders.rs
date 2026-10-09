@@ -64,6 +64,7 @@ fn owner(folder: &FolderSnapshot) -> Result<MaterialEntry> {
         source_path: Some(folder.prefix.clone()),
         attachment_id: None,
         workspace_path: None,
+        metadata_revision: None,
     })
 }
 

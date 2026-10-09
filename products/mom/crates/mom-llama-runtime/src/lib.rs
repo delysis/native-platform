@@ -3,9 +3,11 @@ pub mod chat;
 pub mod composer;
 pub mod config;
 pub mod conversation_store;
+pub mod document;
 pub mod engine;
 pub mod kv_cache;
 pub mod mcp;
+mod memory_policy;
 pub mod mentions;
 pub mod models;
 pub mod native_runtime;
@@ -28,6 +30,7 @@ pub use attachments::{
     AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
     attachment_import_pasted_text, attachment_library_input, attachment_list, attachment_preview,
     attachment_preview_content, attachment_preview_media, attachment_transcription_input,
+    prepare_document_chat_in_scope,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
@@ -47,8 +50,10 @@ pub use config::{
 pub use conversation_store::{
     ChatTemplatePolicy, Conversation, ConversationBranchSibling, ConversationExecutionProfile,
     ConversationExportFormat, ConversationKind, ConversationMutation, ConversationSearchHit,
-    DraftMessage, Message, MessageAttribution, MessageBranchSet, MessageBranchSibling, MessageCopy,
-    MessageRole, MessageSpeakerKind, TextAttachmentImport, ToolBinding, conversation_delete,
+    DraftMessage, DraftRecipients, Message, MessageAttribution, MessageBranchSet,
+    MessageBranchSibling, MessageCopy, MessageRole, MessageSpeakerKind, TextAttachmentImport,
+    ToolBinding, conversation_delete, conversation_draft_open, conversation_draft_preview,
+    conversation_draft_recipients, conversation_draft_recipients_update, conversation_draft_submit,
     conversation_export, conversation_fork, conversation_import_json, conversation_list,
     conversation_new, conversation_rename, conversation_search, conversation_select,
     conversation_siblings, conversation_system_message_update, draft_clear, draft_get,
@@ -64,13 +69,14 @@ pub use mcp::{
     mcp_list_servers, mcp_list_tools_in_scope, mcp_read_resource_in_scope, mcp_status,
 };
 pub use mentions::{
-    ChatDispatchOutput, ChatDispatchStreamEvent, MentionCancelOutput, MentionCandidate,
-    MentionDispatchInput, MentionInvocation, MentionInvocationState, MentionStreamEvent,
-    MentionSynthesisOutput, MentionTargetKind, MentionTargetResult, MentionTargetSnapshot,
-    MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
-    MentionToolApprovalState, MentionToolEffectOutcome, PersonaToolApprovalRecovery,
-    chat_dispatch_in_scope, chat_dispatch_stream_in_scope, mention_cancel_in_scope,
-    mention_candidates, mention_dispatch_in_scope, mention_synthesize,
+    ChatDispatchOutput, ChatDispatchStreamEvent, ConsultSourcePreview, MentionCancelOutput,
+    MentionCandidate, MentionDispatchInput, MentionInvocation, MentionInvocationState,
+    MentionStreamEvent, MentionSynthesisOutput, MentionTargetKind, MentionTargetResult,
+    MentionTargetSnapshot, MentionToolApproval, MentionToolApprovalDecision,
+    MentionToolApprovalResolution, MentionToolApprovalState, MentionToolEffectOutcome,
+    PersonaToolApprovalRecovery, chat_dispatch_in_scope, chat_dispatch_stream_in_scope,
+    consult_source_open, consult_sources, mention_cancel_in_scope, mention_candidates,
+    mention_dispatch_in_scope, mention_history, mention_synthesize,
     mention_tool_approval_decide_in_scope, mention_tool_approval_decide_with_recovery_in_scope,
     mention_tool_approval_list, reconcile_persona_tool_approvals,
     reconcile_persona_tool_approvals_command,

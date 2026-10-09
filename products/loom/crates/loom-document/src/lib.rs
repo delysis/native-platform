@@ -124,9 +124,10 @@ pub fn project_artifact_slices<'a, F>(
 where
     F: FnMut(ArtifactId) -> Result<&'a [u8], DocumentError>,
 {
-    let mut projected = Vec::new();
+    let mut projected = workspace_document::Document::new();
     for slice in slices {
         let bytes = resolve(slice.artifact_id)?;
+        // Preserve the owner's specific error codes and source identities.
         let start = usize::try_from(slice.range.start).map_err(|_| DocumentError::RangeTooLarge)?;
         let end = usize::try_from(slice.range.end).map_err(|_| DocumentError::RangeTooLarge)?;
         let selected = bytes
@@ -136,15 +137,23 @@ where
                 range: slice.range,
                 byte_len: bytes.len(),
             })?;
-        if std::str::from_utf8(selected).is_err() {
-            return Err(DocumentError::RangeSplitsUtf8 {
-                artifact_id: slice.artifact_id,
-                range: slice.range,
-            });
-        }
-        projected.extend_from_slice(selected);
+        std::str::from_utf8(selected).map_err(|_| DocumentError::RangeSplitsUtf8 {
+            artifact_id: slice.artifact_id,
+            range: slice.range,
+        })?;
+        // Source includes the occurrence's exact range. No deduplication by
+        // digest, path acquisition, or citation authority is introduced.
+        projected
+            .push_slice(
+                slice.clone(),
+                bytes,
+                slice.range.start..slice.range.end,
+                workspace_document::PartKind::Text,
+                (),
+            )
+            .map_err(DocumentError::Projection)?;
     }
-    Ok(projected)
+    Ok(projected.text().into_bytes())
 }
 
 pub fn canonicalize_prose(text: &str) -> String {
@@ -173,6 +182,8 @@ fn usize_to_u64(value: usize) -> Result<u64, DocumentError> {
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
+    #[error("common document projection failed: {0}")]
+    Projection(#[from] workspace_document::DocumentError),
     #[error("document is not valid UTF-8: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     #[error("document is too large to represent with 64-bit byte ranges")]

@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/desktop-launch",
+    "crates/workspace-document",
     "crates/desktop-model-defaults",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
@@ -64,6 +66,8 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-launch = { path = "crates/desktop-launch" }
+workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"
@@ -198,6 +202,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Rust's Mach-O stripping can misalign a compiler plugin's LINKEDIT string pool.
+# Keep host build dependencies loadable; shipping release code still strips symbols.
+[profile.release.build-override]
+strip = "none"
 
 [patch.crates-io]
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.

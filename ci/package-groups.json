@@ -2,7 +2,9 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
-      "desktop-model-defaults"
+      "desktop-launch",
+      "desktop-model-defaults",
+      "workspace-document"
     ],
     "native": [
       "llama-native-cache",
@@ -75,12 +77,13 @@
   },
   "secondary": {
     "portable": [
-      "desktop-model-defaults",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
+      "desktop-launch",
+      "desktop-model-defaults",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",
@@ -109,7 +112,8 @@
       "mom-llama-runtime",
       "speech-native-host",
       "speech-native-router",
-      "speech-native-types"
+      "speech-native-types",
+      "workspace-document"
     ],
     "platform-linux": [
       "free-token-energy",

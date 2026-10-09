@@ -210,11 +210,13 @@ struct RunReceipt {
     omitted_evidence: BTreeSet<String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_chat: Option<crate::WorkspaceChatOutput>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct TerminalControl {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     current: Mutex<Option<Arc<LlamaGenerationControl>>>,
     joined: AtomicUsize,
     panicked: AtomicBool,
@@ -385,6 +387,25 @@ fn prompt_reference_names(
     }
 }
 
+fn workspace_chat_reference_names(
+    input: &str,
+    configured: Option<&[String]>,
+) -> Result<BTreeSet<String>, IpcFailure> {
+    let configured = configured.unwrap_or_default();
+    validate_explicit_references(configured)?;
+    let mut names = configured.iter().cloned().collect::<BTreeSet<_>>();
+    // Retained links inserted by the existing pane are passive source identity,
+    // not Persona addresses. Resolve them through the existing grant, snapshot
+    // and media gates before dispatch; never reinterpret their friendly labels.
+    // Bare @addresses remain Mom's participant grammar.
+    for reference in document_references(input).map_err(io_failure)? {
+        if input.as_bytes().get(reference.range.start) == Some(&b'[') {
+            names.insert(reference.name);
+        }
+    }
+    Ok(names)
+}
+
 fn bounded(value: String) -> Result<String, IpcFailure> {
     if value.len() > MAX_PROMPT_BYTES {
         Err(failure(
@@ -465,6 +486,17 @@ pub(super) async fn terminal_run<R: Runtime>(
             "Run presentation needs a valid pane name and input within 64 KiB.",
         ));
     }
+    let workspace_chat = if matches!(turn_boundary, Some(TerminalTurnBoundary::Chat)) {
+        app.try_state::<crate::WorkspaceChatService<R>>()
+            .map(|service| service.inner().clone())
+    } else {
+        None
+    };
+    if workspace_chat.is_some() && presentation.is_none() {
+        return Err(failure(
+            "A workspace chat needs its original message and pane identity.",
+        ));
+    }
     let mut fingerprint_bytes = serde_json::to_vec(&(
         &project_id,
         &document_id,
@@ -536,10 +568,26 @@ pub(super) async fn terminal_run<R: Runtime>(
     if entry.trim().is_empty() {
         return Err(failure("Write or select an idea to try."));
     }
-    let command = parse_neural_command(&entry).map_err(io_failure)?;
+    let command = if workspace_chat.is_some() {
+        NeuralCommand::Prompt(
+            presentation
+                .as_ref()
+                .expect("validated chat presentation")
+                .input
+                .clone(),
+        )
+    } else {
+        parse_neural_command(&entry).map_err(io_failure)?
+    };
     let mut names = BTreeSet::new();
     let mut calls = 0;
     match &command {
+        NeuralCommand::Prompt(text) if workspace_chat.is_some() => {
+            if text.trim().is_empty() {
+                return Err(failure("Write a message to send."));
+            }
+            names = workspace_chat_reference_names(text, context_references.as_deref())?;
+        }
         NeuralCommand::Prompt(text) => {
             names = prompt_reference_names(
                 text,
@@ -617,6 +665,34 @@ pub(super) async fn terminal_run<R: Runtime>(
             }
         }
         bindings.insert(name, value);
+    }
+    if workspace_chat.is_some() {
+        if !material_context::native_media(store, bindings.values())?.is_empty() {
+            return Err(IpcFailure::new(
+                "workspace_chat_media_unbound",
+                "Loom media is not yet bound to Mom. Use a retained Mom persona attachment for this consultation.",
+                false,
+            ));
+        }
+        for id in std::iter::once(source.document_id)
+            .chain(sources.iter().map(|document| document.document_id))
+        {
+            let context = crate::context_attachments::document_context_snapshot(
+                store.root(),
+                &id.to_string(),
+            )
+            .map_err(io_failure)?;
+            if !context.markdown.is_empty()
+                || !context.attachments.is_empty()
+                || !context.materials.is_empty()
+            {
+                return Err(IpcFailure::new(
+                    "workspace_chat_context_unbound",
+                    "This document has additional instructions or attachment context that is not yet bound to Mom. Use a text document or a retained Mom persona source.",
+                    false,
+                ));
+            }
+        }
     }
     let media = if let Some(model) = &model {
         let media = crate::terminal_media::resolve(
@@ -698,6 +774,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         omitted_evidence: BTreeSet::new(),
         sources,
         steps: Vec::new(),
+        workspace_chat: None,
     };
     let identity = GenerationFamilyIdentity {
         request_id: format!("terminal-{command_id}"),
@@ -781,7 +858,18 @@ pub(super) async fn terminal_run<R: Runtime>(
                 folder_scan_budget: material_context::FolderScanBudget::default(),
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                evaluator.evaluate_command(&command)
+                if let Some(service) = &workspace_chat {
+                    let request = evaluator.workspace_chat_request()?;
+                    let output = tauri::async_runtime::block_on(service.dispatch(
+                        worker_app.clone(),
+                        request,
+                        worker_control.cancelled.clone(),
+                    ))
+                    .map_err(io_failure)?;
+                    evaluator.retain_workspace_chat(output)
+                } else {
+                    evaluator.evaluate_command(&command)
+                }
             }));
             let outcome = outcome.unwrap_or_else(|_| {
                 worker_control.panicked.store(true, Ordering::Release);
@@ -1259,6 +1347,66 @@ impl Evaluator<'_> {
         self.receipt.run.output_relative_path = Some(path);
         self.receipt.run.preview = text.chars().take(2000).collect();
         Ok(())
+    }
+
+    fn workspace_chat_request(&mut self) -> Result<crate::WorkspaceChatRequest, IpcFailure> {
+        let presentation = self
+            .receipt
+            .run
+            .presentation
+            .as_ref()
+            .expect("validated chat presentation");
+        let pane_id = presentation.pane_id.clone();
+        let message = presentation.input.clone();
+        let mut context = Vec::new();
+        let mut used = message.len();
+        for (name, value) in self.receipt.bindings.clone() {
+            let consulted =
+                self.consult(&value, &message, MAX_PROMPT_BYTES.saturating_sub(used))?;
+            let text = material_context::exact(&consulted)?;
+            let snapshot = serde_json::to_string(&serde_json::json!({
+                "schema": "loom_document_context_snapshot.v1",
+                "reference": name, "text": text,
+            }))
+            .map_err(io_failure)?;
+            used = used.saturating_add(snapshot.len());
+            if used > MAX_PROMPT_BYTES {
+                return Err(failure(
+                    "The document context exceeds the workspace chat budget.",
+                ));
+            }
+            context.push(snapshot);
+        }
+        Ok(crate::WorkspaceChatRequest {
+            project_id: self.identity.project_id.to_string(),
+            pane_id,
+            message,
+            context,
+        })
+    }
+
+    fn retain_workspace_chat(
+        &mut self,
+        output: crate::WorkspaceChatOutput,
+    ) -> Result<Value, IpcFailure> {
+        let text = bounded(output.text.clone())?;
+        self.receipt.workspace_chat = Some(output);
+        // Record the already committed Mom result before projecting a document.
+        // A failed projection cannot justify another model invocation on replay.
+        self.with_store(|store| {
+            crate::terminal_receipts::write_chat_commit(
+                store.root(),
+                &self.receipt.run.run_id,
+                &serde_json::to_vec(&self.receipt).map_err(io_failure)?,
+            )
+        })?;
+        let evidence = self.with_store(|store| {
+            store
+                .store_provenance_blob(&serde_json::to_vec(&self.receipt).map_err(io_failure)?)
+                .map_err(IpcFailure::store)
+        })?;
+        self.retain(&text, evidence, true, "result")?;
+        Ok(Value::Text(text))
     }
 
     fn finish(&mut self, outcome: Result<Value, IpcFailure>) -> Result<(), IpcFailure> {

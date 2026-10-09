@@ -13,14 +13,12 @@ pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
 pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
+pub(crate) fn valid_occurrence_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
+
+// One role type, with the same serde wire names and public module path.
+pub use workspace_document::MessageRole;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +159,8 @@ pub struct Conversation {
     #[serde(default)]
     pub active_leaf_message_id: Option<String>,
     #[serde(default)]
+    pub recipient_ids: Vec<String>,
+    #[serde(default)]
     pub current_skill_ids: Vec<String>,
     #[serde(default)]
     pub messages: Vec<Message>,
@@ -189,6 +189,8 @@ pub struct ConversationExport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationSearchHit {
     pub conversation_id: String,
+    pub kind: ConversationKind,
+    pub active_leaf_message_id: Option<String>,
     pub title: String,
     pub snippet: String,
     pub message_count: usize,
@@ -261,34 +263,290 @@ pub struct TextAttachmentImport {
     pub bytes: u64,
 }
 
+pub(crate) const NEW_CHAT_CONTEXT_NAMESPACE: &str = "conversation.new-draft-context.v1";
+
+pub(crate) const NEW_CHAT_RECIPIENTS_NAMESPACE: &str = "conversation.new-draft-recipients.v1";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftRecipients {
+    pub recipient_ids: Vec<String>,
+    pub name: Option<String>,
+}
+
+pub fn conversation_draft_recipients() -> Result<DraftRecipients> {
+    let store = RuntimeStore::current()?;
+    if let Some(recipients) = store.get(NEW_CHAT_RECIPIENTS_NAMESPACE)? {
+        return Ok(recipients);
+    }
+    let persona: Option<String> = store.get(NEW_CHAT_CONTEXT_NAMESPACE)?.unwrap_or_default();
+    Ok(DraftRecipients {
+        recipient_ids: persona.into_iter().collect(),
+        name: None,
+    })
+}
+
+/// Recipients are stable identities, never inferred from text in the composer.
+/// This changes the single unsent draft without creating a chat or contact group.
+pub fn conversation_draft_recipients_update(
+    recipient_ids: Vec<String>,
+    name: Option<String>,
+) -> Result<CommandResult<DraftRecipients>> {
+    crate::personas::ensure_builtin_catalog()?;
+    let store = RuntimeStore::current()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let rejected = |message: &str| {
+                Ok(Err(Blocker::new(
+                    "invalid_draft_recipients",
+                    message,
+                    Vec::new(),
+                )))
+            };
+            if db
+                .selected_conversation_id
+                .as_deref()
+                .is_some_and(|id| id != "default")
+            {
+                return rejected("The draft is no longer selected");
+            }
+            if recipient_ids.len() > 4 {
+                return rejected("At most four contacts may be selected");
+            }
+            let mut unique = HashSet::new();
+            for id in &recipient_ids {
+                if !unique.insert(id) {
+                    return rejected("Duplicate contact");
+                }
+                if !db.conversations.iter().any(|contact| {
+                    contact.id == *id && contact.kind == ConversationKind::PersonaTemplate
+                }) {
+                    return rejected("Contact is unavailable");
+                }
+            }
+            let name = name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if name.as_ref().is_some_and(|value| {
+                value.chars().count() > 120 || value.chars().any(char::is_control)
+            }) {
+                return rejected("Invalid group name");
+            }
+            let recipients = DraftRecipients {
+                recipient_ids,
+                name,
+            };
+            let persona =
+                (recipients.recipient_ids.len() == 1).then(|| recipients.recipient_ids[0].clone());
+            documents.put_bytes(NEW_CHAT_CONTEXT_NAMESPACE, &serde_json::to_vec(&persona)?)?;
+            documents.put_bytes(
+                NEW_CHAT_RECIPIENTS_NAMESPACE,
+                &serde_json::to_vec(&recipients)?,
+            )?;
+            db.selected_conversation_id = Some("default".to_string());
+            Ok(Ok(recipients))
+        },
+    )?;
+    Ok(match result {
+        Ok(recipients) => CommandResult::passed(
+            "mom_llama.conversation_draft_recipients_update",
+            "contracted",
+            recipients,
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        ),
+        Err(blocker) => CommandResult::blocked(
+            "mom_llama.conversation_draft_recipients_update",
+            "blocked_recipients",
+            blocker,
+        ),
+    })
+}
+
+/// Opening a composer selects one durable draft, never a saved conversation.
+pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<Option<String>>> {
+    let store = RuntimeStore::current()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let current: Option<String> = documents
+                .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+                .unwrap_or_default();
+            let explicit_persona = persona.is_some();
+            let selected = persona.or(current);
+            if explicit_persona {
+                let recipients = DraftRecipients {
+                    recipient_ids: selected.iter().cloned().collect(),
+                    name: None,
+                };
+                documents.put_bytes(
+                    NEW_CHAT_RECIPIENTS_NAMESPACE,
+                    &serde_json::to_vec(&recipients)?,
+                )?;
+            }
+            if let Some(id) = &selected {
+                anyhow::ensure!(
+                    db.conversations
+                        .iter()
+                        .any(|conversation| conversation.id == *id
+                            && conversation.kind == ConversationKind::PersonaTemplate),
+                    "Persona is unavailable"
+                );
+            }
+            documents.put_bytes(NEW_CHAT_CONTEXT_NAMESPACE, &serde_json::to_vec(&selected)?)?;
+            db.selected_conversation_id = Some("default".to_string());
+            Ok(selected)
+        },
+    )?;
+    Ok(CommandResult::passed(
+        "mom_llama.conversation_draft_open",
+        "contracted",
+        result,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn conversation_draft_preview() -> Result<Option<Conversation>> {
+    let persona: Option<String> = RuntimeStore::current()?
+        .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(persona) = persona else {
+        return Ok(None);
+    };
+    let mut preview = load_db()?
+        .conversations
+        .into_iter()
+        .find(|conversation| {
+            conversation.id == persona && conversation.kind == ConversationKind::PersonaTemplate
+        })
+        .ok_or_else(|| anyhow::anyhow!("Draft Persona is unavailable"))?;
+    preview.source_conversation_id = Some(preview.id.clone());
+    preview.id = "default".to_string();
+    preview.messages.clear();
+    preview.active_leaf_message_id = None;
+    Ok(Some(preview))
+}
+
+/// Materialize only after the shared draft has a submitted message or attachment.
+pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
+    crate::personas::ensure_builtin_catalog()?;
+    let store = RuntimeStore::current()?;
+    let _attachments = crate::attachments::lock_attachment_lifecycle()?;
+    let settings = resolve_settings()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let mut drafts: DraftDb = documents.get(DRAFTS_NAMESPACE)?.unwrap_or_default();
+            let Some(index) = drafts.drafts.iter().position(|draft| {
+                draft_key(draft.conversation_id.as_deref()) == NEW_CHAT_DRAFT_KEY
+            }) else {
+                return Ok(Err(Blocker::new("empty_draft", "Empty draft", Vec::new())));
+            };
+            if drafts.drafts[index].message.trim().is_empty()
+                && drafts.drafts[index].attachment_ids.is_empty()
+            {
+                return Ok(Err(Blocker::new("empty_draft", "Empty draft", Vec::new())));
+            }
+            let persona: Option<String> = documents
+                .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+                .unwrap_or_default();
+            let id = Uuid::new_v4().to_string();
+            let now = now_ms().to_string();
+            let recipients: DraftRecipients = documents
+                .get(NEW_CHAT_RECIPIENTS_NAMESPACE)?
+                .unwrap_or_else(|| DraftRecipients {
+                    recipient_ids: persona.iter().cloned().collect(),
+                    name: None,
+                });
+            for recipient in &recipients.recipient_ids {
+                anyhow::ensure!(
+                    db.conversations
+                        .iter()
+                        .any(|contact| contact.id == *recipient
+                            && contact.kind == ConversationKind::PersonaTemplate),
+                    "Contact is unavailable"
+                );
+            }
+            let mut conversation = if let Some(persona) = persona {
+                match crate::personas::instantiate_from_documents(
+                    db, documents, &persona, None, &id, &now,
+                )? {
+                    Ok(conversation) => conversation,
+                    Err(blocker) => return Ok(Err(blocker)),
+                }
+            } else {
+                let conversation = new_conversation(
+                    title_from_text(&drafts.drafts[index].message),
+                    &settings,
+                    id,
+                    now,
+                );
+                db.selected_conversation_id = Some(conversation.id.clone());
+                db.conversations.insert(0, conversation.clone());
+                conversation
+            };
+            conversation.recipient_ids = recipients.recipient_ids;
+            if let Some(name) = recipients.name {
+                conversation.title = name;
+            }
+            let saved = db
+                .conversations
+                .iter_mut()
+                .find(|saved| saved.id == conversation.id)
+                .expect("newly created conversation");
+            *saved = conversation.clone();
+            documents.put_bytes(
+                NEW_CHAT_RECIPIENTS_NAMESPACE,
+                &serde_json::to_vec(&DraftRecipients::default())?,
+            )?;
+            // Creation and transfer share one encrypted store transaction. A repeated
+            // submission sees no new draft and cannot create another empty chat.
+            crate::attachments::transfer_new_draft_attachments(
+                documents,
+                &drafts.drafts[index].attachment_ids,
+                &conversation.id,
+            )?;
+            drafts.drafts[index].conversation_id = Some(conversation.id.clone());
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            documents.put_bytes(
+                NEW_CHAT_CONTEXT_NAMESPACE,
+                &serde_json::to_vec(&None::<String>)?,
+            )?;
+            Ok(Ok(conversation))
+        },
+    )?;
+    match result {
+        Ok(conversation) => Ok(CommandResult::passed(
+            "mom_llama.conversation_draft_submit",
+            "contracted",
+            conversation,
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        )),
+        Err(blocker) => Ok(CommandResult::blocked(
+            "mom_llama.conversation_draft_submit",
+            "blocked_draft",
+            blocker,
+        )),
+    }
+}
+
 pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversation>> {
     let mut db = load_db()?;
     let now = now_ms().to_string();
     let settings = resolve_settings()?;
     let id = Uuid::new_v4().to_string();
-    let title = title.unwrap_or_else(|| "New chat".to_string());
-    let mention_handle = new_chat_handle(&title, &id);
-    let conversation = Conversation {
-        id,
-        title,
-        created_at: now.clone(),
-        updated_at: now,
-        kind: ConversationKind::Chat,
-        execution_profile: ConversationExecutionProfile {
-            mention_handle,
-            model_path: settings.model_path.clone(),
-            mmproj_path: settings.mmproj_path.clone(),
-            sampling: Some(settings.sampling_config()),
-            ..ConversationExecutionProfile::default()
-        },
-        selected_model_path: settings.model_path,
-        source_conversation_id: None,
-        source_message_id: None,
-        branch_root_message_id: None,
-        active_leaf_message_id: None,
-        current_skill_ids: Vec::new(),
-        messages: Vec::new(),
-    };
+    let conversation = new_conversation(title, &settings, id, now);
     db.selected_conversation_id = Some(conversation.id.clone());
     db.conversations.insert(0, conversation.clone());
     let path = save_db(&db)?;
@@ -301,6 +559,38 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
         false,
         false,
     ))
+}
+
+fn new_conversation(
+    title: Option<String>,
+    settings: &crate::config::Settings,
+    id: String,
+    now: String,
+) -> Conversation {
+    let title = title.unwrap_or_else(|| "New chat".to_string());
+    let mention_handle = new_chat_handle(&title, &id);
+    Conversation {
+        id,
+        title,
+        created_at: now.clone(),
+        updated_at: now,
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile {
+            mention_handle,
+            model_path: settings.model_path.clone(),
+            mmproj_path: settings.mmproj_path.clone(),
+            sampling: Some(settings.sampling_config()),
+            ..ConversationExecutionProfile::default()
+        },
+        selected_model_path: settings.model_path.clone(),
+        source_conversation_id: None,
+        source_message_id: None,
+        branch_root_message_id: None,
+        active_leaf_message_id: None,
+        recipient_ids: Vec::new(),
+        current_skill_ids: Vec::new(),
+        messages: Vec::new(),
+    }
 }
 
 fn new_chat_handle(title: &str, id: &str) -> String {
@@ -334,7 +624,13 @@ pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
     Ok(CommandResult::passed(
         "mom_llama.conversation_list",
         "contracted",
-        db.conversations,
+        db.conversations
+            .into_iter()
+            .map(|mut conversation| {
+                conversation.title = display_title(&conversation);
+                conversation
+            })
+            .collect::<Vec<_>>(),
         Vec::new(),
         Vec::new(),
         false,
@@ -343,34 +639,35 @@ pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
 }
 
 pub fn conversation_select(id: &str) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter()
-        .find(|conversation| conversation.id == id)
-        .cloned()
-    else {
-        return Ok(CommandResult::blocked(
-            "mom_llama.conversation_select",
-            "stub_blocked",
-            Blocker::new(
-                "conversation_not_found",
-                format!("Conversation {id} was not found."),
-                vec!["Run `mom-llama conversation list --json`.".to_string()],
-            ),
-        ));
+    let store = RuntimeStore::current()?;
+    let Some(conversation) = select_conversation_in_store(&store, id)? else {
+        return Ok(conversation_not_found("mom_llama.conversation_select", id));
     };
-    db.selected_conversation_id = Some(id.to_string());
-    let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.conversation_select",
         "contracted",
         project_conversation(&conversation),
-        vec![path.display().to_string()],
+        vec![store.path().display().to_string()],
         Vec::new(),
         false,
         false,
     ))
+}
+
+fn select_conversation_in_store(store: &RuntimeStore, id: &str) -> Result<Option<Conversation>> {
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db.conversations.iter().find(|item| item.id == id).cloned()
+            else {
+                return Ok(None);
+            };
+            db.selected_conversation_id = Some(id.to_string());
+            Ok(Some(conversation))
+        },
+    )
 }
 
 pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<ConversationSearchHit>>> {
@@ -380,8 +677,8 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         .conversations
         .iter()
         .filter_map(|conversation| {
-            let title_matches =
-                query.is_empty() || conversation.title.to_lowercase().contains(&query);
+            let title = display_title(conversation);
+            let title_matches = query.is_empty() || title.to_lowercase().contains(&query);
             let message_match = conversation.messages.iter().find(|message| {
                 query.is_empty() || message.content.to_lowercase().contains(&query)
             });
@@ -390,10 +687,12 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
             }
             let snippet = message_match
                 .map(|message| snippet(&message.content, &query))
-                .unwrap_or_else(|| conversation.title.clone());
+                .unwrap_or_else(|| title.clone());
             Some(ConversationSearchHit {
                 conversation_id: conversation.id.clone(),
-                title: conversation.title.clone(),
+                kind: conversation.kind,
+                active_leaf_message_id: conversation.active_leaf_message_id.clone(),
+                title,
                 snippet,
                 message_count: conversation.messages.len(),
                 updated_at: conversation.updated_at.clone(),
@@ -412,30 +711,47 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
 }
 
 pub fn conversation_rename(id: &str, title: String) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == id)
-    else {
+    let store = RuntimeStore::current()?;
+    let Some(result) = rename_conversation_in_store(&store, id, &title)? else {
         return Ok(conversation_not_found("mom_llama.conversation_rename", id));
     };
-    conversation.title = title.trim().to_string();
-    if conversation.title.is_empty() {
-        conversation.title = "Untitled conversation".to_string();
-    }
-    conversation.updated_at = now_ms().to_string();
-    let result = conversation.clone();
-    let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.conversation_rename",
         "contracted",
         result,
-        vec![path.display().to_string()],
+        vec![store.path().display().to_string()],
         Vec::new(),
         false,
         false,
     ))
+}
+
+fn rename_conversation_in_store(
+    store: &RuntimeStore,
+    id: &str,
+    title: &str,
+) -> Result<Option<Conversation>> {
+    // Native reply commits run concurrently with sidebar commands. Read and
+    // change only this conversation's metadata under the store's IMMEDIATE
+    // transaction; never replace the registry from a pre-transaction snapshot.
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db.conversations.iter_mut().find(|item| item.id == id) else {
+                return Ok(None);
+            };
+            let title = title.trim();
+            conversation.title = if title.is_empty() {
+                "Untitled conversation".to_string()
+            } else {
+                title.to_string()
+            };
+            conversation.updated_at = now_ms().to_string();
+            Ok(Some(conversation.clone()))
+        },
+    )
 }
 
 pub fn conversation_system_message_update(
@@ -475,6 +791,7 @@ pub fn conversation_system_message_update(
 
 pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_db()?;
+    let expected_db = db.clone();
     let Some(index) = db
         .conversations
         .iter()
@@ -489,6 +806,7 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
         .flat_map(|message| message.attachment_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut drafts = load_drafts()?;
+    let expected_drafts = drafts.clone();
     drafts.drafts.retain(|draft| {
         if draft.conversation_id.as_deref() == Some(id) {
             removed_attachment_ids.extend(draft.attachment_ids.iter().cloned());
@@ -505,7 +823,9 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
     }
     let path = crate::attachments::persist_conversations_with_attachment_gc(
         &db,
+        &expected_db,
         Some(&drafts),
+        Some(&expected_drafts),
         &removed_attachment_ids,
         &BTreeSet::from([id.to_string()]),
     )?;
@@ -700,6 +1020,7 @@ pub fn message_delete(
     message_id: &str,
 ) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_db()?;
+    let expected_db = db.clone();
     let Some(conversation) = db
         .conversations
         .iter_mut()
@@ -764,6 +1085,8 @@ pub fn message_delete(
     }
     let path = crate::attachments::persist_conversations_with_attachment_gc(
         &db,
+        &expected_db,
+        None,
         None,
         &removed_attachment_ids,
         &BTreeSet::new(),
@@ -855,6 +1178,7 @@ pub fn conversation_fork(
         source_message_id: Some(message_id.to_string()),
         branch_root_message_id: Some(message_id.to_string()),
         active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+        recipient_ids: source.recipient_ids,
         current_skill_ids: source.current_skill_ids,
         messages,
     };
@@ -1213,8 +1537,45 @@ pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
     path
 }
 
+pub(crate) fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
+    matches!(title, "New chat" | "Default chat" | "Untitled conversation")
+        || title == conversation_id
+}
+
+fn title_from_text(text: &str) -> Option<String> {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            let mut title = line.chars().take(64).collect::<String>();
+            if title.len() < line.len() {
+                title.push_str("...");
+            }
+            title
+        })
+}
+
+pub(crate) fn first_line_title(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| title_from_text(&message.content))
+        .unwrap_or_else(|| "New chat".to_string())
+}
+
+pub(crate) fn display_title(conversation: &Conversation) -> String {
+    if conversation.kind == ConversationKind::Chat
+        && is_placeholder_title(&conversation.title, &conversation.id)
+    {
+        first_line_title(&active_path_messages(conversation))
+    } else {
+        conversation.title.clone()
+    }
+}
+
 pub fn project_conversation(conversation: &Conversation) -> Conversation {
     let mut projected = conversation.clone();
+    projected.title = display_title(conversation);
     normalize_conversation_model_paths(&mut projected);
     projected.messages = active_path_messages(conversation);
     projected.active_leaf_message_id = projected.messages.last().map(|message| message.id.clone());
@@ -1408,6 +1769,9 @@ pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
 }
 
 pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversation)> {
+    if !valid_occurrence_id(id) {
+        anyhow::bail!("invalid conversation occurrence identity");
+    }
     let imported = load_db()?;
     let initially_present = imported
         .conversations
@@ -1449,6 +1813,7 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
                 source_message_id: None,
                 branch_root_message_id: None,
                 active_leaf_message_id: None,
+                recipient_ids: Vec::new(),
                 current_skill_ids: Vec::new(),
                 messages: Vec::new(),
             };
@@ -1555,7 +1920,10 @@ pub(crate) fn load_drafts() -> Result<DraftDb> {
 }
 
 fn draft_key(conversation_id: Option<&str>) -> String {
-    conversation_id.unwrap_or(NEW_CHAT_DRAFT_KEY).to_string()
+    match conversation_id {
+        None | Some("default") => NEW_CHAT_DRAFT_KEY.to_string(),
+        Some(id) => id.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1585,6 +1953,43 @@ mod tests {
             attribution: None,
             attachment_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn placeholder_titles_follow_the_first_user_message_and_manual_titles_survive() {
+        let mut conversation = Conversation {
+            id: "title-test".into(),
+            title: "New chat".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some("reply".into()),
+            recipient_ids: Vec::new(),
+            current_skill_ids: vec![],
+            messages: vec![
+                message("user", None, MessageRole::User, "Actual subject\nDetails"),
+                message("reply", Some("user"), MessageRole::Assistant, "Response"),
+            ],
+        };
+        assert_eq!(super::display_title(&conversation), "Actual subject");
+        assert_eq!(project_conversation(&conversation).title, "Actual subject");
+        assert_eq!(
+            conversation.title, "New chat",
+            "projection does not rewrite stored history"
+        );
+        conversation.title = "Chosen name".into();
+        assert_eq!(super::display_title(&conversation), "Chosen name");
+        assert!(super::title_from_text(" \n ").is_none());
+        assert!(
+            super::title_from_text(&"é".repeat(80))
+                .expect("Unicode title")
+                .ends_with("...")
+        );
     }
 
     #[test]
@@ -1627,6 +2032,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         };
@@ -1637,5 +2043,276 @@ mod tests {
         assert_eq!(projected.selected_model_path, None);
         assert_eq!(projected.execution_profile.model_path, None);
         assert_eq!(projected.execution_profile.mmproj_path, None);
+    }
+
+    #[cfg(unix)]
+    fn with_rename_store(test: impl FnOnce(&crate::store::RuntimeStore) -> anyhow::Result<()>) {
+        let directory = std::env::temp_dir().join(format!("mom-rename-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create isolated store directory");
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(directory.clone());
+        let store =
+            crate::store::RuntimeStore::open(&directory).expect("open encrypted test store");
+        test(&store).expect("rename store regression");
+    }
+
+    #[cfg(unix)]
+    fn rename_fixture(id: &str) -> Conversation {
+        Conversation {
+            id: id.into(),
+            title: "Original title".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_preserves_committed_replies_other_chats_selection_and_draft() {
+        with_rename_store(|store| {
+            let mut db = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            // Work committed since the sidebar displayed the old title must
+            // survive. Reopen the real store to verify durable preservation.
+            db.conversations[0].messages = vec![
+                message("user", None, MessageRole::User, "Preserve my input"),
+                message(
+                    "reply",
+                    Some("user"),
+                    MessageRole::Assistant,
+                    "Native reply",
+                ),
+            ];
+            db.conversations[0].active_leaf_message_id = Some("reply".into());
+            db.conversations.push(rename_fixture("other"));
+            db.selected_conversation_id = Some("other".into());
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            let draft = super::DraftDb {
+                drafts: vec![super::DraftMessage {
+                    conversation_id: Some("default".into()),
+                    message: "Unsent input".into(),
+                    attachment_ids: Vec::new(),
+                    updated_at: "2".into(),
+                }],
+            };
+            store.put(super::DRAFTS_NAMESPACE, &draft)?;
+            let result = super::rename_conversation_in_store(store, "host", "  Chosen title  ")?
+                .expect("existing conversation");
+            assert_eq!(result.title, "Chosen title");
+            assert_eq!(result.messages, db.conversations[0].messages);
+            db.conversations[0].title = result.title;
+            db.conversations[0].updated_at = result.updated_at;
+            let reopened =
+                crate::store::RuntimeStore::open(store.path().parent().expect("store parent"))?;
+            assert_eq!(
+                reopened.get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?,
+                Some(db)
+            );
+            assert_eq!(
+                reopened.get::<super::DraftDb>(super::DRAFTS_NAMESPACE)?,
+                Some(draft)
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_rename_never_discards_committed_messages() {
+        with_rename_store(|store| {
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![rename_fixture("host")],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                let writer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for turn in 0..64 {
+                        store.mutate_documents(
+                            super::CONVERSATIONS_NAMESPACE,
+                            super::ConversationDb::default,
+                            |db, _| {
+                                let host = &mut db.conversations[0];
+                                let user_id = format!("user-{turn}");
+                                let reply_id = format!("reply-{turn}");
+                                let mut user = message(
+                                    &user_id,
+                                    host.active_leaf_message_id.as_deref(),
+                                    MessageRole::User,
+                                    "User input",
+                                );
+                                let mut reply = message(
+                                    &reply_id,
+                                    Some(&user_id),
+                                    MessageRole::Assistant,
+                                    "Committed reply",
+                                );
+                                user.conversation_id = "host".into();
+                                reply.conversation_id = "host".into();
+                                host.messages.extend([user, reply]);
+                                host.active_leaf_message_id = Some(reply_id);
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    Ok(())
+                });
+                let renamer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for iteration in 0..64 {
+                        assert!(
+                            super::rename_conversation_in_store(
+                                store,
+                                "host",
+                                &format!("Title {iteration}")
+                            )?
+                            .is_some()
+                        );
+                    }
+                    Ok(())
+                });
+                writer.join().expect("writer thread")?;
+                renamer.join().expect("rename thread")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let db = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("retained conversations");
+            assert_eq!(db.conversations[0].messages.len(), 128);
+            assert_eq!(
+                db.conversations[0].active_leaf_message_id.as_deref(),
+                Some("reply-63")
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_selection_never_discards_committed_messages() {
+        with_rename_store(|store| {
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![rename_fixture("host")],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                let writer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for turn in 0..64 {
+                        store.mutate_documents(
+                            super::CONVERSATIONS_NAMESPACE,
+                            super::ConversationDb::default,
+                            |db, _| {
+                                let host = &mut db.conversations[0];
+                                let user_id = format!("user-{turn}");
+                                let reply_id = format!("reply-{turn}");
+                                let mut user = message(
+                                    &user_id,
+                                    host.active_leaf_message_id.as_deref(),
+                                    MessageRole::User,
+                                    "User input",
+                                );
+                                let mut reply = message(
+                                    &reply_id,
+                                    Some(&user_id),
+                                    MessageRole::Assistant,
+                                    "Committed reply",
+                                );
+                                user.conversation_id = "host".into();
+                                reply.conversation_id = "host".into();
+                                host.messages.extend([user, reply]);
+                                host.active_leaf_message_id = Some(reply_id);
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    Ok(())
+                });
+                let renamer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for _ in 0..64 {
+                        assert!(super::select_conversation_in_store(store, "host")?.is_some());
+                    }
+                    Ok(())
+                });
+                writer.join().expect("writer thread")?;
+                renamer.join().expect("rename thread")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let db = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("retained conversations");
+            assert_eq!(db.conversations[0].messages.len(), 128);
+            assert_eq!(
+                db.conversations[0].active_leaf_message_id.as_deref(),
+                Some("reply-63")
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_does_not_resurrect_a_removed_conversation() {
+        with_rename_store(|store| {
+            let original = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &original)?;
+            let current = super::ConversationDb {
+                conversations: vec![rename_fixture("other")],
+                selected_conversation_id: Some("other".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &current)?;
+            assert!(super::rename_conversation_in_store(store, "host", "Gone")?.is_none());
+            assert_eq!(
+                store.get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?,
+                Some(current)
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_retains_the_existing_blank_title_policy() {
+        with_rename_store(|store| {
+            let db = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            let result = super::rename_conversation_in_store(store, "host", " \n\t ")?
+                .expect("existing conversation");
+            assert_eq!(result.title, "Untitled conversation");
+            Ok(())
+        });
     }
 }

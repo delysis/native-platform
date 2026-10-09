@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { compositionOwnsKey, nativeEditingCommand, terminalInterruptOwnsKey } from './textEditingInteractions';
   import { afterUpdate, onMount, tick } from 'svelte';
   import { normalizeFailure } from './ipc';
   import { RetainedOutputLoader } from './retainedOutput';
@@ -24,6 +25,7 @@
   export let onOpen: (run: TerminalRun) => void;
   export let onClose: () => void;
   let input: HTMLTextAreaElement | undefined;
+  let composing = false;
   let viewport: HTMLDivElement | undefined;
   let following = true;
   let wasOpen = false;
@@ -32,6 +34,7 @@
   async function focusOnOpen(visible: boolean): Promise<void> {
     const opening = visible && !wasOpen;
     wasOpen = visible;
+    if (!visible) composing = false;
     if (!opening) return;
     following = true;
     await tick();
@@ -55,7 +58,7 @@
   onMount(() => {
     mounted = true;
     const handleCommandKey = async (event: KeyboardEvent) => {
-      if (disabled || event.defaultPrevented || event.isComposing || event.altKey || event.shiftKey || !(event.metaKey || event.ctrlKey) || event.code !== 'Backquote') return;
+      if (disabled || event.defaultPrevented || compositionOwnsKey(event, composing) || event.altKey || event.shiftKey || !(event.metaKey || event.ctrlKey) || event.code !== 'Backquote') return;
       event.preventDefault();
       if (open) { onClose(); return; }
       open = true;
@@ -84,17 +87,20 @@
     if (mounted && serial === outputSerial) { outputs = next; outputError = failureMessage; }
   }
   function handleKey(event: KeyboardEvent): void {
-    if (event.isComposing) return;
+    if (compositionOwnsKey(event, composing)) return;
+    if (input && terminalInterruptOwnsKey(event, busy, input.selectionStart, input.selectionEnd)) {
+      event.preventDefault(); event.stopPropagation(); onCancel(); return;
+    }
+    if (nativeEditingCommand(event)) return;
     if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
       event.preventDefault(); event.stopPropagation();
       if (!disabled && !runDisabled && !busy) { historyIndex = -1; onRun(); }
     } else if (event.key === 'Escape' && !embedded) {
       event.preventDefault(); event.stopPropagation(); onClose();
-    } else if (event.ctrlKey && event.key.toLowerCase() === 'c') {
-      event.preventDefault(); if (busy) onCancel();
-    } else if (event.ctrlKey && event.key.toLowerCase() === 'l') {
+    } else if (event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'l') {
       event.preventDefault(); cleared = new Set(runs.map(run => run.run_id));
-    } else if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && !entry.includes('\n')) {
+    } else if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && !entry.includes('\n') &&
+      !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && input?.selectionStart === input?.selectionEnd) {
       if (event.key === 'ArrowUp' && historyIndex + 1 < commands.length) {
         event.preventDefault(); if (historyIndex < 0) draft = entry; entry = commands[++historyIndex];
       } else if (event.key === 'ArrowDown' && historyIndex >= 0) {
@@ -120,7 +126,7 @@
     {/each}
     {#if outputError}<p class="terminal-error" role="alert">{outputError}</p>{/if}
     {#if error}<p class="terminal-error" role="alert">{error}{#if uncertain}<button class="terminal-action" type="button" on:click={onCheck} disabled={disabled}>Check result</button>{/if}</p>{/if}
-    <div class="terminal-command-row"><span aria-hidden="true">›</span><textarea bind:this={input} bind:value={entry} rows="1" aria-label="Command" spellcheck="false" disabled={disabled} on:keydown={handleKey}></textarea></div>
+    <div class="terminal-command-row"><span aria-hidden="true">›</span><textarea bind:this={input} bind:value={entry} rows="1" aria-label="Command" spellcheck="false" disabled={disabled} on:keydown={handleKey} on:compositionstart={() => composing = true} on:compositionend={() => composing = false}></textarea></div>
   </div>
 </section>
 {/if}

@@ -112,10 +112,11 @@
         return;
       }
       status.textContent = String(label).replaceAll("_", " ");
-      status.classList.toggle("blocked", Boolean(blocker) || value?.status === "blocked");
+      const blocked = Boolean(blocker) || value?.status === "blocked";
+      status.classList.toggle("blocked", blocked);
       status.classList.remove("is-hidden");
       window.clearTimeout(status.hideTimer);
-      status.hideTimer = window.setTimeout(() => status.classList.add("is-hidden"), 5000);
+      if (!blocked) status.hideTimer = window.setTimeout(() => status.classList.add("is-hidden"), 5000);
     }
   };
 
@@ -242,14 +243,19 @@
     }
   };
 
+  const projectionRevisions = new Map();
   const swap = async (selector, command) => {
     const current = document.querySelector(selector);
     if (!current) return null;
+    const revision = (projectionRevisions.get(selector) || 0) + 1;
+    projectionRevisions.set(selector, revision);
     const replacement = parseFragment(await invokeMarkup(command));
+    if (projectionRevisions.get(selector) !== revision || document.querySelector(selector) !== current) return null;
     if (!replacement) throw new Error(`Renderer ${command} returned no element.`);
     if (activeSpeechPlayback?.panel && current.contains(activeSpeechPlayback.panel)) {
       await stopSpeechPlayback();
     }
+    if (projectionRevisions.get(selector) !== revision || document.querySelector(selector) !== current) return null;
     releaseAttachmentObjectUrls(current);
     current.replaceWith(replacement);
     sizeComposer();
@@ -706,6 +712,8 @@
   const refreshSidebar = async () => {
     const replacement = await swap(".sidebar", "mom_llama_render_sidebar_fragment");
     applySidebarSectionState(replacement);
+    const separator = replacement?.querySelector(".sidebar-resizer");
+    separator?.setAttribute("aria-valuenow", String(Math.round(replacement.getBoundingClientRect().width)));
     return replacement;
   };
   const refreshSettings = async (section = "general") => {
@@ -1139,26 +1147,34 @@
   const slugHandle = (value) => String(value || "")
     .trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 
+  const openConversationRename = (target) => {
+    const modal = document.getElementById("conversation-rename-modal");
+    if (!modal) return;
+    modal.dataset.conversation = target.dataset.conversation;
+    const field = formField(modal, "conversation_title");
+    field.value = target.dataset.conversationTitle || target.querySelector?.("span")?.textContent || "";
+    setModalVisibility("conversation-rename-modal", true);
+    field.focus();
+    field.select();
+  };
+
+  const selectConversation = async (conversation) => {
+    await retainComposerDraft();
+    const result = await invoke("mom_llama_conversation_select", { conversation });
+    report(result);
+    await refreshConversationProjection();
+    return result;
+  };
+
   const openPersonaFreeze = (button) => {
     const modal = document.getElementById("persona-freeze-modal");
     if (!modal) return;
+    modal.dataset.conversation = selectedConversation();
     formField(modal, "freeze_message").value = button.dataset.message || "";
     formField(modal, "freeze_name").value = "";
     formField(modal, "freeze_handle").value = "";
     setModalVisibility("persona-freeze-modal", true);
     formField(modal, "freeze_name")?.focus();
-  };
-
-  const personaTools = (value) => {
-    const bindings = String(value || "").split(/\r?\n/)
-      .map((line) => line.trim()).filter(Boolean).map((line) => {
-        const [server, ...tool] = line.split("/");
-        return { server: server.trim(), tool: tool.join("/").trim() };
-      }).filter((binding) => binding.server && binding.tool);
-    if (bindings.length > MAX_PERSONA_TOOL_BINDINGS) {
-      throw new Error(`A Persona may attach at most ${MAX_PERSONA_TOOL_BINDINGS} tools.`);
-    }
-    return bindings;
   };
 
   const setPersonaEditor = (persona) => {
@@ -1184,15 +1200,8 @@
       modelChoice.value = modelPath;
     }
     formField(editor, "persona_system_message").value = profile.system_message || "";
-    formField(editor, "persona_source_tokens").value = profile.source_history_tokens ?? 4096;
-    formField(editor, "persona_host_tokens").value = profile.host_context_tokens ?? 2048;
-    const toolsField = formField(editor, "persona_tools");
-    if (toolsField) {
-      toolsField.value = (profile.tool_bindings || [])
-        .map((binding) => `${binding.server}/${binding.tool}`).join("\n");
-    }
-    const frozen = profile.chat_template && typeof profile.chat_template === "object"
-      ? profile.chat_template.frozen_source : null;
+    const frozen = profile.chat_template?.kind === "frozen_source"
+      ? profile.chat_template.template : null;
     formField(editor, "persona_chat_template_policy").value = frozen == null ? "model_default" : "frozen_source";
     formField(editor, "persona_chat_template").value = frozen || "";
     editor.querySelector(".persona-template-source")?.classList.toggle("is-hidden", frozen == null);
@@ -1334,8 +1343,8 @@
     const profile = current.execution_profile || {};
     const modelPath = formValue(editor, "persona_model_choice") || null;
     const template = formValue(editor, "persona_chat_template_policy") === "frozen_source"
-      ? { frozen_source: formValue(editor, "persona_chat_template") }
-      : "model_default";
+      ? { kind: "frozen_source", template: formValue(editor, "persona_chat_template") }
+      : { kind: "model_default" };
     return {
       persona_id: formValue(editor, "persona_id"),
       name: formValue(editor, "persona_name"),
@@ -1350,11 +1359,6 @@
       system_message: formValue(editor, "persona_system_message") || null,
       sampling: profile.sampling || null,
       chat_template: template,
-      tool_bindings: mcpProcessUiSupported()
-        ? personaTools(formValue(editor, "persona_tools"))
-        : (profile.tool_bindings || []),
-      source_history_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_source_tokens") || 4096))),
-      host_context_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_host_tokens") || 2048))),
     };
   };
 
@@ -1521,7 +1525,11 @@
     if (form) form.classList.toggle("is-hidden", !enabled);
     if (list) list.classList.toggle("is-hidden", enabled);
     if (results) results.classList.toggle("is-hidden", !enabled);
-    if (enabled) form?.querySelector("input[name='query']")?.focus();
+    document.querySelector(".search-toggle")?.classList.toggle("is-hidden", enabled);
+    if (enabled) {
+      shell()?.classList.add("sidebar-open");
+      form?.querySelector("input[name='query']")?.focus();
+    } else document.querySelector(".search-toggle")?.focus();
   };
 
   const commandMetadata = (element, spec) => {
@@ -1679,15 +1687,25 @@
     }
     hits.forEach((hit) => {
       const item = document.createElement("li");
+      if (hit.kind === "persona_template") {
+        item.dataset.personaMenuTarget = "true";
+        item.dataset.persona = hit.conversation_id;
+      } else {
+        item.dataset.conversationMenuTarget = "true";
+        item.dataset.conversation = hit.conversation_id;
+        item.dataset.conversationTitle = hit.title;
+        item.dataset.message = hit.active_leaf_message_id || "";
+      }
       const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect);
       button.type = "button";
       button.className = "conversation-item search-hit";
-      button.dataset.action = "conversation-select";
+      button.dataset.action = hit.kind === "persona_template" ? "persona-draft-open" : "conversation-select";
+      button.dataset.persona = hit.conversation_id;
       button.dataset.conversation = hit.conversation_id;
       const title = document.createElement("span");
       title.textContent = hit.title || hit.conversation_id;
       const detail = document.createElement("small");
-      detail.textContent = hit.snippet || `${hit.message_count || 0} messages`;
+      detail.textContent = hit.snippet || "";
       button.append(title, detail);
       item.appendChild(button);
       list.appendChild(item);
@@ -2004,6 +2022,7 @@
   };
 
   let activeDispatchConversation = null;
+  const activeDispatchStreamLeases = new Set();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
@@ -2045,6 +2064,7 @@
   const acquireStableChatBusy = (lease) => {
     if (!lease) return null;
     chatBusyLeases.add(lease);
+    if (activeDispatchConversation !== null) activeDispatchStreamLeases.add(lease);
     renderChatBusyState();
     return lease;
   };
@@ -2420,12 +2440,88 @@
     }
   };
 
+  const retainComposerDraft = async () => {
+    const form = document.getElementById("chat-form");
+    if (form && form.dataset.busy !== "true") await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+  };
+
+  const openNewDraft = async (persona = null) => {
+    await retainComposerDraft();
+    const result = await invoke("mom_llama_conversation_draft_open", { persona });
+    report(result);
+    if (result?.status !== "blocked") {
+      closeSettings();
+      await refreshConversationProjection();
+      const draftText = document.querySelector("#chat-form textarea[name='message']")?.value || "";
+      if (!persona && !draftText && document.getElementById("recipient-query")) document.getElementById("recipient-query").focus();
+      else focusComposer();
+    }
+  };
+
+  let recipientMutation = Promise.resolve();
+  const draftRecipientIds = () => Array.from(document.querySelectorAll('.recipients-header[data-unsent="true"] [data-recipient-id]'), (chip) => chip.dataset.recipientId);
+  const updateRecipients = (mutate) => {
+    const source = chat();
+    recipientMutation = recipientMutation.catch(() => {}).then(async () => {
+      if (source !== chat() || selectedConversation() !== "default") return;
+      await retainComposerDraft();
+      if (source !== chat() || selectedConversation() !== "default") return;
+      const ids = mutate(draftRecipientIds());
+      const name = document.getElementById("recipient-group-name")?.value || null;
+      const response = await invoke("mom_llama_conversation_draft_recipients_update", { recipientIds: ids, name });
+      report(response);
+      if (response?.status !== "blocked" && source === chat()) {
+        await refreshChat();
+        document.getElementById("recipient-query")?.focus();
+      }
+    });
+    return recipientMutation;
+  };
+  const filterRecipientOptions = () => {
+    const input = document.getElementById("recipient-query");
+    const list = document.getElementById("recipient-options");
+    if (!input || !list) return;
+    const query = input.value.trim().toLowerCase();
+    const open = query.length > 0;
+    list.hidden = !open;
+    input.setAttribute("aria-expanded", String(open));
+    input.removeAttribute("aria-invalid");
+    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !open || !option.dataset.search.includes(query);
+  };
+  document.addEventListener("input", (event) => {
+    if (event.target.id === "recipient-query" && !event.isComposing) filterRecipientOptions();
+  });
+  document.addEventListener("focusin", (event) => {
+    if (event.target.id === "recipient-query") filterRecipientOptions();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.target.id !== "recipient-query" || event.isComposing) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      document.querySelector('.recipient-option:not([hidden])')?.focus();
+    } else if (event.key === "Escape") {
+      document.getElementById("recipient-options").hidden = true;
+      event.target.setAttribute("aria-expanded", "false");
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (event.target.value.trim()) document.querySelector('.recipient-option:not([hidden])')?.click();
+    }
+  });
+  document.addEventListener("focusout", (event) => {
+    const header = event.target.closest?.(".recipients-header");
+    if (header && !header.contains(event.relatedTarget)) {
+      const list = document.getElementById("recipient-options");
+      if (list) list.hidden = true;
+      document.getElementById("recipient-query")?.setAttribute("aria-expanded", "false");
+    }
+  });
+  document.addEventListener("change", (event) => {
+    if (event.target.id === "recipient-group-name") updateRecipients((ids) => ids).catch(reportError);
+  });
+
   const actionHandlers = {
-    "sidebar-toggle": async () => {
-      await invoke("mom_llama_conversation_list");
-      shell()?.classList.toggle("sidebar-open");
-      sizeComposer();
-    },
+    "recipient-add": async (button) => updateRecipients((ids) => ids.includes(button.dataset.recipient) ? ids : [...ids, button.dataset.recipient]),
+    "recipient-remove": async (button) => updateRecipients((ids) => ids.filter((id) => id !== button.dataset.recipient)),
     "sidebar-section-toggle": async (button) => {
       const section = button.dataset.sidebarSection;
       const list = document.getElementById(button.getAttribute("aria-controls"));
@@ -2503,16 +2599,17 @@
     "mention-tool-approve": async () => decidePersonaToolApproval("approve"),
     "mention-tool-deny": async () => decidePersonaToolApproval("deny"),
     "conversation-new": async () => {
-      const result = await invoke("mom_llama_conversation_new", { title: "New chat" });
-      report(result); await refreshConversationProjection();
+      await openNewDraft();
     },
     "conversation-list": async () => refreshConversationProjection(),
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
     "conversation-select": async (button) => {
-      const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
-      report(result); await refreshConversationProjection();
+      if (button.dataset.conversation === selectedConversation()) {
+        openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+      } else await selectConversation(button.dataset.conversation);
     },
+    "conversation-rename-close": async () => setModalVisibility("conversation-rename-modal", false),
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: activeDispatchConversation || selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
       const result = await invoke("mom_llama_chat_skip_reasoning", { conversation: selectedConversation() });
@@ -2708,7 +2805,7 @@
       const modal = document.getElementById("persona-freeze-modal");
       const history = modal?.querySelector('[name="freeze_history"]:checked')?.value || "full";
       const result = await invoke("mom_llama_persona_freeze", {
-        conversation: selectedConversation(),
+        conversation: modal.dataset.conversation,
         message: formValue(modal, "freeze_message"),
         name: formValue(modal, "freeze_name"),
         handle: formValue(modal, "freeze_handle"),
@@ -2723,15 +2820,11 @@
     "persona-edit": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-profile-open": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-menu-open": async (button) => openPersonaMenu(button),
+    "persona-draft-open": async (button) => openNewDraft(button.dataset.persona),
     "persona-menu-start": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
       closePersonaMenu(false);
-      const result = await instantiatePersona(persona);
-      if (result?.status !== "blocked") {
-        closeSettings();
-        await refreshConversationProjection();
-        focusComposer();
-      }
+      await openNewDraft(persona);
     },
     "persona-menu-edit": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
@@ -2746,13 +2839,7 @@
     },
     "persona-removal-close": async () => setModalVisibility("persona-removal-modal", false),
     "persona-removal-commit": async () => commitPersonaRemoval(),
-    "persona-instantiate": async (button) => {
-      const result = await instantiatePersona(button.dataset.persona);
-      if (result?.status !== "blocked") {
-        closeSettings();
-        await refreshConversationProjection();
-      }
-    },
+    "persona-instantiate": async (button) => openNewDraft(button.dataset.persona),
     "persona-update": async () => {
       const result = await invoke("mom_llama_persona_update", { profile: personaProfileFromEditor() });
       report(result);
@@ -2845,7 +2932,7 @@
       if (!path) return;
       const sourceConversation = selectedConversation();
       let conversation = sourceConversation;
-      if (selectedConversationKind() === "persona_template") {
+      if (sourceConversation !== "default" && selectedConversationKind() === "persona_template") {
         const instantiated = await instantiatePersona(sourceConversation);
         if (instantiated?.status === "blocked" || !instantiated?.result?.id) return;
         conversation = instantiated.result.id;
@@ -2857,7 +2944,7 @@
           attachmentIds: [],
         });
       }
-      await persistDraftNow(message, [], conversation);
+      await persistDraftNow(message, draftAttachmentIds(form), conversation);
       const result = await invoke("mom_llama_attachment_import", { conversation, path });
       report(result);
       if (result?.status !== "blocked") await refreshConversationProjection();
@@ -3201,11 +3288,94 @@
     try { await handler(button); } catch (error) { reportError(error); }
   });
 
+  const popupRowMenu = async (target, point = null) => {
+    const Menu = window.__TAURI__?.menu?.Menu;
+    if (!Menu) throw new Error("Native contextual menus are unavailable.");
+    const safeAction = (action) => async () => {
+      try { await action(); } catch (error) { reportError(error); }
+    };
+    let items;
+    if (target.dataset.personaMenuTarget) {
+      const persona = target.dataset.persona;
+      items = [
+        { id: "start", text: "Chat", action: safeAction(() => openNewDraft(persona)) },
+        { id: "edit", text: "Edit", action: safeAction(() => openPersonaProfile(persona)) },
+        { id: "remove", text: "Remove", action: safeAction(() => openPersonaRemoval(persona)) },
+      ];
+    } else {
+      const conversation = target.dataset.conversation;
+      items = [
+        { id: "rename", text: "Rename…", action: safeAction(() => openConversationRename(target)) },
+        { id: "delete", text: "Delete", action: safeAction(async () => {
+          await retainComposerDraft();
+          report(await invoke("mom_llama_conversation_delete", { conversation }));
+          await refreshConversationProjection();
+        }) },
+        { id: "save-persona", text: "Save as Persona…", enabled: !!target.dataset.message,
+          action: safeAction(async () => {
+            if (selectedConversation() !== conversation) await selectConversation(conversation);
+            openPersonaFreeze(target);
+          }) },
+      ];
+    }
+    const menu = await Menu.new({ items });
+    const rect = target.getBoundingClientRect();
+    const anchor = point || { x: rect.left, y: rect.bottom };
+    await menu.popup(new window.__TAURI__.dpi.LogicalPosition(anchor.x, anchor.y));
+    // Tauri callbacks outlive popup(), which returns as soon as it is shown.
+    // Retain this resource until another menu replaces it.
+    if (popupRowMenu.previous) await popupRowMenu.previous.close();
+    popupRowMenu.previous = menu;
+  };
+
   document.addEventListener("contextmenu", (event) => {
-    const target = event.target.closest('[data-persona-menu-target="true"]');
+    const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
     if (!target) return;
     event.preventDefault();
-    openPersonaMenu(target, { x: event.clientX, y: event.clientY });
+    popupRowMenu(target, { x: event.clientX, y: event.clientY }).catch(reportError);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && event.target.closest("#conversation-rename-modal")) {
+      event.preventDefault();
+      setModalVisibility("conversation-rename-modal", false);
+    }
+    if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
+      event.preventDefault();
+      setSearchMode(false);
+    }
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
+      if (target) {
+        event.preventDefault();
+        popupRowMenu(target).catch(reportError);
+      }
+    }
+    if (event.target.matches(".sidebar-resizer") && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+      event.preventDefault();
+      resizeSidebar(document.querySelector(".sidebar").getBoundingClientRect().width + (event.key === "ArrowRight" ? 16 : -16));
+    }
+  });
+
+  const resizeSidebar = (width) => {
+    const clamped = Math.max(180, Math.min(width, 480, window.innerWidth - 300));
+    document.documentElement.style.setProperty("--sidebar-width", `${clamped}px`);
+    document.querySelector(".sidebar-resizer")?.setAttribute("aria-valuenow", String(Math.round(clamped)));
+    localStorage.setItem("mom-sidebar-width", String(clamped));
+  };
+  const storedSidebarWidth = Number(localStorage.getItem("mom-sidebar-width"));
+  if (storedSidebarWidth) resizeSidebar(storedSidebarWidth);
+  window.addEventListener("resize", () => resizeSidebar(document.querySelector(".sidebar")?.getBoundingClientRect().width || 256));
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.matches(".sidebar-resizer")) return;
+    event.preventDefault();
+    const separator = event.target;
+    separator.setPointerCapture(event.pointerId);
+    separator.onpointermove = (move) => resizeSidebar(move.clientX);
+    separator.onpointerup = separator.onpointercancel = () => {
+      separator.onpointermove = null;
+      separator.releasePointerCapture(event.pointerId);
+    };
   });
 
   document.addEventListener("submit", async (event) => {
@@ -3215,6 +3385,13 @@
       if (form.id === "chat-form") {
         if (autocompleteAccepting) return;
         if (form.dataset.busy === "true") return;
+        const recipientQuery = document.getElementById("recipient-query");
+        if (recipientQuery?.value.trim()) {
+          filterRecipientOptions();
+          recipientQuery.focus();
+          recipientQuery.setAttribute("aria-invalid", "true");
+          return;
+        }
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
         const attachmentIds = draftAttachmentIds(form);
@@ -3227,8 +3404,10 @@
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
         try {
+          await recipientMutation;
           if (sourceConversation === "default") {
-            const created = await invoke("mom_llama_conversation_new", { title: "New chat" });
+            await persistDraftNow(message, attachmentIds, sourceConversation);
+            const created = await invoke("mom_llama_conversation_draft_submit");
             report(created);
             if (created?.status === "blocked" || !created?.result?.id) return;
             conversation = created.result.id;
@@ -3253,7 +3432,7 @@
           }
           activeDispatchConversation = conversation;
           await persistDraftNow(message, attachmentIds, conversation);
-          if (conversation !== sourceConversation) {
+          if (conversation !== sourceConversation && sourceConversation !== "default") {
             await invoke("mom_llama_draft_update", {
               conversation: sourceConversation,
               message: "",
@@ -3289,8 +3468,23 @@
           }
           await refreshConversationProjection();
         } finally {
+          // A rejected native batch can return without a terminal stream event
+          // or an invocation result. Its started events must not strand Stop.
+          activeDispatchStreamLeases.forEach(releaseChatBusy);
+          activeDispatchStreamLeases.clear();
           activeDispatchConversation = null;
           releaseChatBusy(dispatchLease);
+        }
+      }
+      if (form.id === "conversation-rename-form") {
+        const modal = document.getElementById("conversation-rename-modal");
+        const title = formValue(form, "conversation_title").trim();
+        if (!title) return;
+        const result = await invoke("mom_llama_conversation_rename", { conversation: modal.dataset.conversation, title });
+        report(result);
+        if (result?.status !== "blocked") {
+          setModalVisibility("conversation-rename-modal", false);
+          await refreshConversationProjection();
         }
       }
       if (form.id === "settings-form") {
@@ -3552,6 +3746,9 @@
   const listen = async () => {
     const events = tauri() && tauri().event;
     if (!events || typeof events.listen !== "function") return;
+    await events.listen("mom_llama_settings_open", async () => {
+      try { await invoke("mom_llama_settings_get"); openSettings(); } catch (error) { reportError(error); }
+    });
     await events.listen("mom_llama_chat_stream", onChatEvent);
     await events.listen("mom_llama_chat_dispatch_stream", onDispatchEvent);
     await events.listen("mom_llama_tool_loop_stream", onToolLoopEvent);
@@ -3564,7 +3761,9 @@
     if (event.button !== 0) return;
     const nativeWindow = tauri()?.window?.getCurrentWindow();
     if (!nativeWindow) return;
-    if (event.target.closest?.(".titlebar-drag-surface")) {
+    const toolbar = event.target.closest?.(".chrome");
+    const control = event.target.closest?.("button, input, textarea, select, a, [contenteditable], form");
+    if (toolbar && !control) {
       event.preventDefault();
       void nativeWindow.startDragging().catch(reportError);
     }
@@ -3573,11 +3772,17 @@
   const boot = async () => {
     const status = document.getElementById("startup-status");
     const retry = document.getElementById("startup-retry");
+    const details = document.getElementById("startup-details");
+    const diagnostic = document.getElementById("startup-error");
     const initialize = async () => {
       if (status) {
         status.classList.remove("startup-error");
-        status.textContent = "Unlocking Mom Llama's encrypted local data…";
+        status.textContent = "Opening";
+        status.removeAttribute("title");
+        status.removeAttribute("aria-label");
       }
+      if (details) { details.hidden = true; details.open = false; }
+      if (diagnostic) diagnostic.textContent = "";
       if (retry) {
         retry.hidden = true;
         retry.disabled = true;
@@ -3591,15 +3796,18 @@
         applyCustomCss(shell()?.dataset.customCss || "");
         await hydrateAttachmentPreviews(root);
         restoreChatViewport(null, chat());
-        const alwaysShowSidebar = shell()?.dataset.alwaysShowSidebar === "true";
-        if (window.innerWidth >= 1180 && alwaysShowSidebar) shell()?.classList.add("sidebar-open");
+
         sizeComposer();
         await listen();
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");
-          status.textContent = `${String(error)} Approve Keychain access, then retry.`;
+          status.textContent = "Unavailable";
+          status.title = String(error);
+          status.setAttribute("aria-label", String(error));
         }
+        if (diagnostic) diagnostic.textContent = String(error);
+        if (details) details.hidden = false;
         if (retry) {
           retry.hidden = false;
           retry.disabled = false;

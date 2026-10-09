@@ -16,6 +16,8 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
+const APPLICATION_SETTINGS_MENU_ID: &str = "mom-llama.application.settings";
+
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
@@ -290,6 +292,10 @@ async fn mom_llama_runtime_initialize(
     app: AppHandle,
     startup: State<'_, StartupController>,
 ) -> Result<(), String> {
+    initialize_runtime(app, &startup).await
+}
+
+async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Result<(), String> {
     let retry_cached_failure = match startup.begin_initialization()? {
         StartupAction::AlreadyReady => return Ok(()),
         StartupAction::Initialize {
@@ -326,13 +332,20 @@ async fn mom_llama_runtime_initialize(
     startup.begin_runtime_build()?;
     let runtime_data_dir = settings.data_dir.clone();
 
-    let built = match tauri::async_runtime::spawn_blocking(move || build_runtime(settings)).await {
-        Ok(built) => built,
-        Err(error) => {
-            startup.finish_failed_build();
-            return Err(format!("Mom Llama startup worker failed: {error}"));
-        }
-    };
+    let shared_client = app
+        .try_state::<EmbeddedMom>()
+        .map(|embedded| embedded.client.clone());
+    let embedded = shared_client.is_some();
+    let built =
+        match tauri::async_runtime::spawn_blocking(move || build_runtime(settings, shared_client))
+            .await
+        {
+            Ok(built) => built,
+            Err(error) => {
+                startup.finish_failed_build();
+                return Err(format!("Mom Llama startup worker failed: {error}"));
+            }
+        };
 
     match built {
         Ok(runtime) => match startup.install(&app, runtime) {
@@ -342,8 +355,16 @@ async fn mom_llama_runtime_initialize(
             }
             Err(runtime) => {
                 runtime.begin_quiesce();
-                let shutdown = runtime.shutdown().await;
-                let safe_to_exit = safe_to_exit_after_shutdown(&shutdown);
+                let shutdown = if embedded {
+                    runtime.drain_shared_services().await
+                } else {
+                    runtime.shutdown().await
+                };
+                let safe_to_exit = if embedded {
+                    shutdown.is_ok()
+                } else {
+                    safe_to_exit_after_shutdown(&shutdown)
+                };
                 log_shutdown_result(&shutdown);
                 startup.finish_rejected_build(runtime, safe_to_exit);
                 Err("Mom Llama stopped before encrypted runtime startup completed".to_string())
@@ -357,7 +378,249 @@ async fn mom_llama_runtime_initialize(
     }
 }
 
-fn main() {
+fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        mom_llama_runtime_initialize,
+        commands::mom_llama_render_app,
+        commands::mom_llama_render_chat_fragment,
+        commands::mom_llama_render_sidebar_fragment,
+        commands::mom_llama_render_settings_fragment,
+        commands::mom_llama_pick_file,
+        commands::mom_llama_information_pick_alexandria,
+        commands::mom_llama_information_register_alexandria,
+        commands::mom_llama_information_libraries,
+        commands::mom_llama_information_search,
+        commands::mom_llama_information_open_citation,
+        commands::mom_llama_information_grant_model_context,
+        commands::mom_llama_information_chat_send,
+        commands::mom_llama_attachment_library_preview,
+        commands::mom_llama_attachment_library_commit,
+        commands::mom_llama_information_managed_attachments,
+        commands::mom_llama_information_search_managed_attachment,
+        commands::mom_llama_information_open_managed_citation,
+        commands::mom_llama_information_managed_removal_preview,
+        commands::mom_llama_information_managed_removal_commit,
+        commands::mom_llama_engine_check,
+        commands::mom_llama_engine_configure,
+        commands::mom_llama_model_list,
+        commands::mom_llama_model_select,
+        commands::mom_llama_chat_send,
+        commands::mom_llama_composer_autocomplete,
+        commands::mom_llama_composer_autocomplete_cancel,
+        commands::mom_llama_composer_autocomplete_accept,
+        commands::mom_llama_chat_dispatch,
+        commands::mom_llama_mention_dispatch,
+        commands::mom_llama_chat_cancel,
+        commands::mom_llama_chat_skip_reasoning,
+        commands::mom_llama_chat_regenerate,
+        commands::mom_llama_chat_continue,
+        commands::mom_llama_mention_candidates,
+        commands::mom_llama_consult_sources,
+        commands::mom_llama_consult_source_open,
+        commands::mom_llama_mention_cancel,
+        commands::mom_llama_mention_synthesize,
+        commands::mom_llama_mention_tool_approval_list,
+        commands::mom_llama_mention_tool_approval_decide,
+        commands::mom_llama_persona_freeze,
+        commands::mom_llama_persona_list,
+        commands::mom_llama_persona_get,
+        commands::mom_llama_persona_update,
+        commands::mom_llama_persona_removal_preview,
+        commands::mom_llama_persona_remove_from_library,
+        commands::mom_llama_persona_instantiate,
+        commands::mom_llama_persona_group_list,
+        commands::mom_llama_persona_group_create,
+        commands::mom_llama_persona_group_update,
+        commands::mom_llama_persona_group_delete,
+        commands::mom_llama_conversation_draft_open,
+        commands::mom_llama_conversation_draft_recipients_update,
+        commands::mom_llama_conversation_draft_submit,
+        commands::mom_llama_conversation_new,
+        commands::mom_llama_conversation_list,
+        commands::mom_llama_conversation_select,
+        commands::mom_llama_conversation_search,
+        commands::mom_llama_conversation_rename,
+        commands::mom_llama_conversation_system_message_update,
+        commands::mom_llama_conversation_delete,
+        commands::mom_llama_conversation_fork,
+        commands::mom_llama_conversation_siblings,
+        commands::mom_llama_draft_get,
+        commands::mom_llama_draft_update,
+        commands::mom_llama_draft_clear,
+        commands::mom_llama_conversation_export,
+        commands::mom_llama_conversation_import,
+        commands::mom_llama_message_copy,
+        commands::mom_llama_speech_read_aloud,
+        commands::mom_llama_message_edit,
+        commands::mom_llama_message_delete,
+        commands::mom_llama_message_branches,
+        commands::mom_llama_message_branch_select,
+        commands::mom_llama_attachment_import_text,
+        commands::mom_llama_attachment_import_paste,
+        commands::mom_llama_attachment_import,
+        commands::mom_llama_attachment_list,
+        commands::mom_llama_attachment_preview,
+        commands::mom_llama_attachment_preview_content,
+        commands::mom_llama_attachment_preview_bytes,
+        commands::mom_llama_speech_transcribe_attachment,
+        commands::mom_llama_speech_audio,
+        commands::mom_llama_speech_stop,
+        commands::mom_llama_settings_get,
+        commands::mom_llama_settings_reset,
+        commands::mom_llama_settings_update,
+        commands::mom_llama_skill_create,
+        commands::mom_llama_skill_update,
+        commands::mom_llama_skill_list,
+        commands::mom_llama_skill_apply,
+        commands::mom_llama_kv_cache_status,
+        commands::mom_llama_kv_cache_save,
+        commands::mom_llama_kv_cache_restore,
+        commands::mom_llama_kv_cache_clear,
+        commands::mom_llama_mcp_status,
+        commands::mom_llama_mcp_configure,
+        commands::mom_llama_mcp_list_servers,
+        commands::mom_llama_mcp_list_tools,
+        commands::mom_llama_mcp_call_tool,
+        commands::mom_llama_mcp_list_resources,
+        commands::mom_llama_mcp_read_resource,
+        commands::mom_llama_mcp_list_prompts,
+        commands::mom_llama_mcp_get_prompt,
+        commands::mom_llama_tool_loop_prepare,
+        commands::mom_llama_tool_loop_run,
+        commands::mom_llama_tool_loop_cancel,
+        commands::mom_llama_tool_loop_status,
+        commands::mom_llama_tool_permission_list,
+        commands::mom_llama_tool_permission_set,
+        commands::mom_llama_tool_permission_revoke,
+        commands::mom_llama_model_slot_list,
+        commands::mom_llama_model_slot_load,
+        commands::mom_llama_model_slot_unload,
+    ]
+}
+
+/// Mom services embedded in an existing application/event loop. Native host
+/// ownership stays with that application's coordinator.
+#[derive(Clone)]
+pub struct EmbeddedMom {
+    client: llama_native_host::NativeClient,
+    startup: StartupController,
+}
+
+impl EmbeddedMom {
+    pub fn new(client: llama_native_host::NativeClient) -> Self {
+        Self {
+            client,
+            startup: StartupController::new(),
+        }
+    }
+
+    pub fn configure(&self, builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+        builder
+            .manage(self.clone())
+            .manage(self.startup.clone())
+            .invoke_handler(command_handler())
+    }
+
+    /// Execute an ordinary Mom turn through the same admission and worker
+    /// supervisor as the Tauri command. The caller owns its document projection;
+    /// this result retains the authoritative message and invocation identities.
+    pub async fn dispatch<F>(
+        &self,
+        app: AppHandle,
+        input: mom_llama_runtime::MentionDispatchInput,
+        on_event: Option<F>,
+    ) -> Result<mom_llama_runtime::CommandResult<mom_llama_runtime::ChatDispatchOutput>, String>
+    where
+        F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.dispatch_cancellable(
+            app,
+            input,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            on_event,
+        )
+        .await
+    }
+
+    /// Cancellation is local to this dispatch and is reswept until its owned
+    /// worker reaches a terminal result. Cancelling never drops a live worker.
+    pub async fn dispatch_cancellable<F>(
+        &self,
+        app: AppHandle,
+        input: mom_llama_runtime::MentionDispatchInput,
+        context: Vec<String>,
+        cancelled: Arc<AtomicBool>,
+        on_event: Option<F>,
+    ) -> Result<mom_llama_runtime::CommandResult<mom_llama_runtime::ChatDispatchOutput>, String>
+    where
+        F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+    {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Mom dispatch was cancelled before startup".into());
+        }
+        let registered = app
+            .try_state::<Self>()
+            .ok_or_else(|| "Mom service is not registered in this application".to_string())?;
+        if !Arc::ptr_eq(&self.startup.state, &registered.startup.state) {
+            return Err("Mom service belongs to another application".to_string());
+        }
+        initialize_runtime(app.clone(), &self.startup).await?;
+        let runtime = app
+            .try_state::<AppRuntimeHandle>()
+            .ok_or_else(|| "Mom runtime was not installed after startup".to_string())?
+            .inner()
+            .clone();
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Mom dispatch was cancelled during startup".into());
+        }
+        let operations = runtime
+            .operation_scope()
+            .child()
+            .map_err(|error| error.to_string())?;
+        let lease = runtime.admit(command_registry::command_spec("mom_llama_chat_dispatch"))?;
+        let dispatch = commands::dispatch_typed_in_scope(
+            runtime,
+            lease,
+            operations.clone(),
+            input,
+            Some(context),
+            on_event,
+        );
+        let mut dispatch = std::pin::pin!(dispatch);
+        let mut sweep = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                result = &mut dispatch => return result,
+                _ = sweep.tick() => {
+                    if cancelled.load(Ordering::Acquire) {
+                        operations.request_cancellation();
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn drain(&self) -> Result<(), String> {
+        match self.startup.final_exit_target() {
+            FinalExitTarget::NoRuntime => Ok(()),
+            FinalExitTarget::Runtime(runtime) => {
+                let result = runtime.drain_shared_services().await;
+                log_shutdown_result(&result);
+                result.map(|_| ()).map_err(|error| error.to_string())
+            }
+            FinalExitTarget::WaitForBuild => {
+                if self.startup.wait_for_build().await {
+                    Ok(())
+                } else {
+                    Err("embedded Mom startup could not drain safely".into())
+                }
+            }
+        }
+    }
+}
+
+pub fn run() {
     if std::env::args().any(|arg| arg == "--dump-html") {
         match view::render_app(&mom_llama_runtime::OperationScope::detached()) {
             Ok(html) => println!("{html}"),
@@ -391,118 +654,7 @@ fn main() {
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
         .manage(startup)
-        .invoke_handler(tauri::generate_handler![
-            mom_llama_runtime_initialize,
-            commands::mom_llama_render_app,
-            commands::mom_llama_render_chat_fragment,
-            commands::mom_llama_render_sidebar_fragment,
-            commands::mom_llama_render_settings_fragment,
-            commands::mom_llama_pick_file,
-            commands::mom_llama_information_pick_alexandria,
-            commands::mom_llama_information_register_alexandria,
-            commands::mom_llama_information_libraries,
-            commands::mom_llama_information_search,
-            commands::mom_llama_information_open_citation,
-            commands::mom_llama_information_grant_model_context,
-            commands::mom_llama_information_chat_send,
-            commands::mom_llama_attachment_library_preview,
-            commands::mom_llama_attachment_library_commit,
-            commands::mom_llama_information_managed_attachments,
-            commands::mom_llama_information_search_managed_attachment,
-            commands::mom_llama_information_open_managed_citation,
-            commands::mom_llama_information_managed_removal_preview,
-            commands::mom_llama_information_managed_removal_commit,
-            commands::mom_llama_engine_check,
-            commands::mom_llama_engine_configure,
-            commands::mom_llama_model_list,
-            commands::mom_llama_model_select,
-            commands::mom_llama_chat_send,
-            commands::mom_llama_composer_autocomplete,
-            commands::mom_llama_composer_autocomplete_cancel,
-            commands::mom_llama_composer_autocomplete_accept,
-            commands::mom_llama_chat_dispatch,
-            commands::mom_llama_mention_dispatch,
-            commands::mom_llama_chat_cancel,
-            commands::mom_llama_chat_skip_reasoning,
-            commands::mom_llama_chat_regenerate,
-            commands::mom_llama_chat_continue,
-            commands::mom_llama_mention_candidates,
-            commands::mom_llama_mention_cancel,
-            commands::mom_llama_mention_synthesize,
-            commands::mom_llama_mention_tool_approval_list,
-            commands::mom_llama_mention_tool_approval_decide,
-            commands::mom_llama_persona_freeze,
-            commands::mom_llama_persona_list,
-            commands::mom_llama_persona_get,
-            commands::mom_llama_persona_update,
-            commands::mom_llama_persona_removal_preview,
-            commands::mom_llama_persona_remove_from_library,
-            commands::mom_llama_persona_instantiate,
-            commands::mom_llama_persona_group_list,
-            commands::mom_llama_persona_group_create,
-            commands::mom_llama_persona_group_update,
-            commands::mom_llama_persona_group_delete,
-            commands::mom_llama_conversation_new,
-            commands::mom_llama_conversation_list,
-            commands::mom_llama_conversation_select,
-            commands::mom_llama_conversation_search,
-            commands::mom_llama_conversation_rename,
-            commands::mom_llama_conversation_system_message_update,
-            commands::mom_llama_conversation_delete,
-            commands::mom_llama_conversation_fork,
-            commands::mom_llama_conversation_siblings,
-            commands::mom_llama_draft_get,
-            commands::mom_llama_draft_update,
-            commands::mom_llama_draft_clear,
-            commands::mom_llama_conversation_export,
-            commands::mom_llama_conversation_import,
-            commands::mom_llama_message_copy,
-            commands::mom_llama_speech_read_aloud,
-            commands::mom_llama_message_edit,
-            commands::mom_llama_message_delete,
-            commands::mom_llama_message_branches,
-            commands::mom_llama_message_branch_select,
-            commands::mom_llama_attachment_import_text,
-            commands::mom_llama_attachment_import_paste,
-            commands::mom_llama_attachment_import,
-            commands::mom_llama_attachment_list,
-            commands::mom_llama_attachment_preview,
-            commands::mom_llama_attachment_preview_content,
-            commands::mom_llama_attachment_preview_bytes,
-            commands::mom_llama_speech_transcribe_attachment,
-            commands::mom_llama_speech_audio,
-            commands::mom_llama_speech_stop,
-            commands::mom_llama_settings_get,
-            commands::mom_llama_settings_reset,
-            commands::mom_llama_settings_update,
-            commands::mom_llama_skill_create,
-            commands::mom_llama_skill_update,
-            commands::mom_llama_skill_list,
-            commands::mom_llama_skill_apply,
-            commands::mom_llama_kv_cache_status,
-            commands::mom_llama_kv_cache_save,
-            commands::mom_llama_kv_cache_restore,
-            commands::mom_llama_kv_cache_clear,
-            commands::mom_llama_mcp_status,
-            commands::mom_llama_mcp_configure,
-            commands::mom_llama_mcp_list_servers,
-            commands::mom_llama_mcp_list_tools,
-            commands::mom_llama_mcp_call_tool,
-            commands::mom_llama_mcp_list_resources,
-            commands::mom_llama_mcp_read_resource,
-            commands::mom_llama_mcp_list_prompts,
-            commands::mom_llama_mcp_get_prompt,
-            commands::mom_llama_tool_loop_prepare,
-            commands::mom_llama_tool_loop_run,
-            commands::mom_llama_tool_loop_cancel,
-            commands::mom_llama_tool_loop_status,
-            commands::mom_llama_tool_permission_list,
-            commands::mom_llama_tool_permission_set,
-            commands::mom_llama_tool_permission_revoke,
-            commands::mom_llama_model_slot_list,
-            commands::mom_llama_model_slot_load,
-            commands::mom_llama_model_slot_unload,
-        ])
+        .invoke_handler(command_handler())
         .build(tauri::generate_context!());
     match app {
         Ok(app) => app.run(move |app_handle, event| {
@@ -510,6 +662,14 @@ fn main() {
                 && menu_event.id() == APPLICATION_QUIT_MENU_ID
             {
                 request_startup_aware_exit(app_handle, &event_startup, &event_exit_allowed, 0);
+                return;
+            }
+            if let tauri::RunEvent::MenuEvent(menu_event) = &event
+                && menu_event.id() == APPLICATION_SETTINGS_MENU_ID
+            {
+                if let Err(error) = app_handle.emit("mom_llama_settings_open", ()) {
+                    eprintln!("Could not open Settings: {error}");
+                }
                 return;
             }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
@@ -602,6 +762,14 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        APPLICATION_SETTINGS_MENU_ID,
+                        "Settings…",
+                        true,
+                        Some("CmdOrCtrl+,"),
+                    )?,
                     &PredefinedMenuItem::separator(app)?,
                     &PredefinedMenuItem::services(app, None)?,
                     &PredefinedMenuItem::separator(app)?,
@@ -767,6 +935,7 @@ fn log_shutdown_result(
 
 fn build_runtime(
     settings: mom_llama_runtime::config::Settings,
+    shared_client: Option<llama_native_host::NativeClient>,
 ) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
     let speech_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -788,12 +957,6 @@ fn build_runtime(
             .map_err(|error| RuntimeBuildError {
                 message: format!("persona approval recovery initialization failed: {error:#}"),
             })?;
-    let native_owner = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(
-        &settings,
-    )
-    .map_err(|error| RuntimeBuildError {
-        message: format!("native runtime owner initialization failed: {error:#}"),
-    })?;
     let information = Arc::new(
         crate::information::MomInformation::open(&settings.data_dir).map_err(|error| {
             RuntimeBuildError {
@@ -801,12 +964,33 @@ fn build_runtime(
             }
         })?,
     );
-    Ok(AppRuntimeHandle::new(
-        native_owner,
-        persona_approval_recovery,
-        speech,
-        information,
-    ))
+    if let Some(client) = shared_client {
+        let scope =
+            mom_llama_runtime::native_runtime::shared_operation_scope(&settings, client.clone())
+                .map_err(|error| RuntimeBuildError {
+                    message: format!("shared native scope initialization failed: {error:#}"),
+                })?;
+        Ok(AppRuntimeHandle::new_shared(
+            client,
+            scope,
+            persona_approval_recovery,
+            speech,
+            information,
+        ))
+    } else {
+        let native_owner = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(
+            &settings,
+        )
+        .map_err(|error| RuntimeBuildError {
+            message: format!("native runtime owner initialization failed: {error:#}"),
+        })?;
+        Ok(AppRuntimeHandle::new(
+            native_owner,
+            persona_approval_recovery,
+            speech,
+            information,
+        ))
+    }
 }
 
 fn smoke() -> Result<()> {

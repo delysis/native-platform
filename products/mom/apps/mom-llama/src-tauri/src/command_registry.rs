@@ -119,6 +119,8 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_chat_dispatch", true, true),
     long("mom_llama_mention_dispatch", true, true),
     read("mom_llama_mention_candidates", true, false),
+    read("mom_llama_consult_sources", true, false),
+    long("mom_llama_consult_source_open", true, false),
     mutation("mom_llama_mention_cancel", true, true),
     long("mom_llama_mention_synthesize", true, true),
     read("mom_llama_mention_tool_approval_list", true, false),
@@ -138,6 +140,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_chat_skip_reasoning", true, true),
     long("mom_llama_chat_regenerate", true, true),
     long("mom_llama_chat_continue", true, true),
+    mutation("mom_llama_conversation_draft_open", true, false),
+    mutation(
+        "mom_llama_conversation_draft_recipients_update",
+        true,
+        false,
+    ),
+    mutation("mom_llama_conversation_draft_submit", true, false),
     mutation("mom_llama_conversation_new", true, false),
     read("mom_llama_conversation_list", true, false),
     mutation("mom_llama_conversation_select", true, false),
@@ -230,17 +239,22 @@ mod tests {
     #[test]
     fn command_registry_matches_invoke_handler() {
         let main = include_str!("main.rs");
-        let invoked = names_between(
-            main,
-            ".invoke_handler(tauri::generate_handler![",
-            "])",
-            "commands::",
-        );
+        let invoked = names_between(main, "tauri::generate_handler![", "]", "commands::");
         let classified = COMMAND_SPECS
             .iter()
             .map(|spec| spec.name.to_string())
             .collect::<BTreeSet<_>>();
         assert_eq!(classified, invoked);
+        assert_eq!(
+            main.matches("tauri::generate_handler![").count(),
+            1,
+            "one shared command implementation"
+        );
+        assert_eq!(
+            main.matches(".invoke_handler(command_handler())").count(),
+            2,
+            "standalone and embedded roots use the same handler"
+        );
         assert_eq!(
             classified.len(),
             COMMAND_SPECS.len(),

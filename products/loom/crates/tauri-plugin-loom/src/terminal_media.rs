@@ -5,14 +5,55 @@
 use std::collections::HashSet;
 
 use llama_native_types::MediaInput;
+#[cfg(test)]
+use llama_native_types::MediaKind;
+use llama_native_types::media_identity::{MediaAdmission, MediaIdentityLedger};
 use loom_store::{LoadedDocument, ProjectStore};
+#[cfg(test)]
+use sha2::{Digest as _, Sha256};
 
 use super::IpcFailure;
 use super::context_attachments::resolve_media_for_document;
 use super::document_bindings::ResolvedDocument;
 
-const MAX_MEDIA: usize = 32;
-const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
+/// The sole ordered media admission/budget implementation for source documents,
+/// references and terminal/context composition. Payload sharing never changes
+/// the source occurrences retained by the caller's document/evidence bindings.
+#[derive(Default)]
+pub(super) struct MediaAccumulator {
+    items: Vec<MediaInput>,
+    identities: MediaIdentityLedger,
+}
+
+impl MediaAccumulator {
+    pub(super) fn extend(
+        &mut self,
+        media: impl IntoIterator<Item = MediaInput>,
+    ) -> Result<(), IpcFailure> {
+        for item in media {
+            self.push(item)?;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, item: MediaInput) -> Result<(), IpcFailure> {
+        let admission = self.identities.admit(&item).map_err(|error| {
+            if error.is_limit() {
+                limit()
+            } else {
+                invalid(&error.to_string())
+            }
+        })?;
+        if admission == MediaAdmission::NewPayload {
+            self.items.push(item);
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> Vec<MediaInput> {
+        self.items
+    }
+}
 
 pub(super) fn resolve(
     store: &ProjectStore,
@@ -28,10 +69,8 @@ pub(super) fn resolve(
             .iter()
             .map(|document| (document.document_id, document.text.as_str())),
     );
-    let mut media = Vec::new();
+    let mut media = MediaAccumulator::default();
     let mut seen_documents = HashSet::new();
-    let mut seen = HashSet::new();
-    let mut total_bytes = 0_usize;
     for (document_id, text) in documents {
         if !seen_documents.insert(document_id) {
             continue;
@@ -40,20 +79,9 @@ pub(super) fn resolve(
             .map_err(|error| {
                 IpcFailure::new("terminal_media_unavailable", error.to_string(), false)
             })?;
-        for item in resolved {
-            if !seen.insert((item.kind, item.sha256.clone())) {
-                continue;
-            }
-            total_bytes = total_bytes
-                .checked_add(item.bytes.len())
-                .ok_or_else(limit)?;
-            if media.len() >= MAX_MEDIA || total_bytes > MAX_MEDIA_BYTES {
-                return Err(limit());
-            }
-            media.push(item);
-        }
+        media.extend(resolved)?;
     }
-    Ok(media)
+    Ok(media.finish())
 }
 
 /// Apply the same aggregate budget after combining independently resolved inputs.
@@ -61,20 +89,14 @@ pub(super) fn merge(
     first: Vec<MediaInput>,
     second: Vec<MediaInput>,
 ) -> Result<Vec<MediaInput>, IpcFailure> {
-    let mut seen = HashSet::new();
-    let mut bytes = 0_usize;
-    let mut result = Vec::new();
-    for item in first.into_iter().chain(second) {
-        if !seen.insert((item.kind, item.sha256.clone())) {
-            continue;
-        }
-        bytes = bytes.checked_add(item.bytes.len()).ok_or_else(limit)?;
-        if result.len() >= MAX_MEDIA || bytes > MAX_MEDIA_BYTES {
-            return Err(limit());
-        }
-        result.push(item);
-    }
-    Ok(result)
+    let mut media = MediaAccumulator::default();
+    media.extend(first)?;
+    media.extend(second)?;
+    Ok(media.finish())
+}
+
+fn invalid(message: &str) -> IpcFailure {
+    IpcFailure::new("terminal_media_identity_conflict", message, false)
 }
 
 fn limit() -> IpcFailure {
@@ -83,6 +105,85 @@ fn limit() -> IpcFailure {
         "Use at most 32 referenced documents and 32 distinct media inputs totaling at most 128 MiB.",
         false,
     )
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn item(id: &str, bytes: &[u8]) -> MediaInput {
+        MediaInput {
+            id: id.into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn equal_payloads_share_bytes_in_first_occurrence_order() {
+        let first = item("first", b"one");
+        let second = item("second", b"two");
+        let duplicate = item("another-occurrence", b"one");
+        assert_eq!(
+            merge(vec![first.clone()], vec![second.clone(), duplicate]).unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn a_duplicate_claim_cannot_hide_corrupt_bytes() {
+        let first = item("first", b"one");
+        let mut corrupt = first.clone();
+        corrupt.id = "another-occurrence".into();
+        corrupt.bytes = b"two".to_vec();
+        assert!(merge(vec![first], vec![corrupt]).is_err());
+    }
+
+    #[test]
+    fn repeated_ids_cannot_rebind_payloads() {
+        assert!(merge(vec![item("same", b"one")], vec![item("same", b"two")]).is_err());
+    }
+
+    #[test]
+    fn duplicate_payloads_cannot_rebind_mime() {
+        let first = item("first", b"one");
+        let mut changed = item("second", b"one");
+        changed.mime = "image/png".into();
+        assert!(merge(vec![first], vec![changed]).is_err());
+    }
+
+    #[test]
+    fn same_bytes_of_different_kinds_are_not_silently_deduplicated() {
+        let audio = item("audio", b"one");
+        let mut image = item("image", b"one");
+        image.kind = MediaKind::Image;
+        image.mime = "image/png".into();
+        assert_eq!(merge(vec![audio], vec![image]).unwrap().len(), 2);
+        // Codec/capability admission still belongs to Attachment and Native;
+        // this accumulator does not call arbitrary bytes a decoded image.
+    }
+
+    #[test]
+    fn count_limit_applies_across_independently_resolved_documents() {
+        let first = (0_u8..16)
+            .map(|index| item(&index.to_string(), &[index]))
+            .collect();
+        let second = (16_u8..33)
+            .map(|index| item(&index.to_string(), &[index]))
+            .collect();
+        assert!(merge(first, second).is_err());
+    }
+
+    #[test]
+    fn invalid_occurrence_does_not_mutate_the_accumulator() {
+        let first = item("first", b"one");
+        let mut media = MediaAccumulator::default();
+        media.extend([first.clone()]).unwrap();
+        assert!(media.extend([item("first", b"two")]).is_err());
+        assert_eq!(media.finish(), vec![first]);
+    }
 }
 
 #[cfg(all(test, unix))]

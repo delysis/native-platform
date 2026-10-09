@@ -1147,7 +1147,10 @@ run_once() {
       ;;
     loom)
       open -F -n -W -o "$stdout_log" --stderr "$stderr_log" \
-        --env "DELYSIS_LOOM_ACCEPTANCE_DIR=$PRODUCT_STATE" "$BUNDLE" &
+        --env "DELYSIS_LOOM_ACCEPTANCE_DIR=$PRODUCT_STATE" \
+        --env "LLAMA_NATIVE_KIT_DATA_DIR=$PRODUCT_STATE/mom" \
+        --env LLAMA_NATIVE_KIT_STORE_KEY_HEX=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
+        "$BUNDLE" &
       ;;
     fte)
       open -F -n -W -o "$stdout_log" --stderr "$stderr_log" \

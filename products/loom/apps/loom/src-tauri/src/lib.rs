@@ -11,6 +11,9 @@ use tauri::menu::{
 use tauri::utils::config::WindowConfig;
 use tauri::{AppHandle, Runtime};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod application;
+
 const EMBEDDED_BUILD_MODEL_POLICY: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/loom-build-model-policy.json"));
 const EMBEDDED_BUILD_MODEL_POLICY_NAME: &str = env!("LOOM_BUILD_MODEL_POLICY_NAME");
@@ -43,8 +46,24 @@ pub fn run() {
         .with_build_model_policy(build_model_policy)
         .with_app_local_data_root(acceptance_app_local_data_root)
         .with_isolated_model_discovery(isolate_model_discovery);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (application, document_runtime) = match application::Application::new() {
+        Ok(application) => application,
+        Err(error) => {
+            eprintln!(
+                "Loom application ownership could not initialize: {}",
+                error.message
+            );
+            return;
+        }
+    };
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let loom_plugin = loom_plugin.with_application_native_runtime(document_runtime);
     let (context, acceptance_windows) = application_context(acceptance_data_store);
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = application.configure(builder);
+    builder
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // bypasses RunEvent::ExitRequested. Loom owns a regular Cmd+Q menu item
         // so every graceful quit enters the joined-worker close coordinator.

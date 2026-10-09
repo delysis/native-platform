@@ -26,13 +26,22 @@ const fn mcp_process_ui_supported() -> bool {
 }
 
 pub const CONTROL_SPECS: &[ControlSpec] = &[
+    // The normal Loom chat projection uses these same product operations.
     ControlSpec {
-        affordance: "layout.sidebar_toggle",
-        command: "mom_llama.conversation_list",
-        tauri_command: "mom_llama_conversation_list",
-        cli: "mom-llama conversation list --json",
+        affordance: "consult.consult_sources",
+        command: "mom_llama.consult_sources",
+        tauri_command: "mom_llama_consult_sources",
+        cli: "mom-llama mention sources --invocation <id> --target <id> --json",
         effect: "mom_llama.effects.conversation_store.v1",
-        label: "Toggle sidebar",
+        label: "Consultation sources",
+    },
+    ControlSpec {
+        affordance: "consult.consult_source_open",
+        command: "mom_llama.consult_source_open",
+        tauri_command: "mom_llama_consult_source_open",
+        cli: "mom-llama mention source-open --invocation <id> --target <id> --conversation <id> --message <id> --attachment <id> --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Open exact source occurrence",
     },
     ControlSpec {
         affordance: "settings.open",
@@ -256,7 +265,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_persona_freeze",
         cli: "mom-llama persona freeze --conversation <id> --message <id> --name <name> --handle <handle> --json",
         effect: "mom_llama.effects.conversation_store.v1",
-        label: "Freeze as persona",
+        label: "Save as persona",
     },
     ControlSpec {
         affordance: "persona.list",
@@ -411,10 +420,34 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Continue",
     },
     ControlSpec {
+        affordance: "conversation.recipients",
+        command: "mom_llama.conversation_draft_recipients_update",
+        tauri_command: "mom_llama_conversation_draft_recipients_update",
+        cli: "mom-llama conversation draft-recipients --recipient <id> --name <name> --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Contacts",
+    },
+    ControlSpec {
+        affordance: "conversation.persona_draft_open",
+        command: "mom_llama.conversation_draft_open",
+        tauri_command: "mom_llama_conversation_draft_open",
+        cli: "mom-llama conversation draft-open --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Chat",
+    },
+    ControlSpec {
+        affordance: "conversation.draft_submit",
+        command: "mom_llama.conversation_draft_submit",
+        tauri_command: "mom_llama_conversation_draft_submit",
+        cli: "mom-llama conversation draft-submit --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Send",
+    },
+    ControlSpec {
         affordance: "conversation.new",
-        command: "mom_llama.conversation_new",
-        tauri_command: "mom_llama_conversation_new",
-        cli: "mom-llama conversation new --title <title> --json",
+        command: "mom_llama.conversation_draft_open",
+        tauri_command: "mom_llama_conversation_draft_open",
+        cli: "mom-llama conversation draft-open --json",
         effect: "mom_llama.effects.conversation_store.v1",
         label: "New chat",
     },
@@ -488,7 +521,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_conversation_fork",
         cli: "mom-llama conversation fork --conversation <id> --message <id> --json",
         effect: "mom_llama.effects.conversation_store.v1",
-        label: "Fork",
+        label: "Branch",
     },
     ControlSpec {
         affordance: "conversation.siblings",
@@ -1053,46 +1086,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
     },
     SettingsFieldSpec {
         section: "display",
-        key: "alwaysShowSidebarOnDesktop",
-        label: "Always show sidebar on desktop",
-        kind: "checkbox",
-        help: "Keep sidebar open on desktop layouts.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showRawModelNames",
-        label: "Show raw model names",
-        kind: "checkbox",
-        help: "Display full raw model identifiers.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showModelQuantization",
-        label: "Show model quantization information",
-        kind: "checkbox",
-        help: "Show the quantization inferred from the selected local GGUF filename.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showModelTags",
-        label: "Show model tags",
-        kind: "checkbox",
-        help: "Show native capability tags such as local, multimodal, and reasoning.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showBuildVersion",
-        label: "Show build version information",
-        kind: "checkbox",
-        help: "Display the Mom Llama app version in the bottom-right corner.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
         key: "showSystemMessage",
         label: "Show system message",
         kind: "checkbox",
@@ -1397,19 +1390,22 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let models = mom_llama_runtime::model_list(scope)?;
     let selected_conversation_id =
         mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
-    let current_conversation_id =
-        active_conversation(&conversations, selected_conversation_id.as_deref())
-            .map(|conversation| conversation.id)
-            .unwrap_or_else(|| "default".to_string());
-    let draft = mom_llama_runtime::draft_get(Some(&current_conversation_id))?;
+    let active = project_active_conversation(&conversations, selected_conversation_id.as_deref())?;
+    let current_conversation_id = active
+        .as_ref()
+        .map(|conversation| conversation.id.as_str())
+        .unwrap_or("default");
+    let draft = mom_llama_runtime::draft_get(Some(current_conversation_id))?;
+    let recipients = mom_llama_runtime::conversation_draft_recipients()?;
     Ok(app_markup(AppProjection {
         settings: &settings,
         engine: &engine,
         conversations: &conversations,
         personas: &personas,
         models: &models,
-        selected_conversation_id: selected_conversation_id.as_deref(),
+        active,
         draft: &draft,
+        recipients: &recipients,
     })
     .into_string())
 }
@@ -1420,16 +1416,24 @@ pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result
     let models = mom_llama_runtime::model_list(scope)?;
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
-    let active = active_conversation(&conversations, selected.as_deref());
+    let active = project_active_conversation(&conversations, selected.as_deref())?;
     let current_id = active
         .as_ref()
         .map(|conversation| conversation.id.as_str())
         .unwrap_or("default");
     let draft = mom_llama_runtime::draft_get(Some(current_id))?;
-    Ok(
-        chat_view_with_draft(&settings, &engine, &models, active.as_ref(), Some(&draft))
-            .into_string(),
+    let personas = persona_projection();
+    let recipients = mom_llama_runtime::conversation_draft_recipients()?;
+    Ok(chat_view_with_draft(
+        &settings,
+        &engine,
+        &models,
+        active.as_ref(),
+        Some(&draft),
+        &personas,
+        &recipients,
     )
+    .into_string())
 }
 
 pub fn render_sidebar_fragment() -> Result<String> {
@@ -1445,7 +1449,7 @@ pub fn render_settings_fragment(scope: &mom_llama_runtime::OperationScope) -> Re
     let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
-    let active = active_conversation(&conversations, selected.as_deref());
+    let active = project_active_conversation(&conversations, selected.as_deref())?;
     Ok(settings_sidebar(&settings, &models, &personas, active.as_ref()).into_string())
 }
 
@@ -1455,8 +1459,9 @@ struct AppProjection<'a> {
     conversations: &'a CommandResult<Vec<Conversation>>,
     personas: &'a StoreProjection<Vec<Conversation>>,
     models: &'a CommandResult<Vec<ModelInfo>>,
-    selected_conversation_id: Option<&'a str>,
+    active: Option<Conversation>,
     draft: &'a CommandResult<DraftMessage>,
+    recipients: &'a mom_llama_runtime::DraftRecipients,
 }
 
 fn app_markup(projection: AppProjection<'_>) -> Markup {
@@ -1466,16 +1471,14 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
         conversations,
         personas,
         models,
-        selected_conversation_id,
+        active,
         draft,
+        recipients,
     } = projection;
-    let active = active_conversation(conversations, selected_conversation_id);
     let theme = upstream_settings_value(settings, "theme");
     let full_height_code = upstream_settings_bool(settings, "fullHeightCodeBlocks");
     let disable_auto_scroll = upstream_settings_bool(settings, "disableAutoScroll");
-    let always_show_sidebar = upstream_settings_bool(settings, "alwaysShowSidebarOnDesktop");
     let custom_css = upstream_settings_value(settings, "customCss");
-    let show_build_version = upstream_settings_bool(settings, "showBuildVersion");
     html! {
         div class=(format!(
                 "llama-ui-shell{}",
@@ -1483,28 +1486,48 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             ))
             data-theme=(theme)
             data-disable-auto-scroll=(disable_auto_scroll)
-            data-always-show-sidebar=(always_show_sidebar)
             data-custom-css=(custom_css)
             data-runtime="tauri-maud-htmx"
             data-native-core-only="true"
             data-mcp-process-ui-supported=(mcp_process_ui_supported()) {
             (sidebar(conversations, personas, active.as_ref().map(|conversation| conversation.id.as_str())))
             header class="chrome" aria-label="Window toolbar" {
-                (button("layout.sidebar_toggle", Some("sidebar-toggle"), "icon-button sidebar-toggle", false))
+                (button("conversation.new", Some("conversation-new"), "icon-button", false))
+                (button("conversation.search", Some("conversation-search-open"), "icon-button search-toggle", false))
+                form id="conversation-search-form" class="nav-search is-hidden"
+                    data-affordance="conversation.search"
+                    data-command="mom_llama.conversation_search"
+                    data-tauri-command="mom_llama_conversation_search"
+                    data-cli="mom-llama conversation search --query <text> --json"
+                    data-effect="mom_llama.effects.conversation_store.v1" {
+                    input name="query" placeholder="Search" aria-label="Search conversations"
+                        data-affordance="conversation.search.query"
+                        data-command="mom_llama.conversation_search"
+                        data-tauri-command="mom_llama_conversation_search"
+                        data-cli="mom-llama conversation search --query <text> --json"
+                        data-effect="mom_llama.effects.conversation_store.v1";
+                    button type="submit"
+                        class="icon-button search-submit"
+                        data-affordance="conversation.search"
+                        data-command="mom_llama.conversation_search"
+                        data-tauri-command="mom_llama_conversation_search"
+                        data-cli="mom-llama conversation search --query <text> --json"
+                        data-effect="mom_llama.effects.conversation_store.v1" {
+                        (icon_markup("search")) span class="sr-only" { "Search" }
+                    }
+                    (button("conversation.search.close", Some("conversation-search-close"), "icon-button search-close", false))
+                }
                 div class="titlebar-drag-surface" {}
-                (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
-            (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft)))
+            (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft), personas, recipients))
             (settings_sidebar(settings, models, personas, active.as_ref()))
+            (conversation_rename_modal())
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
             (attachment_library_modal())
             @if mcp_process_ui_supported() {
                 (tool_approval_modal())
-            }
-            @if show_build_version {
-                small class="build-version" { "Mom Llama " (env!("CARGO_PKG_VERSION")) }
             }
             div id="command-status" class="command-status is-hidden" role="status" aria-live="polite" {}
             output id="command-output" class="sr-command-output" aria-hidden="true" tabindex="-1" {}
@@ -1518,6 +1541,8 @@ fn chat_view_with_draft(
     models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
+    personas: &StoreProjection<Vec<Conversation>>,
+    recipients: &mom_llama_runtime::DraftRecipients,
 ) -> Markup {
     let current_id = active
         .map(|conversation| conversation.id.as_str())
@@ -1565,11 +1590,8 @@ fn chat_view_with_draft(
             aria-label="Chat interface"
             data-current-conversation=(current_id)
             data-conversation-kind=(conversation_kind) {
-            @if let Some(persona) = active.filter(|conversation| {
-                conversation.kind == ConversationKind::PersonaTemplate
-            }) {
-                (persona_context(persona))
-            }
+            (recipients_header(active, personas, recipients))
+
             @if let Some(blocker) = &attachment_blocker {
                 (store_blocker(blocker))
             }
@@ -1633,17 +1655,7 @@ fn chat_view_with_draft(
                 }
             }
             @if empty {
-                section class="landing" aria-label="Empty chat" {
-                    @if let Some(persona) = active.filter(|conversation| {
-                        conversation.kind == ConversationKind::PersonaTemplate
-                    }) {
-                        h1 { (persona.title.clone()) }
-                        p { "@" (persona.execution_profile.mention_handle.clone()) }
-                    } @else {
-                        h1 { "Mom Llama" }
-                        p { "Type a message or upload files to get started" }
-                    }
-                }
+                section class="landing" aria-label="Empty chat" {}
             } @else {
                 section class="message-stream" aria-label="Messages" {
                     @for message in active.map(|conversation| conversation.messages.as_slice()).unwrap_or(&[]) {
@@ -1682,45 +1694,119 @@ fn chat_view_with_draft(
     }
 }
 
-fn persona_context(persona: &Conversation) -> Markup {
-    let profile = &persona.execution_profile;
-    let model = profile
-        .model_path
-        .as_deref()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap_or("Default model");
-    let profile_control = control("persona.get");
-    let start_control = control("persona.instantiate");
+fn recipients_header(
+    active: Option<&Conversation>,
+    personas: &StoreProjection<Vec<Conversation>>,
+    draft: &mom_llama_runtime::DraftRecipients,
+) -> Markup {
+    let unsent = active.is_none_or(|conversation| conversation.id == "default");
+    let ids = if unsent {
+        &draft.recipient_ids
+    } else {
+        &active.expect("saved conversation").recipient_ids
+    };
+    if !unsent && ids.is_empty() {
+        return active
+            .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
+            .map(persona_context)
+            .unwrap_or_default();
+    }
     html! {
-        header class="persona-context" aria-label="Persona template" {
-            span class="persona-context-avatar" { (icon_markup("user-round")) }
+        div class="recipients-header" data-unsent=(unsent) aria-label="Recipients" {
+            div class="recipient-line" {
+                @if unsent { label for="recipient-query" { "To:" } }
+                @for id in ids {
+                    @let contact = personas.value.iter().find(|contact| contact.id == *id);
+                    span class="recipient-chip" data-recipient-id=(id) {
+                        (contact_avatar(id))
+                        span { (contact.map(|contact| contact.title.as_str()).unwrap_or("Unavailable")) }
+                        @if unsent {
+                            button type="button" class="icon-button" title="Remove" aria-label="Remove contact"
+                                data-affordance="conversation.recipients"
+                                data-command="mom_llama.conversation_draft_recipients_update"
+                                data-tauri-command="mom_llama_conversation_draft_recipients_update"
+                                data-cli="mom-llama conversation draft-recipients --recipient <id> --json"
+                                data-effect="mom_llama.effects.conversation_store.v1"
+                                data-action="recipient-remove" data-recipient=(id) { (icon_markup("x")) }
+                        }
+                    }
+                }
+                @if unsent && ids.len() < 4 {
+                    input id="recipient-query" placeholder="" aria-label="Contact" autocomplete="off"
+                        role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="recipient-options"
+                        data-affordance="conversation.recipients"
+                        data-command="mom_llama.conversation_draft_recipients_update"
+                        data-tauri-command="mom_llama_conversation_draft_recipients_update"
+                        data-cli="mom-llama conversation draft-recipients --recipient <id> --json"
+                        data-effect="mom_llama.effects.conversation_store.v1";
+                }
+            }
+            @if unsent {
+                @if ids.len() > 1 {
+                    input id="recipient-group-name" placeholder="Group" aria-label="Group name" maxlength="120" value=(draft.name.as_deref().unwrap_or_default())
+                        data-affordance="conversation.recipients"
+                        data-command="mom_llama.conversation_draft_recipients_update"
+                        data-tauri-command="mom_llama_conversation_draft_recipients_update"
+                        data-cli="mom-llama conversation draft-recipients --recipient <id> --name <name> --json"
+                        data-effect="mom_llama.effects.conversation_store.v1";
+                }
+                div id="recipient-options" class="recipient-options" role="listbox" hidden {
+                    @for contact in &personas.value {
+                        @if !ids.contains(&contact.id) {
+                            button type="button" role="option" aria-selected="false" class="conversation-item recipient-option"
+                                data-affordance="conversation.recipients"
+                                data-command="mom_llama.conversation_draft_recipients_update"
+                                data-tauri-command="mom_llama_conversation_draft_recipients_update"
+                                data-cli="mom-llama conversation draft-recipients --recipient <id> --json"
+                                data-effect="mom_llama.effects.conversation_store.v1"
+                                data-action="recipient-add" data-recipient=(contact.id.clone())
+                                data-search=(format!("{} {}", contact.title, contact.execution_profile.mention_handle).to_lowercase()) {
+                                (contact_avatar(&contact.id)) span { (contact.title.clone()) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn contact_avatar(id: &str) -> Markup {
+    const CONTACTS: &[&str] = &[
+        "persona-bessel_van_der_kolk",
+        "persona-gabor_mate",
+        "persona-peter_levine",
+        "persona-judith_herman",
+        "persona-richard_schwartz",
+        "persona-janina_fisher",
+        "persona-ad_de_jongh",
+        "persona-christine_courtois",
+        "persona-robert_miller_fsap",
+        "persona-arnold_popky_detur",
+        "persona-jim_knipe",
+        "persona-francine_shapiro",
+        "persona-shirley_jean_schmidt_dnms",
+        "persona-dolores_mosquera",
+    ];
+    if let Some(index) = CONTACTS.iter().position(|contact| *contact == id) {
+        html! { span class="contact-avatar illustrated" aria-hidden="true"
+        style=(format!("background-position: {}% {}%", (index % 4) * 100 / 3, (index / 4) * 100 / 3)) {} }
+    } else {
+        html! { span class="contact-avatar" aria-hidden="true" { (icon_markup("user-round")) } }
+    }
+}
+
+fn persona_context(persona: &Conversation) -> Markup {
+    let persona_id = persona
+        .source_conversation_id
+        .as_deref()
+        .unwrap_or(&persona.id);
+    html! {
+        header class="persona-context" aria-label="Contact" {
+            (contact_avatar(persona_id))
             div class="persona-context-copy" {
                 strong { (persona.title.clone()) }
-                span { "@" (profile.mention_handle.clone()) " · " (model) }
-            }
-            div class="persona-context-actions" {
-                button type="button" class="icon-button"
-                    title="Edit profile" aria-label=(format!("Edit {} profile", persona.title))
-                    data-affordance=(profile_control.affordance)
-                    data-command=(profile_control.command)
-                    data-tauri-command=(profile_control.tauri_command)
-                    data-cli=(profile_control.cli)
-                    data-effect=(profile_control.effect)
-                    data-action="persona-profile-open"
-                    data-persona=(persona.id.clone()) {
-                    (icon_markup("sliders-horizontal"))
-                }
-                button type="button" class="text-button persona-start-chat"
-                    data-affordance=(start_control.affordance)
-                    data-command=(start_control.command)
-                    data-tauri-command=(start_control.tauri_command)
-                    data-cli=(start_control.cli)
-                    data-effect=(start_control.effect)
-                    data-action="persona-instantiate"
-                    data-persona=(persona.id.clone()) {
-                    (icon_markup("message-circle")) span { "Start chat" }
-                }
+                span { "@" (persona.execution_profile.mention_handle.clone()) }
             }
         }
     }
@@ -1772,36 +1858,6 @@ fn sidebar(
     let persona_list = control("persona.list");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
-            nav class="sidebar-nav" aria-label="Main actions" {
-                (button("conversation.new", Some("conversation-new"), "nav-button", false))
-                (button("conversation.search", Some("conversation-search-open"), "nav-button", false))
-                form id="conversation-search-form" class="nav-search is-hidden"
-                    data-affordance="conversation.search"
-                    data-command="mom_llama.conversation_search"
-                    data-tauri-command="mom_llama_conversation_search"
-                    data-cli="mom-llama conversation search --query <text> --json"
-                    data-effect="mom_llama.effects.conversation_store.v1" {
-                    input name="query" placeholder="Search conversations" aria-label="Search conversations"
-                        data-affordance="conversation.search.query"
-                        data-command="mom_llama.conversation_search"
-                        data-tauri-command="mom_llama_conversation_search"
-                        data-cli="mom-llama conversation search --query <text> --json"
-                        data-effect="mom_llama.effects.conversation_store.v1";
-                    button type="submit"
-                        class="icon-button search-submit"
-                        data-affordance="conversation.search"
-                        data-command="mom_llama.conversation_search"
-                        data-tauri-command="mom_llama_conversation_search"
-                        data-cli="mom-llama conversation search --query <text> --json"
-                        data-effect="mom_llama.effects.conversation_store.v1" {
-                        (icon_markup("search")) span class="sr-only" { "Search" }
-                    }
-                    (button("conversation.search.close", Some("conversation-search-close"), "icon-button search-close", false))
-                }
-                @if mcp_process_ui_supported() {
-                    (button("mcp.status", Some("mcp-status"), "nav-button", false))
-                }
-            }
             div class="sidebar-sections" {
                 section class="sidebar-section conversation-block" aria-label="Conversations" data-sidebar-section="conversations" {
                     button type="button" class="nav-button sidebar-section-toggle"
@@ -1822,13 +1878,12 @@ fn sidebar(
                     div id="conversation-section-panel" {
                         ol id="conversation-search-results" class="conversation-list search-results is-hidden" aria-live="polite" {}
                         ol id="conversation-list" class="conversation-list sidebar-section-list" {
-                            @if !chats.iter().any(|conversation| conversation.kind == ConversationKind::Chat) {
-                                li class="empty-line" { "No conversations yet" }
-                            }
                             @for conversation in chats.iter()
                                 .filter(|conversation| conversation.kind == ConversationKind::Chat) {
                                 @let active = active_id == Some(conversation.id.as_str());
-                                li {
+                                li data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
+                                    data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default())
+                                    data-conversation-title=(conversation.title.clone()) {
                                     button type="button"
                                         class=(format!("conversation-item {}", if active { "active" } else { "" }))
                                         data-affordance="conversation.select"
@@ -1838,8 +1893,17 @@ fn sidebar(
                                         data-effect="mom_llama.effects.conversation_store.v1"
                                         data-action="conversation-select"
                                         data-conversation=(conversation.id.clone()) {
-                                        span { (conversation.title.clone()) }
-                                        small { (message_count(conversation)) }
+                                        @if conversation.recipient_ids.len() == 1 {
+                                            (contact_avatar(&conversation.recipient_ids[0]))
+                                        } @else {
+                                            span class="contact-avatar" aria-hidden="true" { (icon_markup(if conversation.recipient_ids.is_empty() { "message-circle" } else { "users" })) }
+                                        }
+                                        div class="conversation-copy" {
+                                            span { (conversation.title.clone()) }
+                                            @if let Some(message) = conversation.active_leaf_message_id.as_deref().and_then(|id| conversation.messages.iter().find(|message| message.id == id)) {
+                                                small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1855,48 +1919,43 @@ fn sidebar(
                         data-effect=(persona_list.effect)
                         data-action="sidebar-section-toggle"
                         data-sidebar-section="personas"
-                        data-sidebar-label="Personas"
-                        aria-label="Collapse Personas"
+                        data-sidebar-label="Contacts"
+                        aria-label="Collapse Contacts"
                         aria-expanded="true"
                         aria-controls="sidebar-persona-list" {
-                        span { "Personas" }
+                        span { "Contacts" }
                         span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
                     }
                     ol id="sidebar-persona-list" class="conversation-list sidebar-section-list" {
                         @if let Some(blocker) = &personas.blocker {
                             li { (store_blocker(blocker)) }
-                        } @else if personas.value.is_empty() {
-                            li class="empty-line" { "No Personas yet" }
                         }
                         @for persona in &personas.value {
                             li class="sidebar-persona-row" data-persona-menu-target="true"
                                 data-persona=(persona.id.clone())
                                 data-persona-title=(persona.title.clone())
                                 data-persona-version=(persona.execution_profile.version) {
-                                div class="sidebar-persona-copy" {
-                                    span { (persona.title.clone()) }
-                                    small { "@" (persona.execution_profile.mention_handle.clone()) }
-                                }
-                                button type="button" class="icon-button persona-menu-trigger"
-                                    aria-label=(format!("Actions for {}", persona.title))
-                                    aria-haspopup="menu" aria-expanded="false"
-                                    aria-controls="persona-context-menu"
-                                    data-affordance=(persona_list.affordance)
-                                    data-command=(persona_list.command)
-                                    data-tauri-command=(persona_list.tauri_command)
-                                    data-cli=(persona_list.cli)
-                                    data-effect=(persona_list.effect)
-                                    data-action="persona-menu-open"
-                                    data-persona=(persona.id.clone())
-                                    data-persona-title=(persona.title.clone())
-                                    data-persona-version=(persona.execution_profile.version) {
-                                    (icon_markup("circle-ellipsis"))
+                                button type="button" class="conversation-item sidebar-persona-copy"
+                                    data-affordance="conversation.persona_draft_open"
+                                    data-command="mom_llama.conversation_draft_open"
+                                    data-tauri-command="mom_llama_conversation_draft_open"
+                                    data-cli="mom-llama conversation draft-open --persona <id> --json"
+                                    data-effect="mom_llama.effects.conversation_store.v1"
+                                    data-action="persona-draft-open" data-persona=(persona.id.clone())
+                                    title=(persona.title.clone()) aria-label=(format!("Chat with {}", persona.title)) {
+                                    (contact_avatar(&persona.id))
+                                    div class="contact-copy" {
+                                        span { (persona.title.clone()) }
+                                        small { "@" (persona.execution_profile.mention_handle.clone()) }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            div class="sidebar-resizer" role="separator" aria-label="Sidebar width"
+                aria-orientation="vertical" aria-valuemin="180" aria-valuemax="480" tabindex="0" {}
             div class="sidebar-actions hidden-contract" {
                 (button("conversation.rename", Some("conversation-rename"), "small-button", active_id.is_none()))
                 (button("conversation.delete", Some("conversation-delete"), "small-button danger", active_id.is_none()))
@@ -1909,7 +1968,7 @@ fn sidebar(
 fn composer(
     engine: &CommandResult<impl Serialize>,
     settings: &CommandResult<Settings>,
-    models: &CommandResult<Vec<ModelInfo>>,
+    _models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
     attachments: &[AttachmentRecord],
@@ -1931,6 +1990,11 @@ fn composer(
     let draft_control = control("conversation.draft_update");
     html! {
         form id="chat-form" class="composer"
+            data-draft-submit-affordance="conversation.draft_submit"
+            data-draft-submit-command="mom_llama.conversation_draft_submit"
+            data-draft-submit-tauri-command="mom_llama_conversation_draft_submit"
+            data-draft-submit-cli="mom-llama conversation draft-submit --json"
+            data-draft-submit-effect="mom_llama.effects.conversation_store.v1"
             data-affordance="chat.composer.form"
             data-command="mom_llama.chat_dispatch"
             data-tauri-command="mom_llama_chat_dispatch"
@@ -1981,7 +2045,7 @@ fn composer(
                     aria-describedby="composer-ai-status"
                     aria-haspopup="listbox"
                     aria-expanded="false"
-                    placeholder="Type a message..."
+                    placeholder="Message"
                     data-affordance="chat.composer.message"
                     data-command="mom_llama.chat_dispatch"
                     data-tauri-command="mom_llama_chat_dispatch"
@@ -2036,18 +2100,6 @@ fn composer(
                     (button("attachment.import", Some("attachment-import"), "round-button", false))
                 }
                 div class="composer-right" {
-                    @if !active.is_some_and(|conversation| {
-                        conversation.kind == ConversationKind::PersonaTemplate
-                    }) {
-                        (model_picker(
-                            settings,
-                            models,
-                            effective_conversation_model_path(active, settings),
-                            active.map(|conversation| conversation.id.as_str()),
-                            "Model for this chat",
-                            "composer-model-picker",
-                        ))
-                    }
                     (button(
                         "chat.composer.skip_reasoning",
                         Some("chat-skip-reasoning"),
@@ -2088,12 +2140,6 @@ fn message_row(
     let expand_tool_content = upstream_settings_bool(settings, "alwaysShowToolCallContent");
     let show_agentic_stats = show_stats && upstream_settings_bool(settings, "showAgenticTurnStats");
     let show_raw_output_switch = upstream_settings_bool(settings, "showRawOutputSwitch");
-    let model = message
-        .model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty())
-        .map(|model| model_chip_label(settings, model))
-        .unwrap_or_else(|| "Unknown model".to_string());
     html! {
         article id=(format!("message-{}", message.id))
             class=(format!("message-row {role}"))
@@ -2156,9 +2202,8 @@ fn message_row(
                 }
                 @if message.role == MessageRole::Assistant && show_stats {
                     p class="message-model" {
-                        (model)
                         @if message.prompt_tokens.is_some() || message.completion_tokens.is_some() {
-                            " · " (message.prompt_tokens.unwrap_or_default()) " prompt · "
+                            (message.prompt_tokens.unwrap_or_default()) " prompt · "
                             (message.completion_tokens.unwrap_or_default()) " generated"
                         }
                     }
@@ -2331,7 +2376,7 @@ fn tool_result_text(result: &Value) -> Option<String> {
 
 fn message_actions(
     message: &Message,
-    allow_freeze: bool,
+    _allow_freeze: bool,
     allow_generation_actions: bool,
     enable_continue: bool,
     show_raw_output_switch: bool,
@@ -2346,9 +2391,7 @@ fn message_actions(
                 (message_button("message.raw_toggle", "message-raw-toggle", message))
             }
             (message_button("message.edit", "message-edit", message))
-            @if allow_freeze {
-                (message_button("persona.freeze", "persona-freeze", message))
-            }
+            (message_button("conversation.fork", "conversation-fork", message))
             @if allow_generation_actions {
                 (message_button("chat.message.regenerate", "chat-regenerate", message))
                 @if enable_continue {
@@ -2413,6 +2456,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
         "message-raw-toggle" => "code",
         "message-edit" => "pencil",
         "persona-freeze" => "snowflake",
+        "conversation-fork" => "git-branch",
         "chat-regenerate" => "rotate-ccw",
         "chat-continue" => "skip-forward",
         "message-delete" => "trash-2",
@@ -2814,14 +2858,9 @@ fn persona_settings(
     html! {
         section class="settings-card persona-library" {
             h3 { "Personas" }
-            p class="field-help" {
-                "Use a Persona's menu to start a conversation, edit its profile, or remove it from the library."
-            }
             div id="persona-list" class="persona-list" {
                 @if let Some(blocker) = &personas.blocker {
                     (store_blocker(blocker))
-                } @else if personas.value.is_empty() {
-                    p class="empty-line" { "Freeze any message from its context menu to create a persona." }
                 }
                 @for persona in &personas.value {
                     div class="persona-row" data-persona-menu-target="true"
@@ -2894,24 +2933,6 @@ fn persona_settings(
                     data-cli="mom-llama persona update --profile <json> --json"
                     data-effect="mom_llama.effects.conversation_store.v1" {}
             }
-            div class="native-number-grid" {
-                (command_input("Persona history tokens", "persona_source_tokens", "4096", "persona.update"))
-                (command_input("Host context tokens", "persona_host_tokens", "2048", "persona.update"))
-            }
-            @if mcp_process_ui_supported() {
-                label class="field" { span { "Attached external-process tools" }
-                    textarea name="persona_tools" rows="3" placeholder="server/tool, one per line"
-                        data-affordance="persona.update" data-command="mom_llama.persona_update"
-                        data-tauri-command="mom_llama_persona_update"
-                        data-cli="mom-llama persona update --profile <json> --json"
-                        data-effect="mom_llama.effects.conversation_store.v1" {}
-                    small {
-                        "Only these stable bindings may be offered during an invited response. "
-                        (MCP_PROCESS_AUTHORITY_WARNING) " "
-                        (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE)
-                    }
-                }
-            }
             div class="button-strip" {
                 (button("persona.update", Some("persona-update"), "primary-button", false))
             }
@@ -2940,7 +2961,6 @@ fn persona_model_selector(models: &CommandResult<Vec<ModelInfo>>) -> Markup {
                     }
                 }
             }
-            small { "Choose a discovered local model, or inherit the default for new chats." }
         }
     }
 }
@@ -3035,13 +3055,42 @@ fn consult_settings(personas: &StoreProjection<Vec<Conversation>>) -> Markup {
     }
 }
 
+fn conversation_rename_modal() -> Markup {
+    let rename = control("conversation.rename");
+    html! {
+        div id="conversation-rename-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
+            form id="conversation-rename-form" class="compact-dialog" role="dialog" aria-modal="true"
+                aria-labelledby="conversation-rename-title"
+                data-affordance=(rename.affordance) data-command=(rename.command)
+                data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) {
+                header class="modal-title-row" {
+                    h2 id="conversation-rename-title" { "Rename" }
+                    button type="button" class="icon-button" aria-label="Cancel"
+                        data-affordance=(rename.affordance) data-command=(rename.command)
+                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect)
+                        data-action="conversation-rename-close" { (icon_markup("x")) }
+                }
+                label class="field" {
+                    span { "Name" }
+                    input name="conversation_title" required aria-label="Name"
+                        data-affordance=(rename.affordance) data-command=(rename.command)
+                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect);
+                }
+                button type="submit" class="primary-button"
+                    data-affordance=(rename.affordance) data-command=(rename.command)
+                    data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) { "Save" }
+            }
+        }
+    }
+}
+
 fn persona_freeze_modal() -> Markup {
     let freeze = control("persona.freeze");
     html! {
         div id="persona-freeze-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
             section class="compact-dialog" role="dialog" aria-modal="true" aria-labelledby="persona-freeze-title" {
                 header class="modal-title-row" {
-                    div { p class="eyebrow" { "PERSONA" } h2 id="persona-freeze-title" { "Freeze this branch" } }
+                    div { p class="eyebrow" { "PERSONA" } h2 id="persona-freeze-title" { "Save persona" } }
                     button type="button" class="icon-button" aria-label="Close"
                         data-affordance="persona.list" data-command="mom_llama.persona_list"
                         data-tauri-command="mom_llama_persona_list" data-cli="mom-llama persona list --json"
@@ -3085,7 +3134,7 @@ fn persona_freeze_modal() -> Markup {
                     data-affordance=(freeze.affordance) data-command=(freeze.command)
                     data-tauri-command=(freeze.tauri_command) data-cli=(freeze.cli)
                     data-effect=(freeze.effect) data-action="persona-freeze-save" {
-                    (icon_markup("snowflake")) "Freeze as persona"
+                    (icon_markup("snowflake")) "Save as persona"
                 }
             }
         }
@@ -3602,7 +3651,6 @@ fn button_inner(control: &ControlSpec, class_name: &str) -> Markup {
 
 fn icon_for_affordance(affordance: &str) -> Option<&'static str> {
     match affordance {
-        "layout.sidebar_toggle" => Some("panel-left"),
         "settings.close" => Some("x"),
         "settings.open" | "settings.get" | "settings.section" => Some("settings"),
         "conversation.new" => Some("square-pen"),
@@ -3708,170 +3756,52 @@ fn control(key: &str) -> &'static ControlSpec {
 }
 
 fn markdown_content(content: &str) -> Markup {
-    let mut blocks = Vec::new();
-    let mut in_code = false;
-    let mut code_lang = String::new();
-    let mut code = Vec::new();
-    let mut paragraph = Vec::new();
-    let mut list = Vec::new();
-    let mut table = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.starts_with("```") {
-            if in_code {
-                blocks.push(markdown_code_block(&code_lang, &code.join("\n")));
-                code.clear();
-                code_lang.clear();
-                in_code = false;
-            } else {
-                flush_paragraph(&mut blocks, &mut paragraph);
-                flush_list(&mut blocks, &mut list);
-                flush_table(&mut blocks, &mut table);
-                code_lang = trimmed.trim_start_matches("```").trim().to_string();
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code {
-            code.push(trimmed.to_string());
-            continue;
-        }
-        let plain = trimmed.trim();
-        if plain.is_empty() {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-        } else if is_table_line(plain) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            let cells = markdown_table_cells(plain);
-            if !is_table_separator(&cells) {
-                table.push(cells);
-            }
-        } else if let Some(heading) = plain.strip_prefix("### ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h4 { (heading) } });
-        } else if let Some(heading) = plain.strip_prefix("## ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h3 { (heading) } });
-        } else if let Some(heading) = plain.strip_prefix("# ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h2 { (heading) } });
-        } else if let Some(quote) = plain.strip_prefix("> ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { blockquote { (quote) } });
-        } else if let Some(item) = plain
-            .strip_prefix("- ")
-            .or_else(|| plain.strip_prefix("* "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_table(&mut blocks, &mut table);
-            list.push(item.to_string());
-        } else {
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            paragraph.push(plain.to_string());
-        }
-    }
-    if in_code {
-        blocks.push(markdown_code_block(&code_lang, &code.join("\n")));
-    }
-    flush_paragraph(&mut blocks, &mut paragraph);
-    flush_list(&mut blocks, &mut list);
-    flush_table(&mut blocks, &mut table);
-    html! { div class="markdown-content" { @for block in blocks { (block) } } }
-}
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-fn markdown_code_block(language: &str, code: &str) -> Markup {
-    html! {
-        figure class="code-block" {
-            @if !language.is_empty() {
-                figcaption { (language) }
-            }
-            pre { code { (code) } }
+    // Model text is untrusted. The parser owns Markdown syntax; raw HTML stays
+    // literal, links have explicit schemes, and images never fetch remote bytes.
+    let mut links = Vec::new();
+    let events = Parser::new_ext(
+        content,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    )
+    .filter_map(|event| match event {
+        Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            let allowed = dest_url.starts_with("https://")
+                || dest_url.starts_with("http://")
+                || dest_url.starts_with("mailto:")
+                || dest_url.starts_with('#');
+            links.push(allowed);
+            allowed.then_some(event)
         }
-    }
-}
-
-fn flush_paragraph(blocks: &mut Vec<Markup>, paragraph: &mut Vec<String>) {
-    if paragraph.is_empty() {
-        return;
-    }
-    let text = paragraph.join("\n");
-    blocks.push(html! { p { (text) } });
-    paragraph.clear();
-}
-
-fn flush_list(blocks: &mut Vec<Markup>, list: &mut Vec<String>) {
-    if list.is_empty() {
-        return;
-    }
-    blocks.push(html! { ul { @for item in list.iter() { li { (item) } } } });
-    list.clear();
-}
-
-fn flush_table(blocks: &mut Vec<Markup>, table: &mut Vec<Vec<String>>) {
-    if table.is_empty() {
-        return;
-    }
-    let headers = table.first().cloned().unwrap_or_default();
-    let rows = if table.len() > 1 { &table[1..] } else { &[] };
-    blocks.push(html! {
-        table class="markdown-table" {
-            thead {
-                tr {
-                    @for header in &headers {
-                        th { (header) }
-                    }
-                }
-            }
-            tbody {
-                @for row in rows {
-                    tr {
-                        @for cell in row {
-                            td { (cell) }
-                        }
-                    }
-                }
-            }
-        }
+        Event::End(TagEnd::Link) => links.pop().unwrap_or(false).then_some(event),
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        _ => Some(event),
     });
-    table.clear();
+    let mut rendered = String::new();
+    pulldown_cmark::html::push_html(&mut rendered, events);
+    html! { div class="markdown-content" { (PreEscaped(rendered)) } }
 }
 
-fn is_table_line(line: &str) -> bool {
-    line.starts_with('|') && line.ends_with('|') && line.matches('|').count() >= 2
-}
-
-fn markdown_table_cells(line: &str) -> Vec<String> {
-    line.trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_string())
-        .collect()
-}
-
-fn is_table_separator(cells: &[String]) -> bool {
-    !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.trim();
-            !cell.is_empty()
-                && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
-                && cell.chars().any(|ch| ch == '-')
-        })
+fn project_active_conversation(
+    conversations: &CommandResult<Vec<Conversation>>,
+    selected_id: Option<&str>,
+) -> Result<Option<Conversation>> {
+    if selected_id == Some("default") {
+        mom_llama_runtime::conversation_draft_preview()
+    } else {
+        Ok(active_conversation(conversations, selected_id))
+    }
 }
 
 fn active_conversation(
     conversations: &CommandResult<Vec<Conversation>>,
     selected_id: Option<&str>,
 ) -> Option<Conversation> {
+    if selected_id == Some("default") {
+        return None;
+    }
     let items = conversations.result.as_ref()?;
     selected_id
         .and_then(|id| items.iter().find(|conversation| conversation.id == id))
@@ -3961,65 +3891,6 @@ fn conversation_model_readiness(
     }
 }
 
-fn model_chip_label(settings: &CommandResult<Settings>, label: &str) -> String {
-    let raw = upstream_settings_bool(settings, "showRawModelNames");
-    let mut display = if raw {
-        label.trim_end_matches(".gguf").to_string()
-    } else {
-        label
-            .trim_end_matches(".gguf")
-            .split(['-', '_'])
-            .take(2)
-            .collect::<Vec<_>>()
-            .join("-")
-    };
-    if upstream_settings_bool(settings, "showModelQuantization")
-        && let Some(quantization) = model_quantization(label)
-    {
-        display.push_str(&format!(" · {quantization}"));
-    }
-    if upstream_settings_bool(settings, "showModelTags") {
-        let tags = model_tags(settings, label);
-        if !tags.is_empty() {
-            display.push_str(&format!(" · {}", tags.join(" · ")));
-        }
-    }
-    display
-}
-
-fn model_quantization(label: &str) -> Option<String> {
-    label
-        .trim_end_matches(".gguf")
-        .split(['-', '_', '.'])
-        .rev()
-        .find(|part| {
-            let upper = part.to_ascii_uppercase();
-            upper.starts_with('Q') && upper.chars().nth(1).is_some_and(|ch| ch.is_ascii_digit())
-                || matches!(upper.as_str(), "F16" | "F32" | "BF16")
-        })
-        .map(|part| part.to_ascii_uppercase())
-}
-
-fn model_tags(settings: &CommandResult<Settings>, label: &str) -> Vec<&'static str> {
-    let mut tags = vec!["local"];
-    if settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.mmproj_path.as_ref())
-        .is_some()
-    {
-        tags.push("multimodal");
-    }
-    let lower = label.to_ascii_lowercase();
-    if ["qwen3", "deepseek", "reasoning", "r1"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        tags.push("reasoning");
-    }
-    tags
-}
-
 fn upstream_settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
     let Some(settings) = settings.result.as_ref() else {
         return String::new();
@@ -4056,14 +3927,6 @@ fn json_value_to_form_value(value: &Value) -> String {
         Value::Number(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
         value => value.to_string(),
-    }
-}
-
-fn message_count(conversation: &Conversation) -> String {
-    match conversation.messages.len() {
-        0 => "No messages".to_string(),
-        1 => "1 message".to_string(),
-        count => format!("{count} messages"),
     }
 }
 
@@ -4224,14 +4087,14 @@ mod tests {
         assert!(html.contains(r#"id="sidebar-persona-list""#));
         assert!(html.contains(r#"class="sidebar-persona-row""#));
         assert!(html.contains(r#"data-persona-menu-target="true""#));
-        assert!(html.contains(r#"aria-label="Collapse Personas""#));
+        assert!(html.contains(r#"aria-label="Collapse Contacts""#));
         assert!(html.contains(r#"data-action="persona-menu-open""#));
         assert!(!html.contains(r#"data-sidebar-section="consult-groups""#));
         assert!(!html.contains(r#"id="sidebar-consult-group-list""#));
         assert!(html.contains("Bessel van der Kolk"));
         assert!(!html.contains(r#"data-action="skills-open""#));
         assert!(!html.contains(r#"data-action="persona-open""#));
-        assert!(html.contains("Use a Persona's menu to start a conversation"));
+        assert!(!html.contains("Use a Persona's menu to start a conversation"));
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
@@ -4368,7 +4231,7 @@ mod tests {
         assert!(js.contains("const instantiated = await instantiatePersona(sourceConversation)"));
         assert!(
             js.contains(r#"if (sourceConversation === "default")"#)
-                && js.contains(r#"invoke("mom_llama_conversation_new", { title: "New chat" })"#)
+                && js.contains(r#"invoke("mom_llama_conversation_draft_submit")"#)
                 && js.contains("conversation = created.result.id;"),
             "the landing composer must materialize a real conversation before dispatch"
         );
@@ -4581,8 +4444,10 @@ mod tests {
 
         let context = persona_context(&active).into_string();
         assert!(context.contains(r#"class="persona-context""#));
-        assert!(context.contains(r#"data-action="persona-profile-open""#));
-        assert!(context.contains(r#"data-action="persona-instantiate""#));
+        assert!(!context.contains(r#"data-action="persona-profile-open""#));
+        assert!(!context.contains(r#"data-action="persona-instantiate""#));
+        assert!(!context.contains("Default model"));
+        assert!(!context.contains(".gguf"));
         assert!(!context.contains("Sending starts a separate chat"));
         assert!(!context.contains("Edits version this template"));
     }
@@ -4670,10 +4535,40 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_formatting_and_nested_lists_render_as_elements() {
+        let rendered = markdown_content(
+            "## Why slow?\n\nIf you mean **response speed**, use *local* `timing`.\n\n1. **First**\n   - Nested **detail**\n2. Second\n\n> A **quoted** source\n\n```rust\nlet x = \"**literal**\";\n```",
+        ).into_string();
+        assert!(rendered.contains("<strong>response speed</strong>"));
+        assert!(rendered.contains("<em>local</em>"));
+        assert!(rendered.contains("<code>timing</code>"));
+        assert!(rendered.contains("<ol>"));
+        assert!(rendered.contains("<ul>"));
+        assert!(rendered.contains("<strong>detail</strong>"));
+        assert!(rendered.contains("<blockquote>"));
+        assert!(rendered.contains("<strong>quoted</strong>"));
+        assert!(rendered.contains("class=\"language-rust\""));
+        assert!(rendered.contains("**literal**"));
+    }
+
+    #[test]
+    fn markdown_cannot_execute_html_or_fetch_model_supplied_images() {
+        let rendered = markdown_content(
+            "<script>alert(1)</script>\n\n<img src=\"https://example.com/private\" onerror=\"alert(2)\">\n\n[bad](javascript:alert%281%29) ![image label](https://example.com/image) [good](https://example.com)",
+        ).into_string();
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("<img"));
+        assert!(!rendered.contains("href=\"javascript:"));
+        assert!(rendered.contains("&lt;script&gt;"));
+        assert!(rendered.contains("image label"));
+        assert!(rendered.contains("href=\"https://example.com\""));
+    }
+
+    #[test]
     fn markdown_tables_render_without_frontend_runtime() {
         let html =
             markdown_content("| Name | Value |\n| --- | --- |\n| Cache | Ready |").into_string();
-        assert!(html.contains(r#"<table class="markdown-table">"#));
+        assert!(html.contains("<table>"));
         assert!(html.contains("<th>Name</th>"));
         assert!(html.contains("<td>Ready</td>"));
     }
@@ -5053,12 +4948,12 @@ mod tests {
         let profile_html =
             composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!profile_html.contains("Conversation model"));
-        assert!(profile_html.contains("frozen-profile-Q4_K_M"));
+        assert!(!profile_html.contains("frozen-profile-Q4_K_M"));
         assert!(!profile_html.contains("legacy-selected-Q5_K_M"));
         assert!(!profile_html.contains("global-default-Q8_0"));
-        assert!(profile_html.contains(r#"data-model-picker="true""#));
-        assert!(profile_html.contains("mom_llama_model_select"));
-        assert!(profile_html.contains(r#"data-conversation="chat""#));
+        assert!(!profile_html.contains(r#"data-model-picker="true""#));
+        assert!(!profile_html.contains("mom_llama_model_select"));
+        assert!(!profile_html.contains(r#"data-conversation="chat""#));
 
         conversation.execution_profile.model_path = None;
         assert_eq!(
@@ -5067,7 +4962,7 @@ mod tests {
         );
         let selected_html =
             composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
-        assert!(selected_html.contains("legacy-selected-Q5_K_M"));
+        assert!(!selected_html.contains("legacy-selected-Q5_K_M"));
         assert!(!selected_html.contains("global-default-Q8_0"));
 
         conversation.selected_model_path = None;
@@ -5077,7 +4972,7 @@ mod tests {
         );
         let default_html =
             composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
-        assert!(default_html.contains("global-default-Q8_0"));
+        assert!(!default_html.contains("global-default-Q8_0"));
 
         conversation.execution_profile.model_path = Some(PathBuf::from("   "));
         conversation.selected_model_path = Some(PathBuf::new());
@@ -5170,7 +5065,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_stats_use_the_persisted_message_model_not_the_global_default() {
+    fn assistant_statistics_never_expose_model_names() {
         let mut settings_value = Settings::defaults_for_data_dir(std::env::temp_dir());
         settings_value.model_path = Some(PathBuf::from("/models/global-default-Q8_0.gguf"));
         settings_value
@@ -5194,18 +5089,18 @@ mod tests {
         message.completion_tokens = Some(11);
 
         let html = message_row(&message, &settings, &[], true, true).into_string();
-        assert!(html.contains("frozen-conversation-Q4_K_M"));
+        assert!(!html.contains("frozen-conversation-Q4_K_M"));
         assert!(!html.contains("global-default-Q8_0"));
         assert!(html.contains("7 prompt · 11 generated"));
 
         message.model = None;
         let legacy_html = message_row(&message, &settings, &[], true, true).into_string();
-        assert!(legacy_html.contains("Unknown model"));
+        assert!(!legacy_html.contains("Unknown model"));
         assert!(!legacy_html.contains("global-default-Q8_0"));
 
         message.model = Some("  ".to_string());
         let blank_html = message_row(&message, &settings, &[], true, true).into_string();
-        assert!(blank_html.contains("Unknown model"));
+        assert!(!blank_html.contains("Unknown model"));
     }
 
     #[test]
@@ -5270,6 +5165,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages,
         }
@@ -5432,11 +5328,9 @@ mod tests {
             blocker: None,
         };
         let editor = persona_settings(&personas, &empty_models()).into_string();
-        assert_eq!(
-            editor.contains(r#"name="persona_tools""#),
-            mcp_process_ui_supported(),
-            "Persona MCP bindings must be absent outside macOS and Linux"
-        );
+        assert!(!editor.contains(r#"name="persona_tools""#));
+        assert!(!editor.contains(r#"name="persona_source_tokens""#));
+        assert!(!editor.contains(r#"name="persona_host_tokens""#));
         assert!(editor.contains(r#"name="persona_model_choice""#));
         assert!(editor.contains("Use default model"));
         assert!(!editor.contains(r#"name="persona_model_path""#));

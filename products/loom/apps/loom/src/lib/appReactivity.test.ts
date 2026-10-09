@@ -486,35 +486,29 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('async function commitDocumentRename'),
       source.indexOf('function handleDocumentRenameKeydown')
     );
-    const visibleActions = source.slice(
-      source.indexOf('function handleVisibleDocumentActions'),
-      source.indexOf('function beginDocumentContextLongPress')
-    );
+    const capabilities = readFileSync(new URL('./sidebarInteractions.ts', import.meta.url), 'utf8');
+    const sharedKeys = readFileSync(new URL('./interactionPrimitives.ts', import.meta.url), 'utf8');
     const readonly = source.slice(
       source.indexOf('$: editorReadonly ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
 
     expect(sidebar).toContain('aria-haspopup="menu"');
-    expect(sidebar).toContain('on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}');
-    expect(sidebar).toContain('on:keydown={(event) => handleDocumentContextKey(event, candidate)}');
+    expect(sidebar).toContain('on:contextmenu={(event) => handleSidebarContextPointer(event, target)}');
+    expect(sidebar).toContain('on:keydown={(event) => handleSidebarRowKeydown(event, target)}');
     expect(sidebar).toContain('role="menu"');
     expect(sidebar).toContain('role="menuitem"');
-    expect(sidebar).toContain('>Open</button>');
-    expect(sidebar).toContain('>Rename…</button>');
-    expect(sidebar).toContain('>Export Text…</button>');
-    expect(sidebar).toContain('>Delete Manuscript…</button>');
-    expect(sidebar.indexOf('{documentContextRevealLabel}</button>'))
-      .toBeLessThan(sidebar.indexOf('>Delete Manuscript…</button>'));
-    expect(sidebar).toContain('documentDeleteMenuIndex(Boolean(documentContextRevealLabel))');
+    expect(sidebar).toContain('{@const actions = sidebarMenuCapabilities}');
+    expect(sidebar).toContain('runSidebarContextAction(capability)');
+    expect(sidebar).toContain('class:document-delete-menu-item={capability.destructive}');
     expect(sidebar).toContain('class="document-row-actions"');
     expect(sidebar).toContain('aria-label={`Actions for ${candidate.title}`}');
-    expect(sidebar).toContain('on:click={(event) => handleVisibleDocumentActions(event, candidate)}');
-    expect(visibleActions).toContain('captureDocumentContextTarget(summary)');
-    expect(visibleActions).toContain('openDocumentContextMenu(');
-    expect(visibleActions).toContain('visibleDocumentActionsMenuPoint(');
+    expect(sidebar).toContain('openSidebarContextMenu(target, event.currentTarget, visibleDocumentActionsMenuPoint(');
+    expect(capabilities).toContain("action: 'delete', label: 'Delete Manuscript…'");
+    expect(capabilities).toContain('captureDocumentTarget(project, item.summary)');
+    expect(capabilities).toContain('capturedDocumentIdentityIsCurrent(target.document, live.project)');
+    expect(sharedKeys).toContain('function contextMenuKeyAction');
     expect(source).not.toContain('class:single-document=');
-    expect(sidebar).toContain('{documentContextRevealLabel}</button>');
     expect(action).toContain('const target = documentContextTarget;');
     expect(action).toContain('closeDocumentContextMenu(false);');
     expect(action.indexOf('closeDocumentContextMenu(false);'))
@@ -523,7 +517,9 @@ describe('App ghost reactivity wiring', () => {
     expect(documentCalls).toContain('expectedBlobId');
     expect(documentCalls).not.toContain('relativePath');
     expect(source).toContain('data-document-title');
-    expect(source).toContain('bind:value={renameDocumentTitle}');
+    expect(sidebar).toContain('value={renameDocumentTitle}');
+    expect(sidebar).toContain('on:input={handleDocumentRenameInput}');
+    expect(source).not.toContain('bind:value={renameDocumentTitle}');
     expect(sidebar).toContain('on:compositionstart={handleDocumentRenameCompositionStart}');
     expect(sidebar).toContain('on:compositionend={handleDocumentRenameCompositionEnd}');
     expect(sidebar).toContain('on:blur={handleDocumentRenameBlur}');
@@ -708,13 +704,14 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function handleGlobalKeydown(event:')
     );
 
-    expect(renameKeydown).toContain("if (event.key === 'Escape')");
-    expect(renameKeydown).toContain('renameDocumentComposition.ownsCommandKey(event)');
-    expect(renameKeydown).toContain('event.stopPropagation()');
-    expect(renameKeydown).toContain('event.preventDefault()');
+    const sharedKeys = readFileSync(new URL('./interactionPrimitives.ts', import.meta.url), 'utf8');
+    expect(renameKeydown).toContain('handleInlineRenameKey(event, renameDocumentComposition');
+    expect(sharedKeys).toContain('composition.ownsCommandKey(event)');
+    expect(sharedKeys).toContain('event.stopPropagation()');
+    expect(sharedKeys).toContain('event.preventDefault()');
     expect(menuKeydown).toContain("case 'dismiss':");
     expect(menuKeydown).toContain('event.preventDefault()');
-    expect(globalKeydown.indexOf('if (event.defaultPrevented) return;'))
+    expect(globalKeydown.indexOf('if (event.defaultPrevented || textCompositionBoundary.owns(event)) return;'))
       .toBeLessThan(globalKeydown.indexOf("if (event.key === 'Escape' && shuttleEnabled)"));
     expect(source).toContain("window.addEventListener('keydown', handleGlobalKeydownCapture, true)");
     expect(source).toContain("window.removeEventListener('keydown', handleGlobalKeydownCapture, true)");
@@ -733,7 +730,10 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('async function setMode'),
       source.indexOf('function announce')
     );
-    expect(source).toContain('disabled={editorReadonly}');
+    // The source-to-visual action is a keyboard command; an unrelated row's
+    // disabled attribute does not establish its availability.
+    const globalKeys = source.slice(source.indexOf('function handleGlobalKeydown(event:'), source.indexOf('function handleGlobalPointer'));
+    expect(globalKeys).toContain("void setMode(mode === 'visual' ? 'source' : 'visual')");
     expect(source).not.toContain("disabled={editorReadonly || (mode === 'source' && !canUseVisual)}");
     expect(mode.indexOf('flushEditors()')).toBeLessThan(mode.indexOf('canUseVisualMarkdown(documentText, false)'));
     expect(mode).toContain("'visual_markdown_not_exact'");

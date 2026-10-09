@@ -15,13 +15,16 @@ fn decode_key(bytes: Vec<u8>) -> Result<[u8; 32]> {
 }
 
 fn load_or_create(
+    existing_store: bool,
     mut read: impl FnMut() -> Result<Option<Vec<u8>>>,
     generate: impl FnOnce() -> Result<[u8; 32]>,
     create: impl FnOnce(&[u8; 32]) -> Result<KeyCreation>,
 ) -> Result<[u8; 32]> {
-    if let Some(key) = read()? {
+    if existing_store && let Some(key) = read()? {
         return decode_key(key);
     }
+    // A fresh database needs only create-only insertion. An orphaned existing
+    // credential or a concurrent creator is recovered on duplicate, never rotated.
     let candidate = generate()?;
     match create(&candidate)? {
         KeyCreation::Created => Ok(candidate),
@@ -32,14 +35,20 @@ fn load_or_create(
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
+pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> Result<[u8; 32]> {
     use security_framework::passwords::get_generic_password;
     const ITEM_NOT_FOUND: i32 = -25300;
     load_or_create(
-        || match get_generic_password(super::KEYCHAIN_SERVICE, account) {
-            Ok(key) => Ok(Some(key)),
-            Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
-            Err(error) => Err(error.into()),
+        existing_store,
+        || {
+            trace_keychain_request("read", account, "begin");
+            let result = get_generic_password(super::KEYCHAIN_SERVICE, account);
+            trace_keychain_request("read", account, "end");
+            match result {
+                Ok(key) => Ok(Some(key)),
+                Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
+                Err(error) => Err(error.into()),
+            }
         },
         || {
             let mut key = [0; 32];
@@ -55,14 +64,29 @@ pub(super) fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
 fn create_macos_key(account: &str, key: &[u8; 32]) -> Result<KeyCreation> {
     use security_framework::os::macos::keychain::SecKeychain;
     const DUPLICATE_ITEM: i32 = -25299;
-    // The existing SecItem query uses the default file-based macOS keychain
-    // (no data-protection/synchronizable attributes). Preserve that policy and
-    // service/account. This pinned safe add never updates an existing item,
-    // unlike set_generic_password. No unsafe code or dependency change.
-    match SecKeychain::default()?.add_generic_password(super::KEYCHAIN_SERVICE, account, key) {
+    // Preserve the default file-based keychain and service/account identity.
+    // Create-only insertion must never update an existing encryption key.
+    trace_keychain_request("create", account, "begin");
+    let result =
+        SecKeychain::default()?.add_generic_password(super::KEYCHAIN_SERVICE, account, key);
+    trace_keychain_request("create", account, "end");
+    match result {
         Ok(()) => Ok(KeyCreation::Created),
         Err(error) if error.code() == DUPLICATE_ITEM => Ok(KeyCreation::AlreadyExists),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn trace_keychain_request(operation: &str, account: &str, phase: &str) {
+    if std::env::var("LLAMA_NATIVE_KIT_KEYCHAIN_TRACE").as_deref() == Ok("1") {
+        // Only an opaque account prefix and request boundaries. Never key bytes,
+        // passwords, returned data, or the user's filesystem path.
+        eprintln!(
+            "mom-keychain pid={} account={} operation={operation} phase={phase}",
+            std::process::id(),
+            account.get(..12).unwrap_or(account)
+        );
     }
 }
 
@@ -74,8 +98,41 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn fresh_store_creates_without_requesting_a_password_read() -> Result<()> {
+        let key = load_or_create(
+            false,
+            || panic!("fresh creation must not request a credential read"),
+            || Ok([9; 32]),
+            |candidate| {
+                assert_eq!(candidate, &[9; 32]);
+                Ok(KeyCreation::Created)
+            },
+        )?;
+        assert_eq!(key, [9; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_store_reuses_existing_key_without_overwriting_it() -> Result<()> {
+        let reads = Cell::new(0);
+        let key = load_or_create(
+            false,
+            || {
+                reads.set(reads.get() + 1);
+                Ok(Some(vec![7; 32]))
+            },
+            || Ok([9; 32]),
+            |_| Ok(KeyCreation::AlreadyExists),
+        )?;
+        assert_eq!(key, [7; 32]);
+        assert_eq!(reads.get(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn existing_key_never_generates_or_creates() -> Result<()> {
         let key = load_or_create(
+            true,
             || Ok(Some(vec![7; 32])),
             || panic!("existing key must not generate"),
             |_| panic!("existing key must not be replaced"),
@@ -88,6 +145,7 @@ mod tests {
     fn successful_creation_returns_the_published_candidate() -> Result<()> {
         let calls = Cell::new(0);
         let key = load_or_create(
+            true,
             || Ok(None),
             || Ok([3; 32]),
             |candidate| {
@@ -111,6 +169,7 @@ mod tests {
             let run = |candidate: [u8; 32], ready: mpsc::Receiver<()>| {
                 let mut first_read = true;
                 load_or_create(
+                    true,
                     || {
                         let value = published.lock().expect("fixture key slot").clone();
                         if first_read {
@@ -158,6 +217,7 @@ mod tests {
     fn duplicate_with_missing_winner_does_not_retry_creation() {
         let calls = Cell::new(0);
         let error = load_or_create(
+            true,
             || Ok(None),
             || Ok([3; 32]),
             |_| {
@@ -177,6 +237,7 @@ mod tests {
     fn invalid_existing_and_winning_keys_are_rejected_without_replacement() {
         for length in [0, 31, 33] {
             let error = load_or_create(
+                true,
                 || Ok(Some(vec![7; length])),
                 || panic!("invalid existing key must not rotate"),
                 |_| panic!("invalid existing key must not be replaced"),
@@ -186,6 +247,7 @@ mod tests {
 
             let mut reads = 0;
             let error = load_or_create(
+                true,
                 || {
                     reads += 1;
                     Ok((reads > 1).then(|| vec![7; length]))
@@ -202,6 +264,7 @@ mod tests {
     #[test]
     fn read_generation_creation_and_winner_errors_are_preserved() {
         let read = load_or_create(
+            true,
             || Err(anyhow!("read denied")),
             || panic!("denial must not generate"),
             |_| panic!("denial must not create"),
@@ -209,6 +272,7 @@ mod tests {
         .expect_err("read denial");
         assert_eq!(read.to_string(), "read denied");
         let random = load_or_create(
+            true,
             || Ok(None),
             || Err(anyhow!("randomness unavailable")),
             |_| panic!("failed generation must not create"),
@@ -217,6 +281,7 @@ mod tests {
         assert_eq!(random.to_string(), "randomness unavailable");
         let calls = Cell::new(0);
         let create = load_or_create(
+            true,
             || {
                 calls.set(calls.get() + 1);
                 Ok(None)
@@ -229,6 +294,7 @@ mod tests {
         assert_eq!(calls.get(), 1, "only a duplicate permits winner lookup");
         let mut reads = 0;
         let winner = load_or_create(
+            true,
             || {
                 reads += 1;
                 if reads == 1 {

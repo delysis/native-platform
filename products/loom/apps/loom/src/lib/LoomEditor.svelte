@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { compositionOwnsKey, handleHistoryInput } from './textEditingInteractions';
   import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands';
   import { history, redo, undo } from 'prosemirror-history';
   import { keymap } from 'prosemirror-keymap';
@@ -1279,9 +1280,13 @@
       handleDOMEvents: {
         beforeinput(_view, event) {
           noteBoundaryInput(event);
-          return false;
+          return handleHistoryInput(event, 'prosemirror', readonly,
+            () => undo(_view.state, _view.dispatch), () => redo(_view.state, _view.dispatch));
         },
         keydown(_view, event) {
+          // Do not enter application/history keymaps while an IME owns this key.
+          // Returning handled here suppresses PM command dispatch, not native IME.
+          if (compositionOwnsKey(event, composing)) return true;
           if (onBoundaryObservation) lastBoundaryKey = {
             sequence: ++boundaryInputSequence, at: Date.now(),
             kind: boundaryKeyKind(event), code: event.code.slice(0, 64),

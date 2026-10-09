@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { applyNativeTextEdit, compositionOwnsKey } from './textEditingInteractions';
   import { onDestroy, onMount, tick } from 'svelte';
   import { textBoundaryDelta, type BoundaryObservation } from './completionBoundaryDiagnostics';
   import { observeInlineGhost, inlineGhostPreview } from './inlineGhostObservation';
@@ -514,6 +515,7 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
+    if (compositionOwnsKey(event, composing)) return;
     const candidate = currentPlan();
     const visible = visibleSourceGhostPlan(candidate);
     if (lensVisible && !visible) completionLens = CLOSED_COMPLETION_LENS;
@@ -654,31 +656,19 @@
       );
       // On an unindented line Shift-Tab remains ordinary keyboard navigation
       // out of the textarea instead of becoming a focus trap.
-      if (!edit) return;
+      if (!edit || !applyNativeTextEdit(element, edit)) return;
       event.preventDefault();
       event.stopPropagation();
       suppressCurrentGhost();
-      element.value = edit.value;
-      element.setSelectionRange(edit.selectionStart, edit.selectionEnd);
       readSelection(false, false);
-      onValueInput(element);
       return;
     }
+    const edit = sourceTabEdit(element.value, element.selectionStart, element.selectionEnd);
+    if (!edit || !applyNativeTextEdit(element, { value: edit.value, selectionStart: edit.caret, selectionEnd: edit.caret })) return;
     event.preventDefault();
     event.stopPropagation();
-    const edit = sourceTabEdit(
-      element.value,
-      element.selectionStart,
-      element.selectionEnd
-    );
-    if (!edit) return;
-    // Preserve source bytes exactly. setRangeText also keeps the native caret
-    // and selection semantics of an ordinary textarea edit.
     suppressCurrentGhost();
-    element.setRangeText('\t', element.selectionStart, element.selectionEnd, 'end');
-    if (element.value !== edit.value || element.selectionStart !== edit.caret) return;
     readSelection(false, false);
-    onValueInput(element);
   }
 
   function handleKeyup(event: KeyboardEvent): void {

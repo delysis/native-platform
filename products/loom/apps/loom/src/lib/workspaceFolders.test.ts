@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
-import { readWorkspaceFolders, rememberWorkspaceFolder } from './workspaceFolders';
+import { readWorkspaceFolders, rememberWorkspaceFolder, workspaceFolderLabels, workspaceFolderName, workspaceFolderGroups, forgetWorkspaceFolder, renameWorkspaceFolder } from './workspaceFolders';
 import { workspaceRows } from './workspaceTree';
 import type { DocumentSummary } from './types';
 
@@ -11,12 +11,14 @@ describe('workspace navigation path identity', () => {
   it('distinguishes same-title roots by their exact paths, without dropping either', () => {
     const roots = ['/Users/alice/writing', '/Users/bob/writing'];
     const rows = readWorkspaceFolders(stored(roots.map(root => ({ root, title: 'writing' }))));
-    assert.deepEqual(rows, roots.map(root => ({ root, title: root })));
+    assert.deepEqual(rows, roots.map(root => ({ root, title: 'writing' })));
+    assert.deepEqual([...workspaceFolderLabels(rows).values()], ['writing — alice', 'writing — bob']);
   });
 
-  it('qualifies a single remembered root too, so a real same-name child is unambiguous', () => {
+  it('keeps a readable label and a separate exact root even for a single bookmark', () => {
     assert.deepEqual(readWorkspaceFolders(stored([{ root: '/work/writing', title: 'writing' }])),
-      [{ root: '/work/writing', title: '/work/writing' }]);
+      [{ root: '/work/writing', title: 'writing' }]);
+    assert.equal(workspaceFolderName({ root: '/private/var/folders/gone/writing', title: '/private/var/folders/gone/writing' }), 'writing');
   });
 
   it('does not treat case, Unicode, separators, or path spellings as filesystem aliases', () => {
@@ -31,7 +33,7 @@ describe('workspace navigation path identity', () => {
       ...stored([{ root: '/a', title: 'one' }, { root: '/a', title: 'two' }, { root: '/b', title: 'one' }]),
       setItem: () => { writes += 1; }
     };
-    assert.deepEqual(readWorkspaceFolders(storage), [{ root: '/a', title: '/a' }, { root: '/b', title: '/b' }]);
+    assert.deepEqual(readWorkspaceFolders(storage), [{ root: '/a', title: 'one' }, { root: '/b', title: 'one' }]);
     assert.equal(writes, 0);
   });
 
@@ -43,7 +45,7 @@ describe('workspace navigation path identity', () => {
       setItem: (key, value) => { assert.equal(key, KEY); saved = value; }
     });
     assert.deepEqual(folders, before);
-    assert.deepEqual(next, [{ root: '/a/writing', title: '/a/writing' }, { root: '/b/writing', title: '/b/writing' }]);
+    assert.deepEqual(next, [{ root: '/a/writing', title: 'writing' }, { root: '/b/writing', title: 'writing' }]);
     assert.deepEqual(readWorkspaceFolders({ getItem: () => saved }), next);
   });
 
@@ -52,19 +54,21 @@ describe('workspace navigation path identity', () => {
     let saved = '';
     const next = rememberWorkspaceFolder([], { root, title: 'writing' }, { setItem: (_key, value) => { saved = value; } });
     assert.deepEqual(readWorkspaceFolders({ getItem: () => saved }), next);
-    assert.equal(next[0].title, root);
+    assert.equal(next[0].title, 'writing');
+    assert.equal(next[0].root, root);
   });
 
   it('reopens an exact root without accumulating duplicate entries', () => {
     const next = rememberWorkspaceFolder([{ root: '/a', title: 'old' }], { root: '/a', title: 'new' });
-    assert.deepEqual(next, [{ root: '/a', title: '/a' }]);
+    assert.deepEqual(next, [{ root: '/a', title: 'old' }]);
   });
 
-  it('bounds history and still works when storage is denied', () => {
+  it('bounds history but makes explicit storage failures visible rather than reporting a durable edit', () => {
     const folders = Array.from({ length: 32 }, (_, index) => ({ root: `/root/${index}`, title: 'writing' }));
-    const next = rememberWorkspaceFolder(folders, { root: '/root/new', title: 'writing' }, {
+    assert.throws(() => rememberWorkspaceFolder(folders, { root: '/root/new', title: 'writing' }, {
       setItem: () => { throw new Error('storage unavailable'); }
-    });
+    }), /storage unavailable/);
+    const next = rememberWorkspaceFolder(folders, { root: '/root/new', title: 'writing' });
     assert.equal(next.length, 32);
     assert.equal(next[0].root, '/root/1');
     assert.equal(next.at(-1)?.root, '/root/new');
@@ -74,6 +78,24 @@ describe('workspace navigation path identity', () => {
     assert.deepEqual(readWorkspaceFolders({ getItem: () => 'broken' }), []);
     assert.deepEqual(readWorkspaceFolders(stored([null, {}, { root: 12, title: 'x' },
       { root: '', title: 'x' }, { root: '/x', title: 12 }, { root: 'x'.repeat(4097), title: 'x' } ])), []);
+  });
+
+  it('forgets a missing active bookmark without resurrecting it or losing the live document group', () => {
+    const root = { root: '/missing/writing', title: 'Novel' };
+    let saved = '';
+    const next = forgetWorkspaceFolder([root], root.root, { setItem: (_key, value) => saved = value });
+    assert.deepEqual(next, []); assert.equal(saved, '[]');
+    assert.deepEqual(workspaceFolderGroups(next, root.root), [null]);
+    assert.deepEqual(workspaceFolderGroups(next, null), []);
+  });
+
+  it('renames only a bounded sidebar label and preserves the exact root through reopening', () => {
+    const root = { root: '/missing/writing', title: 'Novel' };
+    const renamed = renameWorkspaceFolder([root], root.root, '  Research  ', { setItem() {} });
+    assert.deepEqual(renamed, [{ root: root.root, title: 'Research' }]);
+    assert.equal(rememberWorkspaceFolder(renamed, root)[0], renamed[0]);
+    assert.equal(root.title, 'Novel');
+    for (const label of ['', '\u0000', '界'.repeat(86)]) assert.throws(() => renameWorkspaceFolder([root], root.root, label, { setItem() { assert.fail(); } }));
   });
 
   it('keeps a root document relative, and preserves a genuine same-name nested directory', () => {

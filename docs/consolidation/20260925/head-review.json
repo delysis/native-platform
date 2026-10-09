@@ -1,0 +1,179 @@
+{
+  "schema": "delysis.consolidation-head-review.v1",
+  "repository": "delysis/native-platform",
+  "baseline": "637e60b6b044230ed24ed3118615a2e5538cae83",
+  "scope": "77 original heads in the supplied 2026-09-24 audit; not a perpetual live branch census",
+  "original_inventory_sha256": "63bafd4c6c378d2a86e3db3673f9043e56755ec1e08d7f7e55d47af196c45227",
+  "original_head_count": 77,
+  "evidence_note": "Original-audit comparisons are reused only at the exact same head and main SHAs. New comparisons fill every previously unknown ancestry relation. Semantic review remains selective; all open families below retain explicit review gates.",
+  "automatic_merge": false,
+  "automatic_deletion": false,
+  "original_inventory_path": "docs/consolidation/20260924/branches.csv",
+  "archive_inventory_sha256": "705b292f1196b6daaf5ac8e69d223275698ace07fe1bae6b0c6e615a28be69a4",
+  "inventory_representation_note": "The retained repository CSV has LF line endings; the uploaded audit CSV uses CRLF. Both hashes are recorded. Rows and content are unchanged.",
+  "semantic_review_complete": false,
+  "families": {
+    "integrated-history": {
+      "disposition": "in-main-history",
+      "notes": [
+        "This exact head is an ancestor of pinned main: no unique commits to merge. This is ancestry evidence, not a claim that every historical feature remains enabled or was never reverted."
+      ]
+    },
+    "easl": {
+      "disposition": "park-research",
+      "notes": [
+        "Preserve generic text/rendering/editing and full source history in a separate EASL research line. Park the Loom-specific frontend. Comparison alone is not a dependency-closed extraction or native Tauri acceptance."
+      ]
+    },
+    "peer-and-cabal": {
+      "disposition": "semantic-rebase-required",
+      "notes": [
+        "Retain Signal/Cabals/peer admission, batching and provenance work for a feature-off research/integration queue. Review unique deltas in dependency order; no automatic listener, remote disclosure, trust promotion or exposure in the ordinary UI."
+      ]
+    },
+    "documentation": {
+      "disposition": "semantic-rebase-required",
+      "notes": [
+        "The unique commit changes AGENTS.md and browser-development guidance, not CI implementation. Retain useful current guidance without weakening acceptance or merging stale instructions."
+      ]
+    },
+    "acceptance-followup": {
+      "disposition": "semantic-rebase-required",
+      "notes": [
+        "One unique older acceptance/helper follow-up. Compare narrowly with the later merged source; never substitute old smoke assumptions or handoff state.",
+        "Retain useful exact-focus/enable-isolation regressions only after comparing the later merged implementation. Do not replace current editor/controller or native smoke with the older branch.",
+        "Review added streaming regressions against the later controller/ghost work. Preserve exact glyph authority; old helper replacements and timing changes require separate evidence.",
+        "Three unique commits around visual/native qualification; compare to current main and #85/#86 before preserving any remaining regression. Historical receipts are not current-tree acceptance.",
+        "Small visual-rejection alternative near current main. Compare the exact delta with promoted #86; retain nonduplicate regressions rather than reverting the controller.",
+        "Superseded broad visual-policy candidate includes numeric-prefix rejection and idle helper changes. Prefer the narrower #85/#86 split; do not revive unrelated acceptance relaxations."
+      ]
+    },
+    "native-admission": {
+      "disposition": "qualify-candidate",
+      "notes": [
+        "Retain PR #85 as the native markup-admission candidate. The preserved packaged run failed product acceptance; no guard loosening, numeric rejection or retry-until-green promotion."
+      ]
+    },
+    "references-and-media": {
+      "disposition": "semantic-rebase-required",
+      "notes": [
+        "Recover incremental collection/reference diagnostics, immutable PDF page/source mapping and draft/workspace isolation against current source. Its large overlap and zero-count file summaries do not prove complete file review.",
+        "Review named references and source/occurrence diagnostics against the current shared grammar. Existing material/document paths already overlap; no parser fork or old frontend replacement."
+      ]
+    },
+    "native-evidence": {
+      "disposition": "semantic-rebase-required",
+      "notes": [
+        "Review exact sampled token and raw-output fidelity against current token-piece and visible-prose contracts. Do not replace current visual admission or acceptance tests with older alternatives."
+      ]
+    },
+    "history": {
+      "disposition": "selective-recovery",
+      "notes": [
+        "PR #103 recovers BranchIndex byte-for-byte. Remaining shared document/sampling/vault work needs a current-tree semantic rebase; do not import older UI, storage codecs or SQLite pins wholesale."
+      ]
+    },
+    "hidden-state-training": {
+      "disposition": "park-research",
+      "notes": [
+        "Keep optional hidden-state/residual training out of default desktop operation. Rebase explicit runtime/weight/dataset evidence independently; no training task starts from opening a document."
+      ]
+    },
+    "baseline": {
+      "disposition": "baseline",
+      "notes": [
+        "Exact pinned canonical main. Original heads and user data remain unchanged."
+      ]
+    }
+  },
+  "selective_recoveries": [
+    {
+      "source_head": "a43231626f5deb4ad8f6f08beb36dca40a236270",
+      "source_path": "crates/workspace-document/src/history.rs",
+      "blob": "d3c20b65b1e1329f2bd6d82fece7de2324b6c168",
+      "destination_path": "crates/workspace-document/src/history.rs",
+      "commit": "b09be65ce15233815b6ea56c813b0c39246f2934",
+      "pr": 103,
+      "qualification": "source-identical; Rust and product tests not executed here"
+    }
+  ],
+  "entries": [
+    {"branch":"agent/w2-integration-current","head":"a2449603dccbeda91729491993a4ba178ba25e34","status":"behind","ahead":0,"behind":847,"merge_base":"a2449603dccbeda91729491993a4ba178ba25e34","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"agent/w2-shell-lf-policy","head":"c8d8f6db09e87be96f9553234a94dff7ad9831fb","status":"behind","ahead":0,"behind":855,"merge_base":"c8d8f6db09e87be96f9553234a94dff7ad9831fb","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"agent/w3-final-evidence","head":"18fdf9457988fea76090f3ae5d1fdc3e58e9993b","status":"behind","ahead":0,"behind":792,"merge_base":"18fdf9457988fea76090f3ae5d1fdc3e58e9993b","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"agent/w3-import-native","head":"6e94d4dd377fd9e970999ff6a090fadbf5c16cb2","status":"behind","ahead":0,"behind":794,"merge_base":"6e94d4dd377fd9e970999ff6a090fadbf5c16cb2","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"agent/w4-import-fte","head":"b427fd7c5f4af6bd708c2509a010cc5017f06609","status":"behind","ahead":0,"behind":725,"merge_base":"b427fd7c5f4af6bd708c2509a010cc5017f06609","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"agent/w5-import-services","head":"a7017421209176659035f7e407cb356615257fd5","status":"behind","ahead":0,"behind":661,"merge_base":"a7017421209176659035f7e407cb356615257fd5","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"audit/360-evidence-20260922","head":"49ec511d2189945c8672bdd874f3650ebc5c7083","status":"behind","ahead":0,"behind":80,"merge_base":"49ec511d2189945c8672bdd874f3650ebc5c7083","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"automation/easl-ax-lock-delta-53e7b7ba","head":"3fd6d84f4e99fa340d3b0b345e45712ded917374","status":"diverged","ahead":45,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"this-turn-exact-compare","disposition":"park-research","family":"easl"},
+    {"branch":"automation/easl-ax-lock-ours-53e7b7ba","head":"f9cff570edc1ac60f4965fc96c59f46d5d043e62","status":"diverged","ahead":45,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"this-turn-exact-compare","disposition":"park-research","family":"easl"},
+    {"branch":"chat/peer-continuous-admission","head":"0fb755a2639b2cc14348ca3d8c9331fe206093d9","status":"diverged","ahead":89,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"peer-and-cabal"},
+    {"branch":"chat/peer-inference-hardening","head":"cdd47396881cd1ae4dd78fecaa01cab7a6e7196a","status":"diverged","ahead":87,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"original-audit-exact-inputs","disposition":"semantic-rebase-required","family":"peer-and-cabal"},
+    {"branch":"chat/peer-static-batching","head":"7796c221ee1a8e4d281be3e45f3033935f6f058e","status":"diverged","ahead":119,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"peer-and-cabal"},
+    {"branch":"codex/audit-cache-linearization","head":"27f2180bf3e5a8b1e9b09993ae3b2dfdf6316da4","status":"behind","ahead":0,"behind":104,"merge_base":"27f2180bf3e5a8b1e9b09993ae3b2dfdf6316da4","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-ci-privacy","head":"271664330affc04e12c31839203c2b2de612235d","status":"behind","ahead":0,"behind":101,"merge_base":"271664330affc04e12c31839203c2b2de612235d","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-loom-distinct-words","head":"d7b730a7aec686a1c5c673f9c443e54ae2719be2","status":"behind","ahead":0,"behind":106,"merge_base":"d7b730a7aec686a1c5c673f9c443e54ae2719be2","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-loom-family","head":"59c377fefa724f8ca93f89647778bbfedb01da71","status":"behind","ahead":0,"behind":116,"merge_base":"59c377fefa724f8ca93f89647778bbfedb01da71","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-native-executor","head":"5bdb2cc74c09d1eb7aafce8c1515b4fd70051ba2","status":"behind","ahead":0,"behind":105,"merge_base":"5bdb2cc74c09d1eb7aafce8c1515b4fd70051ba2","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-release-gates","head":"3401f9c43762f0a83b6c7c27cf63729039fdcc1f","status":"behind","ahead":0,"behind":86,"merge_base":"3401f9c43762f0a83b6c7c27cf63729039fdcc1f","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/audit-sampling-compatibility","head":"53320b9444ac3192d30c93c5d54e175723a44944","status":"behind","ahead":0,"behind":103,"merge_base":"53320b9444ac3192d30c93c5d54e175723a44944","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/bounded-ci-repair","head":"56790c6449c6ca52a8430e4f083bf109eb47f5c1","status":"diverged","ahead":1,"behind":136,"merge_base":"3d5d8c46b38fa821f04f963ae233c1939561b872","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"documentation"},
+    {"branch":"codex/ci-efficiency","head":"cb21e9a294deb243097838ccd4043a9bc0b25bdb","status":"behind","ahead":0,"behind":127,"merge_base":"cb21e9a294deb243097838ccd4043a9bc0b25bdb","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/ci-required-under-10","head":"504175f78d73a22db612b140142a549304a4e037","status":"behind","ahead":0,"behind":354,"merge_base":"504175f78d73a22db612b140142a549304a4e037","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/current-audit-remediation","head":"4f668ef00de34435419f3cb3ee788564092d6c35","status":"behind","ahead":0,"behind":168,"merge_base":"4f668ef00de34435419f3cb3ee788564092d6c35","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/delete-platform-runtime","head":"12983d0b37442e9a66582c35c21579f1ba67a405","status":"behind","ahead":0,"behind":649,"merge_base":"12983d0b37442e9a66582c35c21579f1ba67a405","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/drive-history-diffs","head":"ba709f89fa00d95699bc62c67c06493465876836","status":"behind","ahead":0,"behind":171,"merge_base":"ba709f89fa00d95699bc62c67c06493465876836","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/fte-graceful-quit","head":"308f5f05a453374f03b3d3dc1c5528bf1531451a","status":"behind","ahead":0,"behind":357,"merge_base":"308f5f05a453374f03b3d3dc1c5528bf1531451a","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/full-horizon-steward","head":"3dbd652bed8d94e42c5b2f6ae4935471dafad41a","status":"behind","ahead":0,"behind":260,"merge_base":"3dbd652bed8d94e42c5b2f6ae4935471dafad41a","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/ghost-render-contract-20260922","head":"2fb08be8846cc00c3b58d4e3fbefecc37e26352f","status":"behind","ahead":0,"behind":83,"merge_base":"2fb08be8846cc00c3b58d4e3fbefecc37e26352f","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/home-stretch-20260813","head":"a6da3b8a35fdd18bb10816104624a4054f3390b4","status":"behind","ahead":0,"behind":657,"merge_base":"a6da3b8a35fdd18bb10816104624a4054f3390b4","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/import-completion-ci","head":"68fd411d14e5d9444392ad2c742df5b76be31c9c","status":"behind","ahead":0,"behind":121,"merge_base":"68fd411d14e5d9444392ad2c742df5b76be31c9c","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/import-loom","head":"746576b88859f7ec4ca9a03f86ef34c17aaebc13","status":"behind","ahead":0,"behind":456,"merge_base":"746576b88859f7ec4ca9a03f86ef34c17aaebc13","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/import-mom","head":"be08d82eb6d71681f78bd84bae6a37257d5c6d36","status":"behind","ahead":0,"behind":548,"merge_base":"be08d82eb6d71681f78bd84bae6a37257d5c6d36","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/import-w1-contracts","head":"afdc94eab80048ea93247e6b38f8425e918c2018","status":"behind","ahead":0,"behind":617,"merge_base":"afdc94eab80048ea93247e6b38f8425e918c2018","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/integrated-audit-fixes","head":"748ed74964e9c611e4ccc90fdadb3046e8dfb8ef","status":"behind","ahead":0,"behind":175,"merge_base":"748ed74964e9c611e4ccc90fdadb3046e8dfb8ef","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-audit-next-87939f38","head":"9181786c24c906a6348eaaffbc0df737d03c76fb","status":"diverged","ahead":1,"behind":84,"merge_base":"87939f3873977ef2670ddab9e869ca9d5d7d1739","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/loom-automatic-v3-20260924","head":"732a0f5e6edcbeed67aef4348f75570fee89002a","status":"ahead","ahead":1,"behind":0,"merge_base":"637e60b6b044230ed24ed3118615a2e5538cae83","evidence":"this-turn-exact-compare","disposition":"qualify-candidate","family":"native-admission"},
+    {"branch":"codex/loom-cabals-signal","head":"a7daf722392cf9122bf7adbe95096ba6cf9f98f8","status":"diverged","ahead":76,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"original-audit-exact-inputs","disposition":"semantic-rebase-required","family":"peer-and-cabal"},
+    {"branch":"codex/loom-completion-lens-attachments","head":"3f245fddc65f2d94e47b680abfb08e7f4b532cac","status":"behind","ahead":0,"behind":247,"merge_base":"3f245fddc65f2d94e47b680abfb08e7f4b532cac","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-completion-lifecycle","head":"034eef953a751d8d1031655da872f23d3290b876","status":"behind","ahead":0,"behind":324,"merge_base":"034eef953a751d8d1031655da872f23d3290b876","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-connected-collections","head":"d95b4c1dca08db3e002984577f2e4ed45dff783b","status":"diverged","ahead":47,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"references-and-media"},
+    {"branch":"codex/loom-easl-main-integration","head":"54b955336590e97c04f40f2548c8a271d9c2b2ba","status":"diverged","ahead":50,"behind":120,"merge_base":"c0bcc42d8e274c9f428d3e19508709d7fa6e23ae","evidence":"original-audit-exact-inputs","disposition":"park-research","family":"easl"},
+    {"branch":"codex/loom-easl-native","head":"78392f82762193b3c3f107d981c280f15d727b5d","status":"diverged","ahead":31,"behind":167,"merge_base":"90349a54061790954cf8a88160e4e29a8a325d4d","evidence":"this-turn-exact-compare","disposition":"park-research","family":"easl"},
+    {"branch":"codex/loom-editor-context-speech","head":"eaf1e1dccc7c2109a622dd3b303d8008ecc6d8ef","status":"behind","ahead":0,"behind":237,"merge_base":"eaf1e1dccc7c2109a622dd3b303d8008ecc6d8ef","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-enable-isolation-repair-20260922","head":"2b6cd36d4dc3131bafaa3c7dd83d55538ed0ca2b","status":"diverged","ahead":13,"behind":59,"merge_base":"990977acce6c5a00b1d2b995b8f403cc64af4479","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/loom-folder-sources","head":"412dd436a37ae38ae06c49de5224650c8ddf99ba","status":"behind","ahead":0,"behind":130,"merge_base":"412dd436a37ae38ae06c49de5224650c8ddf99ba","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-material-references","head":"45c416f200b1a73500644ac4c9fed9ec38036661","status":"diverged","ahead":9,"behind":162,"merge_base":"fb3a1b2d5d64b85d148d064cda908912b689347c","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"references-and-media"},
+    {"branch":"codex/loom-material-workflows","head":"a1db244d2371d50dec7204a8dde3ab1cd2978c07","status":"behind","ahead":0,"behind":155,"merge_base":"a1db244d2371d50dec7204a8dde3ab1cd2978c07","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-platform-contract-tests","head":"8c8ece4ec20ae9dcecd18eac8c5e677babbd10f6","status":"behind","ahead":0,"behind":137,"merge_base":"8c8ece4ec20ae9dcecd18eac8c5e677babbd10f6","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-quiet-defaults","head":"d7e4ae92b33690980d24619fa152b3f3ff8da1d4","status":"behind","ahead":0,"behind":165,"merge_base":"d7e4ae92b33690980d24619fa152b3f3ff8da1d4","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/loom-raw-output-fidelity","head":"41c4c8c257a2e1ac3b4867a8e8bfcee1de16689f","status":"diverged","ahead":1,"behind":161,"merge_base":"40a5a47278cd1e9a1463ea906ca1a0001d368f08","evidence":"original-audit-exact-inputs","disposition":"semantic-rebase-required","family":"native-evidence"},
+    {"branch":"codex/loom-streaming-preview-repair-20260922","head":"84de38dce5d80db53d42340c97414b16e6910970","status":"diverged","ahead":3,"behind":84,"merge_base":"87939f3873977ef2670ddab9e869ca9d5d7d1739","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/loom-visual-authority-followup-20260924","head":"c3faf83113f80ac91058f3633243bbd83b25285f","status":"behind","ahead":0,"behind":1,"merge_base":"c3faf83113f80ac91058f3633243bbd83b25285f","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/macos-development-gate","head":"5fc16eacf2ce504fe33c29203b98f407a1b45425","status":"behind","ahead":0,"behind":173,"merge_base":"5fc16eacf2ce504fe33c29203b98f407a1b45425","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/mom-loom-convergence","head":"a43231626f5deb4ad8f6f08beb36dca40a236270","status":"diverged","ahead":30,"behind":172,"merge_base":"8ce8948f3bcfc24df87ed0346801dedc7402feb0","evidence":"this-turn-exact-compare","disposition":"selective-recovery","family":"history"},
+    {"branch":"codex/native-hidden-state-training","head":"e8a2393788a47723e48d13dfc7d2b29125f01f27","status":"diverged","ahead":6,"behind":162,"merge_base":"fb3a1b2d5d64b85d148d064cda908912b689347c","evidence":"this-turn-exact-compare","disposition":"park-research","family":"hidden-state-training"},
+    {"branch":"codex/omp2-provider-adoption","head":"691e9af00e4804588badf061c48a7b19bab6786a","status":"behind","ahead":0,"behind":139,"merge_base":"691e9af00e4804588badf061c48a7b19bab6786a","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/platform-runtime-delete","head":"42dbc0c6b38acb5b9c6af098e75e99db5bbb252c","status":"behind","ahead":0,"behind":651,"merge_base":"42dbc0c6b38acb5b9c6af098e75e99db5bbb252c","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/postmerge-windows-portability","head":"8921a16075f593c671498f3b21f5cbf0608ceefd","status":"behind","ahead":0,"behind":250,"merge_base":"8921a16075f593c671498f3b21f5cbf0608ceefd","evidence":"original-audit-exact-inputs","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/pr75-astra-handoff-20260922","head":"8f935c54edb55c3920ee0c5150b4160650c1c82b","status":"diverged","ahead":3,"behind":3,"merge_base":"3897641f3ac5eb8a3f5a89f6ec9affd969ae1362","evidence":"original-audit-exact-inputs","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/pr75-pro-handoff-20260922","head":"050672127b735df0fba6c0a55dd09de23dad79e8","status":"behind","ahead":0,"behind":78,"merge_base":"050672127b735df0fba6c0a55dd09de23dad79e8","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/pr77-990977-integration-20260923","head":"d15e85f7e00161bd2b0e0ae84a822b51126777c3","status":"diverged","ahead":1,"behind":2,"merge_base":"8ff936d548b21069b781a0f004a652a441aff8f4","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/pr77-native-focus-stabilization-20260924","head":"e8e55d58572d14e884e474e23d4f8aae9fc93f53","status":"diverged","ahead":5,"behind":2,"merge_base":"8ff936d548b21069b781a0f004a652a441aff8f4","evidence":"this-turn-exact-compare","disposition":"semantic-rebase-required","family":"acceptance-followup"},
+    {"branch":"codex/production-release-gates","head":"f25c53129d962cc4c492b36a534ac18b01c77664","status":"behind","ahead":0,"behind":338,"merge_base":"f25c53129d962cc4c492b36a534ac18b01c77664","evidence":"earlier-conversation-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/remove-legacy-ci","head":"d67441a6269cc5810cb01fc973684eaeb4f90315","status":"behind","ahead":0,"behind":653,"merge_base":"d67441a6269cc5810cb01fc973684eaeb4f90315","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/review-remediation","head":"493846195dc0472c442af4cb2776bb904e2be5f5","status":"behind","ahead":0,"behind":223,"merge_base":"493846195dc0472c442af4cb2776bb904e2be5f5","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/turbo-imports","head":"7abe5a9c8f4bc6151941558b0a330b07644f9744","status":"behind","ahead":0,"behind":231,"merge_base":"7abe5a9c8f4bc6151941558b0a330b07644f9744","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w8-sqlite-prep","head":"52765e2e4a2265eaec0f53fd3dfa433362e40b98","status":"behind","ahead":0,"behind":429,"merge_base":"52765e2e4a2265eaec0f53fd3dfa433362e40b98","evidence":"earlier-conversation-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w9-lean","head":"aca1f850f6ef37d23a06b7a17f26c334674aef95","status":"behind","ahead":0,"behind":416,"merge_base":"aca1f850f6ef37d23a06b7a17f26c334674aef95","evidence":"earlier-conversation-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-archive-smoke","head":"bf3d20c31b3151939804b02418b1f84755e2e4f6","status":"behind","ahead":0,"behind":392,"merge_base":"bf3d20c31b3151939804b02418b1f84755e2e4f6","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-current-model-evidence","head":"fa2d7049a9bb90fef597cb0189f253cef1ae760a","status":"behind","ahead":0,"behind":390,"merge_base":"fa2d7049a9bb90fef597cb0189f253cef1ae760a","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-honest-stability","head":"eea1e4af8d05c87626464177b596af48659d16f9","status":"behind","ahead":0,"behind":380,"merge_base":"eea1e4af8d05c87626464177b596af48659d16f9","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-release","head":"5a831160e575703626da4af511fa0af2748a6557","status":"behind","ahead":0,"behind":399,"merge_base":"5a831160e575703626da4af511fa0af2748a6557","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-release-weight-scan","head":"50a8f797b1143c0517312dcf465c508dc76ed166","status":"behind","ahead":0,"behind":376,"merge_base":"50a8f797b1143c0517312dcf465c508dc76ed166","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-smoke-identity","head":"e339467c716156cec3149e44971c334240eda32b","status":"behind","ahead":0,"behind":380,"merge_base":"e339467c716156cec3149e44971c334240eda32b","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"codex/w10-windows-followup","head":"e5f6f595f9a3b288987bb638d70a66d81e8f1990","status":"behind","ahead":0,"behind":397,"merge_base":"e5f6f595f9a3b288987bb638d70a66d81e8f1990","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"},
+    {"branch":"main","head":"637e60b6b044230ed24ed3118615a2e5538cae83","status":"identical","ahead":0,"behind":0,"merge_base":"637e60b6b044230ed24ed3118615a2e5538cae83","evidence":"original-audit-exact-inputs","disposition":"baseline","family":"baseline"},
+    {"branch":"maintenance/phil-cache-identity-20260916","head":"45b855790613b18fb938e82037aca6282cba2308","status":"behind","ahead":0,"behind":117,"merge_base":"45b855790613b18fb938e82037aca6282cba2308","evidence":"this-turn-exact-compare","disposition":"in-main-history","family":"integrated-history"}
+  ]
+}

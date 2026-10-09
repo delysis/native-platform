@@ -1,4 +1,4 @@
-use llama_native_host::NativeHost;
+use llama_native_host::{NativeClient, NativeHost};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -157,10 +157,13 @@ struct OperationRegistries {
     mentions: MentionCancelRegistry,
     mcp: BTreeMap<u64, McpOperation>,
     tool_loops: HashMap<String, ToolLoopOperation>,
+    children: Vec<Weak<OperationScopeInner>>,
 }
 
 struct OperationScopeInner {
     native_host: Weak<NativeHost>,
+    parent: Option<Weak<OperationScopeInner>>,
+    shared_client: Option<NativeClient>,
     quiescing: AtomicBool,
     native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
@@ -192,10 +195,34 @@ impl OperationScope {
         Self::new(Arc::downgrade(host), Some(key))
     }
 
+    pub(crate) fn for_shared_host(
+        client: NativeClient,
+        key: crate::native_runtime::ProductHostKey,
+    ) -> Self {
+        Self::with_client(Weak::new(), Some(client), Some(key))
+    }
+
+    pub(crate) fn native_access(&self) -> Option<crate::native_runtime::NativeHostAccess> {
+        if self.0.quiescing.load(Ordering::Acquire) || self.0.registries.is_poisoned() {
+            return None;
+        }
+        self.0
+            .shared_client
+            .as_ref()
+            .map(|client| crate::native_runtime::NativeHostAccess::Shared(client.clone()))
+            .or_else(|| {
+                self.0
+                    .native_host
+                    .upgrade()
+                    .map(crate::native_runtime::NativeHostAccess::Owned)
+            })
+    }
+
     pub(crate) fn matches_native_key(&self, key: &crate::native_runtime::ProductHostKey) -> bool {
         self.0.native_key.as_ref().is_none_or(|bound| bound == key)
     }
 
+    #[cfg(test)]
     pub(crate) fn native_host(&self) -> Option<Arc<NativeHost>> {
         if self.0.quiescing.load(Ordering::Acquire) || self.0.registries.is_poisoned() {
             return None;
@@ -207,8 +234,18 @@ impl OperationScope {
         native_host: Weak<NativeHost>,
         native_key: Option<crate::native_runtime::ProductHostKey>,
     ) -> Self {
+        Self::with_client(native_host, None, native_key)
+    }
+
+    fn with_client(
+        native_host: Weak<NativeHost>,
+        shared_client: Option<NativeClient>,
+        native_key: Option<crate::native_runtime::ProductHostKey>,
+    ) -> Self {
         Self(Arc::new(OperationScopeInner {
             native_host,
+            parent: None,
+            shared_client,
             quiescing: AtomicBool::new(false),
             native_key,
             registries: Mutex::new(OperationRegistries {
@@ -217,8 +254,47 @@ impl OperationScope {
                 mentions: BTreeMap::new(),
                 mcp: BTreeMap::new(),
                 tool_loops: HashMap::new(),
+                children: Vec::new(),
             }),
         }))
+    }
+
+    #[must_use]
+    pub fn cancellation_requested(&self) -> bool {
+        self.0.quiescing.load(Ordering::Acquire)
+    }
+
+    /// A single dispatch can stop independently while the application keeps
+    /// authority to cancel and count all of its work during shutdown.
+    /// Children share native access; they never construct or own another host.
+    pub fn child(&self) -> anyhow::Result<Self> {
+        if self.0.parent.is_some() {
+            anyhow::bail!("operation scopes support one child level");
+        }
+        let mut registries = self
+            .0
+            .registries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("operation registry is unavailable"))?;
+        if self.0.quiescing.load(Ordering::Acquire) {
+            anyhow::bail!("operation scope is shutting down");
+        }
+        registries
+            .children
+            .retain(|child| child.strong_count() != 0);
+        if registries.children.len() >= 128 {
+            anyhow::bail!("operation scope has too many active dispatches");
+        }
+        let mut child = Self::with_client(
+            self.0.native_host.clone(),
+            self.0.shared_client.clone(),
+            self.0.native_key.clone(),
+        );
+        Arc::get_mut(&mut child.0)
+            .expect("new operation scope has one owner")
+            .parent = Some(Arc::downgrade(&self.0));
+        registries.children.push(Arc::downgrade(&child.0));
+        Ok(child)
     }
 
     pub(crate) fn register_chat(
@@ -367,6 +443,9 @@ impl OperationScope {
     }
 
     pub(crate) fn cancel_native(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        if let Some(client) = &self.0.shared_client {
+            return client.cancel(request_id, branch_id);
+        }
         self.0
             .native_host
             .upgrade()
@@ -374,6 +453,9 @@ impl OperationScope {
     }
 
     pub(crate) fn skip_native_reasoning(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        if let Some(client) = &self.0.shared_client {
+            return client.skip_reasoning(request_id, branch_id);
+        }
         self.0
             .native_host
             .upgrade()
@@ -383,7 +465,7 @@ impl OperationScope {
     /// Closes this scope to new uncancelled operations and requests
     /// cancellation from every operation currently owned by this runtime.
     pub fn request_cancellation(&self) -> usize {
-        let (chat_requests, mention_requests, mcp_cancellations, tool_controls) = {
+        let (chat_requests, mention_requests, mcp_cancellations, tool_controls, children) = {
             let Ok(registries) = self.0.registries.lock() else {
                 return 0;
             };
@@ -410,10 +492,18 @@ impl OperationScope {
                 .values()
                 .map(|operation| operation.control.clone())
                 .collect::<Vec<_>>();
-            (chats, mentions, mcp, tools)
+            let children = registries
+                .children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            (chats, mentions, mcp, tools, children)
         };
 
         let mut cancelled = mcp_cancellations;
+        for child in children {
+            cancelled = cancelled.saturating_add(Self(child).request_cancellation());
+        }
         for request_id in chat_requests {
             cancelled = cancelled.saturating_add(1.max(self.cancel_native(&request_id, None)));
         }
@@ -443,6 +533,14 @@ impl OperationScope {
                 .saturating_add(registries.mentions.len())
                 .saturating_add(registries.mcp.len())
                 .saturating_add(registries.tool_loops.len())
+                .saturating_add(
+                    registries
+                        .children
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .map(|child| Self(child).active_operation_count())
+                        .sum::<usize>(),
+                )
         })
     }
 }
@@ -557,6 +655,67 @@ impl Drop for ToolLoopOperationLease {
 mod tests {
     use super::{MentionCancelControl, OperationScope};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn child_stop_is_independent_and_parent_quit_reaches_late_operations() {
+        let parent = OperationScope::detached();
+        let stopped = parent.child().expect("first dispatch");
+        let active = parent.child().expect("second dispatch");
+        assert!(stopped.child().is_err());
+        let stopped_chat = stopped.register_chat("one", "conversation").expect("chat");
+        let active_chat = active.register_chat("two", "conversation").expect("chat");
+        assert_eq!(parent.active_operation_count(), 2);
+        stopped.request_cancellation();
+        assert!(stopped_chat.cancellation_requested());
+        assert!(!active_chat.cancellation_requested());
+        // Stop precedes native mention registration. The late worker starts
+        // cancelled, rather than escaping the earlier cancellation request.
+        let late_mention = stopped
+            .with_mention_registry(|registry, quiescing| {
+                let control = Arc::new(MentionCancelControl::running(quiescing));
+                registry.insert(("invocation".into(), "target".into()), control.clone());
+                Ok(control)
+            })
+            .expect("late mention");
+        assert!(late_mention.cancellation_requested());
+        parent.request_cancellation();
+        assert!(active_chat.cancellation_requested());
+        assert!(parent.child().is_err());
+        let late_chat = active
+            .register_chat("late", "conversation")
+            .expect("late chat");
+        assert!(late_chat.cancellation_requested());
+        let mut invoked = false;
+        assert!(
+            late_chat
+                .with_native_admission(|| {
+                    invoked = true;
+                })
+                .expect("admission")
+                .is_none()
+        );
+        assert!(!invoked);
+        assert_eq!(parent.active_operation_count(), 4);
+        stopped
+            .with_mention_registry(|registry, _| {
+                registry.clear();
+                Ok(())
+            })
+            .expect("clear");
+        drop((stopped_chat, active_chat, late_chat));
+        assert_eq!(parent.active_operation_count(), 0);
+    }
+
+    #[test]
+    fn child_budget_reclaims_finished_dispatches() {
+        let parent = OperationScope::detached();
+        let children = (0..128)
+            .map(|_| parent.child().expect("dispatch"))
+            .collect::<Vec<_>>();
+        assert!(parent.child().is_err());
+        drop(children);
+        assert!(parent.child().is_ok());
+    }
 
     #[test]
     fn barrier_driven_two_runtime_cancellation_is_exactly_isolated() {

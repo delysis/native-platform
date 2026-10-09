@@ -434,7 +434,7 @@ test("product package scripts select their owned frontend checks", () => {
     present: ["products/mom/Cargo.toml"],
   }).result;
   assert.equal(mom.flags.frontend_mom, true);
-  assert.deepEqual(mom.jobs, ["policy", "mom-linux", "mom-windows", "frontend"]);
+  assert.deepEqual(mom.jobs, ["policy", "mom-linux", "mom-windows", "frontend", "platform-macos"]);
 
   const fte = fixture("products/fte/package.json").result;
   assert.equal(fte.flags.frontend_fte, true);

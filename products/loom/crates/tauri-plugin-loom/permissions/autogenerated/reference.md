@@ -10,6 +10,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-material-read-evidence`
 - `allow-material-bind-attachment`
 - `allow-material-set-pinned`
+- `allow-material-rename`
 - `allow-material-remove`
 - `allow-material-add-library`
 - `allow-material-add-library-path`
@@ -25,6 +26,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-create`
 - `allow-workspace-template-get`
 - `allow-workspace-template-enable`
+- `allow-workspace-chat-route`
 - `allow-document-rename`
 - `allow-document-delete`
 - `allow-attachment-ingest`
@@ -1645,6 +1647,32 @@ Denies the material_remove command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-material-rename`
+
+</td>
+<td>
+
+Enables the material_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-rename`
+
+</td>
+<td>
+
+Denies the material_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-material-search`
 
 </td>
@@ -2548,6 +2576,32 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-chat-route`
+
+</td>
+<td>
+
+Enables the workspace_chat_route command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-chat-route`
+
+</td>
+<td>
+
+Denies the workspace_chat_route command without any pre-configured scope.
 
 </td>
 </tr>
