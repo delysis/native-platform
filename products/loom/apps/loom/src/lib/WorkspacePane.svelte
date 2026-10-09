@@ -10,6 +10,7 @@
 </script>
 
 <script lang="ts">
+  import { compositionOwnsKey } from './textEditingInteractions';
   import { afterUpdate, onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import LoomEditor from './LoomEditor.svelte';
@@ -309,8 +310,8 @@
     return convertFileSrc(`v1-${project}-${session}-${summary.document_id}-${summary.revision_id}-${summary.active_blob_id}`, 'loom-preview');
   }
   function keydown(event: KeyboardEvent): void {
-    if (event.isComposing) return;
-    if (event.key === 'Enter' && ((event.metaKey || event.ctrlKey) || (config.kind === 'chat' && !event.shiftKey))) {
+    if (compositionOwnsKey(event, composing)) return;
+    if (!event.altKey && event.key === 'Enter' && ((event.metaKey || event.ctrlKey) || (config.kind === 'chat' && !event.shiftKey))) {
       event.preventDefault(); event.stopPropagation(); void submit();
     }
   }

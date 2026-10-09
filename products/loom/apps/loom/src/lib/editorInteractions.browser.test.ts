@@ -1,4 +1,4 @@
-import { mount, unmount } from 'svelte';
+import { mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import '../app.css';
@@ -1967,4 +1967,48 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('0');
     await keyboard.cleanup();
   });
+});
+
+it.each([
+  { initial: 'plain', keys: '{Tab}', edited: '\tplain' },
+  { initial: '\tplain', keys: '{Shift>}{Tab}{/Shift}', edited: 'plain' }
+])('ordinary Source indentation enters native undo: $keys', async ({ initial, keys, edited }) => {
+  renderSource(initial, []);
+  await tick();
+  // SourceEditor restores its initial caret on the first mounted frame.
+  await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
+  const input = page.getByRole('textbox', { name: 'Markdown source editor' }).element() as HTMLTextAreaElement;
+  input.focus(); input.setSelectionRange(0, 0);
+  await userEvent.keyboard(keys);
+  await expect.poll(() => input.value).toBe(edited);
+  await expect.element(page.getByRole('status', { name: 'Source Generation Requests' })).toHaveTextContent('1');
+  const mod = /Mac/.test(navigator.platform) ? 'Meta' : 'Control';
+  await userEvent.keyboard(`{${mod}>}z{/${mod}}`);
+  await expect.poll(() => input.value).toBe(initial);
+  await expect.poll(() => page.getByRole('status', { name: 'Source Markdown' }).element().textContent).toBe(initial);
+});
+
+it('rich beforeinput history uses ProseMirror transactions and retains formatting through undo/redo', async () => {
+  render('**Bold**');
+  await tick();
+  const editor = document.querySelector<HTMLElement>('.ProseMirror')!; editor.focus();
+  const range = document.createRange(); range.selectNodeContents(editor); range.collapse(false);
+  const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range);
+  await userEvent.keyboard(' added');
+  await expect.poll(() => editor.textContent).toContain('added');
+  const undo = new InputEvent('beforeinput', { inputType: 'historyUndo', bubbles: true, cancelable: true }); editor.dispatchEvent(undo);
+  expect(undo.defaultPrevented).toBe(true); await expect.poll(() => editor.textContent).toBe('Bold');
+  expect(editor.querySelector('strong')?.textContent).toBe('Bold');
+  const redo = new InputEvent('beforeinput', { inputType: 'historyRedo', bubbles: true, cancelable: true }); editor.dispatchEvent(redo);
+  expect(redo.defaultPrevented).toBe(true); await expect.poll(() => editor.textContent).toContain('added');
+  expect(editor.querySelector('strong')).not.toBeNull();
+});
+
+it('Source legacy IME Tab does not indent, accept completion, steal focus or swallow native text menus', async () => {
+  renderSource('unchanged', []);
+  const input = page.getByRole('textbox', { name: 'Markdown source editor' }).element() as HTMLTextAreaElement;
+  input.focus(); input.setSelectionRange(4, 4);
+  const ime = new KeyboardEvent('keydown', { key: 'Tab', keyCode: 229, bubbles: true, cancelable: true }); input.dispatchEvent(ime);
+  expect(ime.defaultPrevented).toBe(false); expect(input.value).toBe('unchanged'); expect(input.selectionStart).toBe(4);
+  const menu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true }); input.dispatchEvent(menu); expect(menu.defaultPrevented).toBe(false);
 });

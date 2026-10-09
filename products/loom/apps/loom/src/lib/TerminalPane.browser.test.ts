@@ -87,3 +87,13 @@ describe('retained output pane', () => {
   });
 
 });
+
+it('keeps selected Ctrl-C and native text context menus, and does not submit legacy IME Return', async () => {
+  const { onRun, onCancel } = render(true); await tick();
+  const input = document.querySelector('textarea')!; input.value = 'selected text'; input.setSelectionRange(0, 8);
+  const copy = new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true }); input.dispatchEvent(copy);
+  expect(copy.defaultPrevented).toBe(false); expect(onCancel).not.toHaveBeenCalled();
+  const ime = new KeyboardEvent('keydown', { key: 'Enter', keyCode: 229, bubbles: true, cancelable: true }); input.dispatchEvent(ime);
+  expect(ime.defaultPrevented).toBe(false); expect(onRun).not.toHaveBeenCalled();
+  const menu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true }); input.dispatchEvent(menu); expect(menu.defaultPrevented).toBe(false);
+});

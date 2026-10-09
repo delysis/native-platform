@@ -563,3 +563,11 @@ button.document-row:hover { background: var(--chrome-hover); }
 .material-pin { margin-left:auto; flex:0 !important; opacity:.6; }
 .material-connect-view { min-height:0; flex:1; overflow:auto; }
 .material-connect-view .import-sources { padding:12px; }
+
+/* Sidebar selection is distinct from the document currently mounted for editing. */
+.document-list [data-sidebar-row].selected { color: var(--ink); background: var(--selection-bg); outline: 1px solid var(--line); outline-offset: -1px; }
+.document-list .folder-row::before { content: none; }
+.document-list [data-sidebar-disclosure] { display: inline-grid; flex: none; width: 16px; height: 18px; place-items: center; overflow: visible; }
+.document-list [data-sidebar-disclosure]::before { content: ""; width: 5px; height: 5px; border-right: 1.25px solid currentColor; border-bottom: 1.25px solid currentColor; transform: rotate(-45deg); }
+.document-list [aria-expanded="true"] > [data-sidebar-disclosure]::before { transform: translateY(-1px) rotate(45deg); }
+.workspace-label-edit input { width: 100%; min-width: 0; box-sizing: border-box; color: inherit; background: var(--paper); font: inherit; }
