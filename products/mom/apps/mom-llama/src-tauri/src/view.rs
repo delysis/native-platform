@@ -1086,38 +1086,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
     },
     SettingsFieldSpec {
         section: "display",
-        key: "showRawModelNames",
-        label: "Show raw model names",
-        kind: "checkbox",
-        help: "Display full raw model identifiers.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showModelQuantization",
-        label: "Show model quantization information",
-        kind: "checkbox",
-        help: "Show the quantization inferred from the selected local GGUF filename.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showModelTags",
-        label: "Show model tags",
-        kind: "checkbox",
-        help: "Show native capability tags such as local, multimodal, and reasoning.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
-        key: "showBuildVersion",
-        label: "Show build version information",
-        kind: "checkbox",
-        help: "Display the Mom Llama app version in the bottom-right corner.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "display",
         key: "showSystemMessage",
         label: "Show system message",
         kind: "checkbox",
@@ -1511,7 +1479,6 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
     let full_height_code = upstream_settings_bool(settings, "fullHeightCodeBlocks");
     let disable_auto_scroll = upstream_settings_bool(settings, "disableAutoScroll");
     let custom_css = upstream_settings_value(settings, "customCss");
-    let show_build_version = upstream_settings_bool(settings, "showBuildVersion");
     html! {
         div class=(format!(
                 "llama-ui-shell{}",
@@ -1561,9 +1528,6 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (attachment_library_modal())
             @if mcp_process_ui_supported() {
                 (tool_approval_modal())
-            }
-            @if show_build_version {
-                small class="build-version" { "Mom Llama " (env!("CARGO_PKG_VERSION")) }
             }
             div id="command-status" class="command-status is-hidden" role="status" aria-live="polite" {}
             output id="command-output" class="sr-command-output" aria-hidden="true" tabindex="-1" {}
@@ -1768,7 +1732,7 @@ fn recipients_header(
                     }
                 }
                 @if unsent && ids.len() < 4 {
-                    input id="recipient-query" placeholder="To" aria-label="Contact" autocomplete="off"
+                    input id="recipient-query" placeholder="" aria-label="Contact" autocomplete="off"
                         role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="recipient-options"
                         data-affordance="conversation.recipients"
                         data-command="mom_llama.conversation_draft_recipients_update"

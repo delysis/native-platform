@@ -2479,9 +2479,11 @@
     const list = document.getElementById("recipient-options");
     if (!input || !list) return;
     const query = input.value.trim().toLowerCase();
-    list.hidden = false;
-    input.setAttribute("aria-expanded", "true");
-    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !option.dataset.search.includes(query);
+    const open = query.length > 0;
+    list.hidden = !open;
+    input.setAttribute("aria-expanded", String(open));
+    input.removeAttribute("aria-invalid");
+    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !open || !option.dataset.search.includes(query);
   };
   document.addEventListener("input", (event) => {
     if (event.target.id === "recipient-query" && !event.isComposing) filterRecipientOptions();
@@ -3380,6 +3382,13 @@
       if (form.id === "chat-form") {
         if (autocompleteAccepting) return;
         if (form.dataset.busy === "true") return;
+        const recipientQuery = document.getElementById("recipient-query");
+        if (recipientQuery?.value.trim()) {
+          filterRecipientOptions();
+          recipientQuery.focus();
+          recipientQuery.setAttribute("aria-invalid", "true");
+          return;
+        }
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
         const attachmentIds = draftAttachmentIds(form);

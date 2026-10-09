@@ -180,10 +180,6 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "renderUserContentAsMarkdown",
     "disableAutoScroll",
     "fullHeightCodeBlocks",
-    "showRawModelNames",
-    "showModelQuantization",
-    "showModelTags",
-    "showBuildVersion",
     "showSystemMessage",
     "renderThinkingAsMarkdown",
     "temperature",
@@ -395,10 +391,6 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("renderUserContentAsMarkdown".to_string(), json!(false)),
         ("fullHeightCodeBlocks".to_string(), json!(false)),
         ("disableAutoScroll".to_string(), json!(false)),
-        ("showRawModelNames".to_string(), json!(false)),
-        ("showModelQuantization".to_string(), json!(true)),
-        ("showModelTags".to_string(), json!(true)),
-        ("showBuildVersion".to_string(), json!(false)),
         ("showSystemMessage".to_string(), json!(true)),
         ("renderThinkingAsMarkdown".to_string(), json!(true)),
         ("temperature".to_string(), json!(0.7)),
@@ -1213,7 +1205,7 @@ mod tests {
     #[test]
     fn supported_upstream_setting_registry_is_complete_and_distinct_from_extensions() {
         let defaults = upstream_settings_defaults();
-        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 47);
+        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 43);
         for key in UPSTREAM_SETTING_KEYS {
             assert!(
                 defaults.contains_key(*key),

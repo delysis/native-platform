@@ -16,7 +16,7 @@ for (const switchAt of ["persistence", "dispatch"]) {
       const calls = [];
       const switchToB = () => { selected = "B"; textarea.value = "precious B"; };
       const context = {
-        document: { addEventListener: (_, handler) => { submit = handler; } },
+        document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null },
         recipientMutation: Promise.resolve(),
         autocompleteAccepting: false, cancelComposerAutocomplete() {},
         formValue: () => textarea.value, draftAttachmentIds: () => [],
@@ -49,3 +49,26 @@ for (const switchAt of ["persistence", "dispatch"]) {
     });
   }
 }
+
+test("an unresolved To entry cannot create or dispatch a conversation", async () => {
+  let submit;
+  let focused = false;
+  let invalid = false;
+  const context = {
+    document: {
+      addEventListener: (_, handler) => { submit = handler; },
+      getElementById: () => ({ value: "gab", focus: () => { focused = true; }, setAttribute: (key) => { invalid = key === "aria-invalid"; } }),
+    },
+    autocompleteAccepting: false,
+    filterRecipientOptions() {},
+    reportError(error) { throw error; },
+    invoke: () => { throw new Error("Unselected contact must not reach native dispatch"); },
+  };
+  vm.createContext(context);
+  const start = source.indexOf('  document.addEventListener("submit"');
+  const end = start + source.slice(start).indexOf('\n  });') + 7;
+  vm.runInContext(source.slice(start, end), context);
+  await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
+  assert.equal(focused, true);
+  assert.equal(invalid, true);
+});
