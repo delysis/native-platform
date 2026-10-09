@@ -56,3 +56,17 @@ it('streams four full previews without changing next-word actions, slots, or man
   expect(editor.value).toBe('');
   expect(document.querySelector('.loompad')).toBeNull();
 });
+
+it('Loompad leaves legacy IME keys to composition without requesting manuscript acceptance', async () => {
+  const target = document.createElement('div'); document.body.append(target);
+  const choices: CompletionCandidate[] = ['silver', 'amber', 'blue', 'green'].map((word, index) => ({ runId: `run-${index}`, candidateId: `candidate-${index}`, presentationKey: `stream:${index}`, targetByte: 0, text: ` ${word} light`, insertsOnAccept: true }));
+  const onAccept = vi.fn();
+  const mounted = mount(LoompadBrowserHarness, { target, props: { choices, onAccept, onChoose: vi.fn() } });
+  try {
+    await tick(); const editor = target.querySelector('textarea')!; editor.focus();
+    const ime = new KeyboardEvent('keydown', { key: 'Process', code: 'KeyW', altKey: true, keyCode: 229, isComposing: false, bubbles: true, cancelable: true });
+    editor.dispatchEvent(ime);
+    expect(ime.defaultPrevented).toBe(false);
+    expect(onAccept).not.toHaveBeenCalled();
+  } finally { await unmount(mounted); target.remove(); }
+});
