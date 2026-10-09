@@ -141,3 +141,8 @@ fallback.
 
 The desktop sidebar is always present and resizable. Settings are reached through
 the native application menu. Conversation chrome does not display model names.
+
+Below 900px, open Settings use the conversation pane while the navigation sidebar
+stays visible. Closing Settings restores the same composer; the transcript is
+never squeezed between two sidebars. This is a presentation rule, not another
+draft or conversation owner.

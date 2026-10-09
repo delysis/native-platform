@@ -1249,3 +1249,10 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .conversation-copy { min-width: 0; flex: 1; display: grid; gap: 3px; }
 .conversation-copy small { display: block; font-size: 12px; color: var(--muted); text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
 .message-row.assistant .message-card { width: auto; max-width: 92%; border-radius: 16px; padding: 10px 14px; background: var(--surface-raised); }
+
+/* A narrow window has room for the permanent sidebar and one working pane.
+   Preferences use that pane rather than compressing the transcript to a sliver. */
+@media (max-width: 900px) {
+  .llama-ui-shell.settings-open .chat-main { visibility: hidden; }
+  .settings-sidebar { width: calc(100vw - var(--sidebar-width)); }
+}
