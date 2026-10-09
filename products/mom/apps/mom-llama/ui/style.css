@@ -1222,7 +1222,8 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .contact-avatar { display: grid; place-items: center; flex: 0 0 34px; width: 34px; height: 34px; border-radius: 50%; overflow: hidden; background-color: var(--surface-active); }
 .contact-avatar.illustrated { background-image: url("contact-portraits.png"); background-size: 400% 400%; }
 .contact-copy { display: grid; min-width: 0; gap: 2px; }
-.sidebar-persona-copy { align-items: center; gap: 10px; }
+.sidebar-persona-copy { align-items: center; justify-content: flex-start; gap: 10px; }
+.sidebar-persona-copy .contact-copy { flex: 1; text-align: left; }
 .sidebar-persona-copy .contact-copy span { white-space: normal; overflow-wrap: normal; line-height: 1.25; }
 .sidebar-persona-copy .contact-copy small { text-overflow: ellipsis; overflow: hidden; }
 .chrome .icon-button { border-radius: 50%; }

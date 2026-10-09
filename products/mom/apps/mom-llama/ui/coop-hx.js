@@ -112,10 +112,11 @@
         return;
       }
       status.textContent = String(label).replaceAll("_", " ");
-      status.classList.toggle("blocked", Boolean(blocker) || value?.status === "blocked");
+      const blocked = Boolean(blocker) || value?.status === "blocked";
+      status.classList.toggle("blocked", blocked);
       status.classList.remove("is-hidden");
       window.clearTimeout(status.hideTimer);
-      status.hideTimer = window.setTimeout(() => status.classList.add("is-hidden"), 5000);
+      if (!blocked) status.hideTimer = window.setTimeout(() => status.classList.add("is-hidden"), 5000);
     }
   };
 
@@ -2021,6 +2022,7 @@
   };
 
   let activeDispatchConversation = null;
+  const activeDispatchStreamLeases = new Set();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
@@ -2062,6 +2064,7 @@
   const acquireStableChatBusy = (lease) => {
     if (!lease) return null;
     chatBusyLeases.add(lease);
+    if (activeDispatchConversation !== null) activeDispatchStreamLeases.add(lease);
     renderChatBusyState();
     return lease;
   };
@@ -3465,6 +3468,10 @@
           }
           await refreshConversationProjection();
         } finally {
+          // A rejected native batch can return without a terminal stream event
+          // or an invocation result. Its started events must not strand Stop.
+          activeDispatchStreamLeases.forEach(releaseChatBusy);
+          activeDispatchStreamLeases.clear();
           activeDispatchConversation = null;
           releaseChatBusy(dispatchLease);
         }
