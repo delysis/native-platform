@@ -517,7 +517,9 @@ describe('App ghost reactivity wiring', () => {
     expect(documentCalls).toContain('expectedBlobId');
     expect(documentCalls).not.toContain('relativePath');
     expect(source).toContain('data-document-title');
-    expect(source).toContain('bind:value={renameDocumentTitle}');
+    expect(sidebar).toContain('value={renameDocumentTitle}');
+    expect(sidebar).toContain('on:input={handleDocumentRenameInput}');
+    expect(source).not.toContain('bind:value={renameDocumentTitle}');
     expect(sidebar).toContain('on:compositionstart={handleDocumentRenameCompositionStart}');
     expect(sidebar).toContain('on:compositionend={handleDocumentRenameCompositionEnd}');
     expect(sidebar).toContain('on:blur={handleDocumentRenameBlur}');
