@@ -1,7 +1,7 @@
 # Elegance Compendium I integration
 
 Reviewed against Boom `88ee71642e5d5cdeaa25764d314aac82bc8cfa84` and Native-platform
-`cdfea8a7` (the full revision is recorded in the local integration receipt).
+`cdfea8a74da09e102b124f5d382030c85d08f976`.
 The supplied archive is evidence and proposed design, not executable authority.
 Its teaching specimens are not production patches. Earlier Linux Core receipts
 claimed in Boom PRs #1/#2 are unavailable in the supplied archive; this integration
