@@ -15,12 +15,13 @@
   import { readWorkspaceFolders, rememberWorkspaceFolder, forgetWorkspaceFolder, renameWorkspaceFolder,
     workspaceFolderGroups, workspaceFolderLabels, type WorkspaceFolder } from './lib/workspaceFolders';
   import { captureSidebarTarget, sidebarItemKey, sidebarCapabilities, sidebarKeyAction, sidebarScopeIsCurrent,
-    sidebarTargetIsCurrent, type CapturedSidebarTarget, type RootSidebarTarget, type SidebarCapability, type SidebarLiveState } from './lib/sidebarInteractions';
+    sidebarTargetIsCurrent, type CapturedSidebarTarget, type RootSidebarTarget, type MaterialSidebarTarget, type SidebarCapability, type SidebarLiveState } from './lib/sidebarInteractions';
   import { createRenameCompositionGuard, handleInlineRenameKey } from './lib/interactionPrimitives';
   import { compositionOwnsKey, createTextCompositionBoundary, nativeEditingCommand, textEditingElement } from './lib/textEditingInteractions';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import MaterialView from './lib/MaterialView.svelte';
-  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence, pinMaterial, removeMaterial } from './lib/ipc';
+  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence, pinMaterial, removeMaterial, renameMaterial } from './lib/ipc';
+  import { canEditMaterialMetadata, materialMetadataRevision, materialDisplayNameError, materialSourceIsUnchanged, sameMaterialObservation, materialRenameReceiptMatches } from './lib/materialMetadata';
   import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
@@ -426,17 +427,26 @@
   let renameWorkspaceTitle = '';
   let renameWorkspaceInput: HTMLInputElement | undefined;
   const renameWorkspaceComposition = createRenameCompositionGuard();
+  let renamingMaterialTarget: MaterialSidebarTarget | null = null;
+  let renameMaterialName = '';
+  let renameMaterialInput: HTMLInputElement | undefined;
+  let renameMaterialInFlight = false;
+  const renameMaterialComposition = createRenameCompositionGuard();
   const textCompositionBoundary = createTextCompositionBoundary();
   $: if (sidebarSelectionScope !== JSON.stringify([project?.project_id, project?.session_id])) {
     sidebarSelectionScope = JSON.stringify([project?.project_id, project?.session_id]);
     sidebarSelection = null;
     closeDocumentContextMenu(false);
     cancelWorkspaceLabelRename(false);
+    cancelMaterialRename(false);
   }
   $: if (sidebarContextTarget && !sidebarTargetIsCurrent(sidebarContextTarget,
     { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) closeDocumentContextMenu(false);
   $: if (renamingWorkspaceRoot && !sidebarTargetIsCurrent(renamingWorkspaceRoot,
     { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) cancelWorkspaceLabelRename(false);
+  // A refreshed row does not authorize rebasing an in-progress rename. Keep its
+  // exact input visible, but its original native revision must still match.
+  $: if (renamingMaterialTarget && !materialEntries.some(item => item.id === renamingMaterialTarget?.material.id)) cancelMaterialRename(false);
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
@@ -504,6 +514,7 @@
   let materialsOpen = false;
   let addMenuOpen = false;
   let materialEntries: MaterialEntry[] = [];
+  let materialRefreshSerial = 0;
   let materialScope = '';
   let activeMaterial: MaterialEntry | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
@@ -525,10 +536,19 @@
   async function refreshMaterials(): Promise<void> {
     if (!project) return;
     const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const request = ++materialRefreshSerial;
     try {
       const entries = await listMaterials(captured.projectId, captured.sessionId);
-      if (project?.project_id === captured.projectId && project.session_id === captured.sessionId) materialEntries = entries;
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+      if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
+        const existing = new Map(materialEntries.map(item => [item.id, item]));
+        materialEntries = entries.map(item => {
+          const previous = existing.get(item.id);
+          return previous && sameMaterialObservation(previous, item) ? previous : item;
+        });
+        // Refresh display metadata without remounting the source/evidence view.
+        if (activeMaterial) activeMaterial = materialEntries.find(item => item.id === activeMaterial?.id) ?? activeMaterial;
+      }
+    } catch (error) { if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) recordFailure(error); }
   }
   function captureMaterialOrigin(): void {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
@@ -570,14 +590,22 @@
     if (inserted) closeMaterial();
     return inserted;
   }
-  function materialRemoved(id: string, sessionId: string): void {
-    if (project?.session_id !== sessionId) return;
+  function materialRemoved(id: string, sessionId: string, expected?: MaterialEntry): void {
+    if (!componentMounted || project?.session_id !== sessionId) return;
+    if (expected && materialEntries.find(item => item.id === id) !== expected) { void refreshMaterials(); return; }
+    materialRefreshSerial += 1;
     materialEntries = materialEntries.filter(item => item.id !== id);
     if (activeMaterial?.id === id) closeMaterial();
+    void refreshMaterials();
   }
   function materialChanged(item: MaterialEntry): void {
+    if (!componentMounted) return;
+    materialRefreshSerial += 1;
+    const refreshOtherObservations = item.metadata_revision && materialEntries.some(existing =>
+      existing.id !== item.id && existing.metadata_revision !== item.metadata_revision);
     materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
     if (activeMaterial?.id === item.id) activeMaterial = item;
+    if (refreshOtherObservations) void refreshMaterials();
   }
   async function chooseMaterialLibrary(): Promise<void> {
     if (!project || fileCommandInFlight || opening) return;
@@ -2648,6 +2676,7 @@
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       projectFilesystemRefreshSerial += 1;
+      materialRefreshSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
@@ -4858,7 +4887,7 @@
     return sidebarCapabilities(target, {
       idle: componentMounted && applicationClosePhase === 'running' && transition === 'idle' &&
         !fileCommandInFlight && !opening && !documentContextActionInFlight && !sidebarActionInFlight &&
-        !renamingWorkspaceRoot && !renamingDocumentId && !deleteDocumentTarget,
+        !renamingWorkspaceRoot && !renamingMaterialTarget && !renamingDocumentId && !deleteDocumentTarget,
       editable: !editorReadonly,
       activeRoot: target.kind === 'root' && target.bookmark.root === project?.root,
       expanded: target.kind === 'root' ? workspaceRootExpanded : target.kind === 'folder' && (!collapsedFolders.has(target.path) || Boolean(search.trim())),
@@ -4872,7 +4901,7 @@
   // execution, including a second event arriving before the next render tick.
   $: {
     void [componentMounted, applicationClosePhase, transition, fileCommandInFlight, opening,
-      documentContextActionInFlight, sidebarActionInFlight, renamingWorkspaceRoot, renamingDocumentId,
+      documentContextActionInFlight, sidebarActionInFlight, renamingWorkspaceRoot, renamingMaterialTarget, renamingDocumentId,
       deleteDocumentTarget, editorReadonly, project, workspaceRootExpanded, collapsedFolders,
       search, documentContextRevealLabel];
     sidebarMenuCapabilities = sidebarContextTarget ? sidebarCapabilitiesFor(sidebarContextTarget) : [];
@@ -4880,14 +4909,14 @@
 
   $: {
     void [visibleWorkspaceFolders, fileRows, visibleMaterials, workspaceRootExpanded,
-      renamingDocumentId, renamingWorkspaceRoot];
+      renamingDocumentId, renamingWorkspaceRoot, renamingMaterialTarget];
     void reconcileSidebarSelection(sidebarSelection, project);
   }
 
   async function reconcileSidebarSelection(expectedKey: string | null, expectedProject: ProjectSnapshot | null): Promise<void> {
     if (!expectedKey || !expectedProject) return;
     await tick();
-    if (sidebarSelection !== expectedKey || renamingDocumentId || renamingWorkspaceRoot ||
+    if (sidebarSelection !== expectedKey || renamingDocumentId || renamingWorkspaceRoot || renamingMaterialTarget ||
       !sidebarScopeIsCurrent({ projectId: expectedProject.project_id, sessionId: expectedProject.session_id }, project)) return;
     // Filtering/collapse can remove the selected row. Leave a Tab entry point
     // without focusing another surface or manufacturing another selection.
@@ -4917,7 +4946,7 @@
 
   async function restoreSidebarFocus(target: CapturedSidebarTarget, trigger: HTMLButtonElement | null, previousIndex = 0): Promise<void> {
     await tick();
-    if (!sidebarScopeIsCurrent(target.scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingDocumentId) return;
+    if (!componentMounted || applicationClosePhase !== 'running' || !sidebarScopeIsCurrent(target.scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
     const buttons = sidebarButtons();
     const row = buttons.find(button => button.dataset.sidebarRow === target.key);
     if (row) { focusSidebarButton(row); return; }
@@ -4990,7 +5019,7 @@
 
   function openSidebarContextMenu(target: CapturedSidebarTarget, trigger: HTMLButtonElement, point: MenuPoint): void {
     if (!trigger.isConnected || !sidebarTargetIsCurrent(target, sidebarLiveState()) ||
-      applicationClosePhase !== 'running' || transition !== 'idle' || renamingWorkspaceRoot || renamingDocumentId || deleteDocumentTarget) return;
+      applicationClosePhase !== 'running' || transition !== 'idle' || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId || deleteDocumentTarget) return;
     closeFormatMenu(false);
     closeDocumentContextMenu(false);
     sidebarSelection = target.key;
@@ -5027,7 +5056,8 @@
     closeDocumentContextMenu(false);
     if (target.kind === 'root' && action === 'rename_label') { await beginWorkspaceLabelRename(target); return; }
     if (target.kind === 'root' && action === 'open') { await doOpenProject(target.bookmark.root); return; }
-    if (target.kind === 'material' && action === 'open') { openMaterial(target.material); return; }
+    if (target.kind === 'material' && action === 'open') { openMaterial(target.materialLease); return; }
+    if (target.kind === 'material' && action === 'rename') { await beginMaterialRename(target); return; }
     sidebarActionInFlight = true;
     try {
       if (action === 'copy_path' && target.displayPath !== null) {
@@ -5053,26 +5083,114 @@
         fileCommandInFlight = true;
         const { projectId, sessionId } = target.scope;
         if (action === 'pin') {
-          const changed = await pinMaterial(projectId, sessionId, target.material.id, !target.material.pinned);
-          if (!sidebarScopeIsCurrent(target.scope, project)) return;
-          if (changed.id !== target.material.id || changed.reference !== target.material.reference ||
-            changed.pinned !== !target.material.pinned) throw new Error('The source pin receipt did not match its captured target.');
+          const changed = await pinMaterial(projectId, sessionId, target.material.id, !target.material.pinned, materialMetadataRevision(target.material));
+          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+          if (!materialSourceIsUnchanged(target.material, changed) || changed.name !== target.material.name || !canEditMaterialMetadata(changed) ||
+            changed.pinned !== !target.material.pinned || changed.metadata_revision === target.material.metadata_revision) throw new Error('The source pin receipt did not match its captured target.');
           if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialChanged(changed);
           else await refreshMaterials();
         } else {
-          await removeMaterial(projectId, sessionId, target.material.id);
-          if (!sidebarScopeIsCurrent(target.scope, project)) return;
+          await removeMaterial(projectId, sessionId, target.material.id, materialMetadataRevision(target.material));
+          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
           if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialRemoved(target.material.id, sessionId);
           else await refreshMaterials();
         }
       }
     } catch (error) {
-      if (sidebarScopeIsCurrent(target.scope, project)) recordFailure(error);
+      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+        recordFailure(error);
+        if (target.kind === 'material' && (action === 'pin' || action === 'remove')) await refreshMaterials();
+      }
     } finally {
       sidebarActionInFlight = false;
       if (target.kind === 'material' && (action === 'pin' || action === 'remove')) fileCommandInFlight = false;
       await restoreSidebarFocus(target, trigger, previousIndex);
     }
+  }
+
+  async function beginMaterialRename(target: MaterialSidebarTarget): Promise<void> {
+    if (!componentMounted || !sidebarTargetIsCurrent(target, sidebarLiveState()) || !canEditMaterialMetadata(target.material)) return;
+    renameMaterialComposition.reset();
+    renamingMaterialTarget = target;
+    renameMaterialName = target.material.name;
+    await tick();
+    if (!componentMounted || renamingMaterialTarget !== target || !sidebarTargetIsCurrent(target, sidebarLiveState())) return;
+    renameMaterialInput?.focus(); renameMaterialInput?.select();
+  }
+
+  function cancelMaterialRename(refocus = true): void {
+    if (renameMaterialInFlight) return;
+    const target = renamingMaterialTarget;
+    renamingMaterialTarget = null;
+    renameMaterialName = '';
+    renameMaterialComposition.reset();
+    if (refocus && target) void restoreSidebarFocus(target, null);
+  }
+
+  async function commitMaterialRename(refocus = true): Promise<void> {
+    const target = renamingMaterialTarget;
+    if (!target || renameMaterialInFlight || renameMaterialComposition.active || !componentMounted ||
+      applicationClosePhase !== 'running' || transition !== 'idle' || opening || fileCommandInFlight) return;
+    if (!sidebarTargetIsCurrent(target, sidebarLiveState())) {
+      recordFailure(new Error('The source changed. Cancel this rename and select the source again.'));
+      return;
+    }
+    const nameError = materialDisplayNameError(renameMaterialName);
+    if (nameError) { recordFailure(new Error(nameError)); return; }
+    if (renameMaterialName === target.material.name) { cancelMaterialRename(refocus); return; }
+    const request = Object.freeze({ ...target.scope, id: target.material.id,
+      expectedMetadataRevision: materialMetadataRevision(target.material), requestId: newUlid(), name: renameMaterialName });
+    renameMaterialInFlight = true; fileCommandInFlight = true;
+    materialRefreshSerial += 1;
+    let succeeded = false;
+    try {
+      const receipt = await renameMaterial(request);
+      if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+      if (!materialRenameReceiptMatches(request, target.material, receipt)) throw new Error('The source rename receipt did not match its captured target.');
+      if (renamingMaterialTarget === target && sidebarTargetIsCurrent(target, sidebarLiveState())) {
+        materialChanged(receipt.material);
+        succeeded = true;
+      } else if (renamingMaterialTarget === target && materialEntries.some(item => sameMaterialObservation(item, receipt.material))) {
+        // A read may already have published this exact acknowledged generation.
+        // Close this owner without replaying a mutation or rebasing its lease.
+        succeeded = true;
+      } else {
+        await refreshMaterials();
+      }
+    } catch (error) {
+      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+        recordFailure(error);
+        await refreshMaterials();
+      }
+    } finally {
+      renameMaterialInFlight = false; fileCommandInFlight = false;
+      if (renamingMaterialTarget === target) {
+        if (succeeded || !componentMounted || !sidebarScopeIsCurrent(target.scope, project) ||
+          !materialEntries.some(item => item.id === target.material.id)) cancelMaterialRename(succeeded && refocus && componentMounted);
+        else {
+          await tick();
+          if (componentMounted && applicationClosePhase === 'running' && renamingMaterialTarget === target && sidebarScopeIsCurrent(target.scope, project)) renameMaterialInput?.focus();
+        }
+      }
+    }
+  }
+
+  function handleMaterialRenameInput(event: Event): void {
+    if (!renameMaterialInput || event.currentTarget !== renameMaterialInput || renameMaterialInFlight) return;
+    renameMaterialName = renameMaterialInput.value;
+  }
+  function handleMaterialRenameCompositionEnd(event: CompositionEvent): void {
+    if (!renameMaterialInput || event.currentTarget !== renameMaterialInput || renameMaterialInFlight) return;
+    const commitAfterBlur = renameMaterialComposition.finish();
+    handleMaterialRenameInput(event);
+    if (commitAfterBlur) void commitMaterialRename(false);
+  }
+  function handleMaterialRenameKeydown(event: KeyboardEvent): void {
+    if (event.currentTarget !== renameMaterialInput) return;
+    handleInlineRenameKey(event, renameMaterialComposition, () => void commitMaterialRename(), () => cancelMaterialRename());
+  }
+  function handleMaterialRenameBlur(event: FocusEvent): void {
+    if (event.currentTarget === renameMaterialInput && !renameMaterialInFlight && renameMaterialComposition.blurShouldCommit()) void commitMaterialRename(false);
   }
 
   async function beginWorkspaceLabelRename(target: RootSidebarTarget): Promise<void> {
@@ -5112,12 +5230,14 @@
   }
 
   function handleWorkspaceRenameInput(event: Event): void {
+    if (event.currentTarget !== renameWorkspaceInput) return;
     const input = event.currentTarget as HTMLInputElement;
     renameWorkspaceTitle = renameWorkspaceComposition.active ? input.value : boundedDocumentTitleInput(input.value);
     if (!renameWorkspaceComposition.active && input.value !== renameWorkspaceTitle) input.value = renameWorkspaceTitle;
   }
 
   function handleWorkspaceRenameCompositionEnd(event: CompositionEvent): void {
+    if (event.currentTarget !== renameWorkspaceInput) return;
     const commitAfterBlur = renameWorkspaceComposition.finish();
     handleWorkspaceRenameInput(event);
     if (commitAfterBlur && event.currentTarget === renameWorkspaceInput) commitWorkspaceLabelRename(false);
@@ -5146,7 +5266,7 @@
     documentContextFocusIndex = 0;
     if (!refocus) return;
     void tick().then(() => {
-      if (!scope || !sidebarScopeIsCurrent(scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingDocumentId) return;
+      if (!scope || !sidebarScopeIsCurrent(scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
       if (focusConnectedControl(trigger)) return;
       if (focusConnectedControl(outlineToggle)) return;
       focusCurrentWritingSurfaceAtEnd();
@@ -5330,14 +5450,17 @@
   }
 
   function handleDocumentRenameInput(event: Event): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     synchronizeDocumentRenameTitle(event.currentTarget as HTMLInputElement);
   }
 
-  function handleDocumentRenameCompositionStart(): void {
+  function handleDocumentRenameCompositionStart(event: CompositionEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     renameDocumentComposition.start();
   }
 
   function handleDocumentRenameCompositionEnd(event: CompositionEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     const input = event.currentTarget as HTMLInputElement;
     const commitAfterBlur = renameDocumentComposition.finish();
     synchronizeDocumentRenameTitle(input);
@@ -5349,7 +5472,8 @@
     ) void commitDocumentRename(false);
   }
 
-  function handleDocumentRenameBlur(): void {
+  function handleDocumentRenameBlur(event: FocusEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     if (renameDocumentInFlight || !renameDocumentComposition.blurShouldCommit()) return;
     void commitDocumentRename(false);
   }
@@ -5365,7 +5489,7 @@
     renameDocumentEditorLocked = false;
     renameDocumentComposition.reset();
     if (refocus) void tick().then(() => {
-      if (!target || !capturedDocumentBelongsToSession(target, project) || sidebarContextTarget || renamingDocumentId || renamingWorkspaceRoot) return;
+      if (!target || !capturedDocumentBelongsToSession(target, project) || sidebarContextTarget || renamingDocumentId || renamingWorkspaceRoot || renamingMaterialTarget) return;
       const row = Array.from(
         window.document.querySelectorAll<HTMLButtonElement>('[data-document-row]')
       ).find((candidate) => candidate.dataset.documentRow === documentId);
@@ -5431,6 +5555,7 @@
   }
 
   function handleDocumentRenameKeydown(event: KeyboardEvent): void {
+    if (event.currentTarget !== renameDocumentInput) return;
     handleInlineRenameKey(event, renameDocumentComposition, () => void commitDocumentRename(true), () => cancelDocumentRename());
   }
 
@@ -8570,7 +8695,7 @@
     if (!shouldCaptureFormatMenuEscape(event, {
       formatMenuOpen: formatMenu?.isOpen() ?? false,
       compositionActive,
-      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null || renamingWorkspaceRoot !== null,
+      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null || renamingWorkspaceRoot !== null || renamingMaterialTarget !== null,
       documentMenuOwnsEscape: sidebarContextTarget !== null,
       modelManagerOwnsEscape: modelManagerOpen
     })) return;
@@ -10248,13 +10373,13 @@
               {@const target = captureSidebarTarget(project, { kind: 'root', bookmark: folder })}
               {#if renamingWorkspaceRoot?.bookmark === folder}
                 <div class="folder-row workspace-root editing workspace-label-edit" data-copy-folder={active ? '' : undefined}>
-                  <input bind:this={renameWorkspaceInput} bind:value={renameWorkspaceTitle} type="text" maxlength="256"
+                  <input bind:this={renameWorkspaceInput} value={renameWorkspaceTitle} type="text" maxlength="256"
                     aria-label={`Sidebar label for ${target.title}`} title={folder.root}
                     on:input={handleWorkspaceRenameInput}
-                    on:compositionstart={() => renameWorkspaceComposition.start()}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameWorkspaceInput) renameWorkspaceComposition.start(); }}
                     on:compositionend={handleWorkspaceRenameCompositionEnd}
-                    on:keydown={(event) => handleInlineRenameKey(event, renameWorkspaceComposition, () => commitWorkspaceLabelRename(), () => cancelWorkspaceLabelRename())}
-                    on:blur={() => { if (renameWorkspaceComposition.blurShouldCommit()) commitWorkspaceLabelRename(false); }} />
+                    on:keydown={(event) => { if (event.currentTarget === renameWorkspaceInput) handleInlineRenameKey(event, renameWorkspaceComposition, () => commitWorkspaceLabelRename(), () => cancelWorkspaceLabelRename()); }}
+                    on:blur={(event) => { if (event.currentTarget === renameWorkspaceInput && renameWorkspaceComposition.blurShouldCommit()) commitWorkspaceLabelRename(false); }} />
                 </div>
               {:else}
                 <button class="folder-row workspace-root" class:selected={sidebarSelection === target.key}
@@ -10290,6 +10415,16 @@
               </button>
             {:else if 'material' in row}
               {@const target = captureSidebarTarget(project, { kind: 'material', material: row.material })}
+              {#if renamingMaterialTarget?.key === target.key}
+                <div class="folder-row material-row editing" style={`padding-left: ${8 + row.depth * 14}px`}>
+                  <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
+                    aria-label={`Rename ${target.title}`} title={target.displayPath ?? target.title} disabled={renameMaterialInFlight}
+                    on:input={handleMaterialRenameInput}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameMaterialInput) renameMaterialComposition.start(); }}
+                    on:compositionend={handleMaterialRenameCompositionEnd} on:keydown={handleMaterialRenameKeydown}
+                    on:blur={handleMaterialRenameBlur} />
+                </div>
+              {:else}
               <button class="folder-row material-row" class:selected={sidebarSelection === target.key} class:active={activeMaterial?.id === row.material.id}
                 type="button" title={target.displayPath ?? row.material.reference} data-sidebar-row={target.key} data-sidebar-kind="material" data-sidebar-parent={sidebarParentKey(row.path)}
                 aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined}
@@ -10299,13 +10434,14 @@
                 on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
                 <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
+              {/if}
             {:else}
             {@const candidate = row.document}
             {@const target = captureSidebarTarget(project, { kind: 'document', summary: candidate })}
             {#if renamingDocumentId === candidate.document_id}
               <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
                 <span class="document-label">
-                  <input bind:this={renameDocumentInput} bind:value={renameDocumentTitle} type="text" maxlength="256"
+                  <input bind:this={renameDocumentInput} value={renameDocumentTitle} type="text" maxlength="256"
                     aria-label={`Rename ${candidate.title}`} title={target.displayPath ?? undefined} disabled={renameDocumentInFlight}
                     on:input={handleDocumentRenameInput} on:compositionstart={handleDocumentRenameCompositionStart}
                     on:compositionend={handleDocumentRenameCompositionEnd} on:keydown={handleDocumentRenameKeydown} on:blur={handleDocumentRenameBlur} />
@@ -10339,6 +10475,16 @@
           {/each}
           {#each visibleMaterials as item (item.id)}
             {@const target = captureSidebarTarget(project, { kind: 'material', material: item })}
+              {#if renamingMaterialTarget?.key === target.key}
+                <div class="folder-row material-row editing">
+                  <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
+                    aria-label={`Rename ${target.title}`} title={target.displayPath ?? target.title} disabled={renameMaterialInFlight}
+                    on:input={handleMaterialRenameInput}
+                    on:compositionstart={(event) => { if (event.currentTarget === renameMaterialInput) renameMaterialComposition.start(); }}
+                    on:compositionend={handleMaterialRenameCompositionEnd} on:keydown={handleMaterialRenameKeydown}
+                    on:blur={handleMaterialRenameBlur} />
+                </div>
+              {:else}
             <button class="folder-row material-row" class:selected={sidebarSelection === target.key} class:active={activeMaterial?.id === item.id}
               type="button" title={target.displayPath ?? item.reference} data-sidebar-row={target.key} data-sidebar-kind="material" data-sidebar-parent={sidebarParentKey()}
               aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
@@ -10347,6 +10493,7 @@
               on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
             </button>
+              {/if}
           {/each}
             </div>
             {/if}

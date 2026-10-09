@@ -5,6 +5,7 @@ const COMMANDS: &[&str] = &[
     "material_read_evidence",
     "material_bind_attachment",
     "material_set_pinned",
+    "material_rename",
     "material_remove",
     "material_add_library",
     "material_add_library_path",

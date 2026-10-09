@@ -1024,10 +1024,15 @@ export function addLibraryMaterial(projectId: string, sessionId: string): Promis
 export function addLibraryMaterialPath(projectId: string, sessionId: string, path: string): Promise<import('./materials').MaterialEntry> {
   return call('material_add_library_path', { projectId, sessionId, path });
 }
-export function pinMaterial(projectId: string, sessionId: string, materialId: string, pinned: boolean): Promise<import('./materials').MaterialEntry> {
-  return call('material_set_pinned', { projectId, sessionId, id: materialId, pinned });
+export function pinMaterial(projectId: string, sessionId: string, materialId: string, pinned: boolean, expectedMetadataRevision: string): Promise<import('./materials').MaterialEntry> {
+  return call('material_set_pinned', { projectId, sessionId, id: materialId, pinned, expectedMetadataRevision });
 }
 
-export function removeMaterial(projectId: string, sessionId: string, materialId: string): Promise<void> {
-  return call('material_remove', { projectId, sessionId, id: materialId });
+export function removeMaterial(projectId: string, sessionId: string, materialId: string, expectedMetadataRevision: string): Promise<void> {
+  return call('material_remove', { projectId, sessionId, id: materialId, expectedMetadataRevision });
+}
+
+/** Metadata-only rename. No source path or document write enters this command. */
+export function renameMaterial(request: import('./materialMetadata').MaterialRenameRequest): Promise<import('./materialMetadata').MaterialRenameReceipt> {
+  return call('material_rename', { ...request });
 }

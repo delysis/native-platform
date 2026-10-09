@@ -26,6 +26,7 @@ use crate::context_attachments::{self, ContextAttachmentPresentation};
 
 mod folders;
 mod grants;
+mod metadata;
 pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
 pub(crate) use grants::{forget_selected_grant, persist_selected_grant, restore_selected_grants};
 
@@ -98,6 +99,10 @@ pub(crate) struct MaterialEntry {
     pub(crate) attachment_id: Option<String>,
     #[serde(default)]
     pub(crate) workspace_path: Option<String>,
+    /// Native observation of mutable binding metadata, never source authority.
+    /// Absent on immutable admissions and synthetic folder representations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -287,7 +292,7 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
     Ok(MaterialEntry {
         id: binding.id.clone(),
         name: binding.name.clone(),
-        reference: reference(&qualified(binding))?,
+        reference: reference(&binding.id)?,
         kind,
         retention: binding.retention,
         pinned: binding.pinned,
@@ -295,9 +300,33 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
         source_path,
         attachment_id,
         workspace_path: binding.workspace_path.clone(),
+        metadata_revision: None,
     })
 }
 
+/// Observe one complete metadata generation for all rows. The revision is not
+/// stored in the current schema or copied into retained source evidence.
+#[cfg(unix)]
+pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
+    let _lock = WRITE_LOCK
+        .lock()
+        .map_err(|_| invalid("material write lock poisoned"))?;
+    let Some(snapshot) = metadata::Snapshot::open(store.root())? else {
+        return Ok(Vec::new());
+    };
+    let bindings = decode_bindings(&snapshot.bytes)?;
+    bindings
+        .items
+        .iter()
+        .map(|binding| {
+            let mut material = entry(store, binding)?;
+            material.metadata_revision = Some(snapshot.revision.clone());
+            Ok(material)
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
 pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
     read_bindings(store)?
         .items
@@ -305,6 +334,83 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
         .map(|binding| entry(store, binding))
         .collect()
 }
+
+pub(crate) fn observed_entry(store: &ProjectStore, id: &str) -> Result<MaterialEntry> {
+    list(store)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| MaterialError::NotFound(id.into()))
+}
+
+/// Only mutable registration metadata is in this owner's authority. In
+/// particular, Rename is a display name, not a source/file/placement move.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MetadataChange<'a> {
+    Rename(&'a str),
+    Pin(bool),
+    Remove,
+}
+
+/// Compare an observed native generation under the same lock as every binding
+/// writer. Retries with an obsolete observation fail closed; no intent is
+/// silently rebased onto a replaced/re-added source or replayed after relaunch.
+pub(crate) fn change_metadata(
+    store: &ProjectStore,
+    id: &str,
+    expected_revision: &str,
+    change: MetadataChange<'_>,
+) -> Result<Option<MaterialEntry>> {
+    if !is_material_id(id) || !valid_hash(expected_revision) {
+        return Err(invalid("invalid material metadata target"));
+    }
+    if let MetadataChange::Rename(name) = &change {
+        validate_name(name)?;
+    }
+    let _lock = WRITE_LOCK
+        .lock()
+        .map_err(|_| invalid("material write lock poisoned"))?;
+    let snapshot = metadata::Snapshot::open(store.root())?
+        .ok_or_else(|| MaterialError::NotFound(id.into()))?;
+    if snapshot.revision != expected_revision {
+        return Err(invalid(
+            "material metadata changed; select the source again",
+        ));
+    }
+    let mut bindings = decode_bindings(&snapshot.bytes)?;
+    let index = bindings
+        .items
+        .iter()
+        .position(|binding| binding.id == id)
+        .ok_or_else(|| MaterialError::NotFound(id.into()))?;
+    let removed = matches!(change, MetadataChange::Remove);
+    match change {
+        MetadataChange::Rename(name) => bindings.items[index].name = name.into(),
+        MetadataChange::Pin(pinned) => bindings.items[index].pinned = pinned,
+        MetadataChange::Remove => {
+            bindings.items.remove(index);
+        }
+    }
+    // Serialize/validate before touching disk. A duplicate display name is legal:
+    // name-only lookup stays ambiguous; full-id links remain exact.
+    let bytes = serde_json::to_vec(&bindings)?;
+    let committed = if bytes == snapshot.bytes {
+        snapshot.ensure_current(store.root())?;
+        snapshot
+    } else {
+        snapshot.replace(store.root(), &bytes)?
+    };
+    if removed {
+        grants()
+            .lock()
+            .map_err(|_| invalid("library capability lock poisoned"))?
+            .remove(&grant_key(store, id));
+        return Ok(None);
+    }
+    let mut result = entry(store, &bindings.items[index])?;
+    result.metadata_revision = Some(committed.revision);
+    Ok(Some(result))
+}
+
 pub(crate) fn is_material_id(name: &str) -> bool {
     name.strip_prefix("material-").is_some_and(valid_hash)
 }
@@ -583,21 +689,17 @@ pub(crate) fn add_library_persisted(
     Ok(entry)
 }
 
+#[cfg(test)]
 pub(crate) fn set_pinned(store: &ProjectStore, id: &str, pinned: bool) -> Result<MaterialEntry> {
-    let _lock = WRITE_LOCK
-        .lock()
-        .map_err(|_| invalid("material write lock poisoned"))?;
-    let mut bindings = read_bindings(store)?;
-    let binding = bindings
-        .items
-        .iter_mut()
-        .find(|b| b.id == id)
-        .ok_or_else(|| MaterialError::NotFound(id.into()))?;
-    binding.pinned = pinned;
-    let result = entry(store, binding)?;
-    write_bindings(store, &bindings)?;
-    Ok(result)
+    let observed = observed_entry(store, id)?;
+    let revision = observed
+        .metadata_revision
+        .as_deref()
+        .ok_or_else(|| invalid("material metadata mutation is unsupported on this platform"))?;
+    change_metadata(store, id, revision, MetadataChange::Pin(pinned))?
+        .ok_or_else(|| invalid("pin returned no material"))
 }
+
 pub(crate) fn remove(store: &ProjectStore, id: &str) -> Result<()> {
     let _lock = WRITE_LOCK
         .lock()
@@ -1042,7 +1144,11 @@ fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
         }
         Err(e) => return Err(e),
     };
-    let bindings: Bindings = serde_json::from_slice(&bytes)?;
+    decode_bindings(&bytes)
+}
+
+fn decode_bindings(bytes: &[u8]) -> Result<Bindings> {
+    let bindings: Bindings = serde_json::from_slice(bytes)?;
     if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
         return Err(invalid("unsupported material bindings"));
     }
@@ -1465,3 +1571,7 @@ mod tests {
         assert!(read_evidence(&store, &entry.id, &evidence.id).is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "materials/rename_tests.rs"]
+mod rename_tests;

@@ -45,7 +45,7 @@ async function context(row: HTMLElement): Promise<MouseEvent> {
   await expect.element(page.getByRole('menu')).toBeVisible();
   return event;
 }
-async function setup(emptyProject = false) {
+async function setup(emptyProject = false, placement: string | null = 'Notes/Paper.pdf', allowedDraft: string | null = null) {
   oldStorage = Object.entries(localStorage); localStorage.clear();
   localStorage.setItem(KEY, JSON.stringify([{ root: activeRoot, title: activeRoot }, { root: missingRoot, title: missingRoot }]));
   oldNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
@@ -56,8 +56,9 @@ async function setup(emptyProject = false) {
     revision_id: 'revision-1', active_blob_id: blob, word_count: 2, externally_modified: false }, text, visible_blob_id: blob, transient_draft: null };
   const project: ProjectSnapshot = { project_id: 'project-1', session_id: 'session-1', root: activeRoot, title: 'writing',
     schema_version: 4, documents: emptyProject ? [] : [opened.summary], pending_recovery: 0 };
-  const materials: MaterialEntry[] = [{ id: 'paper', name: 'Paper.pdf', reference: 'Paper.pdf', kind: 'attachment',
-    pinned: false, available: true, source_path: '/external/Paper.pdf', workspace_path: 'Notes/Paper.pdf', attachment_id: 'b'.repeat(64) }];
+  const materials: MaterialEntry[] = [{ id: 'material-' + 'a'.repeat(64), name: 'Paper.pdf', reference: '@"material-' + 'a'.repeat(64) + '"', kind: 'attachment', retention: 'ordinary',
+    pinned: false, available: true, source_path: '/external/Paper.pdf', workspace_path: placement, attachment_id: 'b'.repeat(64), metadata_revision: 'd'.repeat(64) }];
+  let draftVersion = 0;
   const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
   transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
     calls.push({ command, args });
@@ -72,15 +73,36 @@ async function setup(emptyProject = false) {
       case 'plugin:loom|build_model_policy_get': return null;
       case 'plugin:loom|model_catalog_list': case 'plugin:loom|model_list': case 'plugin:loom|model_download_list':
       case 'plugin:loom|co_writer_list': case 'plugin:loom|terminal_list': return [];
-      case 'plugin:loom|material_list': return materials;
+      case 'plugin:loom|material_list': return materials.map(item => ({ ...item }));
+      case 'plugin:loom|material_read': return { material: { ...materials[0] }, text: 'Retained source text', complete: true, warnings: [], source_revision: 'source-revision', evidence: [], presentation: null };
+      case 'plugin:loom|material_remove': {
+        expect(args.id).toBe(materials[0].id); expect(args.expectedMetadataRevision).toBe(materials[0].metadata_revision);
+        materials.splice(0, 1); return;
+      }
+      case 'plugin:loom|material_rename': {
+        expect(args.projectId).toBe(project.project_id); expect(args.sessionId).toBe(project.session_id);
+        expect(args.id).toBe(materials[0].id); expect(args.expectedMetadataRevision).toBe(materials[0].metadata_revision);
+        const previous = materials[0];
+        materials[0] = { ...previous, name: String(args.name), metadata_revision: 'e'.repeat(64) };
+        return { project_id: project.project_id, session_id: project.session_id, request_id: args.requestId,
+          expected_metadata_revision: args.expectedMetadataRevision, material: materials[0] };
+      }
       case 'plugin:loom|inference_status': return { suggestions: null };
       case 'plugin:loom|completion_snapshot': return { project_id: project.project_id, session_id: project.session_id,
         document_id: opened.summary.document_id, branches: [], active_operations: [], next_cursor: null, has_more: false };
       case 'plugin:loom|suggestions_set': case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|project_prepare_open_path': throw { code: 'selected_folder_unavailable', message: 'Selected folder is unavailable' };
-      // A dirty-editor test may journal independently on its existing timer; do
-      // not fabricate a receipt. Keep it pending until component disposal.
-      case 'plugin:loom|document_draft_upsert': return new Promise(() => {});
+      // Existing dirty-editor cases keep timer-driven persistence pending. Only
+      // the exact authorized edit below receives a mock transport receipt.
+      case 'plugin:loom|document_draft_upsert': {
+        if (allowedDraft === null) return new Promise(() => {});
+        // Same exact-byte draft transport fixture as appCompletion.browser.test.
+        // It journals only the explicitly authorized user edit, never a rename.
+        expect(args.text).toBe(allowedDraft); expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
+        const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(allowedDraft))), byte => byte.toString(16).padStart(2, '0')).join('');
+        return { document_id: args.documentId, source_revision_id: args.sourceRevisionId, blob_id: hash,
+          version: String(++draftVersion), kind: args.kind, updated_at_unix_ms: Date.now(), replayed: false };
+      }
       default: throw new Error(`Unexpected native operation: ${command}`);
     }
   });
@@ -91,7 +113,7 @@ async function setup(emptyProject = false) {
     await expect.element(page.getByRole('textbox', { name: 'Message', exact: true })).toBeVisible();
   }
   await page.getByRole('button', { name: 'Open manuscript outline', exact: true }).click();
-  return { calls, project, opened };
+  return { calls, project, opened, materials };
 }
 
 it('missing bookmark has readable disambiguated names, exact path tooltip and a handled remove menu without native calls', async () => {
@@ -204,4 +226,68 @@ it('an empty active project still exposes remembered roots for removal without o
   await page.getByRole('menuitem', { name: 'Remove from Sidebar', exact: true }).click();
   await expect.poll(() => rootRow(missingRoot)).toBeUndefined();
   expect(calls.some(call => /project_prepare|project_close|document_delete/.test(call.command))).toBe(false);
+});
+
+
+it.each(['Notes/Paper.pdf', null])('material display rename works in placement %s without changing editor, chat, source path or full ID', async placement => {
+  const { calls, materials } = await setup(false, placement, 'Original manuscript plus exact unsaved words');
+  const before = { ...materials[0] }, editor = document.querySelector<HTMLElement>('.ProseMirror')!;
+  const composer = page.getByRole('textbox', { name: 'Message', exact: true });
+  const composerElement = composer.element(); await composer.fill('Unsent café 🦉 chat');
+  // Wait for the existing editor's mount/caret lifecycle before making real input.
+  await tick(); await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  editor.focus(); await userEvent.keyboard('{End} plus exact unsaved words');
+  await expect.poll(() => editor.textContent).toContain('plus exact unsaved words');
+  const exactText = editor.textContent;
+  await expect.poll(() => document.querySelector('[data-sidebar-kind="material"]')).not.toBeNull();
+  const row = document.querySelector<HTMLButtonElement>('[data-sidebar-kind="material"]')!;
+  await context(row); await page.getByRole('menuitem', { name: 'Rename…', exact: true }).click();
+  const field = page.getByRole('textbox', { name: 'Rename Paper.pdf', exact: true });
+  await expect.element(field).toHaveFocus(); const input = field.element() as HTMLInputElement;
+  expect(input.selectionStart).toBe(0); expect(input.selectionEnd).toBe(input.value.length);
+  const name = '  café 🦉 / display name  '; await field.fill(name); key(input, 'Enter');
+  await expect.poll(() => materials[0].name).toBe(name);
+  await expect.poll(() => document.querySelector('.material-row.editing input')).toBeNull();
+  expect(document.querySelector('.ProseMirror')).toBe(editor); expect(editor.textContent).toBe(exactText);
+  expect(composer.element()).toBe(composerElement); await expect.element(composer).toHaveValue('Unsent café 🦉 chat');
+  expect(materials[0].id).toBe(before.id); expect(materials[0].reference).toBe(before.reference);
+  expect(materials[0].workspace_path).toBe(before.workspace_path); expect(materials[0].attachment_id).toBe(before.attachment_id);
+  const renames = calls.filter(call => call.command === 'plugin:loom|material_rename'); expect(renames).toHaveLength(1);
+  expect(renames[0].args.name).toBe(name);
+  expect(calls.some(call => /document_(rename|checkpoint|delete)|workspace_copy_files|project_(close|commit_open)/.test(call.command))).toBe(false);
+});
+
+it('material IME blur waits for compositionend; Escape cancels without a native mutation', async () => {
+  const { calls, materials } = await setup();
+  await expect.poll(() => document.querySelector('[data-sidebar-kind="material"]')).not.toBeNull();
+  key(document.querySelector<HTMLElement>('[data-sidebar-kind="material"]')!, 'F2');
+  const field = page.getByRole('textbox', { name: 'Rename Paper.pdf', exact: true }); await expect.element(field).toHaveFocus();
+  let input = field.element() as HTMLInputElement;
+  await field.fill('not committed'); key(input, 'Escape'); await tick();
+  expect(calls.some(call => call.command === 'plugin:loom|material_rename')).toBe(false);
+  key(document.querySelector<HTMLElement>('[data-sidebar-kind="material"]')!, 'Enter'); await expect.element(field).toHaveFocus();
+  input = field.element() as HTMLInputElement;
+  input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+  input.value = '途中'; input.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true }));
+  expect(key(input, 'Enter', { keyCode: 229 }).defaultPrevented).toBe(false); input.dispatchEvent(new FocusEvent('blur'));
+  await tick(); expect(calls.some(call => call.command === 'plugin:loom|material_rename')).toBe(false);
+  input.value = '完成'; input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '完成' }));
+  await expect.poll(() => materials[0].name).toBe('完成');
+  expect(calls.filter(call => call.command === 'plugin:loom|material_rename')).toHaveLength(1);
+});
+
+it('removing a source opened through its sidebar row closes that same source view', async () => {
+  const { calls, materials } = await setup();
+  const before = { ...materials[0] };
+  const row = document.querySelector<HTMLButtonElement>('[data-sidebar-kind="material"]')!;
+  await context(row); await page.getByRole('menuitem', { name: 'Open', exact: true }).click();
+  await expect.element(page.getByRole('region', { name: 'Paper.pdf', exact: true })).toBeVisible();
+  await userEvent.click(document.querySelector<HTMLElement>('.material-view summary[aria-label="Source actions"]')!);
+  await page.getByRole('button', { name: 'Remove from workspace', exact: true }).click();
+  await expect.poll(() => document.querySelector('.material-view')).toBeNull();
+  await expect.poll(() => document.querySelector('[data-sidebar-kind="material"]')).toBeNull();
+  const removed = calls.filter(call => call.command === 'plugin:loom|material_remove');
+  expect(removed).toHaveLength(1); expect(removed[0].args.id).toBe(before.id);
+  expect(removed[0].args.expectedMetadataRevision).toBe(before.metadata_revision);
+  expect(calls.some(call => /document_(rename|checkpoint|delete)|workspace_copy_files/.test(call.command))).toBe(false);
 });

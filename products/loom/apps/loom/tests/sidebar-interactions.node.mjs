@@ -22,7 +22,7 @@ function transpile(text, fileName) {
   assert.deepEqual(errors.map(item => ts.flattenDiagnosticMessageText(item.messageText, '\n')), [], fileName);
   return result.outputText;
 }
-function productionLoader(mutate = (_path, text) => text) {
+function productionLoader(mutate = (_path, text) => text, externals = {}) {
   const cache = new Map();
   const load = path => {
     path = resolve(path);
@@ -31,6 +31,7 @@ function productionLoader(mutate = (_path, text) => text) {
     const module = { exports: {} }; cache.set(path, module);
     const text = mutate(path, readFileSync(path, 'utf8'));
     const localRequire = name => {
+      if (Object.hasOwn(externals, name)) return externals[name];
       assert(name.startsWith('.'), `Unexpected runtime dependency: ${name}`);
       return load(resolve(dirname(path), `${name}.ts`));
     };
@@ -46,6 +47,7 @@ const primitives = load('interactionPrimitives');
 const editing = load('textEditingInteractions');
 const documents = load('documentContextActions');
 const tree = load('workspaceTree');
+const metadata = load('materialMetadata');
 
 /** No rewritten handler logic: function declarations come from the current App. */
 function handlers(file, names, bindings, mutate = text => text) {
@@ -77,7 +79,7 @@ const project = () => ({ project_id: 'project', session_id: 'session', root: '/w
 const bookmark = root => Object.freeze({ root, title: root });
 const material = overrides => ({ id: 'material-a', name: 'Paper', reference: 'Paper.pdf', kind: 'attachment',
   source_path: '/external/Paper.pdf', workspace_path: null, attachment_id: 'b'.repeat(64),
-  pinned: false, available: true, retention: 'ordinary', ...overrides });
+  pinned: false, available: true, retention: 'ordinary', metadata_revision: 'a'.repeat(64), ...overrides });
 const policy = { idle: true, editable: true, activeRoot: false, expanded: false, revealLabel: 'Reveal in Finder', searching: false };
 function targets(p = project(), b = bookmark('/missing/writing'), m = material({})) {
   return [sidebar.captureSidebarTarget(p, { kind: 'root', bookmark: b }),
@@ -106,25 +108,30 @@ const appNames = [
   'beginWorkspaceLabelRename', 'cancelWorkspaceLabelRename', 'commitWorkspaceLabelRename',
   'handleWorkspaceRenameInput', 'handleWorkspaceRenameCompositionEnd',
   'closeDocumentContextMenu', 'documentContextMenuItems', 'focusDocumentContextMenu', 'handleDocumentContextMenuKeydown',
-  'doOpenProject'
+  'doOpenProject', 'beginMaterialRename', 'cancelMaterialRename', 'commitMaterialRename',
+  'handleMaterialRenameInput', 'handleMaterialRenameCompositionEnd', 'handleMaterialRenameKeydown', 'handleMaterialRenameBlur'
 ];
 function app(overrides = {}, mutate) {
   const errors = [], calls = [], writes = [], announcements = [];
   const p = project(), root = bookmark(p.root), missing = bookmark('/private/var/folders/gone/writing');
   const outline = new Control(), input = new Control();
   const props = {
-    ...folders, ...sidebar, ...editing, ...documents,
+    ...folders, ...sidebar, ...editing, ...documents, ...metadata, ...primitives,
     project: p, document: { summary: p.documents[0], text: 'unsaved manuscript', visible_blob_id: summary.active_blob_id },
     documentText: 'unsaved manuscript', saveState: 'dirty',
     workspaceFolders: [root, missing], fileRows: tree.workspaceRows(p.documents, new Set(), ''), materialEntries: [],
     componentMounted: true, applicationClosePhase: 'running', transition: 'idle', fileCommandInFlight: false,
     opening: false, documentContextActionInFlight: false, sidebarActionInFlight: false,
-    renamingWorkspaceRoot: null, renamingDocumentId: null, deleteDocumentTarget: null, editorReadonly: false,
+    renamingWorkspaceRoot: null, renamingMaterialTarget: null, renamingDocumentId: null, deleteDocumentTarget: null, editorReadonly: false,
     workspaceRootExpanded: true, collapsedFolders: new Set(), search: '', documentContextRevealLabel: 'Reveal in Finder',
     sidebarContextTarget: null, sidebarSelection: null, documentContextTarget: null, documentContextTrigger: null,
     documentContextPoint: { x: 0, y: 0 }, documentContextFocusIndex: 0, documentContextMenu: new Control(),
     outlineElement: outline, outlineToggle: new Control(),
     renameWorkspaceComposition: primitives.createRenameCompositionGuard(), renameWorkspaceTitle: '', renameWorkspaceInput: input,
+    renameMaterialName: '', renameMaterialInput: input, renameMaterialInFlight: false,
+    renameMaterialComposition: primitives.createRenameCompositionGuard(), materialRefreshSerial: 0,
+    newUlid: () => '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    renameMaterial: async () => { throw new Error('Unexpected rename'); },
     Element: Control, tick: pause,
     window: { localStorage: { setItem: (key, value) => writes.push({ key, value }) }, innerWidth: 1200, innerHeight: 800 },
     navigator: { clipboard: { writeText: async text => calls.push(['clipboard', text]) } },
@@ -133,7 +140,7 @@ function app(overrides = {}, mutate) {
     focusCurrentWritingSurfaceAtEnd: () => calls.push(['focus-editor']),
     announce: text => announcements.push(text), recordFailure: error => errors.push(error),
     materialReferenceMarkdown: m => m.reference,
-    pinMaterial: async (...args) => { calls.push(['pin', ...args]); return { ...props.materialEntries[0], pinned: args[3] }; },
+    pinMaterial: async (...args) => { calls.push(['pin', ...args]); return { ...props.materialEntries[0], pinned: args[3], metadata_revision: 'b'.repeat(64) }; },
     removeMaterial: async (...args) => { calls.push(['remove-source', ...args]); },
     materialRemoved: (...args) => calls.push(['project-source-removal', ...args]), materialChanged: m => calls.push(['project-pin', m]),
     refreshMaterials: async () => calls.push(['refresh-materials']), openMaterial: m => calls.push(['open-material', m]),
@@ -387,7 +394,7 @@ test('real App material mutation uses only native session/id, serializes awaits 
   await a.executeSidebarCapability(capability(selectTarget(a), 'forget'), null); assert.deepEqual(a.writes, []);
   a.state.project = { ...a.state.project, session_id: 'replacement' };
   pending.resolve({ ...m, pinned: true }); await operation;
-  assert.deepEqual(calls, [['project', 'session', m.id, true]]); assert.deepEqual(a.calls, []);
+  assert.deepEqual(calls, [['project', 'session', m.id, true, m.metadata_revision]]); assert.deepEqual(a.calls, []);
   assert.equal(a.state.fileCommandInFlight, false); assert.equal(a.state.sidebarActionInFlight, false);
 });
 test('real App material remove receipt refreshes instead of deleting a replacement row with the same id', async () => {
@@ -493,4 +500,344 @@ test('real App reports explicit-open bookmark persistence failures after navigat
     assert.equal(instance.state.workspaceFolders.length, remember ? 1 : 0);
     assert.equal(instance.state.project, p);
   }
+});
+
+
+// Continuation: metadata transactions and target/renderer lifetimes. These invoke
+// the real production handlers, not an imitation of their decision rules.
+function renameReceipt(request, before, fields = {}) {
+  return { project_id: request.projectId, session_id: request.sessionId, request_id: request.requestId,
+    expected_metadata_revision: request.expectedMetadataRevision,
+    material: { ...before, name: request.name, metadata_revision: 'c'.repeat(64) }, ...fields };
+}
+test('material metadata names retain exact UTF-8 and are never interpreted as paths', () => {
+  for (const name of ['  café 🦉  ', '../a/b', '@"someone"', '界'.repeat(170)]) {
+    assert.equal(metadata.materialDisplayNameError(name), null);
+  }
+  for (const name of ['', '  ', 'a\n', '\0', '界'.repeat(171)]) assert(metadata.materialDisplayNameError(name));
+  for (const m of [material({ metadata_revision: null }), material({ kind: 'folder' }), material({ retention: 'protected' })]) {
+    assert.equal(metadata.canEditMaterialMetadata(m), false);
+    assert.throws(() => metadata.materialMetadataRevision(m));
+    assert.equal(capability(targets(project(), bookmark('/root'), m)[3], 'rename').enabled, false);
+  }
+});
+test('every receipt dimension is checked; mutable labels cannot substitute source authority', () => {
+  const before = material({}), request = { projectId: 'p', sessionId: 's', id: before.id,
+    expectedMetadataRevision: before.metadata_revision, requestId: 'r', name: 'Renamed' };
+  const receipt = renameReceipt(request, before);
+  assert(metadata.materialRenameReceiptMatches(request, before, receipt));
+  for (const key of ['project_id', 'session_id', 'request_id', 'expected_metadata_revision']) {
+    assert.equal(metadata.materialRenameReceiptMatches(request, before, { ...receipt, [key]: 'wrong' }), false, key);
+  }
+  const badFields = { id: 'replacement', reference: '@"replacement"', name: 'different', kind: 'library',
+    source_path: '/elsewhere', attachment_id: 'd'.repeat(64), workspace_path: 'moved/a',
+    retention: 'protected', pinned: true, available: false, metadata_revision: before.metadata_revision };
+  for (const [key, value] of Object.entries(badFields)) {
+    assert.equal(metadata.materialRenameReceiptMatches(request, before,
+      { ...receipt, material: { ...receipt.material, [key]: value } }), false, key);
+  }
+});
+test('real App source rename captures native metadata generation and keeps dirty text and chat drafts untouched', async () => {
+  const before = material({ workspace_path: 'Notes/Paper.pdf' }), requests = [];
+  const a = app({ materialEntries: [before], pendingChat: 'not sent',
+    renameMaterial: async request => { requests.push(request); return renameReceipt(request, before); },
+    flushEditors: () => assert.fail('metadata rename must not flush manuscript'),
+    checkpoint: () => assert.fail('metadata rename must not checkpoint manuscript') });
+  const target = selectTarget(a, 'material', before);
+  await a.executeSidebarCapability(capability(target, 'rename'), null);
+  assert.equal(a.state.renamingMaterialTarget, target); assert.equal(a.input.selected, 1);
+  const exact = '  café 🦉 / display-only  ';
+  a.input.value = exact; a.handleMaterialRenameInput({ currentTarget: a.input });
+  await a.commitMaterialRename(false);
+  assert.deepEqual(requests, [{ projectId: 'project', sessionId: 'session', id: before.id,
+    expectedMetadataRevision: before.metadata_revision, requestId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', name: exact }]);
+  assert.equal(a.state.documentText, 'unsaved manuscript'); assert.equal(a.state.saveState, 'dirty');
+  assert.equal(a.state.pendingChat, 'not sent'); assert.equal(a.state.renamingMaterialTarget, null);
+  assert.equal(a.calls[0][0], 'project-pin'); assert.equal(a.calls[0][1].name, exact);
+  assert.deepEqual(a.errors, []); assert.deepEqual(a.writes, []);
+});
+test('real App duplicate Return and blur submit exactly once; Escape cannot cancel a committed-in-flight operation', async () => {
+  const before = material({}), pending = deferred(), requests = [];
+  const a = app({ materialEntries: [before], renameMaterial: request => { requests.push(request); return pending.promise; } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before));
+  a.state.renameMaterialName = 'Changed'; const first = a.commitMaterialRename(false);
+  await a.commitMaterialRename(false); a.handleMaterialRenameBlur({ currentTarget: a.input }); a.cancelMaterialRename();
+  assert.equal(requests.length, 1); assert(a.state.renamingMaterialTarget); assert(a.state.fileCommandInFlight);
+  pending.resolve(renameReceipt(requests[0], before)); await first;
+  assert.equal(a.state.renamingMaterialTarget, null); assert.equal(a.state.fileCommandInFlight, false);
+});
+test('real App material IME blur-before-compositionend commits only final exact input', async () => {
+  const before = material({}), requests = [];
+  const a = app({ materialEntries: [before], renameMaterial: async request => { requests.push(request); return renameReceipt(request, before); } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before));
+  a.state.renameMaterialComposition.start(); a.input.value = '途中'; a.handleMaterialRenameInput({ currentTarget: a.input });
+  const enter = key('Enter', { keyCode: 229, currentTarget: a.input }); a.handleMaterialRenameKeydown(enter);
+  assert.equal(enter.defaultPrevented, false); a.handleMaterialRenameBlur({ currentTarget: a.input });
+  assert.deepEqual(requests, []);
+  a.input.value = '  完成🦉  '; a.handleMaterialRenameCompositionEnd({ currentTarget: a.input });
+  await pause(); await pause(); assert.equal(requests.length, 1); assert.equal(requests[0].name, a.input.value);
+});
+test('real App failed receipt retains exact rename input, refreshes only, and never rebases onto a replaced row', async () => {
+  const before = material({}), requests = [];
+  const a = app({ materialEntries: [before], renameMaterial: async request => {
+    requests.push(request); return renameReceipt(request, before, { request_id: 'stale' });
+  } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = '  not lost  ';
+  await a.commitMaterialRename(false);
+  assert.equal(a.errors.length, 1); assert.equal(a.state.renameMaterialName, '  not lost  ');
+  assert.deepEqual(a.calls, [['refresh-materials']]);
+  a.state.materialEntries = [{ ...before, metadata_revision: 'd'.repeat(64) }];
+  await a.commitMaterialRename(false); assert.equal(requests.length, 1);
+  assert.equal(a.state.renameMaterialName, '  not lost  ');
+});
+test('real App response for a previous session cannot rename, refocus or report into the next session', async () => {
+  const before = material({}), pending = deferred(); let request;
+  const a = app({ materialEntries: [before], renameMaterial: captured => { request = captured; return pending.promise; } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = 'Old workspace';
+  const operation = a.commitMaterialRename(); const focuses = a.input.focused;
+  a.state.project = { ...a.state.project, session_id: 'new' }; a.state.materialEntries = [material({ name: 'New workspace' })];
+  pending.resolve(renameReceipt(request, before)); await operation;
+  assert.deepEqual(a.calls, []); assert.deepEqual(a.errors, []); assert.equal(a.input.focused, focuses);
+  assert.equal(a.state.materialEntries[0].name, 'New workspace');
+});
+test('real App detached input, blur, key and composition events cannot edit or commit the next material rename', async () => {
+  const before = material({}), a = app({ materialEntries: [before] }), stale = new Control();
+  await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = 'intact';
+  stale.value = 'must not leak'; a.handleMaterialRenameInput({ currentTarget: stale });
+  a.handleMaterialRenameBlur({ currentTarget: stale });
+  a.handleMaterialRenameKeydown(key('Escape', { currentTarget: stale }));
+  a.state.renameMaterialComposition.start(); a.handleMaterialRenameCompositionEnd({ currentTarget: stale });
+  assert.equal(a.state.renameMaterialName, 'intact'); assert(a.state.renameMaterialComposition.active);
+  assert(a.state.renamingMaterialTarget); assert.deepEqual(a.calls, []);
+});
+test('negative control: removing the native metadata-revision receipt check fails stale receipt rejection', () => {
+  const mutant = productionLoader((path, text) => path.endsWith('/materialMetadata.ts')
+    ? text.replace('receipt.expected_metadata_revision === request.expectedMetadataRevision', 'true') : text)('materialMetadata');
+  const before = material({}), request = { projectId: 'p', sessionId: 's', id: before.id,
+    expectedMetadataRevision: before.metadata_revision, requestId: 'r', name: 'new' };
+  const receipt = renameReceipt(request, before, { expected_metadata_revision: 'e'.repeat(64) });
+  assert.throws(() => assert.equal(mutant.materialRenameReceiptMatches(request, before, receipt), false), assert.AssertionError);
+});
+function materialProjection(overrides = {}, mutate) {
+  const calls = [], errors = [];
+  return { calls, errors, ...handlers('App.svelte', ['refreshMaterials', 'materialChanged', 'materialRemoved'], {
+    ...metadata, componentMounted: true, project: project(), materialEntries: [], materialRefreshSerial: 0, activeMaterial: null,
+    listMaterials: async () => [], recordFailure: error => errors.push(error),
+    closeMaterial: () => calls.push('close'), ...overrides
+  }, mutate) };
+}
+test('real App latest-started list response wins; stale errors are suppressed', async () => {
+  const first = deferred(), second = deferred(), queue = [first, second];
+  const a = materialProjection({ listMaterials: () => queue.shift().promise });
+  const one = a.refreshMaterials(), two = a.refreshMaterials(), current = material({ name: 'current' });
+  second.resolve([current]); await two; first.resolve([material({ name: 'old' })]); await one;
+  assert.equal(a.state.materialEntries[0], current); assert.deepEqual(a.errors, []);
+});
+test('real App mutation invalidates a pre-mutation list without remounting retained evidence', async () => {
+  const pending = deferred(), old = material({}), changed = material({ name: 'changed', metadata_revision: 'c'.repeat(64) });
+  const a = materialProjection({ materialEntries: [old], activeMaterial: old, listMaterials: () => pending.promise });
+  const operation = a.refreshMaterials(); a.materialChanged(changed); pending.resolve([old]); await operation;
+  assert.equal(a.state.materialEntries[0], changed); assert.equal(a.state.activeMaterial, changed); assert.deepEqual(a.calls, []);
+});
+test('negative control: removing the list serial check reproduces a renamed label resurrection', async () => {
+  const pending = deferred(), old = material({}), changed = material({ name: 'changed' });
+  const a = materialProjection({ materialEntries: [old], listMaterials: () => pending.promise },
+    text => text.replace('request === materialRefreshSerial && project?.project_id', 'project?.project_id'));
+  const operation = a.refreshMaterials(); a.materialChanged(changed); pending.resolve([old]); await operation;
+  assert.throws(() => assert.equal(a.state.materialEntries[0], changed), assert.AssertionError);
+});
+test('real App view removal carrying a replaced lease refreshes without removing the re-added source', async () => {
+  const old = material({}), replacement = material({ name: 'replacement' }), pending = deferred();
+  const a = materialProjection({ materialEntries: [replacement], activeMaterial: replacement, listMaterials: () => pending.promise });
+  a.materialRemoved(old.id, 'session', old);
+  assert.equal(a.state.materialEntries[0], replacement); assert.deepEqual(a.calls, []);
+  pending.resolve([replacement]); await pause();
+});
+test('rename markup has one event owner rather than an unguarded two-way binding on detached inputs', () => {
+  const text = readFileSync(resolve(src, 'App.svelte'), 'utf8');
+  for (const name of ['renameWorkspaceTitle', 'renameDocumentTitle', 'renameMaterialName']) {
+    assert.equal(text.includes(`bind:value={${name}}`), false, name);
+    assert(text.includes(`value={${name}}`), name);
+  }
+});
+
+test('real App same-generation list preserves an active rename lease; a new generation never does', async () => {
+  const before = material({}); let entries = [{ ...before }];
+  const a = materialProjection({ materialEntries: [before], listMaterials: async () => entries });
+  await a.refreshMaterials(); assert.equal(a.state.materialEntries[0], before);
+  entries = [{ ...before, metadata_revision: 'c'.repeat(64) }];
+  await a.refreshMaterials(); assert.notEqual(a.state.materialEntries[0], before);
+});
+test('real App a stale list rejection never reports after a newer list succeeds', async () => {
+  const old = deferred(), next = deferred(), queue = [old, next];
+  const a = materialProjection({ listMaterials: () => queue.shift().promise });
+  const first = a.refreshMaterials(), second = a.refreshMaterials();
+  next.resolve([material({})]); await second; old.reject(new Error('stale error')); await first;
+  assert.deepEqual(a.errors, []);
+});
+test('real App detached document rename events cannot alter the next document title, composition or transaction', () => {
+  const input = new Control(), old = new Control(); old.value = 'wrong title';
+  const a = handlers('App.svelte', ['synchronizeDocumentRenameTitle', 'handleDocumentRenameInput',
+    'handleDocumentRenameCompositionStart', 'handleDocumentRenameCompositionEnd', 'handleDocumentRenameBlur', 'handleDocumentRenameKeydown'], {
+    ...primitives, ...documents, renameDocumentInput: input, renameDocumentTitle: 'intact',
+    renameDocumentComposition: primitives.createRenameCompositionGuard(), renameDocumentInFlight: false,
+    commitDocumentRename: () => assert.fail('detached input committed'), cancelDocumentRename: () => assert.fail('detached input cancelled')
+  });
+  a.handleDocumentRenameInput({ currentTarget: old });
+  a.handleDocumentRenameCompositionStart({ currentTarget: old });
+  a.handleDocumentRenameCompositionEnd({ currentTarget: old });
+  a.handleDocumentRenameBlur({ currentTarget: old }); a.handleDocumentRenameKeydown(key('Enter', { currentTarget: old }));
+  assert.equal(a.state.renameDocumentTitle, 'intact'); assert.equal(a.state.renameDocumentComposition.active, false);
+});
+
+
+test('real IPC orders metadata rename behind pending draft persistence and snapshots the exact request', async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { __TAURI_INTERNALS__: {} } });
+  const pending = deferred(), calls = [];
+  const ipc = productionLoader(undefined, {
+    '@tauri-apps/api/core': { invoke: async (command, args) => {
+      calls.push([command, args]);
+      if (command === 'plugin:loom|document_draft_upsert') return pending.promise;
+      return undefined;
+    } }, '@tauri-apps/api/event': { listen: async () => () => {} }
+  })('ipc');
+  try {
+    const draft = ipc.upsertTransientDraft('p', 's', 'doc', 'Draft.md', 'exact café 🦉\r\n', 'prose', 'revision', '0');
+    const request = { projectId: 'p', sessionId: 's', id: 'material-id', requestId: 'request', expectedMetadataRevision: 'a'.repeat(64), name: 'exact name' };
+    const rename = ipc.renameMaterial(request); request.name = 'late mutation';
+    const pin = ipc.pinMaterial('p', 's', request.id, true, 'b'.repeat(64));
+    const remove = ipc.removeMaterial('p', 's', request.id, 'c'.repeat(64));
+    await pause(); await pause();
+    assert.deepEqual(calls.map(([command]) => command), ['plugin:loom|document_draft_upsert']);
+    pending.resolve({ testTransportReceipt: true }); // ordering only, not a native draft receipt proof
+    await Promise.all([draft, rename, pin, remove]);
+    assert.deepEqual(calls.map(([command]) => command), ['plugin:loom|document_draft_upsert', 'plugin:loom|material_rename', 'plugin:loom|material_set_pinned', 'plugin:loom|material_remove']);
+    assert.equal(calls[0][1].text, 'exact café 🦉\r\n'); assert.equal(calls[1][1].name, 'exact name');
+    assert.equal(calls[1][1].expectedMetadataRevision, 'a'.repeat(64));
+    assert.equal(calls[2][1].expectedMetadataRevision, 'b'.repeat(64)); assert.equal(calls[3][1].expectedMetadataRevision, 'c'.repeat(64));
+  } finally {
+    if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow); else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+test('real IPC does not replay a failed metadata mutation and leaves subsequent observation usable', async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { __TAURI_INTERNALS__: {} } });
+  const calls = [], ipc = productionLoader(undefined, {
+    '@tauri-apps/api/core': { invoke: async command => {
+      calls.push(command);
+      if (command === 'plugin:loom|material_rename') throw { code: 'material_failed', message: 'commit status uncertain', retryable: true };
+      return [];
+    } }, '@tauri-apps/api/event': { listen: async () => () => {} }
+  })('ipc');
+  try {
+    await assert.rejects(ipc.renameMaterial({ projectId: 'p', sessionId: 's', id: 'm', requestId: 'r', expectedMetadataRevision: 'a'.repeat(64), name: 'new' }));
+    assert.deepEqual(await ipc.listMaterials('p', 's'), []);
+    assert.deepEqual(calls, ['plugin:loom|material_rename', 'plugin:loom|material_list']);
+  } finally {
+    if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow); else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+function materialView(overrides = {}) {
+  const changed = [], removed = [];
+  return { changed, removed, ...handlers('lib/MaterialView.svelte', ['pin', 'remove'], {
+    ...metadata, material: material({}), projectId: 'p', sessionId: 's', mounted: true, busy: false, serial: 0, error: '', removable: true,
+    normalizeFailure: failure => ({ message: String(failure.message ?? failure) }),
+    pinMaterial: async () => assert.fail('unexpected pin'), removeMaterial: async () => assert.fail('unexpected removal'),
+    onChanged: value => changed.push(value), onRemoved: (...args) => removed.push(args), ...overrides
+  }) };
+}
+test('real MaterialView rejects a stale pin response after a new source lease and preserves retained passage text', async () => {
+  const before = material({}), pending = deferred(), calls = [], selected = { id: 'evidence', text: '  retained café 🦉\r\n' };
+  const a = materialView({ material: before, selected, pinMaterial: (...args) => { calls.push(args); return pending.promise; } });
+  const operation = a.pin(), replacement = material({ name: 'replacement', metadata_revision: 'c'.repeat(64) });
+  a.state.material = replacement; pending.resolve({ ...before, pinned: true, metadata_revision: 'b'.repeat(64) }); await operation;
+  assert.deepEqual(calls, [['p', 's', before.id, true, before.metadata_revision]]);
+  assert.deepEqual(a.changed, []); assert.equal(a.state.material, replacement); assert.equal(a.state.selected, selected); assert.equal(a.state.error, '');
+});
+test('real MaterialView refuses a pin receipt that substitutes the retained source', async () => {
+  const before = material({});
+  const a = materialView({ material: before, pinMaterial: async () => ({ ...before, pinned: true, attachment_id: 'c'.repeat(64) }) });
+  await a.pin(); assert.equal(a.state.material, before); assert.deepEqual(a.changed, []); assert(a.state.error.includes('receipt'));
+});
+test('real MaterialView removal sends the observed generation and returns the original lease even after unmount', async () => {
+  const before = material({}), pending = deferred(), calls = [];
+  const a = materialView({ material: before, removeMaterial: (...args) => { calls.push(args); return pending.promise; } });
+  const operation = a.remove(); a.state.mounted = false; pending.resolve(); await operation;
+  assert.deepEqual(calls, [['p', 's', before.id, before.metadata_revision]]);
+  assert.deepEqual(a.removed, [[before.id, 's', before]]);
+});
+
+
+test('real App removal during an in-flight rename releases the rename owner after native completion', async () => {
+  const before = material({}), pending = deferred(); let request;
+  const a = app({ materialEntries: [before], renameMaterial: value => { request = value; return pending.promise; } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = 'Changed';
+  const operation = a.commitMaterialRename(), focused = a.input.focused;
+  a.state.materialEntries = []; a.cancelMaterialRename(false); // reactive disappearance while the owner is in flight
+  assert(a.state.renamingMaterialTarget);
+  pending.resolve(renameReceipt(request, before)); await operation;
+  assert.equal(a.state.renamingMaterialTarget, null); assert.equal(a.state.renameMaterialInFlight, false);
+  assert.equal(a.state.fileCommandInFlight, false); assert.equal(a.input.focused, focused);
+  assert.deepEqual(a.calls, [['refresh-materials']]);
+});
+test('real App acknowledges an exact rename generation already published by a read without replay or stale rebasing', async () => {
+  const before = material({}), pending = deferred(); let request, invocations = 0;
+  const a = app({ materialEntries: [before], renameMaterial: value => { request = value; invocations++; return pending.promise; } });
+  await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = 'Changed';
+  const operation = a.commitMaterialRename(false), receipt = renameReceipt(request, before);
+  a.state.materialEntries = [{ ...receipt.material }]; pending.resolve(receipt); await operation;
+  assert.equal(a.state.renamingMaterialTarget, null); assert.equal(invocations, 1);
+  assert.deepEqual(a.calls, []); assert.deepEqual(a.errors, []);
+});
+test('real App ignores rename completion and failure after unmount without publication, reread or focus', async () => {
+  for (const reject of [false, true]) {
+    const before = material({}), pending = deferred(); let request;
+    const a = app({ materialEntries: [before], renameMaterial: value => { request = value; return pending.promise; } });
+    await a.beginMaterialRename(selectTarget(a, 'material', before)); a.state.renameMaterialName = 'Changed';
+    const operation = a.commitMaterialRename(), focused = a.input.focused;
+    a.state.componentMounted = false;
+    if (reject) pending.reject(new Error('late failure')); else pending.resolve(renameReceipt(request, before));
+    await operation;
+    assert.equal(a.state.renamingMaterialTarget, null); assert.equal(a.state.materialEntries[0], before);
+    assert.equal(a.input.focused, focused); assert.deepEqual(a.calls, []); assert.deepEqual(a.errors, []);
+  }
+});
+test('real App ignores material list and view callbacks after unmount', async () => {
+  for (const reject of [false, true]) {
+    const before = material({}), pending = deferred();
+    const a = materialProjection({ materialEntries: [before], listMaterials: () => pending.promise });
+    const operation = a.refreshMaterials(); a.state.componentMounted = false;
+    if (reject) pending.reject(new Error('late list')); else pending.resolve([material({ name: 'Changed' })]);
+    await operation;
+    a.materialRemoved(before.id, 'session', before); a.materialChanged(material({ name: 'Changed' }));
+    assert.equal(a.state.materialEntries[0], before); assert.deepEqual(a.calls, []); assert.deepEqual(a.errors, []);
+  }
+});
+
+
+test('real App and MaterialView both reject a pin receipt with an unchanged metadata generation', async () => {
+  const before = material({});
+  const a = app({ materialEntries: [before], pinMaterial: async () => ({ ...before, pinned: true }) });
+  const target = selectTarget(a, 'material', before);
+  await a.executeSidebarCapability(capability(target, 'pin'), null);
+  assert.equal(a.errors.length, 1); assert(a.errors[0].message.includes('receipt'));
+  assert.deepEqual(a.calls, [['refresh-materials']]);
+  const view = materialView({ material: before, pinMaterial: async () => ({ ...before, pinned: true }) });
+  await view.pin(); assert.equal(view.state.material, before); assert.deepEqual(view.changed, []);
+  assert(view.state.error.includes('receipt'));
+});
+
+// A selected row must keep its original lease through the actual open/remove
+// owner chain; a presentation copy otherwise strands the removed source view.
+test('real App source opening preserves the row lease required to close its removed view', async () => {
+  const before = material({});
+  const a = app({ materialEntries: [before] });
+  const target = selectTarget(a, 'material', before);
+  await a.executeSidebarCapability(capability(target, 'open'));
+  const opened = a.calls.find(call => call[0] === 'open-material')[1];
+  const owner = materialProjection({ materialEntries: [before], activeMaterial: opened });
+  owner.materialRemoved(before.id, 'session', opened);
+  assert.deepEqual(owner.calls, ['close']);
+  assert.equal(owner.state.materialEntries.length, 0);
 });

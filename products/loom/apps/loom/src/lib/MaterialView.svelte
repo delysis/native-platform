@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { readMaterial, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
+  import { canEditMaterialMetadata, materialMetadataRevision, materialSourceIsUnchanged } from './materialMetadata';
   import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
@@ -12,7 +13,7 @@
   export let onClose: () => void;
   export let onUse: (reference: string, text: string | null) => Promise<boolean>;
   export let removable = true;
-  export let onRemoved: (id: string, session: string) => void = () => {};
+  export let onRemoved: (id: string, session: string, expected?: MaterialEntry) => void = () => {};
   export let onChanged: (entry: MaterialEntry) => void;
   export let onReopen: () => void;
   export let onOpenDocument: ((id: string) => Promise<void>) | undefined = undefined;
@@ -106,22 +107,32 @@
     finally { if (mounted) busy = false; }
   }
   async function pin(): Promise<void> {
-    busy = true;
-    try { const entry = await pinMaterial(projectId, sessionId, material.id, !material.pinned); if (mounted) { material = entry; onChanged(entry); } }
-    catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
-    finally { if (mounted) busy = false; }
-  }
-  async function remove(): Promise<void> {
-    if (busy || !removable) return;
-    const id = material.id, session = sessionId;
+    if (busy || !canEditMaterialMetadata(material)) return;
+    const target = material, project = projectId, session = sessionId, request = ++serial;
+    const current = () => mounted && request === serial && projectId === project && sessionId === session && material === target;
     busy = true; error = '';
     try {
-      await removeMaterial(projectId, session, id);
-      // The removal may settle after the view closes. Its owner checks the
-      // originating session before updating navigation, even after unmount.
-      onRemoved(id, session);
-    } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
-    finally { if (mounted) busy = false; }
+      const entry = await pinMaterial(project, session, target.id, !target.pinned, materialMetadataRevision(target));
+      if (!current()) return;
+      if (!materialSourceIsUnchanged(target, entry) || entry.name !== target.name || entry.pinned !== !target.pinned || !canEditMaterialMetadata(entry) || entry.metadata_revision === target.metadata_revision) {
+        throw new Error('The source pin receipt did not match its captured target.');
+      }
+      material = entry; onChanged(entry);
+    } catch (failure) { if (current()) error = normalizeFailure(failure).message; }
+    finally { if (mounted && request === serial) busy = false; }
+  }
+  async function remove(): Promise<void> {
+    if (busy || !removable || !canEditMaterialMetadata(material)) return;
+    const target = material, project = projectId, session = sessionId, request = ++serial;
+    busy = true; error = '';
+    try {
+      await removeMaterial(project, session, target.id, materialMetadataRevision(target));
+      // The parent compares the original row lease before removing a projection,
+      // even when this view closed while the native command was pending.
+      onRemoved(target.id, session, target);
+    } catch (failure) {
+      if (mounted && request === serial && projectId === project && sessionId === session && material === target) error = normalizeFailure(failure).message;
+    } finally { if (mounted && request === serial) busy = false; }
   }
   async function original(): Promise<void> {
     if (!material.attachment_id) return;
@@ -161,8 +172,8 @@
       {#if writingDocumentId && onOpenDocument}<button disabled={busy} on:click={() => void openWriting()}>Open current writing</button>{/if}
       {#if selectedPage && material.available && material.attachment_id}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
       {#if material.attachment_id}<button on:click={() => void original()}>Reveal original</button>{/if}
-      {#if material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
-      {#if removable && material.kind !== 'folder'}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
+      {#if material.available && material.kind !== 'folder'}<button disabled={busy || !canEditMaterialMetadata(material)} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
+      {#if removable && material.kind !== 'folder'}<button disabled={busy || !canEditMaterialMetadata(material)} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
     <button class="close" on:click={onClose} aria-label="Close source" title="Close source"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
   </header>

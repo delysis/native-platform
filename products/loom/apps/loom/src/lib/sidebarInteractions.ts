@@ -2,6 +2,7 @@ import { captureDocumentTarget, capturedDocumentIdentityIsCurrent } from './docu
 import type { CapturedDocumentTarget, DocumentContextAction } from './documentContextActions';
 import type { DocumentSummary, ProjectSnapshot } from './types';
 import type { MaterialEntry } from './materials';
+import { canEditMaterialMetadata } from './materialMetadata';
 import type { WorkspaceFolder } from './workspaceFolders';
 import { workspaceFolderName } from './workspaceFolders';
 import { isContextMenuTriggerKey } from './interactionPrimitives';
@@ -27,6 +28,7 @@ export type CapturedSidebarTarget = TargetBase & (
   | { readonly kind: 'material'; readonly material: Readonly<MaterialEntry>; readonly materialLease: MaterialEntry }
 );
 export type RootSidebarTarget = Extract<CapturedSidebarTarget, { kind: 'root' }>;
+export type MaterialSidebarTarget = Extract<CapturedSidebarTarget, { kind: 'material' }>;
 export interface SidebarLiveState {
   readonly project: ProjectSnapshot | null;
   readonly bookmarks: readonly WorkspaceFolder[];
@@ -81,14 +83,15 @@ export function sidebarTargetIsCurrent(target: CapturedSidebarTarget, live: Side
       return current === target.materialLease && current !== undefined && current.reference === target.material.reference &&
         current.source_path === target.material.source_path && current.workspace_path === target.material.workspace_path &&
         current.attachment_id === target.material.attachment_id && current.kind === target.material.kind &&
-        current.retention === target.material.retention && current.name === target.material.name && current.pinned === target.material.pinned;
+        current.retention === target.material.retention && current.name === target.material.name && current.pinned === target.material.pinned &&
+        current.metadata_revision === target.material.metadata_revision && current.available === target.material.available;
     }
   }
 }
 
 type RootAction = 'open' | 'toggle' | 'rename_label' | 'forget' | 'copy_path';
 type FolderAction = 'toggle' | 'copy_path';
-type MaterialAction = 'open' | 'pin' | 'remove' | 'copy_reference' | 'copy_path';
+type MaterialAction = 'open' | 'rename' | 'pin' | 'remove' | 'copy_reference' | 'copy_path';
 interface Capability<T, A> { readonly target: T; readonly action: A; readonly label: string; readonly enabled: boolean; readonly destructive?: boolean }
 export type SidebarCapability =
   | Capability<RootSidebarTarget, RootAction>
@@ -128,10 +131,11 @@ export function sidebarCapabilities(target: CapturedSidebarTarget, state: Sideba
     ];
     case 'material': return [
       { target, action: 'open', label: 'Open', enabled: idle && editable },
-      { target, action: 'pin', label: target.material.pinned ? 'Unpin' : 'Pin', enabled: idle },
+      { target, action: 'rename', label: 'Rename…', enabled: idle && canEditMaterialMetadata(target.material) },
+      { target, action: 'pin', label: target.material.pinned ? 'Unpin' : 'Pin', enabled: idle && canEditMaterialMetadata(target.material) },
       { target, action: 'copy_reference', label: 'Copy Reference', enabled: idle },
       ...(target.displayPath ? [{ target, action: 'copy_path' as const, label: 'Copy Path', enabled: idle }] : []),
-      { target, action: 'remove', label: 'Remove Source from Workspace', enabled: idle && target.material.retention !== 'protected' }
+      { target, action: 'remove', label: 'Remove Source from Workspace', enabled: idle && canEditMaterialMetadata(target.material) }
     ];
   }
 }

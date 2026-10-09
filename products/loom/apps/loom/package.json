@@ -7,10 +7,10 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "node --test tests/sidebar-interactions.node.mjs && vitest run --maxWorkers=4 --exclude '**/*.browser.test.ts'",
+    "test": "node --test tests/sidebar-interactions.node.mjs tests/sidebar-metadata-registry.node.mjs && vitest run --maxWorkers=4 --exclude '**/*.browser.test.ts'",
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "tauri": "tauri",
-    "test:sidebar": "node --test tests/sidebar-interactions.node.mjs"
+    "test:sidebar": "node --test tests/sidebar-interactions.node.mjs tests/sidebar-metadata-registry.node.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

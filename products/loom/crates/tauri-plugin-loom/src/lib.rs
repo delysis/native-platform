@@ -2147,6 +2147,7 @@ impl Builder {
                 material_commands::material_read_evidence,
                 material_commands::material_bind_attachment,
                 material_commands::material_set_pinned,
+                material_commands::material_rename,
                 material_commands::material_remove,
                 material_commands::material_add_library,
                 material_commands::material_add_library_path,

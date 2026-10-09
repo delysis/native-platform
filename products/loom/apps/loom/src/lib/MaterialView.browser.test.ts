@@ -6,7 +6,7 @@ import type { MaterialEntry, MaterialEvidence, MaterialRead } from './materials'
 import '../app.css';
 const ipc = vi.hoisted(() => ({ read: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
 vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
-const material: MaterialEntry = { id: 'material-' + 'a'.repeat(64), name: 'Research', reference: '@"materials/Research#a"', kind: 'library', pinned: false, available: true, source_path: '/private/library.sqlite', attachment_id: null };
+const material: MaterialEntry = { id: 'material-' + 'a'.repeat(64), name: 'Research', reference: '@"materials/Research#a"', kind: 'library', pinned: false, available: true, source_path: '/private/library.sqlite', attachment_id: null, metadata_revision: 'a'.repeat(64) };
 const evidence: MaterialEvidence = { id: 'b'.repeat(64), reference: '@"evidence/b"', material_id: material.id, title: 'A source', text: 'Exact café evidence.\nSecond line.', source_revision: 'revision', text_sha256: 'hash', locator: { document_id: 'source', block_id: 7 } };
 let view: ReturnType<typeof mount> | undefined;
 afterEach(async () => { if (view) await unmount(view); view = undefined; document.body.replaceChildren(); vi.resetAllMocks(); });
@@ -14,7 +14,7 @@ function render(props: Partial<ComponentProps<typeof MaterialView>> = {}, read?:
   ipc.read.mockResolvedValue(read ?? { material, text: '', complete: true, warnings: [], source_revision: '', evidence: [], presentation: null });
   ipc.search.mockResolvedValue({ material, query: 'history', hits: [evidence], complete: true, warnings: [] });
   ipc.evidence.mockResolvedValue(evidence);
-  ipc.pin.mockResolvedValue({ ...material, pinned: true });
+  ipc.pin.mockResolvedValue({ ...material, pinned: true, metadata_revision: 'c'.repeat(64) });
   const onUse = vi.fn().mockResolvedValue(true), onChanged = vi.fn(), onClose = vi.fn(), onReopen = vi.fn(), onRemoved = vi.fn();
   const target = document.createElement('div'); target.style.height = '500px'; document.body.append(target);
   view = mount(MaterialView, { target, props: { projectId: 'project', sessionId: 'session', material, originTitle: 'Draft', onUse, onChanged, onClose, onReopen, onRemoved, ...props } });
@@ -130,12 +130,12 @@ describe('named material viewing', () => {
     const { onRemoved, onUse } = render({ initialEvidence: evidence });
     await page.getByText('•••', { exact: true }).click();
     await page.getByRole('button', { name: 'Remove from workspace' }).click();
-    expect(ipc.remove).toHaveBeenCalledWith('project', 'session', material.id);
+    expect(ipc.remove).toHaveBeenCalledWith('project', 'session', material.id, material.metadata_revision);
     expect(onRemoved).not.toHaveBeenCalled();
     await expect.element(page.getByRole('button', { name: 'Remove from workspace' })).toBeDisabled();
     finish();
     await expect.poll(() => onRemoved.mock.calls.length).toBe(1);
-    expect(onRemoved).toHaveBeenCalledWith(material.id, 'session');
+    expect(onRemoved).toHaveBeenCalledWith(material.id, 'session', material);
     expect(onUse).not.toHaveBeenCalled();
     expect(ipc.original).not.toHaveBeenCalled();
   });

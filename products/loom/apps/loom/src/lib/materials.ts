@@ -12,6 +12,8 @@ export interface MaterialEntry {
   source_path: string | null;
   attachment_id: string | null;
   workspace_path?: string | null;
+  /** Native mutable-metadata observation; never part of link/evidence identity. */
+  metadata_revision?: string | null;
 }
 export interface MaterialEvidence {
   id: string;

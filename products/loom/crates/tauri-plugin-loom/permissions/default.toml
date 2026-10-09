@@ -9,6 +9,7 @@ permissions = [
   "allow-material-read-evidence",
   "allow-material-bind-attachment",
   "allow-material-set-pinned",
+  "allow-material-rename",
   "allow-material-remove",
   "allow-material-add-library",
   "allow-material-add-library-path",

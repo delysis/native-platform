@@ -10,6 +10,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-material-read-evidence`
 - `allow-material-bind-attachment`
 - `allow-material-set-pinned`
+- `allow-material-rename`
 - `allow-material-remove`
 - `allow-material-add-library`
 - `allow-material-add-library-path`
@@ -1639,6 +1640,32 @@ Enables the material_remove command without any pre-configured scope.
 <td>
 
 Denies the material_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-rename`
+
+</td>
+<td>
+
+Enables the material_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-rename`
+
+</td>
+<td>
+
+Denies the material_rename command without any pre-configured scope.
 
 </td>
 </tr>
