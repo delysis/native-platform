@@ -3761,7 +3761,9 @@
     if (event.button !== 0) return;
     const nativeWindow = tauri()?.window?.getCurrentWindow();
     if (!nativeWindow) return;
-    if (event.target.closest?.(".titlebar-drag-surface")) {
+    const toolbar = event.target.closest?.(".chrome");
+    const control = event.target.closest?.("button, input, textarea, select, a, [contenteditable], form");
+    if (toolbar && !control) {
       event.preventDefault();
       void nativeWindow.startDragging().catch(reportError);
     }

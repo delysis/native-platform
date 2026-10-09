@@ -66,6 +66,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   position: relative;
   overflow: hidden;
   background: var(--bg);
+  color: var(--text);
 }
 
 .llama-ui-shell[data-theme="light"] {
@@ -1184,8 +1185,8 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .markdown-content ul { padding-left: 22px; }
 .markdown-content blockquote { margin: 12px 0; padding-left: 14px; border-left: 3px solid var(--border-strong); color: var(--muted); }
 .code-block { margin: 14px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
-.code-block figcaption { padding: 7px 10px; color: var(--muted); background: #171717; font-size: 12px; }
-.code-block pre { margin: 0; padding: 14px; overflow: auto; background: #101010; }
+.code-block figcaption { padding: 7px 10px; color: var(--muted); background: var(--surface); font-size: 12px; }
+.code-block pre { margin: 0; padding: 14px; overflow: auto; background: var(--sidebar); }
 .llama-ui-shell.full-height-code .code-block pre { max-height: none; }
 .markdown-table { width: 100%; border-collapse: collapse; }
 .markdown-table th, .markdown-table td { padding: 8px 10px; border: 1px solid var(--border); text-align: left; }
