@@ -1,5 +1,5 @@
 //! One fixed mutable bindings file, not a general filesystem API. Callers hold
-//! the material WRITE_LOCK and a ProjectStore lease. No renderer path reaches
+//! the material `WRITE_LOCK` and a `ProjectStore` lease. No renderer path reaches
 //! this owner. The current JSON schema and immutable sources live elsewhere.
 use std::path::Path;
 
@@ -16,7 +16,7 @@ mod native {
 
     use rustix::fs::{AtFlags, Mode, OFlags, open, openat, renameat, unlinkat};
 
-    use super::*;
+    use super::{MAX_STATE_BYTES, Path, Result, digest, invalid};
 
     const NAME: &str = "bindings.json";
     const DIRECTORY: OFlags = OFlags::RDONLY
@@ -136,12 +136,12 @@ mod native {
             );
             let revision = digest(&[witness.as_bytes(), b"\0", &bytes].concat());
             let value = Self {
+                bytes,
+                revision,
                 root,
                 sidecar,
                 directory,
                 file,
-                bytes,
-                revision,
             };
             value.ensure_paths(path)?;
             Ok(Some(value))

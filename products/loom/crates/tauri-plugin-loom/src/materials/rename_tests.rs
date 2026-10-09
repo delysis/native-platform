@@ -171,7 +171,7 @@ fn malformed_inputs_and_current_schema_rejection_do_not_write_or_repair_state() 
     let path = bindings_path(&store);
     let original_bytes = fs::read(&path).unwrap();
     for name in [
-        "".to_owned(),
+        String::new(),
         " \t".to_owned(),
         "line\nbreak".to_owned(),
         "\0".to_owned(),

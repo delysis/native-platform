@@ -306,6 +306,13 @@ pub(super) async fn material_add_library_path(
 mod rename_tests {
     use super::*;
 
+    fn install_session(state: &PluginState, store: ProjectStore, id: CommandId) {
+        let mut session = state.session.lock().unwrap();
+        session.phase = SessionPhase::Open;
+        session.store = Some(store);
+        session.active_session_id = Some(id);
+    }
+
     #[test]
     fn rename_requires_live_project_session_and_rejects_replay_after_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -324,12 +331,7 @@ mod rename_tests {
         let session_text = session_id.to_string();
         let request = CommandId::new().to_string();
         let state = PluginState::default();
-        {
-            let mut session = state.session.lock().unwrap();
-            session.phase = SessionPhase::Open;
-            session.store = Some(store);
-            session.active_session_id = Some(session_id);
-        }
+        install_session(&state, store, session_id);
         let path = root.join(".loom/materials/bindings.json");
         let bytes = std::fs::read(&path).unwrap();
         for (project_id, session, request_id) in [
