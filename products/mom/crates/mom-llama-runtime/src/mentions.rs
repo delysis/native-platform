@@ -791,7 +791,30 @@ where
         };
         input.conversation_id = conversation.id;
     }
-    let resolution = resolve_targets(&handles, &input.conversation_id)?;
+    let mut resolution = resolve_targets(&handles, &input.conversation_id)?;
+    if !selected.recipient_ids.is_empty() {
+        let contacts = crate::conversation_store::load_db()?.conversations;
+        let recipients = match resolve_recipient_targets(&selected.recipient_ids, &contacts) {
+            Ok(recipients) => recipients,
+            Err(blocker) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.chat_dispatch",
+                    "blocked_recipient",
+                    blocker,
+                ));
+            }
+        };
+        let mut targets = recipients;
+        for target in resolution.targets {
+            if !targets
+                .iter()
+                .any(|recipient| recipient.conversation.id == target.conversation.id)
+            {
+                targets.push(target);
+            }
+        }
+        resolution.targets = targets;
+    }
     if let Some(blocker) = ambiguous_resolution_blocker(&resolution) {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_dispatch",
@@ -3796,6 +3819,37 @@ struct BoundMentionTool {
     tool_schema_sha256: String,
 }
 
+fn resolve_recipient_targets(
+    ids: &[String],
+    contacts: &[Conversation],
+) -> std::result::Result<Vec<ResolvedTarget>, Blocker> {
+    let rejected = || {
+        Blocker::new(
+            "recipient_unavailable",
+            "A contact is unavailable",
+            Vec::new(),
+        )
+    };
+    if ids.len() > MAX_TARGETS {
+        return Err(rejected());
+    }
+    let mut targets = Vec::<ResolvedTarget>::new();
+    for id in ids {
+        if targets.iter().any(|target| target.conversation.id == *id) {
+            return Err(rejected());
+        }
+        let contact = contacts
+            .iter()
+            .find(|contact| contact.id == *id && contact.kind == ConversationKind::PersonaTemplate)
+            .ok_or_else(rejected)?;
+        targets.push(ResolvedTarget {
+            kind: MentionTargetKind::Persona,
+            conversation: contact.clone(),
+        });
+    }
+    Ok(targets)
+}
+
 fn resolve_targets(handles: &[String], host_id: &str) -> Result<TargetResolution> {
     let (conversations, groups) = conversation_and_group_handles()?;
     Ok(resolve_targets_from_registry(
@@ -4931,6 +4985,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contact_routing_preserves_order_and_identity_after_handle_changes() {
+        let mut first = mention_conversation("first-id", "original");
+        first.kind = ConversationKind::PersonaTemplate;
+        first.execution_profile.mention_handle = "renamed".into();
+        let mut second = mention_conversation("second-id", "second");
+        second.kind = ConversationKind::PersonaTemplate;
+        let contacts = vec![first, second];
+        let ids = vec!["second-id".to_string(), "first-id".to_string()];
+        let targets = super::resolve_recipient_targets(&ids, &contacts)
+            .unwrap_or_else(|_| panic!("valid recipients"));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second-id", "first-id"]
+        );
+        assert_eq!(
+            targets[1].conversation.execution_profile.mention_handle,
+            "renamed"
+        );
+        assert!(super::resolve_recipient_targets(&["missing".into()], &contacts).is_err());
+        assert!(
+            super::resolve_recipient_targets(&["first-id".into(), "first-id".into()], &contacts)
+                .is_err()
+        );
+    }
+
     fn mention_conversation(id: &str, handle: &str) -> Conversation {
         Conversation {
             id: id.to_string(),
@@ -4947,6 +5030,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         }
@@ -5479,6 +5563,7 @@ mod tests {
                     source_message_id: None,
                     branch_root_message_id: None,
                     active_leaf_message_id: Some("turn".to_string()),
+                    recipient_ids: Vec::new(),
                     current_skill_ids: Vec::new(),
                     messages: vec![Message {
                         id: "turn".to_string(),

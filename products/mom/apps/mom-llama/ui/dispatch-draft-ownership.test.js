@@ -17,6 +17,7 @@ for (const switchAt of ["persistence", "dispatch"]) {
       const switchToB = () => { selected = "B"; textarea.value = "precious B"; };
       const context = {
         document: { addEventListener: (_, handler) => { submit = handler; } },
+        recipientMutation: Promise.resolve(),
         autocompleteAccepting: false, cancelComposerAutocomplete() {},
         formValue: () => textarea.value, draftAttachmentIds: () => [],
         acquireChatBusy: () => "lease", releaseChatBusy() {},

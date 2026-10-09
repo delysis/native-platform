@@ -159,6 +159,8 @@ pub struct Conversation {
     #[serde(default)]
     pub active_leaf_message_id: Option<String>,
     #[serde(default)]
+    pub recipient_ids: Vec<String>,
+    #[serde(default)]
     pub current_skill_ids: Vec<String>,
     #[serde(default)]
     pub messages: Vec<Message>,
@@ -263,6 +265,107 @@ pub struct TextAttachmentImport {
 
 pub(crate) const NEW_CHAT_CONTEXT_NAMESPACE: &str = "conversation.new-draft-context.v1";
 
+pub(crate) const NEW_CHAT_RECIPIENTS_NAMESPACE: &str = "conversation.new-draft-recipients.v1";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftRecipients {
+    pub recipient_ids: Vec<String>,
+    pub name: Option<String>,
+}
+
+pub fn conversation_draft_recipients() -> Result<DraftRecipients> {
+    let store = RuntimeStore::current()?;
+    if let Some(recipients) = store.get(NEW_CHAT_RECIPIENTS_NAMESPACE)? {
+        return Ok(recipients);
+    }
+    let persona: Option<String> = store.get(NEW_CHAT_CONTEXT_NAMESPACE)?.unwrap_or_default();
+    Ok(DraftRecipients {
+        recipient_ids: persona.into_iter().collect(),
+        name: None,
+    })
+}
+
+/// Recipients are stable identities, never inferred from text in the composer.
+/// This changes the single unsent draft without creating a chat or contact group.
+pub fn conversation_draft_recipients_update(
+    recipient_ids: Vec<String>,
+    name: Option<String>,
+) -> Result<CommandResult<DraftRecipients>> {
+    crate::personas::ensure_builtin_catalog()?;
+    let store = RuntimeStore::current()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let rejected = |message: &str| {
+                Ok(Err(Blocker::new(
+                    "invalid_draft_recipients",
+                    message,
+                    Vec::new(),
+                )))
+            };
+            if db
+                .selected_conversation_id
+                .as_deref()
+                .is_some_and(|id| id != "default")
+            {
+                return rejected("The draft is no longer selected");
+            }
+            if recipient_ids.len() > 4 {
+                return rejected("At most four contacts may be selected");
+            }
+            let mut unique = HashSet::new();
+            for id in &recipient_ids {
+                if !unique.insert(id) {
+                    return rejected("Duplicate contact");
+                }
+                if !db.conversations.iter().any(|contact| {
+                    contact.id == *id && contact.kind == ConversationKind::PersonaTemplate
+                }) {
+                    return rejected("Contact is unavailable");
+                }
+            }
+            let name = name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if name.as_ref().is_some_and(|value| {
+                value.chars().count() > 120 || value.chars().any(char::is_control)
+            }) {
+                return rejected("Invalid group name");
+            }
+            let recipients = DraftRecipients {
+                recipient_ids,
+                name,
+            };
+            let persona =
+                (recipients.recipient_ids.len() == 1).then(|| recipients.recipient_ids[0].clone());
+            documents.put_bytes(NEW_CHAT_CONTEXT_NAMESPACE, &serde_json::to_vec(&persona)?)?;
+            documents.put_bytes(
+                NEW_CHAT_RECIPIENTS_NAMESPACE,
+                &serde_json::to_vec(&recipients)?,
+            )?;
+            db.selected_conversation_id = Some("default".to_string());
+            Ok(Ok(recipients))
+        },
+    )?;
+    Ok(match result {
+        Ok(recipients) => CommandResult::passed(
+            "mom_llama.conversation_draft_recipients_update",
+            "contracted",
+            recipients,
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        ),
+        Err(blocker) => CommandResult::blocked(
+            "mom_llama.conversation_draft_recipients_update",
+            "blocked_recipients",
+            blocker,
+        ),
+    })
+}
+
 /// Opening a composer selects one durable draft, never a saved conversation.
 pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<Option<String>>> {
     let store = RuntimeStore::current()?;
@@ -273,7 +376,18 @@ pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<
             let current: Option<String> = documents
                 .get(NEW_CHAT_CONTEXT_NAMESPACE)?
                 .unwrap_or_default();
+            let explicit_persona = persona.is_some();
             let selected = persona.or(current);
+            if explicit_persona {
+                let recipients = DraftRecipients {
+                    recipient_ids: selected.iter().cloned().collect(),
+                    name: None,
+                };
+                documents.put_bytes(
+                    NEW_CHAT_RECIPIENTS_NAMESPACE,
+                    &serde_json::to_vec(&recipients)?,
+                )?;
+            }
             if let Some(id) = &selected {
                 anyhow::ensure!(
                     db.conversations
@@ -346,7 +460,22 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
                 .unwrap_or_default();
             let id = Uuid::new_v4().to_string();
             let now = now_ms().to_string();
-            let conversation = if let Some(persona) = persona {
+            let recipients: DraftRecipients = documents
+                .get(NEW_CHAT_RECIPIENTS_NAMESPACE)?
+                .unwrap_or_else(|| DraftRecipients {
+                    recipient_ids: persona.iter().cloned().collect(),
+                    name: None,
+                });
+            for recipient in &recipients.recipient_ids {
+                anyhow::ensure!(
+                    db.conversations
+                        .iter()
+                        .any(|contact| contact.id == *recipient
+                            && contact.kind == ConversationKind::PersonaTemplate),
+                    "Contact is unavailable"
+                );
+            }
+            let mut conversation = if let Some(persona) = persona {
                 match crate::personas::instantiate_from_documents(
                     db, documents, &persona, None, &id, &now,
                 )? {
@@ -364,6 +493,20 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
                 db.conversations.insert(0, conversation.clone());
                 conversation
             };
+            conversation.recipient_ids = recipients.recipient_ids;
+            if let Some(name) = recipients.name {
+                conversation.title = name;
+            }
+            let saved = db
+                .conversations
+                .iter_mut()
+                .find(|saved| saved.id == conversation.id)
+                .expect("newly created conversation");
+            *saved = conversation.clone();
+            documents.put_bytes(
+                NEW_CHAT_RECIPIENTS_NAMESPACE,
+                &serde_json::to_vec(&DraftRecipients::default())?,
+            )?;
             // Creation and transfer share one encrypted store transaction. A repeated
             // submission sees no new draft and cannot create another empty chat.
             crate::attachments::transfer_new_draft_attachments(
@@ -444,6 +587,7 @@ fn new_conversation(
         source_message_id: None,
         branch_root_message_id: None,
         active_leaf_message_id: None,
+        recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: Vec::new(),
     }
@@ -1034,6 +1178,7 @@ pub fn conversation_fork(
         source_message_id: Some(message_id.to_string()),
         branch_root_message_id: Some(message_id.to_string()),
         active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+        recipient_ids: source.recipient_ids,
         current_skill_ids: source.current_skill_ids,
         messages,
     };
@@ -1668,6 +1813,7 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
                 source_message_id: None,
                 branch_root_message_id: None,
                 active_leaf_message_id: None,
+                recipient_ids: Vec::new(),
                 current_skill_ids: Vec::new(),
                 messages: Vec::new(),
             };
@@ -1823,6 +1969,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: Some("reply".into()),
+            recipient_ids: Vec::new(),
             current_skill_ids: vec![],
             messages: vec![
                 message("user", None, MessageRole::User, "Actual subject\nDetails"),
@@ -1885,6 +2032,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         };
@@ -1927,6 +2075,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         }

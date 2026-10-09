@@ -119,3 +119,25 @@ can execute at most one exact tool call.
 FTE/generic-plugin speech dependencies outside the reviewed set, retired first-party Git sources in
 Mom's locked graph, child-manifest path overrides, and product network/process
 authority outside the bounded MCP adapter.
+
+## Contacts and unsent conversation routing
+
+Contacts are the existing Persona identities, not a second address book. The
+single encrypted unsent message remains in the draft owner. Its ordered contact
+IDs and optional group name are persisted by the conversation store; choosing
+contacts creates neither a saved conversation nor a Persona group. The existing
+single-template draft context determines the execution profile for a one-contact
+draft. Both records change in the same store transaction.
+
+First submission atomically creates the conversation, transfers its draft and
+attachments, persists its recipient IDs, and clears the new-draft routing.
+Subsequent dispatch resolves those IDs against current Persona identities and
+merges explicit mentions without rewriting message text. Missing recipients
+block dispatch. Forks retain recipient IDs. The renderer owns only autocomplete
+presentation and pending interaction; it cannot select models or infer contact
+identity from display names. Illustrations are local assets mapped to built-in
+IDs, with provenance in `ui/contact-portraits.json`; custom contacts use a neutral
+fallback.
+
+The desktop sidebar is always present and resizable. Settings are reached through
+the native application menu. Conversation chrome does not display model names.

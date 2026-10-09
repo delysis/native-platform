@@ -333,6 +333,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
         source_message_id: Some(input.message_id.clone()),
         branch_root_message_id: Some(input.message_id),
         active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+        recipient_ids: Vec::new(),
         current_skill_ids: source.current_skill_ids,
         messages,
     };
@@ -799,6 +800,11 @@ fn persona_remove_from_library_inner_in_scope(
                 let pending: Option<String> = documents.get(namespace)?.unwrap_or_default();
                 if pending.as_deref() == Some(input.persona_id.as_str()) {
                     documents.put_bytes(namespace, &serde_json::to_vec(&None::<String>)?)?;
+                }
+                let recipients_namespace = crate::conversation_store::NEW_CHAT_RECIPIENTS_NAMESPACE;
+                if let Some(mut recipients) = documents.get::<crate::conversation_store::DraftRecipients>(recipients_namespace)? {
+                    recipients.recipient_ids.retain(|id| id != &input.persona_id);
+                    documents.put_bytes(recipients_namespace, &serde_json::to_vec(&recipients)?)?;
                 }
                 if conversations.selected_conversation_id.as_deref()
                     == Some(input.persona_id.as_str())
@@ -1377,6 +1383,7 @@ pub(crate) fn instantiate_from_documents(
         source_message_id: persona.active_leaf_message_id,
         branch_root_message_id: None,
         active_leaf_message_id: messages.last().map(|message| message.id.to_string()),
+        recipient_ids: Vec::new(),
         current_skill_ids: persona.current_skill_ids,
         messages,
     };
@@ -1753,6 +1760,7 @@ fn reconcile_builtin_personas(
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         };
@@ -2064,6 +2072,7 @@ mod tests {
             source_message_id: Some("source-message".to_string()),
             branch_root_message_id: Some("retained-message".to_string()),
             active_leaf_message_id: Some("retained-message".to_string()),
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: vec![Message {
                 id: "retained-message".to_string(),
@@ -2157,6 +2166,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         }
@@ -2734,6 +2744,133 @@ mod tests {
                 .mention_handle,
             "my-robin"
         );
+    }
+
+    #[test]
+    fn named_recipient_draft_survives_navigation_and_transfers_once() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("named-recipient-draft");
+        super::ensure_builtin_catalog().expect("built-in contacts");
+        let before = load_db().expect("catalog");
+        let contacts: Vec<_> = before
+            .conversations
+            .iter()
+            .filter(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .take(2)
+            .map(|contact| contact.id.clone())
+            .collect();
+        conversation_draft_open(None).expect("open draft");
+        assert!(
+            conversation_draft_recipients_update(contacts.clone(), Some("Consultation".into()))
+                .expect("select contacts")
+                .result
+                .is_some()
+        );
+        assert_eq!(
+            load_db().expect("catalog").conversations,
+            before.conversations,
+            "selecting contacts must not create a chat or group"
+        );
+        assert!(
+            conversation_draft_submit()
+                .expect("empty submit")
+                .blocker
+                .is_some()
+        );
+        draft_update(Some("default"), "precious draft".into(), vec![]).expect("save draft");
+        conversation_select(&contacts[0]).expect("navigate away");
+        assert!(
+            conversation_draft_recipients_update(Vec::new(), None)
+                .expect("stale mutation")
+                .blocker
+                .is_some()
+        );
+        conversation_draft_open(None).expect("reopen draft");
+        assert_eq!(
+            conversation_draft_recipients()
+                .expect("durable recipients")
+                .recipient_ids,
+            contacts
+        );
+        assert_eq!(
+            draft_get(Some("default"))
+                .expect("durable draft")
+                .result
+                .expect("draft")
+                .message,
+            "precious draft"
+        );
+        let chat = conversation_draft_submit()
+            .expect("submit")
+            .result
+            .expect("created chat");
+        assert_eq!(chat.recipient_ids, contacts);
+        assert_eq!(chat.title, "Consultation");
+        assert_eq!(
+            draft_get(Some(&chat.id))
+                .expect("transferred")
+                .result
+                .expect("draft")
+                .message,
+            "precious draft"
+        );
+        assert_eq!(
+            conversation_draft_recipients()
+                .expect("new draft routing")
+                .recipient_ids,
+            Vec::<String>::new()
+        );
+        assert!(
+            conversation_draft_submit()
+                .expect("repeat")
+                .blocker
+                .is_some()
+        );
+        assert_eq!(
+            load_db().expect("catalog").conversations.len(),
+            before.conversations.len() + 1
+        );
+    }
+
+    #[test]
+    fn invalid_contact_selection_preserves_draft_and_prior_recipients() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("invalid-recipient-draft");
+        super::ensure_builtin_catalog().expect("catalog");
+        let contact = load_db()
+            .expect("catalog")
+            .conversations
+            .into_iter()
+            .find(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .expect("contact");
+        conversation_draft_open(Some(contact.id.clone())).expect("open draft");
+        draft_update(Some("default"), "retain me".into(), vec![]).expect("draft");
+        let expected = conversation_draft_recipients().expect("recipients");
+        for (ids, name) in [
+            (vec![contact.id.clone(), contact.id.clone()], None),
+            (vec!["missing".into()], None),
+            (vec![contact.id.clone(); 5], None),
+            (vec![contact.id.clone()], Some("bad\nname".into())),
+        ] {
+            assert!(
+                conversation_draft_recipients_update(ids, name)
+                    .expect("typed rejection")
+                    .blocker
+                    .is_some()
+            );
+            assert_eq!(
+                conversation_draft_recipients().expect("recipients"),
+                expected
+            );
+            assert_eq!(
+                draft_get(Some("default"))
+                    .expect("draft")
+                    .result
+                    .expect("draft")
+                    .message,
+                "retain me"
+            );
+        }
     }
 
     #[test]

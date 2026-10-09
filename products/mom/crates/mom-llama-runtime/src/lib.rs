@@ -50,9 +50,10 @@ pub use config::{
 pub use conversation_store::{
     ChatTemplatePolicy, Conversation, ConversationBranchSibling, ConversationExecutionProfile,
     ConversationExportFormat, ConversationKind, ConversationMutation, ConversationSearchHit,
-    DraftMessage, Message, MessageAttribution, MessageBranchSet, MessageBranchSibling, MessageCopy,
-    MessageRole, MessageSpeakerKind, TextAttachmentImport, ToolBinding, conversation_delete,
-    conversation_draft_open, conversation_draft_preview, conversation_draft_submit,
+    DraftMessage, DraftRecipients, Message, MessageAttribution, MessageBranchSet,
+    MessageBranchSibling, MessageCopy, MessageRole, MessageSpeakerKind, TextAttachmentImport,
+    ToolBinding, conversation_delete, conversation_draft_open, conversation_draft_preview,
+    conversation_draft_recipients, conversation_draft_recipients_update, conversation_draft_submit,
     conversation_export, conversation_fork, conversation_import_json, conversation_list,
     conversation_new, conversation_rename, conversation_search, conversation_select,
     conversation_siblings, conversation_system_message_update, draft_clear, draft_get,

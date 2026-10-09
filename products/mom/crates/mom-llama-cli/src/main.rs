@@ -488,6 +488,14 @@ enum ConversationCommand {
         #[arg(long)]
         json: bool,
     },
+    DraftRecipients {
+        #[arg(long = "recipient")]
+        recipient_ids: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     DraftSubmit {
         #[arg(long)]
         json: bool,
@@ -1455,6 +1463,14 @@ fn run() -> Result<()> {
             ConversationCommand::DraftOpen { persona, json } => {
                 print_result(mom_llama_runtime::conversation_draft_open(persona)?, json)
             }
+            ConversationCommand::DraftRecipients {
+                recipient_ids,
+                name,
+                json,
+            } => print_result(
+                mom_llama_runtime::conversation_draft_recipients_update(recipient_ids, name)?,
+                json,
+            ),
             ConversationCommand::DraftSubmit { json } => {
                 print_result(mom_llama_runtime::conversation_draft_submit()?, json)
             }

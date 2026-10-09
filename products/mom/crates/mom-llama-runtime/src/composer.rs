@@ -826,6 +826,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
             current_skill_ids: vec!["skill".to_string()],
             messages: Vec::new(),
         };

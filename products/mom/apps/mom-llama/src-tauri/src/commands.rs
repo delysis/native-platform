@@ -976,6 +976,21 @@ pub fn mom_llama_conversation_draft_open(
 }
 
 #[tauri::command]
+pub fn mom_llama_conversation_draft_recipients_update(
+    runtime: State<'_, AppRuntimeHandle>,
+    recipient_ids: Vec<String>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec(
+        "mom_llama_conversation_draft_recipients_update",
+    ))?;
+    command_value(mom_llama_runtime::conversation_draft_recipients_update(
+        recipient_ids,
+        name,
+    ))
+}
+
+#[tauri::command]
 pub fn mom_llama_conversation_draft_submit(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Value, String> {

@@ -242,14 +242,19 @@
     }
   };
 
+  const projectionRevisions = new Map();
   const swap = async (selector, command) => {
     const current = document.querySelector(selector);
     if (!current) return null;
+    const revision = (projectionRevisions.get(selector) || 0) + 1;
+    projectionRevisions.set(selector, revision);
     const replacement = parseFragment(await invokeMarkup(command));
+    if (projectionRevisions.get(selector) !== revision || document.querySelector(selector) !== current) return null;
     if (!replacement) throw new Error(`Renderer ${command} returned no element.`);
     if (activeSpeechPlayback?.panel && current.contains(activeSpeechPlayback.panel)) {
       await stopSpeechPlayback();
     }
+    if (projectionRevisions.get(selector) !== revision || document.querySelector(selector) !== current) return null;
     releaseAttachmentObjectUrls(current);
     current.replaceWith(replacement);
     sizeComposer();
@@ -2444,16 +2449,74 @@
     if (result?.status !== "blocked") {
       closeSettings();
       await refreshConversationProjection();
-      focusComposer();
+      const draftText = document.querySelector("#chat-form textarea[name='message']")?.value || "";
+      if (!persona && !draftText && document.getElementById("recipient-query")) document.getElementById("recipient-query").focus();
+      else focusComposer();
     }
   };
 
+  let recipientMutation = Promise.resolve();
+  const draftRecipientIds = () => Array.from(document.querySelectorAll('.recipients-header[data-unsent="true"] [data-recipient-id]'), (chip) => chip.dataset.recipientId);
+  const updateRecipients = (mutate) => {
+    const source = chat();
+    recipientMutation = recipientMutation.catch(() => {}).then(async () => {
+      if (source !== chat() || selectedConversation() !== "default") return;
+      await retainComposerDraft();
+      if (source !== chat() || selectedConversation() !== "default") return;
+      const ids = mutate(draftRecipientIds());
+      const name = document.getElementById("recipient-group-name")?.value || null;
+      const response = await invoke("mom_llama_conversation_draft_recipients_update", { recipientIds: ids, name });
+      report(response);
+      if (response?.status !== "blocked" && source === chat()) {
+        await refreshChat();
+        document.getElementById("recipient-query")?.focus();
+      }
+    });
+    return recipientMutation;
+  };
+  const filterRecipientOptions = () => {
+    const input = document.getElementById("recipient-query");
+    const list = document.getElementById("recipient-options");
+    if (!input || !list) return;
+    const query = input.value.trim().toLowerCase();
+    list.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !option.dataset.search.includes(query);
+  };
+  document.addEventListener("input", (event) => {
+    if (event.target.id === "recipient-query" && !event.isComposing) filterRecipientOptions();
+  });
+  document.addEventListener("focusin", (event) => {
+    if (event.target.id === "recipient-query") filterRecipientOptions();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.target.id !== "recipient-query" || event.isComposing) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      document.querySelector('.recipient-option:not([hidden])')?.focus();
+    } else if (event.key === "Escape") {
+      document.getElementById("recipient-options").hidden = true;
+      event.target.setAttribute("aria-expanded", "false");
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (event.target.value.trim()) document.querySelector('.recipient-option:not([hidden])')?.click();
+    }
+  });
+  document.addEventListener("focusout", (event) => {
+    const header = event.target.closest?.(".recipients-header");
+    if (header && !header.contains(event.relatedTarget)) {
+      const list = document.getElementById("recipient-options");
+      if (list) list.hidden = true;
+      document.getElementById("recipient-query")?.setAttribute("aria-expanded", "false");
+    }
+  });
+  document.addEventListener("change", (event) => {
+    if (event.target.id === "recipient-group-name") updateRecipients((ids) => ids).catch(reportError);
+  });
+
   const actionHandlers = {
-    "sidebar-toggle": async () => {
-      await invoke("mom_llama_conversation_list");
-      shell()?.classList.toggle("sidebar-open");
-      sizeComposer();
-    },
+    "recipient-add": async (button) => updateRecipients((ids) => ids.includes(button.dataset.recipient) ? ids : [...ids, button.dataset.recipient]),
+    "recipient-remove": async (button) => updateRecipients((ids) => ids.filter((id) => id !== button.dataset.recipient)),
     "sidebar-section-toggle": async (button) => {
       const section = button.dataset.sidebarSection;
       const list = document.getElementById(button.getAttribute("aria-controls"));
@@ -3329,6 +3392,7 @@
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
         try {
+          await recipientMutation;
           if (sourceConversation === "default") {
             await persistDraftNow(message, attachmentIds, sourceConversation);
             const created = await invoke("mom_llama_conversation_draft_submit");
@@ -3666,6 +3730,9 @@
   const listen = async () => {
     const events = tauri() && tauri().event;
     if (!events || typeof events.listen !== "function") return;
+    await events.listen("mom_llama_settings_open", async () => {
+      try { await invoke("mom_llama_settings_get"); openSettings(); } catch (error) { reportError(error); }
+    });
     await events.listen("mom_llama_chat_stream", onChatEvent);
     await events.listen("mom_llama_chat_dispatch_stream", onDispatchEvent);
     await events.listen("mom_llama_tool_loop_stream", onToolLoopEvent);
@@ -3711,8 +3778,7 @@
         applyCustomCss(shell()?.dataset.customCss || "");
         await hydrateAttachmentPreviews(root);
         restoreChatViewport(null, chat());
-        const alwaysShowSidebar = shell()?.dataset.alwaysShowSidebar === "true";
-        if (window.innerWidth >= 1180 && alwaysShowSidebar) shell()?.classList.add("sidebar-open");
+
         sizeComposer();
         await listen();
       } catch (error) {

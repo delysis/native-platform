@@ -16,6 +16,8 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
+const APPLICATION_SETTINGS_MENU_ID: &str = "mom-llama.application.settings";
+
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
@@ -431,6 +433,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_persona_group_update,
         commands::mom_llama_persona_group_delete,
         commands::mom_llama_conversation_draft_open,
+        commands::mom_llama_conversation_draft_recipients_update,
         commands::mom_llama_conversation_draft_submit,
         commands::mom_llama_conversation_new,
         commands::mom_llama_conversation_list,
@@ -661,6 +664,14 @@ pub fn run() {
                 request_startup_aware_exit(app_handle, &event_startup, &event_exit_allowed, 0);
                 return;
             }
+            if let tauri::RunEvent::MenuEvent(menu_event) = &event
+                && menu_event.id() == APPLICATION_SETTINGS_MENU_ID
+            {
+                if let Err(error) = app_handle.emit("mom_llama_settings_open", ()) {
+                    eprintln!("Could not open Settings: {error}");
+                }
+                return;
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if event_exit_allowed.load(Ordering::Acquire) {
                     return;
@@ -751,6 +762,14 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        APPLICATION_SETTINGS_MENU_ID,
+                        "Settings…",
+                        true,
+                        Some("CmdOrCtrl+,"),
+                    )?,
                     &PredefinedMenuItem::separator(app)?,
                     &PredefinedMenuItem::services(app, None)?,
                     &PredefinedMenuItem::separator(app)?,

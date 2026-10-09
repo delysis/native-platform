@@ -20,6 +20,7 @@ const personasRuntime = read("crates/mom-llama-runtime/src/personas.rs");
 const cli = read("crates/mom-llama-cli/src/main.rs");
 
 const backendOnlyCommandIds = [
+  "mom_llama.conversation_new",
   "mom_llama.engine_check",
   "mom_llama.engine_configure",
   "mom_llama.kv_cache_clear",
@@ -103,8 +104,8 @@ test("model choice is a scoped searchable picker with automatic projector pairin
   ]) {
     assert.ok(!viewProduction.includes(marker), `obsolete model UI remains: ${marker}`);
   }
-  assert.ok(composer.includes('"Model for this chat"'));
-  assert.ok(composer.includes("effective_conversation_model_path(active, settings)"));
+  assert.ok(!composer.includes("model_picker("));
+  assert.ok(!composer.includes("effective_conversation_model_path(active, settings)"));
 
   for (const marker of [
     "const selectAndLoadModel",

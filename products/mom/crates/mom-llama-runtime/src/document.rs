@@ -160,6 +160,7 @@ mod tests {
             source_message_id: None,
             branch_root_message_id: None,
             active_leaf_message_id: head.map(str::to_owned),
+            recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages,
         }
