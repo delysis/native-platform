@@ -329,8 +329,29 @@ impl ProjectStore {
     }
 
     pub fn reconstruct_revision(&self, revision_id: RevisionId) -> Result<Vec<u8>> {
-        let segments = self.load_revision_segments(revision_id)?;
-        reconstruct_segments(self, &segments)
+        Ok(self.revision_document(revision_id)?.text().into_bytes())
+    }
+
+    pub fn revision_document(
+        &self,
+        revision_id: RevisionId,
+    ) -> Result<
+        workspace_document::Document<
+            'static,
+            workspace_document::SourceReference,
+            ContributionKind,
+        >,
+    > {
+        let snapshot = crate::document_snapshot::load(self, revision_id)?;
+        snapshot.resolve(|source| {
+            let artifact_id = parse_id::<ArtifactId>(&source.occurrence_id, "source occurrence")?;
+            let blob_id: String = self.connection.query_row(
+                "SELECT blob_id FROM artifacts WHERE artifact_id = ?1",
+                [artifact_id.to_string()],
+                |row| row.get(0),
+            )?;
+            self.read_blob(parse_blob_id(&blob_id)?)
+        })
     }
 
     pub(crate) fn verify_visible_source(
@@ -454,12 +475,19 @@ impl ProjectStore {
                 write.created_at_ms,
             )?;
         }
-        let metadata = serde_json::to_string(&json!({
-            "workflow": write.workflow,
-            "relative_path": write.relative_path,
-            "reason": write.reason,
-            "source_revision_id": write.expected.revision_id,
-        }))?;
+        let metadata = serde_json::to_string(&crate::document_snapshot::seal(
+            json!({
+                "workflow": write.workflow, "relative_path": write.relative_path,
+                "reason": write.reason, "source_revision_id": write.expected.revision_id,
+            }),
+            crate::document_snapshot::RevisionIdentity {
+                document_id: write.document_id,
+                revision_id: write.revision_id,
+                parent_revision_id: Some(write.expected.revision_id),
+                kind: write.document_kind,
+            },
+            write.segments,
+        )?)?;
         transaction.execute(
             "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms)
              VALUES (?1, ?2, 'document_revision', ?3, ?4, ?5)",
@@ -566,6 +594,24 @@ impl ProjectStore {
     }
 
     pub(crate) fn load_revision_segments(
+        &self,
+        revision_id: RevisionId,
+    ) -> Result<Vec<StoredSegment>> {
+        crate::document_snapshot::load(self, revision_id)?
+            .parts()
+            .iter()
+            .map(|part| {
+                Ok(StoredSegment {
+                    artifact_id: parse_id(&part.source.occurrence_id, "source occurrence")?,
+                    start: part.source.start_byte,
+                    end: part.source.end_byte,
+                    contribution: part.metadata,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn load_revision_segment_index(
         &self,
         revision_id: RevisionId,
     ) -> Result<Vec<StoredSegment>> {
@@ -1072,11 +1118,14 @@ pub(crate) fn slice_segments(
     Ok(selected)
 }
 
-pub(crate) fn reconstruct_segments(
+/// The shared content document retains every artifact occurrence, source range,
+/// and contribution. Callers may render it as writing or use its typed parts as
+/// untrusted chat context without flattening the stored provenance.
+fn document_from_segments(
     store: &ProjectStore,
     segments: &[StoredSegment],
-) -> Result<Vec<u8>> {
-    let mut reconstructed = Vec::new();
+) -> Result<workspace_document::Document<'static, ArtifactId, ContributionKind>> {
+    let mut document = workspace_document::Document::new();
     for segment in segments {
         let blob_id: String = store.connection.query_row(
             "SELECT blob_id FROM artifacts WHERE artifact_id = ?1",
@@ -1084,25 +1133,29 @@ pub(crate) fn reconstruct_segments(
             |row| row.get(0),
         )?;
         let bytes = store.read_blob(parse_blob_id(&blob_id)?)?;
-        let start = usize::try_from(segment.start)
-            .map_err(|_| StoreError::CorruptDatabase("segment start overflow".into()))?;
-        let end = usize::try_from(segment.end)
-            .map_err(|_| StoreError::CorruptDatabase("segment end overflow".into()))?;
-        let slice = bytes.get(start..end).ok_or_else(|| {
-            StoreError::CorruptDatabase(format!(
-                "segment range is outside artifact {}",
-                segment.artifact_id
-            ))
-        })?;
-        std::str::from_utf8(slice).map_err(|_| {
-            StoreError::CorruptDatabase(format!(
-                "segment range splits UTF-8 in artifact {}",
-                segment.artifact_id
-            ))
-        })?;
-        reconstructed.extend_from_slice(slice);
+        document
+            .push_slice(
+                segment.artifact_id,
+                &bytes,
+                segment.start..segment.end,
+                workspace_document::PartKind::Text,
+                segment.contribution,
+            )
+            .map_err(|error| {
+                StoreError::CorruptDatabase(format!(
+                    "invalid document part for artifact {}: {error}",
+                    segment.artifact_id
+                ))
+            })?;
     }
-    Ok(reconstructed)
+    Ok(document)
+}
+
+pub(crate) fn reconstruct_segments(
+    store: &ProjectStore,
+    segments: &[StoredSegment],
+) -> Result<Vec<u8>> {
+    Ok(document_from_segments(store, segments)?.text().into_bytes())
 }
 
 pub(crate) fn validate_segment_projection(

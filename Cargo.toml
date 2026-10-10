@@ -1,5 +1,11 @@
 [workspace]
 members = [
+    "crates/desktop-vault",
+    "crates/desktop-generation-policy",
+    "products/loom/crates/loom-config",
+    "products/loom/crates/loom-markdown",
+    "products/loom/crates/loom-text-session",
+    "products/loom/experiments/easl-interface",
     "crates/desktop-launch",
     "crates/workspace-document",
     "crates/desktop-model-defaults",
@@ -66,6 +72,9 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-vault = { path = "crates/desktop-vault" }
+desktop-generation-policy = { path = "crates/desktop-generation-policy" }
+loom-config = { path = "products/loom/crates/loom-config" }
 desktop-launch = { path = "crates/desktop-launch" }
 workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
@@ -95,7 +104,7 @@ rand = "0.9"
 rand_chacha = "0.9.0"
 rand_core = "0.9.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -209,6 +218,9 @@ strip = "symbols"
 strip = "none"
 
 [patch.crates-io]
+# EASL owns these text-engine repairs; keep all consumers on its exact revision.
+harfrust = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
+parley = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }
 # Keep verified ONNX Runtime DLLs beside Windows test/example executables.
