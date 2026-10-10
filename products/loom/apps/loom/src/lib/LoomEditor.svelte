@@ -135,7 +135,8 @@
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
-    anchorByteOffset: number
+    anchorByteOffset: number,
+    selectionPinned: boolean
   ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (
@@ -425,7 +426,8 @@
           snapshot.candidateId,
           snapshot.presentationKey,
           snapshot.surfaceKey,
-          provenAnchorByteOffset
+          provenAnchorByteOffset,
+          current.lensPinned
         );
       });
     }

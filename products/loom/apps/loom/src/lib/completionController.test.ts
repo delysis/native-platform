@@ -188,6 +188,42 @@ describe('pure completion controller', () => {
     expect(completionControllerView(state, contextKey, family, true, true).selected?.runId).toBe('run-c');
   });
 
+  it('does not advance a pinned default visual selection after rejection', () => {
+    const initial = readyController();
+    const selected = completionControllerView(initial, contextKey, family, true, true).selected!;
+    const state = rejectVisualPresentation(initial, {
+      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
+      presentationKey: selected.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: selected.targetByte, selectionPinned: true
+    });
+    expect(state.session?.selectedRunId).toBe('run-a');
+    expect(state.activeRunId).toBe('run-a');
+    expect(completionControllerView(state, contextKey, family, true, true).selected).toBeNull();
+  });
+
+  it('keeps exact rollback authority when an accepted visual tail is rejected', () => {
+    const inserted = insert('option_word', ' one ');
+    const state = observeTextMutation(inserted.state, 'Hello one ', manuscript, false).state;
+    const selected = completionControllerView(state, contextKey, family, true, true).selected!;
+    const rejected = rejectVisualPresentation(state, {
+      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
+      presentationKey: selected.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: selected.targetByte
+    });
+    const rollback = completionControllerView(rejected, contextKey, family, true, true);
+    expect(rejected.session?.selectedRunId).toBe('run-a');
+    expect(rejected.session?.acceptedChunks).toEqual([' one ']);
+    expect(rollback.selected).toMatchObject({ runId: 'run-a', text: '' });
+    expect(rollback.unconsumeText).toBe(' one ');
+    const undo = authorizeCompletionUnconsume(rejected, {
+      eligible: rollback.selected, candidateId: rollback.selected!.candidateId,
+      presentationKey: rollback.selected!.presentationKey, text: rollback.unconsumeText,
+      manuscriptText: 'Hello one '
+    });
+    expect(undo.authorized).toBe(true);
+    expect(undo.state.pendingText).toBe(manuscript);
+  });
+
   it('settles with no visual selection after every default family member is rejected', () => {
     let state = readyController();
     for (const expectedRunId of ['run-a', 'run-b', 'run-c', 'run-d']) {

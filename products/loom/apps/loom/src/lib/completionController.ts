@@ -272,17 +272,21 @@ export function completionControllerView(
   const unconsumeText = boundSession ? completionRollbackText(boundSession) : '';
   const presentation = boundSession && state.pendingText === null
     ? completionPresentation(boundSession) : null;
+  const selectedPresentationRejected = Boolean(visualSurface && presentation &&
+    state.unpresentableVisualKeys.includes(presentation.presentationKey));
   // Exhaustion hides the fan, but the accepted chunk still needs its exact
   // candidate identity and end offset for reversal at the editor boundary.
   const rollback = presentation && (boundSession?.presentationsRetired ||
-    (presentation.text === '' && unconsumeText !== '')) ? presentation : null;
+    (presentation.text === '' && unconsumeText !== '') ||
+    (selectedPresentationRejected && unconsumeText !== '')) ? presentation : null;
   const selectedByActiveRun = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ?? null;
   const fallback = activeFamily.length === 0
     ? (rollback ? { ...rollback, text: '' } : null)
     : state.activeRunId === null || !visualSurface
       ? activeFamily[0]
       : null;
-  const selected = selectedByActiveRun ?? fallback;
+  const selected = selectedByActiveRun ??
+    (selectedPresentationRejected && rollback ? { ...rollback, text: '' } : fallback);
   const witnessSelected = selected && boundSession
     ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
     : null;
@@ -561,6 +565,7 @@ export interface RejectVisualPresentationInput {
   surfaceKey: string;
   currentSurfaceKey: string;
   anchorByte: number;
+  selectionPinned?: boolean;
 }
 
 export function rejectVisualPresentation(
@@ -582,6 +587,7 @@ export function rejectVisualPresentation(
   const session = state.session;
   if (
     state.visualSelectionOrigin !== 'default' ||
+    input.selectionPinned ||
     !session ||
     session.acceptedChunks.length > 0 ||
     session.selectedRunId !== input.eligible.runId ||

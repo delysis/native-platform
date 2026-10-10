@@ -8385,7 +8385,8 @@
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
-    anchorByteOffset: number
+    anchorByteOffset: number,
+    selectionPinned = false
   ): void {
     completionController = rejectVisualPresentation(completionController, {
       mode,
@@ -8394,7 +8395,8 @@
       presentationKey,
       surfaceKey,
       currentSurfaceKey: visualGhostSurfaceKey,
-      anchorByte: anchorByteOffset
+      anchorByte: anchorByteOffset,
+      selectionPinned
     });
   }
 
