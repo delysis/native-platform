@@ -1174,6 +1174,11 @@ fn run_generation_worker(
                         Err(error) => break 'worker Err(LlamaBackendError::Native(error)),
                     }
                 }
+                // A drained stream that exceeded its bound has lost candidate
+                // authority. Reject before constructing output provenance.
+                if let Some(error) = events.stream_failure() {
+                    break Err(LlamaBackendError::OutputContract(error));
+                }
                 break build_result(
                     &request,
                     identities,
@@ -1188,14 +1193,6 @@ fn run_generation_worker(
             Err(error) => break Err(LlamaBackendError::Native(error)),
         }
     };
-
-    let result = result.and_then(|materials| {
-        if let Some(error) = events.stream_failure() {
-            Err(LlamaBackendError::OutputContract(error))
-        } else {
-            Ok(materials)
-        }
-    });
 
     match result {
         Ok(materials) => {
@@ -3069,6 +3066,15 @@ mod tests {
 
     #[test]
     fn text_over_native_output_ceiling_fails_authority_without_candidate() {
+        assert_stream_overflow_precedes_candidate_validation(true);
+    }
+
+    #[test]
+    fn stream_overflow_precedes_invalid_native_output_count() {
+        assert_stream_overflow_precedes_candidate_validation(false);
+    }
+
+    fn assert_stream_overflow_precedes_candidate_validation(valid_outputs: bool) {
         let mut request = request_with_two_cases();
         request.cases.truncate(1);
         let case = &request.cases[0];
@@ -3102,7 +3108,11 @@ mod tests {
                 },
             },
         ];
-        let outputs = vec![native_output(&request, 0, GenerationState::Completed, true)];
+        let outputs = if valid_outputs {
+            vec![native_output(&request, 0, GenerationState::Completed, true)]
+        } else {
+            Vec::new()
+        };
         let runtime = fake_runtime(
             &request,
             outputs,
