@@ -93,3 +93,8 @@ Rejected proposals remain in the bounded attempt ledger; numeric prose and liter
 `<3 forever` remain eligible. Source uses its existing automatic V2 policy and
 retains multiline Markdown. V3 records keep their original policy semantics.
 The captured editor mode fixes the request policy across an uncertain-command retry.
+
+Visual Loompad uses `loompad_visual_v3` with the same native visual-prose
+admission as Visual Ghost. Source Loompad retains `loompad_v2`. The immutable
+batch records its admission policy; replay and presentation reject a different
+surface policy. Four-slot families and the 4/16/64/256 sampling caps are unchanged.

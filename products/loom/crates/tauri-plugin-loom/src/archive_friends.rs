@@ -214,7 +214,10 @@ pub(super) async fn prepare(
         )? {
             return Ok(Admission::Replay(replay));
         }
-        if matches!(validated, ValidatedWeavePolicy::LoompadV2 { .. }) {
+        if matches!(
+            validated,
+            ValidatedWeavePolicy::LoompadV2 { .. } | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+        ) {
             ensure_no_active_generations(state, "extending idle choices")?;
         }
         let _model = lock_model_lifecycle(state)?;

@@ -392,6 +392,7 @@ impl Drop for AutomaticBudgetReservation<'_> {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LoompadBatch {
+    admission_policy: llama_native_types::FirstWordChoicePolicy,
     snapshot_id: String,
     sample_target: u32,
     batch_offset: u32,
@@ -910,9 +911,13 @@ mod automatic_writer_authority {
                 ValidatedWeavePolicy::AutomaticV2
                 | ValidatedWeavePolicy::AutomaticV3
                 | ValidatedWeavePolicy::AutomaticVisualV4
-                | ValidatedWeavePolicy::LoompadV2 { .. } => AuthorizedWeaveModelKind::Automatic(
-                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
-                ),
+                | ValidatedWeavePolicy::LoompadV2 { .. }
+                | ValidatedWeavePolicy::LoompadVisualV3 { .. } => {
+                    AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
+                        loaded,
+                        build_policy,
+                    )?)
+                }
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
             Ok(Self { policy, kind })
@@ -3014,6 +3019,10 @@ enum WeavePolicySnapshot {
         sample_target: u32,
         batch_offset: u32,
     },
+    LoompadVisualV3 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
     ManualV2 {
         branch_count: u32,
         max_tokens: u32,
@@ -3043,6 +3052,10 @@ enum ValidatedWeavePolicy {
     AutomaticV3,
     AutomaticVisualV4,
     LoompadV2 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
+    LoompadVisualV3 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -8409,16 +8422,13 @@ fn replay_weave_if_recorded(
                 ));
             }
         }
-        let policy_matches = match (policy, &speculation) {
-            (
-                ValidatedWeavePolicy::LoompadV2 {
-                    sample_target,
-                    batch_offset,
-                },
-                Some(batch),
-            ) => *sample_target == batch.sample_target && *batch_offset == batch.batch_offset,
-            (ValidatedWeavePolicy::LoompadV2 { .. }, None) | (_, Some(_)) => false,
-            (_, None) => true,
+        let policy_matches = match &speculation {
+            Some(batch) => policy.matches_loompad_batch(batch),
+            None => !matches!(
+                policy,
+                ValidatedWeavePolicy::LoompadV2 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+            ),
         };
         let family_matches = policy_matches
             && resolved.is_some_and(|resolved| {
@@ -8730,9 +8740,23 @@ fn weave_start_inner<R: Runtime>(
         ValidatedWeavePolicy::LoompadV2 {
             sample_target,
             batch_offset,
+        }
+        | ValidatedWeavePolicy::LoompadVisualV3 {
+            sample_target,
+            batch_offset,
         } => {
             ensure_no_active_generations(state, "extending idle choices")?;
-            Some((*sample_target, *batch_offset))
+            Some((
+                *sample_target,
+                *batch_offset,
+                match &policy {
+                    ValidatedWeavePolicy::LoompadVisualV3 { .. } => "loompad_visual_v3",
+                    _ => "loompad_v2",
+                },
+                policy
+                    .first_word_choices()
+                    .expect("Loompad requires native admission"),
+            ))
         }
         _ => None,
     };
@@ -8958,18 +8982,18 @@ fn weave_start_inner<R: Runtime>(
         if !attachment_context.media.is_empty() {
             authorized_model.validate_media(&attachment_context.media)?;
         }
-        let speculation = loompad_request.map(|(sample_target, batch_offset)| {
+        let speculation = loompad_request.map(|(sample_target, batch_offset, policy_name, admission_policy)| {
             let context = continuation_context_binding(&attachment_context.context_preamble, &attachment_context.media)
                 .map_err(|error| IpcFailure::backend(&error))?;
             let identity = serde_json::to_vec(&serde_json::json!({
-                "policy": "loompad_v2", "project": store.manifest().project_id,
+                "policy": policy_name, "project": store.manifest().project_id,
                 "session": active_session_id, "document": document_id, "revision": source_revision_id,
                 "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
                 "context": context, "model": model_environment,
                 "materials": BlobId::digest(&serde_json::to_vec(&material_plan)
                     .map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?),
             })).map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?;
-            Ok::<_, IpcFailure>(LoompadBatch { snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
+            Ok::<_, IpcFailure>(LoompadBatch { admission_policy, snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
         }).transpose()?;
         let mut loompad_budget = if let Some(batch) = &speculation {
             let mut budget = state.loompad_budget.lock().map_err(|_| {
@@ -9482,6 +9506,10 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
         WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
+        }
+        | WeavePolicySnapshot::LoompadVisualV3 {
+            sample_target,
+            batch_offset,
         } => {
             if !matches!(sample_target, 4 | 16 | 64 | 256)
                 || batch_offset % 4 != 0
@@ -9493,9 +9521,16 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
                     false,
                 ));
             }
-            ValidatedWeavePolicy::LoompadV2 {
-                sample_target,
-                batch_offset,
+            if matches!(policy, WeavePolicySnapshot::LoompadVisualV3 { .. }) {
+                ValidatedWeavePolicy::LoompadVisualV3 {
+                    sample_target,
+                    batch_offset,
+                }
+            } else {
+                ValidatedWeavePolicy::LoompadV2 {
+                    sample_target,
+                    batch_offset,
+                }
             }
         }
         WeavePolicySnapshot::ManualV2 {
@@ -9533,10 +9568,28 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
 }
 
 impl ValidatedWeavePolicy {
+    fn matches_loompad_batch(&self, batch: &LoompadBatch) -> bool {
+        match self {
+            Self::LoompadV2 {
+                sample_target,
+                batch_offset,
+            }
+            | Self::LoompadVisualV3 {
+                sample_target,
+                batch_offset,
+            } => {
+                *sample_target == batch.sample_target
+                    && *batch_offset == batch.batch_offset
+                    && self.first_word_choices() == Some(batch.admission_policy)
+            }
+            _ => false,
+        }
+    }
+
     const fn first_word_choices(&self) -> Option<llama_native_types::FirstWordChoicePolicy> {
         match self {
             Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV2),
-            Self::AutomaticVisualV4 => {
+            Self::AutomaticVisualV4 | Self::LoompadVisualV3 { .. } => {
                 Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
             }
             Self::AutomaticV3 => {
@@ -9551,7 +9604,8 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
-            | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            | Self::LoompadV2 { .. }
+            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
@@ -9561,7 +9615,7 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4 => {
                 AUTOMATIC_WEAVE_MAX_TOKENS_V2
             }
-            Self::LoompadV2 { .. } => 128,
+            Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
@@ -9571,7 +9625,8 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
-            | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            | Self::LoompadV2 { .. }
+            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
@@ -9597,6 +9652,7 @@ impl ValidatedWeavePolicy {
                 ));
             }
             (Self::LoompadV2 { .. }, _) => WeavePreset::LoompadV2,
+            (Self::LoompadVisualV3 { .. }, _) => WeavePreset::LoompadV2,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
@@ -9627,7 +9683,7 @@ fn sampling_for_weave_case(
         top_k: 40,
         // Keep enough support for distinct words. Retries use this exact saved
         // sampler; they never secretly widen a narrowed distribution.
-        top_p: if preset == WeavePreset::LoompadV2 {
+        top_p: if matches!(preset, WeavePreset::LoompadV2) {
             1.0
         } else {
             0.95
@@ -14195,32 +14251,74 @@ mod tests {
     }
 
     #[test]
-    fn loompad_policy_bounds_each_native_batch_and_total_target() {
-        for target in [4, 16, 64, 256] {
-            let policy = validate_weave_policy(WeavePolicySnapshot::LoompadV2 {
-                sample_target: target,
-                batch_offset: target - 4,
-            })
-            .expect("valid final batch");
-            assert_eq!(policy.branch_count(), 4);
-            assert_eq!(policy.max_tokens(), 128);
-        }
-        for (target, offset) in [
-            (0, 0),
-            (8, 0),
-            (1024, 0),
-            (16, 1),
-            (16, 16),
-            (256, u32::MAX),
+    fn loompad_policy_binds_surface_admission_without_expanding_native_budgets() {
+        for (kind, expected) in [
+            (
+                "loompad_v2",
+                llama_native_types::FirstWordChoicePolicy::DistinctV2,
+            ),
+            (
+                "loompad_visual_v3",
+                llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4,
+            ),
         ] {
-            assert!(
-                validate_weave_policy(WeavePolicySnapshot::LoompadV2 {
-                    sample_target: target,
-                    batch_offset: offset,
-                })
-                .is_err()
-            );
+            for target in [4, 16, 64, 256] {
+                let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
+                    "kind": kind, "sample_target": target, "batch_offset": target - 4
+                }))
+                .expect("explicit surface policy");
+                let policy = validate_weave_policy(parsed).expect("valid final batch");
+                assert_eq!(policy.first_word_choices(), Some(expected));
+                assert_eq!(policy.branch_count(), 4);
+                assert_eq!(policy.max_tokens(), 128);
+            }
+            for (target, offset) in [
+                (0, 0),
+                (8, 0),
+                (1024, 0),
+                (16, 1),
+                (16, 16),
+                (256, u32::MAX),
+            ] {
+                let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
+                    "kind": kind, "sample_target": target, "batch_offset": offset
+                }))
+                .expect("surface policy");
+                assert!(validate_weave_policy(parsed).is_err());
+            }
         }
+        assert!(
+            serde_json::from_value::<LoompadBatch>(serde_json::json!({
+                "snapshot_id": BlobId::digest(b"unspecified admission").to_string(),
+                "sample_target": 4, "batch_offset": 0
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn loompad_replay_rejects_another_surface_even_with_identical_sampling_bounds() {
+        let source = ValidatedWeavePolicy::LoompadV2 {
+            sample_target: 4,
+            batch_offset: 0,
+        };
+        let visual = ValidatedWeavePolicy::LoompadVisualV3 {
+            sample_target: 4,
+            batch_offset: 0,
+        };
+        let mut batch = LoompadBatch {
+            admission_policy: llama_native_types::FirstWordChoicePolicy::DistinctV2,
+            snapshot_id: BlobId::digest(b"source choices").to_string(),
+            sample_target: 4,
+            batch_offset: 0,
+        };
+        assert!(source.matches_loompad_batch(&batch));
+        assert!(!visual.matches_loompad_batch(&batch));
+        batch.admission_policy = llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4;
+        assert!(visual.matches_loompad_batch(&batch));
+        assert!(!source.matches_loompad_batch(&batch));
+        batch.batch_offset = 4;
+        assert!(!visual.matches_loompad_batch(&batch));
     }
 
     #[test]
@@ -14229,6 +14327,7 @@ mod tests {
         let session = CommandId::new();
         let start = Instant::now();
         let mut batch = LoompadBatch {
+            admission_policy: llama_native_types::FirstWordChoicePolicy::DistinctV2,
             snapshot_id: BlobId::digest(b"snapshot").to_string(),
             sample_target: 4,
             batch_offset: 0,
@@ -14296,6 +14395,7 @@ mod tests {
             .read_document(INITIAL_DOCUMENT)
             .expect("read document");
         let batch = LoompadBatch {
+            admission_policy: llama_native_types::FirstWordChoicePolicy::DistinctV2,
             snapshot_id: BlobId::digest(b"exact prompt context and model").to_string(),
             sample_target: 64,
             batch_offset: 12,

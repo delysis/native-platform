@@ -350,6 +350,7 @@ export interface BranchBody {
 }
 
 export interface LoompadBatch {
+  admission_policy: 'distinct_v2' | 'distinct_visual_prose_v4';
   snapshot_id: string;
   sample_target: 4 | 16 | 64 | 256;
   batch_offset: number;

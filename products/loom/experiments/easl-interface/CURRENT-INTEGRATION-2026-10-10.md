@@ -13,3 +13,10 @@ The source checkpoint passed 297 service tests and 120 native adapter component 
 Earlier audit and handoff files are historical evidence and proposals. Their obsolete paths, baseline counts and requested follow-ups do not authorize product changes or establish current qualification. Failed source-reference, compilation and encrypted-storage receipts remain preserved externally.
 
 The candidate adds read-only Loompad scope comparisons to the existing hidden completion witness to diagnose a packaged-native qualification refusal after fresh Visual edits. These comparisons confer no generation or insertion authority. Native acceptance remains open.
+
+Native scope diagnostics excluded a caret/revision/blob/intent/edit mismatch.
+Visual Loompad now requests prose-safe admission and verifies the saved batch
+policy before presentation. Temporary scope diagnostics are removed from the
+final UI; their exact diagnostic builds and failed receipts remain preserved.
+The reference App hash is refreshed for the reviewed policy selection/check.
+Native qualification remains open until the repaired exact artifact passes.

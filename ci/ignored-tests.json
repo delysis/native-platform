@@ -324,7 +324,7 @@
     {
       "package": "loom-easl-interface",
       "src_path": "products/loom/experiments/easl-interface/build.rs",
-      "sha256": "08d946239fde198e8b85cda6da12ef0fef59ce642685018b836fac96e2cc870b"
+      "sha256": "285604668fb6d41f692a272e3270b6d51b5aec6de5e82bbf2d8947dd7392fda7"
     }
   ],
   "entries": [

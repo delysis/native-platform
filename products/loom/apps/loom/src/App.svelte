@@ -1501,21 +1501,6 @@
   let nativeDropWitness: { type: string; point: { x: number; y: number } | null; scope: string | null; path_count: number } | null = null;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
-    pending_runs: activeFamilyEvaluation?.phase.kind === 'pending'
-      ? activeFamilyEvaluation.phase.runIds : [],
-    loompad_scope: {
-      mode,
-      matches: loompadReservoir?.key === loompadSnapshotKey,
-      caret: mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte,
-      captured_caret: loompadReservoir?.capture.cursorByte ?? null,
-      revision_matches: loompadReservoir?.capture.sourceRevisionId === document?.summary.revision_id,
-      blob_matches: loompadReservoir?.capture.visibleBlobId === document?.visible_blob_id,
-      intent_matches: loompadReservoir?.capture.intentEpoch === completionController.intentEpoch,
-      edit_matches: loompadReservoir?.capture.editVersion === editVersion,
-      context_matches: loompadReservoir?.capture.contextEpoch === contextEpoch,
-      epoch_matches: loompadReservoir?.capture.epoch === documentEpoch,
-      phase: activeFamilyEvaluation?.phase.kind ?? 'inactive'
-    },
     native_drop: nativeDropWitness,
     writer_id: currentWriter?.model_id ?? '',
     writer_source: configuredWriter ? 'configured_server' : 'native',
@@ -9078,7 +9063,8 @@
     if (!weaveCaptureStillCurrent(captured)) return false;
     if (captured.speculation) {
       const batch = started.speculation;
-      if (!batch || !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
+      if (!batch || batch.admission_policy !== (captured.mode === 'visual' ? 'distinct_visual_prose_v4' : 'distinct_v2') ||
+          !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
           batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
         throw new Error('The desktop returned choices for a different sampling boundary.');
       }
@@ -9326,7 +9312,7 @@
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
         policy: captured.speculation
-          ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          ? { kind: captured.mode === 'visual' ? 'loompad_visual_v3' : 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
           : { kind: captured.mode === 'visual' ? 'automatic_visual_v4' : 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {

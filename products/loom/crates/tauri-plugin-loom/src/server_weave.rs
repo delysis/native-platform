@@ -27,6 +27,7 @@ impl Engine {
                     | ValidatedWeavePolicy::AutomaticV3
                     | ValidatedWeavePolicy::AutomaticVisualV4
                     | ValidatedWeavePolicy::LoompadV2 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV3 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {
@@ -632,6 +633,7 @@ mod tests {
             WeavePolicySnapshot::AutomaticV3 {}
                 | WeavePolicySnapshot::AutomaticVisualV4 {}
                 | WeavePolicySnapshot::LoompadV2 { .. }
+                | WeavePolicySnapshot::LoompadVisualV3 { .. }
         ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
@@ -662,7 +664,10 @@ mod tests {
         let started = start().unwrap();
         assert_eq!(
             started.speculation.is_some(),
-            matches!(policy, WeavePolicySnapshot::LoompadV2 { .. })
+            matches!(
+                policy,
+                WeavePolicySnapshot::LoompadV2 { .. } | WeavePolicySnapshot::LoompadVisualV3 { .. }
+            )
         );
         if cancel {
             tauri::async_runtime::block_on(async {
@@ -774,6 +779,13 @@ mod tests {
         exercise(
             false,
             WeavePolicySnapshot::LoompadV2 {
+                sample_target: 4,
+                batch_offset: 0,
+            },
+        );
+        exercise(
+            false,
+            WeavePolicySnapshot::LoompadVisualV3 {
                 sample_target: 4,
                 batch_offset: 0,
             },
