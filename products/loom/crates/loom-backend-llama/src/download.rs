@@ -839,7 +839,13 @@ fn validate_request(request: &GgufDownloadRequest) -> Result<ValidatedRequest, D
     if !url.path().to_ascii_lowercase().ends_with(".gguf") {
         return Err(DownloadError::SourceNotGguf);
     }
-    if !is_gguf_path(&request.target_path) {
+    if !is_gguf_path(&request.target_path)
+        && request
+            .target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(request.expected_sha256.to_string().as_str())
+    {
         return Err(DownloadError::TargetNotGguf);
     }
     let parent = request

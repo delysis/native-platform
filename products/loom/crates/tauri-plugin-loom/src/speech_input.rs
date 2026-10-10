@@ -178,7 +178,7 @@ struct SpeechInputTasks {
 }
 
 impl SpeechInputService {
-    pub(crate) fn new(app_local_data_root: Option<PathBuf>) -> Self {
+    pub(crate) fn new(_app_local_data_root: Option<PathBuf>) -> Self {
         Self {
             host: OnceCell::new(),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -187,7 +187,8 @@ impl SpeechInputService {
             recording: Mutex::new(None),
             recording_lifecycle: AsyncMutex::new(()),
             active_scope: Mutex::new(None),
-            managed_model_root: app_local_data_root.map(|root| root.join("speech-models")),
+            managed_model_root: desktop_model_defaults::hugging_face_hub_cache_dir()
+                .map(|hub| hub.join("local/speech/models")),
         }
     }
 

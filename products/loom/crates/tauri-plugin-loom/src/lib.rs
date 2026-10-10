@@ -8,6 +8,7 @@ mod context_attachments;
 mod document_bindings;
 mod document_watcher;
 mod external_import;
+mod hf_download;
 mod import_batch;
 mod import_jobs;
 mod inference;
@@ -50,9 +51,8 @@ use loom_backend_llama::{
     LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
     ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
     SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
-    continuation_context_binding, discover_gguf_models, download_gguf,
-    model_environment_from_verified, validate_candidate_receipt_binding,
-    validate_gguf_download_request,
+    continuation_context_binding, discover_gguf_models, model_environment_from_verified,
+    validate_candidate_receipt_binding, validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
@@ -105,7 +105,7 @@ use crate::external_import::document_import_external;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
-    ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
+    ModelLibraryError, ReservationOutcome, model_target_path,
 };
 use crate::shader_preview::shader_preview;
 use crate::speech_input::{
@@ -2595,9 +2595,6 @@ impl IpcFailure {
     fn model_library(error: &ModelLibraryError) -> Self {
         let (code, retryable) = match error {
             ModelLibraryError::InvalidFileName => ("invalid_model_file_name", false),
-            ModelLibraryError::Symlink(_) => ("model_library_symlink_refused", false),
-            ModelLibraryError::NotDirectory(_) => ("model_library_not_directory", false),
-            ModelLibraryError::Io { .. } => ("model_library_io_error", true),
         };
         Self::new(code, error.to_string(), retryable)
     }
@@ -6891,7 +6888,7 @@ fn start_model_download_worker<R: Runtime>(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_model_download(
-    state: &State<'_, PluginState>,
+    _state: &State<'_, PluginState>,
     command_id: &str,
     url: String,
     file_name: String,
@@ -6926,17 +6923,12 @@ fn prepare_model_download(
         ));
     }
 
-    let root = state.app_local_data_root.as_deref().ok_or_else(|| {
-        IpcFailure::new(
-            "model_library_unavailable",
-            "the operating system did not provide an application data directory",
-            false,
-        )
-    })?;
-    let library = prepare_model_library(root).map_err(|error| IpcFailure::model_library(&error))?;
-    let target_path = model_target_path(&library, &file_name)
+    // Validate the display name before it can become a cache path component.
+    let _ = model_target_path(Path::new("."), &file_name)
         .map_err(|error| IpcFailure::model_library(&error))?;
     let expected_sha256 = Sha256Digest::from_hex(expected_sha256)
+        .map_err(|error| IpcFailure::model_download_request(&error))?;
+    let target_path = hf_download::target(&url, &file_name, expected_sha256)
         .map_err(|error| IpcFailure::model_download_request(&error))?;
     let mut request =
         GgufDownloadRequest::new(url, target_path.clone(), expected_sha256, max_bytes);
@@ -6971,29 +6963,22 @@ fn spawn_model_download<R: Runtime>(
             tauri::async_runtime::block_on(async move {
                 let progress_downloads = Arc::clone(&downloads);
                 let progress_app = app.clone();
-                let result =
-                    download_gguf(
-                        &request,
-                        &cancellation,
-                        move |progress| match progress_downloads.record_progress(
-                            command_id,
-                            progress,
-                            now_unix_ms(),
-                        ) {
-                            Ok(snapshot) => {
-                                emit_model_download_snapshot(
-                                    &progress_app,
-                                    &progress_downloads,
-                                    "loom://model-download-progress",
-                                    command_id,
-                                    &snapshot,
-                                );
-                                DownloadControl::Continue
-                            }
-                            Err(_) => DownloadControl::Cancel,
-                        },
-                    )
-                    .await;
+                let result = hf_download::download(&request, &cancellation, move |progress| {
+                    match progress_downloads.record_progress(command_id, progress, now_unix_ms()) {
+                        Ok(snapshot) => {
+                            emit_model_download_snapshot(
+                                &progress_app,
+                                &progress_downloads,
+                                "loom://model-download-progress",
+                                command_id,
+                                &snapshot,
+                            );
+                            DownloadControl::Continue
+                        }
+                        Err(_) => DownloadControl::Cancel,
+                    }
+                })
+                .await;
                 let terminal = match result {
                     Ok(result) => downloads.complete(command_id, &result, now_unix_ms()),
                     Err(error) if error.is_cancelled() => {
@@ -14005,7 +13990,7 @@ mod tests {
     }
 
     #[test]
-    fn app_local_override_routes_default_project_and_model_library() {
+    fn app_local_override_routes_default_project_and_isolates_discovery() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join("isolated-app-local-data");
         std::fs::create_dir(&root).expect("isolated app data root");
@@ -14018,16 +14003,6 @@ mod tests {
         assert_eq!(
             default_project_path(&state).expect("default project path"),
             root.join(DEFAULT_PROJECT_DIRECTORY)
-        );
-        assert_eq!(
-            prepare_model_library(
-                state
-                    .app_local_data_root
-                    .as_deref()
-                    .expect("app-local data root")
-            )
-            .expect("model library"),
-            root.join("models")
         );
         assert!(state.isolate_model_discovery);
     }
