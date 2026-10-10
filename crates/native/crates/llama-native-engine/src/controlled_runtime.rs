@@ -4705,6 +4705,52 @@ mod tests {
             reused
         );
 
+        let saved = handle.snapshot_sequence(0)?;
+        assert_eq!(
+            handle.restore_sequence(saved.clone(), 0)?,
+            llama_native_types::SequenceRestoreKind::NativeState
+        );
+        let after_import = handle
+            .generate_controlled(ControlledGenerationSubmission::new(
+                constrained.output().request().clone(),
+                Some(schema.to_string()),
+            )?)?
+            .wait_verified()?;
+        assert_eq!(after_import.runtime_cost().resident_prefix_tokens(), reused);
+        assert_eq!(
+            after_import.output().cases()[0]
+                .generation()
+                .generated_token_ids,
+            constrained.output().cases()[0]
+                .generation()
+                .generated_token_ids
+        );
+
+        let replay = saved.reconstruction().sequence(saved.token_ids.clone())?;
+        assert_eq!(
+            handle.restore_sequence(replay, 0)?,
+            llama_native_types::SequenceRestoreKind::TokenReplay
+        );
+        let after_replay = handle
+            .generate_controlled(ControlledGenerationSubmission::new(
+                constrained.output().request().clone(),
+                Some(schema.to_string()),
+            )?)?
+            .wait_verified()?;
+        assert_eq!(after_replay.runtime_cost().resident_prefix_tokens(), 0);
+        assert_eq!(
+            after_replay.runtime_cost().physical_prompt_evaluations(),
+            constrained.runtime_cost().physical_prompt_evaluations()
+        );
+        assert_eq!(
+            after_replay.output().cases()[0]
+                .generation()
+                .generated_token_ids,
+            constrained.output().cases()[0]
+                .generation()
+                .generated_token_ids
+        );
+
         let gbnf = r#"root ::= "A""#;
         let reference = ConstraintArtifactReference::new(
             "real-gbnf".to_string(),
