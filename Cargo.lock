@@ -2171,6 +2171,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-speech"
+version = "0.0.0"
+dependencies = [
+ "speech-native-backend-parakeet",
+ "speech-native-host",
+ "speech-native-platform",
+ "speech-native-types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "desktop-vault"
 version = "0.1.0"
 dependencies = [
@@ -5368,6 +5379,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "desktop-speech",
  "information-native-attachment-bridge",
  "information-native-backend-sqlite",
  "information-native-host",
@@ -8806,6 +8818,7 @@ dependencies = [
  "cpal 0.16.0",
  "crossbeam-channel",
  "desktop-model-defaults",
+ "desktop-speech",
  "desktop-vault",
  "fs4",
  "fte-providers",

@@ -372,7 +372,7 @@ mod apple {
     use speech_native_types::{
         AlignmentGranularity, AudioOutputFormat, SpeechDeadlinePolicy, SpeechPrivacyPolicy,
         SpeechRequestContext, SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector,
-        SpeechRoutingPolicy, SynthesisInput, SynthesisOutput, SynthesisRequest, VoiceSelector,
+        SpeechRoutingPolicy, SynthesisInput, SynthesisRequest, SynthesisResponse, VoiceSelector,
     };
 
     use super::{AudioSpeech, IpcFailure, failure};
@@ -393,6 +393,7 @@ mod apple {
                 .map_err(|error| failure(error.to_string()))?;
             let result = async {
                 let request = request(text);
+                let request_id = request.context.request_id.clone();
                 let ticket = host
                     .synthesize(request)
                     .await
@@ -401,15 +402,7 @@ mod apple {
                     .final_response()
                     .await
                     .map_err(|error| failure(error.to_string()))?;
-                match response.output {
-                    SynthesisOutput::Complete {
-                        audio,
-                        format: AudioOutputFormat::Wav,
-                    } if audio.len() <= 32 * 1024 * 1024 => Ok(AudioSpeech { wav: audio }),
-                    _ => Err(failure(
-                        "Local synthesis did not return a bounded WAV recording.",
-                    )),
-                }
+                publish_response(response, &request_id)
             }
             .await;
             host.shutdown()
@@ -419,6 +412,15 @@ mod apple {
         })
         .await
         .map_err(|_| failure("The local speech worker stopped."))?
+    }
+
+    fn publish_response(
+        response: SynthesisResponse,
+        request_id: &SpeechRequestId,
+    ) -> Result<AudioSpeech, IpcFailure> {
+        desktop_speech::complete_apple_wav(response, request_id, None, 32 * 1024 * 1024)
+            .map(|(wav, _)| AudioSpeech { wav })
+            .map_err(|error| failure(error.to_string()))
     }
 
     fn request(text: String) -> SynthesisRequest {
@@ -457,6 +459,47 @@ mod apple {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use speech_native_types::SynthesisOutput;
+        fn envelope() -> SynthesisResponse {
+            use speech_native_types::{NetworkBehavior, SpeechBackendKind, SpeechResolvedRoute};
+            SynthesisResponse {
+                request_id: SpeechRequestId("current".into()),
+                route: SpeechResolvedRoute {
+                    backend_id: "apple.av-speech".into(),
+                    model_id: None,
+                    voice_id: Some("automatic".into()),
+                    backend_kind: SpeechBackendKind::PlatformOnDevice,
+                    network: NetworkBehavior::Never,
+                },
+                output: SynthesisOutput::Complete {
+                    audio: vec![1, 2, 3],
+                    format: AudioOutputFormat::Wav,
+                },
+                duration_ms: None,
+                alignments: Vec::new(),
+                usage: speech_native_types::SpeechUsage::default(),
+            }
+        }
+
+        #[test]
+        fn synthesis_publication_rejects_a_different_request() {
+            let id = SpeechRequestId("current".into());
+            assert!(publish_response(envelope(), &id).is_ok());
+            let mut response = envelope();
+            response.request_id = SpeechRequestId("different".into());
+            assert!(publish_response(response, &id).is_err());
+        }
+
+        #[test]
+        fn synthesis_publication_rejects_empty_audio() {
+            let mut response = envelope();
+            response.output = SynthesisOutput::Complete {
+                audio: Vec::new(),
+                format: AudioOutputFormat::Wav,
+            };
+            assert!(publish_response(response, &SpeechRequestId("current".into())).is_err());
+        }
+
         #[test]
         fn synthesis_is_exact_local_wav_without_download_or_fallback() {
             let request = request("Read this.".to_owned());

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-speech.workspace = true
 desktop-vault.workspace = true
 desktop-model-defaults.workspace = true
 fs4.workspace = true

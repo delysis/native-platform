@@ -6,6 +6,7 @@
       "desktop-launch",
       "desktop-model-defaults",
       "desktop-model-discovery",
+      "desktop-speech",
       "desktop-vault",
       "operation-lifecycle",
       "workspace-document"
@@ -130,6 +131,7 @@
       "workspace-document"
     ],
     "platform-linux": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
@@ -139,6 +141,7 @@
       "mom-llama-app"
     ],
     "platform-macos": [
+      "desktop-speech",
       "desktop-vault",
       "free-token-energy",
       "llama-native-engine",
@@ -151,6 +154,7 @@
       "speech-native-platform"
     ],
     "platform-windows": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
