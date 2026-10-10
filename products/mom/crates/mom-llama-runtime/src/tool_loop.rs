@@ -677,11 +677,8 @@ fn tool_loop_run_with_events(
 
         let conversation = get_or_create_conversation(conversation_id)?.1;
         let model_request_id = format!("{request_id}:turn:{turn}");
-        let conversation_sampling = conversation
-            .execution_profile
-            .sampling
-            .clone()
-            .unwrap_or_else(|| settings.sampling_config());
+        let conversation_sampling =
+            settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
         let request = GenerationRequest {
             request_id: model_request_id.clone(),
             model_id: model_status.model_id.clone(),

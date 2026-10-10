@@ -367,21 +367,19 @@ where
             }
             let cases = targets
                 .iter()
-                .map(|target| GenerationCase {
-                    case_id: target.snapshot.target_id.clone(),
-                    input: GenerationInput::Chat {
-                        messages: target.messages.clone(),
-                        template: profile_chat_template(&target.snapshot.profile),
-                    },
-                    sampling: target
-                        .snapshot
-                        .profile
-                        .sampling
-                        .clone()
-                        .unwrap_or_else(|| settings.sampling_config()),
-                    cached_prefix: target.cached_prefix.clone(),
+                .map(|target| {
+                    Ok(GenerationCase {
+                        case_id: target.snapshot.target_id.clone(),
+                        input: GenerationInput::Chat {
+                            messages: target.messages.clone(),
+                            template: profile_chat_template(&target.snapshot.profile),
+                        },
+                        sampling: settings
+                            .sampling_for_profile(target.snapshot.profile.sampling.as_ref())?,
+                        cached_prefix: target.cached_prefix.clone(),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let media = std::mem::take(&mut targets[0].media);
             let handle = targets[0].handle.clone();
             Ok(Some(handle.generate_batch(GenerationBatchRequest {

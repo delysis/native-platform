@@ -2908,11 +2908,7 @@ pub fn mention_synthesize(
         .map_err(|error| anyhow!(error))?
         .token_ids
         .len();
-    let sampling = host
-        .execution_profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let sampling = settings.sampling_for_profile(host.execution_profile.sampling.as_ref())?;
     if prompt_tokens.saturating_add(sampling.max_tokens as usize) > settings.context_tokens as usize
     {
         return Ok(CommandResult::blocked(
@@ -4219,12 +4215,9 @@ fn run_persona_tool_decision(
             vec!["Review the target model and attached tool schemas.".to_string()],
         )
     })?;
-    let mut sampling = target
-        .snapshot
-        .profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let mut sampling = settings
+        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+        .map_err(|validation| validation.blocker)?;
     sampling.max_tokens = sampling
         .max_tokens
         .clamp(64, PERSONA_TOOL_DECISION_MAX_TOKENS);
@@ -4486,12 +4479,9 @@ fn prepare_persona_tool_approval(
         model_config: Some(frozen_model_config),
         model_fingerprint,
         chat_template: profile_chat_template(&target.snapshot.profile),
-        sampling: target
-            .snapshot
-            .profile
-            .sampling
-            .clone()
-            .unwrap_or_else(|| settings.sampling_config()),
+        sampling: settings
+            .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+            .map_err(|validation| validation.blocker)?,
         messages: target.messages.clone(),
         provisional_output,
         input_schema: binding.contract.input_schema.clone(),

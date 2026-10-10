@@ -488,7 +488,7 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
                     &settings,
                     id,
                     now,
-                );
+                )?;
                 db.selected_conversation_id = Some(conversation.id.clone());
                 db.conversations.insert(0, conversation.clone());
                 conversation
@@ -546,7 +546,7 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
     let now = now_ms().to_string();
     let settings = resolve_settings()?;
     let id = Uuid::new_v4().to_string();
-    let conversation = new_conversation(title, &settings, id, now);
+    let conversation = new_conversation(title, &settings, id, now)?;
     db.selected_conversation_id = Some(conversation.id.clone());
     db.conversations.insert(0, conversation.clone());
     let path = save_db(&db)?;
@@ -566,10 +566,10 @@ fn new_conversation(
     settings: &crate::config::Settings,
     id: String,
     now: String,
-) -> Conversation {
+) -> Result<Conversation> {
     let title = title.unwrap_or_else(|| "New chat".to_string());
     let mention_handle = new_chat_handle(&title, &id);
-    Conversation {
+    Ok(Conversation {
         id,
         title,
         created_at: now.clone(),
@@ -579,7 +579,7 @@ fn new_conversation(
             mention_handle,
             model_path: settings.model_path.clone(),
             mmproj_path: settings.mmproj_path.clone(),
-            sampling: Some(settings.sampling_config()),
+            sampling: Some(settings.sampling_config()?),
             ..ConversationExecutionProfile::default()
         },
         selected_model_path: settings.model_path.clone(),
@@ -590,7 +590,7 @@ fn new_conversation(
         recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: Vec::new(),
-    }
+    })
 }
 
 fn new_chat_handle(title: &str, id: &str) -> String {
