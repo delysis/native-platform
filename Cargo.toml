@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/services/archive-friends",
     "crates/desktop-launch",
     "crates/workspace-document",
     "crates/desktop-model-defaults",
