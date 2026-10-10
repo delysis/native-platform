@@ -2900,7 +2900,7 @@ fn merge_generated_conversation(
             &conversation.title,
             &conversation.id,
         ) {
-            crate::conversation_store::display_title(existing)
+            crate::conversation_store::display_title(existing)?
         } else {
             conversation.title.clone()
         };
@@ -3142,6 +3142,7 @@ mod tests {
             .find(|item| item.id == conversation.id)
             .expect("conversation");
         let mut source = message("source", Vec::new());
+        source.conversation_id = current.id.clone();
         source.role = crate::conversation_store::MessageRole::Assistant;
         source.content = "Response from @source: Keep these exact stored bytes".to_string();
         source.attribution = Some(crate::conversation_store::MessageAttribution {

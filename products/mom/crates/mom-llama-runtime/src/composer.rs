@@ -546,7 +546,7 @@ fn prepare_composer_generation(
     skill_db: &SkillDb,
     draft: &str,
 ) -> Result<std::result::Result<PreparedComposerGeneration, Blocker>> {
-    let active_messages = active_path_messages(conversation);
+    let active_messages = active_path_messages(conversation)?;
     if let Some(blocker) = context_bound_blocker(&active_messages) {
         return Ok(Err(blocker));
     }

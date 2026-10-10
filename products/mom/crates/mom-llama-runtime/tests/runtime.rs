@@ -687,7 +687,7 @@ fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<(
     assert_eq!(invocation.targets[0].source_leaf_message_id, leaf);
     assert_eq!(
         invocation.targets[0].source_messages,
-        mom_llama_runtime::conversation_store::active_path_messages(&source_before)
+        mom_llama_runtime::conversation_store::active_path_messages(&source_before)?
     );
     assert_eq!(
         mom_llama_runtime::conversation_select(&source.id)?.result,

@@ -21,7 +21,9 @@ impl HistoryNode for Message {
 /// selected head, duplicate IDs, missing ancestry or cycles by guessing a path.
 /// The shared index validates unselected branches as well as the selected one.
 /// Valid inputs retain the existing role-filtered sibling ordering and fields.
-fn checked_index(conversation: &Conversation) -> Result<BranchIndex<'_, Message>, HistoryError> {
+pub(crate) fn checked_index(
+    conversation: &Conversation,
+) -> Result<BranchIndex<'_, Message>, HistoryError> {
     if !valid_occurrence_id(&conversation.id) {
         return Err(HistoryError::InvalidIdentity);
     }
@@ -215,7 +217,7 @@ mod tests {
         let original = input.clone();
         assert_eq!(
             checked_active_messages(&input).expect("valid branch"),
-            crate::conversation_store::active_path_messages(&input)
+            crate::conversation_store::active_path_messages(&input).expect("valid old projection")
         );
         let document = from_conversation(&input).expect("project branch");
         assert_eq!(document.text(), "  exact\r\nsecond");
@@ -326,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             checked_active_messages(&input).expect("last message"),
-            crate::conversation_store::active_path_messages(&input)
+            crate::conversation_store::active_path_messages(&input).expect("valid old projection")
         );
         assert!(
             checked_active_messages(&conversation(Vec::new(), None))

@@ -3811,7 +3811,9 @@ fn active_conversation(
                 .iter()
                 .find(|conversation| conversation.kind == ConversationKind::Chat)
         })
-        .map(mom_llama_runtime::conversation_store::project_conversation)
+        .and_then(|conversation| {
+            mom_llama_runtime::conversation_store::project_conversation(conversation).ok()
+        })
 }
 
 fn role_label(role: &MessageRole) -> &'static str {
@@ -5152,8 +5154,11 @@ mod tests {
         id: &str,
         title: &str,
         kind: ConversationKind,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
     ) -> Conversation {
+        for message in &mut messages {
+            message.conversation_id = id.to_owned();
+        }
         Conversation {
             id: id.to_string(),
             title: title.to_string(),

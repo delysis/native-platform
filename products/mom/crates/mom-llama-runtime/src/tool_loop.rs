@@ -683,7 +683,7 @@ fn tool_loop_run_with_events(
             request_id: model_request_id.clone(),
             model_id: model_status.model_id.clone(),
             input: GenerationInput::Chat {
-                messages: build_model_messages(&conversation, &tool_contract),
+                messages: build_model_messages(&conversation, &tool_contract)?,
                 template: match &conversation.execution_profile.chat_template {
                     ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
                     ChatTemplatePolicy::FrozenSource(template) => {
@@ -1440,7 +1440,7 @@ fn execute_tool_step(
     }))
 }
 
-fn build_model_messages(conversation: &Conversation, tool: &McpTool) -> Vec<ChatMessage> {
+fn build_model_messages(conversation: &Conversation, tool: &McpTool) -> Result<Vec<ChatMessage>> {
     let schema = serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".to_string());
     let mut messages = vec![ChatMessage {
         role: ChatRole::System,
@@ -1453,7 +1453,7 @@ fn build_model_messages(conversation: &Conversation, tool: &McpTool) -> Vec<Chat
             tool.name
         ),
     }];
-    messages.extend(active_path_messages(conversation).iter().map(|message| ChatMessage {
+    messages.extend(active_path_messages(conversation)?.iter().map(|message| ChatMessage {
         role: match message.role {
             MessageRole::System => ChatRole::System,
             MessageRole::User => ChatRole::User,
@@ -1473,7 +1473,7 @@ fn build_model_messages(conversation: &Conversation, tool: &McpTool) -> Vec<Chat
             message.content.clone()
         },
     }));
-    messages
+    Ok(messages)
 }
 
 fn tool_loop_sampling(settings: &SamplingConfig) -> SamplingConfig {
