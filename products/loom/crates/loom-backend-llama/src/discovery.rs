@@ -66,6 +66,8 @@ pub struct DiscoveryWarning {
 pub struct ModelDiscoveryReport {
     pub models: Vec<DiscoveredGguf>,
     pub warnings: Vec<DiscoveryWarning>,
+    /// Entries admitted to the scan, including unreadable directory entries.
+    /// Queued paths consume the budget before metadata/header inspection.
     pub visited_entries: usize,
     pub truncated: bool,
 }
@@ -98,12 +100,17 @@ pub fn discover_gguf_models(
         &mut user_pending,
         &options.user_paths,
         ModelDiscoverySource::UserSelected,
+        options.max_entries,
+        &mut report.truncated,
     );
     enqueue_roots(
         &mut cache_pending,
         &options.hugging_face_cache_roots,
         ModelDiscoverySource::HuggingFaceCache,
+        options.max_entries.saturating_sub(user_pending.len()),
+        &mut report.truncated,
     );
+    report.visited_entries = user_pending.len() + cache_pending.len();
     let mut resolved_models = BTreeSet::new();
     let mut visited_directories = BTreeSet::new();
 
@@ -114,12 +121,6 @@ pub fn discover_gguf_models(
         let Some((path, source, depth)) = next else {
             break;
         };
-        if report.visited_entries >= options.max_entries {
-            report.truncated = true;
-            break;
-        }
-        report.visited_entries += 1;
-
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -143,6 +144,7 @@ pub fn discover_gguf_models(
             continue;
         }
         if depth >= options.max_depth {
+            report.truncated = true;
             report.warnings.push(DiscoveryWarning {
                 path,
                 message: format!("directory depth limit {} reached", options.max_depth),
@@ -163,19 +165,7 @@ pub fn discover_gguf_models(
                 continue;
             }
         };
-        let mut children = entries
-            .filter_map(|entry| match entry {
-                Ok(entry) => Some(entry.path()),
-                Err(error) => {
-                    report.warnings.push(DiscoveryWarning {
-                        path: path.clone(),
-                        message: format!("cannot read directory entry: {error}"),
-                    });
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        children.sort();
+        let children = bounded_directory_children(entries, &path, options.max_entries, &mut report);
         let pending = match source {
             ModelDiscoverySource::UserSelected => &mut user_pending,
             ModelDiscoverySource::HuggingFaceCache => &mut cache_pending,
@@ -192,15 +182,53 @@ pub fn discover_gguf_models(
     Ok(report)
 }
 
+fn bounded_directory_children(
+    entries: std::fs::ReadDir,
+    path: &Path,
+    max_entries: usize,
+    report: &mut ModelDiscoveryReport,
+) -> Vec<PathBuf> {
+    // Count queued entries against the same inspection budget before
+    // reading another directory. One sentinel read detects truncation;
+    // neither directory materialization nor the queue can exceed the cap.
+    let remaining = max_entries.saturating_sub(report.visited_entries);
+    let mut children = Vec::new();
+    for (index, entry) in entries.take(remaining.saturating_add(1)).enumerate() {
+        if index == remaining {
+            report.truncated = true;
+            break;
+        }
+        report.visited_entries += 1;
+        match entry {
+            Ok(entry) => children.push(entry.path()),
+            Err(error) => report.warnings.push(DiscoveryWarning {
+                path: path.to_path_buf(),
+                message: format!("cannot read directory entry: {error}"),
+            }),
+        }
+    }
+    children.sort();
+    children
+}
+
 fn enqueue_roots(
     pending: &mut VecDeque<(PathBuf, ModelDiscoverySource, usize)>,
     roots: &[PathBuf],
     source: ModelDiscoverySource,
+    remaining: usize,
+    truncated: &mut bool,
 ) {
-    let mut ordered = roots.to_vec();
-    ordered.sort();
-    ordered.dedup();
-    pending.extend(ordered.into_iter().map(|path| (path, source, 0)));
+    // Root order is caller policy: a configured alias must win over an older
+    // explicit alias of the same file. Sorting is appropriate for directory
+    // children and the final presentation, but would erase that precedence.
+    let mut seen = BTreeSet::new();
+    for (admitted, path) in roots.iter().filter(|path| seen.insert(*path)).enumerate() {
+        if admitted == remaining {
+            *truncated = true;
+            break;
+        }
+        pending.push_back((path.clone(), source, 0));
+    }
 }
 
 fn inspect_symlink(
@@ -351,6 +379,102 @@ mod tests {
         .expect("discover models");
         assert!(report.truncated);
         assert!(report.models.len() < 4);
+    }
+
+    #[test]
+    fn depth_limited_traversal_is_explicitly_partial() {
+        let directory = tempfile::tempdir().expect("directory");
+        std::fs::write(directory.path().join("model.gguf"), b"GGUF").expect("model");
+        let report = discover_gguf_models(&ModelDiscoveryOptions {
+            hugging_face_cache_roots: Vec::new(),
+            user_paths: vec![directory.path().into()],
+            max_entries: 16,
+            max_depth: 0,
+        })
+        .expect("scan");
+        assert!(report.truncated);
+        assert!(report.models.is_empty());
+        assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn wide_non_model_directory_consumes_the_same_finite_budget() {
+        let directory = tempfile::tempdir().expect("directory");
+        for index in 0..1_000 {
+            std::fs::write(directory.path().join(format!("note-{index}")), b"x").expect("entry");
+        }
+        let report = discover_gguf_models(&ModelDiscoveryOptions {
+            hugging_face_cache_roots: Vec::new(),
+            user_paths: vec![directory.path().into()],
+            max_entries: 8,
+            max_depth: 2,
+        })
+        .expect("bounded scan");
+        assert!(report.truncated);
+        assert_eq!(report.visited_entries, 8);
+        assert!(report.models.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_alias_is_retained_but_directory_symlinks_are_not_traversed() {
+        let directory = tempfile::tempdir().expect("directory");
+        let cache = directory.path().join("cache");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&cache).expect("cache");
+        std::fs::create_dir(&outside).expect("outside");
+        let blob = outside.join("blob");
+        std::fs::write(&blob, b"GGUF").expect("blob");
+        std::fs::write(outside.join("hidden.gguf"), b"GGUF").expect("hidden");
+        let alias = cache.join("model.gguf");
+        std::os::unix::fs::symlink(&blob, &alias).expect("alias");
+        std::os::unix::fs::symlink(&outside, cache.join("linked-directory"))
+            .expect("directory alias");
+        let report = discover_gguf_models(&ModelDiscoveryOptions {
+            hugging_face_cache_roots: vec![cache],
+            user_paths: vec![alias.clone()],
+            max_entries: 16,
+            max_depth: 4,
+        })
+        .expect("scan");
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].selected_path, alias);
+        assert_eq!(
+            report.models[0].resolved_path,
+            blob.canonicalize().expect("canonical")
+        );
+        assert_eq!(report.models[0].source, ModelDiscoverySource::UserSelected);
+        assert!(!report.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_alias_precedes_an_older_explicit_alias_of_the_same_model() {
+        let directory = tempfile::tempdir().expect("directory");
+        let blob = directory.path().join("blob");
+        std::fs::write(&blob, b"GGUF").expect("blob");
+        let configured = directory.path().join("z-configured.gguf");
+        let remembered = directory.path().join("a-remembered.gguf");
+        std::os::unix::fs::symlink(&blob, &configured).expect("configured alias");
+        std::os::unix::fs::symlink(&blob, &remembered).expect("remembered alias");
+
+        let report = discover_gguf_models(&ModelDiscoveryOptions {
+            hugging_face_cache_roots: Vec::new(),
+            user_paths: vec![configured.clone(), configured.clone(), remembered],
+            max_entries: 2,
+            max_depth: 1,
+        })
+        .expect("scan explicit aliases");
+
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].selected_path, configured);
+        assert_eq!(
+            report.models[0].resolved_path,
+            blob.canonicalize().expect("canonical blob")
+        );
+        assert_eq!(report.models[0].source, ModelDiscoverySource::UserSelected);
+        assert_eq!(report.visited_entries, 2);
+        assert!(!report.truncated);
     }
 
     /// Developer acceptance check for Loom's quiet first-run writer discovery.
