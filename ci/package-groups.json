@@ -5,6 +5,7 @@
       "desktop-generation-policy",
       "desktop-launch",
       "desktop-model-defaults",
+      "desktop-model-discovery",
       "desktop-vault",
       "operation-lifecycle",
       "workspace-document"
@@ -92,6 +93,7 @@
       "desktop-generation-policy",
       "desktop-launch",
       "desktop-model-defaults",
+      "desktop-model-discovery",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",

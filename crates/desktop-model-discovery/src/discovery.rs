@@ -291,10 +291,23 @@ fn inspect_file(
     });
 }
 
-fn has_gguf_extension(path: &Path) -> bool {
+pub fn has_gguf_extension(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+/// Candidate classification only; native inspection determines architecture.
+#[must_use]
+pub fn is_model_gguf(path: &Path) -> bool {
+    has_gguf_extension(path)
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                !name.contains("mmproj") && !name.contains("-mtp.")
+            })
 }
 
 fn inspect_gguf_header(path: &Path) -> GgufHeaderStatus {
@@ -475,6 +488,14 @@ mod tests {
         assert_eq!(report.models[0].source, ModelDiscoverySource::UserSelected);
         assert_eq!(report.visited_entries, 2);
         assert!(!report.truncated);
+    }
+
+    #[test]
+    fn projector_and_mtp_names_are_not_primary_model_choices() {
+        for path in ["mmproj-model.gguf", "model.mmproj.GGUF", "model-MTP.gguf"] {
+            assert!(!is_model_gguf(Path::new(path)));
+        }
+        assert!(is_model_gguf(Path::new("model.GGUF")));
     }
 
     /// Developer acceptance check for Loom's quiet first-run writer discovery.

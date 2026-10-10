@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Rust-owned product state, personas, conversations, tools and cache policy for Mom Llama"
 
 [dependencies]
+desktop-model-discovery.workspace = true
 workspace-document.workspace = true
 desktop-model-defaults.workspace = true
 anyhow.workspace = true
@@ -36,6 +37,7 @@ nix.workspace = true
 security-framework = "3.7"
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

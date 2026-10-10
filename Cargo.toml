@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/desktop-model-discovery",
     "crates/operation-lifecycle",
     "crates/desktop-vault",
     "crates/desktop-generation-policy",
@@ -80,6 +81,7 @@ loom-config = { path = "products/loom/crates/loom-config" }
 desktop-launch = { path = "crates/desktop-launch" }
 workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
+desktop-model-discovery = { path = "crates/desktop-model-discovery" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"

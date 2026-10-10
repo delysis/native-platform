@@ -2161,6 +2161,16 @@ name = "desktop-model-defaults"
 version = "0.0.0"
 
 [[package]]
+name = "desktop-model-discovery"
+version = "0.0.0"
+dependencies = [
+ "desktop-model-defaults",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "desktop-vault"
 version = "0.1.0"
 dependencies = [
@@ -4948,7 +4958,7 @@ name = "loom-backend-llama"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
- "desktop-model-defaults",
+ "desktop-model-discovery",
  "fs4",
  "hex",
  "llama-native-engine",
@@ -5409,6 +5419,7 @@ dependencies = [
  "chacha20poly1305",
  "crossbeam-channel",
  "desktop-model-defaults",
+ "desktop-model-discovery",
  "fs2",
  "getrandom 0.3.4",
  "llama-native-cache",
@@ -5423,6 +5434,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sysinfo",
+ "tempfile",
  "tokio",
  "uuid",
  "workspace-document",
