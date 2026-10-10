@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-document-resolve"
+description = "Enables the workspace_document_resolve command without any pre-configured scope."
+commands.allow = ["workspace_document_resolve"]
+
+[[permission]]
+identifier = "deny-workspace-document-resolve"
+description = "Denies the workspace_document_resolve command without any pre-configured scope."
+commands.deny = ["workspace_document_resolve"]

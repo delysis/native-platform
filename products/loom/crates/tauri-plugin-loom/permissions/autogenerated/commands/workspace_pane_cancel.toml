@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-pane-cancel"
+description = "Enables the workspace_pane_cancel command without any pre-configured scope."
+commands.allow = ["workspace_pane_cancel"]
+
+[[permission]]
+identifier = "deny-workspace-pane-cancel"
+description = "Denies the workspace_pane_cancel command without any pre-configured scope."
+commands.deny = ["workspace_pane_cancel"]

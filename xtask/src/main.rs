@@ -264,7 +264,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
             if let Some(repository) = table.get("git").and_then(toml::Value::as_str) {
                 let (name, revision) = match repository.trim_end_matches(".git") {
                     "https://github.com/delysis/llama-cpp-rs" => {
-                        ("llama-cpp-rs", "eb0e47b57c2fba97ed13e8fe5e949d11798232cb")
+                        ("llama-cpp-rs", "b508f1c7652c751513c361c7e4fdeb090fbed577")
                     }
                     "https://github.com/delysis/easl" => {
                         ("easl", "6d7c913a5b8d6874ab56f5168d222dc95964afb9")

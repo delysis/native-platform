@@ -1,7 +1,7 @@
 import type { DocumentSummary } from './types';
 import type { MaterialEntry } from './materials';
 export type WorkspaceRow = { path: string; depth: number; folder: true; title: string } | { path: string; depth: number; folder: false; document: DocumentSummary } | { path: string; depth: number; folder: false; material: MaterialEntry };
-type Entry = { relative_path: string; title: string } & ({ document: DocumentSummary } | { material: MaterialEntry });
+type Entry = { relative_path: string; title: string } & ({ document: DocumentSummary } | { material: MaterialEntry } | { directory: true });
 
 /** Only the active tree grants a destination; another root must be opened first. */
 export function workspaceCopyDestination(element: Element | null, outline: HTMLElement | undefined): string | null {
@@ -12,10 +12,11 @@ export function workspaceCopyDestination(element: Element | null, outline: HTMLE
   return '';
 }
 
-export function workspaceRows(documents: DocumentSummary[], collapsed: Set<string>, query: string, materials: MaterialEntry[] = []): WorkspaceRow[] {
+export function workspaceRows(documents: DocumentSummary[], collapsed: Set<string>, query: string, materials: MaterialEntry[] = [], directories: string[] = []): WorkspaceRow[] {
   const rows: WorkspaceRow[] = [];
   const needle = query.trim().toLocaleLowerCase();
   const entries: Entry[] = [
+    ...directories.map(path => ({ relative_path: `${path.replace(/\/$/, '')}/`, title: path.split('/').filter(Boolean).at(-1) ?? path, directory: true as const })),
     ...documents.map(document => ({ relative_path: document.relative_path, title: document.title, document })),
     ...materials.filter(material => material.workspace_path).map(material => ({ relative_path: material.workspace_path!, title: material.name, material }))
   ];
@@ -25,6 +26,7 @@ export function workspaceRows(documents: DocumentSummary[], collapsed: Set<strin
     const leaves: Entry[] = [];
     for (const doc of members) {
       const rest = doc.relative_path.slice(prefix.length);
+      if (!rest) continue;
       const slash = rest.indexOf('/');
       if (slash < 0) leaves.push(doc);
       else { const name = rest.slice(0, slash); const group = folders.get(name) ?? []; group.push(doc); folders.set(name, group); }
@@ -35,9 +37,10 @@ export function workspaceRows(documents: DocumentSummary[], collapsed: Set<strin
       if (needle || !collapsed.has(path)) walk(path, depth + 1, group);
     }
     leaves.sort((a, b) => Number(a.relative_path.slice(prefix.length).startsWith('.')) - Number(b.relative_path.slice(prefix.length).startsWith('.')) || a.title.localeCompare(b.title));
-    for (const entry of leaves) rows.push('document' in entry
-      ? { path: entry.relative_path, depth, folder: false, document: entry.document }
-      : { path: entry.relative_path, depth, folder: false, material: entry.material });
+    for (const entry of leaves) {
+      if ('document' in entry) rows.push({ path: entry.relative_path, depth, folder: false, document: entry.document });
+      else if ('material' in entry) rows.push({ path: entry.relative_path, depth, folder: false, material: entry.material });
+    }
   };
   walk('', 0, selected);
   return rows;

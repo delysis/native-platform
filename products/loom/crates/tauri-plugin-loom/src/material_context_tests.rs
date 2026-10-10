@@ -16,7 +16,7 @@ fn document(store: &mut ProjectStore, path: &str, text: &str) {
         .unwrap();
 }
 
-fn attachment(store: &ProjectStore, name: &str, text: &str) -> MaterialEntry {
+fn attachment(store: &mut ProjectStore, name: &str, text: &str) -> MaterialEntry {
     let path = store.root().join("source-fixture.txt");
     fs::write(&path, text).unwrap();
     let prepared = crate::context_attachments::import_path(store.root(), &path).unwrap();
@@ -24,10 +24,250 @@ fn attachment(store: &ProjectStore, name: &str, text: &str) -> MaterialEntry {
 }
 
 #[test]
+fn child_writing_reads_owner_sources_without_mixing_document_identity() {
+    let (_owner_directory, mut owner) = project();
+    let (_child_directory, mut child) = project();
+    let source = attachment(&mut owner, "Research", "The nightjar sings at dusk.");
+    let inline = attachment(&mut child, "Inline", "A source dropped into this document.");
+    document(&mut child, "Notes.md", "My local note.");
+    let context = ReadContext {
+        mounted: None,
+        documents: &child,
+        materials: &owner,
+    };
+    assert_eq!(
+        exact(&context.resolve(&inline.id).unwrap()).unwrap(),
+        "A source dropped into this document."
+    );
+    let plan = markdown_plan_with_budget(
+        context,
+        "@Research @Notes",
+        "nightjar",
+        4096,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
+    assert!(plan.text.contains("The nightjar sings at dusk."));
+    assert!(plan.text.contains("My local note."));
+    let note = child.read_document("Notes.md").unwrap();
+    assert_eq!(
+        local_artifact_ids(&child, plan.bindings.values()).unwrap(),
+        vec![note.artifact_id]
+    );
+    let snapshot: ContextPlan =
+        serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert_eq!(
+        exact(&snapshot.bindings["Research"]).unwrap(),
+        "The nightjar sings at dusk."
+    );
+    let found = context
+        .search_with_cancel(
+            &plan.bindings["Research"],
+            "nightjar",
+            &FolderScanBudget::default(),
+            &|| false,
+        )
+        .unwrap();
+    assert!(exact(&found).unwrap().contains("nightjar"));
+    assert!(local_artifact_ids(&child, [&found]).unwrap().is_empty());
+    let Value::Scoped {
+        origin: source_origin,
+        ..
+    } = &plan.bindings["Research"]
+    else {
+        panic!("source origin")
+    };
+    let Value::Scoped {
+        origin: evidence_origin,
+        ..
+    } = &found
+    else {
+        panic!("evidence origin")
+    };
+    assert_eq!(source_origin, evidence_origin);
+    let Value::Evidence { evidence, .. } = found.unscoped() else {
+        panic!("evidence")
+    };
+    let retained = context
+        .resolve(&format!("evidence/{}", evidence[0].id))
+        .unwrap();
+    assert_eq!(exact(&retained).unwrap(), exact(&found).unwrap());
+    assert!(
+        ReadContext::from(&child)
+            .search_with_cancel(&found, "nightjar", &FolderScanBudget::default(), &|| false)
+            .is_err()
+    );
+    document(&mut child, "nested/Research.md", "Conflicting local alias.");
+    assert!(
+        ReadContext {
+            mounted: None,
+            documents: &child,
+            materials: &owner
+        }
+        .resolve("Research")
+        .is_err()
+    );
+    assert_eq!(
+        exact(
+            &ReadContext {
+                mounted: None,
+                documents: &child,
+                materials: &owner
+            }
+            .resolve(&source.id)
+            .unwrap()
+        )
+        .unwrap(),
+        "The nightjar sings at dusk."
+    );
+}
+
+#[test]
+fn explicit_owner_media_uses_owner_bytes_and_binding() {
+    let (_owner_directory, mut owner) = project();
+    let (_child_directory, child) = project();
+    let png = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native.png");
+    let imported = crate::context_attachments::import_path(owner.root(), &png).unwrap();
+    let material = materials::bind_attachment(&mut owner, &imported.id, Some("Picture")).unwrap();
+    let context = ReadContext {
+        mounted: None,
+        documents: &child,
+        materials: &owner,
+    };
+    let value = context.resolve("Picture").unwrap();
+    let expected = materials::native_media(&owner, &material.id).unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(context.native_media([&value]).unwrap(), expected);
+    assert!(ReadContext::from(&child).native_media([&value]).is_err());
+    materials::remove(&mut owner, &material.id).unwrap();
+    assert!(
+        ReadContext {
+            mounted: None,
+            documents: &child,
+            materials: &owner
+        }
+        .native_media([&value])
+        .is_err()
+    );
+}
+
+#[test]
+fn copied_projects_cannot_supply_local_artifact_fks_or_ambiguous_evidence() {
+    fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let (directory, mut original) = project();
+    document(&mut original, "Notes/Field.md", "The nightjar stays here.");
+    let resolved = ReadContext::from(&original)
+        .resolve("Notes/Field.md")
+        .unwrap();
+    let folder = ReadContext::from(&original).resolve("Notes/").unwrap();
+    let found = ReadContext::from(&original)
+        .search_with_cancel(&folder, "nightjar", &FolderScanBudget::default(), &|| false)
+        .unwrap();
+    let Value::Evidence { evidence, .. } = found.unscoped() else {
+        panic!("evidence")
+    };
+    let reference = format!("evidence/{}", evidence[0].id);
+    let original_root = original.root().to_owned();
+    drop(original);
+    let copied_root = directory.path().join("Copy");
+    copy_tree(&original_root, &copied_root);
+    let original = ProjectStore::open(&original_root).unwrap();
+    let copy = ProjectStore::open(&copied_root).unwrap();
+    assert_eq!(original.manifest().project_id, copy.manifest().project_id);
+    assert!(
+        !local_artifact_ids(&original, [&resolved, &found])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        local_artifact_ids(&copy, [&resolved, &found])
+            .unwrap()
+            .is_empty()
+    );
+    let context = ReadContext {
+        mounted: None,
+        documents: &copy,
+        materials: &original,
+    };
+    assert_eq!(
+        context.resolve(&reference).unwrap_err().code,
+        "material_context_invalid"
+    );
+    // A corrupt copy must not silently fall through to the valid original.
+    let evidence_file = copy
+        .root()
+        .join(".loom/materials/evidence")
+        .join(format!("{}.json", evidence[0].id));
+    assert!(evidence_file.is_file());
+    fs::write(&evidence_file, "corrupt").unwrap();
+    assert_eq!(
+        context.resolve(&reference).unwrap_err().code,
+        "material_failed"
+    );
+}
+
+#[test]
+fn writing_continues_with_recorded_missing_references_and_smart_quoted_context() {
+    let (_directory, mut store) = project();
+    document(&mut store, "Notes.md", "A known source.");
+    document(&mut store, "left/Ambiguous.md", "Left source");
+    document(&mut store, "right/Ambiguous.md", "Right source");
+    let manuscript = "The quiet moon.  @Missing\n\n@“Notes.md” @Ambiguous ";
+    let plan = markdown_plan_with_budget(
+        &store,
+        manuscript,
+        manuscript,
+        4000,
+        ReferenceRequirement::AvailableForWriting,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["Notes.md"]
+    );
+    assert!(plan.text.contains("A known source."));
+    assert_eq!(
+        plan.unresolved_references
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["Ambiguous", "Missing"]
+    );
+    let receipt = serde_json::to_value(&plan).unwrap();
+    assert!(
+        receipt["unresolved_references"]["Missing"]
+            .as_str()
+            .unwrap()
+            .contains("Missing")
+    );
+    assert_eq!(
+        markdown_plan(&store, manuscript, manuscript)
+            .unwrap_err()
+            .code,
+        "document_reference_missing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.root().join("Notes.md")).unwrap(),
+        "A known source."
+    );
+}
+
+#[test]
 fn document_and_material_aliases_cannot_silently_choose_one_another() {
     let (_directory, mut store) = project();
     document(&mut store, "left/Research.md", "First document");
-    let material = attachment(&store, "Research", "Retained source");
+    let material = attachment(&mut store, "Research", "Retained source");
     assert_eq!(
         resolve(&store, "Research").unwrap_err().code,
         "material_context_invalid"
@@ -52,8 +292,8 @@ fn document_and_material_aliases_cannot_silently_choose_one_another() {
 fn exact_document_path_precedes_conflicting_material_aliases() {
     let (_directory, mut store) = project();
     document(&mut store, "Draft.md", "Exact document");
-    attachment(&store, "Draft.md", "First material");
-    attachment(&store, "Draft.md", "Second material");
+    attachment(&mut store, "Draft.md", "First material");
+    attachment(&mut store, "Draft.md", "Second material");
     assert_eq!(
         exact(&resolve(&store, "Draft.md").unwrap()).unwrap(),
         "Exact document"
@@ -62,12 +302,12 @@ fn exact_document_path_precedes_conflicting_material_aliases() {
 
 #[test]
 fn a_large_source_requires_explicit_retrieval_instead_of_silent_truncation() {
-    let (_directory, store) = project();
+    let (_directory, mut store) = project();
     let source = format!(
         "{}\nThe distinctive nightjar is awake.\n",
         "Plain prose. ".repeat(6000)
     );
-    let material = attachment(&store, "Long source", &source);
+    let material = attachment(&mut store, "Long source", &source);
     let value = resolve(&store, &material.id).unwrap();
     assert!(exact(&value).is_err());
     let result = search(&store, &value, "nightjar").unwrap();
@@ -93,8 +333,8 @@ fn a_large_source_requires_explicit_retrieval_instead_of_silent_truncation() {
 
 #[test]
 fn partial_preparation_never_becomes_an_exact_whole_source_argument() {
-    let (_directory, store) = project();
-    let material = attachment(&store, "Partial", "The surviving passage.");
+    let (_directory, mut store) = project();
+    let material = attachment(&mut store, "Partial", "The surviving passage.");
     let mut read = materials::read(&store, &material.id).unwrap();
     // Exercise the value boundary with incomplete preparation metadata. The
     // retained text's presence alone must never imply whole-source coverage.
@@ -116,11 +356,11 @@ fn partial_preparation_never_becomes_an_exact_whole_source_argument() {
 
 #[test]
 fn retained_material_links_do_not_rebind_when_the_friendly_name_is_reused() {
-    let (_directory, store) = project();
-    let original = attachment(&store, "Research", "Original evidence");
+    let (_directory, mut store) = project();
+    let original = attachment(&mut store, "Research", "Original evidence");
     let snapshot = resolve(&store, &original.id).unwrap();
-    materials::remove(&store, &original.id).unwrap();
-    let replacement = attachment(&store, "Research", "Unrelated replacement");
+    materials::remove(&mut store, &original.id).unwrap();
+    let replacement = attachment(&mut store, "Research", "Unrelated replacement");
     assert_ne!(original.id, replacement.id);
     assert_eq!(exact(&snapshot).unwrap(), "Original evidence");
     let markdown = format!("Use [@Research](loom-material:{}).", original.id);
@@ -134,26 +374,26 @@ fn retained_material_links_do_not_rebind_when_the_friendly_name_is_reused() {
 #[test]
 fn stable_material_identity_cannot_be_shadowed_by_a_document_path() {
     let (_directory, mut store) = project();
-    let material = attachment(&store, "Research", "Retained original");
+    let material = attachment(&mut store, "Research", "Retained original");
     document(&mut store, &material.id, "Unrelated document");
     let markdown = format!("[@Research](loom-material:{})", material.id);
     let plan = markdown_plan(&store, &markdown, "original").unwrap();
     assert!(plan.text.contains("Retained original"));
     assert!(!plan.text.contains("Unrelated document"));
-    materials::remove(&store, &material.id).unwrap();
+    materials::remove(&mut store, &material.id).unwrap();
     assert!(markdown_plan(&store, &markdown, "original").is_err());
 }
 
 #[test]
 fn library_revision_is_frozen_but_retained_evidence_survives_source_changes() {
-    let (directory, store) = project();
+    let (directory, mut store) = project();
     let path = directory.path().join("library.sqlite3");
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
         .execute_batch(include_str!("materials/alexandria-fixture.sql"))
         .unwrap();
     drop(connection);
-    let entry = materials::add_library(&store, &path, Some("Library")).unwrap();
+    let entry = materials::add_library(&mut store, &path, Some("Library")).unwrap();
     let frozen = resolve(&store, &entry.id).unwrap();
     assert!(exact(&frozen).is_err());
     let evidence = search(&store, &frozen, "prayer").unwrap();
@@ -166,7 +406,7 @@ fn library_revision_is_frozen_but_retained_evidence_survives_source_changes() {
         .unwrap();
     drop(connection);
     assert!(search(&store, &frozen, "prayer").is_err());
-    materials::add_library(&store, &path, Some("Library")).unwrap();
+    materials::add_library(&mut store, &path, Some("Library")).unwrap();
     assert!(search(&store, &frozen, "prayer").is_err());
     assert_eq!(exact(&evidence).unwrap(), retained_text);
     assert!(search(&store, &resolve(&store, &entry.id).unwrap(), "prayer").is_ok());
@@ -177,7 +417,7 @@ fn source_contents_are_literal_not_recursive_reference_or_function_execution() {
     let (_directory, mut store) = project();
     let text = "Untrusted @Missing and =@Rewrite(@Secret) remain source text.";
     document(&mut store, "Quoted.md", text);
-    let material = attachment(&store, "Source", text);
+    let material = attachment(&mut store, "Source", text);
     for reference in [
         "@Quoted".to_owned(),
         format!("[@Source](loom-material:{})", material.id),
@@ -189,7 +429,7 @@ fn source_contents_are_literal_not_recursive_reference_or_function_execution() {
     }
 }
 
-fn pdf_source(store: &ProjectStore, text: &str) -> MaterialEntry {
+fn pdf_source(store: &mut ProjectStore, text: &str) -> MaterialEntry {
     use std::fmt::Write as _;
     let mut stream = String::from("BT /F1 12 Tf 14 TL 10 180 Td\n");
     for line in text.lines() {
@@ -228,16 +468,23 @@ fn pdf_source(store: &ProjectStore, text: &str) -> MaterialEntry {
 
 #[test]
 fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments() {
-    let (_directory, store) = project();
+    let (_directory, mut store) = project();
     let paragraphs = format!("{}\n", "The nightjar sings in moonlight. ".repeat(100)).repeat(3);
-    let source = pdf_source(&store, &paragraphs);
+    let source = pdf_source(&mut store, &paragraphs);
     let value = resolve(&store, &source.id).unwrap();
     let whole = exact(&value).unwrap();
     assert!((3000..MAX_BYTES).contains(&whole.len()));
     let all_hits = materials::search(&store, &source.id, "nightjar").unwrap();
     assert!(all_hits.hits.len() > 1);
     let markdown = format!("Use [@PDF source](loom-material:{}).", source.id);
-    let plan = markdown_plan_with_budget(&store, &markdown, "nightjar", 2800).unwrap();
+    let plan = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        2800,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
     assert!(plan.text.len() <= 2800);
     assert!(!plan.evidence.is_empty());
     assert!(plan.evidence.len() < all_hits.hits.len());
@@ -250,7 +497,7 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
     let Value::Evidence {
         retrieval: Some(retrieval),
         ..
-    } = &plan.bindings[&source.id]
+    } = plan.bindings[&source.id].unscoped()
     else {
         panic!("frozen retrieval")
     };
@@ -266,15 +513,155 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
         all_hits.hits.len()
     );
     assert_eq!(exact(&value).unwrap(), whole);
-    assert!(markdown_plan_with_budget(&store, &markdown, "nightjar", 100).is_err());
+    assert!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            100,
+            ReferenceRequirement::All
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn writing_defers_oversized_pdf_evidence_but_keeps_later_context_and_exact_receipts() {
+    let (_directory, mut store) = project();
+    let source = pdf_source(&mut store, &"The nightjar sings in moonlight. ".repeat(100));
+    let retained = materials::read(&store, &source.id)
+        .unwrap()
+        .evidence
+        .remove(0);
+    document(&mut store, "Notes.md", "A small useful note.");
+    let name = format!("evidence/{}", retained.id);
+    let markdown = format!("[@Paper](loom-evidence:{}) @Notes", retained.id);
+    let plan = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        600,
+        ReferenceRequirement::AvailableForWriting,
+    )
+    .unwrap();
+    assert!(plan.text.contains("A small useful note."));
+    assert!(!plan.text.contains("nightjar"));
+    assert!(plan.text.len() <= 600);
+    assert!(plan.evidence.is_empty());
+    assert!(!plan.bindings.contains_key(&name));
+    assert!(
+        native_media(&store, plan.bindings.values())
+            .unwrap()
+            .is_empty()
+    );
+    let Value::Evidence { evidence, .. } = plan.budget_omissions[&name].unscoped() else {
+        panic!("the frozen, unconsumed evidence must remain in the receipt")
+    };
+    assert_eq!(evidence[0].id, retained.id);
+    assert_eq!(evidence[0].text, retained.text);
+    let receipt: ContextPlan =
+        serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+    assert_eq!(
+        exact(&receipt.budget_omissions[&name]).unwrap(),
+        evidence_text(std::slice::from_ref(&retained)).unwrap()
+    );
+    assert_eq!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            600,
+            ReferenceRequirement::All
+        )
+        .unwrap_err()
+        .code,
+        "material_context_budget_exceeded"
+    );
+    let full = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        MAX_BYTES,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
+    assert_eq!(full.evidence[0].text, retained.text);
+    assert!(full.budget_omissions.is_empty());
+
+    fs::write(
+        store
+            .root()
+            .join(".loom/materials/evidence")
+            .join(format!("{}.json", retained.id)),
+        b"{}",
+    )
+    .unwrap();
+    assert_eq!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            600,
+            ReferenceRequirement::AvailableForWriting,
+        )
+        .unwrap_err()
+        .code,
+        "material_failed"
+    );
+}
+
+#[test]
+fn writing_with_no_context_room_or_a_large_document_still_has_a_valid_plan() {
+    let (_directory, mut store) = project();
+    document(&mut store, "Empty.md", "");
+    document(&mut store, "Long.md", &"prose ".repeat(MAX_BYTES));
+    for (name, budget, code) in [
+        ("Empty", 0, "material_context_budget_exceeded"),
+        ("Long", 4000, "document_reference_budget_exceeded"),
+    ] {
+        let markdown = format!("@{name}");
+        let plan = markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "write on",
+            budget,
+            ReferenceRequirement::AvailableForWriting,
+        )
+        .unwrap();
+        assert!(plan.text.is_empty());
+        assert!(plan.bindings.is_empty());
+        if name == "Empty" {
+            assert!(plan.budget_omissions.contains_key(name));
+        } else {
+            assert!(plan.unresolved_references[name].contains("64 KiB"));
+        }
+        assert_eq!(
+            markdown_plan_with_budget(
+                &store,
+                &markdown,
+                "write on",
+                budget,
+                ReferenceRequirement::All
+            )
+            .unwrap_err()
+            .code,
+            code
+        );
+    }
 }
 
 #[test]
 fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
-    let (_directory, store) = project();
-    let source = attachment(&store, "Research", &"Quiet prose. ".repeat(1000));
-    let plan =
-        markdown_plan_with_budget(&store, &format!("@{}", source.id), "nightjar", 1000).unwrap();
+    let (_directory, mut store) = project();
+    let source = attachment(&mut store, "Research", &"Quiet prose. ".repeat(1000));
+    let plan = markdown_plan_with_budget(
+        &store,
+        &format!("@{}", source.id),
+        "nightjar",
+        1000,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
     assert!(plan.evidence.is_empty());
     assert!(
         plan.text
@@ -283,7 +670,7 @@ fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     let Value::Evidence {
         retrieval: Some(retrieval),
         ..
-    } = &plan.bindings[&source.id]
+    } = plan.bindings[&source.id].unscoped()
     else {
         panic!("frozen empty retrieval")
     };
@@ -293,21 +680,21 @@ fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
 
 #[test]
 fn renaming_display_metadata_preserves_retained_consult_and_full_id_markdown() {
-    let (_directory, store) = project();
-    let original = attachment(&store, "Old display name", "Original café 🦉 evidence");
+    let (_directory, mut store) = project();
+    let original = attachment(&mut store, "Old display name", "Original café 🦉 evidence");
     let snapshot = resolve(&store, &original.id).unwrap();
     let exact_before = exact(&snapshot).unwrap();
     let retained = consult(&store, &snapshot, "Original").unwrap();
     let retained_before = exact(&retained).unwrap();
     let entry = materials::observed_entry(&store, &original.id).unwrap();
     materials::change_metadata(
-        &store,
+        &mut store,
         &entry.id,
         entry.metadata_revision.as_deref().unwrap(),
         materials::MetadataChange::Rename("New display name"),
     )
     .unwrap();
-    attachment(&store, "Old display name", "Unrelated name reuse");
+    attachment(&mut store, "Old display name", "Unrelated name reuse");
     let Value::Material { material: frozen } = &snapshot else {
         panic!("material snapshot")
     };
@@ -322,4 +709,49 @@ fn renaming_display_metadata_preserves_retained_consult_and_full_id_markdown() {
     let plan = markdown_plan(&store, &old_link, "Original").unwrap();
     assert!(plan.text.contains("Original café 🦉 evidence"));
     assert!(!plan.text.contains("Unrelated name reuse"));
+}
+
+#[test]
+fn corpus_count_retains_scope_and_refuses_snippets_or_replaced_source() {
+    let (directory, mut store) = project();
+    let path = directory.path().join("count.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("materials/alexandria-fixture.sql"))
+        .unwrap();
+    drop(connection);
+    let entry = materials::add_library(&mut store, &path, Some("Research")).unwrap();
+    let context = ReadContext::from(&store);
+    let frozen = context.resolve(&entry.id).unwrap();
+    let counted = context.count_documents(&frozen).unwrap();
+    let Value::Count { count } = counted.unscoped() else {
+        panic!("count lost its type");
+    };
+    assert_eq!(count.result.value, 1);
+    assert_eq!(count.material.id, entry.id);
+    assert_eq!(
+        exact(&counted).unwrap(),
+        "1 document record in the entire library \"Research\".\n"
+    );
+    let serialized = serde_json::to_vec(&counted).unwrap();
+    let snippets = context
+        .search_with_cancel(&frozen, "prayer", &FolderScanBudget::default(), &|| false)
+        .unwrap();
+    assert!(context.count_documents(&snippets).is_err());
+    assert!(
+        context
+            .count_documents(&Value::Text("3 retrieved snippets".into()))
+            .is_err()
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("UPDATE documents SET title='Changed'", [])
+        .unwrap();
+    drop(connection);
+    assert!(ReadContext::from(&store).count_documents(&frozen).is_err());
+    materials::add_library(&mut store, &path, Some("Research")).unwrap();
+    assert!(ReadContext::from(&store).count_documents(&frozen).is_err());
+    let replay: Value = serde_json::from_slice(&serialized).unwrap();
+    assert_eq!(exact(&replay).unwrap(), exact(&counted).unwrap());
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), serialized);
 }

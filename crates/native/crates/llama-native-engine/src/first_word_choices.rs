@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use llama_native_types::{
     FIRST_WORD_CHOICE_MAX_ATTEMPTS, FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS, FirstWordChoiceAttempt,
     FirstWordChoiceAttemptOutcome, FirstWordChoiceEvidence, FirstWordChoicePolicy,
-    complete_first_word_key,
+    LeadingMarkupStatus, complete_first_word_key, leading_markup_status,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +81,24 @@ impl FirstWordGate {
         finished: bool,
         reserved: &mut BTreeSet<String>,
     ) -> Admission {
-        let word_key = complete_first_word_key(text, terminal_token_id.is_some());
-        let outcome = if let Some(word) = &word_key {
+        let markup = self
+            .evidence
+            .policy
+            .rejects_leading_markup()
+            .then(|| leading_markup_status(text));
+        let word_key = if markup == Some(LeadingMarkupStatus::NotMarkup) || markup.is_none() {
+            complete_first_word_key(text, terminal_token_id.is_some())
+        } else {
+            None
+        };
+        let leading_line_break = self.evidence.policy.rejects_leading_line_breaks()
+            && text
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .any(|c| matches!(c, '\r' | '\n'));
+        let outcome = if leading_line_break || markup == Some(LeadingMarkupStatus::Complete) {
+            FirstWordChoiceAttemptOutcome::DisallowedPrefix
+        } else if let Some(word) = &word_key {
             if reserved.contains(word) {
                 FirstWordChoiceAttemptOutcome::Duplicate
             } else {
@@ -183,6 +199,121 @@ mod tests {
             gate.evidence.attempts[1].seed,
             FirstWordChoicePolicy::DistinctV2.attempt_seed(41, 1)
         );
+    }
+
+    #[test]
+    fn visual_openings_reject_line_breaks_but_retain_numeric_and_comparison_prose() {
+        for text in ["\n", " \r\nwooden table."] {
+            let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV4, 41);
+            let mut words = BTreeSet::new();
+            assert_eq!(
+                gate.observe(text, &[1], None, false, &mut words),
+                Admission::Retry
+            );
+            assert!(words.is_empty());
+            assert_eq!(
+                gate.evidence.attempts[0].outcome,
+                FirstWordChoiceAttemptOutcome::DisallowedPrefix
+            );
+        }
+        for text in [
+            "2016 ballot",
+            "700-year-old wall",
+            "12-foot ceiling",
+            "<3 forever",
+            "1 < 2",
+        ] {
+            let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV4, 41);
+            assert_eq!(
+                gate.observe(text, &[1], None, false, &mut BTreeSet::new()),
+                Admission::Accepted,
+                "{text:?}"
+            );
+        }
+        let mut source = FirstWordGate::new(FirstWordChoicePolicy::DistinctPlainTextV3, 41);
+        assert_eq!(
+            source.observe("\n\nwooden table", &[1], None, false, &mut BTreeSet::new()),
+            Admission::Accepted
+        );
+    }
+
+    #[test]
+    fn plain_text_policy_retries_complete_markup_without_reserving_its_tag_name() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctPlainTextV3, 41);
+        gate.record_nonterminal_token();
+        assert_eq!(
+            gate.observe("<str", &[1], None, false, &mut words),
+            Admission::Pending
+        );
+        gate.record_nonterminal_token();
+        assert_eq!(
+            gate.observe("<strong>", &[1, 2], None, false, &mut words),
+            Admission::Retry
+        );
+        assert!(words.is_empty());
+        assert_eq!(gate.evidence.attempts[0].word_key, None);
+        assert_eq!(
+            gate.evidence.attempts[0].outcome,
+            FirstWordChoiceAttemptOutcome::DisallowedPrefix
+        );
+        gate.record_nonterminal_token();
+        assert_eq!(
+            gate.observe("Quiet ", &[3], None, false, &mut words),
+            Admission::Accepted
+        );
+        assert_eq!(words, BTreeSet::from(["quiet".to_string()]));
+        assert_eq!(gate.evidence.selected_attempt, Some(1));
+        assert_eq!(gate.evidence.total_attempted_tokens, 3);
+    }
+
+    #[test]
+    fn incomplete_markup_never_acquires_word_authority() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctPlainTextV3, 3);
+        assert_eq!(
+            gate.observe("<strong/", &[1, 2], None, true, &mut words),
+            Admission::Retry
+        );
+        assert!(words.is_empty());
+        assert_eq!(
+            gate.evidence.attempts[0].outcome,
+            FirstWordChoiceAttemptOutcome::PrefixLimit
+        );
+    }
+
+    #[test]
+    fn repeated_markup_exhausts_the_existing_bounded_attempt_ledger() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctPlainTextV3, 9);
+        for attempt in 0..FIRST_WORD_CHOICE_MAX_ATTEMPTS {
+            gate.record_nonterminal_token();
+            assert_eq!(
+                gate.observe("<b>", &[attempt as i32], None, false, &mut words),
+                if attempt + 1 == FIRST_WORD_CHOICE_MAX_ATTEMPTS {
+                    Admission::Exhausted
+                } else {
+                    Admission::Retry
+                }
+            );
+        }
+        assert!(gate.evidence.exhausted);
+        assert_eq!(gate.evidence.selected_attempt, None);
+        assert_eq!(
+            gate.evidence.attempts.len(),
+            FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize
+        );
+        assert!(
+            gate.evidence
+                .attempts
+                .iter()
+                .all(|attempt| attempt.outcome == FirstWordChoiceAttemptOutcome::DisallowedPrefix)
+        );
+        assert_eq!(
+            gate.evidence.total_attempted_tokens,
+            u64::from(FIRST_WORD_CHOICE_MAX_ATTEMPTS)
+        );
+        assert!(words.is_empty());
     }
 
     #[test]

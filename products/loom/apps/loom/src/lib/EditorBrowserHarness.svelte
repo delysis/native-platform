@@ -28,6 +28,7 @@
   export let initialValue = 'alpha beta gamma';
   export let completionCandidates: CompletionCandidate[] = [];
   export let completionFrames: readonly (readonly CompletionCandidate[])[] = [];
+  export let reconcileSelectionFamily = false;
   export let autocomplete = true;
   export let shuttle = false;
   export let acceptImageAttachments = true;
@@ -40,6 +41,10 @@
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
   let editor: LoomEditor;
+  export function insertSourceQuotation(reference: Element, quotation: string): boolean {
+    const anchor = editor.captureTextInsertionAnchor(reference);
+    return Boolean(anchor && editor.insertMarkdownAtAnchor(anchor, quotation));
+  }
   const completionContextKey = completionSessionContextKey(
     'browser-session',
     'browser-document',
@@ -52,6 +57,8 @@
   let checkpointRevision = 1;
   let generationRequests = 0;
   let completionFrameIndex = 0;
+  let selectionByte: number | null = null;
+  let authoritativeCandidates = completionCandidates;
   let exhaustionHandled = false;
   let completionReady = false;
   let lastFormattingResult = 'none';
@@ -90,6 +97,26 @@
       }))
     : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
+  $: if (reconcileSelectionFamily && completionReady) {
+    reconcileSelectionFamilyAt(selectionByte, authoritativeCandidates);
+  }
+
+  function reconcileSelectionFamilyAt(
+    targetByte: number | null,
+    candidates: readonly CompletionCandidate[]
+  ): void {
+    // App derives its eligible family from the reported visual boundary, then
+    // reconciles through this same session helper. Preserve null callbacks:
+    // silently retaining the last boundary would hide the suspected race.
+    const family = targetByte === null
+      ? [] : candidates.filter((candidate) => candidate.targetByte === targetByte);
+    const next = session
+      ? synchronizeCompletionCandidates(session, family, pendingMarkdown === null)
+      : family.length > 0
+        ? startCompletionSession(completionContextKey, family, family[0].runId)
+        : null;
+    if (session !== next) session = next;
+  }
   $: {
     const exhausted = Boolean(
       completionReady &&
@@ -118,6 +145,7 @@
     generationRequests += 1;
     session = null;
     pendingMarkdown = null;
+    if (reconcileSelectionFamily) authoritativeCandidates = [];
   }
 
   function selectionChanged(
@@ -125,6 +153,7 @@
     failure: VisualCaretBoundaryFailure | 'selection_settling' | null,
     diagnostic: string | null
   ): void {
+    selectionByte = markdownByteOffset;
     selectionCallbackCount += 1;
     if (markdownByteOffset === null) nullSelectionCallbackCount += 1;
     latestSelectionCallback = markdownByteOffset === null
@@ -188,6 +217,10 @@
     const candidates = completionFrames[completionFrameIndex];
     if (!candidates) return;
     completionFrameIndex += 1;
+    if (reconcileSelectionFamily) {
+      authoritativeCandidates = [...candidates];
+      return;
+    }
     session = session
       ? synchronizeCompletionCandidates(session, candidates)
       : candidates.length > 0

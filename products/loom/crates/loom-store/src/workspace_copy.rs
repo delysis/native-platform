@@ -39,6 +39,22 @@ impl PreparedWorkspaceCopy {
         let mut file = BoundedNoFollowFile::open(source, max_bytes)?;
         let bytes = file.read()?;
         file.ensure_path_binding()?;
+        Self::from_bytes(Path::new(&relative_path), bytes)
+    }
+
+    /// Bytes read through an already granted, bounded directory capability.
+    pub fn from_bytes(destination: &Path, bytes: Vec<u8>) -> Result<Self> {
+        let relative_path = normalize_document_path(destination)?;
+        let name = destination.to_string_lossy().to_ascii_lowercase();
+        if bytes.starts_with(b"SQLite format 3\0")
+            || [".sqlite", ".sqlite3", ".db", "-wal", "-shm", "-journal"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            return Err(std::io::Error::other(
+                "Open databases as read-only libraries; copying database files is not a consistent snapshot.",
+            ).into());
+        }
         let writing = destination
             .extension()
             .and_then(|ext| ext.to_str())
@@ -94,6 +110,20 @@ impl PreparedWorkspaceCopy {
             relative_path: self.relative_path,
             registration_warning,
         })
+    }
+}
+
+impl ProjectStore {
+    /// Explicit copy destinations never merge into an existing directory.
+    /// Empty source directories remain real directories, without placeholder files.
+    pub fn create_workspace_copy_directory(&self, relative: &Path) -> Result<()> {
+        let relative = normalize_document_path(relative)?;
+        if self.document_path_is_reserved(&relative)? {
+            return Err(StoreError::DocumentAlreadyExists(relative));
+        }
+        let destination = ensure_document_parent(self.root(), &relative)?;
+        std::fs::create_dir(destination)?;
+        Ok(())
     }
 }
 

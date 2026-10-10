@@ -194,6 +194,32 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("Loom acceptance refuses a missing real writer before opening a bundle", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "loom-smoke-preflight-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  writeExecutable(path.join(directory, "uname"), "#!/bin/sh\nprintf 'Darwin\\n'\n");
+  for (const modelPath of ["", path.join(directory, "missing-writer.gguf")]) {
+    const result = spawnSync("sh", [smokeScriptPath, "loom", "/missing/Loom.app"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+        DELYSIS_ACCEPTANCE_SOURCE_SHA: "",
+        MOM_ACCEPTANCE_SOURCE_SHA: "",
+        MOM_ACCEPTANCE_PRODUCT_NAME: "",
+        MOM_ACCEPTANCE_BUNDLE_ID: "",
+        LOOM_SMOKE_GGUF_MODEL_PATH: modelPath,
+        LOOM_SMOKE_PROJECTOR_PATH: "",
+        LOOM_SMOKE_REAL_COMPLETIONS: "", // The former opt-in cannot bypass the gate.
+      },
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Loom acceptance requires a cached GGUF model/);
+    assert.doesNotMatch(result.stderr, /packaged application is missing/);
+  }
+});
+
 test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
   const support = path.join(root, "scripts/macos-smoke-support");
   const smoke = [read(smokeScriptPath), ...fs.readdirSync(support)
@@ -202,11 +228,11 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     .map((name) => read(path.join(support, name)))].join("\n");
   assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
   assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
-  assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
+  assert.match(smoke, /model_name=\$\(basename -- "\$LOOM_SMOKE_GGUF_MODEL_PATH"\)/);
   assert.ok(
-    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"') <
+    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/$model_name"') <
       smoke.indexOf("run_once 1"),
-    "the exact Gemma link must exist before Loom startup discovery",
+    "the source-named model link must exist before Loom startup discovery",
   );
   assert.match(smoke, /stat -Lf '%d:%i' "\$LOOM_SMOKE_GGUF_MODEL_PATH"/);
   assert.doesNotMatch(smoke, /acceptance-writer/);

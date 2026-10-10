@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-preferences-update"
+description = "Enables the preferences_update command without any pre-configured scope."
+commands.allow = ["preferences_update"]
+
+[[permission]]
+identifier = "deny-preferences-update"
+description = "Denies the preferences_update command without any pre-configured scope."
+commands.deny = ["preferences_update"]

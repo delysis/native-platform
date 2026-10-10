@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-pane-run"
+description = "Enables the workspace_pane_run command without any pre-configured scope."
+commands.allow = ["workspace_pane_run"]
+
+[[permission]]
+identifier = "deny-workspace-pane-run"
+description = "Denies the workspace_pane_run command without any pre-configured scope."
+commands.deny = ["workspace_pane_run"]

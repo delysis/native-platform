@@ -2,10 +2,10 @@ import { mount, unmount, type ComponentProps } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import MaterialView from './MaterialView.svelte';
-import type { MaterialEntry, MaterialEvidence, MaterialRead } from './materials';
+import type { MaterialEntry, MaterialEvidence, MaterialRead, MaterialNavigation } from './materials';
 import '../app.css';
-const ipc = vi.hoisted(() => ({ read: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
-vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
+const ipc = vi.hoisted(() => ({ read: vi.fn(), pdf: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
+vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, readMaterialPdfPage: ipc.pdf, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
 const material: MaterialEntry = { id: 'material-' + 'a'.repeat(64), name: 'Research', reference: '@"materials/Research#a"', kind: 'library', pinned: false, available: true, source_path: '/private/library.sqlite', attachment_id: null, metadata_revision: 'a'.repeat(64) };
 const evidence: MaterialEvidence = { id: 'b'.repeat(64), reference: '@"evidence/b"', material_id: material.id, title: 'A source', text: 'Exact café evidence.\nSecond line.', source_revision: 'revision', text_sha256: 'hash', locator: { document_id: 'source', block_id: 7 } };
 let view: ReturnType<typeof mount> | undefined;
@@ -30,6 +30,101 @@ function pdfSource(): MaterialRead {
   } };
 }
 describe('named material viewing', () => {
+  it('restores query and exact evidence across remounts without caching payloads, while explicit links override selection', async () => {
+    let navigation: MaterialNavigation | undefined;
+    const remember = (value: MaterialNavigation) => { navigation = value; };
+    render({ onNavigationChange: remember });
+    await page.getByRole('searchbox', { name: 'Search Research' }).fill('history');
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
+    await page.getByRole('button', { name: /A source/ }).click();
+    await expect.poll(() => navigation?.evidenceId).toBe(evidence.id);
+    expect(navigation?.query).toBe('history');
+    expect(JSON.stringify(navigation)).not.toContain(evidence.text);
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    render({ navigation, onNavigationChange: remember });
+    await expect.element(page.getByText(evidence.text, { exact: true })).toBeVisible();
+    expect(ipc.evidence).toHaveBeenCalledTimes(2);
+    expect(ipc.evidence).toHaveBeenLastCalledWith('project', 'session', material.id, evidence.id);
+    expect(ipc.search).toHaveBeenCalledOnce();
+    await page.getByRole('button', { name: '‹ Search', exact: true }).click();
+    await expect.element(page.getByRole('searchbox', { name: 'Search Research' })).toHaveValue('history');
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    const explicit = { ...evidence, id: 'explicit', text: 'Explicit retained link wins.' };
+    render({ navigation: { ...navigation!, evidenceId: evidence.id }, initialEvidence: explicit, onNavigationChange: remember });
+    await expect.element(page.getByText(explicit.text, { exact: true })).toBeVisible();
+    expect(ipc.evidence).toHaveBeenCalledTimes(2);
+    await expect.poll(() => navigation?.evidenceId).toBe(explicit.id);
+  });
+
+  it('restores the selected PDF page and text view using a fresh native source read', async () => {
+    const read = pdfSource(); read.presentation!.pdf_preview_token = 'retained-pdf';
+    ipc.pdf.mockImplementation(async (_token: string, number: number) => ({ page: number, page_count: 3, width: 1, height: 1, incomplete: false, png_base64: '' }));
+    let navigation: MaterialNavigation | undefined;
+    const remember = (value: MaterialNavigation) => { navigation = value; };
+    render({ material: read.material, onNavigationChange: remember }, read);
+    await expect.poll(() => navigation?.pdfPageCount).toBe(3);
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect.poll(() => navigation?.pageIndex).toBe(1);
+    await expect.element(page.getByRole('button', { name: 'Next page' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Show extracted text' }).click();
+    await expect.poll(() => navigation?.pdfText).toBe(true);
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    render({ material: read.material, navigation, onNavigationChange: remember }, read);
+    await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe('## Page 3\nSecond extracted page 🖋.\n');
+    await expect.element(page.getByRole('combobox', { name: 'Page', exact: true })).toHaveValue('2');
+    await expect.element(page.getByRole('button', { name: 'Previous page' })).toBeEnabled();
+    expect(ipc.read).toHaveBeenCalledTimes(2);
+    expect(ipc.pdf).toHaveBeenCalledTimes(3);
+  });
+
+  it('opens original pages including pages without extracted text, and keeps quotations on canonical text', async () => {
+    const read = pdfSource();
+    read.presentation!.pdf_preview_token = 'retained-pdf';
+    ipc.pdf.mockImplementation(async (_token: string, number: number) => ({ page: number, page_count: 3, width: 1, height: 1, incomplete: false, png_base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' }));
+    const { onUse } = render({ material: read.material }, read);
+    await expect.element(page.getByRole('img', { name: 'Paper.pdf, page 1' })).toBeVisible();
+    expect(document.querySelector('.source-text')).toBeNull();
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect.element(page.getByRole('img', { name: 'Paper.pdf, page 2' })).toBeVisible();
+    expect(ipc.pdf).toHaveBeenLastCalledWith('retained-pdf', 2, expect.any(AbortSignal));
+    await page.getByText('•••', { exact: true }).click();
+    expect(page.getByRole('button', { name: 'Insert quotation' }).query()).toBeNull();
+    await page.getByRole('button', { name: 'Show extracted text' }).click();
+    await expect.element(page.getByText('No text was extracted from this page.', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe('## Page 3\nSecond extracted page 🖋.\n');
+    await page.getByRole('button', { name: 'Insert quotation' }).click();
+    expect(onUse).toHaveBeenCalledWith(`[@A source](loom-evidence:${evidence.id})`, '## Page 3\nSecond extracted page 🖋.\n');
+    expect(ipc.pdf).toHaveBeenCalledTimes(2);
+  });
+  it('discards an in-flight page when switching to extracted text', async () => {
+    const read = pdfSource(); read.presentation!.pdf_preview_token = 'retained-pdf';
+    let settle!: (value: unknown) => void;
+    ipc.pdf.mockImplementation(() => new Promise(resolve => { settle = resolve; }));
+    render({ material: read.material }, read);
+    await expect.poll(() => ipc.pdf.mock.calls.length).toBe(1);
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Show extracted text' }).click();
+    await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe('## Page 1\nFirst café page.\n\n');
+    settle({ page: 1, page_count: 3, width: 1, height: 1, png_base64: '', incomplete: true });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(document.querySelector('.pdf-page')).toBeNull();
+    expect(page.getByText('Some page content could not be drawn. The original is retained.').query()).toBeNull();
+  });
+  it('keeps unmapped extracted text readable when original-page rendering fails', async () => {
+    const read = pdfSource();
+    read.presentation!.pdf_preview_token = 'retained-pdf'; read.presentation!.pdf_pages = [];
+    ipc.pdf.mockRejectedValue({ code: 'pdf_render_failed', message: 'This PDF page could not be drawn.', retryable: false });
+    render({ material: read.material }, read);
+    await expect.element(page.getByRole('alert')).toHaveTextContent('This PDF page could not be drawn.');
+    expect(document.querySelector('.pdf-page')).toBeNull();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Show extracted text' }).click();
+    await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe(read.text);
+    await expect.element(page.getByText('The extracted text has no page mapping. Showing the whole document.')).toBeVisible();
+  });
   it('navigates only mapped PDF pages and quotes the exact displayed page with retained lineage', async () => {
     const read = pdfSource();
     const { onUse } = render({ material: read.material }, read);

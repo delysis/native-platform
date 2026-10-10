@@ -120,6 +120,12 @@ if [ -n "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ]; then
   fi
 fi
 
+# Loom's packaged journey requires the real writer; a missing model never
+# downgrades this gate to editor fixtures. Text-only writers need no projector.
+if [ "$COMPONENT" = loom ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+  echo "Loom acceptance requires a cached GGUF model: set LOOM_SMOKE_GGUF_MODEL_PATH to the approved local writer" >&2
+  exit 1
+fi
 if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
   echo "LOOM_SMOKE_GGUF_MODEL_PATH is not a model file: $LOOM_SMOKE_GGUF_MODEL_PATH" >&2
   exit 1
@@ -316,7 +322,8 @@ cargo run --quiet --locked --manifest-path "$ROOT/Cargo.toml" -p xtask -- \
 if [ "$COMPONENT" = loom ] && [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
   model_library="$PRODUCT_STATE/models"
   mkdir -p "$model_library"
-  LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"
+  model_name=$(basename -- "$LOOM_SMOKE_GGUF_MODEL_PATH")
+  LOOM_SMOKE_MODEL_LINK="$model_library/$model_name"
   if [ -e "$LOOM_SMOKE_MODEL_LINK" ]; then
     echo "isolated acceptance model target already exists: $LOOM_SMOKE_MODEL_LINK" >&2
     exit 1

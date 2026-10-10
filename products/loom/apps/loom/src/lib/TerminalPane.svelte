@@ -7,6 +7,8 @@
   export let projectId = '';
   export let sessionId = '';
   export let documents: DocumentSummary[] = [];
+  export let readOutput: ((run: TerminalRun) => Promise<string>) | undefined = undefined;
+  export let outputRevision = 0;
   export let entry = '';
   export let open = false;
   export let embedded = false;
@@ -52,7 +54,7 @@
   let outputs: Record<string, string> = {};
   let outputError = '';
   const outputLoader = new RetainedOutputLoader();
-  $: if (mounted) void hydrate(projectId, sessionId, open, runs, documents);
+  $: if (mounted) void hydrate(projectId, sessionId, open, runs, documents, readOutput, outputRevision);
   $: history = [...runs].sort((a, b) => a.created_at_ms - b.created_at_ms);
   $: commands = [...history].reverse().map(run => run.presentation?.input ?? run.expression).filter(Boolean);
   onMount(() => {
@@ -68,7 +70,7 @@
     if (!embedded) window.addEventListener('keydown', handleCommandKey);
     return () => { mounted = false; outputSerial++; outputLoader.clear(); window.removeEventListener('keydown', handleCommandKey); };
   });
-  async function hydrate(project: string, session: string, visible: boolean, retained: TerminalRun[], summaries: DocumentSummary[]): Promise<void> {
+  async function hydrate(project: string, session: string, visible: boolean, retained: TerminalRun[], summaries: DocumentSummary[], reader: typeof readOutput, _revision: number): Promise<void> {
     const serial = ++outputSerial;
     const scope = `${project}/${session}`;
     if (scope !== outputScope) {
@@ -79,8 +81,8 @@
     const next: Record<string, string> = {};
     let failureMessage = '';
     for (const run of retained.slice(-64)) {
-      if (!run.output_document_id || !summaries.some((document) => document.document_id === run.output_document_id)) continue;
-      try { next[run.run_id] = await outputLoader.read(project, session, run, summaries); }
+      if (!run.output_document_id || (!reader && !summaries.some((document) => document.document_id === run.output_document_id))) continue;
+      try { next[run.run_id] = await (reader ? reader(run) : outputLoader.read(project, session, run, summaries)); }
       catch (failure) { failureMessage = normalizeFailure(failure).message; }
       if (!mounted || serial !== outputSerial) return;
     }

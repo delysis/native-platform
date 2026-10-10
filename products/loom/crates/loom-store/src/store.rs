@@ -101,6 +101,7 @@ pub struct ProjectStore {
     pub(crate) connection: Connection,
     pub(crate) vault: Option<ProjectVault>,
     pub(crate) folder_warnings: Vec<String>,
+    pub(crate) folder_directories: Vec<String>,
     _lease: ProjectLease,
 }
 
@@ -395,6 +396,7 @@ impl ProjectStore {
             connection,
             vault,
             folder_warnings: Vec::new(),
+            folder_directories: Vec::new(),
             _lease: lease,
         };
         if purpose == OpenPurpose::Editing {

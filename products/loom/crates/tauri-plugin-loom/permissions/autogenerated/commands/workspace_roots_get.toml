@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-roots-get"
+description = "Enables the workspace_roots_get command without any pre-configured scope."
+commands.allow = ["workspace_roots_get"]
+
+[[permission]]
+identifier = "deny-workspace-roots-get"
+description = "Denies the workspace_roots_get command without any pre-configured scope."
+commands.deny = ["workspace_roots_get"]

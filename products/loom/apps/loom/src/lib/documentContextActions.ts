@@ -13,7 +13,7 @@ export type {
 
 import type { DocumentKind, DocumentSummary, OpenDocument, ProjectSnapshot } from './types';
 
-export type DocumentContextAction = 'open' | 'rename' | 'export_text' | 'delete' | 'reveal';
+export type DocumentContextAction = 'open' | 'rename' | 'export_text' | 'delete' | 'reveal' | 'copy_reference';
 export const MAX_DOCUMENT_TITLE_BYTES = 256;
 
 /**

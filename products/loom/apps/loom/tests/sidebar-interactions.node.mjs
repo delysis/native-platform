@@ -104,7 +104,7 @@ class Control {
 const appNames = [
   'sidebarLiveState', 'sidebarCapabilitiesFor', 'reconcileSidebarSelection', 'sidebarButtons', 'focusSidebarButton', 'restoreSidebarFocus',
   'selectSidebarRow', 'handleSidebarContextPointer', 'handleSidebarRowKeydown', 'activateSidebarRow',
-  'openSidebarContextMenu', 'runSidebarContextAction', 'executeSidebarCapability',
+  'openSidebarContextMenu', 'runSidebarContextAction', 'executeSidebarCapability', 'sidebarRootOpenTarget',
   'beginWorkspaceLabelRename', 'cancelWorkspaceLabelRename', 'commitWorkspaceLabelRename',
   'handleWorkspaceRenameInput', 'handleWorkspaceRenameCompositionEnd',
   'closeDocumentContextMenu', 'documentContextMenuItems', 'focusDocumentContextMenu', 'handleDocumentContextMenuKeydown',
@@ -119,6 +119,7 @@ function app(overrides = {}, mutate) {
     ...folders, ...sidebar, ...editing, ...documents, ...metadata, ...primitives,
     project: p, document: { summary: p.documents[0], text: 'unsaved manuscript', visible_blob_id: summary.active_blob_id },
     documentText: 'unsaved manuscript', saveState: 'dirty',
+    materialOwnerScope: undefined, workspaceRoots: null, workspaceRootsScope: '',
     workspaceFolders: [root, missing], fileRows: tree.workspaceRows(p.documents, new Set(), ''), materialEntries: [],
     componentMounted: true, applicationClosePhase: 'running', transition: 'idle', fileCommandInFlight: false,
     opening: false, documentContextActionInFlight: false, sidebarActionInFlight: false,
@@ -301,8 +302,8 @@ test('negative control: old no-removal/stranded bookmark behavior fails the actu
 });
 test('real App failed open preserves current editor and missing bookmark, surfaces error and permits retry then removal', async () => {
   const a = app(), before = a.state.document;
-  assert.equal(await a.doOpenProject(a.missing.root), false);
-  assert.equal(await a.doOpenProject(a.missing.root), false);
+  assert.equal(await a.doOpenProject({ path: a.missing.root }), false);
+  assert.equal(await a.doOpenProject({ path: a.missing.root }), false);
   assert.equal(a.errors.length, 2); assert.equal(a.errors[0].code, 'selected_folder_unavailable');
   assert.equal(a.state.document, before); assert.equal(a.state.documentText, 'unsaved manuscript');
   assert(a.state.workspaceFolders.includes(a.missing));
@@ -483,7 +484,7 @@ test('real App reports explicit-open bookmark persistence failures after navigat
     const p = project(), storageError = new Error('storage denied'), calls = [];
     let reported = null;
     const instance = handlers('App.svelte', ['finishOpeningProject'], {
-      ...folders, project: p, workspaceRestoreIsCurrent: () => true,
+      ...folders, project: p, workspaceRestoreIsCurrent: () => true, refreshWorkspaceRoots: async () => {},
       closeDocumentContextMenu: () => {}, closeDocumentDeleteConfirmation: () => {},
       missingDocumentCapturePending: false, missingDocumentRecovery: null, missingDocumentCopyState: 'idle',
       missingDocumentRecoveryRequiresCopy: () => false, recordLocalFailure: () => assert.fail('Unexpected recovery failure'),
@@ -620,8 +621,12 @@ test('negative control: removing the native metadata-revision receipt check fail
 });
 function materialProjection(overrides = {}, mutate) {
   const calls = [], errors = [];
-  return { calls, errors, ...handlers('App.svelte', ['refreshMaterials', 'materialChanged', 'materialRemoved'], {
-    ...metadata, componentMounted: true, project: project(), materialEntries: [], materialRefreshSerial: 0, activeMaterial: null,
+  return { calls, errors, ...handlers('App.svelte', ['refreshMaterials', 'materialChanged', 'ownerMaterialChanged', 'materialRemoved', 'isOwnerMaterialScope', 'materialNavigationKey'], {
+    ...metadata, componentMounted: true, project: project(),
+    materialOwnerScope: { projectId: project().project_id, sessionId: 'session' },
+    workspaceRoots: { workspace_id: project().project_id, workspace_session_id: 'session', roots: [] },
+    workspaceOwnerActive: true, activeMaterialScope: { projectId: project().project_id, sessionId: 'session' },
+    materialNavigation: new Map(), materialEntries: [], materialRefreshSerial: 0, activeMaterial: null,
     listMaterials: async () => [], recordFailure: error => errors.push(error),
     closeMaterial: () => calls.push('close'), ...overrides
   }, mutate) };
@@ -642,7 +647,7 @@ test('real App mutation invalidates a pre-mutation list without remounting retai
 test('negative control: removing the list serial check reproduces a renamed label resurrection', async () => {
   const pending = deferred(), old = material({}), changed = material({ name: 'changed' });
   const a = materialProjection({ materialEntries: [old], listMaterials: () => pending.promise },
-    text => text.replace('request === materialRefreshSerial && project?.project_id', 'project?.project_id'));
+    text => text.replaceAll('request === materialRefreshSerial && ', ''));
   const operation = a.refreshMaterials(); a.materialChanged(changed); pending.resolve([old]); await operation;
   assert.throws(() => assert.equal(a.state.materialEntries[0], changed), assert.AssertionError);
 });
@@ -840,4 +845,57 @@ test('real App source opening preserves the row lease required to close its remo
   owner.materialRemoved(before.id, 'session', opened);
   assert.deepEqual(owner.calls, ['close']);
   assert.equal(owner.state.materialEntries.length, 0);
+});
+
+
+test('workspace material targets capture native owner authority and the originating editor lifetime', () => {
+  const p = project(), m = material({}), owner = { projectId: 'workspace-owner', sessionId: 'workspace-session' };
+  const target = sidebar.captureSidebarTarget(p, { kind: 'material', material: m }, owner);
+  const live = { project: p, bookmarks: [], folders: [], materials: [m], materialScope: owner };
+  assert.deepEqual(target.scope, owner);
+  assert.deepEqual(target.viewScope, { projectId: p.project_id, sessionId: p.session_id });
+  assert(sidebar.sidebarTargetIsCurrent(target, live));
+  assert.equal(sidebar.sidebarTargetIsCurrent(target, { ...live, materialScope: { ...owner, sessionId: 'reopened' } }), false);
+  assert.equal(sidebar.sidebarTargetIsCurrent(target, { ...live, project: { ...p, session_id: 'different editor' } }), false);
+  assert.equal(sidebar.sidebarTargetIsCurrent(target, { ...live, materialScope: null }), false);
+});
+
+test('real App metadata rename uses the workspace owner and rejects a receipt after its owner changes', async () => {
+  const before = material({}), owner = { projectId: 'workspace-owner', sessionId: 'workspace-session' }, pending = deferred();
+  let captured;
+  const a = app({ materialOwnerScope: owner, materialEntries: [before], renameMaterial: request => { captured = request; return pending.promise; } });
+  const target = sidebar.captureSidebarTarget(a.state.project, { kind: 'material', material: before }, owner);
+  await a.beginMaterialRename(target); a.state.renameMaterialName = 'Changed';
+  const operation = a.commitMaterialRename();
+  assert.equal(captured.projectId, owner.projectId); assert.equal(captured.sessionId, owner.sessionId);
+  a.state.materialOwnerScope = { ...owner, sessionId: 'reopened' };
+  pending.resolve(renameReceipt(captured, before)); await operation;
+  assert.deepEqual(a.calls, []); assert.deepEqual(a.errors, []);
+  assert.equal(a.state.materialEntries[0], before);
+});
+
+test('real App bookmarked mounted roots keep their native workspace handoff instead of establishing another owner', () => {
+  const p = project(), mounted = { id: 'mounted-root', path: '/mounted/writing', available: true };
+  const a = app({ workspaceRoots: { roots: [mounted] }, workspaceRootsScope: `${p.project_id}/${p.session_id}` });
+  assert.deepEqual(a.sidebarRootOpenTarget(mounted.path), { rootId: mounted.id });
+  assert.deepEqual(a.sidebarRootOpenTarget('/other/writing'), { path: '/other/writing' });
+  a.state.workspaceRootsScope = 'stale';
+  assert.deepEqual(a.sidebarRootOpenTarget(mounted.path), { path: mounted.path });
+});
+
+
+test('real App pane toggles preserve a writing fallback and cancel completion only when writing becomes hidden', () => {
+  const layout = productionLoader()('paneLayout'), cancelled = [];
+  const a = handlers('App.svelte', ['togglePane'], {
+    ...layout, equippedPanePositions: [], hiddenPaneSlots: new Set(),
+    cancelSuggestionTimer: () => cancelled.push('timer'), cancelActiveBranches: async () => cancelled.push('branches')
+  });
+  a.togglePane('main'); assert.equal(a.state.hiddenPaneSlots.has('main'), false); assert.deepEqual(cancelled, []);
+  for (const other of ['right', 'bottom']) {
+    a.state.equippedPanePositions = [other]; a.state.hiddenPaneSlots = new Set();
+    a.togglePane('main'); assert.equal(a.state.hiddenPaneSlots.has('main'), true);
+    a.togglePane(other);
+    assert.deepEqual(layout.visiblePanes(a.state.equippedPanePositions, a.state.hiddenPaneSlots), { main: true, right: false, bottom: false });
+  }
+  assert.deepEqual(cancelled, ['timer', 'branches', 'timer', 'branches']);
 });

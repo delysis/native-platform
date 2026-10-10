@@ -366,8 +366,10 @@ export function visualGhostTextMayBePlainProse(text: string): boolean {
   try {
     const left = '\uE100LOOM_LEFT\uE101';
     const right = '\uE102LOOM_RIGHT\uE103';
-    const raw = defaultMarkdownParser.parse(text);
-    if (raw.childCount !== 1 || raw.firstChild?.type.name !== 'paragraph') return false;
+    // Continuations are inline text, not standalone Markdown documents. For
+    // example, "3. 5-meter-long desk" is literal inside an existing paragraph
+    // but a list at block start. The exact caret/document proof below rejects
+    // the latter; this neutral screen must not discard the former.
     const wrapped = `${left}${text}${right}`;
     const parsed = defaultMarkdownParser.parse(wrapped);
     const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;

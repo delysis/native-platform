@@ -28,6 +28,22 @@ impl Default for FolderScanBudget {
     }
 }
 
+impl FolderScanBudget {
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining.get()
+    }
+
+    pub(crate) fn charge(&self, bytes: u64) -> Result<()> {
+        let remaining = self
+            .remaining
+            .get()
+            .checked_sub(bytes)
+            .ok_or_else(|| invalid("Collection retrieval exceeded its scan budget."))?;
+        self.remaining.set(remaining);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct FolderRetrieval {
     pub(crate) snapshot: FolderSnapshot,
@@ -182,6 +198,7 @@ pub(crate) fn search_folder(
         complete,
         warnings,
         folder: Some(coverage),
+        collection: None,
     })
 }
 

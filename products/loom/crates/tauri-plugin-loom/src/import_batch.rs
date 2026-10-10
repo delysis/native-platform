@@ -22,6 +22,7 @@ pub(crate) struct ImportFailure {
 #[derive(Debug, Serialize)]
 pub(crate) struct ImportBatch {
     pub(crate) imported: Vec<StoredAttachment>,
+    pub(crate) references: Vec<String>,
     pub(crate) failures: Vec<ImportFailure>,
     pub(crate) next_page_token: Option<String>,
 }
@@ -79,11 +80,27 @@ pub(super) async fn import_paths(
     }
     let mut report = ImportBatch {
         imported: Vec::new(),
+        references: Vec::new(),
         failures: Vec::new(),
         next_page_token: None,
     };
     for path in paths {
         let name = path.clone();
+        match operation.publish_to_store(state, |store| workspace_document_reference(store, &path))
+        {
+            Ok(Some(reference)) => {
+                report.references.push(reference);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                report.failures.push(ImportFailure {
+                    name,
+                    message: error.message,
+                });
+                continue;
+            }
+        }
         let root = operation.root.clone();
         let result = operation
             .compute(move || {
@@ -101,6 +118,68 @@ pub(super) async fn import_paths(
         }
     }
     Ok(report)
+}
+
+fn workspace_document_reference(
+    store: &mut loom_store::ProjectStore,
+    path: &str,
+) -> Result<Option<String>, IpcFailure> {
+    let source = std::path::Path::new(path);
+    if !source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            ["md", "markdown", "txt"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+    {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(source).map_err(|error| IpcFailure::store(error.into()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let source = source
+        .canonicalize()
+        .map_err(|error| IpcFailure::store(error.into()))?;
+    let Ok(relative) = source.strip_prefix(store.root()) else {
+        return Ok(None);
+    };
+    if relative
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return Ok(None);
+    }
+    let relative = relative.to_str().ok_or_else(|| {
+        IpcFailure::new(
+            "non_utf8_project_path",
+            "The workspace file name is not UTF-8.",
+            false,
+        )
+    })?;
+    // Registration retains existing identities and refuses reserved/deleted
+    // paths. Importing an existing document must not mint an attachment alias.
+    if !store
+        .document_path_is_reserved(relative)
+        .map_err(IpcFailure::store)?
+    {
+        store
+            .adopt_visible_document_if_absent(
+                relative,
+                loom_types::DocumentKind::Prose,
+                "Reference workspace writing",
+            )
+            .map_err(IpcFailure::store)?;
+    }
+    store
+        .import_external_changes_if_uncontested(relative, "Read referenced workspace writing")
+        .map_err(IpcFailure::store)?;
+    store.read_document(relative).map_err(IpcFailure::store)?;
+    serde_json::to_string(relative)
+        .map(|name| Some(format!("@{name}")))
+        .map_err(|error| IpcFailure::new("invalid_document_reference", error.to_string(), false))
 }
 
 struct LocalSource {
@@ -130,6 +209,7 @@ async fn import_local_batch(
         .await;
     let mut report = ImportBatch {
         imported: Vec::new(),
+        references: Vec::new(),
         failures: Vec::new(),
         next_page_token: None,
     };
@@ -349,6 +429,7 @@ async fn import_pasted_chunks(
 ) -> ImportBatch {
     let mut report = ImportBatch {
         imported: Vec::new(),
+        references: Vec::new(),
         failures: Vec::new(),
         next_page_token: None,
     };
@@ -430,6 +511,65 @@ mod tests {
                 })
             })
             .count()
+    }
+
+    #[test]
+    fn editor_import_references_workspace_writing_without_copying_or_conflating_external_sources() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let (state, project_id, session_id) = opened(project.path());
+        let inside = project.path().join("Inside Notes.md");
+        let outside = external.path().join("Outside.md");
+        let bytes = b"# Writing\r\nExact source bytes.\r\n";
+        fs::write(&inside, bytes).unwrap();
+        fs::write(&outside, bytes).unwrap();
+        let operation = ImportOperation::reserve(
+            &state,
+            &project_id,
+            &session_id,
+            &CommandId::new().to_string(),
+        )
+        .unwrap();
+        let paths = vec![
+            inside.to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned(),
+        ];
+        let report =
+            tauri::async_runtime::block_on(import_paths(&operation, &state, paths)).unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.references, ["@\"Inside Notes.md\""]);
+        assert_eq!(report.imported.len(), 1);
+        assert_eq!(report.imported[0].file_name, "Outside.md");
+        let id = operation
+            .publish_to_store(&state, |store| {
+                let loaded = store
+                    .read_document("Inside Notes.md")
+                    .map_err(IpcFailure::store)?;
+                Ok(loaded.document_id)
+            })
+            .unwrap();
+        let again = tauri::async_runtime::block_on(import_paths(
+            &operation,
+            &state,
+            vec![inside.to_string_lossy().into_owned()],
+        ))
+        .unwrap();
+        assert!(again.failures.is_empty(), "{:?}", again.failures);
+        assert!(again.imported.is_empty());
+        assert_eq!(again.references, report.references);
+        operation
+            .publish_to_store(&state, |store| {
+                assert_eq!(
+                    store.read_document("Inside Notes.md").unwrap().document_id,
+                    id
+                );
+                assert!(crate::materials::list(store).unwrap().is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(published_count(project.path()), 1);
+        assert_eq!(fs::read(inside).unwrap(), bytes);
+        assert_eq!(fs::read(outside).unwrap(), bytes);
     }
 
     #[test]
