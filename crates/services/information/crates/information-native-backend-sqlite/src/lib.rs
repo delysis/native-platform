@@ -3019,7 +3019,27 @@ mod tests {
             .join("\n");
 
         assert_eq!(rusqlite::version(), version);
-        assert_eq!(version, "3.51.3");
+        // Cargo unifies the product's SQLCipher feature in workspace builds.
+        // Package-only consumers use the stock amalgamation in the same exact
+        // libsqlite3-sys pin. Seal both reviewed engines, including their full
+        // compile-option identities, instead of assuming one build topology.
+        let (expected_version, expected_options) =
+            if options.iter().any(|option| option == "HAS_CODEC") {
+                let cipher: String = connection
+                    .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+                    .expect("read SQLCipher identity");
+                assert_eq!(cipher, "4.14.0 community");
+                (
+                    "3.51.3",
+                    "26ae684e9fd7165c0c4f1e3fcd771d7fb78e6062a28a9cc3e430dbe525589b0c",
+                )
+            } else {
+                (
+                    "3.53.2",
+                    "805b0fcb795dc1b685e1c3c5f26b3b0b00acb92136a0b683e63a98fc4b5f3c5b",
+                )
+            };
+        assert_eq!(version, expected_version);
         assert_eq!(compiler_options, 1, "expected one SQLite compiler identity");
         assert!(options.iter().any(|option| option == "THREADSAFE=1"));
         assert!(options.iter().any(|option| option == "ENABLE_FTS5"));
@@ -3043,7 +3063,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(stable_options.as_bytes())),
-            "805b0fcb795dc1b685e1c3c5f26b3b0b00acb92136a0b683e63a98fc4b5f3c5b",
+            expected_options,
             "bundled SQLite compile options changed:\n{stable_options}"
         );
     }

@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod document_snapshot;
 mod draft;
+#[cfg(all(test, unix))]
+mod encrypted_tests;
 mod error;
 mod file_io;
 mod folder;
 mod generation;
 mod paths;
+mod private_io;
+mod protected_copy;
 mod provenance;
 mod reconciliation;
 mod schema;
@@ -14,6 +19,7 @@ mod workspace_copy;
 
 pub use workspace_copy::{PreparedWorkspaceCopy, WorkspaceCopyOutcome};
 
+pub use document_snapshot::ImportedDocumentSnapshot;
 pub use draft::{TransientDraft, TransientDraftClaim, TransientDraftWriteOutcome};
 pub use error::{Result, StoreError};
 pub use generation::{
@@ -26,6 +32,7 @@ pub use generation::{
     TerminalEvidenceInput, TerminalGenerationInput, TerminalGenerationOutcome,
 };
 pub use paths::ensure_private_storage_supported;
+pub use protected_copy::ProtectedCopy;
 pub use provenance::{
     IdempotentSaveOutcome, MAX_EDIT_DIFF_WINDOW_BYTES, MAX_EDIT_DIFF_WINDOW_CHARACTERS,
     MAX_EDIT_DIFF_WORK, MAX_REVISION_SEGMENTS, ProvenanceSegment, RevisionProvenance,

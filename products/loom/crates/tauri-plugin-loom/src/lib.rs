@@ -2463,6 +2463,12 @@ impl IpcFailure {
         use loom_store::StoreError;
 
         let code = match &error {
+            StoreError::Vault(desktop_vault::VaultError::Locked) => "vault_locked",
+            StoreError::Vault(desktop_vault::VaultError::Unsupported)
+            | StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
+            StoreError::Vault(_) => "private_storage_invalid",
+            StoreError::EncryptionUnavailable => "vault_unavailable",
+            StoreError::DocumentSnapshot(_) => "document_snapshot_error",
             StoreError::Io(_) => "filesystem_error",
             StoreError::Sqlite(_) => "database_error",
             StoreError::Json(_) => "manifest_json_error",
@@ -2495,7 +2501,6 @@ impl IpcFailure {
             StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
             StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
             StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
-            StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -2549,7 +2554,9 @@ impl IpcFailure {
         };
         let retryable = matches!(
             error,
-            StoreError::ProjectAlreadyOpen(_) | StoreError::DocumentLifecycleUncertain(_)
+            StoreError::ProjectAlreadyOpen(_)
+                | StoreError::DocumentLifecycleUncertain(_)
+                | StoreError::Vault(desktop_vault::VaultError::Locked)
         );
         Self::new(code, error.to_string(), retryable)
     }
