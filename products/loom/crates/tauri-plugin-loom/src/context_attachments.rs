@@ -368,6 +368,8 @@ pub(crate) struct PreparedAttachment {
 struct StagedManifest {
     temporary: PathBuf,
     destination: PathBuf,
+    project_root: PathBuf,
+    codec: crate::private_sidecar::PayloadCodec,
 }
 
 impl Drop for StagedManifest {
@@ -379,8 +381,9 @@ impl Drop for StagedManifest {
 impl PreparedAttachment {
     pub(crate) fn publish(self) -> Result<StoredAttachment, ContextAttachmentError> {
         if let Some(staged) = &self.staged_manifest {
-            // No conversion, serialization, hashing, or payload copying here.
-            // A concurrent conflicting publisher must be retried, never replaced.
+            // Revalidate the vault header without reconstructing attachment
+            // payloads. A conflicting publisher must be retried, never replaced.
+            staged.codec.validate_root(&staged.project_root)?;
             fs::hard_link(&staged.temporary, &staged.destination)?;
         }
         Ok(self.attachment)
@@ -716,17 +719,19 @@ pub(crate) fn prepare_provided(
     if manifest_bytes.len() as u64 > MAX_ATTACHMENT_MANIFEST_BYTES {
         return Err(ContextAttachmentError::ContextInvalid);
     }
+    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
     let staged = StagedManifest {
         temporary: temporary_sibling(&destination),
         destination,
+        project_root: project_root.to_path_buf(),
+        codec,
     };
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staged.temporary)?;
-    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
     let namespace = crate::private_sidecar::namespace(project_root, &staged.destination)?;
-    file.write_all(&codec.seal(&namespace, &manifest_bytes)?)?;
+    file.write_all(&staged.codec.seal(&namespace, &manifest_bytes)?)?;
     file.sync_all()?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
@@ -2897,6 +2902,29 @@ mod tests {
             "A [📎 first](loom-attachment:{first}) B [same](loom-attachment:{first}) C [second](loom-attachment:{second})"
         );
         assert_eq!(inline_attachment_ids(&text), vec![first, second]);
+    }
+
+    #[test]
+    fn prepared_attachment_refuses_publication_after_vault_header_loss() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [53; 32]).unwrap();
+        let source = project.path().join("source.txt");
+        fs::write(&source, "synthetic staged attachment").unwrap();
+        let prepared = prepare_path_bounded(project.path(), &source, 1024).unwrap();
+        let id = prepared.attachment.id.clone();
+        fs::remove_file(project.path().join(".loom/vault.json")).unwrap();
+        assert!(
+            prepared.publish().is_err(),
+            "manifest published after vault identity was lost"
+        );
+        assert!(
+            !project
+                .path()
+                .join(".loom/attachments/manifests")
+                .join(format!("{id}.json"))
+                .exists()
+        );
     }
 
     #[test]
