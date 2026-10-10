@@ -1,4 +1,4 @@
-//! Opt-in acceptance through the production resident worker, not a fake executor.
+//! Opt-in qualification through the production resident worker, not a fake executor.
 //! This proves one native host only; it is not physical-network qualification.
 use llama_native_engine::{NativeModelOwner, WaitOutcome};
 use llama_native_types::{
@@ -14,6 +14,7 @@ fn request(model_id: &str, id: &str, tokens: Vec<i32>, maximum: u32) -> Generati
         request_id: id.to_owned(),
         model_id: model_id.to_owned(),
         media: Vec::new(),
+        first_word_choices: None,
         cases: vec![GenerationCase {
             // Deliberately equal across owners: identity must not be case-id-only.
             case_id: "answer".to_owned(),
@@ -45,7 +46,10 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
     let first_handle = owner.handle();
     let second_handle = owner.handle();
     assert!(first_handle.is_same_worker(&second_handle));
-    let fingerprint = first_handle.status().fingerprint.expect("resident fingerprint");
+    let fingerprint = first_handle
+        .status()
+        .fingerprint
+        .expect("resident fingerprint");
     assert_eq!(fingerprint.model_sha256, expected_model);
 
     let prompts = first_handle.prepare_input(GenerationInput::Completion {
@@ -60,8 +64,26 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
             },
         ],
     })?;
-    let first_request = request(&fingerprint.model_id, "owner-a", prompts[0].token_ids.clone(), 1024);
-    let second_request = request(&fingerprint.model_id, "owner-b", prompts[1].token_ids.clone(), 64);
+    let first_request = request(
+        &fingerprint.model_id,
+        "owner-a",
+        prompts[0].token_ids.clone(),
+        1024,
+    );
+    let second_request = request(
+        &fingerprint.model_id,
+        "owner-b",
+        prompts[1].token_ids.clone(),
+        64,
+    );
+    let isolated = first_handle
+        .generate_batch(request(
+            &fingerprint.model_id,
+            "isolated-b",
+            prompts[1].token_ids.clone(),
+            64,
+        ))?
+        .wait_verified()?;
     let observer = first_handle.observe_cooperative_batches()?;
     let first = first_handle.generate_cooperative(first_request.clone())?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -69,29 +91,43 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
     // Do not submit B until an actual successful native decode has consumed an
     // output token for A. A shared prefill or two queued commands is insufficient.
     let first_decode = loop {
-        assert!(Instant::now() < deadline, "first native decode did not arrive");
+        assert!(
+            Instant::now() < deadline,
+            "first native decode did not arrive"
+        );
         if let Some(sample) = observer.receive_timeout(Duration::from_millis(100))?
-            && sample.members().iter().any(|member| {
-                member.request_id() == "owner-a" && member.decode_tokens() > 0
-            })
+            && sample
+                .members()
+                .iter()
+                .any(|member| member.request_id() == "owner-a" && member.decode_tokens() > 0)
         {
             break sample.ordinal();
         }
     };
     let second = second_handle.generate_cooperative(second_request.clone())?;
     let shared = loop {
-        assert!(Instant::now() < deadline, "late request never shared a native decode");
+        assert!(
+            Instant::now() < deadline,
+            "late request never shared a native decode"
+        );
         if let Some(sample) = observer.receive_timeout(Duration::from_millis(100))? {
-            let has = |id| sample.members().iter().any(|member| {
-                member.request_id() == id && member.decode_tokens() > 0
-            });
+            let has = |id| {
+                sample
+                    .members()
+                    .iter()
+                    .any(|member| member.request_id() == id && member.decode_tokens() > 0)
+            };
             if has("owner-a") && has("owner-b") {
                 assert!(sample.ordinal() > first_decode);
                 break sample;
             }
         }
     };
-    assert_eq!(observer.dropped_samples(), 0, "incomplete trace cannot qualify execution");
+    assert_eq!(
+        observer.dropped_samples(),
+        0,
+        "incomplete trace cannot qualify execution"
+    );
     assert!(first.cancel_branch("answer"));
 
     let first = match first.wait_verified_timeout(Duration::from_secs(120))? {
@@ -113,32 +149,59 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
     assert_eq!(first.outputs()[0].state, GenerationState::Cancelled);
     assert_eq!(second.outputs()[0].state, GenerationState::Completed);
     assert!(!second.outputs()[0].generated_token_ids.is_empty());
+    assert_eq!(
+        second.outputs()[0].generated_token_ids,
+        isolated.outputs()[0].generated_token_ids
+    );
+    assert_eq!(second.outputs()[0].text, isolated.outputs()[0].text);
     for seal in [&first, &second] {
         assert_eq!(seal.model_fingerprint(), &fingerprint);
         assert_eq!(seal.outputs().len(), 1);
         assert_eq!(seal.outputs()[0].input_index, 0);
         assert_eq!(seal.outputs()[0].metrics.shared_prefix_tokens, 0);
         assert_eq!(seal.outputs()[0].metrics.cache.resident_prefix_tokens, 0);
-        assert_eq!(seal.outputs()[0].metrics.cache.batch_shared_prefix_tokens, 0);
+        assert_eq!(
+            seal.outputs()[0].metrics.cache.batch_shared_prefix_tokens,
+            0
+        );
         let trace = &seal.token_piece_traces()[0];
-        assert_eq!(trace.cumulative_boundaries().len(), seal.outputs()[0].generated_token_ids.len() + 1);
+        assert_eq!(
+            trace.cumulative_boundaries().len(),
+            seal.outputs()[0].generated_token_ids.len() + 1
+        );
         assert!(seal.events().iter().all(|event| {
-            event.request_id == seal.request().request_id && event.input_index == 0 && event.sequence_id == 0
+            event.request_id == seal.request().request_id
+                && event.input_index == 0
+                && event.sequence_id == 0
         }));
     }
 
     // Settling a request must release only its own sequence, not the resident.
-    let third_request = request(&fingerprint.model_id, "owner-c", prompts[1].token_ids.clone(), 8);
-    let third = second_handle.generate_cooperative(third_request)?.wait_verified()?;
+    let third_request = request(
+        &fingerprint.model_id,
+        "owner-c",
+        prompts[1].token_ids.clone(),
+        8,
+    );
+    let third = second_handle
+        .generate_cooperative(third_request)?
+        .wait_verified()?;
     assert_eq!(third.outputs()[0].state, GenerationState::Completed);
-    assert_eq!(second_handle.status().fingerprint.as_ref(), Some(&fingerprint));
+    assert_eq!(
+        second_handle.status().fingerprint.as_ref(),
+        Some(&fingerprint)
+    );
     let joined = owner.shutdown_joined()?;
     assert!(joined.belongs_to(&first_handle));
     assert_eq!(joined.expected_worker_count(), 1);
     assert_eq!(joined.joined_worker_count(), 1);
     println!(
         "cooperative native qualification: model={} build={} first_decode={} shared_decode={} members={:?}; physical_network=false",
-        fingerprint.model_sha256, fingerprint.build_id, first_decode, shared.ordinal(), shared.members()
+        fingerprint.model_sha256,
+        fingerprint.build_id,
+        first_decode,
+        shared.ordinal(),
+        shared.members()
     );
     Ok(())
 }

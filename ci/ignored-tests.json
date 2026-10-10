@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 43,
+  "expected_test_count": 44,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -219,6 +219,22 @@
       ],
       "src_path": "products/loom/crates/tauri-plugin-loom/src/lib.rs",
       "manifest_path": "products/loom/crates/tauri-plugin-loom/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "llama-native-engine",
+      "selector": "test:cooperative",
+      "name": "cooperative",
+      "kinds": [
+        "test"
+      ],
+      "src_path": "crates/native/crates/llama-native-engine/tests/cooperative.rs",
+      "manifest_path": "crates/native/crates/llama-native-engine/Cargo.toml",
       "platforms": [
         "linux",
         "macos",
@@ -993,6 +1009,24 @@
       "platforms": [
         "linux",
         "macos"
+      ]
+    },
+    {
+      "test_id": "real_independent_requests_share_decode_and_cancel_separately",
+      "package": "llama-native-engine",
+      "target": "test:cooperative",
+      "source": "crates/native/crates/llama-native-engine/tests/cooperative.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH",
+        "MOM_LLAMA_MODEL_SHA256"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test cannot promote peer/network, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
       ]
     }
   ]

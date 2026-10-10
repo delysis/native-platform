@@ -2,6 +2,8 @@
 mod build_identity;
 pub mod control_math;
 mod controlled_runtime;
+mod cooperative;
+pub use cooperative::{DecodeMember, DecodeObserver, DecodeSample};
 mod embedding_runtime;
 mod first_word_choices;
 mod first_word_runtime;
@@ -892,6 +894,7 @@ struct NativeModelInner {
 
 #[derive(Debug, Default)]
 struct WorkerIdentity {
+    cooperative_decodes: cooperative::DecodeHub,
     exports: state_buffer::LiveExports,
 }
 
@@ -1177,6 +1180,7 @@ enum WorkerCommandClass {
 enum GenerationBatchAdmission {
     Compatibility,
     ExactBatch,
+    Cooperative,
 }
 
 impl NativeModelHandle {
@@ -2307,19 +2311,28 @@ fn run_worker(
     let mut controlled_token_contract = None;
     let mut embedding_call_sequence = 0_u64;
     let mut controlled_call_sequence = 0_u64;
+    let mut deferred_commands = VecDeque::new();
     loop {
-        let (command, command_class, speculative_permit) =
-            match receive_worker_command(&command_rx, &speculative_rx, &shutdown_rx) {
-                Some(ReceivedWorkerCommand {
-                    command,
-                    class,
-                    speculative_permit,
-                }) => (command, class, speculative_permit),
-                None => {
-                    reject_queued_commands(&command_rx, &speculative_rx);
-                    break;
+        let (command, command_class, speculative_permit) = match if !shutdown_rx.is_empty() {
+            None
+        } else {
+            deferred_commands
+                .pop_front()
+                .or_else(|| receive_worker_command(&command_rx, &speculative_rx, &shutdown_rx))
+        } {
+            Some(ReceivedWorkerCommand {
+                command,
+                class,
+                speculative_permit,
+            }) => (command, class, speculative_permit),
+            None => {
+                for deferred in deferred_commands.drain(..) {
+                    reject_queued_command(deferred.command);
                 }
-            };
+                reject_queued_commands(&command_rx, &speculative_rx);
+                break;
+            }
+        };
         let _speculative_permit = speculative_permit;
         // Admission sends the command and commits any exact speculative
         // preemption while holding this lock. A dequeued worker crosses the
@@ -2330,6 +2343,39 @@ fn run_worker(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        if matches!(
+            &command,
+            WorkerCommand::GenerateBatch {
+                admission: GenerationBatchAdmission::Cooperative,
+                ..
+            }
+        ) {
+            // The opt-in pool owns every physical sequence until it drains.
+            // Resident prefixes and exports cannot cross that ownership boundary.
+            context.clear_kv_cache();
+            state_buffer::forget_live_exports();
+            sequence_token_counts.clear();
+            sequence_token_ids.clear();
+            resident_text_prefix.invalidate();
+            controlled_token_contract = None;
+            cooperative::run(
+                command,
+                cooperative::Runtime {
+                    model: &model,
+                    context: &mut context,
+                    fingerprint: &fingerprint,
+                    artifacts: &artifacts,
+                    status: &status,
+                    identity: &worker_identity,
+                    commands: &command_rx,
+                    shutdown: &shutdown_rx,
+                    admission: &admission,
+                    speculative: &speculative_admission,
+                    deferred: &mut deferred_commands,
+                },
+            );
+            continue;
+        }
         match command {
             WorkerCommand::EmbedBatch {
                 request,
@@ -4573,8 +4619,10 @@ fn is_statically_sealable_generation_batch(
     request: &GenerationBatchRequest,
     admission: GenerationBatchAdmission,
 ) -> bool {
-    admission == GenerationBatchAdmission::ExactBatch
-        && request.first_word_choices.is_none()
+    matches!(
+        admission,
+        GenerationBatchAdmission::ExactBatch | GenerationBatchAdmission::Cooperative
+    ) && request.first_word_choices.is_none()
         && request.media.is_empty()
         && is_exact_token_generation_batch(request)
         && request
