@@ -120,6 +120,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("Preference file version {0} is unsupported")]
     Version(u32),
+    #[error("Preference storage must be a private regular file")]
+    FileKind,
     #[error("Preferences exceeded their bounded capacity")]
     Limit,
     #[error("A remembered model must have an absolute, valid path")]
@@ -172,9 +174,12 @@ impl PreferenceStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options.open(self.root.join("preferences.lock"))?;
+        validate_regular_file(&file)?;
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => Error::Busy,
             std::fs::TryLockError::Error(error) => Error::Io(error),
@@ -182,11 +187,22 @@ impl PreferenceStore {
         Ok(file)
     }
     fn load(&self) -> Result<State, Error> {
-        let file = match File::open(self.root.join("preferences.json")) {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(self.root.join("preferences.json")) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
             Err(e) => return Err(e.into()),
         };
+        validate_regular_file(&file)?;
+        if file.metadata()?.len() > MAX_BYTES {
+            return Err(Error::Limit);
+        }
         let mut bytes = Vec::new();
         file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_BYTES {
@@ -217,6 +233,21 @@ impl PreferenceStore {
         }
         Ok(state.snapshot())
     }
+}
+
+fn validate_regular_file(file: &File) -> Result<(), Error> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::FileKind);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(Error::FileKind);
+        }
+    }
+    Ok(())
 }
 
 fn validate_model_path(path: &str) -> Result<(), Error> {

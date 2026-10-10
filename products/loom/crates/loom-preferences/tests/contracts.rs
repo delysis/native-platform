@@ -58,3 +58,57 @@ fn acceptance_model_never_becomes_a_startup_preference() {
     );
     assert_eq!(store.read().unwrap().last_local_model, None);
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_storage_and_lock_are_rejected_without_waiting_for_a_writer() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::time::{Duration, Instant};
+    for name in ["preferences.json", "preferences.lock"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(name);
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let start = Instant::now();
+        assert!(PreferenceStore::new(root.path()).read().is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_preference_files_are_preserved_and_rejected() {
+    for hard_link in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("retained.json");
+        let bytes = b"retained evidence";
+        std::fs::write(&outside, bytes).unwrap();
+        let path = root.path().join("preferences.json");
+        if hard_link {
+            std::fs::hard_link(&outside, &path).unwrap();
+        } else {
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+        }
+        let store = PreferenceStore::new(root.path());
+        assert!(store.read().is_err());
+        assert!(
+            store
+                .update(PreferenceChange::RememberModel {
+                    path: "/models/new.gguf".into()
+                })
+                .is_err()
+        );
+        assert_eq!(std::fs::read(outside).unwrap(), bytes);
+    }
+}

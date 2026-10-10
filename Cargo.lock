@@ -4320,6 +4320,7 @@ name = "loom-preferences"
 version = "0.1.0"
 dependencies = [
  "atomic-write-file",
+ "libc",
  "loom-types",
  "serde",
  "serde_json",
