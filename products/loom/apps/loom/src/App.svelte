@@ -1501,6 +1501,8 @@
   let nativeDropWitness: { type: string; point: { x: number; y: number } | null; scope: string | null; path_count: number } | null = null;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    pending_runs: activeFamilyEvaluation?.phase.kind === 'pending'
+      ? activeFamilyEvaluation.phase.runIds : [],
     loompad_scope: {
       mode,
       matches: loompadReservoir?.key === loompadSnapshotKey,
