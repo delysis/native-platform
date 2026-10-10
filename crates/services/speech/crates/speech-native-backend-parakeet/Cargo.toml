@@ -7,6 +7,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-model-defaults.workspace = true
 async-trait.workspace = true
 speech-native-types = { path = "../speech-native-types" }
 hound.workspace = true

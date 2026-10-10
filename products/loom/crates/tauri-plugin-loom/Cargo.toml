@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 desktop-model-defaults.workspace = true
+fs4.workspace = true
 fte-types = { path = "../../../fte/crates/fte-types" }
 fte-router = { path = "../../../fte/crates/fte-router" }
 fte-providers = { path = "../../../fte/crates/fte-providers" }

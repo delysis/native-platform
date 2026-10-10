@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -358,50 +356,6 @@ impl ModelDownloadRegistry {
     }
 }
 
-pub(crate) fn prepare_model_library(
-    app_local_data_root: &std::path::Path,
-) -> Result<PathBuf, ModelLibraryError> {
-    fs::create_dir_all(app_local_data_root).map_err(|source| ModelLibraryError::Io {
-        operation: "create application data directory",
-        path: app_local_data_root.to_path_buf(),
-        source,
-    })?;
-    let library = app_local_data_root.join("models");
-    match fs::symlink_metadata(&library) {
-        Ok(metadata) => validate_model_library_metadata(&library, &metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&library) {
-            Ok(()) => {
-                #[cfg(unix)]
-                set_private_directory_permissions(&library)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata =
-                    fs::symlink_metadata(&library).map_err(|source| ModelLibraryError::Io {
-                        operation: "inspect raced model library",
-                        path: library.clone(),
-                        source,
-                    })?;
-                validate_model_library_metadata(&library, &metadata)?;
-            }
-            Err(source) => {
-                return Err(ModelLibraryError::Io {
-                    operation: "create model library",
-                    path: library,
-                    source,
-                });
-            }
-        },
-        Err(source) => {
-            return Err(ModelLibraryError::Io {
-                operation: "inspect model library",
-                path: library,
-                source,
-            });
-        }
-    }
-    Ok(library)
-}
-
 pub(crate) fn model_target_path(
     library: &std::path::Path,
     file_name: &str,
@@ -456,32 +410,6 @@ fn is_reserved_windows_device_name(value: &str) -> bool {
             .strip_prefix("COM")
             .or_else(|| value.strip_prefix("LPT"))
             .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
-}
-
-fn validate_model_library_metadata(
-    path: &std::path::Path,
-    metadata: &fs::Metadata,
-) -> Result<(), ModelLibraryError> {
-    if metadata.file_type().is_symlink() {
-        return Err(ModelLibraryError::Symlink(path.to_path_buf()));
-    }
-    if !metadata.is_dir() {
-        return Err(ModelLibraryError::NotDirectory(path.to_path_buf()));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &std::path::Path) -> Result<(), ModelLibraryError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        ModelLibraryError::Io {
-            operation: "protect model library",
-            path: path.to_path_buf(),
-            source,
-        }
-    })
 }
 
 fn terminal_entry(
@@ -544,17 +472,6 @@ pub(crate) enum ModelDownloadRegistryError {
 pub(crate) enum ModelLibraryError {
     #[error("model file name must be one portable .gguf file name")]
     InvalidFileName,
-    #[error("model library is a symbolic link: {0}")]
-    Symlink(PathBuf),
-    #[error("model library is not a directory: {0}")]
-    NotDirectory(PathBuf),
-    #[error("could not {operation} at {path}: {source}")]
-    Io {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 }
 
 #[cfg(test)]
@@ -765,35 +682,5 @@ mod tests {
                 "{invalid:?} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn model_library_refuses_symlinks_and_non_directories() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let library = prepare_model_library(root.path()).expect("create library");
-        assert!(library.is_dir());
-
-        let other = tempfile::tempdir().expect("other tempdir");
-        let file_root = other.path().join("file-root");
-        fs::create_dir(&file_root).expect("file root");
-        fs::write(file_root.join("models"), b"not a directory").expect("write blocker");
-        assert!(matches!(
-            prepare_model_library(&file_root),
-            Err(ModelLibraryError::NotDirectory(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn model_library_refuses_symbolic_links() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().expect("tempdir");
-        let destination = tempfile::tempdir().expect("destination");
-        symlink(destination.path(), root.path().join("models")).expect("create symlink");
-        assert!(matches!(
-            prepare_model_library(root.path()),
-            Err(ModelLibraryError::Symlink(_))
-        ));
     }
 }

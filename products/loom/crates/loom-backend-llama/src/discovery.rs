@@ -78,17 +78,9 @@ pub enum DiscoveryError {
 
 #[must_use]
 pub fn default_hugging_face_cache_roots() -> Vec<PathBuf> {
-    let mut roots = BTreeSet::new();
-    if let Some(cache) = std::env::var_os("HF_HUB_CACHE") {
-        roots.insert(PathBuf::from(cache));
-    }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        roots.insert(PathBuf::from(home).join("hub"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.insert(PathBuf::from(home).join(".cache/huggingface/hub"));
-    }
-    roots.into_iter().collect()
+    desktop_model_defaults::hugging_face_hub_cache_dir()
+        .into_iter()
+        .collect()
 }
 
 pub fn discover_gguf_models(

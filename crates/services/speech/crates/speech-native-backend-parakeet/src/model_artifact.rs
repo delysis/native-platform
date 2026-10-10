@@ -52,6 +52,12 @@ pub(crate) fn prepare_model_dir(
     explicit_managed_root: Option<&Path>,
 ) -> Result<Option<PathBuf>, ModelArtifactError> {
     let manifest = production_manifest()?;
+    if let Some(cached) = discover_exact_hugging_face_candidate(&manifest)
+        .filter(|cached| source_candidate(explicit_candidate, &manifest).as_ref() == Some(cached))
+    {
+        verify_shared_model_dir(&cached, &manifest)?;
+        return Ok(Some(cached));
+    }
     let managed_root = managed_model_root(explicit_managed_root).ok_or_else(|| {
         artifact_error(
             "Parakeet managed model storage is unavailable; configure \
@@ -74,13 +80,19 @@ pub(crate) fn prepare_model_dir(
 /// Cheap startup-only presence and shape probe.
 ///
 /// This deliberately reads metadata only. It cannot confer model-byte
-/// authority: first use still runs the full copy/hash/load/hash admission in
+/// authority: first use still runs the full hash/load/hash admission in
 /// [`prepare_model_dir`] and [`verify_production_model_dir`].
 pub(crate) fn probe_model_source(
     explicit_candidate: Option<&Path>,
     explicit_managed_root: Option<&Path>,
 ) -> Result<bool, ModelArtifactError> {
     let manifest = production_manifest()?;
+    if let Some(cached) = discover_exact_hugging_face_candidate(&manifest)
+        .filter(|cached| source_candidate(explicit_candidate, &manifest).as_ref() == Some(cached))
+    {
+        probe_model_dir_shape(&cached, &manifest, false)?;
+        return Ok(true);
+    }
     let managed_root = managed_model_root(explicit_managed_root).ok_or_else(|| {
         artifact_error(
             "Parakeet managed model storage is unavailable; configure \
@@ -152,7 +164,12 @@ fn probe_model_dir_shape(
 }
 
 pub(crate) fn verify_production_model_dir(path: &Path) -> Result<(), ModelArtifactError> {
-    verify_managed_model_dir(path, &production_manifest()?)
+    let manifest = production_manifest()?;
+    if discover_exact_hugging_face_candidate(&manifest).is_some_and(|cached| cached == path) {
+        verify_shared_model_dir(path, &manifest)
+    } else {
+        verify_managed_model_dir(path, &manifest)
+    }
 }
 
 pub(crate) fn discover_default_model_dir() -> Option<PathBuf> {
@@ -230,25 +247,7 @@ fn managed_model_root(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("SPEECH_NATIVE_PARAKEET_MANAGED_ROOT") {
         return Some(PathBuf::from(root));
     }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return Some(PathBuf::from(home).join("Library/Application Support/Delysis/Speech/models"));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-        return Some(PathBuf::from(root).join("Delysis/Speech/models"));
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        if let Some(root) = std::env::var_os("XDG_DATA_HOME") {
-            return Some(PathBuf::from(root).join("delysis/speech/models"));
-        }
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".local/share/delysis/speech/models"))
-    }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    None
+    desktop_model_defaults::hugging_face_hub_cache_dir().map(|hub| hub.join("local/speech/models"))
 }
 
 fn managed_model_dir(root: &Path, manifest: &ModelManifest) -> PathBuf {
@@ -257,19 +256,9 @@ fn managed_model_dir(root: &Path, manifest: &ModelManifest) -> PathBuf {
 }
 
 fn hugging_face_cache_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        roots.push(PathBuf::from(home).join("hub"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-    }
-    roots.sort();
-    roots.dedup();
-    roots
+    desktop_model_defaults::hugging_face_hub_cache_dir()
+        .into_iter()
+        .collect()
 }
 
 fn discover_exact_hugging_face_candidate(manifest: &ModelManifest) -> Option<PathBuf> {
@@ -474,6 +463,49 @@ fn copy_manifest_files(
 }
 
 fn verify_model_dir(path: &Path, manifest: &ModelManifest) -> Result<(), ModelArtifactError> {
+    verify_model_bytes(path, manifest, false)
+}
+
+fn verify_shared_model_dir(
+    path: &Path,
+    manifest: &ModelManifest,
+) -> Result<(), ModelArtifactError> {
+    let snapshot = path
+        .ancestors()
+        .nth(Path::new(&manifest.subdirectory).components().count())
+        .ok_or_else(|| artifact_error("Invalid HF snapshot directory"))?;
+    let repository = snapshot
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| artifact_error("Invalid HF repository directory"))?;
+    let blobs = fs::canonicalize(repository.join("blobs"))
+        .map_err(|e| artifact_error(format!("Could not inspect HF blobs: {e}")))?;
+    for file in &manifest.files {
+        let selected = path.join(&file.name);
+        let metadata = fs::symlink_metadata(&selected)
+            .map_err(|e| artifact_error(format!("Could not inspect HF artifact: {e}")))?;
+        if metadata.file_type().is_symlink() {
+            let resolved = fs::canonicalize(&selected)
+                .map_err(|e| artifact_error(format!("Could not resolve HF artifact: {e}")))?;
+            if resolved != blobs.join(&file.sha256) {
+                return Err(artifact_error(
+                    "HF snapshot must resolve to its manifest-bound blob",
+                ));
+            }
+        } else if !metadata.is_file() {
+            return Err(artifact_error(
+                "HF snapshot artifact must be a regular file or blob alias",
+            ));
+        }
+    }
+    verify_model_bytes(path, manifest, true)
+}
+
+fn verify_model_bytes(
+    path: &Path,
+    manifest: &ModelManifest,
+    shared: bool,
+) -> Result<(), ModelArtifactError> {
     let directory_metadata = fs::symlink_metadata(path).map_err(|error| {
         artifact_error(format!(
             "Could not inspect Parakeet managed model directory {}: {error}",
@@ -497,7 +529,9 @@ fn verify_model_dir(path: &Path, manifest: &ModelManifest) -> Result<(), ModelAr
                 artifact_path.display()
             ))
         })?;
-        if !path_metadata.file_type().is_file() || managed_file_has_peer_links(&path_metadata) {
+        if !shared
+            && (!path_metadata.file_type().is_file() || managed_file_has_peer_links(&path_metadata))
+        {
             return Err(artifact_error(format!(
                 "Parakeet managed artifact {} is not one private regular file",
                 expected.name
@@ -961,5 +995,40 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn shared_snapshot_loads_original_blobs_and_detects_later_tampering() {
+        let root = temporary_root("shared-hf");
+        let files = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ];
+        let manifest = fixture_manifest(&files);
+        let repository = root.join("models--altunenes--parakeet-rs");
+        let snapshot = repository
+            .join("snapshots")
+            .join(&manifest.revision)
+            .join(&manifest.subdirectory);
+        let blobs = repository.join("blobs");
+        fs::create_dir_all(&snapshot).expect("shared HF fixture");
+        fs::create_dir_all(&blobs).expect("shared HF fixture");
+        for ((name, bytes), expected) in files.iter().zip(&manifest.files) {
+            let blob = blobs.join(&expected.sha256);
+            fs::write(&blob, bytes).expect("shared HF fixture");
+            std::os::unix::fs::symlink(&blob, snapshot.join(name)).expect("shared HF fixture");
+        }
+        verify_shared_model_dir(&snapshot, &manifest).expect("shared HF fixture");
+        assert!(!root.join("managed").exists());
+        fs::write(blobs.join(&manifest.files[0].sha256), b"encodex").expect("shared HF fixture");
+        assert!(verify_shared_model_dir(&snapshot, &manifest).is_err());
+        fs::remove_file(snapshot.join("encoder.onnx")).expect("shared HF fixture");
+        let outside = root.join("outside");
+        fs::write(&outside, b"encoder").expect("shared HF fixture");
+        std::os::unix::fs::symlink(&outside, snapshot.join("encoder.onnx"))
+            .expect("shared HF fixture");
+        assert!(verify_shared_model_dir(&snapshot, &manifest).is_err());
+        fs::remove_dir_all(root).expect("shared HF fixture");
     }
 }
