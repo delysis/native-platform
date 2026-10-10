@@ -7,6 +7,7 @@ mod connected_imports;
 mod context_attachments;
 mod document_bindings;
 mod document_watcher;
+mod export_original;
 mod external_import;
 mod hf_download;
 mod import_batch;
@@ -4807,23 +4808,46 @@ async fn document_export_choose<R: Runtime>(
     reservation.export(&destination).map(Some)
 }
 
-/// Reveal retained source bytes without opening or executing their contents.
+/// Export verified original bytes only after an explicit native Save choice.
+/// The IPC name is retained for existing attachment actions.
 #[tauri::command]
-async fn attachment_reveal_original(
+async fn attachment_reveal_original<R: Runtime>(
     project_id: String,
     session_id: String,
     attachment_id: String,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    let _admission = lock_application_admission(&state, "an attachment reveal")?;
-    let path = {
+    let (file_name, bytes) = {
+        let _admission = lock_application_admission(&state, "an original attachment export")?;
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        context_attachments::original_path(store.root(), &attachment_id)
+        context_attachments::original_for_export(store.root(), &attachment_id)
             .map_err(|error| IpcFailure::context_attachment(&error))?
     };
-    tauri_plugin_opener::reveal_item_in_dir(path)
-        .map_err(|error| IpcFailure::new("attachment_reveal_failed", error.to_string(), false))
+    // Neither application nor project locks remain held across the OS dialog.
+    let Some(destination) = app
+        .dialog()
+        .file()
+        .set_title("Save Original")
+        .set_file_name(export_original::suggested_file_name(&file_name))
+        .blocking_save_file()
+    else {
+        return Ok(());
+    };
+    let destination = destination
+        .into_path()
+        .map_err(|error| IpcFailure::new("attachment_export_failed", error.to_string(), false))?;
+    let _admission = lock_application_admission(&state, "an original attachment export")?;
+    let mut session = lock_session(&state)?;
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    export_original::write_new(&destination, &bytes).map_err(|error| {
+        IpcFailure::new(
+            "attachment_export_failed",
+            format!("The original could not be saved: {error}"),
+            false,
+        )
+    })
 }
 
 #[tauri::command]

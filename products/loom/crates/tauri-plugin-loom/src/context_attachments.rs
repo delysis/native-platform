@@ -2074,6 +2074,16 @@ fn read_object(
     Ok(bytes)
 }
 
+pub(crate) fn original_for_export(
+    project_root: &Path,
+    id: &str,
+) -> Result<(String, Vec<u8>), ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, id)?;
+    let bytes = read_object(project_root, id, manifest.attachment.byte_count)?;
+    Ok((manifest.attachment.file_name, bytes))
+}
+
+#[cfg(test)]
 pub(crate) fn original_path(
     project_root: &Path,
     id: &str,
@@ -2914,6 +2924,10 @@ mod tests {
             read_object(project.path(), &attachment.id, sentinel.len() as u64).unwrap(),
             sentinel
         );
+        let (name, original) = original_for_export(project.path(), &attachment.id).unwrap();
+        assert_eq!(name, "fixture.txt");
+        assert_eq!(original, sentinel);
+
         assert_eq!(
             import_path(project.path(), &source).unwrap().id,
             attachment.id

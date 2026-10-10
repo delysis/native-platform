@@ -135,9 +135,11 @@
     } finally { if (mounted && request === serial) busy = false; }
   }
   async function original(): Promise<void> {
-    if (!material.attachment_id) return;
+    if (busy || !material.attachment_id) return;
+    busy = true;
     try { await revealAttachmentOriginal(projectId, sessionId, material.attachment_id); }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
+    finally { if (mounted) busy = false; }
   }
   async function copyReference(): Promise<void> {
     try { await navigator.clipboard.writeText(reference); }
@@ -171,7 +173,7 @@
       {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if writingDocumentId && onOpenDocument}<button disabled={busy} on:click={() => void openWriting()}>Open current writing</button>{/if}
       {#if selectedPage && material.available && material.attachment_id}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
-      {#if material.attachment_id}<button on:click={() => void original()}>Reveal original</button>{/if}
+      {#if material.attachment_id}<button disabled={busy} aria-label="Export original" title="Save exact original bytes to a new file" on:click={() => void original()}>Export</button>{/if}
       {#if material.available && material.kind !== 'folder'}<button disabled={busy || !canEditMaterialMetadata(material)} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
       {#if removable && material.kind !== 'folder'}<button disabled={busy || !canEditMaterialMetadata(material)} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
