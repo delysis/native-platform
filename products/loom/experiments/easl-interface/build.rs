@@ -65,7 +65,7 @@ fn main() {
                 "add": "class=titlebar-button new-document-button",
                 "record": "class=titlebar-button microphone-toggle",
                 "suggestions": "suggestionInteraction === 'ghost'",
-                "panes": "paneSlots.filter(slot => slot.selected)",
+                "panes": "paneSlots.filter(slot => slot.selected && (slot.position !== 'main' || !mainPaneOpen || rightPaneOpen || bottomPaneOpen))",
                 "selector": "native-authored platform-select arrow, not an App.svelte SVG",
                 "fallback_main": "mainPaneOpen ? 'Collapse main pane' : 'Show main pane'"
             },

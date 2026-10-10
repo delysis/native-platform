@@ -73,7 +73,7 @@ pub fn extract(source: &str) -> Result<BTreeMap<&'static str, String>, String> {
 
     let (_, panes) = unique(
         markup,
-        "{#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}",
+        "{#each paneSlots.filter(slot => slot.selected && (slot.position !== 'main' || !mainPaneOpen || rightPaneOpen || bottomPaneOpen)) as slot (slot.position)}",
     )?;
     let (panes, _) = panes
         .split_once("{/each}")
