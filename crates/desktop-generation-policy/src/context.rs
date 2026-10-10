@@ -54,12 +54,6 @@ pub enum ContextPlanError {
     InsufficientEstimatedMemory,
 }
 
-/// Product headroom policy, not an allocator limit or a live memory reading.
-#[must_use]
-pub fn automatic_resident_memory_budget(physical_memory_bytes: Option<u64>) -> u64 {
-    physical_memory_bytes.map_or(8 * GIB, |bytes| (bytes / 2).clamp(2 * GIB, 64 * GIB))
-}
-
 /// Inputs must be freshly read by the caller. The estimator deliberately owns
 /// no sysinfo or filesystem access and cannot authorize model loading.
 #[derive(Clone, Copy, Debug)]
@@ -165,13 +159,5 @@ mod tests {
         };
         assert!(limits.apply_to(&mut config).is_err());
         assert_eq!(config, original);
-    }
-
-    #[test]
-    fn automatic_host_budget_retains_conservative_bounds() {
-        assert_eq!(automatic_resident_memory_budget(None), 8 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(GIB)), 2 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(512 * GIB)), 64 * GIB);
     }
 }
