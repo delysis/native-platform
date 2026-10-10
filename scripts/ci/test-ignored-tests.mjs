@@ -559,7 +559,7 @@ test("all ignored tests carry exact target, platform, evidence, and non-promotio
   const metadata = workspaceMetadata();
   const report = validateRegistry({ registry, metadata, repoRoot: root });
   assert.equal(report.registry_count, report.source_ignored_count);
-  assert.equal(report.cargo_target_count, 15);
+  assert.equal(report.cargo_target_count, 16);
   assert.equal(report.reviewed_build_script_count, 7);
   assert.equal(report.workspace_proc_macro_count, 0);
   assert.ok(report.guarded_source_count > 0);

@@ -13,6 +13,11 @@ mod operation_registry;
 pub use memory_estimate::{
     MemoryEstimateBasis, NativeMemoryEstimate, estimate_memory_reservation, model_context_capacity,
 };
+mod residual_evaluation;
+mod residual_training;
+mod residual_training_math;
+pub use residual_evaluation::{ResidualEvaluationTicket, VerifiedResidualEvaluation};
+pub use residual_training::{ResidualTrainingTicket, VerifiedResidualTraining};
 mod state_buffer;
 
 pub use controlled_runtime::{
@@ -75,7 +80,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "eb0e47b57c2fba97ed13e8fe5e949d11798232cb";
+pub const LLAMA_CPP_BINDING_REV: &str = "b508f1c7652c751513c361c7e4fdeb090fbed577";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -1100,6 +1105,18 @@ impl NativeModelInner {
 
 #[derive(Debug)]
 enum WorkerCommand {
+    EvaluateResidual {
+        request: llama_native_types::ResidualEvaluationRequest,
+        result: Sender<NativeResult<VerifiedResidualEvaluation>>,
+        cancellation: Arc<AtomicBool>,
+        request_lease: RequestLease,
+    },
+    TrainResidual {
+        request: llama_native_types::ResidualTrainingRequest,
+        result: Sender<NativeResult<VerifiedResidualTraining>>,
+        cancellation: Arc<AtomicBool>,
+        request_lease: RequestLease,
+    },
     EmbedBatch {
         request: EmbeddingBatchRequest,
         admitted_request_sha256: String,
@@ -1653,8 +1670,18 @@ impl NativeModelHandle {
             (RequestClass::Generation | RequestClass::ControlledGeneration, None) => {
                 active.cancel_all()
             }
-            (RequestClass::Embedding, None) => active.cancel_all(),
-            (RequestClass::Embedding, Some(_)) => 0,
+            (
+                RequestClass::Embedding
+                | RequestClass::ResidualTraining
+                | RequestClass::ResidualEvaluation,
+                None,
+            ) => active.cancel_all(),
+            (
+                RequestClass::Embedding
+                | RequestClass::ResidualTraining
+                | RequestClass::ResidualEvaluation,
+                Some(_),
+            ) => 0,
         }
     }
 
@@ -2418,6 +2445,86 @@ fn run_worker(
             continue;
         }
         match command {
+            WorkerCommand::EvaluateResidual {
+                request,
+                result,
+                cancellation,
+                request_lease,
+            } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result.send(Err(error));
+                    continue;
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let evaluated = artifacts
+                    .verify_strict_unchanged(&fingerprint)
+                    .and_then(|()| {
+                        residual_evaluation::execute(
+                            &config,
+                            backend,
+                            &model,
+                            &fingerprint,
+                            &request,
+                            &cancellation,
+                        )
+                    })
+                    .and_then(|output| {
+                        artifacts.verify_strict_unchanged(&fingerprint)?;
+                        if cancellation.load(Ordering::Acquire) {
+                            return Err(NativeError::new(
+                                NativeErrorCode::Cancelled,
+                                "residual evaluation cancelled before completion",
+                            ));
+                        }
+                        Ok(VerifiedResidualEvaluation::from_worker(
+                            output,
+                            Arc::clone(&worker_identity),
+                        ))
+                    });
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(evaluated.is_ok());
+                let _ = result.send(evaluated);
+            }
+            WorkerCommand::TrainResidual {
+                request,
+                result,
+                cancellation,
+                request_lease,
+            } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result.send(Err(error));
+                    continue;
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let trained = artifacts
+                    .verify_strict_unchanged(&fingerprint)
+                    .and_then(|()| {
+                        residual_training::execute(
+                            &config,
+                            backend,
+                            &model,
+                            &fingerprint,
+                            &request,
+                            &cancellation,
+                        )
+                    })
+                    .and_then(|output| {
+                        artifacts.verify_strict_unchanged(&fingerprint)?;
+                        if cancellation.load(Ordering::Acquire) {
+                            return Err(NativeError::new(
+                                NativeErrorCode::Cancelled,
+                                "residual training cancelled before completion",
+                            ));
+                        }
+                        Ok(VerifiedResidualTraining::from_worker(
+                            output,
+                            Arc::clone(&worker_identity),
+                        ))
+                    });
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(trained.is_ok());
+                let _ = result.send(trained);
+            }
             WorkerCommand::EmbedBatch {
                 request,
                 admitted_request_sha256,
@@ -3042,6 +3149,26 @@ fn reject_queued_command(command: WorkerCommand) {
         )
     };
     match command {
+        WorkerCommand::EvaluateResidual {
+            result,
+            cancellation,
+            request_lease,
+            ..
+        } => {
+            cancellation.store(true, Ordering::Release);
+            let _ = request_lease.cancel_queued();
+            let _ = result.send(Err(cancelled()));
+        }
+        WorkerCommand::TrainResidual {
+            result,
+            cancellation,
+            request_lease,
+            ..
+        } => {
+            cancellation.store(true, Ordering::Release);
+            let _ = request_lease.cancel_queued();
+            let _ = result.send(Err(cancelled()));
+        }
         WorkerCommand::EmbedBatch {
             result,
             cancellation,
@@ -8892,7 +9019,7 @@ mod tests {
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "eb0e47b57c2fba97ed13e8fe5e949d11798232cb"
+            "b508f1c7652c751513c361c7e4fdeb090fbed577"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
