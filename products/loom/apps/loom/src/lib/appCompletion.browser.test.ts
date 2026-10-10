@@ -23,6 +23,7 @@ vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({
   onResized: async () => () => {}, isFullscreen: async () => false, setTitle: async () => {}
 }) }));
 import App from '../App.svelte';
+import { getPreferences } from './ipc';
 
 let mounted: ReturnType<typeof mount> | null = null;
 let restoreStorage: Array<[string, string]> = [];
@@ -375,6 +376,8 @@ it.each([
       }]
     };
   }
+  let holdPreferenceReplies = reenable;
+  const releasePreferences: Array<() => void> = [];
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     switch (command) {
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
@@ -402,7 +405,9 @@ it.each([
       case 'plugin:loom|co_writer_list': return [];
       // Keep storage pending to prove toggles follow native policy acknowledgement.
       case 'plugin:loom|preferences_update':
-        if (reenable) return new Promise(() => {});
+        if (holdPreferenceReplies) return new Promise(resolve => {
+          releasePreferences.push(() => resolve({ revision: '1', last_local_model: null, project_suggestions: {} }));
+        });
         return { revision: '1', last_local_model: null, project_suggestions: { [args.change.project_id]: args.change.enabled } };
       case 'plugin:loom|suggestions_set':
         if (deferSuggestionPolicy) {
@@ -773,6 +778,9 @@ it.each([
     }));
     throw error;
   } finally {
+    holdPreferenceReplies = false;
+    for (const release of releasePreferences) release();
+    if (reenable) await getPreferences();
     releaseBodies();
     (releaseSuggestionPolicy as (() => void) | null)?.();
     await keyboard.cleanup();

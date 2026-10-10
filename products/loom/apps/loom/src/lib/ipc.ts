@@ -51,11 +51,24 @@ export type PreferenceChange =
   | { kind: 'remember_model'; path: string }
   | { kind: 'forget_model'; expected_path: string }
   | { kind: 'suggestions'; project_id: string; enabled: boolean | null };
+const MAX_PENDING_PREFERENCES = 8;
+let pendingPreferences = 0;
+let preferenceTail: Promise<void> = Promise.resolve();
+
+function orderedPreferences<T>(operation: () => Promise<T>): Promise<T> {
+  if (pendingPreferences >= MAX_PENDING_PREFERENCES) {
+    return Promise.reject({ code: 'preferences_busy', message: 'Preference storage is busy', retryable: true });
+  }
+  pendingPreferences += 1;
+  const result = preferenceTail.then(operation).finally(() => { pendingPreferences -= 1; });
+  preferenceTail = result.then(() => undefined, () => undefined);
+  return result;
+}
 export function getPreferences(): Promise<LoomPreferences> {
-  return call('preferences_get', {});
+  return orderedPreferences(() => call('preferences_get', {}));
 }
 export function updatePreferences(change: PreferenceChange): Promise<LoomPreferences> {
-  return call('preferences_update', { change });
+  return orderedPreferences(() => call('preferences_update', { change }));
 }
 
 
