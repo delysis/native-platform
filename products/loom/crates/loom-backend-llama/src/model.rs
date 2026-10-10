@@ -123,6 +123,7 @@ impl LocalModelProfile {
             context_tokens: self.context_tokens,
             batch_tokens: self.batch_tokens,
             max_sequences: self.max_parallel_cases,
+            kv_unified: true,
             gpu_layers: self.gpu_layers,
         }
     }

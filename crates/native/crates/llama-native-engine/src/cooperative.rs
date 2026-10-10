@@ -108,6 +108,7 @@ struct Subscriber {
 #[derive(Debug, Default)]
 struct HubState {
     ordinal: u64,
+    closed: bool,
     subscribers: Vec<Subscriber>,
 }
 
@@ -116,12 +117,35 @@ pub(super) struct DecodeHub {
     state: Mutex<HubState>,
 }
 
+#[derive(Debug)]
+pub(super) struct DecodeWorkerLifetime<'a>(&'a DecodeHub);
+impl Drop for DecodeWorkerLifetime<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        state.subscribers.clear();
+    }
+}
+
 impl DecodeHub {
+    pub(super) fn worker_lifetime(&self) -> DecodeWorkerLifetime<'_> {
+        DecodeWorkerLifetime(self)
+    }
     fn subscribe(&self) -> NativeResult<DecodeObserver> {
         let mut hub = self
             .state
             .lock()
             .map_err(|_| internal("decode observer registry poisoned"))?;
+        if hub.closed {
+            return Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native decode observation owner stopped",
+            ));
+        }
         hub.subscribers
             .retain(|subscriber| subscriber.state.strong_count() != 0);
         if hub.subscribers.len() >= MAX_OBSERVERS {
@@ -173,11 +197,17 @@ impl NativeModelHandle {
     /// Submit one independently owned, uncached case to the cooperative lane.
     /// Later cooperative requests may join while this request is decoding.
     /// Media, caller caches and out-of-band reasoning intervention are not
-    /// supported on this lane; the ordinary generation APIs remain unchanged.
+    /// supported on this lane. The resident must be loaded with `kv_unified`
+    /// disabled; its descriptor reports the capacity of each independent stream.
     pub fn generate_cooperative(
         &self,
         request: GenerationBatchRequest,
     ) -> NativeResult<GenerationTicket> {
+        if self.inner.worker_identity.kv_unified {
+            return Err(unsupported(
+                "cooperative generation requires independently allocated KV streams (kv_unified = false)",
+            ));
+        }
         validate_request(&request)?;
         self.submit_generation_batch(
             request,
@@ -255,57 +285,39 @@ fn cancelled() -> NativeError {
     NativeError::new(NativeErrorCode::Cancelled, "cooperative request cancelled")
 }
 
-/// Conservative reservation: the complete prompt plus all permitted growth.
-/// No accounting credit is taken for an identical prefix in another request.
+/// Every stream has fixed native capacity and exactly one live request owner.
+/// Removing one owner cannot change another stream's physical cell layout.
 #[derive(Debug)]
 struct Reservations {
     cells: usize,
     slots: usize,
-    held: BTreeMap<usize, usize>,
-    used: usize,
+    held: std::collections::BTreeSet<usize>,
 }
-
 impl Reservations {
     fn new(cells: usize, sequences: usize, batch: usize) -> Self {
         Self {
             cells,
             slots: sequences.min(batch).min(MAX_LIVE),
-            held: BTreeMap::new(),
-            used: 0,
+            held: std::collections::BTreeSet::new(),
         }
     }
-
     fn reserve(&mut self, cells: usize) -> NativeResult<Option<usize>> {
         if cells == 0 || cells > self.cells || self.slots == 0 {
             return Err(NativeError::new(
                 NativeErrorCode::PromptTooLarge,
-                "cooperative request exceeds the resident capacity",
+                "cooperative request exceeds its independent stream capacity",
             ));
         }
-        let Some(total) = self
-            .used
-            .checked_add(cells)
-            .filter(|total| *total <= self.cells)
-        else {
+        let Some(slot) = (0..self.slots).find(|slot| !self.held.contains(slot)) else {
             return Ok(None);
         };
-        let Some(slot) = (0..self.slots).find(|slot| !self.held.contains_key(slot)) else {
-            return Ok(None);
-        };
-        self.held.insert(slot, cells);
-        self.used = total;
+        self.held.insert(slot);
         Ok(Some(slot))
     }
-
     fn release(&mut self, slot: usize) -> NativeResult<()> {
-        let cells = self
-            .held
-            .remove(&slot)
-            .ok_or_else(|| internal("cooperative reservation released twice"))?;
-        self.used = self
-            .used
-            .checked_sub(cells)
-            .ok_or_else(|| internal("cooperative reservation underflow"))?;
+        if !self.held.remove(&slot) {
+            return Err(internal("cooperative reservation released twice"));
+        }
         Ok(())
     }
 }
@@ -381,7 +393,7 @@ impl Pending {
             let tokens = generation_case_tokens(model, &job.request.cases[0], 0)?;
             let cells = tokens
                 .len()
-                .checked_add(job.request.cases[0].sampling.max_tokens as usize)
+                .checked_add(job.request.cases[0].sampling.max_tokens.saturating_sub(1) as usize)
                 .ok_or_else(|| internal("cooperative cell count overflow"))?;
             if tokens.is_empty() || cells > maximum_cells {
                 return Err(NativeError::new(
@@ -666,7 +678,7 @@ struct Pool {
 pub(super) fn run(first: WorkerCommand, mut runtime: Runtime<'_, '_>) {
     let mut pool = Pool {
         reservations: Reservations::new(
-            runtime.context.n_ctx() as usize,
+            (runtime.context.n_ctx() / runtime.fingerprint.max_sequences) as usize,
             runtime.fingerprint.max_sequences as usize,
             runtime.context.n_batch() as usize,
         ),
@@ -939,16 +951,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_bound_aggregate_growth_and_reuse_only_released_slots() {
-        let mut budget = Reservations::new(100, 4, 4);
-        let first = budget.reserve(60).unwrap().unwrap();
-        assert!(budget.reserve(41).unwrap().is_none());
-        let second = budget.reserve(40).unwrap().unwrap();
+    fn reservations_bound_each_stream_and_reuse_only_released_slots() {
+        let mut budget = Reservations::new(100, 2, 4);
+        let first = budget.reserve(100).unwrap().unwrap();
+        let second = budget.reserve(100).unwrap().unwrap();
         assert_ne!(first, second);
         assert!(budget.reserve(1).unwrap().is_none());
         budget.release(first).unwrap();
-        assert_eq!(budget.reserve(60).unwrap(), Some(first));
-        assert_eq!(budget.used, 100);
+        assert_eq!(budget.reserve(100).unwrap(), Some(first));
         assert!(budget.reserve(101).is_err());
         assert!(budget.reserve(usize::MAX).is_err());
         budget.release(second).unwrap();
@@ -962,6 +972,28 @@ mod tests {
         assert_eq!(budget.reserve(1).unwrap(), Some(1));
         assert!(budget.reserve(1).unwrap().is_none());
         assert!(Reservations::new(100, 0, 2).reserve(1).is_err());
+    }
+
+    #[test]
+    fn worker_exit_closes_observers_after_retaining_queued_samples() {
+        let hub = DecodeHub::default();
+        let lifetime = hub.worker_lifetime();
+        let observer = hub.subscribe().unwrap();
+        hub.publish(Vec::new()).unwrap();
+        drop(lifetime);
+        assert!(hub.subscribe().is_err());
+        assert_eq!(
+            observer
+                .receive_timeout(Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .ordinal(),
+            1
+        );
+        assert_eq!(
+            observer.receive_timeout(Duration::ZERO).unwrap_err().code,
+            NativeErrorCode::WorkerStopped
+        );
     }
 
     #[test]

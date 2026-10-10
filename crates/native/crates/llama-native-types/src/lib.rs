@@ -108,7 +108,17 @@ pub struct NativeModelConfig {
     pub context_tokens: u32,
     pub batch_tokens: u32,
     pub max_sequences: u32,
+    /// Unified storage supports shared prefixes. Disable it for independently
+    /// reclaimed sequence streams for uncached exact-token generation.
+    /// context_tokens requests the total allocation; native padding can enlarge
+    /// it. The live descriptor reports the capacity of one sequence stream.
+    #[serde(default = "default_kv_unified")]
+    pub kv_unified: bool,
     pub gpu_layers: i32,
+}
+
+const fn default_kv_unified() -> bool {
+    true
 }
 
 impl NativeModelConfig {
@@ -128,6 +138,7 @@ impl NativeModelConfig {
             context_tokens: 8192,
             batch_tokens: 512,
             max_sequences: MAX_PARALLEL_SEQUENCES,
+            kv_unified: true,
             gpu_layers: -1,
         }
     }
@@ -3240,6 +3251,7 @@ mod tests {
         let config = NativeModelConfig::local(PathBuf::from("model.gguf"));
         assert_eq!(config.max_sequences, MAX_PARALLEL_SEQUENCES);
         assert_eq!(config.device, NativeDevice::Auto);
+        assert!(config.kv_unified);
         assert!(config.expected_model_sha256.is_none());
         assert!(config.expected_mmproj_sha256.is_none());
     }
@@ -3283,6 +3295,7 @@ mod tests {
             "gpu_layers": 0
         }))
         .expect("legacy config remains readable");
+        assert!(config.kv_unified);
         assert!(config.expected_model_sha256.is_none());
         assert!(config.expected_mmproj_sha256.is_none());
     }

@@ -892,10 +892,21 @@ struct NativeModelInner {
     status: Arc<RwLock<ResidentModelStatus>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WorkerIdentity {
     cooperative_decodes: cooperative::DecodeHub,
+    kv_unified: bool,
     exports: state_buffer::LiveExports,
+}
+
+impl Default for WorkerIdentity {
+    fn default() -> Self {
+        Self {
+            cooperative_decodes: cooperative::DecodeHub::default(),
+            kv_unified: true,
+            exports: state_buffer::LiveExports::default(),
+        }
+    }
 }
 
 impl NativeModelInner {
@@ -1213,7 +1224,10 @@ impl NativeModelHandle {
             max_sequences: config.max_sequences,
         }));
         let worker_status = Arc::clone(&status);
-        let worker_identity = Arc::new(WorkerIdentity::default());
+        let worker_identity = Arc::new(WorkerIdentity {
+            kv_unified: config.kv_unified,
+            ..WorkerIdentity::default()
+        });
         let owner_worker_identity = Arc::clone(&worker_identity);
         let worker_id = format!("llama-model-{}", config.model_id);
         let requests = Arc::new(RequestRegistry::with_external_worker(worker_id.clone()));
@@ -1464,6 +1478,19 @@ impl NativeModelHandle {
         let status = self.status();
         validate_generation_batch_request(&request, &status)?;
         let exact_cell_budget = exact_token_budget_for_submission(&request, &status)?;
+        if !self.inner.worker_identity.kv_unified
+            && (request.cases.len() != 1
+                || exact_cell_budget.is_none()
+                || request
+                    .cases
+                    .iter()
+                    .any(|case| case.cached_prefix.is_some()))
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedParameter,
+                "independent KV streams require one uncached exact-token case per submission",
+            ));
+        }
         let mut cancellations = Vec::with_capacity(request.cases.len());
         let mut reasoning_forces = Vec::with_capacity(request.cases.len());
         for _ in &request.cases {
@@ -1552,10 +1579,22 @@ impl NativeModelHandle {
         })
     }
 
+    fn require_unified_kv(&self) -> NativeResult<()> {
+        if self.inner.worker_identity.kv_unified {
+            Ok(())
+        } else {
+            Err(NativeError::new(
+                NativeErrorCode::UnsupportedParameter,
+                "shared-prefix and controlled generation require unified KV storage",
+            ))
+        }
+    }
+
     pub fn generate_shared_prefix(
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<GenerationTicket> {
+        self.require_unified_kv()?;
         validate_batch_request(&request, &self.status())?;
         let mut flags = Vec::with_capacity(request.branches.len());
         let mut reasoning_flags = Vec::with_capacity(request.branches.len());
@@ -1677,6 +1716,7 @@ impl NativeModelHandle {
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<SequenceStateBlob> {
+        self.require_unified_kv()?;
         self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
         if request.branches.len() < 2 {
@@ -2145,6 +2185,7 @@ fn run_worker(
     status: Arc<RwLock<ResidentModelStatus>>,
     worker_identity: Arc<WorkerIdentity>,
 ) {
+    let _decode_lifetime = worker_identity.cooperative_decodes.worker_lifetime();
     let _export_lifetime = state_buffer::bind_worker_exports(&worker_identity.exports);
     let WorkerLanes {
         command_rx,
@@ -2284,7 +2325,7 @@ fn run_worker(
         &model,
         &artifacts,
         execution_backend,
-        context_tokens,
+        context.n_ctx(),
         rope_config_sha256,
         kv_layout_sha256,
     ) {
@@ -3122,7 +3163,7 @@ fn generation_context_params(
         .with_n_seq_max(config.max_sequences)
         .with_n_threads(native_thread_count())
         .with_n_threads_batch(native_thread_count())
-        .with_kv_unified(true)
+        .with_kv_unified(config.kv_unified)
         .with_no_perf(false)
 }
 
@@ -6500,6 +6541,12 @@ fn batch_cell_budget_error(message: impl Into<String>) -> NativeError {
 }
 
 fn validate_config(config: &NativeModelConfig) -> NativeResult<()> {
+    if !config.kv_unified && config.mmproj_path.is_some() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "independent KV streams support text generation without a multimodal projector",
+        ));
+    }
     if config.max_sequences == 0 || config.max_sequences > MAX_PARALLEL_SEQUENCES {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
@@ -6827,6 +6874,20 @@ fn exact_token_budget_for_submission(
                 "resident model has no exact context fingerprint",
             )
         })?;
+    let stream_tokens = status
+        .descriptor
+        .as_ref()
+        .map_or(context_tokens, |descriptor| descriptor.context_tokens);
+    if budget.cases().iter().any(|case| {
+        case.prompt_tokens()
+            .saturating_add(case.maximum_resident_completion_tokens())
+            > u64::from(stream_tokens)
+    }) {
+        return Err(NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            "exact-token case exceeds its resident sequence stream",
+        ));
+    }
     if !budget.fits(u64::from(context_tokens)) {
         return Err(NativeError::new(
             NativeErrorCode::PromptTooLarge,
@@ -6980,7 +7041,11 @@ fn describe_model(
         architecture,
         parameter_count: model.n_params(),
         model_size: fingerprint.model_size,
-        context_tokens: fingerprint.context_tokens,
+        context_tokens: if config.kv_unified {
+            fingerprint.context_tokens
+        } else {
+            fingerprint.context_tokens / fingerprint.max_sequences
+        },
         max_sequences: fingerprint.max_sequences,
         backend: fingerprint.backend.clone(),
         capabilities: ModelCapabilities {

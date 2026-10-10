@@ -39,7 +39,8 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
     let expected_model = std::env::var("MOM_LLAMA_MODEL_SHA256")?;
     config.expected_model_sha256 = Some(expected_model.clone());
     config.device = NativeDevice::Cpu;
-    config.context_tokens = 4096;
+    config.context_tokens = 8192;
+    config.kv_unified = false;
     config.batch_tokens = 128;
     config.max_sequences = 4;
     let owner = NativeModelOwner::load(config)?;
@@ -208,6 +209,20 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
     assert!(joined.belongs_to(&first_handle));
     assert_eq!(joined.expected_worker_count(), 1);
     assert_eq!(joined.joined_worker_count(), 1);
+    let mut observations_closed = false;
+    for _ in 0..=4096 {
+        match observer.receive_timeout(Duration::ZERO) {
+            Ok(Some(_)) => {}
+            Err(error) if error.code == llama_native_types::NativeErrorCode::WorkerStopped => {
+                observations_closed = true;
+                break;
+            }
+            result => panic!("joined worker retained an open observation stream: {result:?}"),
+        }
+    }
+    assert!(observations_closed);
+    assert_eq!(observer.dropped_samples(), 0);
+
     println!(
         "cooperative native qualification: model={} build={} first_decode={} shared_decode={} members={:?}; physical_network=false",
         fingerprint.model_sha256,
