@@ -509,6 +509,7 @@ pub(super) fn consult_with_budget_and_cancel(
 
 /// Pack ordinary context using whole retained passages. Exact function values
 /// keep their independent semantics and are never shortened by this planner.
+#[cfg(all(test, unix))]
 pub(super) fn markdown_plan_with_budget<'a>(
     context: impl Into<ReadContext<'a>>,
     markdown: &str,
@@ -519,6 +520,17 @@ pub(super) fn markdown_plan_with_budget<'a>(
     let context = context.into();
     let references =
         loom_document::document_references(markdown).map_err(|error| failure(error.to_string()))?;
+    plan_with_references(context, references, query, byte_budget, requirement)
+}
+
+pub(super) fn plan_with_references<'a>(
+    context: impl Into<ReadContext<'a>>,
+    references: Vec<loom_document::DocumentReference>,
+    query: &str,
+    byte_budget: usize,
+    requirement: ReferenceRequirement,
+) -> Result<ContextPlan, IpcFailure> {
+    let context = context.into();
     let mut plan = ContextPlan {
         byte_budget: byte_budget.min(MAX_BYTES),
         ..ContextPlan::default()

@@ -304,12 +304,34 @@ pub fn retrieve(
     draft: &str,
     cancel: &Cancellation,
 ) -> Result<RetrievedCircle, FriendsError> {
+    retrieve_with_mentions(config, draft, cancel, mentions(draft))
+}
+
+/// Native preparation has already selected invitations with the shared
+/// workspace grammar. Its synthesized first line contains only those handles;
+/// the preserved query text below it cannot acquire participant authority.
+pub(crate) fn retrieve_prepared_invitation(
+    config: &FriendsConfig,
+    draft: &str,
+    cancel: &Cancellation,
+) -> Result<RetrievedCircle, FriendsError> {
+    let (invited, _) = draft
+        .split_once('\n')
+        .ok_or_else(|| invalid("native invitation header is missing"))?;
+    retrieve_with_mentions(config, draft, cancel, mentions(invited))
+}
+
+fn retrieve_with_mentions(
+    config: &FriendsConfig,
+    draft: &str,
+    cancel: &Cancellation,
+    mentions: Vec<Mention>,
+) -> Result<RetrievedCircle, FriendsError> {
     config.validate()?;
     cancel.check()?;
     if draft.trim().is_empty() || draft.len() > 16_384 {
         return Err(invalid("draft must contain 1..=16384 UTF-8 bytes"));
     }
-    let mentions = mentions(draft);
     if mentions.is_empty() {
         return Err(invalid("mention a configured friend, for example @visa"));
     }

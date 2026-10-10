@@ -613,19 +613,19 @@ mod tests {
         // Focus blocks even explicitly configured servers before durable work.
         state.session.lock().unwrap().agency.set_focus_mode(true);
         let start = || {
-            weave_start_inner(
+            tauri::async_runtime::block_on(weave_start(
                 project.to_string(),
                 session_id.to_string(),
-                &command.to_string(),
-                &source.document_id.to_string(),
-                INITIAL_DOCUMENT,
-                &source.revision_id.to_string(),
-                &source.blob_id.to_string(),
+                command.to_string(),
+                source.document_id.to_string(),
+                INITIAL_DOCUMENT.into(),
+                source.revision_id.to_string(),
+                source.blob_id.to_string(),
                 5,
                 policy,
-                app.handle(),
-                &state,
-            )
+                app.handle().clone(),
+                app.state::<PluginState>(),
+            ))
         };
         if matches!(
             policy,
@@ -695,6 +695,24 @@ mod tests {
         }
         assert_eq!(&calls.lock().unwrap()[..2], &["offline", "writer"]);
         let before_replay = calls.lock().unwrap().len();
+        // Exact replay must recover durable evidence before model/agency or
+        // archive preparation. A newly invalid opt-in file cannot break it.
+        {
+            let session = state.session.lock().unwrap();
+            std::fs::write(
+                session
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .join(::archive_friends::DOTFILE),
+                "not valid = [",
+            )
+            .unwrap();
+            session.agency.set_focus_mode(true);
+            session.agency.set_automation_enabled(false);
+        }
+
         assert_eq!(start().unwrap().request_id, started.request_id);
         assert_eq!(calls.lock().unwrap().len(), before_replay);
         if cancel {

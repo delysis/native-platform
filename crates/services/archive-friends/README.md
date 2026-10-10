@@ -30,5 +30,13 @@ handles invite archive context; quoted/scoped/path names and retained links
 remain workspace references. Code and historical quotes cannot invite a voice.
 The topic window retains the full document lexical state.
 
-The Loom host adapter remains pending. This crate alone does not establish
-packaged acceptance or authorize promoting the completion integration.
+Loom now prepares this context outside its admission locks and rechecks source,
+workspace, model and cancellation identity at final admission. Archive evidence
+reserves space before ordinary material planning and its pack is stored as
+provenance. Exact command replay precedes preparation. Project close, Focus,
+suggestion opt-out and runtime exit cancel preparation; close/exit drain it.
+Configuration and frozen-snapshot validation occurs inside the provider lease.
+
+The integrated host has component tests; packaged native/model acceptance and
+the original suggestion/help proposal review remain pending. Component success
+does not authorize promoting the completion integration.

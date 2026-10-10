@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod archive_friends;
 mod attachments;
 mod audio_io;
 mod co_writer;
@@ -501,6 +502,7 @@ pub struct PluginState {
     session: Mutex<Session>,
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
+    archive_friends: Arc<archive_friends::Provider>,
     imports: Arc<import_jobs::ImportJobs>,
     previews: Arc<import_jobs::ImportJobs>,
     inference: Option<Arc<inference::Service>>,
@@ -587,6 +589,7 @@ impl PluginState {
             session: Mutex::new(Session::default()),
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
+            archive_friends: Arc::default(),
             imports: Arc::default(),
             previews: Arc::default(),
             inference: None,
@@ -615,6 +618,7 @@ impl PluginState {
 
 impl Drop for PluginState {
     fn drop(&mut self) {
+        self.archive_friends.cancel_all();
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
@@ -3754,6 +3758,7 @@ fn close_project_with_wait(
         (typed_project_id, typed_session_id)
     };
 
+    archive_friends::drain(state, generation_wait)?;
     state.imports.revoke_session(&session_id);
     state.previews.revoke_session(&session_id);
 
@@ -8576,6 +8581,23 @@ async fn weave_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
+    let admission = archive_friends::prepare(
+        &state,
+        &project_id,
+        &session_id,
+        &command_id,
+        &document_id,
+        &relative_path,
+        &source_revision_id,
+        &expected_visible_blob_id,
+        cursor_byte,
+        policy,
+    )
+    .await?;
+    let archive = match admission {
+        archive_friends::Admission::Replay(replay) => return Ok(replay),
+        archive_friends::Admission::Prepared(prepared) => prepared,
+    };
     complete_ipc_setup(|| {
         weave_start_inner(
             project_id,
@@ -8589,6 +8611,7 @@ async fn weave_start<R: Runtime>(
             policy,
             &app,
             &state,
+            archive.as_ref(),
         )
     })
 }
@@ -8606,6 +8629,7 @@ fn weave_start_inner<R: Runtime>(
     policy: WeavePolicySnapshot,
     app: &AppHandle<R>,
     state: &State<'_, PluginState>,
+    archive: Option<&archive_friends::Prepared>,
 ) -> Result<WeaveStarted, IpcFailure> {
     state.emit_timing("generation_request_received");
     ensure_application_running(state, "a writing suggestion")?;
@@ -8676,6 +8700,9 @@ fn weave_start_inner<R: Runtime>(
         ));
     }
     let model_environment = authorized_model.environment()?;
+    if let Some(archive) = archive {
+        archive.validate_model(&model_environment)?;
+    }
 
     let request_id = format!("weave-{command_id}");
     let (
@@ -8771,9 +8798,13 @@ fn weave_start_inner<R: Runtime>(
         } else {
             None
         };
+        let document_root = store.root().to_owned();
+        if let Some(archive) = archive {
+            archive.validate(&session, state, &loaded, cursor_byte)?;
+        }
         let source_prefix = &loaded.text[..cursor];
         let mut attachment_context = resolve_for_generation_with_budget(
-            store.root(),
+            &document_root,
             &document_id.to_string(),
             source_prefix,
             authorized_model.context_tokens(),
@@ -8781,10 +8812,8 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
-        if !loom_document::document_references(&loaded.text)
-            .map_err(|error| IpcFailure::new("material_context_invalid", error.to_string(), false))?
-            .is_empty()
-        {
+        let references = archive_friends::workspace_references(&loaded.text, archive)?;
+        if !references.is_empty() {
             material_commands::restore_grants(state, workspace_owner::store_mut(&mut session)?)?;
         }
         // Match the attachment planner's conservative byte-per-token envelope;
@@ -8805,9 +8834,6 @@ fn weave_start_inner<R: Runtime>(
                 false,
             )
         })?;
-        let references = loom_document::document_references(&loaded.text).map_err(|error| {
-            IpcFailure::new("document_reference_invalid", error.to_string(), false)
-        })?;
         let mut mounted = workspace_references::Snapshots::default();
         mounted.admit(
             state,
@@ -8822,9 +8848,17 @@ fn weave_start_inner<R: Runtime>(
             &owner.session_id.to_string(),
         )?
         .with_mounted(&mounted);
-        let material_plan = material_context::markdown_plan_with_budget(
+        let archive_bytes = archive.map_or(0, |archive| archive.context.preamble.len() + 2);
+        let material_budget = material_budget.checked_sub(archive_bytes).ok_or_else(|| {
+            IpcFailure::new(
+                "archive_context_budget_exceeded",
+                "Archive context does not fit the writing context budget.",
+                false,
+            )
+        })?;
+        let material_plan = material_context::plan_with_references(
             source_context,
-            &loaded.text,
+            references,
             source_prefix,
             material_budget,
             if authorized_model.is_automatic() {
@@ -8846,6 +8880,22 @@ fn weave_start_inner<R: Runtime>(
                 .context_preamble
                 .push_str(document_context);
         }
+        let archive_blob = if let Some(archive) = archive {
+            attachment_context.context_preamble.push_str("\n\n");
+            attachment_context
+                .context_preamble
+                .push_str(&archive.context.preamble);
+            let bytes = serde_json::to_vec(archive.context.pack.as_ref()).map_err(|error| {
+                IpcFailure::new("archive_encode_failed", error.to_string(), false)
+            })?;
+            Some(
+                store
+                    .store_provenance_blob(&bytes)
+                    .map_err(IpcFailure::store)?,
+            )
+        } else {
+            None
+        };
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()
@@ -8914,13 +8964,20 @@ fn weave_start_inner<R: Runtime>(
             .record_prompt_recipe(&prompt_recipe)
             .map_err(IpcFailure::store)?;
         let retrieval_evidence_blob_id = {
-            let identity =
-                serde_json::to_vec(&match &speculation {
-                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "loompad": batch }),
-                    None => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media }),
-                }).map_err(|error| {
-                    IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
-                })?;
+            let mut evidence = match &speculation {
+                Some(batch) => {
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "loompad": batch })
+                }
+                None => {
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media })
+                }
+            };
+            if let Some(id) = archive_blob {
+                evidence["archive_friends_pack_blob_id"] = serde_json::json!(id);
+            }
+            let identity = serde_json::to_vec(&evidence).map_err(|error| {
+                IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
+            })?;
             Some(
                 store
                     .store_provenance_blob(&identity)
@@ -10710,6 +10767,7 @@ impl DesktopWorkersJoined {
 
 impl PluginState {
     fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
+        archive_friends::drain(self, PROJECT_CLOSE_GENERATION_WAIT)?;
         self.imports.shutdown()?;
         self.previews.shutdown()?;
         let model_loads = self.model_loads.close_and_drain();
@@ -10752,6 +10810,7 @@ impl PluginState {
     /// removed under a poison-recovering registry lock, cancelled, and joined
     /// before the returned exact-registry facts are assembled.
     fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
+        self.archive_friends.cancel_and_drain_for_exit();
         if let Err(error) = self.imports.shutdown() {
             eprintln!("Loom import drain: {}", error.message);
         }
@@ -10779,6 +10838,7 @@ fn application_close<R: Runtime>(
 ) -> Result<(), IpcFailure> {
     let _audio = state.audio_capture.close_guard()?;
     let close_attempt = begin_application_close(&state)?;
+    archive_friends::drain(&state, PROJECT_CLOSE_GENERATION_WAIT)?;
     lock_prepared_project(&state)?.take();
     terminal::drain_workspace_runs(&state, PROJECT_CLOSE_GENERATION_WAIT)?;
     if state
@@ -10934,6 +10994,7 @@ fn focus_mode_set(
     session.agency.set_focus_mode(enabled);
     drop(session);
     if enabled {
+        state.archive_friends.cancel_all();
         state
             .generations
             .cancel_session(project_id_typed, session_id_typed)
@@ -10964,6 +11025,7 @@ fn suggestions_set(
     session.agency.set_automation_enabled(enabled);
     drop(session);
     if !enabled {
+        state.archive_friends.cancel_all();
         state
             .generations
             .cancel_session(project_id_typed, session_id_typed)

@@ -2,7 +2,7 @@
 //! execution and checks its document/session authority again before use.
 use crate::{
     Cancellation, FriendsConfig, FriendsError, PromptPack, compile, continuation_context,
-    fingerprint, invalid, retrieve,
+    fingerprint, invalid,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -24,6 +24,36 @@ pub struct PreparedContext {
     pub preamble: String,
     pub config_sha256: String,
     pub reserved_handles: Vec<String>,
+}
+impl PreparedContext {
+    /// Revalidate the selected configuration and frozen snapshot immediately
+    /// before returning preparation to a host. This performs filesystem I/O;
+    /// callers must not hold their document/model admission mutexes.
+    pub fn validate_snapshot(
+        &self,
+        dotfile: &Path,
+        source_basis: &str,
+    ) -> Result<(), FriendsError> {
+        if self.source_basis != source_basis {
+            return Err(invalid("archive context source basis changed"));
+        }
+        self.pack.verify()?;
+        if fingerprint(&FriendsConfig::load(dotfile)?)? != self.config_sha256 {
+            return Err(invalid("archive dotfile changed after preparation"));
+        }
+        let stamp = &self.pack.circle.archive;
+        let metadata = std::fs::metadata(&stamp.path)?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| invalid("invalid archive date"))?
+            .as_nanos();
+        crate::retrieval::check_wal(&stamp.path)?;
+        if metadata.len() != stamp.bytes || modified != stamp.modified_unix_nanos {
+            return Err(invalid("archive snapshot changed after preparation"));
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Default)]
 struct State {
@@ -47,16 +77,19 @@ struct Lease<'a> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if let Ok(mut state) = self.provider.state.lock() {
-            state.in_flight = state.in_flight.saturating_sub(1);
-            self.provider.idle.notify_all();
-            if state
-                .active
-                .get(&self.scope)
-                .is_some_and(|(id, _)| *id == self.id)
-            {
-                state.active.remove(&self.scope);
-            }
+        let mut state = self
+            .provider
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        self.provider.idle.notify_all();
+        if state
+            .active
+            .get(&self.scope)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            state.active.remove(&self.scope);
         }
     }
 }
@@ -93,6 +126,24 @@ impl NativeContextProvider {
             return Err(invalid("archive preparation is still cancelling"));
         }
         Ok(())
+    }
+    /// Final runtime-exit boundary: recover a poisoned registry, cancel every
+    /// admitted operation and wait until its lease has released all archive I/O.
+    pub fn cancel_and_drain_for_exit(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, cancel) in state.active.values() {
+            cancel.cancel();
+        }
+        while state.in_flight != 0 {
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
     pub fn prepare(
         &self,
@@ -179,11 +230,13 @@ impl NativeContextProvider {
             crate::retrieval::check_wal(&stamp.path)?;
             cancel.check()?;
             if meta.len() == stamp.bytes && current == stamp.modified_unix_nanos {
+                cached.validate_snapshot(dotfile, source_basis)?;
+                cancel.check()?;
                 return Ok(Some(cached));
             }
         }
         cancel.check()?;
-        let circle = retrieve(&config, &draft, &cancel)?;
+        let circle = crate::retrieval::retrieve_prepared_invitation(&config, &draft, &cancel)?;
         let pack = Arc::new(compile(&config, circle)?);
         let prepared = PreparedContext {
             source_basis: source_basis.into(),
@@ -197,9 +250,8 @@ impl NativeContextProvider {
                 .collect(),
         };
         cancel.check()?;
-        if fingerprint(&FriendsConfig::load(dotfile)?)? != prepared.config_sha256 {
-            return Err(invalid("archive dotfile changed during preparation"));
-        }
+        prepared.validate_snapshot(dotfile, source_basis)?;
+        cancel.check()?;
         let size = serde_json::to_vec(prepared.pack.as_ref())?.len() + prepared.preamble.len();
         let mut state = self
             .state
@@ -309,6 +361,42 @@ pub fn is_friend_invitation(
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+    #[test]
+    fn lease_release_survives_a_poisoned_registry_before_exit_drain() {
+        let provider = NativeContextProvider::default();
+        let scope = ContextScope {
+            project: "p".into(),
+            session: "s".into(),
+            document: "d".into(),
+        };
+        let cancel = Cancellation::default();
+        {
+            let mut state = provider.state.lock().expect("controlled registry");
+            state.in_flight = 1;
+            state.active.insert(scope.clone(), (7, cancel.clone()));
+        }
+        let lease = Lease {
+            provider: &provider,
+            scope,
+            id: 7,
+            cancel: cancel.clone(),
+        };
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = provider.state.lock().expect("controlled registry");
+            panic!("controlled registry poison");
+        });
+        assert!(poisoned.is_err());
+        drop(lease);
+        let state = provider
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.in_flight, 0);
+        assert!(state.active.is_empty());
+        drop(state);
+        assert!(cancel.check().is_err());
+        provider.cancel_and_drain_for_exit();
+    }
     #[test]
     fn topic_window_keeps_full_document_code_state() {
         let mut config = FriendsConfig::default();

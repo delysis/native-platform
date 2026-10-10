@@ -176,3 +176,66 @@ fn incompatible_archive_records_are_not_reinterpreted_as_authored_tweets() {
             .is_err()
     );
 }
+
+#[test]
+fn prepared_snapshot_revalidation_refuses_config_changes_basis_and_wal() {
+    let (temp, config) = fixture();
+    let dotfile = temp.path().join(DOTFILE);
+    fs::write(
+        &dotfile,
+        toml::to_string(&config).expect("controlled config"),
+    )
+    .expect("controlled config");
+    let provider = NativeContextProvider::default();
+    let prepared = provider
+        .prepare(scope(), "blob:3", &dotfile, "@a friendship")
+        .expect("controlled snapshot")
+        .expect("invited context");
+    assert!(prepared.validate_snapshot(&dotfile, "blob:3").is_ok());
+    assert!(prepared.validate_snapshot(&dotfile, "other:3").is_err());
+    let mut changed = config.clone();
+    changed.prompt.direction = "Changed authored direction".into();
+    fs::write(
+        &dotfile,
+        toml::to_string(&changed).expect("controlled config"),
+    )
+    .expect("controlled config");
+    assert!(prepared.validate_snapshot(&dotfile, "blob:3").is_err());
+    fs::write(
+        &dotfile,
+        toml::to_string(&config).expect("controlled config"),
+    )
+    .expect("controlled config");
+    let wal = temp.path().join("snapshot.sqlite-wal");
+    fs::write(&wal, b"retained failed snapshot evidence").expect("controlled WAL");
+    assert!(prepared.validate_snapshot(&dotfile, "blob:3").is_err());
+    assert_eq!(
+        fs::read(&wal).expect("retained WAL"),
+        b"retained failed snapshot evidence"
+    );
+    provider.cancel_and_drain_for_exit();
+}
+
+#[test]
+fn native_retrieval_does_not_reinterpret_query_text_as_additional_invitations() {
+    let (temp, config) = fixture();
+    let dotfile = temp.path().join(DOTFILE);
+    fs::write(
+        &dotfile,
+        toml::to_string(&config).expect("controlled config"),
+    )
+    .expect("controlled config");
+    let source = "@a friendship\n> Historical @outsider quotation\n~~~\n@outsider code\n~~~\n[link](https://example.com/@outsider)";
+    let provider = NativeContextProvider::default();
+    let prepared = provider
+        .prepare(scope(), "source:1", &dotfile, source)
+        .expect("query text cannot invite another voice")
+        .expect("authored invitation");
+    assert_eq!(prepared.pack.circle.friends.len(), 1);
+    assert_eq!(prepared.pack.circle.mentions.len(), 1);
+    assert!(prepared.pack.circle.draft.contains("@outsider quotation"));
+    assert_eq!(
+        source,
+        "@a friendship\n> Historical @outsider quotation\n~~~\n@outsider code\n~~~\n[link](https://example.com/@outsider)"
+    );
+}
