@@ -387,7 +387,7 @@ impl Pending {
         job: Job,
         model: &LlamaModel,
         maximum_cells: usize,
-    ) -> std::result::Result<Self, (Job, NativeError)> {
+    ) -> std::result::Result<Self, (Box<Job>, NativeError)> {
         let prepared = (|| {
             validate_request(&job.request)?;
             let tokens = generation_case_tokens(model, &job.request.cases[0], 0)?;
@@ -405,7 +405,7 @@ impl Pending {
         })();
         match prepared {
             Ok((tokens, cells)) => Ok(Self { job, tokens, cells }),
-            Err(error) => Err((job, error)),
+            Err(error) => Err((Box::new(job), error)),
         }
     }
 }
@@ -435,14 +435,14 @@ impl Sequence {
     fn start(
         pending: Pending,
         runtime: &Runtime<'_, '_>,
-    ) -> std::result::Result<Self, (Job, NativeError)> {
+    ) -> std::result::Result<Self, (Box<Job>, NativeError)> {
         let Pending { job, tokens, .. } = pending;
         if let Err(error) = begin_generation_command(
             &job.lease,
             WorkerCommandClass::Foreground,
             runtime.speculative,
         ) {
-            return Err((job, error));
+            return Err((Box::new(job), error));
         }
         let _ = job.lease.progress(0);
         let authority_error = if is_statically_sealable_generation_batch(
@@ -746,7 +746,7 @@ fn run_inner(
                     } else {
                         match Pending::prepare(job, runtime.model, pool.reservations.cells) {
                             Ok(pending) => pool.pending = Some(pending),
-                            Err((job, error)) => job.reject(error),
+                            Err((job, error)) => (*job).reject(error),
                         }
                     }
                 } else {
@@ -771,7 +771,7 @@ fn run_inner(
                     }
                     Err((job, error)) => {
                         pool.reservations.release(slot)?;
-                        job.reject(error);
+                        (*job).reject(error);
                     }
                 }
             } else {
@@ -951,70 +951,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_bound_each_stream_and_reuse_only_released_slots() {
+    fn reservations_bound_each_stream_and_reuse_only_released_slots() -> NativeResult<()> {
         let mut budget = Reservations::new(100, 2, 4);
-        let first = budget.reserve(100).unwrap().unwrap();
-        let second = budget.reserve(100).unwrap().unwrap();
+        let first = budget.reserve(100)?.expect("free independent stream");
+        let second = budget.reserve(100)?.expect("free independent stream");
         assert_ne!(first, second);
-        assert!(budget.reserve(1).unwrap().is_none());
-        budget.release(first).unwrap();
-        assert_eq!(budget.reserve(100).unwrap(), Some(first));
+        assert!(budget.reserve(1)?.is_none());
+        budget.release(first)?;
+        assert_eq!(budget.reserve(100)?, Some(first));
         assert!(budget.reserve(101).is_err());
         assert!(budget.reserve(usize::MAX).is_err());
-        budget.release(second).unwrap();
+        budget.release(second)?;
         assert!(budget.release(second).is_err());
+        Ok(())
     }
 
     #[test]
-    fn batch_width_and_sequence_limits_are_both_admission_limits() {
+    fn batch_width_and_sequence_limits_are_both_admission_limits() -> NativeResult<()> {
         let mut budget = Reservations::new(100, 8, 2);
-        assert_eq!(budget.reserve(1).unwrap(), Some(0));
-        assert_eq!(budget.reserve(1).unwrap(), Some(1));
-        assert!(budget.reserve(1).unwrap().is_none());
+        assert_eq!(budget.reserve(1)?, Some(0));
+        assert_eq!(budget.reserve(1)?, Some(1));
+        assert!(budget.reserve(1)?.is_none());
         assert!(Reservations::new(100, 0, 2).reserve(1).is_err());
+        Ok(())
     }
 
     #[test]
-    fn worker_exit_closes_observers_after_retaining_queued_samples() {
+    fn worker_exit_closes_observers_after_retaining_queued_samples() -> NativeResult<()> {
         let hub = DecodeHub::default();
         let lifetime = hub.worker_lifetime();
-        let observer = hub.subscribe().unwrap();
-        hub.publish(Vec::new()).unwrap();
+        let observer = hub.subscribe()?;
+        hub.publish(Vec::new())?;
         drop(lifetime);
         assert!(hub.subscribe().is_err());
         assert_eq!(
             observer
-                .receive_timeout(Duration::ZERO)
-                .unwrap()
-                .unwrap()
+                .receive_timeout(Duration::ZERO)?
+                .expect("queued decode sample retained")
                 .ordinal(),
             1
         );
         assert_eq!(
-            observer.receive_timeout(Duration::ZERO).unwrap_err().code,
+            observer
+                .receive_timeout(Duration::ZERO)
+                .expect_err("joined worker closes observations")
+                .code,
             NativeErrorCode::WorkerStopped
         );
+        Ok(())
     }
 
     #[test]
-    fn observers_are_bounded_and_dropped_receivers_release_their_slot() {
+    fn observers_are_bounded_and_dropped_receivers_release_their_slot() -> NativeResult<()> {
         let hub = DecodeHub::default();
-        let first = hub.subscribe().unwrap();
-        let second = hub.subscribe().unwrap();
+        let first = hub.subscribe()?;
+        let second = hub.subscribe()?;
         assert!(hub.subscribe().is_err());
         drop(second);
-        let _replacement = hub.subscribe().unwrap();
+        let _replacement = hub.subscribe()?;
         for _ in 0..=OBSERVATION_CAPACITY {
-            hub.publish(Vec::new()).unwrap();
+            hub.publish(Vec::new())?;
         }
         assert_eq!(first.dropped_samples(), 1);
         assert_eq!(
             first
-                .receive_timeout(Duration::ZERO)
-                .unwrap()
-                .unwrap()
+                .receive_timeout(Duration::ZERO)?
+                .expect("queued decode sample retained")
                 .ordinal(),
             1
         );
+        Ok(())
     }
 }
