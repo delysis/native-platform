@@ -1127,6 +1127,7 @@
   }
 
   interface WeaveCapture {
+    mode: EditorMode;
     contextEpoch: number;
     commandId: string;
     epoch: number;
@@ -9279,6 +9280,7 @@
     const sourceRevisionId = document.summary.revision_id;
     if (!sourceRevisionId) return false;
     const captured: WeaveCapture = {
+      mode,
       contextEpoch,
       commandId: newUlid(),
       epoch: documentEpoch,
@@ -9318,7 +9320,7 @@
         cursorByte: captured.cursorByte,
         policy: captured.speculation
           ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
-          : { kind: 'automatic_v3' }
+          : { kind: captured.mode === 'visual' ? 'automatic_visual_v4' : 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;

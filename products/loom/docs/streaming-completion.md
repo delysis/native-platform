@@ -87,3 +87,9 @@ Use bounded lookahead, shared-prefix reuse, and pruning after the author's choic
 never postpone the current preview until an exponential subtree is complete.
 A four-run refill is not evidence of four immediately available children at every
 deeper prefix. No such exhaustive scheduler is supplied by the preview repair.
+
+Visual automatic V4 withholds leading line breaks and markup before native emission.
+Rejected proposals remain in the bounded attempt ledger; numeric prose and literal
+`<3 forever` remain eligible. Source uses its existing automatic V2 policy and
+retains multiline Markdown. V3 records keep their original policy semantics.
+The captured editor mode fixes the request policy across an uncertain-command retry.

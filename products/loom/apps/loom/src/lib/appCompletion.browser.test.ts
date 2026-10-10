@@ -368,7 +368,7 @@ it.each([
         expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
         expect(args.expectedVisibleBlobId).toBe(sourceBlob);
         expect(args.cursorByte).toBe(sourceBytes);
-        expect(args.policy.kind).toBe('automatic_v3');
+        expect(args.policy.kind).toBe('automatic_visual_v4');
         admission = {
           command_id: args.commandId, request_id: `weave-${args.commandId}`, project_id: project.project_id,
           session_id: project.session_id, document_id: opened.summary.document_id, source_revision_id: 'revision-1',

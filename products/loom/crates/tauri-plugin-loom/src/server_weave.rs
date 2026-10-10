@@ -25,6 +25,7 @@ impl Engine {
                 policy,
                 ValidatedWeavePolicy::AutomaticV2
                     | ValidatedWeavePolicy::AutomaticV3
+                    | ValidatedWeavePolicy::AutomaticVisualV4
                     | ValidatedWeavePolicy::LoompadV2 { .. }
             ))
         }) {
@@ -628,7 +629,9 @@ mod tests {
         };
         if matches!(
             policy,
-            WeavePolicySnapshot::AutomaticV3 {} | WeavePolicySnapshot::LoompadV2 { .. }
+            WeavePolicySnapshot::AutomaticV3 {}
+                | WeavePolicySnapshot::AutomaticVisualV4 {}
+                | WeavePolicySnapshot::LoompadV2 { .. }
         ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
@@ -722,6 +725,11 @@ mod tests {
     fn cancellation_drains_server_work_and_never_dispatches_remaining_branches() {
         exercise(true, WeavePolicySnapshot::AutomaticV2 {});
     }
+    #[test]
+    fn visual_v4_never_falls_back_to_a_server_without_native_admission_evidence() {
+        exercise(false, WeavePolicySnapshot::AutomaticVisualV4 {});
+    }
+
     #[test]
     fn automatic_v3_never_falls_back_to_a_server_without_native_admission_evidence() {
         exercise(false, WeavePolicySnapshot::AutomaticV3 {});

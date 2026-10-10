@@ -25,12 +25,22 @@ pub enum FirstWordChoicePolicy {
     /// complete angle-bracket markup construct. Rejected proposal bytes remain
     /// in the attempt ledger and never acquire stream authority.
     DistinctPlainTextV3,
+    /// Visual openings retain exact prose bytes but exclude leading line breaks.
+    DistinctVisualProseV4,
 }
 
 impl FirstWordChoicePolicy {
     #[must_use]
     pub const fn rejects_leading_markup(self) -> bool {
-        matches!(self, Self::DistinctPlainTextV3)
+        matches!(
+            self,
+            Self::DistinctPlainTextV3 | Self::DistinctVisualProseV4
+        )
+    }
+
+    #[must_use]
+    pub const fn rejects_leading_line_breaks(self) -> bool {
+        matches!(self, Self::DistinctVisualProseV4)
     }
 
     /// Attempt zero preserves the explicit caller seed. Later seeds are the
@@ -43,6 +53,9 @@ impl FirstWordChoicePolicy {
         }
         let mut digest = Sha256::new();
         digest.update(match self {
+            Self::DistinctVisualProseV4 => {
+                b"llama-native:first-word-distinct-visual-prose-v4\0".as_slice()
+            }
             Self::DistinctV2 => b"llama-native:first-word-distinct-v2\0".as_slice(),
             Self::DistinctPlainTextV3 => {
                 b"llama-native:first-word-distinct-plain-text-v3\0".as_slice()
