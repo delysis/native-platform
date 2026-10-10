@@ -3,8 +3,20 @@
 
 use super::*;
 
-const TEMPLATE_PATH: &str = ".loom.md";
-const MAX_TEMPLATE_BYTES: usize = 65_536;
+#[path = "workspace_collections.rs"]
+pub(crate) mod collections;
+#[path = "workspace_materials.rs"]
+pub(crate) mod materials;
+pub(super) use collections::{
+    CollectionDefinition, CollectionScope, collection_definition, collection_definitions,
+    collection_definitions_current, upsert_collection,
+};
+
+#[cfg(test)]
+pub(super) use collections::remove_collection;
+
+pub(crate) const TEMPLATE_PATH: &str = ".loom.md";
+pub(crate) const MAX_TEMPLATE_BYTES: usize = 65_536;
 const MAX_PANES: usize = 8;
 
 const DEFAULT_TEMPLATE: &str = r##"# Workspace
@@ -75,12 +87,12 @@ pub(super) enum PanePosition {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct PaneConfig {
-    kind: PaneKind,
+    pub(super) kind: PaneKind,
     position: PanePosition,
     visible: bool,
     title: Option<String>,
-    document: Option<String>,
-    context: Vec<String>,
+    pub(super) document: Option<String>,
+    pub(super) context: Vec<String>,
 }
 
 impl PaneConfig {
@@ -168,15 +180,18 @@ impl WorkspaceTheme {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
+    pub(super) panes_enabled: bool,
     model: Option<WorkspaceModel>,
     functions: FunctionSettings,
     theme: WorkspaceTheme,
-    panes: BTreeMap<String, PaneConfig>,
+    pub(super) panes: BTreeMap<String, PaneConfig>,
+    collections: Vec<CollectionDefinition>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
+            panes_enabled: true,
             model: None,
             functions: FunctionSettings::default(),
             theme: WorkspaceTheme::default(),
@@ -189,6 +204,7 @@ impl Default for WorkspaceConfig {
             .into_iter()
             .map(|(name, kind)| (name.into(), PaneConfig::new(kind)))
             .collect(),
+            collections: Vec::new(),
         }
     }
 }
@@ -196,10 +212,14 @@ impl Default for WorkspaceConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverrides {
+    panes_enabled: Option<bool>,
     model: Option<WorkspaceModel>,
     functions: FunctionSettings,
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneOverrides>,
+    collections: Vec<CollectionDefinition>,
+    materials: Vec<crate::materials::Binding>,
+    roots: Vec<crate::workspace_roots::RootDefinition>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -222,6 +242,23 @@ struct FunctionSettings {
 pub(super) struct FunctionRecipe {
     pub format: FunctionFormat,
     pub configuration: Option<crate::document_bindings::ResolvedDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ConfigurationOrigin>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ConfigurationOrigin {
+    project_id: ProjectId,
+    root: PathBuf,
+}
+
+impl FunctionRecipe {
+    pub(super) fn local_configuration_artifact(&self, store: &ProjectStore) -> Option<ArtifactId> {
+        let origin = self.origin.as_ref()?;
+        (origin.project_id == store.manifest().project_id && origin.root == store.root())
+            .then(|| self.configuration.as_ref().map(|source| source.artifact_id))
+            .flatten()
+    }
 }
 
 pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe, IpcFailure> {
@@ -229,12 +266,24 @@ pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe
         return Ok(FunctionRecipe {
             format: FunctionFormat::Model,
             configuration: None,
+            origin: None,
         });
     };
+    function_recipe_from_snapshot(store, &loaded)
+}
+
+pub(super) fn function_recipe_from_snapshot(
+    store: &ProjectStore,
+    loaded: &LoadedDocument,
+) -> Result<FunctionRecipe, IpcFailure> {
     let config = parse_config(&loaded.text)
         .map_err(|message| IpcFailure::new("workspace_template_failed", message, false))?;
     Ok(FunctionRecipe {
         format: config.functions.format,
+        origin: Some(ConfigurationOrigin {
+            project_id: store.manifest().project_id,
+            root: store.root().to_owned(),
+        }),
         configuration: Some(crate::document_bindings::ResolvedDocument {
             name: TEMPLATE_PATH.into(),
             path: TEMPLATE_PATH.into(),
@@ -242,7 +291,7 @@ pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe
             revision_id: loaded.revision_id,
             blob_id: loaded.blob_id,
             artifact_id: loaded.artifact_id,
-            text: loaded.text,
+            text: loaded.text.clone(),
         }),
     })
 }
@@ -288,13 +337,21 @@ fn validate_reference(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
+pub(super) fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
     if markdown.len() > MAX_TEMPLATE_BYTES {
         return Err("The workspace template exceeds 64 KiB.".into());
     }
     let overrides: WorkspaceOverrides = toml::from_str(config_fence(markdown)?)
         .map_err(|error| format!("Workspace settings: {error}"))?;
-    let mut config = WorkspaceConfig::default();
+    collections::validate_definitions(&overrides.collections).map_err(|error| error.message)?;
+    crate::materials::validate_bindings(&overrides.materials).map_err(|error| error.to_string())?;
+    crate::workspace_roots::validate_definitions(&overrides.roots)
+        .map_err(|error| error.message)?;
+    let mut config = WorkspaceConfig {
+        panes_enabled: overrides.panes_enabled.unwrap_or(true),
+        collections: overrides.collections,
+        ..WorkspaceConfig::default()
+    };
     if let Some(model) = overrides.model {
         model.validate()?;
         config.model = Some(model);
@@ -366,6 +423,10 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
 /// Ignore configuration-looking text inside other Markdown fences. Only one
 /// complete, top-level `loom-workspace` fence is authoritative.
 fn config_fence(markdown: &str) -> Result<&str, String> {
+    Ok(config_fence_range(markdown)?.map_or("", |range| &markdown[range]))
+}
+
+pub(crate) fn config_fence_range(markdown: &str) -> Result<Option<std::ops::Range<usize>>, String> {
     let mut open: Option<(u8, usize, bool, usize)> = None;
     let mut found = None;
     let mut offset = 0;
@@ -380,7 +441,7 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
                 if let Some((opening_marker, opening_count, selected, start)) = open {
                     if marker == opening_marker && count >= opening_count && suffix.is_empty() {
                         if selected {
-                            found = Some(&markdown[start..offset]);
+                            found = Some(start..offset);
                         }
                         open = None;
                     }
@@ -398,28 +459,58 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
     if matches!(open, Some((_, _, true, _))) {
         return Err("Close the loom-workspace settings fence.".into());
     }
-    Ok(found.unwrap_or(""))
+    Ok(found)
 }
 
-fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, IpcFailure> {
+pub(crate) fn load_template(
+    store: &mut ProjectStore,
+) -> Result<Option<LoadedDocument>, IpcFailure> {
     let document = store
         .list_documents()
         .map_err(IpcFailure::store)?
         .into_iter()
         .find(|document| document.relative_path == TEMPLATE_PATH);
     if document.is_none() {
-        return Ok(None);
+        match std::fs::symlink_metadata(store.root().join(TEMPLATE_PATH)) {
+            Ok(metadata) => {
+                if metadata.len() > MAX_TEMPLATE_BYTES as u64
+                    || !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                {
+                    return Err(IpcFailure::new(
+                        "workspace_template_failed",
+                        "The workspace configuration must be an ordinary file within 64 KiB.",
+                        false,
+                    ));
+                }
+                store
+                    .adopt_visible_document_if_absent(
+                        TEMPLATE_PATH,
+                        DocumentKind::Prose,
+                        "Read workspace settings",
+                    )
+                    .map_err(IpcFailure::store)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(IpcFailure::new(
+                    "workspace_template_failed",
+                    error.to_string(),
+                    false,
+                ));
+            }
+        }
     }
     store
         .import_external_changes_if_uncontested(TEMPLATE_PATH, "Read external workspace settings")
         .map_err(IpcFailure::store)?;
     store
-        .read_document(TEMPLATE_PATH)
+        .read_document_bounded(TEMPLATE_PATH, MAX_TEMPLATE_BYTES as u64)
         .map(Some)
         .map_err(IpcFailure::store)
 }
 
-fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+pub(super) fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let Some(loaded) = load_template(store)? else {
         return Ok(WorkspaceTemplateSnapshot {
             enabled: false,
@@ -434,7 +525,7 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
         Err(error) => (WorkspaceConfig::default(), Some(error)),
     };
     Ok(WorkspaceTemplateSnapshot {
-        enabled: true,
+        enabled: config.panes_enabled,
         document_id: Some(loaded.document_id.to_string()),
         revision_id: Some(loaded.revision_id.to_string()),
         config,
@@ -442,10 +533,14 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
     })
 }
 
-fn enable(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+pub(super) fn enable(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let current = snapshot(store)?;
     if current.enabled {
         return Ok(current);
+    }
+    if let Some(loaded) = load_template(store)? {
+        collections::enable_panes(store, &loaded)?;
+        return snapshot(store);
     }
     match std::fs::symlink_metadata(store.root().join(TEMPLATE_PATH)) {
         Ok(_) => {
@@ -485,7 +580,17 @@ pub(super) async fn workspace_template_get(
 ) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
-    snapshot(require_bound_store(&mut session, &project_id, &session_id)?)
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    refresh_owner_snapshot(&mut session)
+}
+
+fn refresh_owner_snapshot(session: &mut Session) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+    let owner = crate::workspace_owner::store_mut(session)?;
+    // The owner watcher remains active while another folder is displayed.
+    // Discover only its bounded writing files; never scan the active child's
+    // configuration or replace existing document history.
+    owner.discover_documents().map_err(IpcFailure::store)?;
+    snapshot(owner)
 }
 
 #[tauri::command]
@@ -496,13 +601,58 @@ pub(super) async fn workspace_template_enable(
 ) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
-    enable(require_bound_store(&mut session, &project_id, &session_id)?)
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    enable(crate::workspace_owner::store_mut(&mut session)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn refresh_discovers_parked_owner_documents_without_adopting_child_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner_root = directory.path().join("Owner");
+        let child_root = directory.path().join("Child");
+        let (owner, _) = ProjectStore::initialize(&owner_root, "Owner").unwrap();
+        let (child, _) = ProjectStore::initialize(&child_root, "Child").unwrap();
+        let state = PluginState::with_app_local_data_root(
+            Some(directory.path().join("app")),
+            true,
+            BuildModelPolicy::default(),
+        );
+        let mut session = state.session.lock().unwrap();
+        crate::workspace_owner::establish(&mut session, &owner);
+        session.store = Some(owner);
+        crate::workspace_owner::park_active(&mut session);
+        session.store = Some(child);
+        let text = "Owner source.\r\n";
+        std::fs::write(owner_root.join("Facts.md"), text).unwrap();
+        std::fs::write(child_root.join("Facts.md"), "Conflicting child source.").unwrap();
+        refresh_owner_snapshot(&mut session).unwrap();
+        let owner = crate::workspace_owner::store(&session).unwrap();
+        let facts = crate::document_bindings::resolve_document_id(owner, "Facts").unwrap();
+        assert_eq!(owner.read_document("Facts.md").unwrap().document_id, facts);
+        assert_eq!(owner.read_document("Facts.md").unwrap().text, text);
+        assert_eq!(
+            std::fs::read(owner_root.join("Facts.md")).unwrap(),
+            text.as_bytes()
+        );
+        assert!(
+            crate::document_bindings::resolve_document_id(session.store.as_ref().unwrap(), "Facts")
+                .is_err()
+        );
+        refresh_owner_snapshot(&mut session).unwrap();
+        assert_eq!(
+            crate::document_bindings::resolve_document_id(
+                crate::workspace_owner::store(&session).unwrap(),
+                "Facts"
+            )
+            .unwrap(),
+            facts
+        );
+    }
 
     #[test]
     #[cfg(unix)]
@@ -722,11 +872,44 @@ mod tests {
             ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
         let text = "# Mine\r\n```loom-workspace\r\nunknown = true\r\n```\r\n";
         std::fs::write(store.root().join(TEMPLATE_PATH), text).unwrap();
-        assert!(!snapshot(&mut store).unwrap().enabled);
-        let result = enable(&mut store).unwrap();
+        let result = snapshot(&mut store).unwrap();
         assert!(result.enabled && result.error.is_some() && result.document_id.is_some());
         assert_eq!(store.read_document(TEMPLATE_PATH).unwrap().text, text);
         assert_eq!(enable(&mut store).unwrap().revision_id, result.revision_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copied_collection_settings_load_without_enabling_panes_or_authorizing_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let id = format!("material-{}", "a".repeat(64));
+        let text = format!(
+            "# Research workspace\r\n```loom-workspace\r\npanes_enabled = false\r\n[[collections]]\r\nid = '{id}'\r\nname = 'Research'\r\nscope = {{ kind = 'drive_folder', id = 'explicit-test-scope' }}\r\n```\r\n"
+        );
+        std::fs::write(store.root().join(TEMPLATE_PATH), &text).unwrap();
+        let loaded = snapshot(&mut store).unwrap();
+        assert!(!loaded.enabled);
+        assert!(loaded.error.is_none());
+        assert!(loaded.document_id.is_some());
+        let materials = crate::materials::list(&store).unwrap();
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0].id, id);
+        assert_eq!(materials[0].name, "Research");
+        assert!(
+            crate::connected_collections::read_head(&store, &id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(store.root().join(TEMPLATE_PATH)).unwrap(),
+            text.as_bytes()
+        );
+        assert_eq!(
+            snapshot(&mut store).unwrap().revision_id,
+            loaded.revision_id
+        );
     }
     #[test]
     #[cfg(unix)]

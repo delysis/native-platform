@@ -63,9 +63,12 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
   transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
     calls.push({ command, args });
     switch (command) {
+      case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'loom';
       case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
+      case 'plugin:loom|workspace_pane_list': return [];
       case 'plugin:loom|document_open': return opened;
       case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
       case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: null, revision_id: null, error: null,
@@ -80,11 +83,11 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
         materials.splice(0, 1); return;
       }
       case 'plugin:loom|material_rename': {
-        expect(args.projectId).toBe(project.project_id); expect(args.sessionId).toBe(project.session_id);
+        expect(args.projectId).toBe(project.project_id); expect(args.sessionId).toBe('workspace-session');
         expect(args.id).toBe(materials[0].id); expect(args.expectedMetadataRevision).toBe(materials[0].metadata_revision);
         const previous = materials[0];
         materials[0] = { ...previous, name: String(args.name), metadata_revision: 'e'.repeat(64) };
-        return { project_id: project.project_id, session_id: project.session_id, request_id: args.requestId,
+        return { project_id: project.project_id, session_id: 'workspace-session', request_id: args.requestId,
           expected_metadata_revision: args.expectedMetadataRevision, material: materials[0] };
       }
       case 'plugin:loom|inference_status': return { suggestions: null };

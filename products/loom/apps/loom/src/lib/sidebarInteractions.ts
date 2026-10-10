@@ -16,6 +16,7 @@ export type SidebarItem =
   | { readonly kind: 'material'; readonly material: MaterialEntry };
 interface TargetBase {
   readonly scope: SidebarScope;
+  readonly viewScope: SidebarScope;
   readonly key: string;
   readonly title: string;
   /** Copy/tooltip only. Never passed to a native mutation command. */
@@ -34,6 +35,7 @@ export interface SidebarLiveState {
   readonly bookmarks: readonly WorkspaceFolder[];
   readonly folders: readonly string[];
   readonly materials: readonly MaterialEntry[];
+  readonly materialScope?: SidebarScope | null;
 }
 
 export function workspaceDisplayPath(root: string, relative: string): string {
@@ -50,9 +52,10 @@ export function sidebarItemKey(scope: SidebarScope, item: SidebarItem): string {
   }
 }
 
-export function captureSidebarTarget(project: ProjectSnapshot, item: SidebarItem): CapturedSidebarTarget {
-  const scope = Object.freeze({ projectId: project.project_id, sessionId: project.session_id });
-  const base = { scope, key: sidebarItemKey(scope, item) };
+export function captureSidebarTarget(project: ProjectSnapshot, item: SidebarItem, materialScope?: SidebarScope): CapturedSidebarTarget {
+  const viewScope = Object.freeze({ projectId: project.project_id, sessionId: project.session_id });
+  const scope = item.kind === 'material' && materialScope ? Object.freeze({ ...materialScope }) : viewScope;
+  const base = { scope, viewScope, key: sidebarItemKey(scope, item) };
   switch (item.kind) {
     case 'root': return Object.freeze({ ...base, ...item, title: workspaceFolderName(item.bookmark), displayPath: item.bookmark.root });
     case 'folder': return Object.freeze({ ...base, ...item, displayPath: workspaceDisplayPath(project.root, item.path) });
@@ -68,8 +71,15 @@ export function sidebarScopeIsCurrent(scope: SidebarScope, project: ProjectSnaps
   return project?.project_id === scope.projectId && project.session_id === scope.sessionId;
 }
 
+/** Native workspace authority and the originating editor lifetime are distinct. */
+export function sidebarTargetScopeIsCurrent(target: CapturedSidebarTarget, live: SidebarLiveState): boolean {
+  if (!sidebarScopeIsCurrent(target.viewScope, live.project)) return false;
+  if (target.kind !== 'material' || live.materialScope === undefined) return sidebarScopeIsCurrent(target.scope, live.project);
+  return Boolean(live.materialScope && target.scope.projectId === live.materialScope.projectId && target.scope.sessionId === live.materialScope.sessionId);
+}
+
 export function sidebarTargetIsCurrent(target: CapturedSidebarTarget, live: SidebarLiveState): boolean {
-  if (!sidebarScopeIsCurrent(target.scope, live.project)) return false;
+  if (!sidebarTargetScopeIsCurrent(target, live)) return false;
   switch (target.kind) {
     // Object identity rejects remove/re-add ABA and a superseded inline label.
     case 'root': return live.bookmarks.some(bookmark => bookmark === target.bookmark);

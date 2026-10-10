@@ -206,13 +206,35 @@ func jsonObject(in text: String, schema: String) -> [String: Any]? {
     return object
 }
 
+// Cache only the AX element, never its value. Rewalking the entire window can
+// miss the hidden-before-first-word transition while Shuttle's timer advances.
+var cachedCompletionWitnessElement: AXUIElement?
+var witnessReadCount = 0
+var witnessReadMaximumSeconds: TimeInterval = 0
+
+func readCompletionWitness(_ element: AXUIElement) -> [String: Any]? {
+    for value in strings(element) {
+        if let object = jsonObject(in: value, schema: "delysis.loom-completion-witness.v1") {
+            return object
+        }
+    }
+    return nil
+}
+
 func completionWitness() -> [String: Any]? {
+    let started = ProcessInfo.processInfo.systemUptime
+    defer {
+        witnessReadCount += 1
+        witnessReadMaximumSeconds = max(witnessReadMaximumSeconds,
+            ProcessInfo.processInfo.systemUptime - started)
+    }
+    if let element = cachedCompletionWitnessElement,
+       let witness = readCompletionWitness(element) { return witness }
+    cachedCompletionWitnessElement = nil
     for element in descendants() {
-        for value in strings(element) {
-            if let object = jsonObject(
-                in: value,
-                schema: "delysis.loom-completion-witness.v1"
-            ) { return object }
+        if let witness = readCompletionWitness(element) {
+            cachedCompletionWitnessElement = element
+            return witness
         }
     }
     return nil
@@ -592,6 +614,8 @@ func releaseOptionAndFail(_ message: String) -> Never {
     let selection = surface.flatMap { selectedRange($0) }
     let diagnostic: [String: Any] = [
         "completion_witness": completionWitness() ?? [:],
+        "witness_read_count": witnessReadCount,
+        "witness_read_maximum_seconds": witnessReadMaximumSeconds,
         "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
         "editor_focused": surface.map {
             (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true
@@ -956,6 +980,8 @@ guard let engineDisabled = waitForWitness(timeout: 10, { witness in
 }
 
 let evidence: [String: Any] = [
+    "witness_read_count": witnessReadCount,
+    "witness_read_maximum_seconds": witnessReadMaximumSeconds,
     "dispatch": "Option held across native Right and Left arrow events",
     "original_bytes": original.count,
     "accepted_bytes": accepted.count,

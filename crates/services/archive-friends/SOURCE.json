@@ -1,0 +1,47 @@
+{
+  "origin": "Uncommitted Community Archive source; files copied read-only with SHA-256 binding",
+  "scope": "Native preparation path, original retrieval/config/recipe/sampling semantics and prompt-pack schema. No model experiments, ingestion, migrations, network or archive writers imported. Original corpus and source untouched.",
+  "files": [
+    {
+      "path": "crates/community_archive_friends/src/config.rs",
+      "sha256": "f5b4a06dda940e47d12b4b2939ee35c47458872c34223f2736eda0d2d553a5eb"
+    },
+    {
+      "path": "crates/community_archive_friends/src/retrieval.rs",
+      "sha256": "0599c8600d2884465bc5aa203ba2c664286ba0d1e3f8ec2119e726b54b4551f7"
+    },
+    {
+      "path": "crates/community_archive_friends/src/native_context.rs",
+      "sha256": "8ce1c4fe3276f216002fdc5d84cd62548129a3410ce20d18251db6949474b1c2"
+    },
+    {
+      "path": "crates/community_archive_friends/src/sampling.rs",
+      "sha256": "060509a900f417141d4d4a849c7e4df3d70218a8413251f1f6b7adadac0fd14b"
+    },
+    {
+      "path": "crates/community_archive_friends/src/compiler.rs",
+      "sha256": "1e795dc715806bc6c0de24e6d75600948781bb038e101016c66f9e55019e7ff2"
+    },
+    {
+      "path": "crates/community_archive_friends/src/prompting.rs",
+      "sha256": "3bee04eb6279957da7f6522d3291d709f303e17d3cd59723cc57952a74594203"
+    },
+    {
+      "path": "crates/community_archive_friends/src/critique.rs",
+      "sha256": "32505e08d2754c6fd21aab0e178c2f85caf867b42b2fe87eec3b30e357c968b6"
+    },
+    {
+      "path": "crates/community_archive_wisdom/src/timeline.rs",
+      "sha256": "effa6d8abce00155fdc0cf4d182ab018a94d707f0d9749044afcd63e3859514a"
+    },
+    {
+      "path": "crates/community_archive_core/src/models.rs",
+      "sha256": "d1eaf48921c03641179343a9b23d4ec7fe283dd6841a95d01b194bd78026ee6f"
+    },
+    {
+      "path": "crates/community_archive_sqlite/src/db.rs",
+      "sha256": "9b0a9b1f134237030246eb7995b1195b80aea20f8c40e046e74194283d8fa4f6"
+    }
+  ],
+  "source_root": "Community Archive workspace (source snapshot held in local qualification evidence)"
+}

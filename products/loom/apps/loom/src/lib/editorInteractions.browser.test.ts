@@ -22,6 +22,7 @@ function render(
     autocomplete?: boolean;
     shuttle?: boolean;
     completionFrames?: readonly (readonly CompletionCandidate[])[];
+    reconcileSelectionFamily?: boolean;
     acceptImageAttachments?: boolean;
     onImageAttachments?: (files: readonly File[]) => Promise<readonly string[]>;
     onImageAttachmentsCommitted?: (count: number) => void;
@@ -334,6 +335,23 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(serializedMarkdown).toBe('[Words](https://example.com)');
     await page.getByRole('button', { name: 'Remove' }).click();
     await expect.poll(serializedMarkdown).toBe('Words');
+  });
+
+  it('preserves a live trailing separator through palette structures and reversal', async () => {
+    render('Words ');
+    await page.getByRole('textbox', { name: 'Manuscript editor' }).click();
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await page.getByRole('button', { name: 'Format text' }).click();
+    for (const [label, expected] of [
+      ['Block quote', '> Words '],
+      ['Bulleted list', '* Words '],
+      ['Numbered list', '1. Words ']
+    ] as const) {
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe(expected);
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe('Words ');
+    }
   });
 
   it('preserves a full selection across repeated AX-style inline toggles', async () => {
@@ -1250,6 +1268,108 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByText(' stays cached', { exact: true }).first()).toBeVisible();
   });
 
+  it('cycles a fresh streamed family before audio across same-anchor reconciliation and invalidates moved selection', async () => {
+    const markdown = `hello\n\n![Audio: fixture.wav](loom-attachment:${'a'.repeat(64)}/${'b'.repeat(64)} "loom-waveform:001080ff")`;
+    const choices = fourChoiceCompletion();
+    render(markdown, [], {
+      reconcileSelectionFamily: true,
+      completionFrames: [choices.slice(0, 1), choices, choices.map((candidate) => ({
+        ...candidate, presentationKey: `${candidate.candidateId}:2`, text: `${candidate.text} continues`
+      }))]
+    });
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeVisible();
+    const editor = editorLocator.element();
+    editor.focus();
+    const text = editor.querySelector('p')?.firstChild;
+    expect(text?.textContent).toBe('hello');
+    document.getSelection()?.collapse(text!, 5);
+    document.dispatchEvent(new Event('selectionchange'));
+    const latest = page.getByRole('status', { name: 'Latest Selection Callback' });
+    await expect.element(latest).toHaveTextContent('5:none');
+    const advance = page.getByRole('button', { name: 'Advance completion stream' });
+    await advance.click();
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const nullCount = page.getByRole('status', { name: 'Null Selection Callback Count', exact: true });
+    const nullsBefore = nullCount.element().textContent;
+    const requests = page.getByRole('status', { name: 'Generation Requests' });
+    const requestsBefore = requests.element().textContent;
+    const witness = () => JSON.parse(
+      page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
+    );
+
+    await advance.click();
+    await page.getByRole('button', { name: 'Reconcile current selection' }).click();
+    // Direct chord covers delivery without a preceding Alt event. Dispatch
+    // immediately after reconciliation, before another visibility assertion.
+    const down = new KeyboardEvent('keydown', {
+      key: 'ArrowDown', code: 'ArrowDown', altKey: true, bubbles: true, cancelable: true
+    });
+    editor.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
+    expect(nullCount.element().textContent).toBe(nullsBefore);
+    expect(requests.element().textContent).toBe(requestsBefore);
+    expect(witness()).toMatchObject({ available: true, empty: true, caretByteOffset: 5 });
+    expect(serializedMarkdown()).toBe(markdown);
+
+    dispatchOptionUp(editor);
+    await advance.click();
+    await userEvent.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await expect.element(page.getByText(' world continues', { exact: true }).first()).toBeVisible();
+    expect(witness()).toMatchObject({ available: true, empty: true, caretByteOffset: 5 });
+    expect(requests.element().textContent).toBe(requestsBefore);
+    expect(serializedMarkdown()).toBe(markdown);
+
+    // A real move is a different boundary: it must revoke the presentation.
+    await userEvent.keyboard('{ArrowLeft}');
+    await expect.element(latest).toHaveTextContent('4:none');
+    await expect.element(page.getByRole('status', { name: 'Completion Context' })).toHaveTextContent('none');
+    expect(editor.querySelector('.loom-visual-ghost')).toBeNull();
+    expect(Number(nullCount.element().textContent)).toBeGreaterThan(Number(nullsBefore));
+    expect(Number(requests.element().textContent)).toBeGreaterThan(Number(requestsBefore));
+    expect(serializedMarkdown()).toBe(markdown);
+  });
+
+  it('reports the unchanged exact caret after Cmd-Right dismisses a ghost at paragraph end before audio', async () => {
+    const markdown = `hello\n\n![Audio: fixture.wav](loom-attachment:${'a'.repeat(64)}/${'b'.repeat(64)} "loom-waveform:001080ff")`;
+    render(markdown, [], {
+      reconcileSelectionFamily: true,
+      completionFrames: [fourChoiceCompletion()]
+    });
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeVisible();
+    const editor = editorLocator.element();
+    editor.focus();
+    const text = editor.querySelector('p')?.firstChild;
+    expect(text?.textContent).toBe('hello');
+    document.getSelection()?.collapse(text!, 5);
+    document.dispatchEvent(new Event('selectionchange'));
+    const latest = page.getByRole('status', { name: 'Latest Selection Callback' });
+    await expect.element(latest).toHaveTextContent('5:none');
+    await page.getByRole('button', { name: 'Advance completion stream' }).click();
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    // Let the initial selection's delayed report finish before measuring the
+    // report owed by this new navigation event, even when native movement is nil.
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const callbacks = page.getByRole('status', { name: 'Selection Callback Count', exact: true });
+    const before = Number(callbacks.element().textContent);
+
+    await userEvent.keyboard('{Meta>}{ArrowRight}{/Meta}');
+
+    await expect.element(page.getByRole('status', { name: 'Completion Context' })).toHaveTextContent('none');
+    expect(editor.querySelector('.loom-visual-ghost')).toBeNull();
+    expect(serializedMarkdown()).toBe(markdown);
+    const selection = document.getSelection();
+    expect(selection?.isCollapsed).toBe(true);
+    expect(selection?.anchorNode?.textContent).toBe('hello');
+    expect(selection?.anchorOffset).toBe(5);
+    // The owner must learn the still-exact caret again so its pending
+    // navigation can settle and authorize a fresh family, not revive the old one.
+    await expect.poll(() => Number(callbacks.element().textContent)).toBeGreaterThan(before);
+    await expect.element(latest).toHaveTextContent('5:none');
+  });
+
   for (const mode of ['visual', 'source'] as const) {
     it(`cycles compatible ${mode} ghost previews in both directions after accepting a word`, async () => {
       const choices = [' one alpha tail', ' one beta tail', ' other gamma'].map((text, index) => ({
@@ -1635,7 +1755,8 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent).toBe('');
   });
 
-  it('keeps the selected MD remainder visible across its value echo and a stable rerender, then reverses it', async () => {
+  it.each(['{Alt>}{ArrowLeft}{/Alt}', '{Meta>}z{/Meta}'])(
+    'keeps the selected MD remainder visible, then reverses it with %s', async (undoKey) => {
     const keyboard = userEvent.setup();
     renderSource('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
@@ -1655,7 +1776,7 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
 
-    await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+    await keyboard.keyboard(undoKey);
     await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' there friend', { exact: true }).first()).toBeVisible();

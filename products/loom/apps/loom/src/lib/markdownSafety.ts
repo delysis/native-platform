@@ -41,10 +41,7 @@ export function parseVisualMarkdown(
     throw new Error('This document schema cannot retain terminal newlines.');
   }
   const body = markdown.slice(0, markdown.length - terminalSuffix.length);
-  let parserSource = body.replaceAll('\t', '&#9;');
-  if (differsOnlyByHarmlessTerminalProseSpace(body)) {
-    parserSource = `${parserSource.slice(0, -1)}&#32;`;
-  }
+  const parserSource = preserveProseEndSpaces(body.replaceAll('\t', '&#9;'));
   const parsed = parserFor(schema).parse(parserSource);
   return parsed.type.create({ ...parsed.attrs, terminalSuffix }, parsed.content, parsed.marks);
 }
@@ -57,30 +54,27 @@ export function canRoundTripMarkdownExactly(markdown: string): boolean {
   }
 }
 
-function differsOnlyByHarmlessTerminalProseSpace(markdown: string): boolean {
-  if (!markdown.endsWith(' ') || markdown.endsWith('  ')) return false;
-
-  try {
-    const parsed = defaultMarkdownParser.parse(markdown.replaceAll('\t', '&#9;'));
-    let tail: ProseMirrorNode | null = parsed.lastChild;
-    while (tail && !tail.isTextblock && tail.lastChild) tail = tail.lastChild;
-
-    if (!tail || (tail.type.name !== 'paragraph' && tail.type.name !== 'heading')) {
-      return false;
-    }
-
-    return defaultMarkdownSerializer.serialize(parsed) === markdown.slice(0, -1);
-  } catch {
-    return false;
+function preserveProseEndSpaces(markdown: string): string {
+  const lines = markdown.split('\n');
+  for (const token of defaultMarkdownParser.tokenizer.parse(markdown, {})) {
+    if (!token.map ||
+        (token.type !== 'paragraph_open' && token.type !== 'heading_open')) continue;
+    const index = token.map[1] - 1;
+    const line = lines[index];
+    // Preserve an ordinary separator at every prose block boundary, including
+    // before media and inside quotes/lists. Token maps identify prose even
+    // when nested; fenced and indented code never enter this branch.
+    if (line?.endsWith(' ') && !line.endsWith('  ')) lines[index] = `${line.slice(0, -1)}&#32;`;
   }
+  return lines.join('\n');
 }
 
 /**
  * Return the canonical byte surface shared by the visual document and store.
  *
- * Loom's parser encodes the one serializer-proven terminal prose space as a
- * character reference before parsing, so ProseMirror preserves the writer's
- * separator and serializes it back to the same byte. The function remains the
+ * Loom's parser encodes a single trailing prose-block space as a character
+ * reference before parsing, so ProseMirror preserves the writer's separator
+ * and serializes it back to the same byte. The function remains the
  * single normalization boundary for callers, but no longer creates a second,
  * shorter manuscript identity behind the mounted editor.
  */
@@ -100,7 +94,7 @@ export function serializeVisualMarkdown(document: ProseMirrorNode): string {
 /**
  * Keep an admitted visual editing session mounted across transient serializer
  * states. Source/imported text must still prove an exact dialect round trip,
- * including the explicitly preserved single terminal prose space. Two spaces
+ * including explicitly preserved single prose-block spaces. Two spaces
  * can encode a hard break, while code and unsupported syntax remain fail-closed.
  */
 export function canUseVisualMarkdown(markdown: string, visualSessionActive: boolean): boolean {

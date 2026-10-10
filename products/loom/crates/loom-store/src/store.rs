@@ -85,6 +85,7 @@ pub struct ProjectStore {
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
     pub(crate) folder_warnings: Vec<String>,
+    pub(crate) folder_directories: Vec<String>,
     _lease: ProjectLease,
 }
 
@@ -237,6 +238,7 @@ impl ProjectStore {
             manifest,
             connection,
             folder_warnings: Vec::new(),
+            folder_directories: Vec::new(),
             _lease: lease,
         };
         store.recover_document_rename_operations()?;

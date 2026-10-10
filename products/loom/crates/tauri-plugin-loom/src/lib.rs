@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod archive_friends;
 mod attachments;
 mod audio_io;
 mod co_writer;
+mod connected_collections;
 mod connected_imports;
 mod context_attachments;
 mod document_bindings;
@@ -15,10 +17,13 @@ mod inference;
 mod material_commands;
 mod material_context;
 mod material_media;
+mod material_references;
 mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod preferences;
+mod reference_diagnostics;
 mod server_weave;
 mod shader_preview;
 mod speech_input;
@@ -31,7 +36,12 @@ pub use workspace_chat::{
     WorkspaceChatRoute, WorkspaceChatService,
 };
 mod workspace_copy;
+mod workspace_output;
+mod workspace_owner;
 mod workspace_preview;
+mod workspace_references;
+mod workspace_roots;
+mod workspace_source_import;
 mod workspace_template;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,7 +122,10 @@ use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
-use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
+use crate::terminal::{
+    terminal_cancel, terminal_list, terminal_run, workspace_pane_cancel, workspace_pane_list,
+    workspace_pane_run,
+};
 use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
 
@@ -127,6 +140,7 @@ const COMPLETION_SNAPSHOT_BRANCH_LIMIT: usize = 24;
 const COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
+pub const ARCHIVE_FRIENDS_MENU_ID: &str = "loom.help.archive-friends";
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
 pub const FILE_NEW_DOCUMENT_MENU_ID: &str = "loom.file.new-document";
 pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
@@ -215,6 +229,7 @@ struct Session {
     phase: SessionPhase,
     document_filesystem_watcher: Option<DocumentFilesystemWatcher>,
     store: Option<ProjectStore>,
+    workspace: Option<workspace_owner::Owner>,
     active_session_id: Option<CommandId>,
     agency: AgencyGate,
     last_close: Option<ProjectCloseReceipt>,
@@ -474,7 +489,10 @@ fn recorded_loompad_batch(
 #[derive(Debug)]
 struct PreparedProject {
     id: CommandId,
-    store: ProjectStore,
+    store: Option<ProjectStore>,
+    workspace_session: Option<CommandId>,
+    workspace_revision: Option<RevisionId>,
+    granted_root: Option<String>,
 }
 
 #[derive(Debug)]
@@ -486,7 +504,9 @@ pub struct PluginState {
     session: Mutex<Session>,
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
+    archive_friends: Arc<archive_friends::Provider>,
     imports: Arc<import_jobs::ImportJobs>,
+    previews: Arc<import_jobs::ImportJobs>,
     inference: Option<Arc<inference::Service>>,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
@@ -571,7 +591,9 @@ impl PluginState {
             session: Mutex::new(Session::default()),
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
+            archive_friends: Arc::default(),
             imports: Arc::default(),
+            previews: Arc::default(),
             inference: None,
             native_runtime,
             backend,
@@ -598,6 +620,7 @@ impl PluginState {
 
 impl Drop for PluginState {
     fn drop(&mut self) {
+        self.archive_friends.cancel_all();
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
@@ -613,6 +636,11 @@ impl Drop for PluginState {
         // native authority that those callbacks can wake in the renderer.
         let document_filesystem_watcher = session.document_filesystem_watcher.take();
         drop(document_filesystem_watcher);
+        let owner_filesystem_watcher = session
+            .workspace
+            .as_mut()
+            .and_then(|owner| owner.filesystem_watcher.take());
+        drop(owner_filesystem_watcher);
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
@@ -876,12 +904,12 @@ mod automatic_writer_authority {
             build_policy: &BuildModelPolicy,
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. } => {
-                    AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
-                        loaded,
-                        build_policy,
-                    )?)
-                }
+                ValidatedWeavePolicy::AutomaticV2
+                | ValidatedWeavePolicy::AutomaticV3
+                | ValidatedWeavePolicy::AutomaticVisualV4
+                | ValidatedWeavePolicy::LoompadV2 { .. } => AuthorizedWeaveModelKind::Automatic(
+                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
+                ),
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
             Ok(Self { policy, kind })
@@ -2131,9 +2159,18 @@ impl Builder {
                 workspace_preview::response(&state, context.webview_label(), &request)
             })
             .invoke_handler(tauri::generate_handler![
+                preferences::preferences_get,
+                preferences::preferences_update,
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
+                workspace_owner::workspace_roots_get,
+                workspace_owner::workspace_root_prepare,
+                workspace_owner::workspace_root_remove,
+                workspace_source_import::workspace_source_import_paths,
+                workspace_source_import::workspace_source_import_choose,
+                workspace_source_import::workspace_source_import_paste,
+                workspace_source_import::workspace_source_import_cancel,
                 project_drop_directories,
                 project_commit_open,
                 project_discard_open,
@@ -2142,7 +2179,10 @@ impl Builder {
                 project_recover,
                 document_create,
                 material_commands::material_list,
+                material_references::material_resolve_reference,
+                reference_diagnostics::document_reference_diagnostics,
                 material_commands::material_read,
+                material_media::pdf::material_pdf_page,
                 material_commands::material_search,
                 material_commands::material_read_evidence,
                 material_commands::material_bind_attachment,
@@ -2152,6 +2192,9 @@ impl Builder {
                 material_commands::material_add_library,
                 material_commands::material_add_library_path,
                 workspace_template_get,
+                workspace_output::workspace_pane_output,
+                workspace_output::workspace_document_resolve,
+                workspace_references::workspace_reference_resolve,
                 workspace_template_enable,
                 audio_record_start,
                 audio_record_stop,
@@ -2161,12 +2204,19 @@ impl Builder {
                 import_batch::import_text_sources,
                 import_batch::attachment_import_batch_choose,
                 workspace_copy::workspace_copy_files,
+                workspace_copy::directory::workspace_copy_folder_choose,
                 connected_imports::import_account_cancel,
                 connected_imports::import_source_url,
                 connected_imports::import_accounts,
                 connected_imports::import_account_connect,
                 connected_imports::import_account_disconnect,
-                connected_imports::import_account_sync,
+                connected_imports::collections::collection_add,
+                connected_imports::collections::collection_authorize,
+                connected_imports::collections::collection_refresh,
+                connected_imports::collections::collection_status,
+                connected_imports::collections::collection_cancel,
+                connected_imports::collections::collection_members,
+                connected_imports::collections::collection_read_member,
                 attachment_ingest,
                 attachment_import_choose,
                 attachment_import_paths,
@@ -2221,6 +2271,9 @@ impl Builder {
                 terminal_run,
                 terminal_list,
                 terminal_cancel,
+                workspace_pane_run,
+                workspace_pane_list,
+                workspace_pane_cancel,
                 shader_preview,
                 generation_cancel,
                 candidate_keep,
@@ -2331,6 +2384,10 @@ fn visual_ghost_rendered(state: State<'_, PluginState>) {
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
+    if menu_id == ARCHIVE_FRIENDS_MENU_ID {
+        archive_friends::show_help(app);
+        return;
+    }
     if menu_id == APPLICATION_QUIT_MENU_ID {
         let _ = prepare_application_exit_request(app);
         emit_application_close_request(app);
@@ -2403,7 +2460,6 @@ impl IpcFailure {
             ContextAttachmentError::UnsafeSource => "attachment_source_refused",
             ContextAttachmentError::SourceSize => "attachment_size_refused",
             ContextAttachmentError::Processing(_) => "attachment_processing_failed",
-            ContextAttachmentError::NoRepresentation => "attachment_no_model_representation",
             ContextAttachmentError::ContextLimit => "attachment_context_limit",
             ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
             ContextAttachmentError::ContextInvalid => "attachment_context_invalid",
@@ -2612,6 +2668,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    directories: Vec<String>,
     retained_output_document_ids: Vec<String>,
     folder_warnings: Vec<String>,
     pending_recovery: u64,
@@ -2941,6 +2998,8 @@ pub struct WeaveStarted {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WeavePolicySnapshot {
     AutomaticV2 {},
+    AutomaticV3 {},
+    AutomaticVisualV4 {},
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
@@ -2971,6 +3030,8 @@ struct ResolvedWeavePolicy {
 #[derive(Debug, PartialEq)]
 enum ValidatedWeavePolicy {
     AutomaticV2,
+    AutomaticV3,
+    AutomaticVisualV4,
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
@@ -3005,8 +3066,18 @@ async fn project_open_default<R: Runtime>(
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
-    let result =
-        default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
+    let result = {
+        let mut session = lock_session_internal(&state)?;
+        if session.workspace.is_some() {
+            workspace_owner::store_mut(&mut session)?;
+            Ok(ProjectChoiceStore::Workspace)
+        } else {
+            drop(session);
+            default_project_path(&state)
+                .and_then(|path| open_or_initialize_default_project(&path))
+                .map(ProjectChoiceStore::from)
+        }
+    };
     choice.finish(&app, result)
 }
 
@@ -3147,14 +3218,39 @@ fn prepare_project_folder(
     let path = path
         .canonicalize()
         .map_err(|error| IpcFailure::new("selected_folder_unavailable", error.to_string(), true))?;
-    {
-        let session = lock_session(state)?;
+    let (workspace_session, workspace_revision) = {
+        let mut session = lock_session(state)?;
         if let Some(current) = &session.store
             && current.root() == path
         {
             return Ok(None);
         }
-    }
+        let owner_session = session.workspace.as_ref().map(|owner| owner.session_id);
+        let revision = if owner_session.is_some() {
+            let owner = workspace_owner::store_mut(&mut session)?;
+            workspace_template::load_template(owner)?;
+            workspace_roots::current_revision(owner)?
+        } else {
+            None
+        };
+        if session
+            .workspace
+            .as_ref()
+            .is_some_and(|owner| owner.root == path)
+        {
+            let id = CommandId::new();
+            snapshot_for(workspace_owner::store(&session)?, id)?;
+            *lock_prepared_project(state)? = Some(PreparedProject {
+                id,
+                store: None,
+                workspace_session: owner_session,
+                workspace_revision: revision,
+                granted_root: Some(workspace_roots::OWNER_ROOT_ID.into()),
+            });
+            return Ok(Some(id.to_string()));
+        }
+        (owner_session, revision)
+    };
     let mut store = ProjectStore::open_folder(&path).map_err(IpcFailure::store)?;
     store
         .recover_interrupted_generations()
@@ -3164,7 +3260,13 @@ fn prepare_project_folder(
     // Surface an unreadable catalogue before asking the renderer to save and
     // close the current writing. The commit reads a fresh handoff snapshot.
     snapshot_for(&store, id)?;
-    *lock_prepared_project(state)? = Some(PreparedProject { id, store });
+    *lock_prepared_project(state)? = Some(PreparedProject {
+        id,
+        store: Some(store),
+        workspace_session,
+        workspace_revision,
+        granted_root: None,
+    });
     Ok(Some(id.to_string()))
 }
 
@@ -3180,13 +3282,51 @@ fn lock_prepared_project(
     })
 }
 
-fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectStore, IpcFailure> {
+enum ProjectChoiceStore {
+    New(Box<ProjectStore>),
+    Workspace,
+}
+
+impl From<ProjectStore> for ProjectChoiceStore {
+    fn from(store: ProjectStore) -> Self {
+        Self::New(Box::new(store))
+    }
+}
+
+fn take_prepared_project(
+    state: &PluginState,
+    id: CommandId,
+) -> Result<ProjectChoiceStore, IpcFailure> {
     let mut prepared = lock_prepared_project(state)?;
     if prepared
         .as_ref()
         .is_some_and(|candidate| candidate.id == id)
     {
-        return Ok(prepared.take().expect("matching prepared project").store);
+        let candidate = prepared.take().expect("matching prepared project");
+        drop(prepared);
+        let mut session = lock_session_internal(state)?;
+        if candidate.workspace_session != session.workspace.as_ref().map(|owner| owner.session_id) {
+            return Err(IpcFailure::new(
+                "workspace_changed",
+                "Choose the folder again in this workspace.",
+                false,
+            ));
+        }
+        return if let Some(store) = candidate.store {
+            if candidate.workspace_session.is_some() {
+                let owner = workspace_owner::store_mut(&mut session)?;
+                let private = workspace_owner::private_root(state)?;
+                if let Some(id) = candidate.granted_root {
+                    workspace_roots::validate_opened(owner, &id, &store, &private)?;
+                } else {
+                    workspace_roots::mount(owner, &store, &private, candidate.workspace_revision)?;
+                }
+            }
+            Ok(store.into())
+        } else {
+            workspace_owner::store(&session)?;
+            Ok(ProjectChoiceStore::Workspace)
+        };
     }
     Err(IpcFailure::new(
         "prepared_project_expired",
@@ -3238,6 +3378,7 @@ fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservatio
         state,
         _application_admission: application_admission,
         committed: false,
+        pending_store: None,
     })
 }
 
@@ -3245,13 +3386,14 @@ struct ProjectChoiceReservation<'a> {
     state: &'a PluginState,
     _application_admission: MutexGuard<'a, ApplicationPhase>,
     committed: bool,
+    pending_store: Option<ProjectStore>,
 }
 
 impl ProjectChoiceReservation<'_> {
     fn finish<R: Runtime>(
         self,
         app: &AppHandle<R>,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         self.finish_with_document_filesystem_watcher(result, |store, session_id| {
             DocumentFilesystemWatcher::start(
@@ -3273,20 +3415,29 @@ impl ProjectChoiceReservation<'_> {
 
     fn finish_with_document_filesystem_watcher(
         mut self,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
         start_watcher: impl FnOnce(
             &ProjectStore,
             CommandId,
         ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
-        let store = result?;
+        self.pending_store = Some(match result?.into() {
+            ProjectChoiceStore::New(store) => *store,
+            ProjectChoiceStore::Workspace => return self.finish_owner_with_watcher(start_watcher),
+        });
+        let store = self.pending_store.as_ref().expect("prepared store");
         let session_id = CommandId::new();
-        let document_filesystem_watcher = start_watcher(&store, session_id)?;
+        let owner_watch_session = {
+            let session = lock_session_internal(self.state)?;
+            session.workspace.is_none().then(CommandId::new)
+        };
+        let document_filesystem_watcher =
+            start_watcher(store, owner_watch_session.unwrap_or(session_id))?;
         // Establish observation before reading the handoff snapshot. The
         // renderer performs one coalesced refresh after attaching it, closing
         // the small interval in which correctly scoped early hints are still
         // rejected because no renderer session is attached yet.
-        let snapshot = snapshot_for(&store, session_id)?;
+        let snapshot = snapshot_for(store, session_id)?;
         let mut session = lock_session_internal(self.state)?;
         if session.phase != SessionPhase::Choosing {
             return Err(IpcFailure::new(
@@ -3302,8 +3453,16 @@ impl ProjectChoiceReservation<'_> {
                 session_id.to_string(),
             )
             .map_err(|error| IpcFailure::speech_input(&error))?;
-        session.document_filesystem_watcher = document_filesystem_watcher;
-        session.store = Some(store);
+        workspace_owner::establish(&mut session, store);
+        if let Some(owner_session_id) = owner_watch_session {
+            let owner = session.workspace.as_mut().expect("established owner");
+            owner.session_id = owner_session_id;
+            owner.filesystem_watcher = document_filesystem_watcher;
+            session.document_filesystem_watcher = None;
+        } else {
+            session.document_filesystem_watcher = document_filesystem_watcher;
+        }
+        session.store = self.pending_store.take();
         session.active_session_id = Some(session_id);
         session.agency = AgencyGate::default();
         session.phase = SessionPhase::Open;
@@ -3315,9 +3474,62 @@ impl ProjectChoiceReservation<'_> {
     #[cfg(test)]
     fn finish_without_document_filesystem_watcher(
         self,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         self.finish_with_document_filesystem_watcher(result, |_store, _session_id| Ok(None))
+    }
+
+    fn finish_owner_with_watcher(
+        mut self,
+        start_watcher: impl FnOnce(
+            &ProjectStore,
+            CommandId,
+        ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        // Existing pane workers can keep using the parked owner during chooser
+        // preparation. Hold the session lock only for this final borrowed read
+        // and atomic activation; never move its store through pending_store.
+        let mut session = lock_session_internal(self.state)?;
+        if session.phase != SessionPhase::Choosing || session.store.is_some() {
+            return Err(IpcFailure::new(
+                "project_choice_state_changed",
+                "The project chooser lost its reserved session.",
+                false,
+            ));
+        }
+        let owner = session.workspace.as_ref().ok_or_else(|| {
+            IpcFailure::new("workspace_not_open", "Open a workspace first.", false)
+        })?;
+        let owner_session = owner.session_id;
+        let store = workspace_owner::store(&session)?;
+        let watcher = if owner.filesystem_watcher.is_none() {
+            start_watcher(store, owner_session)?
+        } else {
+            None
+        };
+        let session_id = CommandId::new();
+        let snapshot = snapshot_for(store, session_id)?;
+        self.state
+            .speech_input
+            .bind_scope(
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map_err(|error| IpcFailure::speech_input(&error))?;
+        if let Some(watcher) = watcher {
+            session
+                .workspace
+                .as_mut()
+                .expect("borrowed owner")
+                .filesystem_watcher = Some(watcher);
+        }
+        session.store = Some(workspace_owner::take_parked(&mut session)?);
+        session.document_filesystem_watcher = None;
+        session.active_session_id = Some(session_id);
+        session.agency = AgencyGate::default();
+        session.phase = SessionPhase::Open;
+        self.committed = true;
+        Ok(snapshot)
     }
 }
 
@@ -3334,6 +3546,9 @@ impl Drop for ProjectChoiceReservation<'_> {
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = self.pending_store.take() {
+            workspace_owner::restore_parked(&mut session, store);
+        }
         if session.phase == SessionPhase::Choosing {
             session.phase = SessionPhase::Closed;
         }
@@ -3551,7 +3766,9 @@ fn close_project_with_wait(
         (typed_project_id, typed_session_id)
     };
 
+    archive_friends::drain(state, generation_wait)?;
     state.imports.revoke_session(&session_id);
+    state.previews.revoke_session(&session_id);
 
     // Project close removes command authority before waiting for inference.
     // A slow or failed drain must never leave a promotion nonce usable.
@@ -3575,6 +3792,7 @@ fn close_project_with_wait(
     )?;
 
     state.imports.drain_session(&session_id)?;
+    state.previews.drain_session(&session_id)?;
     let mut session = lock_session_internal(state)?;
     if session.phase == SessionPhase::Closed {
         if let Some(receipt) = &session.last_close
@@ -3610,7 +3828,7 @@ fn close_project_with_wait(
         closed_at_unix_ms: now_unix_ms(),
     };
     let document_filesystem_watcher = session.document_filesystem_watcher.take();
-    session.store = None;
+    workspace_owner::park_active(&mut session);
     session.active_session_id = None;
     session.agency = AgencyGate::default();
     session.phase = SessionPhase::Closed;
@@ -4810,7 +5028,8 @@ async fn attachment_reveal_original(
     let _admission = lock_application_admission(&state, "an attachment reveal")?;
     let path = {
         let mut session = lock_session(&state)?;
-        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let store =
+            material_commands::require_source_store(&mut session, &project_id, &session_id)?;
         context_attachments::original_path(store.root(), &attachment_id)
             .map_err(|error| IpcFailure::context_attachment(&error))?
     };
@@ -5238,6 +5457,9 @@ async fn document_draft_upsert(
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     ensure_registered_document(store, &relative_path, &document_id)?;
+    archive_friends::cancel_document(&state, &session, &project_id, &session_id, &document_id);
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+
     match store.upsert_transient_draft(
         &relative_path,
         source_revision_id,
@@ -8370,6 +8592,23 @@ async fn weave_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
+    let admission = archive_friends::prepare(
+        &state,
+        &project_id,
+        &session_id,
+        &command_id,
+        &document_id,
+        &relative_path,
+        &source_revision_id,
+        &expected_visible_blob_id,
+        cursor_byte,
+        policy,
+    )
+    .await?;
+    let archive = match admission {
+        archive_friends::Admission::Replay(replay) => return Ok(replay),
+        archive_friends::Admission::Prepared(prepared) => prepared,
+    };
     complete_ipc_setup(|| {
         weave_start_inner(
             project_id,
@@ -8383,6 +8622,7 @@ async fn weave_start<R: Runtime>(
             policy,
             &app,
             &state,
+            archive.as_ref(),
         )
     })
 }
@@ -8400,6 +8640,7 @@ fn weave_start_inner<R: Runtime>(
     policy: WeavePolicySnapshot,
     app: &AppHandle<R>,
     state: &State<'_, PluginState>,
+    archive: Option<&archive_friends::Prepared>,
 ) -> Result<WeaveStarted, IpcFailure> {
     state.emit_timing("generation_request_received");
     ensure_application_running(state, "a writing suggestion")?;
@@ -8470,6 +8711,9 @@ fn weave_start_inner<R: Runtime>(
         ));
     }
     let model_environment = authorized_model.environment()?;
+    if let Some(archive) = archive {
+        archive.validate_model(&model_environment)?;
+    }
 
     let request_id = format!("weave-{command_id}");
     let (
@@ -8565,9 +8809,13 @@ fn weave_start_inner<R: Runtime>(
         } else {
             None
         };
+        let document_root = store.root().to_owned();
+        if let Some(archive) = archive {
+            archive.validate(&session, state, &loaded, cursor_byte)?;
+        }
         let source_prefix = &loaded.text[..cursor];
         let mut attachment_context = resolve_for_generation_with_budget(
-            store.root(),
+            &document_root,
             &document_id.to_string(),
             source_prefix,
             authorized_model.context_tokens(),
@@ -8575,11 +8823,9 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
-        if !loom_document::document_references(&loaded.text)
-            .map_err(|error| IpcFailure::new("material_context_invalid", error.to_string(), false))?
-            .is_empty()
-        {
-            material_commands::restore_grants(state, store)?;
+        let references = archive_friends::workspace_references(&loaded.text, archive)?;
+        if !references.is_empty() {
+            material_commands::restore_grants(state, workspace_owner::store_mut(&mut session)?)?;
         }
         // Match the attachment planner's conservative byte-per-token envelope;
         // every branch's generation and the runtime scaffold keep their reserve.
@@ -8592,16 +8838,52 @@ fn weave_start_inner<R: Runtime>(
             .saturating_sub(attachment_context.manuscript_prompt.len())
             .saturating_sub(attachment_context.context_preamble.len())
             .saturating_sub(2);
-        let material_plan = material_context::markdown_plan_with_budget(
-            store,
-            &loaded.text,
+        let owner = session.workspace.as_ref().ok_or_else(|| {
+            IpcFailure::new(
+                "workspace_not_open",
+                "The source workspace is not open.",
+                false,
+            )
+        })?;
+        let mut mounted = workspace_references::Snapshots::default();
+        mounted.admit(
+            state,
+            &session,
+            references.iter().map(|reference| reference.name.as_str()),
+        )?;
+        let source_context = workspace_owner::read_context(
+            &session,
+            &project_id,
+            &session_id,
+            &owner.project_id.to_string(),
+            &owner.session_id.to_string(),
+        )?
+        .with_mounted(&mounted);
+        let archive_bytes = archive.map_or(0, |archive| archive.context.preamble.len() + 2);
+        let material_budget = material_budget.checked_sub(archive_bytes).ok_or_else(|| {
+            IpcFailure::new(
+                "archive_context_budget_exceeded",
+                "Archive context does not fit the writing context budget.",
+                false,
+            )
+        })?;
+        let material_plan = material_context::plan_with_references(
+            source_context,
+            references,
             source_prefix,
             material_budget,
+            if authorized_model.is_automatic() {
+                material_context::ReferenceRequirement::AvailableForWriting
+            } else {
+                material_context::ReferenceRequirement::All
+            },
         )?;
         attachment_context.media = terminal_media::merge(
             attachment_context.media,
-            material_context::native_media(store, material_plan.bindings.values())?,
+            source_context.native_media(material_plan.bindings.values())?,
         )?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let retained_media = terminal_media::retain(store, &attachment_context.media)?;
         let document_context = &material_plan.text;
         if !document_context.is_empty() {
             attachment_context.context_preamble.push_str("\n\n");
@@ -8609,6 +8891,22 @@ fn weave_start_inner<R: Runtime>(
                 .context_preamble
                 .push_str(document_context);
         }
+        let archive_blob = if let Some(archive) = archive {
+            attachment_context.context_preamble.push_str("\n\n");
+            attachment_context
+                .context_preamble
+                .push_str(&archive.context.preamble);
+            let bytes = serde_json::to_vec(archive.context.pack.as_ref()).map_err(|error| {
+                IpcFailure::new("archive_encode_failed", error.to_string(), false)
+            })?;
+            Some(
+                store
+                    .store_provenance_blob(&bytes)
+                    .map_err(IpcFailure::store)?,
+            )
+        } else {
+            None
+        };
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()
@@ -8662,14 +8960,8 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
-        let mut context_inputs = material_context::evidence_artifact_ids(&material_plan.evidence)?;
-        for value in material_plan.bindings.values() {
-            if let material_context::Value::Documents { documents } = value {
-                context_inputs.extend(documents.iter().map(|document| document.artifact_id));
-            }
-        }
-        context_inputs.sort();
-        context_inputs.dedup();
+        let context_inputs =
+            material_context::local_artifact_ids(store, material_plan.bindings.values())?;
         let mut prompt_inputs = vec![loaded.artifact_id];
         prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
@@ -8683,13 +8975,20 @@ fn weave_start_inner<R: Runtime>(
             .record_prompt_recipe(&prompt_recipe)
             .map_err(IpcFailure::store)?;
         let retrieval_evidence_blob_id = {
-            let identity =
-                serde_json::to_vec(&match &speculation {
-                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "loompad": batch }),
-                    None => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan }),
-                }).map_err(|error| {
-                    IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
-                })?;
+            let mut evidence = match &speculation {
+                Some(batch) => {
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "loompad": batch })
+                }
+                None => {
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media })
+                }
+            };
+            if let Some(id) = archive_blob {
+                evidence["archive_friends_pack_blob_id"] = serde_json::json!(id);
+            }
+            let identity = serde_json::to_vec(&evidence).map_err(|error| {
+                IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
+            })?;
             Some(
                 store
                     .store_provenance_blob(&identity)
@@ -9141,6 +9440,8 @@ impl WeavePreset {
 fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
     let validated = match policy {
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
+        WeavePolicySnapshot::AutomaticV3 {} => ValidatedWeavePolicy::AutomaticV3,
+        WeavePolicySnapshot::AutomaticVisualV4 {} => ValidatedWeavePolicy::AutomaticVisualV4,
         WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
@@ -9198,20 +9499,31 @@ impl ValidatedWeavePolicy {
     const fn first_word_choices(&self) -> Option<llama_native_types::FirstWordChoicePolicy> {
         match self {
             Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV2),
+            Self::AutomaticVisualV4 => {
+                Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
+            }
+            Self::AutomaticV3 => {
+                Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
+            }
             Self::AutomaticV2 | Self::ManualV2 { .. } => None,
         }
     }
 
     const fn branch_count(&self) -> u32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::AutomaticV2
+            | Self::AutomaticV3
+            | Self::AutomaticVisualV4
+            | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
 
     const fn max_tokens(&self) -> u32 {
         match self {
-            Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4 => {
+                AUTOMATIC_WEAVE_MAX_TOKENS_V2
+            }
             Self::LoompadV2 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
@@ -9219,16 +9531,28 @@ impl ValidatedWeavePolicy {
 
     const fn temperature(&self) -> f32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::AutomaticV2
+            | Self::AutomaticV3
+            | Self::AutomaticVisualV4
+            | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
 
     fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
         let preset = match (self, kind) {
-            (Self::AutomaticV2, DocumentKind::Prose) => WeavePreset::AutomaticProseV2,
-            (Self::AutomaticV2, DocumentKind::Verse) => WeavePreset::AutomaticVerseV2,
-            (Self::AutomaticV2, DocumentKind::Hybrid) => {
+            (
+                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                DocumentKind::Prose,
+            ) => WeavePreset::AutomaticProseV2,
+            (
+                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                DocumentKind::Verse,
+            ) => WeavePreset::AutomaticVerseV2,
+            (
+                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                DocumentKind::Hybrid,
+            ) => {
                 return Err(IpcFailure::new(
                     "automatic_hybrid_boundary_unresolved",
                     "automatic suggestions require an authoritative prose or verse block boundary",
@@ -9308,7 +9632,7 @@ fn sampling_for_weave_case(
     }
 }
 
-fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
+fn loaded_model(state: &PluginState) -> Result<LoadedModel, IpcFailure> {
     loaded_model_for_state(state)
 }
 
@@ -9969,15 +10293,13 @@ async fn generation_cancel<R: Runtime>(
     // Persist the user's request before delivering the process-local side
     // effect. Reaching a terminal state in this interval is benign: a cancel
     // request is not a promise that the terminal status will be Cancelled.
-    let _delivered = state
-        .generations
-        .cancel_run(route.identity.project_id, route.identity.session_id, run_id)
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
-    emit_desktop_event(
-        &app,
-        &route.identity,
-        LoomEvent::Generation(outcome.event.clone()),
-    )?;
+    if let Some(event) = outcome.event {
+        let _delivered = state
+            .generations
+            .cancel_run(route.identity.project_id, route.identity.session_id, run_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        emit_desktop_event(&app, &route.identity, LoomEvent::Generation(event))?;
+    }
     let mut receipt = Receipt::from(outcome.receipt);
     receipt.request_fingerprint = Some(outcome.request_fingerprint.to_string());
     receipt.replayed = outcome.replayed;
@@ -10456,7 +10778,9 @@ impl DesktopWorkersJoined {
 
 impl PluginState {
     fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
+        archive_friends::drain(self, PROJECT_CLOSE_GENERATION_WAIT)?;
         self.imports.shutdown()?;
+        self.previews.shutdown()?;
         let model_loads = self.model_loads.close_and_drain();
         self.downloads
             .cancel_all_active(now_unix_ms())
@@ -10497,8 +10821,12 @@ impl PluginState {
     /// removed under a poison-recovering registry lock, cancelled, and joined
     /// before the returned exact-registry facts are assembled.
     fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
+        self.archive_friends.cancel_and_drain_for_exit();
         if let Err(error) = self.imports.shutdown() {
             eprintln!("Loom import drain: {}", error.message);
+        }
+        if let Err(error) = self.previews.shutdown() {
+            eprintln!("Loom preview drain: {}", error.message);
         }
         let model_loads = self.model_loads.close_and_drain();
         // Running worker slots retain the authoritative cancellation handles.
@@ -10521,7 +10849,9 @@ fn application_close<R: Runtime>(
 ) -> Result<(), IpcFailure> {
     let _audio = state.audio_capture.close_guard()?;
     let close_attempt = begin_application_close(&state)?;
+    archive_friends::drain(&state, PROJECT_CLOSE_GENERATION_WAIT)?;
     lock_prepared_project(&state)?.take();
+    terminal::drain_workspace_runs(&state, PROJECT_CLOSE_GENERATION_WAIT)?;
     if state
         .generations
         .active_branch_count()
@@ -10675,6 +11005,7 @@ fn focus_mode_set(
     session.agency.set_focus_mode(enabled);
     drop(session);
     if enabled {
+        state.archive_friends.cancel_all();
         state
             .generations
             .cancel_session(project_id_typed, session_id_typed)
@@ -10705,6 +11036,7 @@ fn suggestions_set(
     session.agency.set_automation_enabled(enabled);
     drop(session);
     if !enabled {
+        state.archive_friends.cancel_all();
         state
             .generations
             .cancel_session(project_id_typed, session_id_typed)
@@ -10779,6 +11111,7 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        directories: store.folder_directories().to_vec(),
         retained_output_document_ids: ["retained experiment", "retained expression"]
             .into_iter()
             .map(|reason| store.document_ids_created_with_reason(reason))
@@ -11507,8 +11840,13 @@ mod tests {
     fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
         let current = tempfile::tempdir().expect("current writing");
         let next = tempfile::tempdir().expect("next writing");
+        let private = tempfile::tempdir().expect("private workspace grants");
         std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
-        let state = PluginState::default();
+        let state = PluginState::with_app_local_data_root(
+            Some(private.path().to_owned()),
+            true,
+            BuildModelPolicy::default(),
+        );
         let mut store = initialize_project(current.path(), "Current".into()).unwrap();
         let source = store.read_document(INITIAL_DOCUMENT).unwrap();
         store
@@ -11539,7 +11877,11 @@ mod tests {
         let id = prepare_project_path(&state, next.path().to_str().unwrap())
             .unwrap()
             .unwrap();
-        let candidate = take_prepared_project(&state, id.parse().unwrap()).unwrap();
+        let ProjectChoiceStore::New(candidate) =
+            take_prepared_project(&state, id.parse().unwrap()).unwrap()
+        else {
+            panic!("new folder")
+        };
         assert_eq!(
             candidate.read_document("Notes.md").unwrap().text,
             "Exact next writing.\r\n"
@@ -11564,9 +11906,14 @@ mod tests {
     fn prepared_folder_lease_survives_old_session_close_and_is_consumed_once() {
         let current = tempfile::tempdir().expect("current folder");
         let next = tempfile::tempdir().expect("next folder");
+        let private = tempfile::tempdir().expect("private application data");
         std::fs::write(next.path().join("Existing.md"), "Exact writing.\r\n")
             .expect("existing manuscript");
-        let state = PluginState::default();
+        let state = PluginState::with_app_local_data_root(
+            Some(private.path().to_owned()),
+            true,
+            BuildModelPolicy::default(),
+        );
         let store = initialize_project(current.path(), "Current".into()).expect("current store");
         let opened = reserve_project_choice(&state)
             .expect("reserve")
@@ -11612,7 +11959,12 @@ mod tests {
             std::fs::read(next.path().join("Existing.md")).expect("unchanged bytes"),
             b"Exact writing.\r\n"
         );
-        drop(ProjectStore::open(current.path()).expect("old lease released"));
+        assert!(matches!(
+            ProjectStore::open(current.path()),
+            Err(loom_store::StoreError::ProjectAlreadyOpen(_))
+        ));
+        drop(state);
+        drop(ProjectStore::open(current.path()).expect("workspace lease released on shutdown"));
     }
 
     #[test]
@@ -13899,43 +14251,69 @@ mod tests {
 
     #[test]
     fn automatic_policy_has_no_runtime_budget_fields() {
-        let parsed: WeavePolicySnapshot =
-            serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
-        let validated = validate_weave_policy(parsed).expect("validate automatic");
-        assert_eq!(validated, ValidatedWeavePolicy::AutomaticV2);
-        assert_eq!(validated.branch_count(), 4);
-        assert!(
-            serde_json::from_str::<WeavePolicySnapshot>(
-                r#"{"kind":"automatic_v2","max_tokens":2048}"#
-            )
-            .is_err()
+        for (kind, expected) in [
+            ("automatic_v2", ValidatedWeavePolicy::AutomaticV2),
+            ("automatic_v3", ValidatedWeavePolicy::AutomaticV3),
+            (
+                "automatic_visual_v4",
+                ValidatedWeavePolicy::AutomaticVisualV4,
+            ),
+        ] {
+            let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
+                "kind": kind
+            }))
+            .expect("automatic policy");
+            let validated = validate_weave_policy(parsed).expect("validate automatic");
+            assert_eq!(validated, expected);
+            assert_eq!(validated.branch_count(), 4);
+            assert!(
+                serde_json::from_value::<WeavePolicySnapshot>(serde_json::json!({
+                    "kind": kind,
+                    "max_tokens": 2048
+                }))
+                .is_err()
+            );
+        }
+        assert_eq!(ValidatedWeavePolicy::AutomaticV2.first_word_choices(), None);
+        assert_eq!(
+            ValidatedWeavePolicy::AutomaticVisualV4.first_word_choices(),
+            Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
+        );
+        assert_eq!(
+            ValidatedWeavePolicy::AutomaticV3.first_word_choices(),
+            Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
         );
     }
 
     #[test]
     fn automatic_policy_is_bound_by_rust_to_the_authoritative_document_kind() {
-        let policy = ValidatedWeavePolicy::AutomaticV2;
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Prose)
-                .expect("prose")
-                .preset,
-            WeavePreset::AutomaticProseV2
-        );
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Verse)
-                .expect("verse")
-                .preset,
-            WeavePreset::AutomaticVerseV2
-        );
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Hybrid)
-                .expect_err("hybrid has no authoritative caret block")
-                .code,
-            "automatic_hybrid_boundary_unresolved"
-        );
+        for policy in [
+            ValidatedWeavePolicy::AutomaticV2,
+            ValidatedWeavePolicy::AutomaticV3,
+            ValidatedWeavePolicy::AutomaticVisualV4,
+        ] {
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Prose)
+                    .expect("prose")
+                    .preset,
+                WeavePreset::AutomaticProseV2
+            );
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Verse)
+                    .expect("verse")
+                    .preset,
+                WeavePreset::AutomaticVerseV2
+            );
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Hybrid)
+                    .expect_err("hybrid has no authoritative caret block")
+                    .code,
+                "automatic_hybrid_boundary_unresolved"
+            );
+        }
     }
 
     #[test]
@@ -14906,6 +15284,7 @@ mod tests {
             phase: SessionPhase::Open,
             document_filesystem_watcher: None,
             store: Some(store),
+            workspace: None,
             active_session_id: Some(session_id),
             agency: AgencyGate::default(),
             last_close: None,

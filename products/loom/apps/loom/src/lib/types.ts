@@ -40,6 +40,7 @@ export interface ProjectSnapshot {
   root: string;
   schema_version: number;
   documents: DocumentSummary[];
+  directories?: string[];
   retained_output_document_ids?: string[];
   folder_warnings?: string[];
   pending_recovery: number;
@@ -456,6 +457,16 @@ export interface ContextAttachmentPresentation {
   warnings: string[];
   /** Exact extracted page ranges in canonical UTF-8 text; absent pages are not inferred. */
   pdf_pages?: Array<{ number: number; start_byte: number; end_byte: number }>;
+  pdf_preview_token?: string | null;
+}
+
+export interface MaterialPdfPage {
+  page: number;
+  page_count: number;
+  width: number;
+  height: number;
+  png_base64: string;
+  incomplete: boolean;
 }
 
 export interface ContextMaterial {
@@ -585,4 +596,36 @@ export interface TerminalRunRequest {
   sourceStartByte: number;
   sourceEndByte: number;
   expression: string;
+}
+
+export type CollectionScope =
+  | { kind: 'drive_folder'; id: string }
+  | { kind: 'gmail_query'; query: string };
+
+export interface CollectionStatus {
+  id: string;
+  scope: CollectionScope;
+  definition_fingerprint: string;
+  job_id: string | null;
+  phase: 'idle' | 'running' | 'paused' | 'interrupted' | 'complete';
+  retained_count: number;
+  failures: { name: string; message: string }[];
+  resumable: boolean;
+  local_readable: boolean;
+  refresh_authorized: boolean;
+  coverage_complete: boolean;
+}
+
+export interface CollectionMember {
+  snapshot_id: string;
+  occurrence_id: string;
+  name: string;
+  attachment_id: string;
+  source_uri: string;
+}
+export interface CollectionMemberPage {
+  snapshot_id: string;
+  members: CollectionMember[];
+  total: number;
+  next_offset: number | null;
 }

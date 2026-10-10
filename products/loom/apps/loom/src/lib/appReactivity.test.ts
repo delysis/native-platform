@@ -286,12 +286,6 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('Opening your writing…');
   });
 
-  it('offers main-pane collapse only when a visible right pane can fill the canvas', () => {
-    expect(source).toContain('{#if project && !mainPane && rightPaneOpen}');
-    expect(source).toContain("if (position === 'main' && next.has('main') && !rightPaneOpen) return;");
-    expect(source).toContain("if (position === 'right' && next.has('right') && !mainPaneOpen) next.delete('main');");
-  });
-
   it('rebinds completion after an incompatible caret navigation settles', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');

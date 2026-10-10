@@ -3,4 +3,4 @@
 [[permission]]
 identifier = "connected-import"
 description = "Explicit read-only account authorization and imports, with credentials in the OS credential store."
-commands.allow = ["import_account_cancel", "import_source_url", "import_accounts", "import_account_connect", "import_account_disconnect", "import_account_sync"]
+commands.allow = ["import_account_cancel", "import_source_url", "import_accounts", "import_account_connect", "import_account_disconnect", "collection_add", "collection_authorize", "collection_refresh", "collection_status", "collection_cancel", "collection_members", "collection_read_member"]

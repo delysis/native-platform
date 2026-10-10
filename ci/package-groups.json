@@ -62,6 +62,8 @@
       "mom-llama-runtime"
     ],
     "product-loom": [
+      "archive-friends",
+      "loom-preferences",
       "loom-app",
       "loom-backend-llama",
       "loom-cli",
@@ -77,6 +79,8 @@
   },
   "secondary": {
     "portable": [
+      "archive-friends",
+      "loom-preferences",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",

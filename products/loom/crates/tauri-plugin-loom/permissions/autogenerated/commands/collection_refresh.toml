@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-collection-refresh"
+description = "Enables the collection_refresh command without any pre-configured scope."
+commands.allow = ["collection_refresh"]
+
+[[permission]]
+identifier = "deny-collection-refresh"
+description = "Denies the collection_refresh command without any pre-configured scope."
+commands.deny = ["collection_refresh"]

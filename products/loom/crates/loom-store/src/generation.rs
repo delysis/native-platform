@@ -156,7 +156,8 @@ pub struct TerminalGenerationOutcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CancelGenerationOutcome {
-    pub event: GenerationEvent,
+    /// Absent when an immutable terminal already satisfied the request.
+    pub event: Option<GenerationEvent>,
     pub receipt: CommandReceipt,
     pub request_fingerprint: BlobId,
     pub replayed: bool,
@@ -819,14 +820,24 @@ impl ProjectStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_generation_open(&transaction, run_id)?;
-        let event = GenerationEvent {
-            event_id: GenerationEventId::new(),
-            run_id,
-            branch_id: run.branch_id,
-            sequence: next_sequence(&transaction, run_id)?,
-            kind,
-            occurred_at_ms: now_unix_ms(),
+        // Completion and cancellation race normally. A terminal satisfies a
+        // late request without appending to its closed event stream.
+        let terminal_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generation_terminals WHERE run_id = ?1)",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let event = if terminal_exists {
+            None
+        } else {
+            Some(GenerationEvent {
+                event_id: GenerationEventId::new(),
+                run_id,
+                branch_id: run.branch_id,
+                sequence: next_sequence(&transaction, run_id)?,
+                kind,
+                occurred_at_ms: now_unix_ms(),
+            })
         };
         let receipt = CommandReceipt {
             command_id,
@@ -838,9 +849,11 @@ impl ProjectStore {
             resulting_operation_ids: Vec::new(),
             resulting_revision_ids: Vec::new(),
             started_at_ms,
-            completed_at_ms: event.occurred_at_ms,
+            completed_at_ms: now_unix_ms(),
         };
-        insert_generation_event_with_payload(&transaction, &event, &payload, false)?;
+        if let Some(event) = &event {
+            insert_generation_event_with_payload(&transaction, event, &payload, false)?;
+        }
         persist_receipt_in(&transaction, &receipt)?;
         insert_command_request(
             &transaction,
@@ -849,10 +862,12 @@ impl ProjectStore {
             CommandKind::CancelGeneration,
             started_at_ms,
         )?;
-        transaction.execute(
-            "INSERT INTO generation_command_events(command_id, event_id) VALUES (?1, ?2)",
-            params![command_id.to_string(), event.event_id.to_string()],
-        )?;
+        if let Some(event) = &event {
+            transaction.execute(
+                "INSERT INTO generation_command_events(command_id, event_id) VALUES (?1, ?2)",
+                params![command_id.to_string(), event.event_id.to_string()],
+            )?;
+        }
         transaction.commit()?;
         Ok(CancelGenerationOutcome {
             event,
@@ -2397,26 +2412,44 @@ impl ProjectStore {
         else {
             return Ok(None);
         };
-        let row: (String, String, String, i64, String, i64, i64) = self.connection.query_row(
-            "SELECT ge.event_id, ge.run_id, gr.branch_id, ge.sequence,
+        let row: Option<(String, String, String, i64, String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT ge.event_id, ge.run_id, gr.branch_id, ge.sequence,
                     ge.payload_json, ge.is_terminal, ge.created_at_ms
              FROM generation_command_events gce
              JOIN generation_events ge ON ge.event_id = gce.event_id
              JOIN generation_runs gr ON gr.run_id = ge.run_id
              WHERE gce.command_id = ?1",
-            [command_id.to_string()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
-        )?;
+                [command_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            // No event is written when the request finds an immutable terminal.
+            // The command fingerprint binds this replay to that exact run.
+            if self.generation_terminal_count(command.run_id)? != 1 {
+                return Err(StoreError::CorruptDatabase(
+                    "cancel receipt has neither a request event nor a terminal".into(),
+                ));
+            }
+            return Ok(Some(CancelGenerationOutcome {
+                event: None,
+                receipt,
+                request_fingerprint,
+                replayed: true,
+            }));
+        };
         let run_id = parse_id(&row.1, "cancel run_id")?;
         let kind: GenerationEventKind = serde_json::from_str(&row.4)?;
         if run_id != command.run_id
@@ -2428,7 +2461,7 @@ impl ProjectStore {
             ));
         }
         Ok(Some(CancelGenerationOutcome {
-            event: GenerationEvent {
+            event: Some(GenerationEvent {
                 event_id: parse_id(&row.0, "cancel event_id")?,
                 run_id,
                 branch_id: parse_id(&row.2, "cancel branch_id")?,
@@ -2437,7 +2470,7 @@ impl ProjectStore {
                 })?,
                 kind,
                 occurred_at_ms: row.6,
-            },
+            }),
             receipt,
             request_fingerprint,
             replayed: true,
@@ -4958,6 +4991,98 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn cancel_after_completion_retains_terminal_and_replays_without_new_events() {
+        let mut fixture = Fixture::new();
+        let started = fixture.start(fixture.writer_environment);
+        let other = fixture.start(fixture.writer_environment);
+        let run_id = started.generation.run_id;
+        fixture.finish(run_id, "the completed suggestion");
+        let before = fixture
+            .store
+            .generation_terminal_evidence(run_id)
+            .expect("read terminal evidence");
+        let event_count = |store: &ProjectStore| -> i64 {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM generation_events WHERE run_id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("count generation events")
+        };
+        let before_events = event_count(&fixture.store);
+        let command_id = CommandId::new();
+        let command = CancelGenerationCommand { run_id };
+        let requested = fixture
+            .store
+            .request_cancel_generation_with_command(command_id, command)
+            .expect("completed run already satisfies cancellation");
+        assert!(requested.event.is_none());
+        assert!(!requested.replayed);
+        let replay = fixture
+            .store
+            .request_cancel_generation_with_command(command_id, command)
+            .expect("replay terminal-satisfied cancellation");
+        assert!(replay.event.is_none());
+        assert!(replay.replayed);
+        assert_eq!(replay.receipt, requested.receipt);
+        assert_eq!(replay.request_fingerprint, requested.request_fingerprint);
+        assert_eq!(event_count(&fixture.store), before_events);
+        assert_eq!(
+            fixture
+                .store
+                .generation_terminal_evidence(run_id)
+                .expect("read unchanged evidence"),
+            before
+        );
+        let second = fixture
+            .store
+            .request_cancel_generation_with_command(CommandId::new(), command)
+            .expect("independent late cancellation is also satisfied");
+        assert!(second.event.is_none());
+        assert!(!second.replayed);
+        assert_eq!(event_count(&fixture.store), before_events);
+        assert!(matches!(
+            fixture.store.request_cancel_generation_with_command(
+                command_id,
+                CancelGenerationCommand { run_id: other.generation.run_id },
+            ),
+            Err(StoreError::IdempotencyConflict { command_id: conflict }) if conflict == command_id
+        ));
+
+        // A bare receipt cannot make an open run look cancelled.
+        let malformed_command = CancelGenerationCommand {
+            run_id: other.generation.run_id,
+        };
+        let mut malformed_receipt = requested.receipt;
+        malformed_receipt.command_id = CommandId::new();
+        let transaction = fixture
+            .store
+            .connection
+            .transaction()
+            .expect("fixture transaction");
+        persist_receipt_in(&transaction, &malformed_receipt).expect("fixture receipt");
+        insert_command_request(
+            &transaction,
+            malformed_receipt.command_id,
+            cancel_generation_fingerprint(malformed_command).expect("fingerprint"),
+            CommandKind::CancelGeneration,
+            malformed_receipt.started_at_ms,
+        )
+        .expect("fixture request");
+        transaction.commit().expect("commit malformed fixture");
+        assert!(matches!(
+            fixture.store.request_cancel_generation_with_command(
+                malformed_receipt.command_id,
+                malformed_command,
+            ),
+            Err(StoreError::CorruptDatabase(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn cancel_exact_retry_survives_terminal_and_rejects_command_reuse() {
         let mut fixture = Fixture::new();
         let first = fixture.start(fixture.writer_environment);
@@ -4983,6 +5108,7 @@ mod tests {
             .request_cancel_generation_with_command(command_id, command)
             .expect("replay cancellation after terminal");
         assert!(!requested.replayed);
+        assert!(requested.event.is_some());
         assert!(replay.replayed);
         assert_eq!(replay.event, requested.event);
         assert_eq!(replay.receipt, requested.receipt);
@@ -6670,6 +6796,54 @@ mod tests {
             mismatch,
             Err(StoreError::IdempotencyConflict { .. })
         ));
+    }
+
+    #[test]
+    fn native_observation_guard_retains_pending_receipt_without_overwriting_visible_bytes() {
+        let mut fixture = Fixture::new();
+        let path = fixture.store.root.join("manuscript/001.md");
+        let before = fs::read(&path).expect("visible source");
+        let outcome = fixture
+            .store
+            .save_document_if_source_with_guard(
+                "manuscript/001.md",
+                DocumentContent::Prose("new editor value".into()),
+                "native metadata guard",
+                fixture.loaded.revision_id,
+                fixture.loaded.blob_id,
+                |_| {
+                    Err(StoreError::Io(std::io::Error::other(
+                        "native observation was replaced",
+                    )))
+                },
+            )
+            .expect("retain the committed semantic revision and failed projection receipt");
+        assert!(matches!(
+            outcome.visible_projection,
+            crate::VisibleProjectionState::PendingRetry { .. }
+        ));
+        assert_eq!(fs::read(path).expect("original remains visible"), before);
+        assert_eq!(
+            fixture
+                .store
+                .pending_outbox_count()
+                .expect("pending receipt"),
+            1
+        );
+        assert_eq!(
+            fixture
+                .store
+                .reconstruct_revision(outcome.save.revision_id)
+                .expect("immutable intended value"),
+            b"new editor value"
+        );
+        assert!(
+            fixture
+                .store
+                .load_receipt(outcome.save.receipt.command_id)
+                .expect("committed receipt")
+                .is_some()
+        );
     }
 
     #[test]

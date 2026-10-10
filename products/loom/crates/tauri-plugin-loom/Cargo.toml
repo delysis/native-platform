@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+archive-friends = { path = "../../../../crates/services/archive-friends" }
+cap-std = "=4.0.2"
+cap-fs-ext = "=4.0.2"
 desktop-model-defaults.workspace = true
 fs4.workspace = true
 fte-types = { path = "../../../fte/crates/fte-types" }
@@ -28,6 +31,7 @@ base64.workspace = true
 cpal = "=0.16.0"
 crossbeam-channel.workspace = true
 hound.workspace = true
+hayro = "=0.7.1"
 http.workspace = true
 image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 loom-document = { path = "../loom-document" }
@@ -35,6 +39,7 @@ loom-backend-llama = { path = "../loom-backend-llama" }
 loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
+loom-preferences = { path = "../loom-preferences" }
 llama-native-types.workspace = true
 notify.workspace = true
 naga = { version = "29.0.3", default-features = false, features = ["wgsl-in", "glsl-out"] }
@@ -52,6 +57,12 @@ tauri-plugin-opener = "2.5.4"
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
+toml_edit = "=0.25.13"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# sha2 0.10 gates ARM SHA instructions behind this feature. Verify every byte
+# without making local model startup wait on the portable software compressor.
+sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

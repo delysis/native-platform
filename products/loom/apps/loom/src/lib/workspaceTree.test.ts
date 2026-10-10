@@ -11,6 +11,21 @@ const photo = material('photo', 'Notes/Photo.png', 'Photograph');
 const external = material('external', null, 'Private external library');
 
 describe('workspace physical material navigation', () => {
+  it('shows empty physical directories and merges them with populated paths without duplicate rows', () => {
+    const directories = ['Empty', 'Empty/Nested', 'Notes', 'Notes/Clippings'];
+    expect(workspaceRows(documents, new Set(), '', [paper], directories).map(row => row.path)).toEqual([
+      'Empty/', 'Empty/Nested/', 'Notes/', 'Notes/Clippings/', 'Notes/Clippings/Paper.pdf',
+      'Notes/Clippings/Thought.md', 'Notes/Draft.md', 'Writing.md'
+    ]);
+    expect(workspaceRows([], new Set(['Empty/']), '', [], directories).map(row => row.path)).toEqual([
+      'Empty/', 'Notes/', 'Notes/Clippings/'
+    ]);
+    expect(workspaceRows([], new Set(['Empty/']), 'nested', [], directories).map(row => row.path)).toEqual([
+      'Empty/', 'Empty/Nested/'
+    ]);
+    expect(workspaceRows([], new Set(), 'missing', [], directories)).toEqual([]);
+  });
+
   it('places copied material in its real folder alongside writing without inventing a material section', () => {
     const rows = workspaceRows(documents, new Set(), '', [paper, photo, external]);
     expect(rows.map(row => [row.path, row.depth])).toEqual([

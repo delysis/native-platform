@@ -28,12 +28,12 @@ fn wav(sample: i16) -> Vec<u8> {
 
 #[test]
 fn direct_attachment_media_is_bound_to_the_admitted_revision() {
-    let (_directory, store) = project();
+    let (_directory, mut store) = project();
     let bytes = wav(42);
     let prepared =
         crate::context_attachments::import_recorded_wav(store.root(), "voice.wav".into(), &bytes)
             .expect("retain");
-    let entry = materials::bind_attachment(&store, &prepared.id, Some("Voice")).expect("bind");
+    let entry = materials::bind_attachment(&mut store, &prepared.id, Some("Voice")).expect("bind");
     let value = resolve(&store, &entry.id).expect("resolve");
     let media = native_media(&store, [&value]).expect("direct media");
     assert_eq!(media.len(), 1);

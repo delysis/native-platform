@@ -92,6 +92,8 @@ pub(crate) struct ContextAttachmentPresentation {
     pub(crate) excerpt: Option<String>,
     #[serde(default)]
     pub(crate) pdf_pages: Vec<PdfPageLocation>,
+    #[serde(default)]
+    pub(crate) pdf_preview_token: Option<String>,
 }
 
 /// An extracted PDF page's exact byte span in the retained canonical text.
@@ -249,8 +251,6 @@ pub(crate) enum ContextAttachmentError {
     SourceSize,
     #[error("attachment processing failed: {0}")]
     Processing(String),
-    #[error("the attachment produced no safe text or media representation")]
-    NoRepresentation,
     #[error("the document context already contains Loom's 32-attachment limit")]
     ContextLimit,
     #[error("pasted context exceeds Loom's 256 KB saved-text limit")]
@@ -609,12 +609,6 @@ pub(crate) fn prepare_provided(
         ));
     }
     let id = prepared.bundle.graph.root.0.clone();
-    if prepared.bundle.graph.objects.iter().any(|object| {
-        object.id == prepared.bundle.graph.root
-            && object.detection.selected == Some(DetectedFormat::Executable)
-    }) {
-        return Err(ContextAttachmentError::NoRepresentation);
-    }
     // Retaining an original does not assert extraction or model support.
     // Identity is the root's content hash, shared with its immutable receipt.
     install_object(project_root, &id, &original)?;
@@ -1103,6 +1097,7 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
         source_revision: String::new(),
         excerpt: None,
         pdf_pages: manifest.pdf_pages,
+        pdf_preview_token: None,
         id: manifest.attachment.id,
         file_name: manifest.attachment.file_name,
         detected_format: manifest.attachment.detected_format,
@@ -1156,6 +1151,15 @@ pub(crate) fn describe_source(
     let mut presentation = attachment_presentation(manifest);
     presentation.source_revision = revision;
     Ok(presentation)
+}
+
+pub(crate) fn source_byte_count(
+    project_root: &Path,
+    attachment_id: &str,
+) -> Result<u64, ContextAttachmentError> {
+    Ok(read_manifest_metadata(project_root, attachment_id)?
+        .attachment
+        .byte_count)
 }
 
 /// A named material reference explicitly selects this retained source alone.
@@ -2067,18 +2071,63 @@ pub(crate) fn original_path(
     Ok(attachment_root(project_root)?.join("objects").join(id))
 }
 
+pub(crate) fn read_pdf_original(
+    project_root: &Path,
+    id: &str,
+) -> Result<Vec<u8>, ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, id)?;
+    if manifest.attachment.detected_format != "pdf" {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    read_object(project_root, id, manifest.attachment.byte_count)
+}
+
 /// Acquisition provenance is separate from the offline processing receipt.
 /// The receipt is immutable and contains no OAuth credential material.
 pub(crate) fn record_import_origin(
     project_root: &Path,
     origin: &impl Serialize,
-) -> Result<(), ContextAttachmentError> {
+) -> Result<String, ContextAttachmentError> {
     let bytes = serde_json::to_vec_pretty(origin)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
     let hash = format!("{:x}", Sha256::digest(&bytes));
+    let id = format!("source-{hash}");
     let path = attachment_root(project_root)?
         .join("manifests")
-        .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+        .join(format!("{id}.json"));
+    install_immutable(&path, &bytes)?;
+    Ok(id)
+}
+
+pub(crate) fn read_import_origin(
+    project_root: &Path,
+    id: &str,
+) -> Result<serde_json::Value, ContextAttachmentError> {
+    let hash = id
+        .strip_prefix("source-")
+        .filter(|hash| is_sha256(hash))
+        .ok_or(ContextAttachmentError::ContextInvalid)?;
+    let path = attachment_root(project_root)?
+        .join("manifests")
+        .join(format!("{id}.json"));
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    let file = File::open(&path)?;
+    let identity = FileIdentityHandle::from_file(file.try_clone()?)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024
+        || FileIdentityHandle::from_path(&path)? != identity
+        || fs::symlink_metadata(&path)?.file_type().is_symlink()
+        || format!("{:x}", Sha256::digest(&bytes)) != hash
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]
@@ -2637,56 +2686,86 @@ mod tests {
 
     #[test]
     fn source_only_files_retain_originals_without_inventing_model_content() {
-        let project = tempfile::tempdir().unwrap();
-        let source = tempfile::tempdir().unwrap();
-        let bytes = b"\x00\xff\xfe\xfd\x80\x81\x82\x83";
-        let path = source.path().join("Archive.bin");
-        fs::write(&path, bytes).unwrap();
-        let attachment = import_path(project.path(), &path).unwrap();
-        assert_eq!(attachment.text_bytes, 0);
-        assert!(attachment.media_kinds.is_empty());
-        assert!(attachment.editable_markdown.is_none());
-        assert!(
-            attachment
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("not sent to the model"))
-        );
-        fs::remove_file(&path).unwrap();
-        assert_eq!(
-            fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
-            bytes
-        );
-        let snapshot = add_document_context_snapshot(
-            project.path(),
-            "doc",
-            std::slice::from_ref(&attachment.id),
-        )
-        .unwrap();
-        assert_eq!(
-            snapshot.attachments[0].presentation_kind,
-            ContextAttachmentPresentationKind::File
-        );
-        let persisted = set_document_context_snapshot(
-            project.path(),
-            "doc",
-            "",
-            std::slice::from_ref(&attachment.id),
-        )
-        .unwrap();
-        assert_eq!(persisted.attachments.len(), 1);
-        let resolved =
-            resolve_for_generation_with_budget(project.path(), "doc", "Writing", 32768, 4, 128)
-                .unwrap();
-        assert!(resolved.media.is_empty());
-        assert!(resolved.context_preamble.is_empty());
-        assert_eq!(resolved.manuscript_prompt, "Writing");
-        assert!(
-            remove_document_context_snapshot(project.path(), "doc", &attachment.id)
-                .unwrap()
-                .attachments
-                .is_empty()
-        );
+        for (name, bytes, executable) in [
+            (
+                "Archive.bin",
+                b"\x00\xff\xfe\xfd\x80\x81\x82\x83".as_slice(),
+                false,
+            ),
+            ("Program.elf", b"\x7fELF\x02\x01\x01\x00".as_slice(), true),
+            (
+                "Program.exe",
+                b"MZ\x00\x00\xff\xfe\x80\x81".as_slice(),
+                true,
+            ),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let source = tempfile::tempdir().unwrap();
+            let path = source.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let attachment = import_path(project.path(), &path).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            if executable {
+                assert_eq!(attachment.detected_format, "executable");
+            }
+            assert_eq!(attachment.text_bytes, 0);
+            assert!(attachment.media_kinds.is_empty());
+            assert!(attachment.editable_markdown.is_none());
+            assert!(
+                attachment
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("not sent to the model"))
+            );
+            let retained = original_path(project.path(), &attachment.id).unwrap();
+            assert_eq!(fs::read(&retained).unwrap(), bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&retained).unwrap().permissions().mode() & 0o111,
+                    0
+                );
+            }
+            let snapshot = add_document_context_snapshot(
+                project.path(),
+                "doc",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot.attachments[0].presentation_kind,
+                ContextAttachmentPresentationKind::File
+            );
+            let persisted = set_document_context_snapshot(
+                project.path(),
+                "doc",
+                "",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            assert_eq!(persisted.attachments.len(), 1);
+            let resolved =
+                resolve_for_generation_with_budget(project.path(), "doc", "Writing", 32768, 4, 128)
+                    .unwrap();
+            assert!(resolved.media.is_empty());
+            assert!(resolved.context_preamble.is_empty());
+            assert_eq!(resolved.manuscript_prompt, "Writing");
+            assert!(
+                remove_document_context_snapshot(project.path(), "doc", &attachment.id)
+                    .unwrap()
+                    .attachments
+                    .is_empty()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&retained).unwrap(), bytes);
+            // A missing external original does not erase the retained source.
+            fs::remove_file(&path).unwrap();
+            assert_eq!(
+                fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]

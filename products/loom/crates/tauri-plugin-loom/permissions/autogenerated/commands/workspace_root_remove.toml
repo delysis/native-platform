@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-root-remove"
+description = "Enables the workspace_root_remove command without any pre-configured scope."
+commands.allow = ["workspace_root_remove"]
+
+[[permission]]
+identifier = "deny-workspace-root-remove"
+description = "Denies the workspace_root_remove command without any pre-configured scope."
+commands.deny = ["workspace_root_remove"]

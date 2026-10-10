@@ -1,11 +1,15 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { resolveWorkspaceReference } from './lib/ipc';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { Menu } from '@tauri-apps/api/menu';
+  import { LogicalPosition } from '@tauri-apps/api/dpi';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
   import PaneDivider from './lib/PaneDivider.svelte';
   import PaneHeader from './lib/PaneHeader.svelte';
+  import { visiblePanes, togglePaneVisibility } from './lib/paneLayout';
   import Loompad from './lib/Loompad.svelte';
   import { loompadPrefix, type LoompadLength } from './lib/loompad';
   import type { CompletionCandidate } from './lib/completionSession';
@@ -15,14 +19,17 @@
   import { readWorkspaceFolders, rememberWorkspaceFolder, forgetWorkspaceFolder, renameWorkspaceFolder,
     workspaceFolderGroups, workspaceFolderLabels, type WorkspaceFolder } from './lib/workspaceFolders';
   import { captureSidebarTarget, sidebarItemKey, sidebarCapabilities, sidebarKeyAction, sidebarScopeIsCurrent,
-    sidebarTargetIsCurrent, type CapturedSidebarTarget, type RootSidebarTarget, type MaterialSidebarTarget, type SidebarCapability, type SidebarLiveState } from './lib/sidebarInteractions';
+    sidebarTargetIsCurrent, sidebarTargetScopeIsCurrent, type CapturedSidebarTarget, type RootSidebarTarget, type MaterialSidebarTarget, type SidebarCapability, type SidebarLiveState } from './lib/sidebarInteractions';
   import { createRenameCompositionGuard, handleInlineRenameKey } from './lib/interactionPrimitives';
   import { compositionOwnsKey, createTextCompositionBoundary, nativeEditingCommand, textEditingElement } from './lib/textEditingInteractions';
+  import { workspaceFoldersForProject, workspaceRootIsActive, type MountedWorkspaceFolderRow, type WorkspaceRootsSnapshot } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
+  import { WorkspacePaneDrafts, type WorkspacePanePreparation } from './lib/workspacePaneDrafts';
   import MaterialView from './lib/MaterialView.svelte';
-  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence, pinMaterial, removeMaterial, renameMaterial } from './lib/ipc';
+  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence, pinMaterial, removeMaterial, renameMaterial, resolveMaterialReference } from './lib/ipc';
   import { canEditMaterialMetadata, materialMetadataRevision, materialDisplayNameError, materialSourceIsUnchanged, sameMaterialObservation, materialRenameReceiptMatches } from './lib/materialMetadata';
-  import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
+  import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence, type MaterialNavigation } from './lib/materials';
+  import { resolveScopedMaterialReference } from './lib/materialEvidenceScope';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
@@ -32,6 +39,9 @@
   import MaterialExcerpt from './lib/MaterialExcerpt.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
+    getPreferences,
+    updatePreferences,
+    type LoomPreferences,
     abortApplicationClose,
     runTerminal,
     listTerminalRuns,
@@ -47,7 +57,11 @@
     clearTransientDraft,
     applyDocumentReconciliation,
     chooseAttachments,
+    chooseWorkspaceSources,
     prepareProjectOpen,
+    getWorkspaceRoots,
+    prepareWorkspaceRoot,
+    removeWorkspaceRoot,
     commitProjectOpen,
     discardProjectOpen,
     chooseModel,
@@ -68,6 +82,8 @@
     ingestImageAttachment,
     importAttachmentPaths,
     copyWorkspaceFiles,
+    copyWorkspaceFolder,
+    cancelImportAccount,
     revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
@@ -411,6 +427,9 @@
   let opening = false;
   let search = '';
   let workspaceFolders: WorkspaceFolder[] = [];
+  let workspaceRoots: WorkspaceRootsSnapshot | null = null;
+  let workspaceRootsScope = '';
+  let workspaceRootsSerial = 0;
   let workspaceRootExpanded = true;
   let workspaceDocuments: Record<string, string> = {};
   let workspaceDropActive = false;
@@ -441,12 +460,13 @@
     cancelMaterialRename(false);
   }
   $: if (sidebarContextTarget && !sidebarTargetIsCurrent(sidebarContextTarget,
-    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) closeDocumentContextMenu(false);
+    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries, materialScope: materialOwnerScope })) closeDocumentContextMenu(false);
   $: if (renamingWorkspaceRoot && !sidebarTargetIsCurrent(renamingWorkspaceRoot,
-    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries })) cancelWorkspaceLabelRename(false);
+    { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries, materialScope: materialOwnerScope })) cancelWorkspaceLabelRename(false);
   // A refreshed row does not authorize rebasing an in-progress rename. Keep its
   // exact input visible, but its original native revision must still match.
   $: if (renamingMaterialTarget && !materialEntries.some(item => item.id === renamingMaterialTarget?.material.id)) cancelMaterialRename(false);
+  $: mountedWorkspaceFolders = workspaceFoldersForProject(workspaceRoots, workspaceRootsScope, project);
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
@@ -455,6 +475,9 @@
   let templateKey = '';
   let templateSerial = 0;
   let paneSelection: Record<string, string> = {};
+  const paneDrafts = new WorkspacePaneDrafts();
+  let workspaceOutputRevision = 0;
+  let workspaceRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let hiddenPaneSlots = new Set<string>();
   let workspaceWidth = 1000;
   let workspaceHeight = 600;
@@ -467,9 +490,11 @@
   $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
   $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
   $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
-  $: mainPaneOpen = !hiddenPaneSlots.has('main');
-  $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
-  $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
+  $: equippedPanePositions = paneSlots.filter(slot => slot.selected).map(slot => slot.position);
+  $: paneVisibility = visiblePanes(equippedPanePositions, hiddenPaneSlots);
+  $: mainPaneOpen = paneVisibility.main;
+  $: rightPaneOpen = paneVisibility.right;
+  $: bottomPaneOpen = paneVisibility.bottom;
   $: mainColumn = mainPaneOpen ? 'minmax(0,1fr)' : '0px';
   $: sideColumn = mainPaneOpen ? (rightPaneOpen ? `${Math.min(rightWidth, rightLimit)}px` : '0px') : 'minmax(0,1fr)';
   $: bottomOnly = bottomPaneOpen && !mainPaneOpen && !rightPaneOpen;
@@ -494,6 +519,12 @@
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
   let pinnedOutputs = new Set<string>();
+  let ownerPinnedOutputs = new Set<string>();
+  let ownerPinsSession = '';
+  $: if (workspaceRoots && ownerPinsSession !== workspaceRoots.workspace_session_id) {
+    ownerPinsSession = workspaceRoots.workspace_session_id;
+    ownerPinnedOutputs = readPinnedOutputs(window.localStorage, workspaceRoots.workspace_id);
+  }
   function toggleOutputPin(documentId: string): void {
     if (!project || !project.documents.some(item => item.document_id === documentId)) return;
     const next = new Set(pinnedOutputs);
@@ -501,6 +532,7 @@
     try { rememberPinnedOutputs(window.localStorage, project.project_id, next); }
     catch { announce('This navigation pin could not be saved on this device.'); }
     pinnedOutputs = next;
+    if (workspaceOwnerActive) ownerPinnedOutputs = new Set(next);
   }
   let terminalDispatching = false;
   let terminalCancelRequested = false;
@@ -515,63 +547,102 @@
   let addMenuOpen = false;
   let materialEntries: MaterialEntry[] = [];
   let materialRefreshSerial = 0;
+  type MaterialScope = { projectId: string; sessionId: string };
+  $: materialOwnerScope = workspaceRoots ? { projectId: workspaceRoots.workspace_id, sessionId: workspaceRoots.workspace_session_id } : null;
+  $: workspaceOwner = workspaceRoots?.roots.find(root => root.owner);
+  $: workspaceOwnerActive = Boolean(project && workspaceOwner && workspaceRootIsActive(workspaceOwner, project));
+  $: referenceScope = project ? {
+    projectId: project.project_id, sessionId: project.session_id,
+    revision: JSON.stringify([project.documents.map(item => [item.document_id, item.revision_id, item.relative_path, item.title, item.externally_modified]), materialEntries.map(item => [item.id, item.name, item.available])])
+  } : null;
   let materialScope = '';
   let activeMaterial: MaterialEntry | null = null;
+  let activeMaterialScope: MaterialScope | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
+  let materialNavigation = new Map<string, { scope: MaterialScope; navigation: MaterialNavigation }>();
+  function materialNavigationKey(scope: MaterialScope, id: string): string { return JSON.stringify([scope.projectId, scope.sessionId, id]); }
+  function rememberMaterialNavigation(scope: MaterialScope, id: string, navigation: MaterialNavigation): void {
+    if ((!isOwnerMaterialScope(scope) && (project?.project_id !== scope.projectId || project?.session_id !== scope.sessionId)) || activeMaterial?.id !== id) return;
+    const key = materialNavigationKey(scope, id);
+    if (JSON.stringify(materialNavigation.get(key)?.navigation) === JSON.stringify(navigation)) return;
+    const next = new Map(materialNavigation); next.delete(key); next.set(key, { scope, navigation });
+    if (next.size > 128) next.delete(next.keys().next().value!);
+    materialNavigation = next;
+  }
+  $: pruneMaterialNavigation(materialOwnerScope, project?.project_id, project?.session_id);
+  function pruneMaterialNavigation(owner: MaterialScope | null, projectId?: string, sessionId?: string): void {
+    const next = new Map([...materialNavigation].filter(([, { scope }]) =>
+      (owner?.projectId === scope.projectId && owner.sessionId === scope.sessionId) || (projectId === scope.projectId && sessionId === scope.sessionId)));
+    if (next.size !== materialNavigation.size) materialNavigation = next;
+  }
   let materialOriginPane: string | null = null;
   let materialOrigin: {
     projectId: string; sessionId: string; documentId: string; title: string; markdown: string;
     mode: EditorMode; visualAnchor: VisualTextInsertionAnchor | null; sourceAnchor: SourceTextInsertionAnchor | null;
     paneInsert: ((markdown: string) => boolean) | null; paneId: string | null;
   } | null = null;
-  $: if (desktop && project && materialScope !== `${project.project_id}/${project.session_id}`) {
-    materialScope = `${project.project_id}/${project.session_id}`;
-    activeMaterial = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
+  $: if (desktop && materialOwnerScope && materialScope !== `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`) {
+    materialScope = `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`;
+    materialNavigation = new Map();
+    activeMaterial = null; activeMaterialScope = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
     void refreshMaterials();
   }
-  $: if (!project) { materialScope = ''; materialEntries = []; activeMaterial = null; materialOrigin = null; }
-  $: visibleMaterials = materialEntries.filter(item => !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
+  $: if (materialOrigin && (project?.project_id !== materialOrigin.projectId || project?.session_id !== materialOrigin.sessionId || document?.summary.document_id !== materialOrigin.documentId)) materialOrigin = null;
+  $: if (activeMaterialScope && !isOwnerMaterialScope(activeMaterialScope) && (project?.project_id !== activeMaterialScope.projectId || project?.session_id !== activeMaterialScope.sessionId)) {
+    activeMaterial = null; activeMaterialScope = null; activeMaterialEvidence = null;
+  }
+  $: visibleMaterials = materialEntries.filter(item => workspaceOwnerActive && !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name));
 
   async function refreshMaterials(): Promise<void> {
-    if (!project) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const captured = materialOwnerScope;
+    if (!captured) return;
     const request = ++materialRefreshSerial;
     try {
       const entries = await listMaterials(captured.projectId, captured.sessionId);
-      if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
+      if (componentMounted && request === materialRefreshSerial && isOwnerMaterialScope(captured)) {
+        const removed = materialEntries.filter(previous => !entries.some(entry => entry.id === previous.id));
+        if (removed.length) {
+          const next = new Map(materialNavigation);
+          for (const item of removed) next.delete(materialNavigationKey(captured, item.id));
+          materialNavigation = next;
+          if (activeMaterial && removed.some(item => item.id === activeMaterial?.id) && activeMaterialScope && isOwnerMaterialScope(activeMaterialScope)) closeMaterial();
+        }
         const existing = new Map(materialEntries.map(item => [item.id, item]));
         materialEntries = entries.map(item => {
           const previous = existing.get(item.id);
           return previous && sameMaterialObservation(previous, item) ? previous : item;
         });
-        // Refresh display metadata without remounting the source/evidence view.
-        if (activeMaterial) activeMaterial = materialEntries.find(item => item.id === activeMaterial?.id) ?? activeMaterial;
+        if (activeMaterial && activeMaterialScope && isOwnerMaterialScope(activeMaterialScope)) activeMaterial = materialEntries.find(item => item.id === activeMaterial?.id) ?? activeMaterial;
       }
-    } catch (error) { if (componentMounted && request === materialRefreshSerial && project?.project_id === captured.projectId && project.session_id === captured.sessionId) recordFailure(error); }
+    } catch (error) { if (componentMounted && request === materialRefreshSerial && isOwnerMaterialScope(captured)) recordFailure(error); }
   }
-  function captureMaterialOrigin(): void {
+  function isOwnerMaterialScope(scope: MaterialScope): boolean {
+    return workspaceRoots?.workspace_id === scope.projectId && workspaceRoots.workspace_session_id === scope.sessionId;
+  }
+  function captureMaterialOrigin(openedReference?: Element): void {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
-    const paneInsert = materialOriginPane ? paneEditors[materialOriginPane]?.captureReferenceInsertion() ?? null : null;
+    const paneInsert = materialOriginPane ? paneEditors[materialOriginPane]?.captureReferenceInsertion(openedReference) ?? null : null;
     if (materialOriginPane && !paneInsert) { materialOrigin = null; return; }
     materialOrigin = {
       paneInsert, paneId: materialOriginPane,
       projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id,
       title: document.summary.title, markdown: documentText, mode,
-      visualAnchor: mode === 'visual' ? visualEditor?.captureTextInsertionAnchor() ?? null : null,
+      visualAnchor: mode === 'visual' ? visualEditor?.captureTextInsertionAnchor(openedReference) ?? null : null,
       sourceAnchor: mode === 'source' ? sourceEditor?.captureTextInsertionAnchor() ?? null : null
     };
   }
-  function openMaterial(item: MaterialEntry): void {
+  function openMaterial(item: MaterialEntry, openedReference?: Element, scope: MaterialScope | null = materialOwnerScope, captureOrigin = true): void {
+    if (!scope) return;
     if (compositionActive || !flushEditors()) return;
     showMainPane();
-    if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
-    activeMaterialEvidence = null; activeMaterial = item; materialsOpen = false; addMenuOpen = false;
+    if (captureOrigin && !activeMaterial && !materialsOpen) captureMaterialOrigin(openedReference);
+    activeMaterialEvidence = null; activeMaterial = item; activeMaterialScope = scope; materialsOpen = false; addMenuOpen = false;
     clearSuggestionTimerHandle();
   }
   function closeMaterial(): void {
     const paneId = materialOrigin?.paneId;
-    activeMaterialEvidence = null; activeMaterial = null; materialsOpen = false; materialOrigin = null;
+    activeMaterialEvidence = null; activeMaterial = null; activeMaterialScope = null; materialsOpen = false; materialOrigin = null;
     void tick().then(() => {
       if (paneId) paneEditors[paneId]?.focusInput();
       else { visualEditor?.focusCurrentSelection(); sourceEditor?.focusCurrentSelection(); }
@@ -591,51 +662,58 @@
     return inserted;
   }
   function materialRemoved(id: string, sessionId: string, expected?: MaterialEntry): void {
-    if (!componentMounted || project?.session_id !== sessionId) return;
+    if (!componentMounted || workspaceRoots?.workspace_session_id !== sessionId) return;
     if (expected && materialEntries.find(item => item.id === id) !== expected) { void refreshMaterials(); return; }
     materialRefreshSerial += 1;
+    if (materialOwnerScope) { const next = new Map(materialNavigation); next.delete(materialNavigationKey(materialOwnerScope, id)); materialNavigation = next; }
     materialEntries = materialEntries.filter(item => item.id !== id);
     if (activeMaterial?.id === id) closeMaterial();
     void refreshMaterials();
   }
   function materialChanged(item: MaterialEntry): void {
+    // Document-local imports stay local. An identically named source in a
+    // mounted folder must never become a workspace source merely by rendering.
+    if (workspaceOwnerActive && materialOwnerScope) ownerMaterialChanged(item, materialOwnerScope);
+    else if (activeMaterial?.id === item.id && activeMaterialScope?.sessionId === project?.session_id) activeMaterial = item;
+  }
+  function ownerMaterialChanged(item: MaterialEntry, scope: MaterialScope): void {
+    if (!isOwnerMaterialScope(scope)) return;
     if (!componentMounted) return;
     materialRefreshSerial += 1;
     const refreshOtherObservations = item.metadata_revision && materialEntries.some(existing =>
       existing.id !== item.id && existing.metadata_revision !== item.metadata_revision);
     materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
-    if (activeMaterial?.id === item.id) activeMaterial = item;
+    if (activeMaterial?.id === item.id && activeMaterialScope && isOwnerMaterialScope(activeMaterialScope)) activeMaterial = item;
     if (refreshOtherObservations) void refreshMaterials();
+
   }
   async function chooseMaterialLibrary(): Promise<void> {
-    if (!project || fileCommandInFlight || opening) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    if (!project || !materialOwnerScope || fileCommandInFlight || opening) return;
+    const captured = materialOwnerScope;
     if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
     addMenuOpen = false;
     try {
       const item = await addLibraryMaterial(captured.projectId, captured.sessionId);
-      if (item && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
-        materialChanged(item); openMaterial(item); outlineOpen = true;
+      if (item && isOwnerMaterialScope(captured)) {
+        ownerMaterialChanged(item, captured); openMaterial(item, undefined, captured, false); outlineOpen = true;
       }
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+    } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
   }
   async function chooseMaterialFiles(): Promise<void> {
-    if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    if (!project || !materialOwnerScope || fileCommandInFlight || opening || contextAttachmentBusy) return;
+    const captured = materialOwnerScope;
+    const operationId = newUlid();
     captureMaterialOrigin(); addMenuOpen = false; contextAttachmentBusy = true;
     try {
-      const report = await chooseAttachments(captured.projectId, captured.sessionId);
-      for (const attachment of report.imported) {
-        const item = await bindAttachmentMaterial(captured.projectId, captured.sessionId, attachment.id);
-        if (project?.session_id !== captured.sessionId) return;
-        materialChanged(item);
-      }
+      const report = await chooseWorkspaceSources(captured.projectId, captured.sessionId, operationId);
+      if (!isOwnerMaterialScope(captured)) return;
+      if (report.workspace_id !== captured.projectId || report.workspace_session_id !== captured.sessionId || report.operation_id !== operationId) throw new Error('The source import belongs to a different workspace.');
+      for (const { material } of report.imported) if (material) ownerMaterialChanged(material, captured);
       if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
-      if (project?.session_id !== captured.sessionId) return;
       outlineOpen = true;
-      const first = materialEntries.find(item => item.attachment_id === report.imported[0]?.id);
-      if (first) openMaterial(first);
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+      const first = report.imported.find(item => item.material)?.material;
+      if (first) openMaterial(first, undefined, captured, false);
+    } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
     finally { contextAttachmentBusy = false; }
   }
   function openMaterialConnections(): void {
@@ -662,7 +740,7 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     formattingDiagnostic: () => string;
     insertTextAtSelection: (text: string) => boolean;
-    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    captureTextInsertionAnchor: (openedReference?: Element) => VisualTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let contextSourceTextarea: HTMLTextAreaElement | undefined;
@@ -677,6 +755,7 @@
     selectionEmpty: true
   };
   let contextAttachmentBusy = false;
+  let copyingFolder: { projectId: string; sessionId: string; destination: string; operationId: string } | null = null;
   let contextLoadError = '';
   let contextDropActive = false;
   let contextDocumentId = '';
@@ -913,7 +992,7 @@
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
-    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    captureTextInsertionAnchor: (openedReference?: Element) => VisualTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let sourceEditor: {
@@ -1051,6 +1130,7 @@
   }
 
   interface WeaveCapture {
+    mode: EditorMode;
     contextEpoch: number;
     commandId: string;
     epoch: number;
@@ -1208,7 +1288,7 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries);
+  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, workspaceOwnerActive ? materialEntries : [], project?.directories ?? []);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   let configuredWriter: { model_id: string; completion: boolean } | null = null;
@@ -1227,7 +1307,7 @@
     transition === 'idle'
   );
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
-  $: availableWriterModels = orderedLocalTextModels(models, loadLastLocalModelPath());
+  $: availableWriterModels = orderedLocalTextModels(models, sharedPreferences?.last_local_model ?? null);
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
     ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
@@ -1418,10 +1498,22 @@
         : null
       : null;
   $: completionWitnessSelected = completionView.witnessSelected;
+  let nativeDropWitness: { type: string; point: { x: number; y: number } | null; scope: string | null; path_count: number } | null = null;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    native_drop: nativeDropWitness,
     writer_id: currentWriter?.model_id ?? '',
     writer_source: configuredWriter ? 'configured_server' : 'native',
+    writer_setup: {
+      pending: Boolean(preferredWriterPending),
+      preparing: Boolean(preferredWriterEnsureInFlight),
+      loading: modelLoading,
+      refreshing: modelRefreshInFlightCount,
+      template_ready: Boolean(workspaceTemplate && !workspaceTemplate.error),
+      template_scope: workspaceTemplateScope,
+      transition,
+      failure: quietModelLoadFailure?.code ?? '',
+    },
     mode,
     context_key: boundCompletionSession?.contextKey ?? '',
     session_cached: Boolean(boundCompletionSession),
@@ -2327,6 +2419,11 @@
       ) return;
       const report = await chooseAttachments(captured.projectId, captured.sessionId);
       const imported = report.imported;
+      if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId) return;
+      if (report.references?.length) {
+        updateContextText([contextText, ...report.references].filter(Boolean).join('\n\n'));
+        if (!await persistCurrentContextText()) return;
+      }
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
       const snapshot = imported.length === 0
         ? null
@@ -2344,7 +2441,7 @@
           captured.documentId
         )) return;
       }
-      if (imported.length > 0) announce(`${imported.length} context attachment${imported.length === 1 ? '' : 's'} ready`);
+      if (imported.length || report.references?.length) announce('Sources ready');
     } catch (error) {
       recordFailure(error);
       announce('Loom could not add that context attachment');
@@ -2354,25 +2451,17 @@
   }
 
   async function addImportedSources(items: import('./lib/types').ContextAttachment[], projectId: string, sessionId: string): Promise<void> {
-    const current = () => project?.project_id === projectId && project.session_id === sessionId;
-    const failures: string[] = [];
-    for (const item of items) {
-      if (!current()) return;
-      try {
-        const bound = await bindAttachmentMaterial(projectId, sessionId, item.id);
-        if (current()) materialChanged(bound);
-      } catch (error) { failures.push(`${item.file_name}: ${normalizeFailure(error).message}`); }
-    }
-    if (current() && failures.length) throw new Error(failures.join('\n'));
+    if (items.length && isOwnerMaterialScope({ projectId, sessionId })) await refreshMaterials();
   }
 
   async function openImportedSource(item: import('./lib/types').ContextAttachment, projectId: string, sessionId: string): Promise<void> {
-    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
-    const bound = materialEntries.find(entry => entry.attachment_id === item.id)
-      ?? await bindAttachmentMaterial(projectId, sessionId, item.id);
-    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
-    materialChanged(bound);
-    openMaterial(bound);
+    const scope = { projectId, sessionId };
+    if (!isOwnerMaterialScope(scope)) return;
+    await refreshMaterials();
+    if (!isOwnerMaterialScope(scope)) return;
+    const bound = materialEntries.find(entry => entry.attachment_id === item.id);
+    if (!bound) throw new Error('The original is retained, but this source could not be opened.');
+    openMaterial(bound, undefined, scope, false);
   }
 
   async function saveMaterialExcerpt(attachmentId: string, sourceRevision: string, excerpt: string | null): Promise<boolean> {
@@ -2459,21 +2548,24 @@
         document?.summary.document_id !== captured.documentId
       ) return;
       const filePaths = paths.filter(path => !isDatabasePath(path));
-      const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
-      const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], failures: [] };
+      const owner = materialOwnerScope;
+      const libraryPaths = paths.filter(isDatabasePath);
+      if (libraryPaths.length && !owner) throw new Error('The workspace is not ready for sources yet.');
+      const libraries = owner ? await Promise.all(libraryPaths.map(path => addLibraryMaterialPath(owner.projectId, owner.sessionId, path))) : [];
+      const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], references: [], failures: [] };
       if (project?.session_id !== captured.sessionId) return;
-      libraries.forEach(materialChanged);
+      if (owner) libraries.forEach(item => ownerMaterialChanged(item, owner));
       const imported = report.imported;
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
-      if (!imported.length && !libraries.length) return;
+      if (!imported.length && !libraries.length && !report.references?.length) return;
       if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId ||
           document?.summary.document_id !== captured.documentId || mode !== captured.mode ||
           (scope === 'inline' && documentText !== captured.markdown)) {
         throw new Error('The editor changed during import. The file is stored; drop it again at the intended location.');
       }
       if (scope === 'context') {
-        if (libraries.length) {
-          updateContextText([contextText, ...libraries.map(materialReferenceMarkdown)].filter(Boolean).join('\n\n'));
+        if (libraries.length || report.references?.length) {
+          updateContextText([contextText, ...libraries.map(materialReferenceMarkdown), ...(report.references ?? [])].filter(Boolean).join('\n\n'));
           if (!await persistCurrentContextText()) return;
         }
         const snapshot = await addDocumentContexts(
@@ -2492,7 +2584,7 @@
         const bound = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
         if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId || mode !== captured.mode || documentText !== captured.markdown) throw new Error('The writing changed. Your files are retained in this workspace.');
         bound.forEach(materialChanged);
-        const markdown = [...libraries.map(materialReferenceMarkdown), ...imported.map((item, index) => importedMaterialMarkdown(item, bound[index]))].join('\n\n');
+        const markdown = [...libraries.map(materialReferenceMarkdown), ...(report.references ?? []), ...imported.map((item, index) => importedMaterialMarkdown(item, bound[index]))].join('\n\n');
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
         const prefix = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
@@ -2502,7 +2594,7 @@
           : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, `${prefix}${markdown}${suffix}`);
         if (!inserted) throw new Error('The attachment was stored, but the current editor could not insert its card.');
       }
-      announce(`${imported.length} attachment${imported.length === 1 ? '' : 's'} added`);
+      announce('Sources added');
     } catch (error) {
       recordFailure(error);
       announce('Loom could not attach those files');
@@ -2517,7 +2609,7 @@
     if (fileCommandInFlight || opening || !paths.length) return;
     // Each folder uses the same prepared-open/save/commit path as the picker.
     for (const path of paths.slice(0, 32)) {
-      if (!await doOpenProject(path)) break;
+      if (!await doOpenProject({ path })) break;
     }
   }
 
@@ -2525,7 +2617,89 @@
     return workspaceCopyDestination(window.document.elementFromPoint(point.x, point.y), outlineElement);
   }
 
+  async function copyFolderHere(projectId: string, sessionId: string, destination: string): Promise<void> {
+    if (project?.project_id !== projectId || project.session_id !== sessionId ||
+        fileCommandInFlight || opening || contextAttachmentBusy || copyingFolder) return;
+    const copy = { projectId, sessionId, destination, operationId: newUlid() };
+    copyingFolder = copy;
+    try {
+      const report = await copyWorkspaceFolder(projectId, sessionId, destination, copy.operationId);
+      if (!report || project?.session_id !== sessionId) return;
+      report.materials.forEach(materialChanged);
+      if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
+      announce(`Copied ${report.copied.length} file${report.copied.length === 1 ? '' : 's'}`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      if (copyingFolder === copy) copyingFolder = null;
+      if (project?.session_id === sessionId) {
+        await refreshProjectFilesystemState();
+        await refreshMaterials();
+      }
+    }
+  }
+
+  async function showFolderActions(event: MouseEvent | KeyboardEvent, destination: string, root?: MountedWorkspaceFolderRow): Promise<void> {
+    if (event instanceof KeyboardEvent && !isDocumentContextTriggerKey(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    const active = !root || workspaceRootIsActive(root, project);
+    const workspaceSessionId = workspaceRoots?.workspace_session_id;
+    if (root?.owner && !active) return;
+    const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const at = event instanceof MouseEvent
+      ? new LogicalPosition(event.clientX, event.clientY)
+      : new LogicalPosition(bounds.left + 12, bounds.bottom);
+    let menu: Menu | undefined;
+    try {
+      const copy = copyingFolder;
+      menu = await Menu.new({ items: [...(active ? copy?.sessionId === sessionId && copy.destination === destination
+        ? [{ id: 'stop-folder-copy', text: 'Stop', action: () => {
+            void cancelImportAccount(copy.projectId, copy.sessionId, copy.operationId).catch(recordFailure);
+          } }]
+        : [{ id: 'copy-folder-here', text: 'Copy', enabled: !copy,
+          action: () => { void copyFolderHere(projectId, sessionId, destination).catch(recordFailure); } }] : []),
+        ...(root && !root.owner && !root.transient && workspaceSessionId ? [{ id: 'remove-workspace-folder', text: 'Remove',
+          action: () => { void detachWorkspaceRoot(root, workspaceSessionId); } }] : [])] });
+      await menu.popup(at);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      await menu?.close().catch(recordFailure);
+    }
+  }
+
+  async function detachWorkspaceRoot(root: MountedWorkspaceFolderRow, workspaceSessionId: string): Promise<void> {
+    if (!project || root.owner || root.transient || opening || fileCommandInFlight || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+    try {
+      if (workspaceRootIsActive(root, project)) {
+        const owner = workspaceRoots.roots.find(folder => folder.owner);
+        if (!owner || !await doOpenProject({ rootId: owner.id })) return;
+      }
+      if (!project || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+      fileCommandInFlight = true;
+      if (!flushEditors()) return;
+      await saveNow();
+      if (!project || uncertainSave || saveState === 'error' || saveState === 'uncertain' || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+      await removeWorkspaceRoot(project.project_id, project.session_id, root.id);
+      await refreshWorkspaceRoots();
+      scheduleProjectFilesystemRefresh(0);
+      announce(`Removed ${root.name} from the workspace`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
   async function openMaterialWriting(id: string): Promise<void> {
+    const scope = activeMaterialScope;
+    if (scope && isOwnerMaterialScope(scope) && !workspaceOwnerActive) {
+      const owner = workspaceRoots?.roots.find(root => root.owner);
+      if (!owner || !await doOpenProject({ rootId: owner.id }) || !isOwnerMaterialScope(scope)) return;
+    }
     const candidate = project?.documents.find(item => item.document_id === id);
     if (!candidate) throw new Error('This writing is no longer in the folder.');
     await selectDocument(candidate, true);
@@ -2551,10 +2725,12 @@
           if (destination === null) return;
           const projectId = project.project_id;
           const sessionId = project.session_id;
+          const owner = materialOwnerScope;
           for (const path of paths.filter(isDatabasePath)) {
-            const library = await addLibraryMaterialPath(projectId, sessionId, path);
-            if (project?.session_id !== sessionId) return;
-            materialChanged(library);
+            if (!owner) return;
+            const library = await addLibraryMaterialPath(owner.projectId, owner.sessionId, path);
+            if (!isOwnerMaterialScope(owner) || project?.session_id !== sessionId) return;
+            ownerMaterialChanged(library, owner);
           }
           const files = paths.filter(path => !isDatabasePath(path));
           if (!files.length) return;
@@ -2590,6 +2766,7 @@
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
+        nativeDropWitness = { type: payload.type, point: null, scope: null, path_count: 0 };
         contextDropActive = false;
         workspaceDropActive = false;
         workspaceDropFolder = null;
@@ -2598,6 +2775,11 @@
       const point = nativeDropPoint(payload.position);
       const outline = outlineElement?.getBoundingClientRect();
       const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+      const inPane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).some(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+      });
+      nativeDropWitness = { type: payload.type, point, scope: inOutline ? 'outline' : inPane ? 'pane' : nativeAttachmentDropScope(point), path_count: 'paths' in payload ? payload.paths.length : 0 };
       workspaceDropFolder = inOutline ? workspaceFolderAt(point) : null;
       workspaceDropActive = inOutline && workspaceDropFolder !== null;
       if (payload.type === 'drop') {
@@ -2614,6 +2796,7 @@
 
   onMount(() => {
     componentMounted = true;
+    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     recordStartupTiming('renderer_mounted');
     appearance = 'system';
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
@@ -2625,7 +2808,6 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
-    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     if (desktop) void refreshCuratedModels();
     if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
@@ -2641,6 +2823,7 @@
           const lifecycle = await installWindowLifecycleHandlers();
           switch (lifecycle.status) {
             case 'ready':
+              await loadSharedPreferences();
               startDesktopWorkspace();
               return;
             case 'close_pending':
@@ -2732,6 +2915,7 @@
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
       unlistenDocumentFilesystemHints?.();
+      if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
     };
   });
 
@@ -3116,6 +3300,10 @@
     try {
       const unlisten = await listenForDocumentFilesystemHints((hint) => {
         routeDocumentFilesystemHint(hint, project, scheduleProjectFilesystemRefresh);
+        if (workspaceRoots && hint.project_id === workspaceRoots.workspace_id && hint.session_id === workspaceRoots.workspace_session_id) {
+          scheduleWorkspaceRefresh();
+          if (workspaceOwnerActive) scheduleProjectFilesystemRefresh();
+        }
       });
       if (!componentMounted) {
         unlisten();
@@ -4880,7 +5068,7 @@
   }
 
   function sidebarLiveState(): SidebarLiveState {
-    return { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries };
+    return { project, bookmarks: workspaceFolders, folders: fileRows.filter(row => row.folder).map(row => row.path), materials: materialEntries, materialScope: materialOwnerScope };
   }
 
   function sidebarCapabilitiesFor(target: CapturedSidebarTarget): readonly SidebarCapability[] {
@@ -4946,7 +5134,7 @@
 
   async function restoreSidebarFocus(target: CapturedSidebarTarget, trigger: HTMLButtonElement | null, previousIndex = 0): Promise<void> {
     await tick();
-    if (!componentMounted || applicationClosePhase !== 'running' || !sidebarScopeIsCurrent(target.scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
+    if (!componentMounted || applicationClosePhase !== 'running' || !sidebarTargetScopeIsCurrent(target, sidebarLiveState()) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
     const buttons = sidebarButtons();
     const row = buttons.find(button => button.dataset.sidebarRow === target.key);
     if (row) { focusSidebarButton(row); return; }
@@ -5038,6 +5226,12 @@
     await executeSidebarCapability(capability, documentContextTrigger);
   }
 
+  function sidebarRootOpenTarget(path: string): { path: string } | { rootId: string } {
+    const mounted = workspaceRootsScope === `${project?.project_id}/${project?.session_id}`
+      ? workspaceRoots?.roots.find(root => root.available && root.path === path) : undefined;
+    return mounted ? { rootId: mounted.id } : { path };
+  }
+
   async function executeSidebarCapability(capability: SidebarCapability, trigger: HTMLButtonElement | null): Promise<void> {
     const target = capability.target;
     if (!sidebarTargetIsCurrent(target, sidebarLiveState()) ||
@@ -5055,7 +5249,7 @@
     const previousIndex = Math.max(0, sidebarButtons().findIndex(button => button.dataset.sidebarRow === target.key));
     closeDocumentContextMenu(false);
     if (target.kind === 'root' && action === 'rename_label') { await beginWorkspaceLabelRename(target); return; }
-    if (target.kind === 'root' && action === 'open') { await doOpenProject(target.bookmark.root); return; }
+    if (target.kind === 'root' && action === 'open') { await doOpenProject(sidebarRootOpenTarget(target.bookmark.root)); return; }
     if (target.kind === 'material' && action === 'open') { openMaterial(target.materialLease); return; }
     if (target.kind === 'material' && action === 'rename') { await beginMaterialRename(target); return; }
     sidebarActionInFlight = true;
@@ -5084,20 +5278,20 @@
         const { projectId, sessionId } = target.scope;
         if (action === 'pin') {
           const changed = await pinMaterial(projectId, sessionId, target.material.id, !target.material.pinned, materialMetadataRevision(target.material));
-          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+          if (!componentMounted || !sidebarTargetScopeIsCurrent(target, sidebarLiveState())) return;
           if (!materialSourceIsUnchanged(target.material, changed) || changed.name !== target.material.name || !canEditMaterialMetadata(changed) ||
             changed.pinned !== !target.material.pinned || changed.metadata_revision === target.material.metadata_revision) throw new Error('The source pin receipt did not match its captured target.');
           if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialChanged(changed);
           else await refreshMaterials();
         } else {
           await removeMaterial(projectId, sessionId, target.material.id, materialMetadataRevision(target.material));
-          if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+          if (!componentMounted || !sidebarTargetScopeIsCurrent(target, sidebarLiveState())) return;
           if (sidebarTargetIsCurrent(target, sidebarLiveState())) materialRemoved(target.material.id, sessionId);
           else await refreshMaterials();
         }
       }
     } catch (error) {
-      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+      if (componentMounted && sidebarTargetScopeIsCurrent(target, sidebarLiveState())) {
         recordFailure(error);
         if (target.kind === 'material' && (action === 'pin' || action === 'remove')) await refreshMaterials();
       }
@@ -5145,7 +5339,7 @@
     let succeeded = false;
     try {
       const receipt = await renameMaterial(request);
-      if (!componentMounted || !sidebarScopeIsCurrent(target.scope, project)) return;
+      if (!componentMounted || !sidebarTargetScopeIsCurrent(target, sidebarLiveState())) return;
       if (!materialRenameReceiptMatches(request, target.material, receipt)) throw new Error('The source rename receipt did not match its captured target.');
       if (renamingMaterialTarget === target && sidebarTargetIsCurrent(target, sidebarLiveState())) {
         materialChanged(receipt.material);
@@ -5158,18 +5352,18 @@
         await refreshMaterials();
       }
     } catch (error) {
-      if (componentMounted && sidebarScopeIsCurrent(target.scope, project)) {
+      if (componentMounted && sidebarTargetScopeIsCurrent(target, sidebarLiveState())) {
         recordFailure(error);
         await refreshMaterials();
       }
     } finally {
       renameMaterialInFlight = false; fileCommandInFlight = false;
       if (renamingMaterialTarget === target) {
-        if (succeeded || !componentMounted || !sidebarScopeIsCurrent(target.scope, project) ||
+        if (succeeded || !componentMounted || !sidebarTargetScopeIsCurrent(target, sidebarLiveState()) ||
           !materialEntries.some(item => item.id === target.material.id)) cancelMaterialRename(succeeded && refocus && componentMounted);
         else {
           await tick();
-          if (componentMounted && applicationClosePhase === 'running' && renamingMaterialTarget === target && sidebarScopeIsCurrent(target.scope, project)) renameMaterialInput?.focus();
+          if (componentMounted && applicationClosePhase === 'running' && renamingMaterialTarget === target && sidebarTargetScopeIsCurrent(target, sidebarLiveState())) renameMaterialInput?.focus();
         }
       }
     }
@@ -5258,7 +5452,8 @@
   function closeDocumentContextMenu(refocus = true): void {
     clearDocumentContextLongPress();
     const trigger = documentContextTrigger;
-    const scope = sidebarContextTarget?.scope ?? (documentContextTarget ?
+    const capturedTarget = sidebarContextTarget;
+    const scope = capturedTarget?.viewScope ?? (documentContextTarget ?
       { projectId: documentContextTarget.projectId, sessionId: documentContextTarget.sessionId } : null);
     documentContextTarget = null;
     sidebarContextTarget = null;
@@ -5267,6 +5462,7 @@
     if (!refocus) return;
     void tick().then(() => {
       if (!scope || !sidebarScopeIsCurrent(scope, project) || sidebarContextTarget || renamingWorkspaceRoot || renamingMaterialTarget || renamingDocumentId) return;
+      if (capturedTarget && !sidebarTargetScopeIsCurrent(capturedTarget, sidebarLiveState())) return;
       if (focusConnectedControl(trigger)) return;
       if (focusConnectedControl(outlineToggle)) return;
       focusCurrentWritingSurfaceAtEnd();
@@ -5830,6 +6026,16 @@
     let restoreTrigger = action !== 'open';
     try {
       switch (action) {
+        case 'copy_reference': {
+          const root = workspaceRoots?.roots.find(root => project && workspaceRootIsActive(root, project));
+          const summary = project?.documents.find(item => item.document_id === target.documentId);
+          if (!root || !summary || workspaceRoots?.roots.filter(item => item.name === root.name).length !== 1) throw new Error('This document needs one uniquely named workspace folder.');
+          const name = `${root.name}::${summary.relative_path}`;
+          const href = [...new TextEncoder().encode(name)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+          const label = `@${JSON.stringify(name)}`.replace(/[\\\[\]]/g, '\\$&');
+          await window.navigator.clipboard.writeText(`[${label}](loom-document:${href})`);
+          break;
+        }
         case 'open':
           await selectCapturedDocument(target, true, true);
           restoreTrigger =
@@ -5885,42 +6091,32 @@
     }
   }
 
-  function suggestionPreferenceKey(projectId: string): string {
-    return `loom:suggestions:${projectId}`;
+  let sharedPreferences: LoomPreferences | null = null;
+  let preferencesLoading: Promise<void> | null = null;
+
+  function acceptPreferences(snapshot: LoomPreferences): void {
+    if (!sharedPreferences || BigInt(snapshot.revision) >= BigInt(sharedPreferences.revision)) {
+      sharedPreferences = snapshot;
+    }
   }
 
-  const lastLocalModelKey = 'loom:last-local-model';
+  function loadSharedPreferences(): Promise<void> {
+    return preferencesLoading ??= getPreferences().then(acceptPreferences).catch((error) => { recordFailure(error); });
+  }
 
   function loadLastLocalModelPath(): string | null {
-    try {
-      const remembered = window.localStorage.getItem(lastLocalModelKey);
-      if (remembered && isEphemeralAcceptanceModelPath(remembered)) {
-        window.localStorage.removeItem(lastLocalModelKey);
-        return null;
-      }
-      return remembered;
-    } catch {
-      return null;
-    }
+    return sharedPreferences?.last_local_model ?? null;
   }
 
-  function rememberLastLocalModelPath(modelPath: string): void {
+  async function rememberLastLocalModelPath(modelPath: string): Promise<void> {
     if (isEphemeralAcceptanceModelPath(modelPath)) return;
-    try {
-      window.localStorage.setItem(lastLocalModelKey, modelPath);
-    } catch {
-      // Discovery remains available when browser persistence is unavailable.
-    }
+    try { acceptPreferences(await updatePreferences({ kind: 'remember_model', path: modelPath })); }
+    catch (error) { recordFailure(error); }
   }
 
-  function forgetLastLocalModelPath(modelPath: string): void {
-    try {
-      if (window.localStorage.getItem(lastLocalModelKey) === modelPath) {
-        window.localStorage.removeItem(lastLocalModelKey);
-      }
-    } catch {
-      // Storage is only a convenience; native policy verification is authority.
-    }
+  async function forgetLastLocalModelPath(modelPath: string): Promise<void> {
+    try { acceptPreferences(await updatePreferences({ kind: 'forget_model', expected_path: modelPath })); }
+    catch (error) { recordFailure(error); }
   }
 
   function rememberedWriterPathIsInvalid(code: string): boolean {
@@ -5940,14 +6136,12 @@
   }
 
   function loadSuggestionPreference(projectId: string): boolean {
-    try {
-      return suggestionsEnabledFromStoredPreference(
-        window.localStorage.getItem(suggestionPreferenceKey(projectId)),
-        buildModelPolicy?.activation ?? null
-      );
-    } catch {
-      return false;
-    }
+    if (!sharedPreferences) return false;
+    const stored = sharedPreferences.project_suggestions[projectId];
+    return suggestionsEnabledFromStoredPreference(
+      stored === undefined ? null : stored ? 'on' : 'off',
+      buildModelPolicy?.activation ?? null
+    );
   }
 
   function clearSuggestionTimerHandle(): void {
@@ -6011,11 +6205,11 @@
       suggestionsEnabled = enabled;
       if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
-        try {
-          window.localStorage.setItem(suggestionPreferenceKey(project.project_id), enabled ? 'on' : 'off');
-        } catch {
-          // The backend gate remains authoritative if browser persistence is unavailable.
-        }
+        // Persistence is a convenience, not acknowledgement of native policy.
+        // Keep a completed toggle available while its blocking storage write drains.
+        void updatePreferences({ kind: 'suggestions', project_id: boundProject.project_id, enabled })
+          .then(acceptPreferences)
+          .catch((error) => { recordFailure(error); });
       }
       // Scheduling/model preparation read legacy reactive policy and writer
       // projections. Let the acknowledged policy reach those projections first;
@@ -6200,7 +6394,7 @@
     quietModelLoadFailure = null;
     if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
     selectedModelPath = loaded.model_path;
-    rememberLastLocalModelPath(loaded.model_path);
+    await rememberLastLocalModelPath(loaded.model_path);
     if (!quiet) {
       announce(`${loaded.display_name} is verified for exact local completion`);
     }
@@ -6287,7 +6481,7 @@
             ? !isVerifiedCatalogWriter(catalogEntry, loaded)
             : !isUsableSuggestionWriter(loaded)) {
           if (candidate.remembered && !candidate.profileId) {
-            forgetLastLocalModelPath(candidate.modelPath);
+            await forgetLastLocalModelPath(candidate.modelPath);
           }
           await refreshModels(captured);
           continue;
@@ -6307,7 +6501,7 @@
           rememberedWriterPathIsInvalid(failure.code) ||
           (!candidate.profileId && ['model_path_error', 'model_header_unverified'].includes(failure.code))
         )) {
-          forgetLastLocalModelPath(candidate.modelPath);
+          await forgetLastLocalModelPath(candidate.modelPath);
         }
         await refreshModels(captured);
       } finally {
@@ -6685,18 +6879,21 @@
     });
   }
 
-  async function doOpenProject(path?: string): Promise<boolean> {
+  async function doOpenProject(target?: { path: string } | { rootId: string }): Promise<boolean> {
     if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
     closeDocumentContextMenu(false);
     cancelWorkspaceLabelRename(false);
+    if (target && 'rootId' in target && !project) return false;
     opening = true;
     fileCommandInFlight = true;
     let preparationId: string | null = null;
     let handoffStarted = false;
     try {
       // The chooser and validation leave the current editor/session intact.
-      preparationId = await (path ? prepareProjectOpenPath(path) : prepareProjectOpen());
-      if (!preparationId) return Boolean(path);
+      preparationId = target && 'rootId' in target
+        ? project && await prepareWorkspaceRoot(project.project_id, project.session_id, target.rootId)
+        : target ? await prepareProjectOpenPath(target.path) : await prepareProjectOpen();
+      if (!preparationId) return Boolean(target);
       if (!componentMounted || applicationClosePhase !== 'running') return false;
       clearFailure();
       if (project) {
@@ -6904,9 +7101,9 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
+    await refreshWorkspaceRoots();
+    if (!workspaceRestoreIsCurrent(captured)) return false;
     workspaceRootExpanded = true;
-    hiddenPaneSlots = new Set();
-    paneSelection = {};
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
@@ -8181,7 +8378,8 @@
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
-    anchorByteOffset: number
+    anchorByteOffset: number,
+    selectionPinned = false
   ): void {
     completionController = rejectVisualPresentation(completionController, {
       mode,
@@ -8190,7 +8388,8 @@
       presentationKey,
       surfaceKey,
       currentSurfaceKey: visualGhostSurfaceKey,
-      anchorByte: anchorByteOffset
+      anchorByte: anchorByteOffset,
+      selectionPinned
     });
   }
 
@@ -8655,37 +8854,56 @@
   }
 
   function handleAttachmentLink(event: MouseEvent): void {
-    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"], a[href^="loom-material:"], a[href^="loom-evidence:"]') : null;
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"], a[href^="loom-material:"], a[href^="loom-evidence:"], a[href^="loom-document:"]') : null;
     if (!link || !project) return;
     event.preventDefault(); event.stopPropagation();
     const href = link.getAttribute('href') ?? '';
-    const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
-    if (evidenceId) {
-      const captured = { projectId: project.project_id, sessionId: project.session_id };
-      captureMaterialOrigin();
-      void readMaterialEvidence(captured.projectId, captured.sessionId, '', evidenceId).then(evidence => {
-        if (project?.session_id !== captured.sessionId) return;
-        const item = materialEntries.find(entry => entry.id === evidence.material_id) ?? {
-          id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
-          pinned: false, available: false, source_path: null, attachment_id: null
-        };
-        openMaterial(item); activeMaterialEvidence = evidence;
-      }).catch(recordFailure);
+    if (href.startsWith('loom-document:')) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id, owner: workspaceRoots?.workspace_session_id };
+      void (async () => {
+        const hex = href.slice('loom-document:'.length);
+        if (!/^(?:[a-f0-9]{2}){1,4096}$/u.test(hex)) throw new Error('Invalid document reference.');
+        const name = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(hex.match(/../g)!, byte => parseInt(byte, 16)));
+        const destination = await resolveWorkspaceReference(captured.projectId, captured.sessionId, name);
+        if (project?.session_id !== captured.sessionId || workspaceRoots?.workspace_session_id !== captured.owner || destination.workspace_session_id !== captured.owner) return;
+        const root = workspaceRoots?.roots.find(item => item.id === destination.root_id);
+        if (!root || !project) return;
+        if (!workspaceRootIsActive(root, project) && !await doOpenProject({ rootId: root.id })) return;
+        if (!project || workspaceRoots?.workspace_session_id !== captured.owner || !workspaceRootIsActive(root, project)) return;
+        const summary = project.documents.find(item => item.document_id === destination.document_id);
+        if (summary) await selectDocument(summary, true);
+      })().catch(error => { if (workspaceRoots?.workspace_session_id === captured.owner) recordFailure(error); });
       return;
     }
-    const materialId = href.match(/^loom-material:(material-[a-f0-9]{64})$/u)?.[1];
-    if (materialId) {
-      const item = materialEntries.find(entry => entry.id === materialId);
-      if (item) openMaterial(item);
-      else recordFailure(new Error('This source is no longer available in this workspace.'));
+    const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
+    const materialReference = href.match(/^loom-material:(material-[a-f0-9]{64}|materials\/[^\r\n]+)$/u)?.[1];
+    const reference = evidenceId ? `evidence/${evidenceId}` : materialReference;
+    if (reference) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id, root: project.root };
+      const owner = materialOwnerScope;
+      const current = () => project?.project_id === captured.projectId && project.session_id === captured.sessionId && project.root === captured.root && (!owner || isOwnerMaterialScope(owner));
+      captureMaterialOrigin(link);
+      void resolveScopedMaterialReference(captured, owner, reference, current, resolveMaterialReference).then(result => {
+        if (!result) return;
+        const { evidence } = result;
+        const scope = { projectId: result.project_id, sessionId: result.session_id };
+        const item = result.material ?? (evidence ? {
+          id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
+          pinned: false, available: false, source_path: null, attachment_id: null
+        } : null);
+        if (!item) return;
+        openMaterial(item, link, scope, false); activeMaterialEvidence = evidence;
+      }).catch(error => { if (current()) recordFailure(error); });
       return;
     }
     const attachmentId = href.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
     if (attachmentId) {
       const captured = { projectId: project.project_id, sessionId: project.session_id };
+      const sourceScope = workspaceOwnerActive ? materialOwnerScope : captured;
+      captureMaterialOrigin(link);
       void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId).then(item => {
         if (project?.session_id !== captured.sessionId) return;
-        materialChanged(item); openMaterial(item);
+        materialChanged(item); openMaterial(item, link, sourceScope, false);
       }).catch(recordFailure);
     }
   }
@@ -9054,6 +9272,7 @@
     const sourceRevisionId = document.summary.revision_id;
     if (!sourceRevisionId) return false;
     const captured: WeaveCapture = {
+      mode,
       contextEpoch,
       commandId: newUlid(),
       epoch: documentEpoch,
@@ -9093,7 +9312,7 @@
         cursorByte: captured.cursorByte,
         policy: captured.speculation
           ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
-          : { kind: 'automatic_v2' }
+          : { kind: captured.mode === 'visual' ? 'automatic_visual_v4' : 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -9112,6 +9331,12 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
+        // Ordinary typing can leave an unfinished or unresolved mention. Its
+        // inline diagnostic owns the feedback; automatic inference must not
+        // interrupt the writer with a technical toast. Explicit runs still
+        // report their own failures, and command recovery below stays intact.
+        const referenceNeedsAttention = failure.code === 'document_reference_missing' ||
+          failure.code === 'document_reference_ambiguous';
         if (captureIsCurrent && captured.speculation && failure.speculation_recovery) {
           uncertainWeave = null;
           try { await recoverLoompad(captured, failure.speculation_recovery); }
@@ -9134,7 +9359,7 @@
           return true;
         }
         if (captureIsCurrent) {
-          recordFailure(failure);
+          if (!referenceNeedsAttention) recordFailure(failure);
           uncertainWeave = captured;
         }
         try {
@@ -9153,7 +9378,7 @@
             }
           } else if (captureIsCurrent) {
             uncertainWeave = null;
-            announce('No Weave was committed; the request can be started again');
+            if (!referenceNeedsAttention) announce('No Weave was committed; the request can be started again');
           }
         } catch {
           if (captureIsCurrent) {
@@ -10132,9 +10357,50 @@
     return { status: 'closed' };
   }
 
+  function scheduleWorkspaceRefresh(): void {
+    const owner = materialOwnerScope;
+    if (!owner || !project) return;
+    if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
+    workspaceRefreshTimer = setTimeout(() => {
+      workspaceRefreshTimer = undefined;
+      if (!componentMounted || !project || materialOwnerScope?.projectId !== owner.projectId || materialOwnerScope.sessionId !== owner.sessionId) return;
+      workspaceOutputRevision += 1;
+      void refreshWorkspaceTemplate();
+      void refreshWorkspaceRoots();
+    }, 80);
+  }
+
+  async function refreshWorkspaceRoots(): Promise<WorkspaceRootsSnapshot | null> {
+    if (!project) return null;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++workspaceRootsSerial;
+    try {
+      const snapshot = await getWorkspaceRoots(scope.projectId, scope.sessionId);
+      if (serial !== workspaceRootsSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return null;
+      if (workspaceRoots && workspaceRoots.workspace_session_id !== snapshot.workspace_session_id) {
+        workspaceDocuments = {};
+        hiddenPaneSlots = new Set();
+        paneSelection = {};
+      }
+      workspaceRoots = snapshot;
+      workspaceRootsScope = `${scope.projectId}/${scope.sessionId}`;
+      return snapshot;
+    } catch (error) {
+      if (serial === workspaceRootsSerial && terminalScopeIsCurrent(scope.projectId, scope.sessionId)) recordFailure(error);
+      return null;
+    }
+  }
+
   async function refreshWorkspaceTemplate(enable = false): Promise<void> {
     if (!project || compositionActive || !flushEditors()) return;
     if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
+    if (enable) {
+      const roots = await refreshWorkspaceRoots();
+      const owner = roots?.roots.find(folder => folder.owner);
+      if (!project || !owner) return;
+      if (!workspaceRootIsActive(owner, project) && !await doOpenProject({ rootId: owner.id })) return;
+    }
+    if (!project) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
@@ -10143,9 +10409,12 @@
       if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
       workspaceTemplate = snapshot;
       workspaceTemplateScope = `${scope.projectId}/${scope.sessionId}`;
+      void refreshWorkspaceRoots();
+      void refreshMaterials();
       void tick().then(requestPreferredWriterForCurrentWorkspace);
       const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
-      if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
+      const owner = workspaceRoots?.roots.find(folder => folder.owner);
+      if (snapshot.document_id && project && owner && workspaceRootIsActive(owner, project) && registered?.revision_id !== snapshot.revision_id) {
         scheduleProjectFilesystemRefresh(0);
       }
       if (enable && snapshot.document_id) {
@@ -10161,6 +10430,18 @@
   async function openPaneDocument(id: string): Promise<void> {
     const candidate = project?.documents.find(item => item.document_id === id);
     if (candidate) await selectDocument(candidate, true);
+  }
+
+  async function openOwnerPaneDocument(id: string, ownerSession: string, pin = false): Promise<void> {
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession) return;
+    const owner = workspaceRoots.roots.find(root => root.owner);
+    if (!owner) return;
+    if (!workspaceRootIsActive(owner, project) && !await doOpenProject({ rootId: owner.id })) return;
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession || !workspaceRootIsActive(owner, project)) return;
+    await refreshProjectFilesystemState();
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession || !workspaceRootIsActive(owner, project)) return;
+    if (pin) toggleOutputPin(id);
+    else await openPaneDocument(id);
   }
 
   function applyDeferredTemplate(): void {
@@ -10182,10 +10463,7 @@
   function togglePane(position: 'main' | 'right' | 'bottom'): void {
     // Collapsing only changes presentation. Mounted editors and active runs
     // retain their state, so a busy pane must never trap its owner on screen.
-    const next = new Set(hiddenPaneSlots);
-    if (next.has(position)) next.delete(position); else next.add(position);
-    if (position === 'main' && next.has('main') && !rightPaneOpen) return;
-    if (position === 'right' && next.has('right') && !mainPaneOpen) next.delete('main');
+    const next = togglePaneVisibility(position, equippedPanePositions, hiddenPaneSlots);
     hiddenPaneSlots = next;
     if (position === 'main' && next.has('main')) {
       cancelSuggestionTimer();
@@ -10198,9 +10476,9 @@
     paneSelection = { ...paneSelection, [position]: id };
   }
 
-  async function preparePaneRun(chat = false): Promise<OpenDocument | null> {
-    if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
-    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
+  async function preparePaneRun(chat = false): Promise<WorkspacePanePreparation | null> {
+    if (!project || editorReadonly || compositionActive || !flushEditors()) return null;
+    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document?.summary.document_id, epoch: documentEpoch, text: documentText };
     const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
     cancelSuggestionTimer();
     await cancelActiveBranches();
@@ -10217,7 +10495,7 @@
     }
     if (requireWritingModel && !currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
     if (!current() || (requireWritingModel && !currentModel)) return null;
-    return document;
+    return { document };
   }
 
   function kindLabel(kind: DocumentKind): string {
@@ -10281,7 +10559,7 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
+        {#each paneSlots.filter(slot => slot.selected && (slot.position !== 'main' || !mainPaneOpen || rightPaneOpen || bottomPaneOpen)) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
             aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Collapse'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
@@ -10289,7 +10567,7 @@
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else if slot.position === 'bottom'}<path d="M2 10h12"/>{:else}<path d="M5 2.5v11M11 2.5v11"/>{/if}</svg>
           </button>
         {/each}
-        {#if project && !mainPane && rightPaneOpen}
+        {#if project && !mainPane && (!mainPaneOpen || rightPaneOpen || bottomPaneOpen)}
           <button class="titlebar-button" class:active={mainPaneOpen} type="button" aria-label={mainPaneOpen ? 'Collapse main pane' : 'Show main pane'} aria-pressed={mainPaneOpen} title="Main pane" on:click={() => togglePane('main')}>
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 2.5v11M11 2.5v11"/></svg>
           </button>
@@ -10367,6 +10645,17 @@
           <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
         <nav class="document-list" aria-label="Workspace folders">
+          {#each mountedWorkspaceFolders.filter(folder => !folder.path || (folder.path !== project?.root && !workspaceFolders.some(bookmark => bookmark.root === folder.path))) as folder (folder.id)}
+            {@const active = workspaceRootIsActive(folder, project)}
+            <button class="folder-row workspace-root" class:active class:unavailable={!folder.available} class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.available ? folder.path ?? folder.name : `${folder.name} is unavailable`}
+              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.name}${folder.available ? '' : ' (unavailable)'}`}
+              aria-expanded={active && workspaceRootExpanded} aria-disabled={!folder.available} disabled={fileCommandInFlight || opening}
+              on:contextmenu={(event) => void showFolderActions(event, '', folder)}
+              on:keydown={(event) => void showFolderActions(event, '', folder)}
+              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else if (folder.available) void doOpenProject({ rootId: folder.id }); }}>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.name}</span>{#if active && copyingFolder?.sessionId === project.session_id && copyingFolder.destination === ''}<span aria-label="Copying">…</span>{/if}
+            </button>
+          {/each}
           {#each visibleWorkspaceFolders as folder (folder ? JSON.stringify(['root', folder.root]) : JSON.stringify(['session', project.session_id]))}
             {@const active = folder === null || folder.root === project.root}
             {#if folder}
@@ -10414,7 +10703,7 @@
                 <span data-sidebar-disclosure aria-hidden="true"></span><span>{row.title}</span>
               </button>
             {:else if 'material' in row}
-              {@const target = captureSidebarTarget(project, { kind: 'material', material: row.material })}
+              {@const target = captureSidebarTarget(project, { kind: 'material', material: row.material }, materialOwnerScope ?? undefined)}
               {#if renamingMaterialTarget?.key === target.key}
                 <div class="folder-row material-row editing" style={`padding-left: ${8 + row.depth * 14}px`}>
                   <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
@@ -10474,7 +10763,7 @@
             {#if !visibleMaterials.length}<p class="empty-copy">No notes.</p>{/if}
           {/each}
           {#each visibleMaterials as item (item.id)}
-            {@const target = captureSidebarTarget(project, { kind: 'material', material: item })}
+            {@const target = captureSidebarTarget(project, { kind: 'material', material: item }, materialOwnerScope ?? undefined)}
               {#if renamingMaterialTarget?.key === target.key}
                 <div class="folder-row material-row editing">
                   <input bind:this={renameMaterialInput} value={renameMaterialName} type="text"
@@ -10491,6 +10780,7 @@
               on:focus={() => sidebarSelection = target.key} on:click={(event) => selectSidebarRow(event, target)}
               on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
               on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
+              <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library' || item.kind === 'collection'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
             </button>
               {/if}
@@ -10526,16 +10816,21 @@
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
-        {#if activeMaterial}
-          {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
-            <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
+        {#if activeMaterial && activeMaterialScope}
+          {@const viewScope = activeMaterialScope}
+          {@const viewMaterialId = activeMaterial.id}
+          {#key `${viewScope.projectId}/${viewScope.sessionId}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
+            <MaterialView projectId={viewScope.projectId} sessionId={viewScope.sessionId} material={activeMaterial}
+              navigation={materialNavigation.get(materialNavigationKey(viewScope, viewMaterialId))?.navigation} onNavigationChange={value => rememberMaterialNavigation(viewScope, viewMaterialId, value)}
               initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
-              removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
+              workspaceOwned={isOwnerMaterialScope(viewScope)} removable={isOwnerMaterialScope(viewScope) && materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={(item) => ownerMaterialChanged(item, viewScope)} onReopen={() => void chooseMaterialLibrary()} />
           {/key}
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
-            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources} />{/key}{/if}
+            {#if materialOwnerScope}{#key materialOwnerScope.sessionId}<ImportSources projectId={materialOwnerScope.projectId} sessionId={materialOwnerScope.sessionId} onOpen={openImportedSource} onImported={addImportedSources} onOpenFolder={openAnotherProject}
+              onCollectionAdded={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) { ownerMaterialChanged(item, scope); void refreshMaterials(); } }}
+              onOpenCollection={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) openMaterial(item, undefined, scope); }} />{/key}{/if}
           </section>
         {/if}
         <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>
@@ -10564,7 +10859,7 @@
             <div class="context-composer">
               <div class="context-editor-surface" on:focusout={flushContextEditorProjection}>
                 {#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}
-                  <LoomEditor
+                  <LoomEditor {referenceScope}
                     bind:this={contextVisualEditor}
                     value={contextText}
                     label="Steering context"
@@ -10577,7 +10872,7 @@
                     onGhostPresentationRejected={() => {}}
                   />
                 {:else}
-                  <SourceEditor
+                  <SourceEditor {referenceScope}
                     bind:element={contextSourceTextarea}
                     label="Steering context Markdown"
                     value={contextText}
@@ -10768,7 +11063,7 @@
                   <div class="verse-notice">Verse stays in the exact-whitespace source surface.</div>
                 {:else}
                   {#if canUseVisual}
-                    <LoomEditor
+                    <LoomEditor {referenceScope}
                       bind:this={visualEditor}
                       value={documentText}
                       label={`${document.summary.title}, manuscript editor`}
@@ -10826,7 +11121,7 @@
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
                 {/if}
-                <SourceEditor
+                <SourceEditor {referenceScope}
                   bind:this={sourceEditor}
                   bind:element={sourceTextarea}
                   value={sourceDisplayText}
@@ -10900,14 +11195,15 @@
       {#each paneSlots as slot (slot.position)}
         {#if slot.selected && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
-          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+          <aside class:hidden-pane={!paneVisibility[slot.position] || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
             {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
             <PaneHeader title={selected[1].title ?? selected[0]} choices={slot.choices} selected={selected[0]}
+              collapsible={slot.position !== 'main' || rightPaneOpen || bottomPaneOpen}
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={() => preparePaneRun(paneConfig.kind === 'chat')} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane workspaceScope={materialOwnerScope} configurationRevisionId={workspaceTemplate?.revision_id ?? null} ownerActive={workspaceOwnerActive} outputRevision={workspaceOutputRevision} draft={workspaceRoots ? paneDrafts.forPane(workspaceRoots.workspace_session_id, paneId) : undefined} {referenceScope} {materialOwnerScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={() => preparePaneRun(paneConfig.kind === 'chat')} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => workspaceRoots && void openOwnerPaneDocument(id, workspaceRoots.workspace_session_id)} onRunsChanged={() => { if (workspaceOwnerActive) scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={ownerPinnedOutputs} onPinOutput={(id) => workspaceRoots && void openOwnerPaneDocument(id, workspaceRoots.workspace_session_id, true)} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>
@@ -11391,3 +11687,7 @@
     {completionAccessibilityWitness}
   </div>
 </div>
+
+<style>
+  .workspace-root.unavailable { opacity: 0.55; }
+</style>

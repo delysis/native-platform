@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/services/archive-friends",
     "crates/desktop-launch",
     "crates/workspace-document",
     "crates/desktop-model-defaults",
@@ -48,6 +49,7 @@ members = [
     "products/loom/crates/loom-host",
     "products/loom/crates/loom-store",
     "products/loom/crates/loom-types",
+    "products/loom/crates/loom-preferences",
     "products/loom/crates/tauri-plugin-loom",
     "products/mom/apps/mom-llama/src-tauri",
     "products/mom/crates/mom-llama-cli",

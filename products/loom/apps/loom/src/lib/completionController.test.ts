@@ -188,6 +188,42 @@ describe('pure completion controller', () => {
     expect(completionControllerView(state, contextKey, family, true, true).selected?.runId).toBe('run-c');
   });
 
+  it('does not advance a pinned default visual selection after rejection', () => {
+    const initial = readyController();
+    const selected = completionControllerView(initial, contextKey, family, true, true).selected!;
+    const state = rejectVisualPresentation(initial, {
+      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
+      presentationKey: selected.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: selected.targetByte, selectionPinned: true
+    });
+    expect(state.session?.selectedRunId).toBe('run-a');
+    expect(state.activeRunId).toBe('run-a');
+    expect(completionControllerView(state, contextKey, family, true, true).selected).toBeNull();
+  });
+
+  it('keeps exact rollback authority when an accepted visual tail is rejected', () => {
+    const inserted = insert('option_word', ' one ');
+    const state = observeTextMutation(inserted.state, 'Hello one ', manuscript, false).state;
+    const selected = completionControllerView(state, contextKey, family, true, true).selected!;
+    const rejected = rejectVisualPresentation(state, {
+      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
+      presentationKey: selected.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: selected.targetByte
+    });
+    const rollback = completionControllerView(rejected, contextKey, family, true, true);
+    expect(rejected.session?.selectedRunId).toBe('run-a');
+    expect(rejected.session?.acceptedChunks).toEqual([' one ']);
+    expect(rollback.selected).toMatchObject({ runId: 'run-a', text: '' });
+    expect(rollback.unconsumeText).toBe(' one ');
+    const undo = authorizeCompletionUnconsume(rejected, {
+      eligible: rollback.selected, candidateId: rollback.selected!.candidateId,
+      presentationKey: rollback.selected!.presentationKey, text: rollback.unconsumeText,
+      manuscriptText: 'Hello one '
+    });
+    expect(undo.authorized).toBe(true);
+    expect(undo.state.pendingText).toBe(manuscript);
+  });
+
   it('settles with no visual selection after every default family member is rejected', () => {
     let state = readyController();
     for (const expectedRunId of ['run-a', 'run-b', 'run-c', 'run-d']) {
@@ -206,6 +242,21 @@ describe('pure completion controller', () => {
     expect(settled.alternatives).toEqual([]);
     expect(state.session?.candidates).toEqual(family);
     expect(state.lastAction).toBeNull();
+  });
+
+  it('keeps the displayed choice as cycling authority when a streaming family temporarily disappears', () => {
+    let state = cycleCompletion(readyController(), family, 1).state;
+    state = reconcileCompletionController(state, contextKey, []);
+    expect(completionControllerView(state, contextKey, []).selected).toBeNull();
+    const grown = family.map(candidate => ({ ...candidate,
+      text: `${candidate.text} grows`, presentationKey: `${candidate.presentationKey}:next`
+    }));
+    state = reconcileCompletionController(state, contextKey, grown);
+    const visible = completionControllerView(state, contextKey, grown);
+    expect(visible.selected?.runId).toBe('run-b');
+    expect(visible.witnessSelected?.runId).toBe(visible.selected?.runId);
+    state = cycleCompletion(state, grown, -1).state;
+    expect(completionControllerView(state, contextKey, grown).selected?.runId).toBe('run-a');
   });
 
   it.each<CompletionInsertionAction>([

@@ -1,6 +1,6 @@
-//! One fixed mutable bindings file, not a general filesystem API. Callers hold
-//! the material `WRITE_LOCK` and a `ProjectStore` lease. No renderer path reaches
-//! this owner. The current JSON schema and immutable sources live elsewhere.
+//! Fixed native metadata observations, never a renderer-selected filesystem API.
+//! Legacy bindings are observed and archived through native descriptors;
+//! workspace configuration remains owned by the project store.
 use std::path::Path;
 
 #[cfg(unix)]
@@ -14,7 +14,10 @@ mod native {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
 
-    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, renameat, unlinkat};
+    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, unlinkat};
+
+    #[cfg(test)]
+    use rustix::fs::renameat;
 
     use super::{MAX_STATE_BYTES, Path, Result, digest, invalid};
 
@@ -104,15 +107,86 @@ mod native {
     }
 
     fn read_stable(file: &mut File) -> Result<(Vec<u8>, String)> {
+        read_stable_bounded(file, MAX_STATE_BYTES)
+    }
+
+    fn read_stable_bounded(file: &mut File, maximum: u64) -> Result<(Vec<u8>, String)> {
         let before = stamp(file)?;
         let mut bytes = Vec::new();
-        (&mut *file)
-            .take(MAX_STATE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_STATE_BYTES || stamp(file)? != before {
+        (&mut *file).take(maximum + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum || stamp(file)? != before {
             return Err(invalid("material metadata changed during read"));
         }
         Ok((bytes, before))
+    }
+
+    /// A generation observation for the ordinary workspace document. This does
+    /// not create another writer or confer authority from a content hash alone.
+    #[derive(Debug)]
+    pub(crate) struct WorkspaceSnapshot {
+        pub(crate) bytes: Vec<u8>,
+        pub(crate) revision: String,
+        root: File,
+        sidecar: File,
+        file: File,
+    }
+
+    impl WorkspaceSnapshot {
+        pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
+            let root = directory(path)?;
+            let sidecar = child(&root, ".loom", DIRECTORY)?;
+            let Some(mut file) =
+                optional_child(&root, crate::workspace_template::TEMPLATE_PATH, READ_FILE)?
+            else {
+                return Ok(None);
+            };
+            let (bytes, file_stamp) = read_stable_bounded(
+                &mut file,
+                crate::workspace_template::MAX_TEMPLATE_BYTES as u64,
+            )?;
+            let witness = format!("{}:{}:{file_stamp}", identity(&root)?, identity(&sidecar)?);
+            let revision = digest(
+                &[
+                    b"loom.workspace-materials-generation.v1\0".as_slice(),
+                    witness.as_bytes(),
+                    b"\0",
+                    &bytes,
+                ]
+                .concat(),
+            );
+            let snapshot = Self {
+                bytes,
+                revision,
+                root,
+                sidecar,
+                file,
+            };
+            snapshot.ensure_paths(path)?;
+            Ok(Some(snapshot))
+        }
+
+        fn ensure_paths(&self, path: &Path) -> Result<()> {
+            let root = directory(path)?;
+            let sidecar = child(&root, ".loom", DIRECTORY)?;
+            let file = child(&root, crate::workspace_template::TEMPLATE_PATH, READ_FILE)?;
+            if !same_file(&self.root, &root)?
+                || !same_file(&self.sidecar, &sidecar)?
+                || !same_file(&self.file, &file)?
+            {
+                return Err(invalid("workspace material metadata target was replaced"));
+            }
+            Ok(())
+        }
+
+        pub(crate) fn ensure_current(&self, path: &Path) -> Result<()> {
+            self.ensure_paths(path)?;
+            let current = Self::open(path)?
+                .ok_or_else(|| invalid("workspace material metadata disappeared"))?;
+            if current.revision != self.revision {
+                return Err(invalid("workspace material metadata changed before commit"));
+            }
+            Ok(())
+        }
     }
 
     impl Snapshot {
@@ -172,10 +246,42 @@ mod native {
             Ok(())
         }
 
+        /// Retain exactly the observed generation before retiring its old name.
+        /// Both installation and unlink stay in the held native directory.
+        pub(crate) fn preserve(&self, root: &Path) -> Result<()> {
+            self.ensure_current(root)?;
+            let name = format!("bindings-{}.json", digest(&self.bytes));
+            match openat(
+                &self.directory,
+                name.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(descriptor) => {
+                    let mut file = File::from(descriptor);
+                    file.write_all(&self.bytes)?;
+                    file.sync_all()?;
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+            let mut retained = child(&self.directory, name.as_str(), READ_FILE)?;
+            if read_stable(&mut retained)?.0 != self.bytes {
+                return Err(invalid("preserved material metadata identity mismatch"));
+            }
+            self.directory.sync_all()?;
+            self.ensure_current(root)?;
+            unlinkat(&self.directory, NAME, AtFlags::empty()).map_err(std::io::Error::from)?;
+            self.directory.sync_all()?;
+            Ok(())
+        }
+
+        #[cfg(test)]
         pub(crate) fn replace(&self, root: &Path, bytes: &[u8]) -> Result<Self> {
             self.replace_before_commit(root, bytes, || Ok(()))
         }
 
+        #[cfg(test)]
         fn replace_before_commit(
             &self,
             root: &Path,
@@ -248,6 +354,67 @@ mod native {
             )
             .unwrap();
             root
+        }
+
+        #[test]
+        fn migration_preserves_observed_bytes_and_refuses_replaced_or_forged_archives() -> Result<()>
+        {
+            let root = fixture();
+            let snapshot = Snapshot::open(root.path())?.expect("legacy metadata exists");
+            let bindings = root.path().join(".loom/materials/bindings.json");
+            let archive = root
+                .path()
+                .join(".loom/materials")
+                .join(format!("bindings-{}.json", digest(b"original")));
+            fs::write(&archive, b"forged")?;
+            assert!(snapshot.preserve(root.path()).is_err());
+            assert_eq!(fs::read(&bindings)?, b"original");
+            assert_eq!(fs::read(&archive)?, b"forged");
+            fs::remove_file(&archive)?;
+            fs::rename(&bindings, bindings.with_extension("saved"))?;
+            fs::write(&bindings, b"original")?;
+            assert!(snapshot.preserve(root.path()).is_err());
+            assert!(!archive.exists());
+            let fresh = Snapshot::open(root.path())?.expect("replacement metadata exists");
+            fresh.preserve(root.path())?;
+            assert_eq!(fs::read(&archive)?, b"original");
+            assert!(!bindings.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn workspace_generation_rejects_same_bytes_replacement() -> Result<()> {
+            let root = fixture();
+            let path = root.path().join(crate::workspace_template::TEMPLATE_PATH);
+            fs::write(&path, b"# Workspace\n")?;
+            let snapshot = WorkspaceSnapshot::open(root.path())?.expect("workspace exists");
+            fs::rename(&path, path.with_extension("saved"))?;
+            fs::write(&path, b"# Workspace\n")?;
+            assert!(snapshot.ensure_current(root.path()).is_err());
+            let current =
+                WorkspaceSnapshot::open(root.path())?.expect("replacement workspace exists");
+            assert_eq!(current.bytes, snapshot.bytes);
+            assert_ne!(current.revision, snapshot.revision);
+            Ok(())
+        }
+
+        #[test]
+        fn workspace_generation_refuses_symlinks_and_overlong_documents() -> Result<()> {
+            let root = fixture();
+            let outside = fixture();
+            let target = outside.path().join("untouched.md");
+            fs::write(&target, b"untouched")?;
+            let path = root.path().join(crate::workspace_template::TEMPLATE_PATH);
+            symlink(&target, &path)?;
+            assert!(WorkspaceSnapshot::open(root.path()).is_err());
+            assert_eq!(fs::read(&target)?, b"untouched");
+            fs::remove_file(&path)?;
+            fs::write(
+                &path,
+                vec![b'x'; crate::workspace_template::MAX_TEMPLATE_BYTES + 1],
+            )?;
+            assert!(WorkspaceSnapshot::open(root.path()).is_err());
+            Ok(())
         }
 
         #[test]
@@ -381,7 +548,7 @@ mod native {
 }
 
 #[cfg(unix)]
-pub(crate) use native::Snapshot;
+pub(crate) use native::{Snapshot, WorkspaceSnapshot};
 
 #[cfg(not(unix))]
 #[derive(Debug)]
@@ -401,6 +568,12 @@ impl Snapshot {
             "material metadata mutation is unsupported on this platform",
         ))
     }
+    pub(crate) fn preserve(&self, _: &Path) -> Result<()> {
+        Err(invalid(
+            "material metadata migration is unsupported on this platform",
+        ))
+    }
+    #[cfg(test)]
     pub(crate) fn replace(&self, _: &Path, _: &[u8]) -> Result<Self> {
         Err(invalid(
             "material metadata mutation is unsupported on this platform",

@@ -18,3 +18,14 @@ it('allows a running pane to collapse even while its presentation selector is lo
     expect(onSelect).not.toHaveBeenCalled();
   } finally { await unmount(view); target.remove(); }
 });
+
+it('omits the collapse affordance for the only content pane', async () => {
+  const target = document.createElement('div'); document.body.append(target);
+  const view = mount(PaneHeader, { target, props: {
+    title: 'Writing', collapsible: false, onCollapse: vi.fn()
+  } });
+  try {
+    await expect.element(page.getByText('Writing', { exact: true })).toBeVisible();
+    await expect.element(page.getByRole('button', { name: 'Collapse Writing' })).not.toBeInTheDocument();
+  } finally { await unmount(view); target.remove(); }
+});

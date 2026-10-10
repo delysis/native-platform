@@ -23,7 +23,10 @@ impl Engine {
         if let Some(scope) = state.inference.as_ref().and_then(|service| {
             service.scope(matches!(
                 policy,
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. }
+                ValidatedWeavePolicy::AutomaticV2
+                    | ValidatedWeavePolicy::AutomaticV3
+                    | ValidatedWeavePolicy::AutomaticVisualV4
+                    | ValidatedWeavePolicy::LoompadV2 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {
@@ -594,6 +597,7 @@ mod tests {
         let session_id = CommandId::new();
         {
             let mut session = state.session.lock().unwrap();
+            crate::workspace_owner::establish(&mut session, &store);
             session.store = Some(store);
             session.active_session_id = Some(session_id);
             session.phase = SessionPhase::Open;
@@ -609,21 +613,26 @@ mod tests {
         // Focus blocks even explicitly configured servers before durable work.
         state.session.lock().unwrap().agency.set_focus_mode(true);
         let start = || {
-            weave_start_inner(
+            tauri::async_runtime::block_on(weave_start(
                 project.to_string(),
                 session_id.to_string(),
-                &command.to_string(),
-                &source.document_id.to_string(),
-                INITIAL_DOCUMENT,
-                &source.revision_id.to_string(),
-                &source.blob_id.to_string(),
+                command.to_string(),
+                source.document_id.to_string(),
+                INITIAL_DOCUMENT.into(),
+                source.revision_id.to_string(),
+                source.blob_id.to_string(),
                 5,
                 policy,
-                app.handle(),
-                &state,
-            )
+                app.handle().clone(),
+                app.state::<PluginState>(),
+            ))
         };
-        if matches!(policy, WeavePolicySnapshot::LoompadV2 { .. }) {
+        if matches!(
+            policy,
+            WeavePolicySnapshot::AutomaticV3 {}
+                | WeavePolicySnapshot::AutomaticVisualV4 {}
+                | WeavePolicySnapshot::LoompadV2 { .. }
+        ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
             tauri::async_runtime::block_on(service.gateway.shutdown()).unwrap();
@@ -633,6 +642,23 @@ mod tests {
         assert_eq!(start().unwrap_err().code, "generation_blocked");
         assert!(calls.lock().unwrap().is_empty());
         state.session.lock().unwrap().agency.set_focus_mode(false);
+        // Without archive opt-in, preparation must preserve the original
+        // saved-source command semantics rather than impose draft admission.
+        state
+            .session
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .unwrap()
+            .upsert_transient_draft(
+                INITIAL_DOCUMENT,
+                source.revision_id,
+                0,
+                DocumentContent::Prose("Newer unsaved text".into()),
+            )
+            .unwrap();
+
         let started = start().unwrap();
         assert_eq!(
             started.speculation.is_some(),
@@ -686,6 +712,24 @@ mod tests {
         }
         assert_eq!(&calls.lock().unwrap()[..2], &["offline", "writer"]);
         let before_replay = calls.lock().unwrap().len();
+        // Exact replay must recover durable evidence before model/agency or
+        // archive preparation. A newly invalid opt-in file cannot break it.
+        {
+            let session = state.session.lock().unwrap();
+            std::fs::write(
+                session
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .join(::archive_friends::DOTFILE),
+                "not valid = [",
+            )
+            .unwrap();
+            session.agency.set_focus_mode(true);
+            session.agency.set_automation_enabled(false);
+        }
+
         assert_eq!(start().unwrap().request_id, started.request_id);
         assert_eq!(calls.lock().unwrap().len(), before_replay);
         if cancel {
@@ -715,6 +759,15 @@ mod tests {
     #[test]
     fn cancellation_drains_server_work_and_never_dispatches_remaining_branches() {
         exercise(true, WeavePolicySnapshot::AutomaticV2 {});
+    }
+    #[test]
+    fn visual_v4_never_falls_back_to_a_server_without_native_admission_evidence() {
+        exercise(false, WeavePolicySnapshot::AutomaticVisualV4 {});
+    }
+
+    #[test]
+    fn automatic_v3_never_falls_back_to_a_server_without_native_admission_evidence() {
+        exercise(false, WeavePolicySnapshot::AutomaticV3 {});
     }
     #[test]
     fn loompad_never_relabels_independent_server_draws_as_distinct_words() {
