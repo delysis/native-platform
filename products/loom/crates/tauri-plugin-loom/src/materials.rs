@@ -75,7 +75,7 @@ pub(crate) enum MaterialKind {
 }
 
 /// Storage promise attached to every serialized material and evidence record.
-/// Loom currently owns a Unix-permission boundary, not encrypted retention.
+/// Protected retention requires an authenticated encrypted project vault.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MaterialRetention {
@@ -239,12 +239,18 @@ fn grants() -> &'static Mutex<LibraryGrants> {
 fn invalid(message: impl Into<String>) -> MaterialError {
     MaterialError::Invalid(message.into())
 }
-fn require_supported_retention(retention: MaterialRetention) -> Result<()> {
+fn require_supported_retention(store: &ProjectStore, retention: MaterialRetention) -> Result<()> {
     match retention {
         MaterialRetention::Ordinary => Ok(()),
-        MaterialRetention::Protected => Err(invalid(
-            "protected material retention requires an existing encrypted storage boundary",
-        )),
+        MaterialRetention::Protected => {
+            if crate::private_sidecar::PayloadCodec::open(store.root())?.encrypted() {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "protected material retention requires an existing encrypted storage boundary",
+                ))
+            }
+        }
     }
 }
 fn digest(bytes: &[u8]) -> String {
@@ -314,7 +320,7 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
     let Some(snapshot) = metadata::Snapshot::open(store.root())? else {
         return Ok(Vec::new());
     };
-    let bindings = decode_bindings(&snapshot.bytes)?;
+    let bindings = decode_bindings(store, &snapshot.bytes)?;
     bindings
         .items
         .iter()
@@ -376,7 +382,7 @@ pub(crate) fn change_metadata(
             "material metadata changed; select the source again",
         ));
     }
-    let mut bindings = decode_bindings(&snapshot.bytes)?;
+    let mut bindings = decode_bindings(store, &snapshot.bytes)?;
     let index = bindings
         .items
         .iter()
@@ -502,7 +508,7 @@ fn save_binding_at_path(
     workspace_path: Option<&str>,
     retention: MaterialRetention,
 ) -> Result<Binding> {
-    require_supported_retention(retention)?;
+    require_supported_retention(store, retention)?;
     validate_name(name)?;
     let _lock = WRITE_LOCK
         .lock()
@@ -541,7 +547,7 @@ pub(crate) fn bind_attachment_with_retention(
     name: Option<&str>,
     retention: MaterialRetention,
 ) -> Result<MaterialEntry> {
-    require_supported_retention(retention)?;
+    require_supported_retention(store, retention)?;
     let source = context_attachments::describe_source(store.root(), attachment_id)?;
     let binding = save_binding_at_path(
         store,
@@ -1043,7 +1049,7 @@ fn retain_evidence(
     store: &ProjectStore,
     mut evidence: MaterialEvidence,
 ) -> Result<MaterialEvidence> {
-    require_supported_retention(evidence.retention)?;
+    require_supported_retention(store, evidence.retention)?;
     let bytes = evidence_payload(&evidence)?;
     if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
         return Err(invalid("source evidence exceeds retained evidence limit"));
@@ -1094,7 +1100,7 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
         return Err(invalid("retained evidence identity mismatch"));
     }
     let mut evidence: MaterialEvidence = serde_json::from_slice(&bytes)?;
-    require_supported_retention(evidence.retention)?;
+    require_supported_retention(store, evidence.retention)?;
     if digest(evidence.text.as_bytes()) != evidence.text_sha256 {
         return Err(invalid("retained evidence text mismatch"));
     }
@@ -1147,17 +1153,23 @@ fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
             items: Vec::new(),
         });
     };
-    decode_bindings(&bytes)
+    decode_bindings(store, &bytes)
 }
 
-fn decode_bindings(bytes: &[u8]) -> Result<Bindings> {
+fn decode_bindings(store: &ProjectStore, bytes: &[u8]) -> Result<Bindings> {
     let bindings: Bindings = serde_json::from_slice(bytes)?;
     if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
         return Err(invalid("unsupported material bindings"));
     }
+    if bindings
+        .items
+        .iter()
+        .any(|binding| binding.retention == MaterialRetention::Protected)
+    {
+        require_supported_retention(store, MaterialRetention::Protected)?;
+    }
     let mut ids = std::collections::BTreeSet::new();
     for binding in &bindings.items {
-        require_supported_retention(binding.retention)?;
         validate_name(&binding.name)?;
         if binding.id != binding_identity(&binding.source, binding.workspace_path.as_deref())?
             || !ids.insert(&binding.id)
@@ -1325,13 +1337,27 @@ mod tests {
 
     #[test]
     fn encrypted_project_material_sidecars_do_not_publish_plaintext() {
+        assert_encrypted_material_roundtrip(MaterialRetention::Ordinary);
+    }
+
+    #[test]
+    fn protected_materials_roundtrip_only_inside_an_encrypted_project() {
+        assert_encrypted_material_roundtrip(MaterialRetention::Protected);
+    }
+
+    fn assert_encrypted_material_roundtrip(retention: MaterialRetention) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Writing");
         fs::create_dir_all(root.join(".loom")).unwrap();
         let vault = desktop_vault::ProjectVault::initialize_with_key(&root, [23; 32]).unwrap();
         let (store, _) = ProjectStore::initialize_with_vault(&root, "Writing", vault).unwrap();
         let sentinel = "synthetic material secret e571";
-        let material = source(&store, sentinel, sentinel);
+        let source_path = root.join("source.txt");
+        fs::write(&source_path, sentinel).unwrap();
+        let attachment = context_attachments::import_path(&root, &source_path).unwrap();
+        let material =
+            bind_attachment_with_retention(&store, &attachment.id, Some(sentinel), retention)
+                .unwrap();
         let evidence = retain_evidence(
             &store,
             MaterialEvidence {
@@ -1340,7 +1366,7 @@ mod tests {
                 id: String::new(),
                 reference: String::new(),
                 material_id: material.id.clone(),
-                retention: MaterialRetention::Ordinary,
+                retention,
                 title: sentinel.into(),
                 text: sentinel.into(),
                 source_revision: "revision".into(),
