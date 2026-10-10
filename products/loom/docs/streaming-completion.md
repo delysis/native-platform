@@ -49,6 +49,20 @@ render cap, a blocked accepted stream, and acceptance of truncated DOM text must
 each fail their corresponding browser/controller regression. Do not replace the
 full-prefix expectation with a first-word expectation to make a build green.
 
+## Automatic candidate admission
+
+`automatic_v3` opts into the native `distinct_plain_text_v3` first-word policy.
+The native worker withholds each proposal until it has both a complete lexical
+first word and proof that its leading non-whitespace bytes are not a completed
+angle-bracket markup construct. A completed markup-led proposal is recorded as
+`disallowed_prefix`, charged to the immutable attempt ledger, discarded before
+emission, and retried from the exact prompt with the policy's deterministic retry
+seed. Incomplete markup remains withheld. The existing token and attempt bounds
+still fail closed; exhaustion never releases rejected bytes.
+
+`automatic_v2` remains unchanged for receipt compatibility. Automatic V3 cannot
+fall back to a server path that cannot return the native admission evidence.
+
 ## Native promotion boundary
 
 A clean build, four completed runs, events, Metal initialization and green

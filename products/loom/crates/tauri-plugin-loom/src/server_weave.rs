@@ -23,7 +23,9 @@ impl Engine {
         if let Some(scope) = state.inference.as_ref().and_then(|service| {
             service.scope(matches!(
                 policy,
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. }
+                ValidatedWeavePolicy::AutomaticV2
+                    | ValidatedWeavePolicy::AutomaticV3
+                    | ValidatedWeavePolicy::LoompadV2 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {
@@ -624,7 +626,10 @@ mod tests {
                 &state,
             )
         };
-        if matches!(policy, WeavePolicySnapshot::LoompadV2 { .. }) {
+        if matches!(
+            policy,
+            WeavePolicySnapshot::AutomaticV3 {} | WeavePolicySnapshot::LoompadV2 { .. }
+        ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
             tauri::async_runtime::block_on(service.gateway.shutdown()).unwrap();
@@ -716,6 +721,10 @@ mod tests {
     #[test]
     fn cancellation_drains_server_work_and_never_dispatches_remaining_branches() {
         exercise(true, WeavePolicySnapshot::AutomaticV2 {});
+    }
+    #[test]
+    fn automatic_v3_never_falls_back_to_a_server_without_native_admission_evidence() {
+        exercise(false, WeavePolicySnapshot::AutomaticV3 {});
     }
     #[test]
     fn loompad_never_relabels_independent_server_draws_as_distinct_words() {
