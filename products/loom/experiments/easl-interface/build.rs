@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 mod build_assets;
 
 const REFERENCE: &str = "native-platform main a7248566b5012e32810584725af9e4574699c478 plus reviewed collections 0c4677b343af0d144df6cb4f36260e42a9932385; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9";
-const APP_SHA256: &str = "e9f6de720c1780da65500041b101ad1f2ee87b859ed14a96b2ea9bce0c2f3dd8";
+const APP_SHA256: &str = "bce10d659d5758e21baa1f06380823eb6b39ee33f0c6ab66b2a13e061b4c1d4a";
 const CSS_SHA256: &str = "a153e13ad1ee00c84d2e02b31fa318d4af556e7f1fe3b3c581ee36bf58dbb81f";
 
 fn main() {

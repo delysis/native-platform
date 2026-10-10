@@ -1501,6 +1501,19 @@
   let nativeDropWitness: { type: string; point: { x: number; y: number } | null; scope: string | null; path_count: number } | null = null;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    loompad_scope: {
+      mode,
+      matches: loompadReservoir?.key === loompadSnapshotKey,
+      caret: mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte,
+      captured_caret: loompadReservoir?.capture.cursorByte ?? null,
+      revision_matches: loompadReservoir?.capture.sourceRevisionId === document?.summary.revision_id,
+      blob_matches: loompadReservoir?.capture.visibleBlobId === document?.visible_blob_id,
+      intent_matches: loompadReservoir?.capture.intentEpoch === completionController.intentEpoch,
+      edit_matches: loompadReservoir?.capture.editVersion === editVersion,
+      context_matches: loompadReservoir?.capture.contextEpoch === contextEpoch,
+      epoch_matches: loompadReservoir?.capture.epoch === documentEpoch,
+      phase: activeFamilyEvaluation?.phase.kind ?? 'inactive'
+    },
     native_drop: nativeDropWitness,
     writer_id: currentWriter?.model_id ?? '',
     writer_source: configuredWriter ? 'configured_server' : 'native',
