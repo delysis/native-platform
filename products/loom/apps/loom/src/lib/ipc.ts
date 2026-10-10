@@ -69,6 +69,9 @@ export function documentReferenceDiagnostics(projectId: string, sessionId: strin
 // its bounded critical sections, so renderer classification is an ordering and
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
+  'preferences_get',
+  'preferences_update',
+  'preferences_suggestions_get',
   'material_pdf_page',
   'workspace_source_import_cancel',
   'import_account_cancel',

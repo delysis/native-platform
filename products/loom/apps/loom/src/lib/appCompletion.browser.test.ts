@@ -115,6 +115,73 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
   expect(input.element().getBoundingClientRect().height).toBeLessThanOrEqual(40);
 });
 
+it('waits for shared preferences before workspace restore and refuses saved suggestions without native model policy', async () => {
+  restoreStorage = Object.entries(localStorage); localStorage.clear();
+  restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
+  Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+  const blob = await sha256('Original manuscript');
+  const opened: OpenDocument = { summary: {
+    document_id: 'doc-1', relative_path: 'Untitled.md', title: 'Untitled', kind: 'prose',
+    revision_id: 'revision-1', active_blob_id: blob, word_count: 2, externally_modified: false
+  }, visible_blob_id: blob, text: 'Original manuscript', transient_draft: null };
+  const project: ProjectSnapshot = { project_id: 'project-1', session_id: 'session-1', title: 'writing',
+    root: '/injected/writing', schema_version: 1, pending_recovery: 0, documents: [opened.summary] };
+  const calls: string[] = [];
+  let resolvePreferences!: (value: unknown) => void;
+  const preferences = new Promise(resolve => { resolvePreferences = resolve; });
+  localStorage.setItem('loom:last-local-model', '/legacy/unverified.gguf');
+  localStorage.setItem('loom:suggestions:project-1', 'on');
+  let submitted: Record<string, any> | null = null;
+  let retainedRun: TerminalRun | null = null;
+  transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
+    calls.push(command);
+    switch (command) {
+      case 'plugin:loom|preferences_get': return preferences;
+      case 'plugin:loom|application_close_pending': return false;
+      case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
+      case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
+      case 'plugin:loom|document_open': return opened;
+      case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
+      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: 'workspace-config-document', revision_id: 'workspace-config-1', error: null,
+        config: { panes: { chat: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['@document'] } } } };
+      case 'plugin:loom|build_model_policy_get': return null;
+      case 'plugin:loom|model_catalog_list': return [];
+      case 'plugin:loom|model_list': return [];
+      case 'plugin:loom|inference_status': return { suggestions: null };
+      case 'plugin:loom|completion_snapshot': return { project_id: project.project_id, session_id: project.session_id,
+        document_id: opened.summary.document_id, branches: [], active_operations: [], next_cursor: null, has_more: false };
+      case 'plugin:loom|model_download_list':
+      case 'plugin:loom|material_list':
+      case 'plugin:loom|co_writer_list': return [];
+      case 'plugin:loom|workspace_pane_list':
+      case 'plugin:loom|terminal_list': return retainedRun ? [retainedRun] : [];
+      case 'plugin:loom|suggestions_set':
+      case 'plugin:loom|focus_mode_set': return;
+      case 'plugin:loom|workspace_pane_run':
+        submitted = args.request;
+        retainedRun = { run_id: args.request.command_id, status: 'completed', expression: args.request.expression,
+          presentation: { pane_id: args.request.pane_id, input: args.request.input },
+          output_document_id: null, output_relative_path: null, preview: 'Transport fixture reply', error: null, created_at_ms: 1 };
+        return { status: 'accepted', run: retainedRun };
+      default: throw new Error(`Unexpected native operation: ${command}`);
+    }
+  });
+  const target = document.createElement('div'); document.body.append(target);
+  mounted = mount(App, { target });
+  await expect.poll(() => calls.includes('plugin:loom|preferences_get')).toBe(true);
+  // Hold the storage reply across an event-loop interval, so an unawaited
+  // startup can reach project_current before the assertion.
+  await new Promise(resolve => window.setTimeout(resolve, 150));
+  expect(calls).not.toContain('plugin:loom|project_current');
+  resolvePreferences({ revision: '9007199254740993', last_local_model: null, project_suggestions: { 'project-1': true } });
+  await expect.element(page.getByRole('textbox', { name: 'Message', exact: true })).toBeVisible();
+  await expect.poll(() => calls.includes('plugin:loom|build_model_policy_get')).toBe(true);
+  expect(calls.filter(command => command === 'plugin:loom|weave_start' || command.includes('model_load'))).toEqual([]);
+  expect(localStorage.getItem('loom:last-local-model')).toBe('/legacy/unverified.gguf');
+  expect(localStorage.getItem('loom:suggestions:project-1')).toBe('on');
+});
+
 it.each([
   { loomModel: 'A', momModel: 'B', edited: false },
   { loomModel: 'A', momModel: 'B', edited: true },
