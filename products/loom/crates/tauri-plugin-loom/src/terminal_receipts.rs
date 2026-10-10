@@ -232,6 +232,7 @@ mod unix {
             file.sync_all().map_err(io_failure)?;
             before_publish()?;
             directory.ensure_binding()?;
+            codec.validate_root(root).map_err(io_failure)?;
             match linkat(
                 &directory.runs,
                 temporary.as_str(),
@@ -324,6 +325,34 @@ mod tests {
         assert!(read(root.path(), &id, false).is_err());
         assert!(write(root.path(), &id, false, bytes).is_err());
         assert_eq!(fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn vault_header_loss_before_receipt_publication_refuses_commit() {
+        let root = fixture();
+        desktop_vault::ProjectVault::initialize_with_key(root.path(), [43; 32]).unwrap();
+        let name = file_name(&loom_types::CommandId::new().to_string(), false).unwrap();
+        let result = unix::write(root.path(), &name, b"{}", || {
+            fs::remove_file(root.path().join(".loom/vault.json")).unwrap();
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "receipt published after its vault header disappeared"
+        );
+        assert!(!root.path().join(".loom/function-runs").join(name).exists());
+    }
+
+    #[test]
+    fn newly_protected_project_refuses_pending_plaintext_receipt() {
+        let root = fixture();
+        let name = file_name(&loom_types::CommandId::new().to_string(), false).unwrap();
+        let result = unix::write(root.path(), &name, b"{}", || {
+            desktop_vault::ProjectVault::initialize_with_key(root.path(), [47; 32]).unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!root.path().join(".loom/function-runs").join(name).exists());
     }
 
     #[test]

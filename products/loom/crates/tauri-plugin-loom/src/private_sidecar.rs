@@ -28,6 +28,17 @@ impl PayloadCodec {
         })
     }
 
+    pub(crate) fn validate_root(&self, root: &Path) -> io::Result<()> {
+        match &self.vault {
+            Some(vault) => vault.validate_root(root).map_err(io::Error::other),
+            None => match fs::symlink_metadata(root.join(".loom/vault.json")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err(invalid("Project protection changed during publication.")),
+            },
+        }
+    }
+
     pub(crate) fn encrypted(&self) -> bool {
         self.vault.is_some()
     }
