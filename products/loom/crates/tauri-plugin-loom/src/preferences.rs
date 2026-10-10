@@ -2,7 +2,6 @@
 //! preference service; the application admission lock covers the complete write.
 use crate::{IpcFailure, PluginState, lock_application_admission};
 use loom_preferences::{PreferenceChange, PreferenceStore, Preferences};
-use loom_types::ProjectId;
 use tauri::{AppHandle, Manager, Runtime};
 
 async fn with_preferences<R: Runtime, T: Send + 'static>(
@@ -51,19 +50,6 @@ pub(crate) async fn preferences_update<R: Runtime>(
     change: PreferenceChange,
 ) -> Result<Preferences, IpcFailure> {
     with_preferences(app, move |store, _| store.update(change)).await
-}
-
-#[tauri::command]
-pub(crate) async fn preferences_suggestions_get<R: Runtime>(
-    app: AppHandle<R>,
-    project_id: ProjectId,
-) -> Result<bool, IpcFailure> {
-    with_preferences(app, move |store, state| {
-        Ok(store
-            .read()?
-            .suggestions_enabled(project_id, Some(state.build_model_policy.activation())))
-    })
-    .await
 }
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
 const COMMANDS: &[&str] = &[
     "preferences_get",
     "preferences_update",
-    "preferences_suggestions_get",
     "document_reference_diagnostics",
     "material_list",
     "material_resolve_reference",

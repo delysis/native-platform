@@ -2161,7 +2161,6 @@ impl Builder {
             .invoke_handler(tauri::generate_handler![
                 preferences::preferences_get,
                 preferences::preferences_update,
-                preferences::preferences_suggestions_get,
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
