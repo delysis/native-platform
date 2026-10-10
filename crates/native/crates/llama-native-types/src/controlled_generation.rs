@@ -1725,6 +1725,7 @@ struct StrictGenerationMetricsWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictGenerationCacheMetricsWire {
+    resident_prefix_tokens: usize,
     supplied_prefix_tokens: usize,
     restored_prefix_tokens: usize,
     batch_shared_prefix_tokens: usize,
@@ -1805,7 +1806,7 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
                     restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
                     replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: value.metrics.cache.batch_shared_prefix_tokens,
-                    resident_prefix_tokens: 0,
+                    resident_prefix_tokens: value.metrics.cache.resident_prefix_tokens,
                 },
             },
             real_engine_invoked: value.real_engine_invoked,
@@ -1867,6 +1868,7 @@ impl TryFrom<&GenerationOutput> for StrictGenerationOutputWire {
                 first_token_ms: value.metrics.first_token_ms,
                 tokens_per_second: ExactF64::new(value.metrics.tokens_per_second)?,
                 cache: StrictGenerationCacheMetricsWire {
+                    resident_prefix_tokens: value.metrics.cache.resident_prefix_tokens,
                     supplied_prefix_tokens: value.metrics.cache.supplied_prefix_tokens,
                     restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
                     batch_shared_prefix_tokens: value.metrics.cache.batch_shared_prefix_tokens,
