@@ -208,6 +208,21 @@ describe('pure completion controller', () => {
     expect(state.lastAction).toBeNull();
   });
 
+  it('keeps the displayed choice as cycling authority when a streaming family temporarily disappears', () => {
+    let state = cycleCompletion(readyController(), family, 1).state;
+    state = reconcileCompletionController(state, contextKey, []);
+    expect(completionControllerView(state, contextKey, []).selected).toBeNull();
+    const grown = family.map(candidate => ({ ...candidate,
+      text: `${candidate.text} grows`, presentationKey: `${candidate.presentationKey}:next`
+    }));
+    state = reconcileCompletionController(state, contextKey, grown);
+    const visible = completionControllerView(state, contextKey, grown);
+    expect(visible.selected?.runId).toBe('run-b');
+    expect(visible.witnessSelected?.runId).toBe(visible.selected?.runId);
+    state = cycleCompletion(state, grown, -1).state;
+    expect(completionControllerView(state, contextKey, grown).selected?.runId).toBe('run-a');
+  });
+
   it.each<CompletionInsertionAction>([
     'option_word',
     'fan_return',

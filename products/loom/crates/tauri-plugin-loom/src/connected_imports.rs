@@ -1,4 +1,5 @@
 //! Product-owned account grants, credential storage, and explicit sync.
+pub(super) mod collections;
 mod credentials;
 
 use super::{
@@ -11,7 +12,7 @@ use credentials::AccountStore;
 use information_native_acquire::google_import::{
     self, GoogleService, GoogleSession, ImportQuery, RemoteFile,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::Duration;
 use tauri::State;
 
@@ -26,31 +27,6 @@ pub(crate) struct AccountStatus {
 
 use crate::import_batch::{ImportBatch as SyncReport, ImportFailure as SyncFailure};
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ImportSource {
-    Gmail,
-    GoogleAlerts,
-    LinkedIn,
-    Drive,
-}
-impl ImportSource {
-    fn service(self) -> GoogleService {
-        if matches!(self, Self::Drive) {
-            GoogleService::Drive
-        } else {
-            GoogleService::Gmail
-        }
-    }
-    fn query(self, input: &str) -> String {
-        match self {
-            Self::GoogleAlerts => format!("from:googlealerts-noreply@google.com ({input})"),
-            Self::LinkedIn => format!("from:linkedin.com ({input})"),
-            Self::Gmail | Self::Drive => input.to_string(),
-        }
-    }
-}
-
 fn failure(message: impl Into<String>) -> IpcFailure {
     IpcFailure::new("connected_import_failed", message, false)
 }
@@ -61,7 +37,7 @@ fn validate_session(
     session_id: &str,
 ) -> Result<(), IpcFailure> {
     let _admission = lock_application_admission(state, "connected import")?;
-    require_bound_store(&mut *lock_session(state)?, project_id, session_id)?;
+    crate::workspace_owner::require_store_mut(&mut *lock_session(state)?, project_id, session_id)?;
     Ok(())
 }
 
@@ -97,7 +73,8 @@ pub(crate) async fn import_account_connect(
     let _operation = ACCOUNT_OPERATION
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    let operation =
+        ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
     let credential = operation
         .network(async move {
             let pending = google_import::begin_authorization(client_id, client_secret, service)
@@ -134,7 +111,11 @@ pub(crate) async fn import_account_disconnect(
         failure("An account import is running; wait for it to finish before disconnecting.")
     })?;
     let _admission = lock_application_admission(&state, "disconnecting an import account")?;
-    require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
+    crate::workspace_owner::require_store_mut(
+        &mut *lock_session(&state)?,
+        &project_id,
+        &session_id,
+    )?;
     AccountStore::new(&project_id, service).disconnect(&account_email)
 }
 
@@ -155,21 +136,21 @@ struct ImportOrigin<'a> {
 
 fn prepare_remote_file(
     root: &std::path::Path,
-    source: ImportSource,
+    service: GoogleService,
     email: &str,
     file: &RemoteFile,
     bytes: Vec<u8>,
-) -> Result<PreparedAttachment, IpcFailure> {
+) -> Result<(PreparedAttachment, String), IpcFailure> {
     let mut prepared = prepare_provided(
         root,
         ProvidedAttachment::from_bytes(&file.name, None, bytes),
     )
     .map_err(|error| failure(error.to_string()))?;
-    record_import_origin(
+    let origin = record_import_origin(
         root,
         &ImportOrigin {
             schema: "loom.connected-import.v1",
-            service: source.service(),
+            service,
             account_email: email,
             source_uri: &file.source_uri,
             remote_id: &file.id,
@@ -184,7 +165,7 @@ fn prepare_remote_file(
     .map_err(|error| failure(error.to_string()))?;
     prepared.attachment.editable_markdown = None;
     prepared.attachment.media_markdown = None;
-    Ok(prepared)
+    Ok((prepared, origin))
 }
 
 async fn download_page_file(
@@ -201,104 +182,6 @@ async fn download_page_file(
     }
 }
 
-// Keep the existing flat IPC fields and the separately cancellable operation identity.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn import_account_sync(
-    project_id: String,
-    session_id: String,
-    operation_id: String,
-    source: ImportSource,
-    account_email: String,
-    query: String,
-    page_token: Option<String>,
-    state: State<'_, PluginState>,
-) -> Result<SyncReport, IpcFailure> {
-    let _operation = ACCOUNT_OPERATION
-        .try_lock()
-        .map_err(|_| failure("Another account import is running."))?;
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
-    if query.trim().is_empty() && !matches!(source, ImportSource::Drive) {
-        return Err(failure(
-            "Enter a Gmail search, such as newer_than:30d or label:Research.",
-        ));
-    }
-    let credential = AccountStore::new(&project_id, source.service())
-        .list()?
-        .into_iter()
-        .find(|account| account.account_email == account_email)
-        .ok_or_else(|| failure("Connect this account first."))?;
-    let import_query = ImportQuery {
-        query: source.query(query.trim()),
-        page_token,
-    };
-    let origin_email = credential.account_email.clone();
-    let (remote, page) = operation
-        .network(async move {
-            let remote = GoogleSession::refresh(&credential)
-                .await
-                .map_err(|error| failure(error.to_string()))?;
-            let page = remote
-                .list(&import_query)
-                .await
-                .map_err(|error| failure(error.to_string()))?;
-            Ok((std::sync::Arc::new(remote), page))
-        })
-        .await?;
-    let mut report = SyncReport {
-        imported: Vec::new(),
-        failures: Vec::new(),
-        next_page_token: page.next_page_token,
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_mins(3);
-    let mut total_bytes = 0usize;
-    let file_count = page.files.len();
-    for (index, file) in page.files.into_iter().enumerate() {
-        let name = file.name.clone();
-        let root = operation.root.clone();
-        let remote = std::sync::Arc::clone(&remote);
-        let remaining = (64 * 1024 * 1024usize).saturating_sub(total_bytes);
-        let downloaded = operation
-            .network(async move {
-                let bytes = download_page_file(&remote, &file, deadline, remaining)
-                    .await
-                    .map_err(failure)?;
-                Ok((file, bytes))
-            })
-            .await;
-        let result = match downloaded {
-            Ok((file, bytes)) => {
-                total_bytes += bytes.len();
-                let email = origin_email.clone();
-                operation
-                    .compute(move || prepare_remote_file(&root, source, &email, &file, bytes))
-                    .await
-                    .and_then(|prepared| operation.publish(&state, prepared))
-            }
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(attachment) => report.imported.push(attachment),
-            Err(error) => report.failures.push(SyncFailure {
-                name,
-                message: error.message,
-            }),
-        }
-        if operation.check().is_err() {
-            report.next_page_token = None;
-            if index + 1 < file_count {
-                report.failures.push(SyncFailure {
-                    name: "Remaining sources".into(),
-                    message: format!("Import stopped with {} sources remaining on this page. Retry this page to import them.", file_count - index - 1),
-                });
-            }
-            break;
-        }
-    }
-
-    Ok(report)
-}
-
 #[tauri::command]
 pub(crate) async fn import_source_url(
     project_id: String,
@@ -307,7 +190,8 @@ pub(crate) async fn import_source_url(
     url: String,
     state: State<'_, PluginState>,
 ) -> Result<SyncReport, IpcFailure> {
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    let operation =
+        ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
     if url.len() > 4096 || !url.starts_with("https://") {
         return Err(failure("Enter a public HTTPS document URL."));
     }
@@ -331,10 +215,19 @@ pub(crate) async fn import_source_url(
         prepared.attachment.media_markdown = None;
         Ok(prepared)
     }).await?;
-    let attachment = operation.publish(&state, prepared)?;
+    let (source, binding_failure) =
+        crate::workspace_source_import::publish(&operation, &state, prepared)?;
+    let failures = binding_failure
+        .into_iter()
+        .map(|message| SyncFailure {
+            name: source.attachment.file_name.clone(),
+            message,
+        })
+        .collect();
     Ok(SyncReport {
-        imported: vec![attachment],
-        failures: Vec::new(),
+        imported: vec![source.attachment],
+        references: Vec::new(),
+        failures,
         next_page_token: None,
     })
 }
@@ -346,7 +239,8 @@ pub(crate) async fn import_account_cancel(
     operation_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    validate_session(&state, &project_id, &session_id)?;
+    let _admission = lock_application_admission(&state, "stopping a document import")?;
+    require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
     state.imports.cancel(&session_id, &operation_id)?;
     Ok(())
 }

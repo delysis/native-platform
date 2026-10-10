@@ -9,6 +9,10 @@ use loom_document::{
 };
 use std::sync::atomic::AtomicUsize;
 
+#[path = "terminal_scope.rs"]
+mod scope;
+use scope::{DocumentRunRequest, PreparedInput, RunRequest, RunScope, WorkspacePaneRequest};
+
 const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_HISTORY: usize = 64;
@@ -83,7 +87,7 @@ fn projected_run(receipt: &RunReceipt) -> TerminalRun {
     let retained_sources = receipt
         .bindings
         .values()
-        .filter_map(|value| match value {
+        .filter_map(|value| match value.unscoped() {
             Value::Material { material } if material.text.is_some() => {
                 Some(material.material.id.as_str())
             }
@@ -180,15 +184,44 @@ fn terminal_sampling(
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct TerminalMediaEvidence {
-    id: String,
-    kind: llama_native_types::MediaKind,
-    mime: String,
-    bytes_blob_id: BlobId,
+struct SourceUse {
+    origin: material_context::SourceOrigin,
+    evidence_ids: Vec<String>,
+    search_index: Option<usize>,
+}
+
+impl SourceUse {
+    fn evidence_value(
+        &self,
+        evidence: &[crate::materials::MaterialEvidence],
+    ) -> Result<Value, IpcFailure> {
+        let evidence = self
+            .evidence_ids
+            .iter()
+            .map(|id| {
+                evidence
+                    .iter()
+                    .find(|hit| &hit.id == id)
+                    .cloned()
+                    .ok_or_else(|| failure("A retained source use is missing its evidence."))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Value::Scoped {
+            origin: self.origin.clone(),
+            value: Box::new(Value::Evidence {
+                evidence,
+                retrieval: None,
+            }),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RunReceipt {
+    #[serde(default)]
+    scope: RunScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_configuration: Option<Value>,
     run: TerminalRun,
     request_fingerprint: BlobId,
     source_document_id: DocumentId,
@@ -199,13 +232,22 @@ struct RunReceipt {
     #[serde(default)]
     context_references: Option<Vec<String>>,
     #[serde(default)]
-    media: Vec<TerminalMediaEvidence>,
+    media: Vec<crate::terminal_media::RetainedMedia>,
     model: Option<VerifiedModelDescriptor>,
     bindings: BTreeMap<String, Value>,
+    #[serde(default)]
+    function_contexts: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     evidence: Vec<crate::materials::MaterialEvidence>,
     #[serde(default)]
     searches: Vec<crate::materials::MaterialSearch>,
+    /// Typed full-scope aggregates, each retaining its explicit source origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    counts: Vec<Value>,
+    /// Source attribution indexes the exact snapshots above without duplicating
+    /// their text. Empty searches retain an origin through their search index.
+    #[serde(default)]
+    source_uses: Vec<SourceUse>,
     #[serde(default)]
     omitted_evidence: BTreeSet<String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
@@ -312,6 +354,7 @@ fn expression_names(
             names.insert(name.clone());
         }
         NeuralExpression::Literal { .. } => {}
+        NeuralExpression::Count { source } => expression_names(source, names, calls),
         NeuralExpression::Find { source, query } => {
             expression_names(source, names, calls);
             expression_names(query, names, calls);
@@ -331,6 +374,7 @@ fn expression_names(
 
 fn function_names(expression: &NeuralExpression, names: &mut BTreeSet<String>) {
     match expression {
+        NeuralExpression::Count { source } => function_names(source, names),
         NeuralExpression::Call {
             function,
             arguments,
@@ -445,11 +489,15 @@ fn read_receipt(root: &Path, id: &str, finished: bool) -> Result<Option<RunRecei
     Ok(Some(receipt))
 }
 
-fn settle_interrupted(run: &mut TerminalRun, state: &PluginState) -> Result<(), IpcFailure> {
+fn settle_interrupted(
+    run: &mut TerminalRun,
+    scope: RunScope,
+    state: &PluginState,
+) -> Result<(), IpcFailure> {
     if run.status == "running"
         && state
             .generation_lifecycle
-            .current_lease(&format!("terminal-{}", run.run_id))
+            .current_lease(&scope.request_id(&run.run_id))
             .map_err(io_failure)?
             .is_none()
     {
@@ -477,15 +525,109 @@ pub(super) async fn terminal_run<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
-    let command_id = parse_command_id(&command_id)?;
-    if let Some(presentation) = &presentation
-        && (!crate::workspace_template::valid_pane_id(&presentation.pane_id)
-            || presentation.input.len() > MAX_PROMPT_BYTES)
-    {
-        return Err(failure(
-            "Run presentation needs a valid pane name and input within 64 KiB.",
-        ));
+    let mut may_have_started = false;
+    start_run(
+        &RunRequest::Document(DocumentRunRequest {
+            project_id,
+            session_id,
+            command_id,
+            document_id,
+            source_revision_id,
+            expected_visible_blob_id,
+            source_start_byte,
+            source_end_byte,
+            expression,
+            presentation,
+            context_references,
+            turn_boundary,
+        }),
+        &app,
+        &state,
+        &mut may_have_started,
+    )
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum WorkspacePaneSubmission {
+    Accepted { run: Box<TerminalRun> },
+    Rejected { error: IpcFailure },
+}
+
+#[tauri::command]
+pub(super) async fn workspace_pane_run<R: Runtime>(
+    request: WorkspacePaneRequest,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<WorkspacePaneSubmission, IpcFailure> {
+    let mut may_have_started = false;
+    match start_run(
+        &RunRequest::Workspace(request),
+        &app,
+        &state,
+        &mut may_have_started,
+    ) {
+        Ok(run) => Ok(WorkspacePaneSubmission::Accepted { run: Box::new(run) }),
+        Err(error) if !may_have_started => Ok(WorkspacePaneSubmission::Rejected { error }),
+        Err(error) => Err(error),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn start_run<R: Runtime>(
+    request: &RunRequest,
+    app: &AppHandle<R>,
+    state: &PluginState,
+    may_have_started: &mut bool,
+) -> Result<TerminalRun, IpcFailure> {
+    let scope = request.scope();
+    let (project_id, session_id, command_id) = request.identity();
+    let project_id = project_id.to_owned();
+    let session_id = session_id.to_owned();
+    let command_id = parse_command_id(command_id)?;
+    let mut fingerprint_bytes = request.fingerprint()?;
+    let admission = lock_application_admission(state, "an experiment")?;
+    let model_guard = lock_model_lifecycle(state)?;
+    let mut session = lock_session(state)?;
+    if scope == RunScope::Document {
+        session
+            .agency
+            .admit_manual_generation()
+            .map_err(io_failure)?;
+    }
+    let store = scope.store(&mut session, &project_id, &session_id)?;
+    let root = store.root().to_owned();
+    let existing = read_receipt(&root, &command_id.to_string(), false).inspect_err(|_| {
+        // An unreadable receipt may belong to an earlier admitted submission.
+        *may_have_started = true;
+    })?;
+    if let Some(receipt) = existing {
+        // A replay uses the admitted configuration, even when the live dotfile
+        // changed afterwards. A new command captures the new revision instead.
+        if let Some(recipe) = &receipt.function_recipe {
+            fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
+        }
+        let fingerprint = BlobId::digest(&fingerprint_bytes);
+        if receipt.scope != scope || receipt.request_fingerprint != fingerprint {
+            return Err(failure(
+                "This run identifier belongs to a different experiment",
+            ));
+        }
+        *may_have_started = true;
+        let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
+        settle_interrupted(&mut result.run, scope, state)?;
+        return Ok(projected_run(&result));
+    }
+    let PreparedInput {
+        source,
+        input,
+        entry,
+        presentation,
+        context_references,
+        turn_boundary,
+        configuration: workspace_configuration,
+        capture_request,
+    } = request.prepare(&mut session)?;
     let workspace_chat = if matches!(turn_boundary, Some(TerminalTurnBoundary::Chat)) {
         app.try_state::<crate::WorkspaceChatService<R>>()
             .map(|service| service.inner().clone())
@@ -497,74 +639,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             "A workspace chat needs its original message and pane identity.",
         ));
     }
-    let mut fingerprint_bytes = serde_json::to_vec(&(
-        &project_id,
-        &document_id,
-        &source_revision_id,
-        &expected_visible_blob_id,
-        source_start_byte,
-        source_end_byte,
-        &expression,
-    ))
-    .map_err(io_failure)?;
-    if let Some(presentation) = &presentation {
-        // An absent presentation keeps the existing request identity. A present
-        // one must match on replay just like every execution input.
-        fingerprint_bytes.extend(serde_json::to_vec(presentation).map_err(io_failure)?);
-    }
-    if let Some(references) = &context_references {
-        validate_explicit_references(references)?;
-        fingerprint_bytes.extend(serde_json::to_vec(references).map_err(io_failure)?);
-    }
-    if let Some(boundary) = turn_boundary {
-        fingerprint_bytes.extend(serde_json::to_vec(&boundary).map_err(io_failure)?);
-    }
-    let admission = lock_application_admission(&state, "an experiment")?;
-    let model_guard = lock_model_lifecycle(&state)?;
-    let mut session = lock_session(&state)?;
-    session
-        .agency
-        .admit_manual_generation()
-        .map_err(io_failure)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let root = store.root().to_owned();
-    if let Some(receipt) = read_receipt(&root, &command_id.to_string(), false)? {
-        // A replay uses the admitted configuration, even when the live dotfile
-        // changed afterwards. A new command captures the new revision instead.
-        if let Some(recipe) = &receipt.function_recipe {
-            fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
-        }
-        let fingerprint = BlobId::digest(&fingerprint_bytes);
-        if receipt.request_fingerprint != fingerprint {
-            return Err(failure(
-                "This run identifier belongs to a different experiment",
-            ));
-        }
-        let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
-        settle_interrupted(&mut result.run, &state)?;
-        return Ok(projected_run(&result));
-    }
-    let document_id = document_id.parse::<DocumentId>().map_err(io_failure)?;
-    let summary = store
-        .registered_document(document_id)
-        .map_err(IpcFailure::store)?
-        .ok_or_else(|| failure("The source document is no longer available"))?;
-    let source = store
-        .read_document(&summary.relative_path)
-        .map_err(IpcFailure::store)?;
-    if source.revision_id.to_string() != source_revision_id
-        || source.blob_id.to_string() != expected_visible_blob_id
-    {
-        return Err(failure(
-            "The source changed before the experiment began. Try again.",
-        ));
-    }
-    let input = input_range(&source.text, source_start_byte, source_end_byte)?.to_owned();
-    let entry = if expression.is_empty() {
-        input.clone()
-    } else {
-        expression.clone()
-    };
+    let document_id = source.document_id;
     if entry.trim().is_empty() {
         return Err(failure("Write or select an idea to try."));
     }
@@ -618,7 +693,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     let model = if calls == 0 {
         None
     } else {
-        Some(loaded_model(&state)?)
+        Some(loaded_model(state)?)
     };
     let names = names.into_iter().collect::<Vec<_>>();
     // Only called functions contribute direct context. Reference values remain
@@ -627,39 +702,119 @@ pub(super) async fn terminal_run<R: Runtime>(
     if let NeuralCommand::Expression(expression) = &command {
         function_names(expression, &mut functions);
     }
-    let function_recipe = if functions.is_empty() {
+    let workspace_chat_recipe =
+        scope == RunScope::Workspace && matches!(turn_boundary, Some(TerminalTurnBoundary::Chat));
+    let function_recipe = if functions.is_empty() && !workspace_chat_recipe {
         None
+    } else if scope == RunScope::Workspace {
+        Some(crate::workspace_template::function_recipe_from_snapshot(
+            crate::workspace_owner::store(&session)?,
+            &source,
+        )?)
     } else {
-        Some(crate::workspace_template::function_recipe(store)?)
+        Some(crate::workspace_template::function_recipe(
+            crate::workspace_owner::store_mut(&mut session)?,
+        )?)
     };
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| failure("The workspace closed before this experiment began."))?;
+    let owner_project_id = owner.project_id;
+    let owner_session_id = owner.session_id;
+    if !names.is_empty() || !functions.is_empty() {
+        crate::material_commands::restore_grants(
+            state,
+            crate::workspace_owner::require_store_mut(
+                &mut session,
+                &owner_project_id.to_string(),
+                &owner_session_id.to_string(),
+            )?,
+        )?;
+    }
+    let mut capture = None;
+    let mut capture_media = Vec::new();
+    if scope == RunScope::Workspace && names.iter().any(|name| name == "document") {
+        let (value, media) = scope::capture_document(&mut session, capture_request.as_ref())?;
+        capture = Some(value);
+        capture_media = media;
+    }
     if let Some(recipe) = &function_recipe {
         fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
     }
     let fingerprint = BlobId::digest(&fingerprint_bytes);
     let mut all_names = names.into_iter().collect::<BTreeSet<_>>();
-    for function in functions {
-        if function.ends_with('/') {
-            return Err(failure("A function must name one document."));
-        }
-        let function_value = material_context::resolve(store, &function)?;
-        let function_text = material_context::exact(&function_value)?;
-        for reference in document_references(&function_text).map_err(io_failure)? {
-            all_names.insert(reference.name);
+    let mut mounted = crate::workspace_references::Snapshots::default();
+    mounted.admit(state, &session, all_names.iter().map(String::as_str))?;
+    let mut function_contexts = BTreeMap::new();
+    {
+        let read_context = scope
+            .read_context(
+                &mut session,
+                &project_id,
+                &session_id,
+                &owner_project_id.to_string(),
+                &owner_session_id.to_string(),
+            )?
+            .with_mounted(&mounted);
+        for function in functions {
+            if function.ends_with('/') {
+                return Err(failure("A function must name one document."));
+            }
+            let function_value = if scope == RunScope::Workspace && function == "document" {
+                capture
+                    .clone()
+                    .ok_or_else(|| failure("This run has no captured active document."))?
+            } else {
+                read_context.resolve(&function)?
+            };
+            let function_text = material_context::exact(&function_value)?;
+            let mut direct = BTreeMap::new();
+            for reference in document_references(&function_text).map_err(io_failure)? {
+                let bound = crate::workspace_references::relative(&function, &reference.name)?;
+                all_names.insert(bound.clone());
+                direct.insert(reference.name, bound);
+            }
+            function_contexts.insert(function, direct);
         }
     }
-    if !all_names.is_empty() {
-        crate::material_commands::restore_grants(&state, store)?;
-    }
+    mounted.admit(state, &session, all_names.iter().map(String::as_str))?;
     let mut bindings = BTreeMap::new();
     let mut sources = Vec::new();
     let mut seen_documents = BTreeSet::new();
     let mut folder_budget = material_context::FolderAdmissionBudget::default();
+    let uses_capture = scope == RunScope::Workspace && all_names.contains("document");
+    if uses_capture && capture.is_none() {
+        let (value, media) = scope::capture_document(&mut session, capture_request.as_ref())?;
+        capture = Some(value);
+        capture_media = media;
+    }
+    let read_context = scope
+        .read_context(
+            &mut session,
+            &project_id,
+            &session_id,
+            &owner_project_id.to_string(),
+            &owner_session_id.to_string(),
+        )?
+        .with_mounted(&mounted);
     for name in all_names {
-        let value = material_context::resolve(store, &name)?;
+        let value = if scope == RunScope::Workspace && name == "document" {
+            capture
+                .clone()
+                .ok_or_else(|| failure("This run has no captured active document."))?
+        } else {
+            read_context.resolve(&name)?
+        };
         folder_budget.admit(&value)?;
-        if let Value::Documents { documents } = &value {
+        if let Value::Documents { documents } = value.unscoped()
+            && !(scope == RunScope::Workspace && name == "document")
+        {
             for document in documents {
-                if seen_documents.insert(document.document_id) {
+                if crate::material_context::local_artifact_ids(read_context.documents, [&value])?
+                    .contains(&document.artifact_id)
+                    && seen_documents.insert(document.document_id)
+                {
                     sources.push(document.clone());
                 }
             }
@@ -667,7 +822,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         bindings.insert(name, value);
     }
     if workspace_chat.is_some() {
-        if !material_context::native_media(store, bindings.values())?.is_empty() {
+        if !read_context.native_media(bindings.values())?.is_empty() {
             return Err(IpcFailure::new(
                 "workspace_chat_media_unbound",
                 "Loom media is not yet bound to Mom. Use a retained Mom persona attachment for this consultation.",
@@ -678,7 +833,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             .chain(sources.iter().map(|document| document.document_id))
         {
             let context = crate::context_attachments::document_context_snapshot(
-                store.root(),
+                read_context.documents.root(),
                 &id.to_string(),
             )
             .map_err(io_failure)?;
@@ -695,40 +850,43 @@ pub(super) async fn terminal_run<R: Runtime>(
         }
     }
     let media = if let Some(model) = &model {
-        let media = crate::terminal_media::resolve(
-            store,
-            &source,
-            &sources,
-            resident_context_tokens(model),
-        )?;
+        let media = if scope == RunScope::Document {
+            crate::terminal_media::resolve(
+                read_context.documents,
+                &source,
+                &sources,
+                resident_context_tokens(model),
+            )?
+        } else if uses_capture {
+            capture_media
+        } else {
+            Vec::new()
+        };
         let media = crate::terminal_media::merge(
             media,
-            material_context::native_media(store, bindings.values())?,
+            read_context.native_media(
+                bindings
+                    .iter()
+                    .filter(|(name, _)| {
+                        !(scope == RunScope::Workspace && name.as_str() == "document")
+                    })
+                    .map(|(_, value)| value),
+            )?,
         )?;
         validate_media_against_resident_model(&media, &model.descriptor)?;
         media
     } else {
-        Vec::new()
+        // A reference-only expression still retains the mounted document's
+        // exact media independently of the source root's later lifetime.
+        read_context.native_media(
+            bindings
+                .iter()
+                .filter(|(name, _)| name.contains("::"))
+                .map(|(_, value)| value),
+        )?
     };
-    let media_evidence = media
-        .iter()
-        .map(|item| {
-            let bytes_blob_id = store
-                .store_provenance_blob(&item.bytes)
-                .map_err(IpcFailure::store)?;
-            if bytes_blob_id.to_string() != item.sha256 {
-                return Err(failure(
-                    "The attached media changed before this experiment.",
-                ));
-            }
-            Ok(TerminalMediaEvidence {
-                id: item.id.clone(),
-                kind: item.kind,
-                mime: item.mime.clone(),
-                bytes_blob_id,
-            })
-        })
-        .collect::<Result<Vec<_>, IpcFailure>>()?;
+    let store = scope.store(&mut session, &project_id, &session_id)?;
+    let media_evidence = crate::terminal_media::retain(store, &media)?;
     let input_blob_id = store
         .store_provenance_blob(input.as_bytes())
         .map_err(IpcFailure::store)?;
@@ -745,6 +903,8 @@ pub(super) async fn terminal_run<R: Runtime>(
             .collect(),
     };
     let receipt = RunReceipt {
+        scope,
+        workspace_configuration,
         run: TerminalRun {
             run_id: command_id.to_string(),
             status: "running".into(),
@@ -769,15 +929,18 @@ pub(super) async fn terminal_run<R: Runtime>(
         media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
+        function_contexts,
         evidence: Vec::new(),
         searches: Vec::new(),
+        counts: Vec::new(),
+        source_uses: Vec::new(),
         omitted_evidence: BTreeSet::new(),
         sources,
         steps: Vec::new(),
         workspace_chat: None,
     };
     let identity = GenerationFamilyIdentity {
-        request_id: format!("terminal-{command_id}"),
+        request_id: scope.request_id(&command_id.to_string()),
         project_id: store.manifest().project_id,
         session_id: parse_command_id(&session_id)?,
         document_id,
@@ -815,6 +978,9 @@ pub(super) async fn terminal_run<R: Runtime>(
             .generation_lifecycle
             .start(&lease)
             .map_err(io_failure)?;
+        // Publication can fail after creating the receipt. From this point the
+        // caller must reconcile the same command, never assume non-admission.
+        *may_have_started = true;
         write_receipt(&root, &receipt, false)
     })();
     if let Err(error) = setup {
@@ -848,6 +1014,8 @@ pub(super) async fn terminal_run<R: Runtime>(
             let mut evaluator = Evaluator {
                 state: &state,
                 identity: &worker_identity,
+                owner_project_id,
+                owner_session_id,
                 model: model.as_ref(),
                 control: &worker_control,
                 source: &source,
@@ -927,6 +1095,8 @@ pub(super) async fn terminal_run<R: Runtime>(
 struct Evaluator<'a> {
     state: &'a PluginState,
     identity: &'a GenerationFamilyIdentity,
+    owner_project_id: ProjectId,
+    owner_session_id: CommandId,
     model: Option<&'a LoadedModel>,
     control: &'a TerminalControl,
     source: &'a LoadedDocument,
@@ -938,12 +1108,36 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    fn with_read_context<T>(
+        &self,
+        operation: impl FnOnce(material_context::ReadContext<'_>) -> Result<T, IpcFailure>,
+    ) -> Result<T, IpcFailure> {
+        let mut session = lock_session_internal(self.state)?;
+        let context = match self.receipt.scope {
+            RunScope::Document => crate::workspace_owner::read_context(
+                &session,
+                &self.identity.project_id.to_string(),
+                &self.identity.session_id.to_string(),
+                &self.owner_project_id.to_string(),
+                &self.owner_session_id.to_string(),
+            )?,
+            RunScope::Workspace => {
+                material_context::ReadContext::from(&*crate::workspace_owner::require_store_mut(
+                    &mut session,
+                    &self.owner_project_id.to_string(),
+                    &self.owner_session_id.to_string(),
+                )?)
+            }
+        };
+        operation(context)
+    }
+
     fn with_store<T>(
         &self,
         operation: impl FnOnce(&mut ProjectStore) -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
         let mut session = lock_session_internal(self.state)?;
-        operation(require_bound_store(
+        operation(self.receipt.scope.store(
             &mut session,
             &self.identity.project_id.to_string(),
             &self.identity.session_id.to_string(),
@@ -965,7 +1159,7 @@ impl Evaluator<'_> {
                     self.append_context(&mut prefix, &name, &value, &query, text.len())?;
                 }
                 prefix.push_str(text);
-                self.complete(bounded(prefix)?, PromptMode::RawCompletion)
+                self.complete(bounded(prefix)?, self.function_prompt_mode())
                     .map(Value::Text)
             }
             NeuralCommand::Expression(expression) => self.evaluate(expression),
@@ -979,30 +1173,38 @@ impl Evaluator<'_> {
         match expression {
             NeuralExpression::Reference { name } => self.binding(name),
             NeuralExpression::Literal { text } => Ok(Value::Text(text.clone())),
+            NeuralExpression::Count { source } => {
+                let source = self.evaluate(source)?;
+                let value = self.with_read_context(|context| context.count_documents(&source))?;
+                self.record_evidence(&value)?;
+                Ok(value)
+            }
             NeuralExpression::Find { source, query } => {
                 let source = self.evaluate(source)?;
                 let query = material_context::exact(&self.evaluate(query)?)?;
-                let value = self.with_store(|store| {
-                    material_context::search_with_cancel(
-                        store,
-                        &source,
-                        &query,
-                        &self.folder_scan_budget,
-                        &|| self.control.cancelled.load(Ordering::Acquire),
-                    )
+                let value = self.with_read_context(|context| {
+                    context.search_with_cancel(&source, &query, &self.folder_scan_budget, &|| {
+                        self.control.cancelled.load(Ordering::Acquire)
+                    })
                 })?;
-                self.record_evidence(&value);
+                self.record_evidence(&value)?;
                 Ok(value)
             }
             NeuralExpression::Call {
                 function,
                 arguments,
             } => {
+                let direct = self
+                    .receipt
+                    .function_contexts
+                    .get(function)
+                    .cloned()
+                    .unwrap_or_default();
                 let function = material_context::exact(&self.binding(function)?)?;
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let value = self.evaluate(argument)?;
-                    self.record_evidence(&value);
+                    self.record_evidence(&value)?;
                     inputs.push(material_context::exact(&value)?);
                 }
                 if inputs.is_empty() {
@@ -1019,7 +1221,8 @@ impl Evaluator<'_> {
                     if !seen_context.insert(reference.name.clone()) {
                         continue;
                     }
-                    let value = self.binding(&reference.name)?;
+                    let value =
+                        self.binding(direct.get(&reference.name).unwrap_or(&reference.name))?;
                     self.append_context(
                         &mut contextual_function,
                         &reference.name,
@@ -1031,46 +1234,83 @@ impl Evaluator<'_> {
                 contextual_function.push_str(&function);
                 let prompt = render_base_function_prompt(&contextual_function, &input_refs)
                     .map_err(io_failure)?;
-                let mode = match self
-                    .receipt
-                    .function_recipe
-                    .as_ref()
-                    .map(|recipe| recipe.format)
-                {
-                    Some(crate::workspace_template::FunctionFormat::Model) => PromptMode::Function,
-                    _ => PromptMode::RawCompletion,
-                };
+                let mode = self.function_prompt_mode();
                 self.complete(bounded(prompt)?, mode).map(Value::Text)
             }
         }
     }
 
-    fn record_evidence(&mut self, value: &Value) {
+    fn function_prompt_mode(&self) -> PromptMode {
+        match self
+            .receipt
+            .function_recipe
+            .as_ref()
+            .map(|recipe| recipe.format)
+        {
+            Some(crate::workspace_template::FunctionFormat::Model) => PromptMode::Function,
+            _ => PromptMode::RawCompletion,
+        }
+    }
+
+    fn record_evidence(&mut self, value: &Value) -> Result<(), IpcFailure> {
+        if let Value::Count { .. } = value.unscoped() {
+            if !matches!(value, Value::Scoped { .. }) {
+                return Err(failure("A count is missing its source origin."));
+            }
+            let snapshot = serde_json::to_value(value).map_err(io_failure)?;
+            if !self
+                .receipt
+                .counts
+                .iter()
+                .any(|prior| serde_json::to_value(prior).is_ok_and(|prior| prior == snapshot))
+            {
+                self.receipt.counts.push(value.clone());
+            }
+        }
         if let Value::Evidence {
             evidence,
             retrieval,
-        } = value
+        } = value.unscoped()
         {
-            if let Some(search) = retrieval
-                && !self.receipt.searches.iter().any(|prior| {
-                    prior.material.id == search.material.id
-                        && prior.query == search.query
-                        && prior.source_revision == search.source_revision
-                        && prior
-                            .hits
-                            .iter()
-                            .map(|hit| &hit.id)
-                            .eq(search.hits.iter().map(|hit| &hit.id))
-                })
-            {
-                self.receipt.searches.push(search.as_ref().clone());
-            }
+            let Value::Scoped { origin, .. } = value else {
+                return Err(failure("Retrieved evidence is missing its source origin."));
+            };
+            let search_index = if let Some(search) = retrieval {
+                let snapshot = serde_json::to_vec(search.as_ref()).map_err(io_failure)?;
+                let mut existing = None;
+                for (index, prior) in self.receipt.searches.iter().enumerate() {
+                    if serde_json::to_vec(prior).map_err(io_failure)? == snapshot {
+                        existing = Some(index);
+                        break;
+                    }
+                }
+                Some(existing.unwrap_or_else(|| {
+                    let index = self.receipt.searches.len();
+                    self.receipt.searches.push(search.as_ref().clone());
+                    index
+                }))
+            } else {
+                None
+            };
             for hit in evidence {
                 if !self.receipt.evidence.iter().any(|prior| prior.id == hit.id) {
                     self.receipt.evidence.push(hit.clone());
                 }
             }
+            let source_use = SourceUse {
+                origin: origin.clone(),
+                evidence_ids: evidence.iter().map(|hit| hit.id.clone()).collect(),
+                search_index,
+            };
+            if !self.receipt.source_uses.iter().any(|prior| {
+                prior.origin == source_use.origin
+                    && prior.evidence_ids == source_use.evidence_ids
+                    && prior.search_index == source_use.search_index
+            }) {
+                self.receipt.source_uses.push(source_use);
+            }
         }
+        Ok(())
     }
 
     fn append_context(
@@ -1098,9 +1338,33 @@ impl Evaluator<'_> {
     }
 
     fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
-        let (consulted, omitted) = self.with_store(|store| {
-            material_context::consult_with_budget_and_cancel(
-                store,
+        let (consulted, omitted) = self.with_read_context(|context| {
+            // A captured document is exact admitted data. Reading its frozen
+            // text neither requires nor renews access to its former root.
+            if self.receipt.scope == RunScope::Workspace
+                && let Value::Scoped { origin, value } = value
+                && matches!(
+                    value.as_ref(),
+                    Value::Documents { .. } | Value::Evidence { .. }
+                )
+            {
+                let (result, omitted) = material_context::consult_with_budget_and_cancel(
+                    context.documents,
+                    value,
+                    query,
+                    budget,
+                    &self.folder_scan_budget,
+                    &|| self.control.cancelled.load(Ordering::Acquire),
+                )?;
+                return Ok((
+                    Value::Scoped {
+                        origin: origin.clone(),
+                        value: Box::new(result),
+                    },
+                    omitted,
+                ));
+            }
+            context.consult_with_budget_and_cancel(
                 value,
                 query,
                 budget,
@@ -1109,7 +1373,7 @@ impl Evaluator<'_> {
             )
         })?;
         self.receipt.omitted_evidence.extend(omitted);
-        self.record_evidence(&consulted);
+        self.record_evidence(&consulted)?;
         Ok(consulted)
     }
 
@@ -1141,17 +1405,23 @@ impl Evaluator<'_> {
                 .record_model_environment(&environment)
                 .map_err(IpcFailure::store)?;
             let mut inputs = vec![self.source.artifact_id];
-            inputs.extend(self.receipt.sources.iter().map(|source| source.artifact_id));
-            inputs.extend(material_context::evidence_artifact_ids(
-                &self.receipt.evidence,
+            let evidence_values = self
+                .receipt
+                .source_uses
+                .iter()
+                .map(|source| source.evidence_value(&self.receipt.evidence))
+                .collect::<Result<Vec<_>, _>>()?;
+            inputs.extend(material_context::local_artifact_ids(
+                store,
+                self.receipt.bindings.values().chain(&evidence_values),
             )?);
-            if let Some(configuration) = self
+            if let Some(artifact_id) = self
                 .receipt
                 .function_recipe
                 .as_ref()
-                .and_then(|recipe| recipe.configuration.as_ref())
+                .and_then(|recipe| recipe.local_configuration_artifact(store))
             {
-                inputs.push(configuration.artifact_id);
+                inputs.push(artifact_id);
             }
             inputs.sort();
             inputs.dedup();
@@ -1171,6 +1441,12 @@ impl Evaluator<'_> {
                         &self.receipt.searches,
                         &self.receipt.bindings,
                         &self.receipt.omitted_evidence,
+                        // Foreign configuration is retained with its source
+                        // identity and exact bytes, never as a local artifact ID.
+                        &self.receipt.function_recipe,
+                        &self.receipt.source_uses,
+                        &self.receipt.workspace_configuration,
+                        &self.receipt.counts,
                     ))
                     .map_err(io_failure)?,
                 )
@@ -1414,7 +1690,7 @@ impl Evaluator<'_> {
             outcome.and_then(|value| material_context::exact(&value).map(|text| (value, text)));
         match outcome {
             Ok((value, text)) => {
-                self.record_evidence(&value);
+                self.record_evidence(&value)?;
                 if self.receipt.run.output_document_id.is_none() || !matches!(value, Value::Text(_))
                 {
                     let evidence = self.with_store(|store| {
@@ -1448,8 +1724,26 @@ pub(super) async fn terminal_list(
     session_id: String,
     state: State<'_, PluginState>,
 ) -> Result<Vec<TerminalRun>, IpcFailure> {
-    let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    list_runs(&state, &project_id, &session_id, RunScope::Document)
+}
+
+#[tauri::command]
+pub(super) async fn workspace_pane_list(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<TerminalRun>, IpcFailure> {
+    list_runs(&state, &project_id, &session_id, RunScope::Workspace)
+}
+
+fn list_runs(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    scope: RunScope,
+) -> Result<Vec<TerminalRun>, IpcFailure> {
+    let mut session = lock_session(state)?;
+    let store = scope.store(&mut session, project_id, session_id)?;
     let directory = receipt_directory(store.root())?;
     let mut ids = BTreeSet::new();
     for (index, entry) in std::fs::read_dir(directory)
@@ -1471,15 +1765,26 @@ pub(super) async fn terminal_list(
         }
     }
     let mut runs = Vec::new();
-    for id in ids.into_iter().rev().take(MAX_HISTORY) {
+    for id in ids.into_iter().rev() {
         if let Some(receipt) = read_receipt(store.root(), &id, true)? {
+            if visible_history(&receipt, scope) {
+                runs.push(projected_run(&receipt));
+            }
+        } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)?
+            && visible_history(&receipt, scope)
+        {
+            settle_interrupted(&mut receipt.run, receipt.scope, state)?;
             runs.push(projected_run(&receipt));
-        } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)? {
-            settle_interrupted(&mut receipt.run, &state)?;
-            runs.push(projected_run(&receipt));
+        }
+        if runs.len() == MAX_HISTORY {
+            break;
         }
     }
     Ok(runs)
+}
+
+fn visible_history(receipt: &RunReceipt, scope: RunScope) -> bool {
+    receipt.scope == scope || (scope == RunScope::Workspace && receipt.run.presentation.is_some())
 }
 
 #[tauri::command]
@@ -1489,12 +1794,44 @@ pub(super) async fn terminal_cancel(
     run_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    let request_id = format!("terminal-{}", parse_command_id(&run_id)?);
+    cancel_run(
+        &state,
+        &project_id,
+        &session_id,
+        &run_id,
+        RunScope::Document,
+    )
+}
+
+#[tauri::command]
+pub(super) async fn workspace_pane_cancel(
+    project_id: String,
+    session_id: String,
+    run_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    cancel_run(
+        &state,
+        &project_id,
+        &session_id,
+        &run_id,
+        RunScope::Workspace,
+    )
+}
+
+fn cancel_run(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    run_id: &str,
+    scope: RunScope,
+) -> Result<(), IpcFailure> {
+    let request_id = scope.request_id(&parse_command_id(run_id)?.to_string());
     let routes = state
         .generations
         .active_routes_for_request(
             project_id.parse::<ProjectId>().map_err(io_failure)?,
-            parse_command_id(&session_id)?,
+            parse_command_id(session_id)?,
             &request_id,
         )
         .map_err(|error| IpcFailure::generation_registry(&error))?;
@@ -1515,23 +1852,21 @@ pub(super) async fn terminal_cancel(
     }
     // Preserve inactive receipt validation and the admission race: a family
     // may become live while we wait for an in-progress admission's store lock.
-    let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    if read_receipt(store.root(), &run_id, false)?.is_none() {
-        return Err(failure("This experiment does not exist"));
-    }
+    let mut session = lock_session(state)?;
+    let store = scope.store(&mut session, project_id, session_id)?;
+    let receipt = read_receipt(store.root(), run_id, false)?
+        .filter(|receipt| receipt.scope == scope)
+        .ok_or_else(|| failure("This experiment does not exist in the requested scope."))?;
     if let Some(route) = state
         .generations
         .active_routes_for_document(
             store.manifest().project_id,
-            parse_command_id(&session_id)?,
-            read_receipt(store.root(), &run_id, false)?
-                .expect("checked receipt")
-                .source_document_id,
+            parse_command_id(session_id)?,
+            receipt.source_document_id,
         )
         .map_err(|error| IpcFailure::generation_registry(&error))?
         .into_iter()
-        .find(|route| route.identity.request_id == format!("terminal-{run_id}"))
+        .find(|route| route.identity.request_id == request_id)
     {
         state
             .generations
@@ -1541,6 +1876,67 @@ pub(super) async fn terminal_cancel(
                 route.run_id,
             )
             .map_err(|error| IpcFailure::generation_registry(&error))?;
+    }
+    Ok(())
+}
+
+pub(super) fn output_document(
+    store: &ProjectStore,
+    run_id: &str,
+) -> Result<Option<DocumentId>, IpcFailure> {
+    let canonical = parse_command_id(run_id)?.to_string();
+    if canonical != run_id {
+        return Err(failure("The run identity is not canonical."));
+    }
+    let receipt = read_receipt(store.root(), run_id, true)?
+        .or(read_receipt(store.root(), run_id, false)?)
+        .filter(|receipt| visible_history(receipt, RunScope::Workspace))
+        .ok_or_else(|| failure("This workspace pane run does not exist."))?;
+    receipt
+        .run
+        .output_document_id
+        .map(|id| id.parse().map_err(io_failure))
+        .transpose()
+}
+
+/// Application close holds its admission barrier while this drain runs. Root
+/// switches never invoke it: their document-session drain has a different token.
+pub(super) fn drain_workspace_runs(state: &PluginState, wait: Duration) -> Result<(), IpcFailure> {
+    let owner = {
+        let session = lock_session_internal(state)?;
+        session
+            .workspace
+            .as_ref()
+            .map(|owner| (owner.project_id, owner.session_id))
+    };
+    let Some((project, session)) = owner else {
+        return Ok(());
+    };
+    state
+        .generations
+        .cancel_session(project, session)
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    if !state
+        .generations
+        .wait_for_session_idle(project, session, wait)
+        .map_err(|error| IpcFailure::generation_registry(&error))?
+    {
+        let failures = state
+            .generations
+            .terminal_persistence_failures(project, session)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        if let Some(failure) = failures.first() {
+            return Err(IpcFailure::new(
+                "workspace_run_persistence_failed",
+                failure.error.clone(),
+                true,
+            ));
+        }
+        return Err(IpcFailure::new(
+            "workspace_run_cancellation_in_progress",
+            "Workspace pane runs are preserving their final results. Retry closing shortly.",
+            true,
+        ));
     }
     Ok(())
 }

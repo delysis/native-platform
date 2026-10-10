@@ -67,9 +67,10 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
       case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
       case 'plugin:loom|document_open': return opened;
       case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
-      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: null, revision_id: null, error: null,
+      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: 'workspace-config-document', revision_id: 'workspace-config-1', error: null,
         config: { panes: { chat: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['@document'] } } } };
       case 'plugin:loom|build_model_policy_get': return null;
       case 'plugin:loom|model_catalog_list': return [];
@@ -80,14 +81,16 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
       case 'plugin:loom|model_download_list':
       case 'plugin:loom|material_list':
       case 'plugin:loom|co_writer_list': return [];
+      case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list': return retainedRun ? [retainedRun] : [];
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
-      case 'plugin:loom|terminal_run':
-        submitted = args;
-        retainedRun = { run_id: args.commandId, status: 'completed', expression: args.expression, presentation: args.presentation,
+      case 'plugin:loom|workspace_pane_run':
+        submitted = args.request;
+        retainedRun = { run_id: args.request.command_id, status: 'completed', expression: args.request.expression,
+          presentation: { pane_id: args.request.pane_id, input: args.request.input },
           output_document_id: null, output_relative_path: null, preview: 'Transport fixture reply', error: null, created_at_ms: 1 };
-        return retainedRun;
+        return { status: 'accepted', run: retainedRun };
       default: throw new Error(`Unexpected native operation: ${command}`);
     }
   });
@@ -102,8 +105,10 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
   const beforeSend = calls.length;
   await userEvent.keyboard('{Enter}');
   await expect.poll(() => submitted).not.toBeNull();
-  expect(submitted).toMatchObject({ documentId: 'doc-1', sourceRevisionId: 'revision-1', expectedVisibleBlobId: blob,
-    turnBoundary: 'chat', presentation: { pane_id: 'chat', input: '@mom hello' }, contextReferences: ['Untitled.md'] });
+  expect(submitted).toMatchObject({ workspace_id: project.project_id, workspace_session_id: 'workspace-session',
+    pane_id: 'chat', configuration_revision_id: 'workspace-config-1', input: '@mom hello',
+    captured_document: { project_id: project.project_id, session_id: project.session_id,
+      document_id: 'doc-1', revision_id: 'revision-1', visible_blob_id: blob } });
   expect(calls.slice(beforeSend).filter(command => /model|weave_start/.test(command))).toEqual([]);
   expect(document.querySelector('[role="alert"]')?.textContent ?? '').not.toContain('Open and save');
   await expect.element(page.getByText('Transport fixture reply', { exact: true })).toBeVisible();
@@ -159,14 +164,19 @@ it.each([
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'loom';
       case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
       case 'plugin:loom|document_open': {
         const chosen = args.documentId === answer.summary.document_id ? answer : source;
         expect(args.expectedRevisionId).toBe(chosen.summary.revision_id);
         expect(args.expectedBlobId).toBe(chosen.summary.active_blob_id);
         return chosen;
       }
+      case 'plugin:loom|workspace_pane_output':
+        expect(args.projectId).toBe(project.project_id); expect(args.sessionId).toBe('workspace-session');
+        expect(args.runId).toBe(legacy.run_id);
+        return answer;
       case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
-      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: null, revision_id: null, error: null,
+      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: 'workspace-config-document', revision_id: 'workspace-config-1', error: null,
         config: { panes: { chat: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: [] } } } };
       case 'plugin:loom|build_model_policy_get': return null;
       case 'plugin:loom|model_catalog_list': return [];
@@ -177,14 +187,16 @@ it.each([
       case 'plugin:loom|model_download_list':
       case 'plugin:loom|material_list':
       case 'plugin:loom|co_writer_list': return [];
+      case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list': return retainedRun ? [legacy, retainedRun] : [legacy];
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
-      case 'plugin:loom|terminal_run':
-        submitted = args;
-        retainedRun = { run_id: args.commandId, status: 'completed', expression: args.expression, presentation: args.presentation,
+      case 'plugin:loom|workspace_pane_run':
+        submitted = args.request;
+        retainedRun = { run_id: args.request.command_id, status: 'completed', expression: args.request.expression,
+          presentation: { pane_id: args.request.pane_id, input: args.request.input },
           output_document_id: null, output_relative_path: null, preview: 'Transport fixture reply', error: null, created_at_ms: 2 };
-        return retainedRun;
+        return { status: 'accepted', run: retainedRun };
       default: throw new Error(`Unexpected native operation: ${command}`);
     }
   });
@@ -198,9 +210,9 @@ it.each([
   await input.fill('Continue');
   await userEvent.keyboard('{Enter}');
   await expect.poll(() => submitted).not.toBeNull();
-  expect(submitted).toMatchObject({ turnBoundary: 'chat',
-    expression: `User: Pre-Mom question\nAssistant: ${answerText}\n\nUser: Continue\nAssistant:`,
-    presentation: { pane_id: 'chat', input: 'Continue' } });
+  expect(submitted).toMatchObject({ workspace_id: project.project_id, workspace_session_id: 'workspace-session',
+    pane_id: 'chat', configuration_revision_id: 'workspace-config-1', input: 'Continue',
+    expression: `User: Pre-Mom question\nAssistant: ${answerText}\n\nUser: Continue\nAssistant:` });
   expect(calls.some(call => call.command === 'plugin:loom|workspace_chat_route')).toBe(true);
   expect(calls.filter(call => /mom_llama|model_load|model_unload/.test(call.command))).toEqual([]);
   expect(model.model_id).not.toBe(momProfile.model_id);
@@ -293,6 +305,7 @@ it.each([
     switch (command) {
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
       case 'plugin:loom|document_open': return opened;
       case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
       case 'plugin:loom|workspace_template_get': return { enabled: false, document_id: null, revision_id: null, error: null, config: { panes: {} } };
@@ -308,6 +321,7 @@ it.each([
         visualGhostTelemetryPayloads.push(args);
         return;
       case 'plugin:loom|model_download_list':
+      case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list':
       case 'plugin:loom|material_list':
       case 'plugin:loom|co_writer_list': return [];

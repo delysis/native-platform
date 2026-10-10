@@ -13,6 +13,9 @@ use crate::materials::{
     self, MaterialEntry, MaterialEvidence, MaterialKind, MaterialRead, MaterialSearch,
 };
 
+mod sources;
+pub(super) use sources::{ReadContext, SourceOrigin, local_artifact_ids};
+
 impl From<materials::MaterialError> for IpcFailure {
     fn from(error: materials::MaterialError) -> Self {
         let code = match &error {
@@ -33,12 +36,22 @@ const EMPTY_EVIDENCE: &str = "No matching source passages were found.\n";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(super) enum Value {
+    Scoped {
+        origin: SourceOrigin,
+        value: Box<Value>,
+    },
     Text(String),
+    Count {
+        count: Box<materials::MaterialCount>,
+    },
     Documents {
         documents: Vec<ResolvedDocument>,
     },
     Folder {
         folder: document_bindings::FolderSnapshot,
+    },
+    Collection {
+        collection: materials::collections::FrozenCollection,
     },
     Material {
         material: MaterialValue,
@@ -48,6 +61,15 @@ pub(super) enum Value {
         #[serde(default)]
         retrieval: Option<Box<MaterialSearch>>,
     },
+}
+
+impl Value {
+    pub(super) fn unscoped(&self) -> &Self {
+        match self {
+            Self::Scoped { value, .. } => value.unscoped(),
+            _ => self,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +109,17 @@ pub(super) struct ContextPlan {
     pub evidence: Vec<MaterialEvidence>,
     pub byte_budget: usize,
     pub omitted_evidence: BTreeMap<String, Vec<String>>,
+    pub unresolved_references: BTreeMap<String, String>,
+    /// Resolved inputs that automatic writing could not fit. Retain their
+    /// identity and bytes without claiming they were supplied to the writer.
+    #[serde(default)]
+    pub budget_omissions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReferenceRequirement {
+    All,
+    AvailableForWriting,
 }
 
 /// Shared operation bound: overlapping folders cannot multiply admission work.
@@ -98,7 +131,7 @@ pub(super) struct FolderAdmissionBudget {
 
 impl FolderAdmissionBudget {
     pub(super) fn admit(&mut self, value: &Value) -> Result<(), IpcFailure> {
-        let Value::Folder { folder } = value else {
+        let Value::Folder { folder } = value.unscoped() else {
             return Ok(());
         };
         self.documents
@@ -143,54 +176,98 @@ fn failure(message: impl Into<String>) -> IpcFailure {
     IpcFailure::new("material_context_invalid", message, false)
 }
 
+fn budget_failure(message: impl Into<String>) -> IpcFailure {
+    IpcFailure::new("material_context_budget_exceeded", message, false)
+}
+
 pub(super) fn bounded(text: String) -> Result<String, IpcFailure> {
     if text.len() > MAX_BYTES {
-        return Err(failure(
+        return Err(budget_failure(
             "The exact material exceeds 64 KiB. Select a passage or search it with find().",
         ));
     }
     Ok(text)
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn resolve(store: &ProjectStore, name: &str) -> Result<Value, IpcFailure> {
+    resolve_value(ReadContext::from(store), name).map(|(value, _)| value)
+}
+
+fn resolve_value<'a>(
+    context: ReadContext<'a>,
+    name: &str,
+) -> Result<(Value, &'a ProjectStore), IpcFailure> {
+    let store = context.documents;
     if name.ends_with('/') {
-        return Ok(Value::Folder {
-            folder: document_bindings::snapshot_folder(store, name)?,
-        });
+        return Ok((
+            Value::Folder {
+                folder: document_bindings::snapshot_folder(store, name)?,
+            },
+            store,
+        ));
     }
-    if let Some(evidence) = materials::resolve_evidence_reference(store, name)? {
-        return Ok(Value::Evidence {
-            evidence: vec![evidence],
-            retrieval: None,
-        });
+    if let Some((evidence, source)) = context.retained_evidence(name)? {
+        return Ok((
+            Value::Evidence {
+                evidence: vec![evidence],
+                retrieval: None,
+            },
+            source,
+        ));
     }
     if name.starts_with("materials/") || materials::is_material_id(name) {
-        let material = materials::resolve_optional(store, name)?;
-        let entry = material.ok_or_else(|| failure(format!("Material @{name} is unavailable.")))?;
-        return Ok(Value::Material {
-            material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
-        });
+        let (entry, store) = context.explicit_material(name)?;
+        if entry.kind == MaterialKind::Collection {
+            return Ok((
+                Value::Collection {
+                    collection: materials::collections::freeze(store, entry)?,
+                },
+                store,
+            ));
+        }
+        return Ok((
+            Value::Material {
+                material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
+            },
+            store,
+        ));
     }
     let documents = document_bindings::resolve_references(store, &[name.to_owned()]);
     if let Ok(documents) = &documents
         && documents.iter().any(|document| document.path == name)
     {
-        return Ok(Value::Documents {
-            documents: documents.clone(),
-        });
+        return Ok((
+            Value::Documents {
+                documents: documents.clone(),
+            },
+            store,
+        ));
     }
-    let material = materials::resolve_optional(store, name)?;
+    let material = materials::resolve_optional(context.materials, name)?;
     match (documents, material) {
         (Ok(documents), Some(_)) if !documents.iter().any(|doc| doc.path == name) => {
             Err(failure(format!(
                 "Reference @{name} names both a document and material. Use its full reference."
             )))
         }
-        (Ok(documents), _) => Ok(Value::Documents { documents }),
+        (Ok(documents), _) => Ok((Value::Documents { documents }, store)),
         (Err(error), Some(entry)) if error.code == "document_reference_missing" => {
-            Ok(Value::Material {
-                material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
-            })
+            let store = context.materials;
+            if entry.kind == MaterialKind::Collection {
+                return Ok((
+                    Value::Collection {
+                        collection: materials::collections::freeze(store, entry)?,
+                    },
+                    store,
+                ));
+            }
+            Ok((
+                Value::Material {
+                    material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
+                },
+                store,
+            ))
         }
         (Err(error), _) => Err(error),
     }
@@ -216,10 +293,15 @@ fn evidence_passage(hit: &MaterialEvidence) -> String {
 
 pub(super) fn exact(value: &Value) -> Result<String, IpcFailure> {
     match value {
+        Value::Scoped { value, .. } => exact(value),
+        Value::Collection { .. } => Err(failure(
+            "A collection is not an exact text argument. Use find() to select source passages.",
+        )),
         Value::Folder { .. } => Err(failure(
             "A folder is a collection, not an exact text argument. Use find(@Folder/, \"query\") to select evidence.",
         )),
         Value::Text(text) => bounded(text.clone()),
+        Value::Count { count } => bounded(count.text()),
         Value::Documents { documents } => bounded(
             documents
                 .iter()
@@ -261,6 +343,14 @@ pub(super) fn search_with_cancel(
     scan_budget: &FolderScanBudget,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Value, IpcFailure> {
+    if let Value::Collection { collection } = source {
+        let result =
+            materials::collections::search(store, collection, query, scan_budget, cancelled)?;
+        return Ok(Value::Evidence {
+            evidence: result.hits.clone(),
+            retrieval: Some(Box::new(result)),
+        });
+    }
     if let Value::Folder { folder } = source {
         let result = materials::search_folder(store, folder, query, scan_budget, cancelled)?;
         return Ok(Value::Evidence {
@@ -303,7 +393,9 @@ pub(super) fn consult(
     query: &str,
 ) -> Result<Value, IpcFailure> {
     match value {
-        Value::Folder { .. } => search(store, value, query_window(query)),
+        Value::Folder { .. } | Value::Collection { .. } => {
+            search(store, value, query_window(query))
+        }
         Value::Material { material }
             if material.material.kind == MaterialKind::Library
                 || material.text.is_none()
@@ -321,7 +413,7 @@ pub(super) fn markdown_plan(
     markdown: &str,
     query: &str,
 ) -> Result<ContextPlan, IpcFailure> {
-    markdown_plan_with_budget(store, markdown, query, MAX_BYTES)
+    markdown_plan_with_budget(store, markdown, query, MAX_BYTES, ReferenceRequirement::All)
 }
 
 #[cfg(all(test, unix))]
@@ -350,7 +442,7 @@ pub(super) fn consult_with_budget_and_cancel(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Value, Vec<String>), IpcFailure> {
     let consulted = match value {
-        Value::Folder { .. } => {
+        Value::Folder { .. } | Value::Collection { .. } => {
             search_with_cancel(store, value, query_window(query), scan_budget, cancelled)?
         }
         Value::Material { material }
@@ -369,7 +461,7 @@ pub(super) fn consult_with_budget_and_cancel(
     } = consulted
     else {
         if exact(&consulted)?.len() > budget {
-            return Err(failure(
+            return Err(budget_failure(
                 "The referenced document does not fit the remaining context. Select a smaller passage.",
             ));
         }
@@ -392,7 +484,7 @@ pub(super) fn consult_with_budget_and_cancel(
         }
     }
     if used > budget || (selected.is_empty() && !omitted.is_empty()) {
-        return Err(failure(
+        return Err(budget_failure(
             "No whole source passage fits the remaining context. Select a smaller passage or shorten the writing prefix.",
         ));
     }
@@ -417,12 +509,14 @@ pub(super) fn consult_with_budget_and_cancel(
 
 /// Pack ordinary context using whole retained passages. Exact function values
 /// keep their independent semantics and are never shortened by this planner.
-pub(super) fn markdown_plan_with_budget(
-    store: &ProjectStore,
+pub(super) fn markdown_plan_with_budget<'a>(
+    context: impl Into<ReadContext<'a>>,
     markdown: &str,
     query: &str,
     byte_budget: usize,
+    requirement: ReferenceRequirement,
 ) -> Result<ContextPlan, IpcFailure> {
+    let context = context.into();
     let references =
         loom_document::document_references(markdown).map_err(|error| failure(error.to_string()))?;
     let mut plan = ContextPlan {
@@ -436,22 +530,57 @@ pub(super) fn markdown_plan_with_budget(
         if !seen.insert(reference.name.clone()) {
             continue;
         }
-        let value = resolve(store, &reference.name)?;
+        let value = match context.resolve(&reference.name) {
+            Ok(value) => value,
+            Err(error)
+                if matches!(requirement, ReferenceRequirement::AvailableForWriting)
+                    && matches!(
+                        error.code,
+                        "document_reference_missing"
+                            | "document_reference_ambiguous"
+                            | "document_reference_budget_exceeded"
+                    ) =>
+            {
+                // Unavailable context must not turn off writing. Keep the
+                // reason in the family receipt; explicit calls require every input.
+                plan.unresolved_references
+                    .insert(reference.name, error.message);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         folder_budget.admit(&value)?;
         let header = format!("\n--- Referenced material {:?} ---\n", reference.name);
         let footer = "\n--- End material ---\n";
-        let remaining = plan
-            .byte_budget
-            .saturating_sub(plan.text.len() + header.len() + footer.len());
-        let (consulted, omitted) =
-            consult_with_budget_and_cancel(store, &value, query, remaining, &scan_budget, &|| {
-                false
-            })?;
+        let remaining = plan.byte_budget.saturating_sub(plan.text.len());
+        let consultation = if let Some(remaining) =
+            remaining.checked_sub(header.len() + footer.len())
+        {
+            context
+                .consult_with_budget_and_cancel(&value, query, remaining, &scan_budget, &|| false)
+        } else {
+            Err(budget_failure(
+                "The source labels exceed the remaining context budget.",
+            ))
+        };
+        let (consulted, omitted) = match consultation {
+            Ok(result) => result,
+            Err(error)
+                if matches!(requirement, ReferenceRequirement::AvailableForWriting)
+                    && error.code == "material_context_budget_exceeded" =>
+            {
+                // Suggestions remain available while the manuscript grows.
+                // Explicit function calls still require their declared inputs.
+                plan.budget_omissions.insert(reference.name, value);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !omitted.is_empty() {
             plan.omitted_evidence
                 .insert(reference.name.clone(), omitted);
         }
-        if let Value::Evidence { evidence, .. } = &consulted {
+        if let Value::Evidence { evidence, .. } = consulted.unscoped() {
             plan.evidence.extend(evidence.iter().cloned());
         }
         plan.text.push_str(&header);
@@ -461,7 +590,7 @@ pub(super) fn markdown_plan_with_budget(
     }
     plan.text = bounded(plan.text)?;
     if plan.text.len() > plan.byte_budget {
-        return Err(failure(
+        return Err(budget_failure(
             "The source labels exceed the remaining context budget.",
         ));
     }
@@ -478,6 +607,14 @@ pub(super) fn native_media<'a>(
     let mut seen_documents = BTreeMap::new();
     for value in values {
         match value {
+            Value::Scoped { origin, value } => {
+                if !origin.matches(store) {
+                    return Err(failure(
+                        "The media source belongs to a different workspace.",
+                    ));
+                }
+                media.extend(native_media(store, [value.as_ref()])?)?;
+            }
             Value::Material { material } => {
                 // A library/folder reference is never permission to enumerate
                 // all media in that collection, even when it is named directly.
@@ -518,7 +655,11 @@ pub(super) fn native_media<'a>(
                     seen_documents.insert(document.document_id, identity);
                 }
             }
-            Value::Text(_) | Value::Evidence { .. } | Value::Folder { .. } => {}
+            Value::Text(_)
+            | Value::Count { .. }
+            | Value::Evidence { .. }
+            | Value::Folder { .. }
+            | Value::Collection { .. } => {}
         }
     }
     Ok(media.finish())

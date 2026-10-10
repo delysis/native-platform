@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-reference-diagnostics"
+description = "Enables the document_reference_diagnostics command without any pre-configured scope."
+commands.allow = ["document_reference_diagnostics"]
+
+[[permission]]
+identifier = "deny-document-reference-diagnostics"
+description = "Denies the document_reference_diagnostics command without any pre-configured scope."
+commands.deny = ["document_reference_diagnostics"]

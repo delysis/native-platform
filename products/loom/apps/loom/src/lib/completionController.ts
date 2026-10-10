@@ -225,7 +225,8 @@ export function reconcileCompletionController(
   }
   if (contextKey) {
     if (!session && family.length > 0) {
-      session = startCompletionSession(contextKey, family, family[0].runId);
+      const selected = family.find(candidate => candidate.runId === state.activeRunId) ?? family[0];
+      session = startCompletionSession(contextKey, family, selected.runId);
     } else if (session) {
       const completeRefill = refillLoompad && pendingText === null && family.length >= 4 &&
         new Set(family.map(candidate => loompadWordKey(candidate.text)).filter(Boolean)).size >= 4;
@@ -235,10 +236,10 @@ export function reconcileCompletionController(
     }
   }
   const activeFamily = completionActiveFamily(session, pendingText, family, forkAtCurrentCaret);
-  const activeRunId = activeFamily.length > 0 &&
+  const activeRunId = session?.selectedRunId ?? (activeFamily.length > 0 &&
       !activeFamily.some((candidate) => candidate.runId === state.activeRunId)
     ? activeFamily[0].runId
-    : state.activeRunId;
+    : state.activeRunId);
   const visualSelectionOrigin = session !== state.session
     ? 'default'
     : state.visualSelectionOrigin;

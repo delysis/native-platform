@@ -4,8 +4,11 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-document-reference-diagnostics`
 - `allow-material-list`
+- `allow-material-resolve-reference`
 - `allow-material-read`
+- `allow-material-pdf-page`
 - `allow-material-search`
 - `allow-material-read-evidence`
 - `allow-material-bind-attachment`
@@ -17,6 +20,13 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-open-default`
 - `allow-project-prepare-open`
 - `allow-project-prepare-open-path`
+- `allow-workspace-roots-get`
+- `allow-workspace-root-prepare`
+- `allow-workspace-root-remove`
+- `allow-workspace-source-import-paths`
+- `allow-workspace-source-import-choose`
+- `allow-workspace-source-import-paste`
+- `allow-workspace-source-import-cancel`
 - `allow-project-drop-directories`
 - `allow-project-commit-open`
 - `allow-project-discard-open`
@@ -33,6 +43,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
 - `allow-workspace-copy-files`
+- `allow-workspace-copy-folder-choose`
 - `allow-attachment-reveal-original`
 - `allow-import-text-sources`
 - `allow-attachment-import-batch-choose`
@@ -50,6 +61,9 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-speech-input-capabilities`
 - `allow-speech-input-status`
 - `allow-document-open`
+- `allow-workspace-pane-output`
+- `allow-workspace-document-resolve`
+- `allow-workspace-reference-resolve`
 - `allow-document-import-external`
 - `allow-shader-preview`
 - `allow-document-checkpoint`
@@ -685,6 +699,188 @@ Denies the co_writer_save command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-collection-add`
+
+</td>
+<td>
+
+Enables the collection_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-add`
+
+</td>
+<td>
+
+Denies the collection_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-authorize`
+
+</td>
+<td>
+
+Enables the collection_authorize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-authorize`
+
+</td>
+<td>
+
+Denies the collection_authorize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-cancel`
+
+</td>
+<td>
+
+Enables the collection_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-cancel`
+
+</td>
+<td>
+
+Denies the collection_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-members`
+
+</td>
+<td>
+
+Enables the collection_members command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-members`
+
+</td>
+<td>
+
+Denies the collection_members command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-read-member`
+
+</td>
+<td>
+
+Enables the collection_read_member command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-read-member`
+
+</td>
+<td>
+
+Denies the collection_read_member command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-refresh`
+
+</td>
+<td>
+
+Enables the collection_refresh command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-refresh`
+
+</td>
+<td>
+
+Denies the collection_refresh command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-status`
+
+</td>
+<td>
+
+Enables the collection_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-status`
+
+</td>
+<td>
+
+Denies the collection_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-completion-snapshot`
 
 </td>
@@ -1153,6 +1349,32 @@ Denies the document_reconciliation_preview command without any pre-configured sc
 <tr>
 <td>
 
+`loom:allow-document-reference-diagnostics`
+
+</td>
+<td>
+
+Enables the document_reference_diagnostics command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-reference-diagnostics`
+
+</td>
+<td>
+
+Denies the document_reference_diagnostics command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-document-rename`
 
 </td>
@@ -1328,32 +1550,6 @@ Enables the import_account_disconnect command without any pre-configured scope.
 <td>
 
 Denies the import_account_disconnect command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:allow-import-account-sync`
-
-</td>
-<td>
-
-Enables the import_account_sync command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-import-account-sync`
-
-</td>
-<td>
-
-Denies the import_account_sync command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1569,6 +1765,32 @@ Denies the material_list command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-material-pdf-page`
+
+</td>
+<td>
+
+Enables the material_pdf_page command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-pdf-page`
+
+</td>
+<td>
+
+Denies the material_pdf_page command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-material-read`
 
 </td>
@@ -1666,6 +1888,32 @@ Enables the material_rename command without any pre-configured scope.
 <td>
 
 Denies the material_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-resolve-reference`
+
+</td>
+<td>
+
+Enables the material_resolve_reference command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-resolve-reference`
+
+</td>
+<td>
+
+Denies the material_resolve_reference command without any pre-configured scope.
 
 </td>
 </tr>
@@ -2628,6 +2876,370 @@ Enables the workspace_copy_files command without any pre-configured scope.
 <td>
 
 Denies the workspace_copy_files command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-copy-folder-choose`
+
+</td>
+<td>
+
+Enables the workspace_copy_folder_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-copy-folder-choose`
+
+</td>
+<td>
+
+Denies the workspace_copy_folder_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-document-resolve`
+
+</td>
+<td>
+
+Enables the workspace_document_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-document-resolve`
+
+</td>
+<td>
+
+Denies the workspace_document_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-cancel`
+
+</td>
+<td>
+
+Enables the workspace_pane_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-cancel`
+
+</td>
+<td>
+
+Denies the workspace_pane_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-list`
+
+</td>
+<td>
+
+Enables the workspace_pane_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-list`
+
+</td>
+<td>
+
+Denies the workspace_pane_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-output`
+
+</td>
+<td>
+
+Enables the workspace_pane_output command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-output`
+
+</td>
+<td>
+
+Denies the workspace_pane_output command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-run`
+
+</td>
+<td>
+
+Enables the workspace_pane_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-run`
+
+</td>
+<td>
+
+Denies the workspace_pane_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-reference-resolve`
+
+</td>
+<td>
+
+Enables the workspace_reference_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-reference-resolve`
+
+</td>
+<td>
+
+Denies the workspace_reference_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-root-prepare`
+
+</td>
+<td>
+
+Enables the workspace_root_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-root-prepare`
+
+</td>
+<td>
+
+Denies the workspace_root_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-root-remove`
+
+</td>
+<td>
+
+Enables the workspace_root_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-root-remove`
+
+</td>
+<td>
+
+Denies the workspace_root_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-roots-get`
+
+</td>
+<td>
+
+Enables the workspace_roots_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-roots-get`
+
+</td>
+<td>
+
+Denies the workspace_roots_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-cancel`
+
+</td>
+<td>
+
+Enables the workspace_source_import_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-cancel`
+
+</td>
+<td>
+
+Denies the workspace_source_import_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-choose`
+
+</td>
+<td>
+
+Enables the workspace_source_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-choose`
+
+</td>
+<td>
+
+Denies the workspace_source_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-paste`
+
+</td>
+<td>
+
+Enables the workspace_source_import_paste command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-paste`
+
+</td>
+<td>
+
+Denies the workspace_source_import_paste command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-paths`
+
+</td>
+<td>
+
+Enables the workspace_source_import_paths command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-paths`
+
+</td>
+<td>
+
+Denies the workspace_source_import_paths command without any pre-configured scope.
 
 </td>
 </tr>

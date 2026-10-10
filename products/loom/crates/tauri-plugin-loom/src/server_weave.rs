@@ -594,6 +594,7 @@ mod tests {
         let session_id = CommandId::new();
         {
             let mut session = state.session.lock().unwrap();
+            crate::workspace_owner::establish(&mut session, &store);
             session.store = Some(store);
             session.active_session_id = Some(session_id);
             session.phase = SessionPhase::Open;

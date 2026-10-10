@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use atomic_write_file::AtomicWriteFile;
 use information_native_backend_sqlite::{AlexandriaBackend, AlexandriaBackendConfig};
 use information_native_retrieval::{ReadRequest, ResourceBackend};
 use information_native_types::{
@@ -24,11 +23,14 @@ use thiserror::Error;
 
 use crate::context_attachments::{self, ContextAttachmentPresentation};
 
+pub(crate) mod collections;
 mod folders;
 mod grants;
-mod metadata;
+pub(crate) mod metadata;
+mod query;
 pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
 pub(crate) use grants::{forget_selected_grant, persist_selected_grant, restore_selected_grants};
+pub(crate) use query::{MaterialCount, count_documents};
 
 const SCHEMA: &str = "loom.materials.v1";
 const MAX_BINDINGS: usize = 4096;
@@ -72,6 +74,7 @@ pub(crate) enum MaterialKind {
     Attachment,
     Library,
     Folder,
+    Collection,
 }
 
 /// Storage promise attached to every serialized material and evidence record.
@@ -105,9 +108,9 @@ pub(crate) struct MaterialEntry {
     pub(crate) metadata_revision: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Binding {
+pub(crate) struct Binding {
     id: String,
     name: String,
     pinned: bool,
@@ -117,7 +120,7 @@ struct Binding {
     #[serde(default)]
     workspace_path: Option<String>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Source {
     Attachment { attachment_id: String },
@@ -128,6 +131,8 @@ enum Source {
 struct Bindings {
     schema: String,
     items: Vec<Binding>,
+    #[serde(skip)]
+    revision: Option<loom_types::RevisionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -223,6 +228,8 @@ pub(crate) struct MaterialSearch {
     pub(crate) warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) folder: Option<FolderRetrieval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collection: Option<collections::CollectionRetrieval>,
 }
 
 fn grant_key(store: &ProjectStore, id: &str) -> (PathBuf, String, String) {
@@ -259,9 +266,6 @@ fn valid_hash(value: &str) -> bool {
 fn binding_id(source: &Source) -> Result<String> {
     Ok(format!("material-{}", digest(&serde_json::to_vec(source)?)))
 }
-fn qualified(binding: &Binding) -> String {
-    format!("materials/{}#{}", binding.name, &binding.id[9..21])
-}
 fn reference(name: &str) -> Result<String> {
     Ok(format!("@{}", serde_json::to_string(name)?))
 }
@@ -277,7 +281,7 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
             MaterialKind::Attachment,
             None,
             Some(attachment_id.clone()),
-            true,
+            context_attachments::describe_source(store.root(), attachment_id).is_ok(),
         ),
         Source::Library { path } => (
             MaterialKind::Library,
@@ -311,28 +315,87 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
-    let Some(snapshot) = metadata::Snapshot::open(store.root())? else {
-        return Ok(Vec::new());
+    let (configuration_revision, configured) = crate::workspace_template::materials::current(store)
+        .map_err(|error| invalid(error.message))?;
+    let workspace_observation = if let Some(revision) = configuration_revision {
+        let snapshot = metadata::WorkspaceSnapshot::open(store.root())?
+            .ok_or_else(|| invalid("workspace material metadata disappeared"))?;
+        let loaded = store
+            .read_document_bounded(
+                crate::workspace_template::TEMPLATE_PATH,
+                crate::workspace_template::MAX_TEMPLATE_BYTES as u64,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        if loaded.revision_id != revision || loaded.text.as_bytes() != snapshot.bytes {
+            return Err(invalid(
+                "workspace material metadata changed during observation",
+            ));
+        }
+        Some(snapshot)
+    } else {
+        None
     };
-    let bindings = decode_bindings(&snapshot.bytes)?;
-    bindings
-        .items
+    let mut legacy_observation = None;
+    let (items, metadata_revision) = if let Some(items) = configured {
+        (
+            items,
+            workspace_observation
+                .as_ref()
+                .map(|snapshot| snapshot.revision.clone()),
+        )
+    } else if let Some(snapshot) = metadata::Snapshot::open(store.root())? {
+        let items = decode_bindings(&snapshot.bytes)?.items;
+        let revision = Some(snapshot.revision.clone());
+        legacy_observation = Some(snapshot);
+        (items, revision)
+    } else {
+        (Vec::new(), None)
+    };
+    let mut entries = items
         .iter()
         .map(|binding| {
             let mut material = entry(store, binding)?;
-            material.metadata_revision = Some(snapshot.revision.clone());
+            material.metadata_revision.clone_from(&metadata_revision);
             Ok(material)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for definition in collections::definitions(store)? {
+        if entries.iter().any(|entry| entry.id == definition.id) {
+            return Err(invalid(
+                "A collection identity conflicts with an existing source.",
+            ));
+        }
+        let mut item = collections::entry(store, &definition)?;
+        item.metadata_revision = workspace_observation
+            .as_ref()
+            .map(|snapshot| snapshot.revision.clone());
+        entries.push(item);
+    }
+    if let Some(snapshot) = workspace_observation {
+        snapshot.ensure_current(store.root())?;
+    }
+    if let Some(snapshot) = legacy_observation {
+        snapshot.ensure_current(store.root())?;
+    }
+    Ok(entries)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
-    read_bindings(store)?
+    let mut entries = read_bindings(store)?
         .items
         .iter()
         .map(|binding| entry(store, binding))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for definition in collections::definitions(store)? {
+        if entries.iter().any(|entry| entry.id == definition.id) {
+            return Err(invalid(
+                "A collection identity conflicts with an existing source.",
+            ));
+        }
+        entries.push(collections::entry(store, &definition)?);
+    }
+    Ok(entries)
 }
 
 pub(crate) fn observed_entry(store: &ProjectStore, id: &str) -> Result<MaterialEntry> {
@@ -355,7 +418,7 @@ pub(crate) enum MetadataChange<'a> {
 /// writer. Retries with an obsolete observation fail closed; no intent is
 /// silently rebased onto a replaced/re-added source or replayed after relaunch.
 pub(crate) fn change_metadata(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     id: &str,
     expected_revision: &str,
     change: MetadataChange<'_>,
@@ -369,46 +432,104 @@ pub(crate) fn change_metadata(
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
-    let snapshot = metadata::Snapshot::open(store.root())?
+    change_workspace_metadata(store, id, expected_revision, change)
+}
+
+#[cfg(not(unix))]
+fn change_workspace_metadata(
+    _store: &mut ProjectStore,
+    _id: &str,
+    _expected_revision: &str,
+    _change: MetadataChange<'_>,
+) -> Result<Option<MaterialEntry>> {
+    Err(invalid(
+        "material metadata mutation is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn change_workspace_metadata(
+    store: &mut ProjectStore,
+    id: &str,
+    expected_revision: &str,
+    change: MetadataChange<'_>,
+) -> Result<Option<MaterialEntry>> {
+    let snapshot = metadata::WorkspaceSnapshot::open(store.root())?
         .ok_or_else(|| MaterialError::NotFound(id.into()))?;
     if snapshot.revision != expected_revision {
         return Err(invalid(
             "material metadata changed; select the source again",
         ));
     }
-    let mut bindings = decode_bindings(&snapshot.bytes)?;
-    let index = bindings
-        .items
-        .iter()
-        .position(|binding| binding.id == id)
-        .ok_or_else(|| MaterialError::NotFound(id.into()))?;
-    let removed = matches!(change, MetadataChange::Remove);
-    match change {
-        MetadataChange::Rename(name) => bindings.items[index].name = name.into(),
-        MetadataChange::Pin(pinned) => bindings.items[index].pinned = pinned,
-        MetadataChange::Remove => {
-            bindings.items.remove(index);
-        }
+    let (revision, configured) = crate::workspace_template::materials::current(store)
+        .map_err(|error| invalid(error.message))?;
+    let loaded = store
+        .read_document_bounded(
+            crate::workspace_template::TEMPLATE_PATH,
+            crate::workspace_template::MAX_TEMPLATE_BYTES as u64,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    if Some(loaded.revision_id) != revision || loaded.text.as_bytes() != snapshot.bytes {
+        return Err(invalid(
+            "workspace material metadata changed during observation",
+        ));
     }
-    // Serialize/validate before touching disk. A duplicate display name is legal:
-    // name-only lookup stays ambiguous; full-id links remain exact.
-    let bytes = serde_json::to_vec(&bindings)?;
-    let committed = if bytes == snapshot.bytes {
-        snapshot.ensure_current(store.root())?;
-        snapshot
+    snapshot.ensure_current(store.root())?;
+    let removed = matches!(change, MetadataChange::Remove);
+    let mut items = configured.unwrap_or_default();
+    let mut changed = if let Some(index) = items.iter().position(|binding| binding.id == id) {
+        match change {
+            MetadataChange::Rename(name) => items[index].name = name.into(),
+            MetadataChange::Pin(pinned) => items[index].pinned = pinned,
+            MetadataChange::Remove => {
+                items.remove(index);
+            }
+        }
+        crate::workspace_template::materials::save_observed(
+            store,
+            revision,
+            &items,
+            Some(&snapshot.revision),
+        )
+        .map_err(|error| invalid(error.message))?;
+        if removed {
+            None
+        } else {
+            Some(entry(store, &items[index])?)
+        }
     } else {
-        snapshot.replace(store.root(), &bytes)?
+        let saved = crate::workspace_template::collections::change_metadata(
+            store,
+            revision,
+            id,
+            change,
+            &snapshot.revision,
+        )
+        .map_err(|error| invalid(error.message))?;
+        if removed {
+            None
+        } else {
+            let definition = saved
+                .collections
+                .iter()
+                .find(|definition| definition.id == id)
+                .ok_or_else(|| invalid("committed collection disappeared"))?;
+            Some(collections::entry(store, definition)?)
+        }
     };
     if removed {
         grants()
             .lock()
             .map_err(|_| invalid("library capability lock poisoned"))?
             .remove(&grant_key(store, id));
-        return Ok(None);
+    } else if let Some(material) = &mut changed {
+        material.metadata_revision = Some(
+            metadata::WorkspaceSnapshot::open(store.root())?
+                .ok_or_else(|| invalid("committed workspace metadata disappeared"))?
+                .revision,
+        );
     }
-    let mut result = entry(store, &bindings.items[index])?;
-    result.metadata_revision = Some(committed.revision);
-    Ok(Some(result))
+    Ok(changed)
 }
 
 pub(crate) fn is_material_id(name: &str) -> bool {
@@ -422,42 +543,34 @@ pub(crate) fn resolve_optional(store: &ProjectStore, name: &str) -> Result<Optio
     }
 }
 pub(crate) fn resolve(store: &ProjectStore, name: &str) -> Result<MaterialEntry> {
-    let bindings = read_bindings(store)?;
+    let entries = list(store)?;
     if is_material_id(name) {
-        return bindings
-            .items
-            .iter()
-            .find(|binding| binding.id == name)
-            .map(|binding| entry(store, binding))
-            .transpose()?
+        return entries
+            .into_iter()
+            .find(|entry| entry.id == name)
             .ok_or_else(|| MaterialError::NotFound(name.into()));
     }
-
-    let mut matches: Vec<_> = bindings
-        .items
+    let mut matches: Vec<_> = entries
         .iter()
-        .filter(|binding| binding.id == name || qualified(binding) == name)
+        .filter(|entry| format!("materials/{}#{}", entry.name, &entry.id[9..21]) == name)
         .collect();
     if matches.is_empty() {
-        matches = bindings
-            .items
+        matches = entries
             .iter()
-            .filter(|binding| binding.workspace_path.as_deref() == Some(name))
+            .filter(|entry| entry.workspace_path.as_deref() == Some(name))
             .collect();
     }
     if matches.is_empty() {
-        matches = bindings.items.iter().filter(|binding| matches!(&binding.source, Source::Library { path } if path.to_str() == Some(name))).collect();
-    }
-    if matches.is_empty() {
-        matches = bindings
-            .items
+        matches = entries
             .iter()
-            .filter(|binding| binding.name == name)
+            .filter(|entry| entry.source_path.as_deref() == Some(name))
             .collect();
     }
-
+    if matches.is_empty() {
+        matches = entries.iter().filter(|entry| entry.name == name).collect();
+    }
     match matches.as_slice() {
-        [binding] => entry(store, binding),
+        [entry] => Ok((*entry).clone()),
         [] => Err(MaterialError::NotFound(name.into())),
         _ => Err(MaterialError::Ambiguous(name.into())),
     }
@@ -469,7 +582,7 @@ fn binding(store: &ProjectStore, id: &str) -> Result<Binding> {
         .find(|binding| binding.id == id)
         .ok_or_else(|| MaterialError::NotFound(id.into()))
 }
-fn save_binding(store: &ProjectStore, source: Source, name: &str) -> Result<Binding> {
+fn save_binding(store: &mut ProjectStore, source: Source, name: &str) -> Result<Binding> {
     save_binding_at_path(store, source, name, None, MaterialRetention::Ordinary)
 }
 
@@ -496,7 +609,7 @@ fn binding_identity(source: &Source, workspace_path: Option<&str>) -> Result<Str
 }
 
 fn save_binding_at_path(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     source: Source,
     name: &str,
     workspace_path: Option<&str>,
@@ -507,6 +620,7 @@ fn save_binding_at_path(
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    crate::workspace_template::materials::prepare(store).map_err(|error| invalid(error.message))?;
     let mut bindings = read_bindings(store)?;
     let id = binding_identity(&source, workspace_path)?;
     if let Some(existing) = bindings.items.iter().find(|binding| binding.id == id) {
@@ -528,7 +642,7 @@ fn save_binding_at_path(
     Ok(binding)
 }
 pub(crate) fn bind_attachment(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     attachment_id: &str,
     name: Option<&str>,
 ) -> Result<MaterialEntry> {
@@ -536,7 +650,7 @@ pub(crate) fn bind_attachment(
 }
 
 pub(crate) fn bind_attachment_with_retention(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     attachment_id: &str,
     name: Option<&str>,
     retention: MaterialRetention,
@@ -557,7 +671,7 @@ pub(crate) fn bind_attachment_with_retention(
 
 /// Each workspace placement has its own binding while retaining shared bytes.
 pub(crate) fn bind_workspace_attachment(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     attachment_id: &str,
     relative_path: &str,
 ) -> Result<MaterialEntry> {
@@ -594,7 +708,7 @@ fn validate_workspace_path(path: &str) -> Result<()> {
 /// Only call after a native file selection (or a separately authenticated
 /// application-owned grant). Workspace JSON paths never call this function.
 pub(crate) fn add_library(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     selected_path: &Path,
     name: Option<&str>,
 ) -> Result<MaterialEntry> {
@@ -651,7 +765,7 @@ pub(crate) fn add_library(
 /// Register an explicitly selected source and save native access together. A
 /// failed private-state write rolls back the newly exposed binding/capability.
 pub(crate) fn add_library_persisted(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     selected: &Path,
     grant_root: Option<&Path>,
 ) -> Result<MaterialEntry> {
@@ -690,7 +804,11 @@ pub(crate) fn add_library_persisted(
 }
 
 #[cfg(test)]
-pub(crate) fn set_pinned(store: &ProjectStore, id: &str, pinned: bool) -> Result<MaterialEntry> {
+pub(crate) fn set_pinned(
+    store: &mut ProjectStore,
+    id: &str,
+    pinned: bool,
+) -> Result<MaterialEntry> {
     let observed = observed_entry(store, id)?;
     let revision = observed
         .metadata_revision
@@ -700,10 +818,11 @@ pub(crate) fn set_pinned(store: &ProjectStore, id: &str, pinned: bool) -> Result
         .ok_or_else(|| invalid("pin returned no material"))
 }
 
-pub(crate) fn remove(store: &ProjectStore, id: &str) -> Result<()> {
+pub(crate) fn remove(store: &mut ProjectStore, id: &str) -> Result<()> {
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    crate::workspace_template::materials::prepare(store).map_err(|error| invalid(error.message))?;
     let mut bindings = read_bindings(store)?;
     let previous = bindings.items.len();
     bindings.items.retain(|b| b.id != id);
@@ -720,6 +839,10 @@ pub(crate) fn remove(store: &ProjectStore, id: &str) -> Result<()> {
 }
 
 pub(crate) fn read(store: &ProjectStore, id: &str) -> Result<MaterialRead> {
+    let material = resolve(store, id)?;
+    if material.kind == MaterialKind::Collection {
+        return collections::read(store, material);
+    }
     let binding = binding(store, id)?;
     let material = entry(store, &binding)?;
     match binding.source {
@@ -774,6 +897,9 @@ pub(crate) fn native_media(
     store: &ProjectStore,
     id: &str,
 ) -> Result<Vec<llama_native_types::MediaInput>> {
+    if resolve(store, id)?.kind == MaterialKind::Collection {
+        return Ok(Vec::new());
+    }
     match binding(store, id)?.source {
         Source::Attachment { attachment_id } => Ok(context_attachments::source_native_media(
             store.root(),
@@ -787,8 +913,17 @@ pub(crate) fn search(store: &ProjectStore, id: &str, query: &str) -> Result<Mate
     if query.trim().is_empty() || query.len() > MAX_QUERY_BYTES {
         return Err(invalid("search needs 1–4096 bytes of text"));
     }
+    let material = resolve(store, id)?;
+    if material.kind == MaterialKind::Collection {
+        return collections::search(
+            store,
+            &collections::freeze(store, material)?,
+            query,
+            &FolderScanBudget::default(),
+            &|| false,
+        );
+    }
     let binding = binding(store, id)?;
-    let material = entry(store, &binding)?;
     match binding.source {
         Source::Library { .. } => search_library(store, material, query),
         Source::Attachment { attachment_id } => {
@@ -909,6 +1044,7 @@ fn search_library(
         complete: result.complete,
         warnings: result.warnings,
         folder: None,
+        collection: None,
     })
 }
 fn search_attachment(
@@ -950,6 +1086,7 @@ fn search_attachment(
         hits,
         warnings,
         folder: None,
+        collection: None,
     })
 }
 
@@ -1082,7 +1219,13 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
     let bytes = read_safe(
         &storage(store)?.join("evidence").join(format!("{id}.json")),
         MAX_EVIDENCE_BYTES,
-    )?;
+    )
+    .map_err(|error| match error {
+        MaterialError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            MaterialError::NotFound(format!("evidence/{id}"))
+        }
+        other => other,
+    })?;
     if digest(&bytes) != id {
         return Err(invalid("retained evidence identity mismatch"));
     }
@@ -1133,18 +1276,24 @@ fn read_safe(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
-    let path = storage(store)?.join("bindings.json");
-    let bytes = match read_safe(&path, MAX_STATE_BYTES) {
-        Ok(bytes) => bytes,
-        Err(MaterialError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Bindings {
-                schema: SCHEMA.into(),
-                items: Vec::new(),
-            });
-        }
-        Err(e) => return Err(e),
+    let (revision, configured) = crate::workspace_template::materials::current(store)
+        .map_err(|error| invalid(error.message))?;
+    let items = match configured {
+        Some(items) => items,
+        None => unconfigured_bindings(store)?.unwrap_or_default(),
     };
-    decode_bindings(&bytes)
+    validate_bindings(&items)?;
+    Ok(Bindings {
+        schema: SCHEMA.into(),
+        items,
+        revision,
+    })
+}
+
+pub(crate) fn unconfigured_bindings(store: &ProjectStore) -> Result<Option<Vec<Binding>>> {
+    metadata::Snapshot::open(store.root())?
+        .map(|snapshot| decode_bindings(&snapshot.bytes).map(|bindings| bindings.items))
+        .transpose()
 }
 
 fn decode_bindings(bytes: &[u8]) -> Result<Bindings> {
@@ -1152,8 +1301,34 @@ fn decode_bindings(bytes: &[u8]) -> Result<Bindings> {
     if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
         return Err(invalid("unsupported material bindings"));
     }
+    validate_bindings(&bindings.items)?;
+    Ok(bindings)
+}
+
+pub(crate) fn adopt_previous_bindings(store: &mut ProjectStore) -> Result<()> {
+    let Some(snapshot) = metadata::Snapshot::open(store.root())? else {
+        return Ok(());
+    };
+    let items = decode_bindings(&snapshot.bytes)?.items;
+    let (revision, configured) = crate::workspace_template::materials::current(store)
+        .map_err(|error| invalid(error.message))?;
+    snapshot.ensure_current(store.root())?;
+    if configured.is_none() {
+        crate::workspace_template::materials::save(store, revision, &items)
+            .map_err(|error| invalid(error.message))?;
+    }
+    // If another writer replaced the legacy generation while configuration was
+    // saved, retain it in place and require reconciliation; never reread and
+    // silently archive a different generation or resurrect obsolete bindings.
+    snapshot.preserve(store.root())
+}
+
+pub(crate) fn validate_bindings(items: &[Binding]) -> Result<()> {
+    if items.len() > MAX_BINDINGS {
+        return Err(invalid("workspace material limit reached"));
+    }
     let mut ids = std::collections::BTreeSet::new();
-    for binding in &bindings.items {
+    for binding in items {
         require_supported_retention(binding.retention)?;
         validate_name(&binding.name)?;
         if binding.id != binding_identity(&binding.source, binding.workspace_path.as_deref())?
@@ -1171,31 +1346,12 @@ fn decode_bindings(bytes: &[u8]) -> Result<Bindings> {
             _ => {}
         }
     }
-    Ok(bindings)
-}
-fn write_bindings(store: &ProjectStore, bindings: &Bindings) -> Result<()> {
-    let bytes = serde_json::to_vec(bindings)?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err(invalid("workspace material metadata limit reached"));
-    }
-    let path = storage(store)?.join("bindings.json");
-    if let Ok(metadata) = fs::symlink_metadata(&path)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        return Err(invalid("unsafe material bindings file"));
-    }
-    let options = AtomicWriteFile::options();
-    #[cfg(unix)]
-    let options = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut options = options;
-        options.mode(0o600);
-        options
-    };
-    let mut file = options.open(&path)?;
-    file.write_all(&bytes)?;
-    file.commit()?;
     Ok(())
+}
+
+fn write_bindings(store: &mut ProjectStore, bindings: &Bindings) -> Result<()> {
+    crate::workspace_template::materials::save(store, bindings.revision, &bindings.items)
+        .map_err(|error| invalid(error.message))
 }
 
 // A registration pins the local file identity, not a claim of a whole-file
@@ -1305,7 +1461,7 @@ mod tests {
             .execute_batch(include_str!("materials/alexandria-fixture.sql"))
             .unwrap();
     }
-    fn source(store: &ProjectStore, text: &str, name: &str) -> MaterialEntry {
+    fn source(store: &mut ProjectStore, text: &str, name: &str) -> MaterialEntry {
         let path = store.root().join("fixture.txt");
         fs::write(&path, text).unwrap();
         let source = context_attachments::import_path(store.root(), &path).unwrap();
@@ -1314,7 +1470,7 @@ mod tests {
 
     #[test]
     fn protected_retention_fails_before_plaintext_binding_or_evidence_publication() {
-        let (_temp, store) = project();
+        let (_temp, mut store) = project();
         let source_path = store.root().join("protected-source.txt");
         fs::write(&source_path, "protected sentinel").unwrap();
         let attachment = context_attachments::import_path(store.root(), &source_path).unwrap();
@@ -1322,7 +1478,7 @@ mod tests {
         assert!(!material_storage.exists());
 
         let error = bind_attachment_with_retention(
-            &store,
+            &mut store,
             &attachment.id,
             Some("Protected"),
             MaterialRetention::Protected,
@@ -1354,11 +1510,11 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_retention_is_serialized_under_private_unix_permissions() {
+    fn ordinary_retention_preserves_class_and_private_evidence_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let (_temp, store) = project();
-        let entry = source(&store, "ordinary sentinel", "Ordinary");
+        let (_temp, mut store) = project();
+        let entry = source(&mut store, "ordinary sentinel", "Ordinary");
         assert_eq!(entry.retention, MaterialRetention::Ordinary);
         let evidence = read(&store, &entry.id).unwrap().evidence.remove(0);
         assert_eq!(evidence.retention, MaterialRetention::Ordinary);
@@ -1370,29 +1526,32 @@ mod tests {
                 0o700
             );
         }
-        let bindings = root.join("bindings.json");
         let evidence_path = root.join("evidence").join(format!("{}.json", evidence.id));
-        for file in [&bindings, &evidence_path] {
-            assert_eq!(
-                fs::metadata(file).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            let value: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
-            assert!(
-                value.to_string().contains("ordinary"),
-                "serialized record must name its retention class"
-            );
-        }
+        assert_eq!(
+            fs::metadata(&evidence_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let value: Value = serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        assert!(
+            value.to_string().contains("ordinary"),
+            "immutable evidence names its retention class"
+        );
+        // Definitions are portable, author-editable workspace prose; retained
+        // originals, grants and evidence keep their separate private owners.
+        let (_, items) = crate::workspace_template::materials::current(&store).unwrap();
+        assert_eq!(items.unwrap()[0].retention, MaterialRetention::Ordinary);
+        assert!(!root.join("bindings.json").exists());
     }
     #[cfg(unix)]
     #[test]
     fn workspace_copies_preserve_distinct_placements_and_shared_original_identity() {
-        let (_temp, store) = project();
-        let original = source(&store, "One shared original.", "Original");
+        let (_temp, mut store) = project();
+        let original = source(&mut store, "One shared original.", "Original");
         let attachment_id = original.attachment_id.as_deref().unwrap();
         let first =
-            bind_workspace_attachment(&store, attachment_id, "Research/source.txt").unwrap();
-        let second = bind_workspace_attachment(&store, attachment_id, "Drafts/source.txt").unwrap();
+            bind_workspace_attachment(&mut store, attachment_id, "Research/source.txt").unwrap();
+        let second =
+            bind_workspace_attachment(&mut store, attachment_id, "Drafts/source.txt").unwrap();
         assert_ne!(first.id, second.id);
         assert_ne!(first.id, original.id);
         assert_eq!(first.attachment_id, second.attachment_id);
@@ -1401,7 +1560,7 @@ mod tests {
         assert_eq!(resolve(&store, "Research/source.txt").unwrap().id, first.id);
         assert_eq!(resolve(&store, "Drafts/source.txt").unwrap().id, second.id);
         assert_eq!(
-            bind_workspace_attachment(&store, attachment_id, "Research/source.txt")
+            bind_workspace_attachment(&mut store, attachment_id, "Research/source.txt")
                 .unwrap()
                 .id,
             first.id
@@ -1416,15 +1575,15 @@ mod tests {
             "Notes\\source.txt",
         ] {
             assert!(
-                bind_workspace_attachment(&store, attachment_id, path).is_err(),
+                bind_workspace_attachment(&mut store, attachment_id, path).is_err(),
                 "accepted {path}"
             );
         }
     }
     #[test]
     fn admitting_large_source_does_not_publish_or_load_a_full_text_value() {
-        let (_temp, store) = project();
-        let entry = source(&store, &"words ".repeat(20_000), "Book");
+        let (_temp, mut store) = project();
+        let entry = source(&mut store, &"words ".repeat(20_000), "Book");
         let admission = admit(&store, &entry.id, 65_536).unwrap();
         assert!(admission.text.is_none());
         assert!(admission.complete);
@@ -1434,7 +1593,7 @@ mod tests {
                 .next()
                 .is_none()
         );
-        let small = source(&store, "Short text.", "Note");
+        let small = source(&mut store, "Short text.", "Note");
         assert!(
             admit(&store, &small.id, 65_536)
                 .unwrap()
@@ -1445,10 +1604,10 @@ mod tests {
     }
     #[test]
     fn names_fail_on_ambiguity_qualified_names_remain_exact() {
-        let (_temp, store) = project();
+        let (_temp, mut store) = project();
         assert!(list(&store).unwrap().is_empty());
-        let first = source(&store, "First source", "Research");
-        let second = source(&store, "Second source", "Research");
+        let first = source(&mut store, "First source", "Research");
+        let second = source(&mut store, "Second source", "Research");
         assert!(matches!(
             resolve(&store, "Research"),
             Err(MaterialError::Ambiguous(_))
@@ -1460,13 +1619,17 @@ mod tests {
     }
     #[test]
     fn removing_binding_preserves_source_and_exact_retained_evidence() {
-        let (_temp, store) = project();
-        let entry = source(&store, "A line with café 🦉.\r\nSecond line.\n", "Notes");
+        let (_temp, mut store) = project();
+        let entry = source(
+            &mut store,
+            "A line with café 🦉.\r\nSecond line.\n",
+            "Notes",
+        );
         let read = read(&store, &entry.id).unwrap();
         let before = read.evidence[0].clone();
-        set_pinned(&store, &entry.id, true).unwrap();
+        set_pinned(&mut store, &entry.id, true).unwrap();
         assert!(list(&store).unwrap()[0].pinned);
-        remove(&store, &entry.id).unwrap();
+        remove(&mut store, &entry.id).unwrap();
         assert!(list(&store).unwrap().is_empty());
         assert_eq!(
             read_evidence(&store, &entry.id, &before.id).unwrap().text,
@@ -1483,11 +1646,11 @@ mod tests {
     }
     #[test]
     fn sqlite_search_preserves_source_and_retains_evidence_after_source_change() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
         let original = fs::read(&path).unwrap();
-        let entry = add_library(&store, &path, Some("Library")).unwrap();
+        let entry = add_library(&mut store, &path, Some("Library")).unwrap();
         let result = search(&store, &entry.id, "prayer").unwrap();
         assert!(!result.hits.is_empty());
         let hit = &result.hits[0];
@@ -1516,10 +1679,10 @@ mod tests {
     }
     #[test]
     fn workspace_metadata_cannot_replay_local_file_authority() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
-        let entry = add_library(&store, &path, None).unwrap();
+        let entry = add_library(&mut store, &path, None).unwrap();
         grants()
             .lock()
             .unwrap()
@@ -1529,22 +1692,22 @@ mod tests {
             search(&store, &entry.id, "prayer"),
             Err(MaterialError::NeedsAuthorization(_))
         ));
-        assert!(add_library(&store, &path, None).unwrap().available);
+        assert!(add_library(&mut store, &path, None).unwrap().available);
     }
     #[test]
     fn nonempty_wal_is_rejected_without_creating_a_binding() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
         fs::write(path.with_extension("sqlite3-wal"), b"uncheckpointed").unwrap();
-        assert!(add_library(&store, &path, None).is_err());
+        assert!(add_library(&mut store, &path, None).is_err());
         assert!(list(&store).unwrap().is_empty());
     }
     #[test]
     fn attachment_search_preserves_unicode_offsets_across_chunk_boundaries() {
-        let (_temp, store) = project();
+        let (_temp, mut store) = project();
         let text = format!("{}Kelvin \u{212a}elvin café 🦉 finish", "x".repeat(2045));
-        let entry = source(&store, &text, "Unicode");
+        let entry = source(&mut store, &text, "Unicode");
         let result = search(&store, &entry.id, "kelvin").unwrap();
         assert_eq!(result.hits.len(), 1);
         let hit = &result.hits[0];
@@ -1557,8 +1720,8 @@ mod tests {
     }
     #[test]
     fn retained_evidence_tampering_is_not_reinterpreted_as_source() {
-        let (_temp, store) = project();
-        let entry = source(&store, "Unchanged original", "Notes");
+        let (_temp, mut store) = project();
+        let entry = source(&mut store, "Unchanged original", "Notes");
         let evidence = read(&store, &entry.id).unwrap().evidence.remove(0);
         fs::write(
             storage(&store)

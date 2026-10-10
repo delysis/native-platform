@@ -73,6 +73,34 @@ impl ProjectStore {
         )
     }
 
+    /// Apply a caller-owned native observation guard at the visible replacement
+    /// boundary. A failed guard retains the committed revision and its pending
+    /// outbox receipt; callers must require an Applied projection before success.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_document_if_source_with_guard<F>(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        content: DocumentContent,
+        reason: impl Into<String>,
+        expected_revision_id: RevisionId,
+        expected_visible_blob_id: BlobId,
+        before_projection: F,
+    ) -> Result<IdempotentSaveOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        self.save_document_if_source_idempotent_inner(
+            CommandId::new(),
+            relative_path,
+            content,
+            reason,
+            expected_revision_id,
+            expected_visible_blob_id,
+            None,
+            before_projection,
+        )
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn save_document_if_source_idempotent(
         &mut self,

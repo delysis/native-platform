@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-root-prepare"
+description = "Enables the workspace_root_prepare command without any pre-configured scope."
+commands.allow = ["workspace_root_prepare"]
+
+[[permission]]
+identifier = "deny-workspace-root-prepare"
+description = "Denies the workspace_root_prepare command without any pre-configured scope."
+commands.deny = ["workspace_root_prepare"]

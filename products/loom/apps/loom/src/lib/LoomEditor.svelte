@@ -6,6 +6,7 @@
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
+  import { ReferenceDiagnostics, referenceDiagnosticKey, referenceDiagnosticPlugin, visualReferenceDecorations, type ReferenceScope } from './referenceDiagnostics';
   import { onDestroy, onMount } from 'svelte';
   import {
     boundaryKeyKind, textBoundaryDelta, type BoundaryObservation
@@ -90,6 +91,8 @@
   }
 
   export let value = '';
+  export let referenceScope: ReferenceScope | null = null;
+  const referenceDiagnostics = new ReferenceDiagnostics();
   export let label = 'Manuscript editor';
   export let readonly = false;
   export let autofocus = false;
@@ -597,18 +600,23 @@
     return view && !readonly && !composing ? visualTerminalRange(view.state, lastEmitted) : null;
   }
 
-  export function captureTextInsertionAnchor(): {
+  export function captureTextInsertionAnchor(openedReference?: Element): {
     surfaceKey: string;
     markdown: string;
     from: number;
     to: number;
   } | null {
     if (!view || readonly || composing) return null;
+    // Clicking a source places the browser caret inside its label. Derivations
+    // from that source belong after the intact reference, not inside its name.
+    const afterReference = openedReference && view.dom.contains(openedReference)
+      ? view.posAtDOM(openedReference, openedReference.childNodes.length)
+      : null;
     return {
       surfaceKey,
       markdown: lastEmitted,
-      from: view.state.selection.from,
-      to: view.state.selection.to
+      from: afterReference ?? view.state.selection.from,
+      to: afterReference ?? view.state.selection.to
     };
   }
 
@@ -864,6 +872,7 @@
     return EditorState.create({
       doc,
       plugins: [
+        referenceDiagnosticPlugin(),
         history(),
         objectNavigation(),
         visualMarkdownInputRules(schema),
@@ -896,7 +905,13 @@
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
-          navigate: onCaretNavigation,
+          navigate: () => {
+            onCaretNavigation();
+            // Native navigation can leave the caret unchanged (Cmd-Right at
+            // line end). Reconcile after the default action even when WebKit
+            // emits no selection transaction, so completion can resume.
+            scheduleSelectionReport();
+          },
           pin: setLensPinned,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
@@ -1362,6 +1377,13 @@
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
+
+  $: referenceDiagnostics.update(referenceScope, value, (items) => {
+    if (view) {
+      view.dispatch(view.state.tr.setMeta(referenceDiagnosticKey, visualReferenceDecorations(view.state.doc, value, items)).setMeta('addToHistory', false));
+    }
+  });
+  onDestroy(() => referenceDiagnostics.dispose());
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
     const normalized = normalizeVisualMarkdownSource(value);

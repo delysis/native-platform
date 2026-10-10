@@ -42,18 +42,26 @@ export type { DocumentFilesystemHint } from './documentFilesystemHint';
 
 const PREFIX = 'plugin:loom|';
 
+export function documentReferenceDiagnostics(projectId: string, sessionId: string, text: string): Promise<import('./referenceDiagnostics').ReferenceDiagnostic[]> {
+  return call('document_reference_diagnostics', { projectId, sessionId, text });
+}
+
 // Project commands share one renderer-side ordering lane. Classify by the
 // smaller, fail-safe exception set: an unrecognized future command is queued.
 // Native session admission is authoritative across renderers and blocks for
 // its bounded critical sections, so renderer classification is an ordering and
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
+  'material_pdf_page',
+  'workspace_source_import_cancel',
   'import_account_cancel',
+  'collection_cancel',
+  'collection_status',
+  'collection_refresh',
   'import_source_url',
   'import_accounts',
   'import_account_connect',
   'import_account_disconnect',
-  'import_account_sync',
   'application_close_abort',
   'application_close_pending',
   'audio_synthesize',
@@ -145,6 +153,18 @@ export function prepareProjectOpenPath(path: string): Promise<string | null> {
   return call('project_prepare_open_path', { path });
 }
 
+export function getWorkspaceRoots(projectId: string, sessionId: string): Promise<import('./workspaceFolders').WorkspaceRootsSnapshot> {
+  return call('workspace_roots_get', { projectId, sessionId });
+}
+
+export function prepareWorkspaceRoot(projectId: string, sessionId: string, rootId: string): Promise<string | null> {
+  return call('workspace_root_prepare', { projectId, sessionId, rootId });
+}
+
+export function removeWorkspaceRoot(projectId: string, sessionId: string, rootId: string): Promise<void> {
+  return call('workspace_root_remove', { projectId, sessionId, rootId });
+}
+
 export function projectDropDirectories(paths: string[]): Promise<string[]> {
   return call('project_drop_directories', { paths });
 }
@@ -228,12 +248,18 @@ export function revealAttachmentOriginal(projectId: string, sessionId: string, a
   return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
 }
 
-export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<{
+export interface WorkspaceCopyReport {
   copied: string[];
   materials: import('./materials').MaterialEntry[];
   failures: { name: string; message: string }[];
-}> {
+}
+
+export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<WorkspaceCopyReport> {
   return call('workspace_copy_files', { projectId, sessionId, destination, paths: [...paths], operationId: newUlid() });
+}
+
+export function copyWorkspaceFolder(projectId: string, sessionId: string, destination: string, operationId = newUlid()): Promise<WorkspaceCopyReport | null> {
+  return call('workspace_copy_folder_choose', { projectId, sessionId, destination, operationId });
 }
 
 export function chooseAttachments(
@@ -242,6 +268,31 @@ export function chooseAttachments(
   operationId = newUlid()
 ): Promise<ImportBatch> {
   return call('attachment_import_choose', { projectId, sessionId, operationId });
+}
+
+export interface WorkspaceSourceImportReport {
+  workspace_id: string;
+  workspace_session_id: string;
+  operation_id: string;
+  imported: Array<{ attachment: ContextAttachment; material: import('./materials').MaterialEntry | null }>;
+  failures: Array<{ name: string; message: string }>;
+  cancelled: boolean;
+}
+
+export function chooseWorkspaceSources(projectId: string, sessionId: string, operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_choose', { projectId, sessionId, operationId });
+}
+
+export function importWorkspaceSourcePaths(projectId: string, sessionId: string, paths: readonly string[], operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_paths', { projectId, sessionId, operationId, paths: [...paths] });
+}
+
+export function pasteWorkspaceSources(projectId: string, sessionId: string, text: string, separator: string, operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_paste', { projectId, sessionId, operationId, text, separator });
+}
+
+export function cancelWorkspaceSourceImport(projectId: string, sessionId: string, operationId: string): Promise<void> {
+  return call('workspace_source_import_cancel', { projectId, sessionId, operationId });
 }
 
 export function listDocumentContext(
@@ -960,6 +1011,30 @@ export function cancelTerminalRun(projectId: string, sessionId: string, runId: s
   return call('terminal_cancel', { projectId, sessionId, runId });
 }
 
+export function runWorkspacePane(request: import('./workspacePaneDrafts').WorkspacePaneRunRequest): Promise<import('./workspacePaneDrafts').WorkspacePaneSubmission> {
+  return call('workspace_pane_run', { request });
+}
+
+export function listWorkspacePaneRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
+  return call('workspace_pane_list', { projectId, sessionId });
+}
+
+export function cancelWorkspacePaneRun(projectId: string, sessionId: string, runId: string): Promise<void> {
+  return call('workspace_pane_cancel', { projectId, sessionId, runId });
+}
+
+export function readWorkspacePaneOutput(projectId: string, sessionId: string, runId: string): Promise<OpenDocument | null> {
+  return call('workspace_pane_output', { projectId, sessionId, runId });
+}
+
+export function resolveWorkspaceDocument(projectId: string, sessionId: string, reference: string): Promise<OpenDocument | null> {
+  return call('workspace_document_resolve', { projectId, sessionId, reference });
+}
+
+export function resolveWorkspaceReference(projectId: string, sessionId: string, reference: string): Promise<{ root_id: string; document_id: string; workspace_session_id: string }> {
+  return call('workspace_reference_resolve', { projectId, sessionId, reference });
+}
+
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
   return call('shader_preview', { source });
 }
@@ -973,7 +1048,7 @@ export function enableWorkspaceTemplate(projectId: string, sessionId: string): P
 
 export type ImportSource = 'gmail' | 'google_alerts' | 'linked_in' | 'drive';
 export interface ImportAccount { service: 'gmail' | 'drive'; email: string | null }
-export interface ImportBatch { imported: ContextAttachment[]; failures: { name: string; message: string }[]; next_page_token: string | null }
+export interface ImportBatch { imported: ContextAttachment[]; references?: string[]; failures: { name: string; message: string }[]; next_page_token: string | null }
 export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
   return call('import_accounts', { projectId, sessionId });
 }
@@ -982,9 +1057,6 @@ export function connectImportAccount(projectId: string, sessionId: string, servi
 }
 export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
   return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });
-}
-export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null, operationId: string = newUlid()): Promise<ImportBatch> {
-  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken, operationId });
 }
 export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean, operationId: string = newUlid()): Promise<ImportBatch> {
   return call('attachment_import_batch_choose', { projectId, sessionId, folder, operationId });
@@ -1012,11 +1084,28 @@ export function bindAttachmentMaterial(projectId: string, sessionId: string, att
 export function readMaterial(projectId: string, sessionId: string, materialId: string): Promise<import('./materials').MaterialRead> {
   return call('material_read', { projectId, sessionId, id: materialId });
 }
+
+// Page requests share a separate lane: they neither delay edits nor race one
+// another for the native preview worker. Authority is rechecked natively.
+let pdfPageTail: Promise<unknown> = Promise.resolve();
+export function readMaterialPdfPage(token: string, page: number, signal?: AbortSignal): Promise<import('./types').MaterialPdfPage> {
+  const operationId = newUlid();
+  const result = pdfPageTail.then(() => {
+    signal?.throwIfAborted();
+    return call<import('./types').MaterialPdfPage>('material_pdf_page', { token, page, operationId });
+  });
+  pdfPageTail = result.catch(() => undefined);
+  return result;
+}
 export function searchMaterial(projectId: string, sessionId: string, materialId: string, query: string): Promise<import('./materials').MaterialSearch> {
   return call('material_search', { projectId, sessionId, id: materialId, query });
 }
 export function readMaterialEvidence(projectId: string, sessionId: string, materialId: string, evidenceId: string): Promise<import('./materials').MaterialEvidence> {
   return call('material_read_evidence', { projectId, sessionId, id: materialId, evidenceId });
+}
+
+export function resolveMaterialReference(projectId: string, sessionId: string, reference: string): Promise<import('./materialEvidenceScope').MaterialReferenceResolution> {
+  return call('material_resolve_reference', { projectId, sessionId, reference });
 }
 export function addLibraryMaterial(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry | null> {
   return call('material_add_library', { projectId, sessionId });
@@ -1035,4 +1124,26 @@ export function removeMaterial(projectId: string, sessionId: string, materialId:
 /** Metadata-only rename. No source path or document write enters this command. */
 export function renameMaterial(request: import('./materialMetadata').MaterialRenameRequest): Promise<import('./materialMetadata').MaterialRenameReceipt> {
   return call('material_rename', { ...request });
+}
+
+export function addCollection(projectId: string, sessionId: string, name: string, scope: import('./types').CollectionScope, accountEmail: string, operationId: string = newUlid()): Promise<import('./materials').MaterialEntry> {
+  return call('collection_add', { projectId, sessionId, operationId, name, scope, accountEmail });
+}
+export function refreshCollection(projectId: string, sessionId: string, id: string, mode: 'fresh' | 'resume'): Promise<import('./types').CollectionStatus> {
+  return call('collection_refresh', { projectId, sessionId, id, mode });
+}
+export function authorizeCollection(projectId: string, sessionId: string, id: string, definitionFingerprint: string, accountEmail: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_authorize', { projectId, sessionId, id, definitionFingerprint, accountEmail });
+}
+export function collectionStatus(projectId: string, sessionId: string, id: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_status', { projectId, sessionId, id });
+}
+export function cancelCollection(projectId: string, sessionId: string, id: string, jobId: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_cancel', { projectId, sessionId, id, jobId });
+}
+export function collectionMembers(projectId: string, sessionId: string, id: string, offset = 0, snapshotId: string | null = null): Promise<import('./types').CollectionMemberPage> {
+  return call('collection_members', { projectId, sessionId, id, offset, snapshotId });
+}
+export function readCollectionMember(projectId: string, sessionId: string, id: string, occurrenceId: string, snapshotId: string): Promise<import('./materials').MaterialRead> {
+  return call('collection_read_member', { projectId, sessionId, id, occurrenceId, snapshotId });
 }

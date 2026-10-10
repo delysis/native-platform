@@ -2259,16 +2259,16 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-material-list`\n- `allow-material-read`\n- `allow-material-search`\n- `allow-material-read-evidence`\n- `allow-material-bind-attachment`\n- `allow-material-set-pinned`\n- `allow-material-rename`\n- `allow-material-remove`\n- `allow-material-add-library`\n- `allow-material-add-library-path`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-workspace-chat-route`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-workspace-copy-files`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-inference-status`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-document-reference-diagnostics`\n- `allow-material-list`\n- `allow-material-resolve-reference`\n- `allow-material-read`\n- `allow-material-pdf-page`\n- `allow-material-search`\n- `allow-material-read-evidence`\n- `allow-material-bind-attachment`\n- `allow-material-set-pinned`\n- `allow-material-rename`\n- `allow-material-remove`\n- `allow-material-add-library`\n- `allow-material-add-library-path`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-workspace-roots-get`\n- `allow-workspace-root-prepare`\n- `allow-workspace-root-remove`\n- `allow-workspace-source-import-paths`\n- `allow-workspace-source-import-choose`\n- `allow-workspace-source-import-paste`\n- `allow-workspace-source-import-cancel`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-workspace-chat-route`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-workspace-copy-files`\n- `allow-workspace-copy-folder-choose`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-workspace-pane-output`\n- `allow-workspace-document-resolve`\n- `allow-workspace-reference-resolve`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-inference-status`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-material-list`\n- `allow-material-read`\n- `allow-material-search`\n- `allow-material-read-evidence`\n- `allow-material-bind-attachment`\n- `allow-material-set-pinned`\n- `allow-material-rename`\n- `allow-material-remove`\n- `allow-material-add-library`\n- `allow-material-add-library-path`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-workspace-chat-route`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-workspace-copy-files`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-inference-status`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-document-reference-diagnostics`\n- `allow-material-list`\n- `allow-material-resolve-reference`\n- `allow-material-read`\n- `allow-material-pdf-page`\n- `allow-material-search`\n- `allow-material-read-evidence`\n- `allow-material-bind-attachment`\n- `allow-material-set-pinned`\n- `allow-material-rename`\n- `allow-material-remove`\n- `allow-material-add-library`\n- `allow-material-add-library-path`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-workspace-roots-get`\n- `allow-workspace-root-prepare`\n- `allow-workspace-root-remove`\n- `allow-workspace-source-import-paths`\n- `allow-workspace-source-import-choose`\n- `allow-workspace-source-import-paste`\n- `allow-workspace-source-import-cancel`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-workspace-chat-route`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-workspace-copy-files`\n- `allow-workspace-copy-folder-choose`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-workspace-pane-output`\n- `allow-workspace-document-resolve`\n- `allow-workspace-reference-resolve`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-inference-status`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         },
         {
-          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-workspace-pane-run`\n- `allow-workspace-pane-list`\n- `allow-workspace-pane-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "loom:local-generation",
-          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-workspace-pane-run`\n- `allow-workspace-pane-list`\n- `allow-workspace-pane-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
           "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
@@ -2415,6 +2415,48 @@
           "markdownDescription": "Enables the co_writer_save command without any pre-configured scope."
         },
         {
+          "description": "Enables the collection_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-add",
+          "markdownDescription": "Enables the collection_add command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_authorize command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-authorize",
+          "markdownDescription": "Enables the collection_authorize command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-cancel",
+          "markdownDescription": "Enables the collection_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_members command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-members",
+          "markdownDescription": "Enables the collection_members command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_read_member command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-read-member",
+          "markdownDescription": "Enables the collection_read_member command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-refresh",
+          "markdownDescription": "Enables the collection_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-collection-status",
+          "markdownDescription": "Enables the collection_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the completion_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-completion-snapshot",
@@ -2523,6 +2565,12 @@
           "markdownDescription": "Enables the document_reconciliation_preview command without any pre-configured scope."
         },
         {
+          "description": "Enables the document_reference_diagnostics command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-document-reference-diagnostics",
+          "markdownDescription": "Enables the document_reference_diagnostics command without any pre-configured scope."
+        },
+        {
           "description": "Enables the document_rename command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-document-rename",
@@ -2563,12 +2611,6 @@
           "type": "string",
           "const": "loom:allow-import-account-disconnect",
           "markdownDescription": "Enables the import_account_disconnect command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the import_account_sync command without any pre-configured scope.",
-          "type": "string",
-          "const": "loom:allow-import-account-sync",
-          "markdownDescription": "Enables the import_account_sync command without any pre-configured scope."
         },
         {
           "description": "Enables the import_accounts command without any pre-configured scope.",
@@ -2619,6 +2661,12 @@
           "markdownDescription": "Enables the material_list command without any pre-configured scope."
         },
         {
+          "description": "Enables the material_pdf_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-material-pdf-page",
+          "markdownDescription": "Enables the material_pdf_page command without any pre-configured scope."
+        },
+        {
           "description": "Enables the material_read command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-material-read",
@@ -2641,6 +2689,12 @@
           "type": "string",
           "const": "loom:allow-material-rename",
           "markdownDescription": "Enables the material_rename command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the material_resolve_reference command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-material-resolve-reference",
+          "markdownDescription": "Enables the material_resolve_reference command without any pre-configured scope."
         },
         {
           "description": "Enables the material_search command without any pre-configured scope.",
@@ -2865,6 +2919,90 @@
           "markdownDescription": "Enables the workspace_copy_files command without any pre-configured scope."
         },
         {
+          "description": "Enables the workspace_copy_folder_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-copy-folder-choose",
+          "markdownDescription": "Enables the workspace_copy_folder_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_document_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-document-resolve",
+          "markdownDescription": "Enables the workspace_document_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_pane_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-pane-cancel",
+          "markdownDescription": "Enables the workspace_pane_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_pane_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-pane-list",
+          "markdownDescription": "Enables the workspace_pane_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_pane_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-pane-output",
+          "markdownDescription": "Enables the workspace_pane_output command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_pane_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-pane-run",
+          "markdownDescription": "Enables the workspace_pane_run command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_reference_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-reference-resolve",
+          "markdownDescription": "Enables the workspace_reference_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_root_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-root-prepare",
+          "markdownDescription": "Enables the workspace_root_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_root_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-root-remove",
+          "markdownDescription": "Enables the workspace_root_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_roots_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-roots-get",
+          "markdownDescription": "Enables the workspace_roots_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_source_import_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-source-import-cancel",
+          "markdownDescription": "Enables the workspace_source_import_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_source_import_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-source-import-choose",
+          "markdownDescription": "Enables the workspace_source_import_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_source_import_paste command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-source-import-paste",
+          "markdownDescription": "Enables the workspace_source_import_paste command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_source_import_paths command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-workspace-source-import-paths",
+          "markdownDescription": "Enables the workspace_source_import_paths command without any pre-configured scope."
+        },
+        {
           "description": "Enables the workspace_template_enable command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-workspace-template-enable",
@@ -3009,6 +3147,48 @@
           "markdownDescription": "Denies the co_writer_save command without any pre-configured scope."
         },
         {
+          "description": "Denies the collection_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-add",
+          "markdownDescription": "Denies the collection_add command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_authorize command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-authorize",
+          "markdownDescription": "Denies the collection_authorize command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-cancel",
+          "markdownDescription": "Denies the collection_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_members command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-members",
+          "markdownDescription": "Denies the collection_members command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_read_member command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-read-member",
+          "markdownDescription": "Denies the collection_read_member command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-refresh",
+          "markdownDescription": "Denies the collection_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-collection-status",
+          "markdownDescription": "Denies the collection_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the completion_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-completion-snapshot",
@@ -3117,6 +3297,12 @@
           "markdownDescription": "Denies the document_reconciliation_preview command without any pre-configured scope."
         },
         {
+          "description": "Denies the document_reference_diagnostics command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-document-reference-diagnostics",
+          "markdownDescription": "Denies the document_reference_diagnostics command without any pre-configured scope."
+        },
+        {
           "description": "Denies the document_rename command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-document-rename",
@@ -3157,12 +3343,6 @@
           "type": "string",
           "const": "loom:deny-import-account-disconnect",
           "markdownDescription": "Denies the import_account_disconnect command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the import_account_sync command without any pre-configured scope.",
-          "type": "string",
-          "const": "loom:deny-import-account-sync",
-          "markdownDescription": "Denies the import_account_sync command without any pre-configured scope."
         },
         {
           "description": "Denies the import_accounts command without any pre-configured scope.",
@@ -3213,6 +3393,12 @@
           "markdownDescription": "Denies the material_list command without any pre-configured scope."
         },
         {
+          "description": "Denies the material_pdf_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-material-pdf-page",
+          "markdownDescription": "Denies the material_pdf_page command without any pre-configured scope."
+        },
+        {
           "description": "Denies the material_read command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-material-read",
@@ -3235,6 +3421,12 @@
           "type": "string",
           "const": "loom:deny-material-rename",
           "markdownDescription": "Denies the material_rename command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the material_resolve_reference command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-material-resolve-reference",
+          "markdownDescription": "Denies the material_resolve_reference command without any pre-configured scope."
         },
         {
           "description": "Denies the material_search command without any pre-configured scope.",
@@ -3457,6 +3649,90 @@
           "type": "string",
           "const": "loom:deny-workspace-copy-files",
           "markdownDescription": "Denies the workspace_copy_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_copy_folder_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-copy-folder-choose",
+          "markdownDescription": "Denies the workspace_copy_folder_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_document_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-document-resolve",
+          "markdownDescription": "Denies the workspace_document_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_pane_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-pane-cancel",
+          "markdownDescription": "Denies the workspace_pane_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_pane_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-pane-list",
+          "markdownDescription": "Denies the workspace_pane_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_pane_output command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-pane-output",
+          "markdownDescription": "Denies the workspace_pane_output command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_pane_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-pane-run",
+          "markdownDescription": "Denies the workspace_pane_run command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_reference_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-reference-resolve",
+          "markdownDescription": "Denies the workspace_reference_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_root_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-root-prepare",
+          "markdownDescription": "Denies the workspace_root_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_root_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-root-remove",
+          "markdownDescription": "Denies the workspace_root_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_roots_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-roots-get",
+          "markdownDescription": "Denies the workspace_roots_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_source_import_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-source-import-cancel",
+          "markdownDescription": "Denies the workspace_source_import_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_source_import_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-source-import-choose",
+          "markdownDescription": "Denies the workspace_source_import_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_source_import_paste command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-source-import-paste",
+          "markdownDescription": "Denies the workspace_source_import_paste command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_source_import_paths command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-workspace-source-import-paths",
+          "markdownDescription": "Denies the workspace_source_import_paths command without any pre-configured scope."
         },
         {
           "description": "Denies the workspace_template_enable command without any pre-configured scope.",

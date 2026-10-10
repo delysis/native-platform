@@ -25,6 +25,7 @@ import {
   loadCatalogModelCandidate,
   openDocument,
   previewDocumentReconciliation,
+  readMaterialPdfPage,
   revealDocument
 } from './ipc';
 
@@ -61,6 +62,26 @@ afterEach(() => {
 });
 
 describe('session IPC admission', () => {
+  it('serializes PDF rendering without delaying writing, and skips abandoned queued pages', async () => {
+    installDesktopRuntime();
+    const first = deferred<never>();
+    mocks.invoke.mockImplementation((command: string, args: { page?: number }) =>
+      command === 'plugin:loom|material_pdf_page' && args.page === 1 ? first.promise : Promise.resolve(null));
+    const one = readMaterialPdfPage('source', 1);
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    const abandoned = new AbortController();
+    const two = readMaterialPdfPage('source', 2, abandoned.signal);
+    const twoFailure = expect(two).rejects.toThrow();
+    const three = readMaterialPdfPage('source', 3);
+    abandoned.abort();
+    await expect(openDocument('project', 'session', 'draft', 'revision', 'a'.repeat(64))).resolves.toBeNull();
+    expect(mocks.invoke.mock.calls.map(call => call[0])).toEqual(['plugin:loom|material_pdf_page', 'plugin:loom|document_open']);
+    const oneFailure = expect(one).rejects.toThrow('done');
+    first.reject(new Error('done'));
+    await oneFailure; await twoFailure;
+    await expect(three).resolves.toBeNull();
+    expect(mocks.invoke.mock.calls.filter(call => call[0] === 'plugin:loom|material_pdf_page').map(call => call[1].page)).toEqual([1, 3]);
+  });
   it('reads the embedded model catalog outside the project session lane', async () => {
     installDesktopRuntime();
     const projectRead = deferred<never>();
