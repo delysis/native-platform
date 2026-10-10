@@ -6,6 +6,7 @@
       "desktop-launch",
       "desktop-model-defaults",
       "desktop-vault",
+      "operation-lifecycle",
       "workspace-document"
     ],
     "native": [
@@ -120,6 +121,7 @@
       "loom-text-session",
       "loom-types",
       "mom-llama-runtime",
+      "operation-lifecycle",
       "speech-native-host",
       "speech-native-router",
       "speech-native-types",
