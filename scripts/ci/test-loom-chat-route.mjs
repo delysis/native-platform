@@ -62,7 +62,9 @@ function fixture({ route = 'loom', loomModel = 'A', momModel = 'B', loaded = fal
     busy: false, composing: false, readonly: false, dispatching: false, cancelRequested: false,
     entry: 'Continue', error: '', pending: null, scope: 'project-1/session-1/chat',
     paneId: 'chat', config: { kind, context: [], document: null },
-    documents: [opened.summary, answer.summary], runs: [oldRun], MAX_PROMPT_BYTES: 65536,
+    ownerDocuments: [opened.summary, answer.summary], runs: [oldRun], MAX_PROMPT_BYTES: 65536,
+    workspaceScope: { projectId: 'project-1', sessionId: 'workspace-session-1' }, configurationRevisionId: 'workspace-revision-1', scopeSerial: 1,
+    $draft: { entry: 'Continue', pending: null, failure: null },
     models: [writer(loomModel, loaded)], selectedModelPath: `/component/${loomModel}.gguf`,
     workspaceTemplate: { enabled: true, error: null, config: { panes: {} } },
     momProfile: mom,
@@ -84,36 +86,41 @@ function fixture({ route = 'loom', loomModel = 'A', momModel = 'B', loaded = fal
       for (const model of context.models) model.loaded = model.model_path === context.selectedModelPath;
       return true;
     },
-    openDocument: async (project, session, id, revision, blob) => {
-      reads.push([project, session, id, revision, blob]);
-      const found = outputStore.get(id);
-      if (!found || found.summary.revision_id !== revision || found.summary.active_blob_id !== blob) {
+    // Inject the owning native output API, including explicit failed reads.
+    // ownerDocuments models its registration snapshot, not the displayed root.
+    readWorkspacePaneOutput: async (project, session, runId) => {
+      assert.equal(runId, oldRun.run_id);
+      const registered = context.ownerDocuments.find(item => item.document_id === oldRun.output_document_id);
+      const found = registered && outputStore.get(registered.document_id);
+      reads.push([project, session, oldRun.output_document_id, registered?.revision_id, registered?.active_blob_id]);
+      if (!found || found.summary.revision_id !== registered.revision_id || found.summary.active_blob_id !== registered.active_blob_id) {
         throw new Error('Retained output revision/identity changed');
       }
       return structuredClone(found);
     },
     newUlid: () => `component-command-${++seq}`,
-    runTerminal: async request => {
+    runWorkspacePane: async request => {
       // Capture actual IPC input; do NOT pretend to execute either Rust route.
       requests.push({ request: structuredClone(request), writerAtIpc: context.currentModel?.model_id ?? null });
-      return { run_id: request.commandId, status: 'completed', created_at_ms: 2 + seq,
-        expression: request.expression, presentation: request.presentation,
-        output_document_id: null, output_relative_path: null, preview: 'Transport-only response', error: null };
+      return { status: 'accepted', run: { run_id: request.command_id, status: 'completed', created_at_ms: 2 + seq,
+        expression: request.expression, presentation: { pane_id: request.pane_id, input: request.input },
+        output_document_id: null, output_relative_path: null, preview: 'Transport-only response', error: null } };
     },
     onRunsChanged: () => calls.push('runs-changed'),
     refresh: async () => {},
     normalizeFailure: failure => ({ message: failure?.message ?? String(failure) })
   };
+  context.draft = { update: action => { context.$draft = action(context.$draft); } };
+  Object.defineProperty(context, 'entry', { get: () => context.$draft.entry, set: value => { context.$draft.entry = value; } });
   vm.createContext(context);
-  for (const source of ['modelPolicy.ts', 'workspaceTemplate.ts', 'retainedOutput.ts']) {
+  for (const source of ['modelPolicy.ts', 'workspaceTemplate.ts']) {
     vm.runInContext(moduleBody(`products/loom/apps/loom/src/lib/${source}`), context, { filename: source });
   }
-  vm.runInContext('this.outputLoader = new RetainedOutputLoader()', context);
   Object.defineProperty(context, 'currentModel', {
     get: () => context.workspaceWriterModel(context.models, null, [], context.workspaceTemplate, true)
   });
   vm.runInContext(svelteFunction(appSource, 'preparePaneRun'), context);
-  for (const name of ['readOutput', 'referenceName', 'prompt', 'submit']) {
+  for (const name of ['readOutput', 'captureScope', 'settleSubmission', 'prompt', 'submit']) {
     vm.runInContext(svelteFunction(paneSource, name), context);
   }
   const before = appSource.match(/beforeRun=\{\(\) => (preparePaneRun\([^}]*\))\}/u);
@@ -136,7 +143,7 @@ test('source contract: ordinary root is Loom; only native opt-in installs Mom', 
   const terminal = read(`${plugin}src/terminal.rs`);
   assert.match(terminal, /app\.try_state::<crate::WorkspaceChatService<R>>\(\)/u);
   assert.match(terminal, /else \{\s*parse_neural_command\(&entry\)/u);
-  assert.match(terminal, /Some\(loaded_model\(&state\)\?\)/u);
+  assert.match(terminal, /Some\(loaded_model\(state\)\?\)/u);
   assert.match(terminal, /else \{\s*evaluator\.evaluate_command\(&command\)/u);
   assert.doesNotMatch(source, /conversation_store|save_document|save_messages|std::fs::write/u);
 });
@@ -160,10 +167,11 @@ for (const [loomModel, momModel] of [['A', 'B'], ['B', 'A']]) {
       assert.equal(f.requests[0].writerAtIpc, loomModel);
       assert.equal(f.requests[0].request.expression,
         'User: Pre-Mom question\nAssistant: Original pre-Mom answer\n\nUser: Continue\nAssistant:');
-      assert.deepEqual(f.requests[0].request.presentation, { pane_id: 'chat', input: 'Continue' });
-      assert.equal(f.requests[0].request.sourceRevisionId, 'source-revision');
-      assert.equal(f.requests[0].request.expectedVisibleBlobId, 'source-blob');
-      assert.equal(f.requests[0].request.turnBoundary, 'chat');
+      assert.equal(f.requests[0].request.pane_id, 'chat'); assert.equal(f.requests[0].request.input, 'Continue');
+      assert.equal(f.requests[0].request.workspace_session_id, 'workspace-session-1');
+      assert.equal(f.requests[0].request.configuration_revision_id, 'workspace-revision-1');
+      assert.equal(f.requests[0].request.captured_document.revision_id, 'source-revision');
+      assert.equal(f.requests[0].request.captured_document.visible_blob_id, 'source-blob');
       assert.equal(f.calls.filter(call => call.startsWith('load:')).length, loaded ? 0 : 1);
       assert(f.calls.indexOf('checkpoint') < f.calls.indexOf('route'));
       assert.equal(f.context.momProfile, f.mom);
@@ -175,33 +183,33 @@ for (const [loomModel, momModel] of [['A', 'B'], ['B', 'A']]) {
 
 test('output-document edits change the next prompt at the new revision without rewriting the old run', async () => {
   const f = fixture();
-  const original = await f.context.prompt('Continue', f.opened);
-  assert.match(original.expression, /Original pre-Mom answer/u);
+  const original = await f.context.prompt('Continue', () => true);
+  assert.match(original, /Original pre-Mom answer/u);
   const edited = snapshot('old-answer', 'Author-edited answer α', 'answer-revision-2', 'answer-blob-2');
   f.outputStore.set('old-answer', edited);
-  f.context.documents = [f.opened.summary, edited.summary];
+  f.context.ownerDocuments = [f.opened.summary, edited.summary];
   await f.context.submit();
   assert.equal(f.requests.length, 1, f.context.error);
   assert.equal(f.requests[0].request.expression,
     'User: Pre-Mom question\nAssistant: Author-edited answer α\n\nUser: Continue\nAssistant:');
   assert.deepEqual(f.reads, [
-    ['project-1', 'session-1', 'old-answer', 'answer-revision-1', 'answer-blob-1'],
-    ['project-1', 'session-1', 'old-answer', 'answer-revision-2', 'answer-blob-2']
+    ['project-1', 'workspace-session-1', 'old-answer', 'answer-revision-1', 'answer-blob-1'],
+    ['project-1', 'workspace-session-1', 'old-answer', 'answer-revision-2', 'answer-blob-2']
   ]);
   f.assertImmutable();
   assert.equal(f.oldRun.expression, 'Original immutable expression');
 });
 
-test('output cache identity includes both blob and revision, even if one changes alone', async () => {
+test('owning output reads refresh when blob or revision changes alone', async () => {
   const f = fixture();
-  await f.context.prompt('One', f.opened);
+  await f.context.prompt('One', () => true);
   for (const [revision, blob, text] of [
     ['answer-revision-1', 'new-blob', 'Different content'],
     ['new-revision', 'new-blob', 'Different content']
   ]) {
     const next = snapshot('old-answer', text, revision, blob);
-    f.outputStore.set('old-answer', next); f.context.documents = [next.summary];
-    assert.match((await f.context.prompt('Next', f.opened)).expression, /Different content/u);
+    f.outputStore.set('old-answer', next); f.context.ownerDocuments = [next.summary];
+    assert.match((await f.context.prompt('Next', () => true)), /Different content/u);
   }
   assert.equal(f.reads.length, 3);
   f.assertImmutable();
@@ -211,12 +219,12 @@ test('same-path replacement cannot impersonate a retained output document', asyn
   const f = fixture();
   const replacement = snapshot('different-identity', 'Not the retained output');
   replacement.summary.relative_path = f.answer.summary.relative_path;
-  f.context.documents = [f.opened.summary, replacement.summary];
+  f.context.ownerDocuments = [f.opened.summary, replacement.summary];
   f.outputStore.set(replacement.summary.document_id, replacement);
   await f.context.submit();
   assert.equal(f.requests.length, 0);
   assert.equal(f.context.entry, 'Continue');
-  assert.match(f.context.error, /retained document is not available/u);
+  assert.match(f.context.error, /revision\/identity changed/u);
   f.assertImmutable();
 });
 
@@ -228,7 +236,7 @@ test('a stale exact-output read blocks dispatch and retains the draft; refreshed
   assert.equal(f.requests.length, 0);
   assert.equal(f.context.entry, 'Continue');
   assert.match(f.context.error, /revision\/identity changed/u);
-  f.context.documents = [f.opened.summary, edited.summary];
+  f.context.ownerDocuments = [f.opened.summary, edited.summary];
   await f.context.submit();
   assert.equal(f.requests.length, 1, f.context.error);
   assert.match(f.requests[0].request.expression, /New exact answer/u);
@@ -238,19 +246,22 @@ test('a stale exact-output read blocks dispatch and retains the draft; refreshed
 test('failed output hydration can retry the same revision rather than caching rejection', async () => {
   const f = fixture();
   f.outputStore.delete('old-answer');
-  await assert.rejects(f.context.prompt('Continue', f.opened), /revision\/identity changed/u);
+  await assert.rejects(f.context.prompt('Continue', () => true), /revision\/identity changed/u);
   f.outputStore.set('old-answer', f.answer);
-  assert.match((await f.context.prompt('Continue', f.opened)).expression, /Original pre-Mom answer/u);
+  assert.match((await f.context.prompt('Continue', () => true)), /Original pre-Mom answer/u);
   assert.equal(f.reads.length, 2);
 });
 
-test('output cache does not cross project or session identity', async () => {
+test('owning output reads survive displayed-root changes and never cross workspace identity', async () => {
   const f = fixture();
-  await f.context.prompt('Continue', f.opened);
-  f.context.projectId = 'project-2'; f.context.sessionId = 'session-2';
-  await f.context.prompt('Continue', f.opened);
-  assert.equal(f.reads.length, 2);
-  assert.deepEqual(f.reads[1].slice(0, 2), ['project-2', 'session-2']);
+  await f.context.prompt('Continue', () => true);
+  f.context.projectId = 'mounted-root'; f.context.sessionId = 'mounted-session';
+  await f.context.prompt('Continue', () => true);
+  assert.deepEqual(f.reads[1].slice(0, 2), ['project-1', 'workspace-session-1']);
+  f.context.workspaceScope = { projectId: 'project-2', sessionId: 'workspace-session-2' };
+  await f.context.prompt('Continue', () => true);
+  assert.equal(f.reads.length, 3);
+  assert.deepEqual(f.reads[2].slice(0, 2), ['project-2', 'workspace-session-2']);
 });
 
 test('ordinary cold chat cannot dispatch when writer admission fails', async () => {
@@ -290,7 +301,7 @@ test('explicit experimental Mom route preserves its profile and never activates 
   assert.equal(f.requests.length, 1, f.context.error);
   assert.equal(f.requests[0].writerAtIpc, null);
   assert.equal(f.calls.filter(call => call.startsWith('load:')).length, 0);
-  assert.equal(f.requests[0].request.presentation.input, '@expert Continue');
+  assert.equal(f.requests[0].request.input, '@expert Continue');
   assert.equal(f.context.momProfile.persona.model_id, 'B');
   assert.equal(f.context.momProfile, f.mom);
 });
@@ -306,7 +317,7 @@ test('non-chat panes retain the existing writer admission and do not query a cha
 test('history budget failure preserves the unsent input and dispatches nothing', async () => {
   const f = fixture();
   const huge = snapshot('old-answer', 'α'.repeat(40000), 'large-revision', 'large-blob');
-  f.outputStore.set('old-answer', huge); f.context.documents = [huge.summary];
+  f.outputStore.set('old-answer', huge); f.context.ownerDocuments = [huge.summary];
   await f.context.submit();
   assert.equal(f.requests.length, 0);
   assert.equal(f.context.entry, 'Continue');

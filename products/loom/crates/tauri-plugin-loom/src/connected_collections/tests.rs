@@ -314,3 +314,76 @@ fn local_context_freezes_membership_and_retains_evidence_after_disconnect_and_re
     assert_eq!(retained.text, old.hits[0].text);
     assert_eq!(retained.text_sha256, old.hits[0].text_sha256);
 }
+
+#[test]
+fn stale_collection_removal_cannot_revoke_the_current_native_grant() {
+    use crate::{
+        BuildModelPolicy, PluginState, SessionPhase, material_commands, materials, workspace_owner,
+        workspace_template,
+    };
+    use tauri::Manager as _;
+    let (temporary, mut store, definition, unrelated_private) = fixture();
+    workspace_template::upsert_collection(&mut store, None, &definition).unwrap();
+    let observed = materials::observed_entry(&store, &definition.id).unwrap();
+    let app_data = temporary.path().canonicalize().unwrap().join("app-data");
+    fs::create_dir(&app_data).unwrap();
+    let owned_private = app_data.join("connected-collections");
+    save_grant(&store, &owned_private, &definition, PRINCIPAL).unwrap();
+    let state =
+        PluginState::with_app_local_data_root(Some(app_data), true, BuildModelPolicy::default());
+    let (project, owner_token) = {
+        let mut session = state.session.lock().unwrap();
+        session.phase = SessionPhase::Open;
+        workspace_owner::establish(&mut session, &store);
+        let owner = session.workspace.as_ref().unwrap();
+        let identity = (owner.project_id.to_string(), owner.session_id.to_string());
+        session.store = Some(store);
+        session.active_session_id = Some(crate::CommandId::new());
+        identity
+    };
+    let app = tauri::test::mock_app();
+    assert!(app.manage(state));
+    let pinned = tauri::async_runtime::block_on(material_commands::material_set_pinned(
+        project.clone(),
+        owner_token.clone(),
+        definition.id.clone(),
+        true,
+        observed.metadata_revision.clone().unwrap(),
+        app.state(),
+    ))
+    .unwrap();
+    assert!(
+        tauri::async_runtime::block_on(material_commands::material_remove(
+            project.clone(),
+            owner_token.clone(),
+            definition.id.clone(),
+            observed.metadata_revision.unwrap(),
+            app.state(),
+        ))
+        .is_err()
+    );
+    {
+        let state = app.state::<PluginState>();
+        let session = state.session.lock().unwrap();
+        let store = workspace_owner::store(&session).unwrap();
+        assert!(materials::resolve(store, &definition.id).unwrap().pinned);
+        assert!(require_grant(store, &owned_private, &definition).is_ok());
+    }
+    tauri::async_runtime::block_on(material_commands::material_remove(
+        project,
+        owner_token,
+        definition.id.clone(),
+        pinned.metadata_revision.unwrap(),
+        app.state(),
+    ))
+    .unwrap();
+    let state = app.state::<PluginState>();
+    let session = state.session.lock().unwrap();
+    let store = workspace_owner::store(&session).unwrap();
+    assert!(materials::resolve(store, &definition.id).is_err());
+    assert!(matches!(
+        require_grant(store, &owned_private, &definition),
+        Err(CollectionError::NeedsAuthorization)
+    ));
+    assert!(require_grant(store, &unrelated_private, &definition).is_ok());
+}
