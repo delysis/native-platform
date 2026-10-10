@@ -6037,12 +6037,15 @@ fn prepare_exact_model_load(
             false,
         ));
     }
-    let mut profile = state.native_runtime.model_profile_for_current_memory(
-        canonical_path.clone(),
-        expectation.model_file_bytes,
-        expectation.projector_file_bytes.unwrap_or(0),
-        expectation.maximum_context_tokens,
-    );
+    let mut profile = state
+        .native_runtime
+        .model_profile_for_current_memory(
+            canonical_path.clone(),
+            expectation.model_file_bytes,
+            expectation.projector_file_bytes.unwrap_or(0),
+            expectation.maximum_context_tokens,
+        )
+        .map_err(|error| model_memory_plan_failure(&error))?;
     if let (Some(projector_name), Some(projector_sha256), Some(projector_file_bytes)) = (
         expectation.projector_name.as_deref(),
         expectation.projector_sha256.as_deref(),
@@ -6477,10 +6480,12 @@ fn policy_model_file_changed() -> IpcFailure {
     )
 }
 
-fn prepare_model_load(
-    model_path: &str,
-    state: &State<'_, PluginState>,
-) -> Result<ModelLoadPlan, IpcFailure> {
+fn model_memory_plan_failure(error: &llama_native_types::NativeError) -> IpcFailure {
+    let retryable = error.code == llama_native_types::NativeErrorCode::MemoryBudgetExceeded;
+    IpcFailure::new("model_memory_plan_refused", error.to_string(), retryable)
+}
+
+fn prepare_model_load(model_path: &str, state: &PluginState) -> Result<ModelLoadPlan, IpcFailure> {
     let requested = PathBuf::from(model_path);
     let canonical = requested.canonicalize().map_err(|error| {
         IpcFailure::new(
@@ -6522,6 +6527,10 @@ fn prepare_model_load(
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
+    let profile = state
+        .native_runtime
+        .model_profile_for_current_memory(discovered.resolved_path, discovered.file_bytes, 0, None)
+        .map_err(|error| model_memory_plan_failure(&error))?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
@@ -6538,12 +6547,7 @@ fn prepare_model_load(
     Ok(ModelLoadPlan::Inspect {
         selected_path,
         canonical_path: canonical,
-        profile: state.native_runtime.model_profile_for_current_memory(
-            discovered.resolved_path,
-            discovered.file_bytes,
-            0,
-            None,
-        ),
+        profile,
     })
 }
 
@@ -7111,7 +7115,7 @@ fn emit_model_download_snapshot<R: Runtime>(
 }
 
 fn discover_loadable_model(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     canonical: &Path,
 ) -> Result<loom_backend_llama::DiscoveredGguf, IpcFailure> {
     let options = desktop_model_discovery_options(state)?;
@@ -7181,7 +7185,7 @@ fn discover_strict_policy_candidate(
 }
 
 fn desktop_model_discovery_options(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
     let mut options = base_desktop_model_discovery_options(state.isolate_model_discovery);
     if !state.isolate_model_discovery
@@ -7222,7 +7226,7 @@ fn base_desktop_model_discovery_options(isolate: bool) -> ModelDiscoveryOptions 
 }
 
 fn ensure_model_path_in_isolated_library(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     canonical_path: &Path,
 ) -> Result<(), IpcFailure> {
     ensure_model_path_in_isolated_library_from(
@@ -10953,10 +10957,7 @@ fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_,
         })
 }
 
-fn ensure_no_active_generations(
-    state: &State<'_, PluginState>,
-    action: &str,
-) -> Result<(), IpcFailure> {
+fn ensure_no_active_generations(state: &PluginState, action: &str) -> Result<(), IpcFailure> {
     if state
         .generations
         .active_branch_count()
@@ -12460,6 +12461,47 @@ mod tests {
         let error = validate_policy_model_descriptor(&substituted, path, &expectation)
             .expect_err("catalog admission must reject a substituted digest");
         assert_eq!(error.code, "policy_model_native_identity_mismatch");
+    }
+
+    #[test]
+    fn impossible_memory_plan_preserves_previous_model_before_loading_transition() {
+        let fixture = tempfile::tempdir().expect("isolated model library");
+        let library = fixture.path().join("models");
+        std::fs::create_dir(&library).expect("isolated library");
+        let candidate = library.join("unloaded-fixture.gguf");
+        let mut file = std::fs::File::create(&candidate).expect("sparse planning fixture");
+        std::io::Write::write_all(&mut file, b"GGUF").expect("magic-only discovery fixture");
+        file.set_len(128 * 1024 * 1024 * 1024)
+            .expect("sparse declared length");
+        drop(file);
+        let state = PluginState::with_app_local_data_root(
+            Some(fixture.path().to_path_buf()),
+            true,
+            BuildModelPolicy::default(),
+        );
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(
+            test_loaded_model(&library.join("previous.gguf"), "previous-model"),
+        ));
+        let result = prepare_model_load(candidate.to_str().expect("fixture path"), &state);
+        match &result {
+            Ok(ModelLoadPlan::Inspect { profile, .. }) => {
+                println!("admitted_unaffordable_context={}", profile.context_tokens);
+            }
+            Ok(ModelLoadPlan::Ready(_)) => println!("unexpected_ready_result"),
+            Err(error) => println!("admission_error={}", error.code),
+        }
+        println!(
+            "registry_loading={}",
+            matches!(
+                &*state.model.lock().expect("model registry"),
+                ModelRegistry::Loading { .. }
+            )
+        );
+        assert!(
+            matches!(result, Err(ref error) if error.code == "model_memory_plan_refused"),
+            "unaffordable planning must fail before loading admission"
+        );
+        assert_loaded_model_id(&state, "previous-model");
     }
 
     #[test]

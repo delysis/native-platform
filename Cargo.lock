@@ -4969,6 +4969,7 @@ name = "loom-backend-llama"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "desktop-generation-policy",
  "desktop-model-discovery",
  "fs4",
  "hex",
