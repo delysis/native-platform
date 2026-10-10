@@ -63,6 +63,7 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
   transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
     calls.push({ command, args });
     switch (command) {
+      case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'loom';
       case 'plugin:loom|project_current': return project;

@@ -64,6 +64,7 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     calls.push(command);
     switch (command) {
+      case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
       case 'plugin:loom|project_current': return project;
@@ -83,6 +84,7 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
       case 'plugin:loom|co_writer_list': return [];
       case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list': return retainedRun ? [retainedRun] : [];
+      case 'plugin:loom|preferences_update': return { revision: '1', last_local_model: null, project_suggestions: { [args.change.project_id]: args.change.enabled } };
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|workspace_pane_run':
@@ -115,7 +117,7 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
   expect(input.element().getBoundingClientRect().height).toBeLessThanOrEqual(40);
 });
 
-it('waits for shared preferences before workspace restore and refuses saved suggestions without native model policy', async () => {
+it.each(['saved', 'failed'] as const)('waits for shared preferences (%s) before workspace restore and refuses suggestions without native model policy', async (outcome) => {
   restoreStorage = Object.entries(localStorage); localStorage.clear();
   restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
   Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
@@ -128,7 +130,8 @@ it('waits for shared preferences before workspace restore and refuses saved sugg
     root: '/injected/writing', schema_version: 1, pending_recovery: 0, documents: [opened.summary] };
   const calls: string[] = [];
   let resolvePreferences!: (value: unknown) => void;
-  const preferences = new Promise(resolve => { resolvePreferences = resolve; });
+  let rejectPreferences!: (reason: unknown) => void;
+  const preferences = new Promise((resolve, reject) => { resolvePreferences = resolve; rejectPreferences = reject; });
   localStorage.setItem('loom:last-local-model', '/legacy/unverified.gguf');
   localStorage.setItem('loom:suggestions:project-1', 'on');
   let submitted: Record<string, any> | null = null;
@@ -156,6 +159,7 @@ it('waits for shared preferences before workspace restore and refuses saved sugg
       case 'plugin:loom|co_writer_list': return [];
       case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list': return retainedRun ? [retainedRun] : [];
+      case 'plugin:loom|preferences_update': return { revision: '1', last_local_model: null, project_suggestions: { [args.change.project_id]: args.change.enabled } };
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|workspace_pane_run':
@@ -174,7 +178,8 @@ it('waits for shared preferences before workspace restore and refuses saved sugg
   // startup can reach project_current before the assertion.
   await new Promise(resolve => window.setTimeout(resolve, 150));
   expect(calls).not.toContain('plugin:loom|project_current');
-  resolvePreferences({ revision: '9007199254740993', last_local_model: null, project_suggestions: { 'project-1': true } });
+  if (outcome === 'failed') rejectPreferences({ code: 'preferences_failed', message: 'Retained incompatible preference file', retryable: false });
+  else resolvePreferences({ revision: '9007199254740993', last_local_model: null, project_suggestions: { 'project-1': true } });
   await expect.element(page.getByRole('textbox', { name: 'Message', exact: true })).toBeVisible();
   await expect.poll(() => calls.includes('plugin:loom|build_model_policy_get')).toBe(true);
   expect(calls.filter(command => command === 'plugin:loom|weave_start' || command.includes('model_load'))).toEqual([]);
@@ -228,6 +233,7 @@ it.each([
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     calls.push({ command, args });
     switch (command) {
+      case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'loom';
       case 'plugin:loom|project_current': return project;
@@ -256,6 +262,7 @@ it.each([
       case 'plugin:loom|co_writer_list': return [];
       case 'plugin:loom|workspace_pane_list':
       case 'plugin:loom|terminal_list': return retainedRun ? [legacy, retainedRun] : [legacy];
+      case 'plugin:loom|preferences_update': return { revision: '1', last_local_model: null, project_suggestions: { [args.change.project_id]: args.change.enabled } };
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|workspace_pane_run':
@@ -370,6 +377,7 @@ it.each([
   }
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     switch (command) {
+      case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
@@ -392,6 +400,10 @@ it.each([
       case 'plugin:loom|terminal_list':
       case 'plugin:loom|material_list':
       case 'plugin:loom|co_writer_list': return [];
+      // Keep storage pending to prove toggles follow native policy acknowledgement.
+      case 'plugin:loom|preferences_update':
+        if (reenable) return new Promise(() => {});
+        return { revision: '1', last_local_model: null, project_suggestions: { [args.change.project_id]: args.change.enabled } };
       case 'plugin:loom|suggestions_set':
         if (deferSuggestionPolicy) {
           deferSuggestionPolicy = false;

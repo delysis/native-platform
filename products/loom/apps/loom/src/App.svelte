@@ -6205,11 +6205,11 @@
       suggestionsEnabled = enabled;
       if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
-        try {
-          acceptPreferences(await updatePreferences({ kind: 'suggestions', project_id: boundProject.project_id, enabled }));
-        } catch {
-          // The backend gate remains authoritative if browser persistence is unavailable.
-        }
+        // Persistence is a convenience, not acknowledgement of native policy.
+        // Keep a completed toggle available while its blocking storage write drains.
+        void updatePreferences({ kind: 'suggestions', project_id: boundProject.project_id, enabled })
+          .then(acceptPreferences)
+          .catch((error) => { recordFailure(error); });
       }
       // Scheduling/model preparation read legacy reactive policy and writer
       // projections. Let the acknowledged policy reach those projections first;
