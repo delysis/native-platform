@@ -24,6 +24,23 @@ Use three repository roles:
 
 The monorepo has one Cargo lockfile after path cutover, but products retain independent domains, stores, UI bundles, runtime owners, release tags, roadmaps, and feature sets. A monorepo is not permission to collapse trust boundaries into one crate.
 
+## Canonical EASL dependency — 2026-10-10
+
+The reusable EASL language/text implementation now has a canonical repository,
+`delysis/easl`. The experimental Loom adapter consumes that implementation at
+exact revision `6d7c913a5b8d6874ab56f5168d222dc95964afb9`, including its Parley and
+Harfrust repairs. Keeping another editable service copy in native-platform would
+create two implementation authorities. Loom-specific configuration, document,
+storage, session, view and integration checks remain in this monorepo.
+
+This is a narrow additional repository boundary. Ordinary policy permits only
+that sealed EASL revision and the already sealed native binding revision; it
+rejects other Git repositories, revision drift, branches and tags. Updating a
+pin requires source review and current consumer validation. The canonical
+library's local checks and the adapter's component checks do not establish
+packaged native behavior, full frontend parity, hosted CI or release acceptance.
+The original phase-one consolidation evidence below remains historical.
+
 ## Alternatives
 
 ### Continue with the current repositories
