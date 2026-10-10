@@ -4726,7 +4726,10 @@ mod tests {
                 .generated_token_ids
         );
 
-        let replay = saved.reconstruction().sequence(saved.token_ids.clone())?;
+        let replay = saved
+            .reconstruction()
+            .sequence(saved.token_ids.clone())
+            .expect("the saved controlled prefix has a checked token reconstruction");
         assert_eq!(
             handle.restore_sequence(replay, 0)?,
             llama_native_types::SequenceRestoreKind::TokenReplay
