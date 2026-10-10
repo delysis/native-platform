@@ -1053,7 +1053,7 @@ fn retain_evidence(
     let path = storage(store)?
         .join("evidence")
         .join(format!("{}.json", evidence.id));
-    install_evidence(&path, &bytes)?;
+    install_evidence(store, &path, &bytes)?;
     Ok(evidence)
 }
 pub(crate) fn read_evidence(
@@ -1079,10 +1079,17 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
     if !valid_hash(id) {
         return Err(invalid("invalid evidence identity"));
     }
-    let bytes = read_safe(
+    let bytes = crate::private_sidecar::read(
+        store.root(),
         &storage(store)?.join("evidence").join(format!("{id}.json")),
         MAX_EVIDENCE_BYTES,
-    )?;
+    )?
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "retained material evidence is missing",
+        )
+    })?;
     if digest(&bytes) != id {
         return Err(invalid("retained evidence identity mismatch"));
     }
@@ -1134,15 +1141,11 @@ fn read_safe(path: &Path, max: u64) -> Result<Vec<u8>> {
 }
 fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
     let path = storage(store)?.join("bindings.json");
-    let bytes = match read_safe(&path, MAX_STATE_BYTES) {
-        Ok(bytes) => bytes,
-        Err(MaterialError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Bindings {
-                schema: SCHEMA.into(),
-                items: Vec::new(),
-            });
-        }
-        Err(e) => return Err(e),
+    let Some(bytes) = crate::private_sidecar::read(store.root(), &path, MAX_STATE_BYTES)? else {
+        return Ok(Bindings {
+            schema: SCHEMA.into(),
+            items: Vec::new(),
+        });
     };
     decode_bindings(&bytes)
 }
@@ -1193,7 +1196,9 @@ fn write_bindings(store: &ProjectStore, bindings: &Bindings) -> Result<()> {
         options
     };
     let mut file = options.open(&path)?;
-    file.write_all(&bytes)?;
+    let codec = crate::private_sidecar::PayloadCodec::open(store.root())?;
+    let namespace = crate::private_sidecar::namespace(store.root(), &path)?;
+    file.write_all(&codec.seal(&namespace, &bytes)?)?;
     file.commit()?;
     Ok(())
 }
@@ -1226,9 +1231,11 @@ fn file_version(path: &Path) -> Result<String> {
     ))
 }
 
-fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
+fn install_evidence(store: &ProjectStore, path: &Path, bytes: &[u8]) -> Result<()> {
     if path.try_exists()? {
-        if read_safe(path, MAX_EVIDENCE_BYTES)? != bytes {
+        if crate::private_sidecar::read(store.root(), path, MAX_EVIDENCE_BYTES)?.as_deref()
+            != Some(bytes)
+        {
             return Err(invalid("retained evidence identity mismatch"));
         }
         return Ok(());
@@ -1246,12 +1253,16 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
         }
         let mut file = options.open(&temp)?;
         created = true;
-        file.write_all(bytes)?;
+        let codec = crate::private_sidecar::PayloadCodec::open(store.root())?;
+        let namespace = crate::private_sidecar::namespace(store.root(), path)?;
+        file.write_all(&codec.seal(&namespace, bytes)?)?;
         file.sync_all()?;
         match fs::hard_link(&temp, path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_safe(path, MAX_EVIDENCE_BYTES)? != bytes {
+                if crate::private_sidecar::read(store.root(), path, MAX_EVIDENCE_BYTES)?.as_deref()
+                    != Some(bytes)
+                {
                     return Err(invalid("retained evidence identity mismatch"));
                 }
             }
@@ -1310,6 +1321,70 @@ mod tests {
         fs::write(&path, text).unwrap();
         let source = context_attachments::import_path(store.root(), &path).unwrap();
         bind_attachment(store, &source.id, Some(name)).unwrap()
+    }
+
+    #[test]
+    fn encrypted_project_material_sidecars_do_not_publish_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Writing");
+        fs::create_dir_all(root.join(".loom")).unwrap();
+        let vault = desktop_vault::ProjectVault::initialize_with_key(&root, [23; 32]).unwrap();
+        let (store, _) = ProjectStore::initialize_with_vault(&root, "Writing", vault).unwrap();
+        let sentinel = "synthetic material secret e571";
+        let material = source(&store, sentinel, sentinel);
+        let evidence = retain_evidence(
+            &store,
+            MaterialEvidence {
+                complete: true,
+                warnings: Vec::new(),
+                id: String::new(),
+                reference: String::new(),
+                material_id: material.id.clone(),
+                retention: MaterialRetention::Ordinary,
+                title: sentinel.into(),
+                text: sentinel.into(),
+                source_revision: "revision".into(),
+                text_sha256: digest(sentinel.as_bytes()),
+                locator: json!({"kind":"test"}),
+                source_evidence: None,
+            },
+        )
+        .unwrap();
+        let paths = [
+            root.join(".loom/materials/bindings.json"),
+            root.join(".loom/materials/evidence")
+                .join(format!("{}.json", evidence.id)),
+        ];
+        let exposed: Vec<_> = paths
+            .iter()
+            .filter(|path| {
+                fs::read(path)
+                    .unwrap()
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes())
+            })
+            .collect();
+        assert!(
+            exposed.is_empty(),
+            "encrypted material sidecars exposed plaintext: {exposed:?}"
+        );
+        assert_eq!(
+            read_evidence(&store, &material.id, &evidence.id)
+                .unwrap()
+                .text,
+            sentinel
+        );
+        let selected = list(&store).unwrap().remove(0);
+        let renamed = change_metadata(
+            &store,
+            &material.id,
+            selected.metadata_revision.as_deref().unwrap(),
+            MetadataChange::Rename("private renamed title"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(renamed.name, "private renamed title");
+        assert_eq!(list(&store).unwrap()[0].name, "private renamed title");
     }
 
     #[test]

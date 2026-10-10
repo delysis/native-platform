@@ -84,9 +84,13 @@ mod native {
         Ok(identity(left)? == identity(right)?)
     }
 
+    fn stored_limit() -> u64 {
+        desktop_vault::encrypted_max_len(MAX_STATE_BYTES)
+    }
+
     fn stamp(file: &File) -> Result<String> {
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES || metadata.nlink() != 1 {
+        if !metadata.is_file() || metadata.len() > stored_limit() || metadata.nlink() != 1 {
             return Err(invalid(
                 "unsafe, hard-linked or oversized material bindings",
             ));
@@ -107,9 +111,9 @@ mod native {
         let before = stamp(file)?;
         let mut bytes = Vec::new();
         (&mut *file)
-            .take(MAX_STATE_BYTES + 1)
+            .take(stored_limit().saturating_add(1))
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_STATE_BYTES || stamp(file)? != before {
+        if bytes.len() as u64 > stored_limit() || stamp(file)? != before {
             return Err(invalid("material metadata changed during read"));
         }
         Ok((bytes, before))
@@ -135,6 +139,9 @@ mod native {
                 identity(&directory)?
             );
             let revision = digest(&[witness.as_bytes(), b"\0", &bytes].concat());
+            let codec = crate::private_sidecar::PayloadCodec::open(path)?;
+            let namespace = ".loom/materials/bindings.json";
+            let bytes = codec.open_bytes(namespace, &bytes, MAX_STATE_BYTES)?;
             let value = Self {
                 bytes,
                 revision,
@@ -186,6 +193,8 @@ mod native {
                 return Err(invalid("workspace material metadata limit reached"));
             }
             self.ensure_current(root)?;
+            let codec = crate::private_sidecar::PayloadCodec::open(root)?;
+            let stored = codec.seal(".loom/materials/bindings.json", bytes)?;
             let temporary = format!(".bindings-{}.pending", loom_types::CommandId::new());
             let descriptor = openat(
                 &self.directory,
@@ -196,13 +205,13 @@ mod native {
             .map_err(std::io::Error::from)?;
             let mut file = File::from(descriptor);
             let result = (|| {
-                file.write_all(bytes)?;
+                file.write_all(&stored)?;
                 file.sync_all()?;
                 before_commit()?;
                 self.ensure_current(root)?;
                 let mut prepared = child(&self.directory, temporary.as_str(), READ_FILE)?;
                 let (prepared_bytes, _) = read_stable(&mut prepared)?;
-                if !same_file(&file, &prepared)? || prepared_bytes != bytes {
+                if !same_file(&file, &prepared)? || prepared_bytes != stored {
                     return Err(invalid("prepared material metadata was replaced"));
                 }
                 // One atomic replacement in the held private directory. The
