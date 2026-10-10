@@ -84,6 +84,19 @@ fn real_independent_requests_share_decode_and_cancel_separately() -> Result<()> 
             64,
         ))?
         .wait_verified()?;
+    let solo = first_handle
+        .generate_cooperative(request(
+            &fingerprint.model_id,
+            "solo-b",
+            prompts[1].token_ids.clone(),
+            64,
+        ))?
+        .wait_verified()?;
+    assert_eq!(
+        solo.outputs()[0].generated_token_ids,
+        isolated.outputs()[0].generated_token_ids,
+        "a solo cooperative request must first match isolated execution"
+    );
     let observer = first_handle.observe_cooperative_batches()?;
     let first = first_handle.generate_cooperative(first_request.clone())?;
     let deadline = Instant::now() + Duration::from_secs(120);
