@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +22,8 @@ use thiserror::Error;
 
 const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CONTEXT_ATTACHMENTS: usize = 32;
+const MAX_ATTACHMENT_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DOCUMENT_CONTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CANONICAL_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MANUAL_CONTEXT_BYTES: usize = 256 * 1024;
 const MAX_NATIVE_MEDIA_OBJECTS: usize = 32;
@@ -710,6 +712,10 @@ pub(crate) fn prepare_provided(
     let destination = attachment_root(project_root)?
         .join("manifests")
         .join(format!("{}.json", manifest.attachment.id));
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    if manifest_bytes.len() as u64 > MAX_ATTACHMENT_MANIFEST_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
     let staged = StagedManifest {
         temporary: temporary_sibling(&destination),
         destination,
@@ -718,7 +724,9 @@ pub(crate) fn prepare_provided(
         .write(true)
         .create_new(true)
         .open(&staged.temporary)?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
+    let namespace = crate::private_sidecar::namespace(project_root, &staged.destination)?;
+    file.write_all(&codec.seal(&namespace, &manifest_bytes)?)?;
     file.sync_all()?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
@@ -2044,7 +2052,7 @@ fn install_object(
     }
     let root = attachment_root(project_root)?;
     let path = root.join("objects").join(sha256);
-    install_immutable(&path, bytes)
+    install_immutable(project_root, &path, bytes)
 }
 
 fn read_object(
@@ -2056,20 +2064,11 @@ fn read_object(
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let path = attachment_root(project_root)?.join("objects").join(sha256);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
-    {
-        return Err(ContextAttachmentError::ContextInvalid);
-    }
-    let file = File::open(&path)?;
-    let identity = FileIdentityHandle::from_file(file.try_clone()?)?;
-    let mut bytes = Vec::new();
-    file.take(expected_bytes + 1).read_to_end(&mut bytes)?;
-    if FileIdentityHandle::from_path(&path)? != identity
-        || fs::symlink_metadata(&path)?.file_type().is_symlink()
-        || bytes.len() as u64 != expected_bytes
-        || format!("{:x}", Sha256::digest(&bytes)) != sha256
-    {
+    let bytes =
+        crate::private_sidecar::read(project_root, &path, expected_bytes)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "attachment object is missing")
+        })?;
+    if bytes.len() as u64 != expected_bytes || format!("{:x}", Sha256::digest(&bytes)) != sha256 {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(bytes)
@@ -2095,7 +2094,7 @@ pub(crate) fn record_import_origin(
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+    install_immutable(project_root, &path, &bytes)
 }
 
 #[cfg(test)]
@@ -2130,10 +2129,10 @@ fn read_manifest_if_present(
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("{id}.json"));
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        crate::private_sidecar::read(project_root, &path, MAX_ATTACHMENT_MANIFEST_BYTES)?
+    else {
+        return Ok(None);
     };
     let manifest: AttachmentManifest = serde_json::from_slice(&bytes)?;
     let expected_media_kinds = manifest
@@ -2239,15 +2238,13 @@ fn read_canonical_text(
 
 fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachmentError> {
     let path = attachment_root(project_root)?.join("document-context.json");
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DocumentContexts {
-                schema: CONTEXT_SCHEMA.to_owned(),
-                documents: BTreeMap::new(),
-            });
-        }
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        crate::private_sidecar::read(project_root, &path, MAX_DOCUMENT_CONTEXT_BYTES)?
+    else {
+        return Ok(DocumentContexts {
+            schema: CONTEXT_SCHEMA.to_owned(),
+            documents: BTreeMap::new(),
+        });
     };
     let contexts: DocumentContexts = serde_json::from_slice(&bytes)?;
     if contexts.schema != CONTEXT_SCHEMA
@@ -2288,11 +2285,19 @@ fn write_contexts(
     contexts: &DocumentContexts,
 ) -> Result<(), ContextAttachmentError> {
     let path = attachment_root(project_root)?.join("document-context.json");
-    replace_atomically(&path, &serde_json::to_vec_pretty(contexts)?)
+    let bytes = serde_json::to_vec_pretty(contexts)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_CONTEXT_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    replace_atomically(project_root, &path, &bytes)
 }
 
-fn install_immutable(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentError> {
-    if let Ok(existing) = fs::read(path) {
+fn install_immutable(
+    project_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ContextAttachmentError> {
+    if let Some(existing) = crate::private_sidecar::read(project_root, path, bytes.len() as u64)? {
         return if existing == bytes {
             Ok(())
         } else {
@@ -2304,12 +2309,16 @@ fn install_immutable(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentE
         .write(true)
         .create_new(true)
         .open(&temp)?;
-    file.write_all(bytes)?;
+    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
+    let namespace = crate::private_sidecar::namespace(project_root, path)?;
+    file.write_all(&codec.seal(&namespace, bytes)?)?;
     file.sync_all()?;
     match fs::hard_link(&temp, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::read(path)? != bytes {
+            if crate::private_sidecar::read(project_root, path, bytes.len() as u64)?.as_deref()
+                != Some(bytes)
+            {
                 let _ = fs::remove_file(&temp);
                 return Err(ContextAttachmentError::ContextInvalid);
             }
@@ -2323,12 +2332,18 @@ fn install_immutable(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentE
     Ok(())
 }
 
-fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentError> {
+fn replace_atomically(
+    project_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ContextAttachmentError> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let mut file = AtomicWriteFile::options().open(path)?;
-    file.write_all(bytes)?;
+    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
+    let namespace = crate::private_sidecar::namespace(project_root, path)?;
+    file.write_all(&codec.seal(&namespace, bytes)?)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -2872,6 +2887,71 @@ mod tests {
             "A [📎 first](loom-attachment:{first}) B [same](loom-attachment:{first}) C [second](loom-attachment:{second})"
         );
         assert_eq!(inline_attachment_ids(&text), vec![first, second]);
+    }
+
+    #[test]
+    fn encrypted_project_attachment_does_not_publish_plaintext() {
+        let project = tempfile::tempdir().expect("isolated project");
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [17; 32])
+            .expect("synthetic wrapping key");
+        let source = project.path().join("fixture.txt");
+        let sentinel = b"synthetic private attachment sentinel 7c3e";
+        fs::write(&source, sentinel).unwrap();
+        let attachment = import_path(project.path(), &source).expect("actual attachment import");
+        let retained = attachment_root(project.path())
+            .unwrap()
+            .join("objects")
+            .join(&attachment.id);
+        let stored = fs::read(&retained).unwrap();
+        assert!(
+            !stored
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel),
+            "encrypted project retained a plaintext attachment object"
+        );
+        assert_eq!(
+            read_object(project.path(), &attachment.id, sentinel.len() as u64).unwrap(),
+            sentinel
+        );
+        assert_eq!(
+            import_path(project.path(), &source).unwrap().id,
+            attachment.id
+        );
+        let manifest = read_manifest(project.path(), &attachment.id).unwrap();
+        assert_eq!(
+            read_canonical_text(project.path(), &manifest)
+                .unwrap()
+                .as_bytes(),
+            sentinel
+        );
+        set_document_context_snapshot(project.path(), "doc", "synthetic private instruction", &[])
+            .unwrap();
+        assert_eq!(
+            document_context_text(project.path(), "doc").unwrap(),
+            "synthetic private instruction"
+        );
+        let context_path = attachment_root(project.path())
+            .unwrap()
+            .join("document-context.json");
+        let context_bytes = fs::read(&context_path).unwrap();
+        assert!(
+            !context_bytes
+                .windows(29)
+                .any(|bytes| bytes == b"synthetic private instruction")
+        );
+        let mut tampered = stored.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&retained, &tampered).unwrap();
+        assert!(read_object(project.path(), &attachment.id, sentinel.len() as u64).is_err());
+        assert_eq!(fs::read(&retained).unwrap(), tampered);
+        fs::write(&retained, sentinel).unwrap();
+        assert!(read_object(project.path(), &attachment.id, sentinel.len() as u64).is_err());
+        fs::write(&retained, &stored).unwrap();
+        assert_eq!(
+            read_object(project.path(), &attachment.id, sentinel.len() as u64).unwrap(),
+            sentinel
+        );
     }
 
     #[test]
