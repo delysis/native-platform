@@ -6,4 +6,4 @@ The application supplies a settings directory. Each update reloads the current f
 
 Storage is bounded to 128 KiB, 1,024 project choices and a 4,096-byte absolute model path. Compare-and-clear preserves newer model choices. Temporary acceptance models cannot become startup preferences. Rust revisions are `u64`; JavaScript DTOs carry decimal strings.
 
-This reconciliation is not yet connected to product adapters or qualified.
+The current Loom Tauri adapter and renderer consume this service. Native application admission covers accepted storage work. Product/native qualification remains separate from component checks. The current EASL presentation draft has no model/suggestion service consumer; no unused worker is added there.
