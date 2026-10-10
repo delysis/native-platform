@@ -1,22 +1,13 @@
 # Current integration reference
 
-This candidate is based on native-platform main `a7248566b5012e32810584725af9e4574699c478` with the reviewed collections integration `0c4677b343af0d144df6cb4f36260e42a9932385`. The reusable EASL implementation is consumed from its canonical repository at `6d7c913a5b8d6874ab56f5168d222dc95964afb9`, including the same Parley and Harfrust revisions. There is no separately editable service copy here.
+This candidate combines native-platform main `a7248566b5012e32810584725af9e4574699c478` with collections `0c4677b343af0d144df6cb4f36260e42a9932385`. EASL is consumed from its canonical repository at `6d7c913a5b8d6874ab56f5168d222dc95964afb9`, with the same Parley and Harfrust revisions. There is no separately editable service copy here.
 
-The native build retains its exact source-hash refusal. Its current App reference is `bce10d659d5758e21baa1f06380823eb6b39ee33f0c6ab66b2a13e061b4c1d4a` and its CSS reference is `a153e13ad1ee00c84d2e02b31fa318d4af556e7f1fe3b3c581ee36bf58dbb81f`. The production asset extractor compared all nine semantic SVG assets against the earlier reference and found them byte-identical: outline, add, record, Ghost, Loompad, three pane positions, and selector. This binds assets and source provenance; it does not establish frontend parity or packaged acceptance.
+The native experiment retains its exact source-hash refusal: App `79d5fe0fd5095fa75d266be8feb4791ed416228b8969353c4909fd15f3069f8d`, CSS `a153e13ad1ee00c84d2e02b31fa318d4af556e7f1fe3b3c581ee36bf58dbb81f`. All nine extracted semantic SVG assets match the earlier reviewed reference byte for byte. These hashes bind source and assets; they establish neither frontend parity nor packaged acceptance.
 
-The combined collections reference was reviewed against this native port. Its workspace-root ownership, connected collection progress, scoped material/PDF navigation, native preferences ordering, and read-only archive context services are not implemented by the experiment. The browser pane visibility and context menus also remain separate implementations. All nine extracted semantic SVG assets remain byte-identical; the changed CSS adds collection/material and pane layout behavior rather than native adapter parity. Updating these hashes records the reviewed boundary only.
+The experiment supplies source/semantic editing, formatting, pane routing and authored-byte behavior. It does not implement current Tauri workspace ownership, collections, material/PDF operations, archive context, model controls, inference, recording, cancellation or promotion. Its Ghost/Loompad icons confer no such authority. The retained Mine consumer is experimental.
 
-The current browser application additionally has richer sidebar selection, renaming and material operations, model download controls, and newer completion/admission behavior. Those services are not supplied by this experimental native adapter. Its recording and assistance controls remain unavailable; Ghost/Loompad icons do not imply inference, cancellation, or promotion authority. The native editor's source/semantic editing, formatting, pane routing and authored-byte behavior are the component scope. The retained Mine configuration consumer is experimental and does not replace the current Tauri workspace or model authorities.
+The unchanged EASL service/adapter checkpoint passed 297 service and 120 adapter tests; its two registered rendering/performance tests remain unrun. Current combined qualification is recorded in external exact-tree receipts. No hosted CI, physical IME/VoiceOver, ordinary Loom replacement, frontend parity or distribution acceptance is claimed.
 
-The source checkpoint passed 297 service tests and 120 native adapter component tests. Two manual rendering/performance tests remain unrun and registered with their explicit promotion prohibitions. Strict lint passed for the affected owned packages. Consolidated current-tree validation and native application interaction remain outstanding. No hosted CI, physical IME/VoiceOver, ordinary Loom replacement, frontend parity or distribution acceptance is claimed.
+Native scope diagnostics excluded a caret/revision/blob/intent/edit mismatch. Visual Loompad now requests prose-safe native admission and checks the saved batch policy before presentation. Temporary diagnostics are removed; their exact builds and failed outputs remain preserved. Packaged-native qualification remains open until the repaired exact artifact passes.
 
-Earlier audit and handoff files are historical evidence and proposals. Their obsolete paths, baseline counts and requested follow-ups do not authorize product changes or establish current qualification. Failed source-reference, compilation and encrypted-storage receipts remain preserved externally.
-
-The candidate adds read-only Loompad scope comparisons to the existing hidden completion witness to diagnose a packaged-native qualification refusal after fresh Visual edits. These comparisons confer no generation or insertion authority. Native acceptance remains open.
-
-Native scope diagnostics excluded a caret/revision/blob/intent/edit mismatch.
-Visual Loompad now requests prose-safe admission and verifies the saved batch
-policy before presentation. Temporary scope diagnostics are removed from the
-final UI; their exact diagnostic builds and failed receipts remain preserved.
-The reference App hash is refreshed for the reviewed policy selection/check.
-Native qualification remains open until the repaired exact artifact passes.
+Earlier audit and handoff files are historical evidence and proposals, not user instructions or current qualification. Failed reference, compilation, encrypted-storage and native receipts remain preserved externally.

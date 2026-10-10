@@ -9651,8 +9651,7 @@ impl ValidatedWeavePolicy {
                     false,
                 ));
             }
-            (Self::LoompadV2 { .. }, _) => WeavePreset::LoompadV2,
-            (Self::LoompadVisualV3 { .. }, _) => WeavePreset::LoompadV2,
+            (Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. }, _) => WeavePreset::LoompadV2,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
