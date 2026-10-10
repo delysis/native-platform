@@ -28,6 +28,7 @@ struct Authority {
     cursor: u64,
     epoch: u64,
     model_basis: BlobId,
+    draft: Option<loom_store::TransientDraftClaim>,
 }
 
 impl Prepared {
@@ -87,10 +88,57 @@ impl Authority {
             || cursor != authority.cursor
             || epoch != authority.epoch
             || source_basis != format!("{}:{}", authority.blob, authority.cursor)
+            || draft_claim(
+                session.store.as_ref().ok_or_else(stale)?,
+                &loaded.relative_path,
+            )? != authority.draft
         {
             return Err(stale());
         }
         Ok(())
+    }
+}
+
+fn draft_claim(
+    store: &ProjectStore,
+    path: &str,
+) -> Result<Option<loom_store::TransientDraftClaim>, IpcFailure> {
+    store
+        .load_transient_draft(path)
+        .map(|draft| {
+            draft.map(|draft| loom_store::TransientDraftClaim {
+                version: draft.version,
+                source_revision_id: draft.source_revision_id,
+                blob_id: draft.blob_id,
+            })
+        })
+        .map_err(IpcFailure::store)
+}
+
+fn document_scope(
+    owner: &workspace_owner::Owner,
+    project: &str,
+    active_session: &str,
+    document: &str,
+) -> ContextScope {
+    ContextScope {
+        project: format!("{}:{project}", owner.project_id),
+        session: format!("{}:{active_session}", owner.session_id),
+        document: document.into(),
+    }
+}
+
+pub(super) fn cancel_document(
+    state: &PluginState,
+    session: &Session,
+    project: &str,
+    active_session: &str,
+    document: &str,
+) {
+    if let Some(owner) = &session.workspace {
+        state
+            .archive_friends
+            .cancel(&document_scope(owner, project, active_session, document));
     }
 }
 
@@ -197,14 +245,11 @@ pub(super) async fn prepare(
                 false,
             ));
         }
+        let draft = draft_claim(store, relative_path)?;
         let owner = session.workspace.as_ref().ok_or_else(stale)?;
-        let dotfile = owner.root.join(DOTFILE);
+        let dotfile = workspace_owner::store(&session)?.root().join(DOTFILE);
         let prefix = loaded.text[..cursor].to_owned();
-        let scope = ContextScope {
-            project: format!("{}:{project_id}", owner.project_id),
-            session: format!("{}:{session_id}", owner.session_id),
-            document: document_id.into(),
-        };
+        let scope = document_scope(owner, project_id, session_id, document_id);
         let authority = Authority {
             project: project_id.into(),
             session: session_id.into(),
@@ -217,6 +262,7 @@ pub(super) async fn prepare(
             cursor: cursor_byte,
             epoch: state.archive_friends.epoch(),
             model_basis: environment_basis(&engine.environment()?)?,
+            draft,
         };
         (authority, dotfile, prefix, scope)
     };
@@ -229,6 +275,13 @@ pub(super) async fn prepare(
     .await
     .map_err(failure)?
     .map_err(failure)?;
+    if context.is_some()
+        && authority.draft.as_ref().is_some_and(|draft| {
+            draft.blob_id != authority.blob || draft.source_revision_id != authority.revision
+        })
+    {
+        return Err(stale());
+    }
     Ok(Admission::Prepared(
         context.map(|context| Prepared { context, authority }),
     ))
@@ -425,6 +478,7 @@ mod tests {
             cursor: 3,
             epoch: 7,
             model_basis: BlobId::digest(b"controlled model environment"),
+            draft: None,
         };
         assert_eq!(
             help_workspace(&session).expect("owned Help workspace").2,
@@ -447,6 +501,28 @@ mod tests {
                 .validate(&session, 7, &loaded, 3, "other source")
                 .is_err()
         );
+        session
+            .store
+            .as_mut()
+            .expect("owned source store")
+            .upsert_transient_draft(
+                "Draft.md",
+                loaded.revision_id,
+                0,
+                DocumentContent::Prose("☀ Newly typed draft".into()),
+            )
+            .expect("unsaved edit fixture");
+        assert!(
+            authority.validate(&session, 7, &loaded, 3, &basis).is_err(),
+            "unsaved typing must invalidate prepared archive context"
+        );
+        session
+            .store
+            .as_mut()
+            .expect("owned source store")
+            .clear_transient_draft("Draft.md", 1)
+            .expect("clear edit fixture");
+        assert!(authority.validate(&session, 7, &loaded, 3, &basis).is_ok());
         session.active_session_id = Some(CommandId::new());
         assert!(authority.validate(&session, 7, &loaded, 3, &basis).is_err());
         session.active_session_id = Some(session_id);

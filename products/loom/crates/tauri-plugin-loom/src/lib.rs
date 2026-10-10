@@ -5454,6 +5454,9 @@ async fn document_draft_upsert(
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     ensure_registered_document(store, &relative_path, &document_id)?;
+    archive_friends::cancel_document(&state, &session, &project_id, &session_id, &document_id);
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+
     match store.upsert_transient_draft(
         &relative_path,
         source_revision_id,

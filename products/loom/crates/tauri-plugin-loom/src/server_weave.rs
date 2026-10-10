@@ -642,6 +642,23 @@ mod tests {
         assert_eq!(start().unwrap_err().code, "generation_blocked");
         assert!(calls.lock().unwrap().is_empty());
         state.session.lock().unwrap().agency.set_focus_mode(false);
+        // Without archive opt-in, preparation must preserve the original
+        // saved-source command semantics rather than impose draft admission.
+        state
+            .session
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .unwrap()
+            .upsert_transient_draft(
+                INITIAL_DOCUMENT,
+                source.revision_id,
+                0,
+                DocumentContent::Prose("Newer unsaved text".into()),
+            )
+            .unwrap();
+
         let started = start().unwrap();
         assert_eq!(
             started.speculation.is_some(),

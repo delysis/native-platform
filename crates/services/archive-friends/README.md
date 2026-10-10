@@ -46,3 +46,9 @@ bounded provider lease. It captures and revalidates the leased workspace owner,
 shares cancellation/draining with preparation, and never opens the archive or
 runs a model. Closed or replaced sessions cannot publish its result. The old
 standalone suggestion IPC proposal had no frontend caller; it is not imported.
+
+Transient draft writes cancel active preparation in that document's scope.
+Final admission also compares the captured draft version and content claim,
+so an unsaved edit cannot enter an already-prepared request. These archive
+checks apply to opted-in context; projects without it retain their saved-source
+command semantics.
