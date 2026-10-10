@@ -834,36 +834,62 @@ fn settle(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
 fn step(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
     let capacity = runtime.context.n_batch() as usize;
     let mut batch = LlamaBatch::new(capacity, 1);
-    let mut row_count = 0usize;
-    let mut logits = Vec::<(usize, i32)>::new();
-    let mut members = BTreeMap::<usize, DecodeMember>::new();
-    // Every decoding sequence gets its next token before any prefill work.
+    let mut logits = Vec::new();
+    let mut members = Vec::new();
     for (slot, sequence) in &mut pool.live {
-        if let Some(token) = sequence.pending_token.take() {
-            batch
-                .add(token, sequence.next_position as i32, &[*slot as i32], true)
-                .map_err(|error| native_decode_error("cooperative generation batch", error))?;
-            logits.push((*slot, row_count as i32));
-            row_count += 1;
-            sequence.next_position += 1;
-            members.insert(
-                *slot,
-                DecodeMember {
-                    request_id: sequence.job.request.request_id.clone(),
-                    case_id: sequence.job.request.cases[0].case_id.clone(),
-                    physical_sequence: *slot,
-                    prefill_tokens: 0,
-                    decode_tokens: 1,
-                },
-            );
+        // As in ordinary native generation, prefill excludes the final prompt
+        // token. Ready requests share this one-token-per-sequence decode call.
+        let final_prompt = sequence.prefilled + 1 == sequence.prompt.len();
+        let token = if final_prompt {
+            sequence.prompt.last().copied()
+        } else {
+            sequence.pending_token.take()
+        };
+        let Some(token) = token else {
+            continue;
+        };
+        let row = logits.len() as i32;
+        batch
+            .add(token, sequence.next_position as i32, &[*slot as i32], true)
+            .map_err(|error| native_decode_error("cooperative generation batch", error))?;
+        sequence.next_position += 1;
+        if final_prompt {
+            sequence.prefilled += 1;
+        }
+        logits.push((*slot, row));
+        members.push(DecodeMember {
+            request_id: sequence.job.request.request_id.clone(),
+            case_id: sequence.job.request.cases[0].case_id.clone(),
+            physical_sequence: *slot,
+            prefill_tokens: usize::from(final_prompt),
+            decode_tokens: usize::from(!final_prompt),
+        });
+    }
+    let mut progressed = !logits.is_empty();
+    if progressed {
+        runtime
+            .context
+            .decode(&mut batch)
+            .map_err(|error| native_decode_error("cooperative native decode", error))?;
+        runtime.identity.cooperative_decodes.publish(members)?;
+        // A later prefill replaces the logit buffer; consume every owner first.
+        for (slot, row) in logits {
+            pool.live
+                .get_mut(&slot)
+                .ok_or_else(|| internal("cooperative logit owner disappeared"))?
+                .sample(runtime.model, runtime.context, row)?;
         }
     }
-    let mut remaining = capacity.saturating_sub(row_count).min(PREFILL_QUANTUM);
+
+    // Keep prefill bounded and rotate its owner, without combining a multi-token
+    // prefill with another sequence's generation row. This retains the existing
+    // native prompt boundary and avoids changing that request's cached states.
+    let mut remaining = capacity.min(PREFILL_QUANTUM);
     let mut prefilling = pool
         .live
         .iter()
         .filter_map(|(slot, sequence)| {
-            (sequence.prefilled < sequence.prompt.len()).then_some(*slot)
+            (sequence.prefilled + 1 < sequence.prompt.len()).then_some(*slot)
         })
         .collect::<Vec<_>>();
     prefilling.sort_by_key(|slot| (*slot + MAX_LIVE - pool.prefill_cursor) % MAX_LIVE);
@@ -874,61 +900,36 @@ fn step(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
         let sequence = pool
             .live
             .get_mut(&slot)
-            .ok_or_else(|| internal("cooperative prefill slot disappeared"))?;
-        let count = remaining.min(sequence.prompt.len() - sequence.prefilled);
+            .ok_or_else(|| internal("cooperative prefill owner disappeared"))?;
+        let count = remaining.min(sequence.prompt.len() - 1 - sequence.prefilled);
         let end = sequence.prefilled + count;
-        for position in sequence.prefilled..end {
-            let last = position + 1 == sequence.prompt.len();
-            batch
-                .add(
-                    sequence.prompt[position],
-                    position as i32,
-                    &[slot as i32],
-                    last,
-                )
-                .map_err(|error| native_decode_error("cooperative prefill batch", error))?;
-            if last {
-                logits.push((slot, row_count as i32));
-            }
-            row_count += 1;
-        }
-        sequence.prefilled = end;
-        sequence.next_position = end;
-        remaining -= count;
-        members.insert(
-            slot,
-            DecodeMember {
+        decode_tokens_chunked(
+            runtime.context,
+            &sequence.prompt[sequence.prefilled..end],
+            slot as i32,
+            sequence.prefilled as i32,
+            false,
+        )?;
+        runtime
+            .identity
+            .cooperative_decodes
+            .publish(vec![DecodeMember {
                 request_id: sequence.job.request.request_id.clone(),
                 case_id: sequence.job.request.cases[0].case_id.clone(),
                 physical_sequence: slot,
                 prefill_tokens: count,
                 decode_tokens: 0,
-            },
-        );
+            }])?;
+        sequence.prefilled = end;
+        sequence.next_position = end;
+        remaining -= count;
         pool.prefill_cursor = (slot + 1) % MAX_LIVE;
+        progressed = true;
     }
-    if row_count == 0 {
+    if !progressed {
         return Err(internal(
             "live cooperative requests produced no bounded decode work",
         ));
-    }
-    runtime
-        .context
-        .decode(&mut batch)
-        .map_err(|error| native_decode_error("cooperative native decode", error))?;
-    // This is the instrumentation boundary: successful real decode, not a
-    // scheduler callback, fixture count, or inferred overlapping task lifetime.
-    runtime
-        .identity
-        .cooperative_decodes
-        .publish(members.into_values().collect())?;
-    // Consume every live logit row before another decode can replace it.
-    for (slot, row) in logits {
-        let sequence = pool
-            .live
-            .get_mut(&slot)
-            .ok_or_else(|| internal("cooperative logit owner disappeared"))?;
-        sequence.sample(runtime.model, runtime.context, row)?;
     }
     Ok(())
 }
