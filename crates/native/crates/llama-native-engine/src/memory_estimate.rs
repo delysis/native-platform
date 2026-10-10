@@ -128,7 +128,14 @@ fn estimate(
     const MIN_WORKSPACE: u64 = 384 * 1024 * 1024;
     // Deliberately use requested context even when the model may cap it lower.
     // 256-cell rounding conservatively covers the pinned context padding.
-    let context = u64::from(config.context_tokens.max(512)).div_ceil(256) * 256;
+    let requested = u64::from(config.context_tokens.max(512));
+    let context = if config.kv_unified {
+        requested.div_ceil(256) * 256
+    } else {
+        // Each independent stream is padded separately by the native context.
+        let streams = u64::from(config.max_sequences.max(1));
+        requested.div_ceil(streams).div_ceil(256) * 256 * streams
+    };
     let workspace = (model_bytes / 2).max(MIN_WORKSPACE);
     let (kv_bytes, basis, backend_baseline) = if let Some(layout) = layout {
         (
@@ -206,6 +213,24 @@ mod tests {
         assert!(
             estimate(&config, 4 << 30, 0, layout).backend_workspace_bytes
                 > sequences.backend_workspace_bytes
+        );
+    }
+
+    #[test]
+    fn independent_stream_estimate_covers_per_stream_padding() {
+        let mut config = NativeModelConfig::local("fixture.gguf".into());
+        config.context_tokens = 512;
+        config.max_sequences = 4;
+        let unified = estimate(&config, 4 << 30, 0, None);
+        config.kv_unified = false;
+        let independent = estimate(&config, 4 << 30, 0, None);
+        assert_eq!(independent.kv_bytes, unified.kv_bytes * 2);
+        config.context_tokens = 8192;
+        let independent = estimate(&config, 4 << 30, 0, None);
+        config.kv_unified = true;
+        assert_eq!(
+            independent.kv_bytes,
+            estimate(&config, 4 << 30, 0, None).kv_bytes
         );
     }
 

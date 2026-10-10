@@ -405,7 +405,13 @@ impl NativeModelHandle {
     /// Multi-model arithmetic and static profiles remain explicitly disabled.
     #[must_use]
     pub fn controlled_generation_capabilities(&self) -> ControlledGenerationCapabilities {
-        ControlledGenerationCapabilities::inspected(true, false, true, false, false)
+        ControlledGenerationCapabilities::inspected(
+            self.inner.worker_identity.kv_unified,
+            false,
+            self.inner.worker_identity.kv_unified,
+            false,
+            false,
+        )
     }
 
     /// Obtain the live writer identity required to compile a fingerprint-bound
@@ -415,6 +421,7 @@ impl NativeModelHandle {
         &self,
         participant_id: impl Into<String>,
     ) -> NativeResult<ControlledModelIdentity> {
+        self.require_unified_kv()?;
         self.inner.ensure_accepting()?;
         let participant_id = participant_id.into();
         validate_public_id("controlled participant_id", &participant_id)?;
@@ -439,6 +446,7 @@ impl NativeModelHandle {
         &self,
         submission: ControlledGenerationSubmission,
     ) -> NativeResult<ControlledGenerationTicket> {
+        self.require_unified_kv()?;
         preflight_submission(&submission, &self.status())?;
 
         let request_id = submission.request().request_id().to_string();
