@@ -4060,6 +4060,7 @@ name = "loom-backend-llama"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "desktop-model-defaults",
  "fs4",
  "hex",
  "llama-native-engine",
@@ -6695,6 +6696,7 @@ name = "speech-native-backend-parakeet"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "desktop-model-defaults",
  "hound",
  "parakeet-rs",
  "serde",
@@ -7202,6 +7204,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "desktop-model-defaults",
+ "fs4",
  "fte-providers",
  "fte-router",
  "fte-store",
