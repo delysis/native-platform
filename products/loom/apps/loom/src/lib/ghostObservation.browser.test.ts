@@ -24,6 +24,7 @@ async function render() {
   let witness: VisualCompletionAccessibilityWitness = unavailableVisualCompletionWitness();
   let changes = 0;
   let insertions = 0;
+  let visibleKey = '';
   const editor = mount(LoomEditor, { target: pane, props: {
     value: 'hello', autofocus: true,
     ghostText: ' world again', ghostCandidateId: 'run:r1', ghostPresentationKey: 'stream:r1:7',
@@ -31,6 +32,7 @@ async function render() {
     onChange: () => { changes += 1; },
     onGhostInsert: () => { insertions += 1; return false; },
     onGhostPresentationRejected: () => {},
+    onGhostVisibilityChange: (key: string) => { visibleKey = key; },
     onCompletionAccessibilityChange: (next: VisualCompletionAccessibilityWitness) => { witness = next; }
   } });
   mounted = editor;
@@ -39,10 +41,28 @@ async function render() {
   await expect.poll(() => witness.inline?.text).toBe(' world again');
   const glyph = pane.querySelector<HTMLElement>('.loom-visual-ghost')!;
   return { editor, outer, pane, glyph, witness: () => witness,
+    visibleKey: () => visibleKey,
     changes: () => changes, insertions: () => insertions };
 }
 
 describe('rendered inline ghost witness', () => {
+  it('publishes one DOM observation for glyph evidence and visibility authority', async () => {
+    const state = await render();
+    await expect.poll(state.visibleKey).toBe('stream:r1:7');
+    const bounds = state.glyph.getBoundingClientRect.bind(state.glyph);
+    let reads = 0;
+    state.glyph.getBoundingClientRect = () => {
+      const rect = bounds();
+      return ++reads === 1 ? new DOMRect(-1000, rect.y, rect.width, rect.height) : rect;
+    };
+    window.dispatchEvent(new Event('resize'));
+    expect(state.visibleKey()).toBe(state.witness().inline?.presentationKey ?? '');
+    state.glyph.getBoundingClientRect = bounds;
+    window.dispatchEvent(new Event('resize'));
+    expect(state.visibleKey()).toBe('stream:r1:7');
+    expect(state.witness().inline?.presentationKey).toBe(state.visibleKey());
+  });
+
   it('observes only painted preview text while keeping the multiword buffer out of manuscript state', async () => {
     const state = await render();
     expect(state.glyph.textContent).toBe(' world again');

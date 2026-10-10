@@ -266,6 +266,14 @@
       alternativePresentationKeys: plan?.alternatives.map((item) => item.presentationKey) ?? [],
       alternativeRunIds: plan?.alternatives.map((item) => item.runId ?? '') ?? []
     };
+    // Publish glyph evidence and insertion authority from the same DOM read.
+    // Layout can settle between independent reads, leaving the parent with a
+    // valid glyph witness but an empty (or stale) visibility key.
+    const presentationKey = witness.inline?.presentationKey ?? '';
+    if (reportedGhostPresentationKey !== presentationKey) {
+      reportedGhostPresentationKey = presentationKey;
+      onGhostVisibilityChange(presentationKey);
+    }
     const identity = JSON.stringify(witness);
     if (identity === reportedCompletionAccessibilityIdentity) return;
     reportedCompletionAccessibilityIdentity = identity;
@@ -313,12 +321,8 @@
   }
 
   function reportGhostVisibility(): void {
-    const presentationKey = view ? visibleGhostWidgetPresentationKey(view) : '';
     // Layout/scroll changes can invalidate glyphs without changing the plan.
     reportCompletionAccessibility();
-    if (reportedGhostPresentationKey === presentationKey) return;
-    reportedGhostPresentationKey = presentationKey;
-    onGhostVisibilityChange(presentationKey);
   }
 
   function scheduleGhostVisibilityReport(): void {
