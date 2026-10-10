@@ -239,3 +239,31 @@ fn native_retrieval_does_not_reinterpret_query_text_as_additional_invitations() 
         "@a friendship\n> Historical @outsider quotation\n~~~\n@outsider code\n~~~\n[link](https://example.com/@outsider)"
     );
 }
+
+#[test]
+fn help_inspection_is_scoped_cancellable_and_never_opens_the_archive() {
+    let temp = tempfile::tempdir().expect("Help fixture");
+    let dotfile = temp.path().join(DOTFILE);
+    fs::write(
+        &dotfile,
+        "archive='archive-that-does-not-exist.sqlite'\n[friends.a]\nhandle='a'\n",
+    )
+    .expect("Help fixture");
+    let before = fs::read(&dotfile).expect("Help fixture");
+    let provider = NativeContextProvider::default();
+    let epoch = provider.epoch();
+    let config = provider
+        .inspect_config_at_epoch(scope(), &dotfile, epoch)
+        .expect("Help inspection")
+        .expect("authored config");
+    assert_eq!(config.friends["a"].handle, "a");
+    assert!(!config.archive.exists());
+    assert_eq!(fs::read(&dotfile).expect("unchanged config"), before);
+    provider.cancel_all();
+    assert!(
+        provider
+            .inspect_config_at_epoch(scope(), &dotfile, epoch)
+            .is_err()
+    );
+    provider.cancel_and_drain_for_exit();
+}

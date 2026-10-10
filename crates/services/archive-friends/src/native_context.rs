@@ -145,25 +145,7 @@ impl NativeContextProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
-    pub fn prepare(
-        &self,
-        scope: ContextScope,
-        source_basis: &str,
-        dotfile: &Path,
-        prefix: &str,
-    ) -> Result<Option<PreparedContext>, FriendsError> {
-        self.prepare_at_epoch(scope, source_basis, dotfile, prefix, self.epoch())
-    }
-    /// Capture the epoch before queuing work; closing or switching a project
-    /// invalidates jobs that have not started yet as well as active retrieval.
-    pub fn prepare_at_epoch(
-        &self,
-        scope: ContextScope,
-        source_basis: &str,
-        dotfile: &Path,
-        prefix: &str,
-        epoch: u64,
-    ) -> Result<Option<PreparedContext>, FriendsError> {
+    fn admit(&self, scope: ContextScope, epoch: u64) -> Result<Lease<'_>, FriendsError> {
         let cancel = Cancellation::default();
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
         {
@@ -185,12 +167,54 @@ impl NativeContextProvider {
             state.in_flight += 1;
             state.active.insert(scope.clone(), (id, cancel.clone()));
         }
-        let _lease = Lease {
+        Ok(Lease {
             provider: self,
-            scope: scope.clone(),
+            scope,
             id,
-            cancel: cancel.clone(),
+            cancel,
+        })
+    }
+
+    /// Read the selected configuration under the same cancellation and drain
+    /// authority as retrieval. This does not open the archive or call a model.
+    pub fn inspect_config_at_epoch(
+        &self,
+        scope: ContextScope,
+        dotfile: &Path,
+        epoch: u64,
+    ) -> Result<Option<FriendsConfig>, FriendsError> {
+        let lease = self.admit(scope, epoch)?;
+        lease.cancel.check()?;
+        let config = if dotfile.try_exists()? {
+            Some(FriendsConfig::load(dotfile)?)
+        } else {
+            None
         };
+        lease.cancel.check()?;
+        Ok(config)
+    }
+
+    pub fn prepare(
+        &self,
+        scope: ContextScope,
+        source_basis: &str,
+        dotfile: &Path,
+        prefix: &str,
+    ) -> Result<Option<PreparedContext>, FriendsError> {
+        self.prepare_at_epoch(scope, source_basis, dotfile, prefix, self.epoch())
+    }
+    /// Capture the epoch before queuing work; closing or switching a project
+    /// invalidates jobs that have not started yet as well as active retrieval.
+    pub fn prepare_at_epoch(
+        &self,
+        scope: ContextScope,
+        source_basis: &str,
+        dotfile: &Path,
+        prefix: &str,
+        epoch: u64,
+    ) -> Result<Option<PreparedContext>, FriendsError> {
+        let lease = self.admit(scope.clone(), epoch)?;
+        let cancel = &lease.cancel;
         if !dotfile.try_exists()? {
             return Ok(None);
         }
@@ -236,7 +260,7 @@ impl NativeContextProvider {
             }
         }
         cancel.check()?;
-        let circle = crate::retrieval::retrieve_prepared_invitation(&config, &draft, &cancel)?;
+        let circle = crate::retrieval::retrieve_prepared_invitation(&config, &draft, cancel)?;
         let pack = Arc::new(compile(&config, circle)?);
         let prepared = PreparedContext {
             source_basis: source_basis.into(),
@@ -260,7 +284,7 @@ impl NativeContextProvider {
         if state
             .active
             .get(&scope)
-            .is_none_or(|(current, _)| *current != id)
+            .is_none_or(|(current, _)| *current != lease.id)
         {
             return Err(invalid("archive preparation was superseded"));
         }

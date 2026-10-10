@@ -209,6 +209,13 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
         "Help",
         true,
         &[
+            &MenuItem::with_id(
+                app,
+                tauri_plugin_loom::ARCHIVE_FRIENDS_MENU_ID,
+                "Friends…",
+                true,
+                None::<&str>,
+            )?,
             #[cfg(not(target_os = "macos"))]
             &PredefinedMenuItem::about(app, None, Some(about.clone()))?,
         ],

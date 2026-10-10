@@ -139,6 +139,7 @@ const COMPLETION_SNAPSHOT_BRANCH_LIMIT: usize = 24;
 const COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
+pub const ARCHIVE_FRIENDS_MENU_ID: &str = "loom.help.archive-friends";
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
 pub const FILE_NEW_DOCUMENT_MENU_ID: &str = "loom.file.new-document";
 pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
@@ -2380,6 +2381,10 @@ fn visual_ghost_rendered(state: State<'_, PluginState>) {
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
+    if menu_id == ARCHIVE_FRIENDS_MENU_ID {
+        archive_friends::show_help(app);
+        return;
+    }
     if menu_id == APPLICATION_QUIT_MENU_ID {
         let _ = prepare_application_exit_request(app);
         emit_application_close_request(app);

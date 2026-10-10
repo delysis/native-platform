@@ -12,7 +12,7 @@ preamble; it never edits a manuscript or calls a model. The host must revalidate
 its document/session authority before using the result, reserve model context
 space and preserve the pack's provenance.
 
-Two preparations may be in flight. Scope replacement cancels its predecessor;
+Two archive operations may be in flight. Scope replacement cancels its predecessor;
 project shutdown must cancel and drain the provider. Queued jobs capture an
 epoch before dispatch. Cache entries are bounded and scoped to source/config
 identity. Archive size/mtime and WAL checks assume a frozen SQLite snapshot;
@@ -38,5 +38,11 @@ suggestion opt-out and runtime exit cancel preparation; close/exit drain it.
 Configuration and frozen-snapshot validation occurs inside the provider lease.
 
 The integrated host has component tests; packaged native/model acceptance and
-the original suggestion/help proposal review remain pending. Component success
+native Help presentation remain pending. Component success
 does not authorize promoting the completion integration.
+
+The native Friends Help entry reads the actual configured circle through a
+bounded provider lease. It captures and revalidates the leased workspace owner,
+shares cancellation/draining with preparation, and never opens the archive or
+runs a model. Closed or replaced sessions cannot publish its result. The old
+standalone suggestion IPC proposal had no frontend caller; it is not imported.

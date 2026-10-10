@@ -2,6 +2,7 @@
 //! The resulting immutable evidence cannot grant a workspace or edit authority.
 use super::*;
 use ::archive_friends::{ContextScope, DOTFILE, PreparedContext};
+use std::fmt::Write as _;
 
 pub(super) type Provider = ::archive_friends::NativeContextProvider;
 
@@ -263,6 +264,89 @@ pub(super) fn drain(state: &PluginState, timeout: Duration) -> Result<(), IpcFai
         .map_err(failure)
 }
 
+fn help_workspace(session: &Session) -> Option<(ProjectId, CommandId, PathBuf)> {
+    if session.phase != SessionPhase::Open {
+        return None;
+    }
+    let owner = session.workspace.as_ref()?;
+    let store = workspace_owner::store(session).ok()?;
+    Some((
+        owner.project_id,
+        owner.session_id,
+        store.root().join(DOTFILE),
+    ))
+}
+
+/// Deliberately opened Help is substantive content, not editor chrome. Only
+/// configuration I/O enters a background job; it shares the provider's drain.
+pub(super) fn show_help<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<PluginState>() else {
+        return;
+    };
+    if ensure_application_running(&state, "archive Help").is_err() {
+        return;
+    }
+    let selected = {
+        let Ok(session) = lock_session(&state) else {
+            return;
+        };
+        help_workspace(&session)
+    };
+    let provider = Arc::clone(&state.archive_friends);
+    let epoch = provider.epoch();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut text = String::from(
+            "Write a bare @alias to invite historical archive passages into a writing suggestion. These are source quotations, not a live conversation.\n\nQuoted @“names” and @file.md remain document references. The archive does not edit your manuscript or run model experiments.\n\n",
+        );
+        if let Some((project, session_id, dotfile)) = &selected {
+            let scope = ContextScope {
+                project: project.to_string(),
+                session: session_id.to_string(),
+                document: "archive-help".into(),
+            };
+            match provider.inspect_config_at_epoch(scope, dotfile, epoch) {
+                Ok(Some(config)) => {
+                    let names = config.friends.keys().map(|name| format!("@{name}")).collect::<Vec<_>>().join("  ");
+                    let _ = write!(text, "Your circle: {names}\n\n");
+                }
+                Ok(None) => text.push_str("Add a checkpointed archive path and friend aliases in the workspace dotfile to begin.\n\n"),
+                Err(error) => { let _ = write!(text, "Configuration unavailable: {error}\n\n"); },
+            }
+            let _ = write!(
+                text,
+                "Source selection is configured in {}.",
+                dotfile.display()
+            );
+        } else {
+            text.push_str("Open a workspace with a .community-archive.toml file to begin.");
+        }
+        let Some(state) = app.try_state::<PluginState>() else {
+            return;
+        };
+        if provider.epoch() != epoch || ensure_application_running(&state, "archive Help").is_err()
+        {
+            return;
+        }
+        {
+            let Ok(session) = lock_session(&state) else {
+                return;
+            };
+            let current = help_workspace(&session);
+            if current != selected {
+                return;
+            }
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            app.dialog()
+                .message(text)
+                .title("Friends")
+                .parent(&window)
+                .show(|_| {});
+        }
+    });
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -342,6 +426,18 @@ mod tests {
             epoch: 7,
             model_basis: BlobId::digest(b"controlled model environment"),
         };
+        assert_eq!(
+            help_workspace(&session).expect("owned Help workspace").2,
+            directory
+                .path()
+                .join("Writing")
+                .canonicalize()
+                .expect("canonical owned fixture")
+                .join(DOTFILE)
+        );
+        session.phase = SessionPhase::Closed;
+        assert!(help_workspace(&session).is_none());
+        session.phase = SessionPhase::Open;
         let basis = format!("{}:3", loaded.blob_id);
         assert!(authority.validate(&session, 7, &loaded, 3, &basis).is_ok());
         assert!(authority.validate(&session, 8, &loaded, 3, &basis).is_err());
