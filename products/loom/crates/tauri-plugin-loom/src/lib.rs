@@ -22,6 +22,7 @@ mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod preferences;
 mod reference_diagnostics;
 mod server_weave;
 mod shader_preview;
@@ -2158,6 +2159,9 @@ impl Builder {
                 workspace_preview::response(&state, context.webview_label(), &request)
             })
             .invoke_handler(tauri::generate_handler![
+                preferences::preferences_get,
+                preferences::preferences_update,
+                preferences::preferences_suggestions_get,
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,

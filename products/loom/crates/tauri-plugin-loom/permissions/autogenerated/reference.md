@@ -4,6 +4,9 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-preferences-get`
+- `allow-preferences-update`
+- `allow-preferences-suggestions-get`
 - `allow-document-reference-diagnostics`
 - `allow-material-list`
 - `allow-material-resolve-reference`
@@ -2252,6 +2255,84 @@ Enables the model_unload command without any pre-configured scope.
 <td>
 
 Denies the model_unload command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-preferences-get`
+
+</td>
+<td>
+
+Enables the preferences_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-preferences-get`
+
+</td>
+<td>
+
+Denies the preferences_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-preferences-suggestions-get`
+
+</td>
+<td>
+
+Enables the preferences_suggestions_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-preferences-suggestions-get`
+
+</td>
+<td>
+
+Denies the preferences_suggestions_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-preferences-update`
+
+</td>
+<td>
+
+Enables the preferences_update command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-preferences-update`
+
+</td>
+<td>
+
+Denies the preferences_update command without any pre-configured scope.
 
 </td>
 </tr>

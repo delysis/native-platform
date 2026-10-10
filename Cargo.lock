@@ -7499,6 +7499,7 @@ dependencies = [
  "loom-backend-llama",
  "loom-document",
  "loom-host",
+ "loom-preferences",
  "loom-store",
  "loom-types",
  "naga",
