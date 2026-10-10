@@ -13,9 +13,9 @@ mod operation_registry;
 pub use memory_estimate::{
     MemoryEstimateBasis, NativeMemoryEstimate, estimate_memory_reservation, model_context_capacity,
 };
+mod residual_evaluation;
 mod residual_training;
 mod residual_training_math;
-mod residual_evaluation;
 pub use residual_evaluation::{ResidualEvaluationTicket, VerifiedResidualEvaluation};
 pub use residual_training::{ResidualTrainingTicket, VerifiedResidualTraining};
 mod state_buffer;
