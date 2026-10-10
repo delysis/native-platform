@@ -8788,6 +8788,7 @@ dependencies = [
  "cpal 0.16.0",
  "crossbeam-channel",
  "desktop-model-defaults",
+ "desktop-vault",
  "fs4",
  "fte-providers",
  "fte-router",
