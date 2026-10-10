@@ -39,6 +39,9 @@
   import MaterialExcerpt from './lib/MaterialExcerpt.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
+    getPreferences,
+    updatePreferences,
+    type LoomPreferences,
     abortApplicationClose,
     runTerminal,
     listTerminalRuns,
@@ -1304,7 +1307,7 @@
     transition === 'idle'
   );
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
-  $: availableWriterModels = orderedLocalTextModels(models, loadLastLocalModelPath());
+  $: availableWriterModels = orderedLocalTextModels(models, sharedPreferences?.last_local_model ?? null);
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
     ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
@@ -2820,6 +2823,7 @@
           const lifecycle = await installWindowLifecycleHandlers();
           switch (lifecycle.status) {
             case 'ready':
+              await loadSharedPreferences();
               startDesktopWorkspace();
               return;
             case 'close_pending':
@@ -6087,42 +6091,32 @@
     }
   }
 
-  function suggestionPreferenceKey(projectId: string): string {
-    return `loom:suggestions:${projectId}`;
+  let sharedPreferences: LoomPreferences | null = null;
+  let preferencesLoading: Promise<void> | null = null;
+
+  function acceptPreferences(snapshot: LoomPreferences): void {
+    if (!sharedPreferences || BigInt(snapshot.revision) >= BigInt(sharedPreferences.revision)) {
+      sharedPreferences = snapshot;
+    }
   }
 
-  const lastLocalModelKey = 'loom:last-local-model';
+  function loadSharedPreferences(): Promise<void> {
+    return preferencesLoading ??= getPreferences().then(acceptPreferences).catch((error) => { recordFailure(error); });
+  }
 
   function loadLastLocalModelPath(): string | null {
-    try {
-      const remembered = window.localStorage.getItem(lastLocalModelKey);
-      if (remembered && isEphemeralAcceptanceModelPath(remembered)) {
-        window.localStorage.removeItem(lastLocalModelKey);
-        return null;
-      }
-      return remembered;
-    } catch {
-      return null;
-    }
+    return sharedPreferences?.last_local_model ?? null;
   }
 
-  function rememberLastLocalModelPath(modelPath: string): void {
+  async function rememberLastLocalModelPath(modelPath: string): Promise<void> {
     if (isEphemeralAcceptanceModelPath(modelPath)) return;
-    try {
-      window.localStorage.setItem(lastLocalModelKey, modelPath);
-    } catch {
-      // Discovery remains available when browser persistence is unavailable.
-    }
+    try { acceptPreferences(await updatePreferences({ kind: 'remember_model', path: modelPath })); }
+    catch (error) { recordFailure(error); }
   }
 
-  function forgetLastLocalModelPath(modelPath: string): void {
-    try {
-      if (window.localStorage.getItem(lastLocalModelKey) === modelPath) {
-        window.localStorage.removeItem(lastLocalModelKey);
-      }
-    } catch {
-      // Storage is only a convenience; native policy verification is authority.
-    }
+  async function forgetLastLocalModelPath(modelPath: string): Promise<void> {
+    try { acceptPreferences(await updatePreferences({ kind: 'forget_model', expected_path: modelPath })); }
+    catch (error) { recordFailure(error); }
   }
 
   function rememberedWriterPathIsInvalid(code: string): boolean {
@@ -6142,14 +6136,12 @@
   }
 
   function loadSuggestionPreference(projectId: string): boolean {
-    try {
-      return suggestionsEnabledFromStoredPreference(
-        window.localStorage.getItem(suggestionPreferenceKey(projectId)),
-        buildModelPolicy?.activation ?? null
-      );
-    } catch {
-      return false;
-    }
+    if (!sharedPreferences) return false;
+    const stored = sharedPreferences.project_suggestions[projectId];
+    return suggestionsEnabledFromStoredPreference(
+      stored === undefined ? null : stored ? 'on' : 'off',
+      buildModelPolicy?.activation ?? null
+    );
   }
 
   function clearSuggestionTimerHandle(): void {
@@ -6214,7 +6206,7 @@
       if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
         try {
-          window.localStorage.setItem(suggestionPreferenceKey(project.project_id), enabled ? 'on' : 'off');
+          acceptPreferences(await updatePreferences({ kind: 'suggestions', project_id: boundProject.project_id, enabled }));
         } catch {
           // The backend gate remains authoritative if browser persistence is unavailable.
         }
@@ -6402,7 +6394,7 @@
     quietModelLoadFailure = null;
     if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
     selectedModelPath = loaded.model_path;
-    rememberLastLocalModelPath(loaded.model_path);
+    await rememberLastLocalModelPath(loaded.model_path);
     if (!quiet) {
       announce(`${loaded.display_name} is verified for exact local completion`);
     }
@@ -6489,7 +6481,7 @@
             ? !isVerifiedCatalogWriter(catalogEntry, loaded)
             : !isUsableSuggestionWriter(loaded)) {
           if (candidate.remembered && !candidate.profileId) {
-            forgetLastLocalModelPath(candidate.modelPath);
+            await forgetLastLocalModelPath(candidate.modelPath);
           }
           await refreshModels(captured);
           continue;
@@ -6509,7 +6501,7 @@
           rememberedWriterPathIsInvalid(failure.code) ||
           (!candidate.profileId && ['model_path_error', 'model_header_unverified'].includes(failure.code))
         )) {
-          forgetLastLocalModelPath(candidate.modelPath);
+          await forgetLastLocalModelPath(candidate.modelPath);
         }
         await refreshModels(captured);
       } finally {

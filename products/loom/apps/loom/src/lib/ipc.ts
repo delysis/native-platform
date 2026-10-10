@@ -42,6 +42,23 @@ export type { DocumentFilesystemHint } from './documentFilesystemHint';
 
 const PREFIX = 'plugin:loom|';
 
+export interface LoomPreferences {
+  revision: string;
+  last_local_model: string | null;
+  project_suggestions: Record<string, boolean>;
+}
+export type PreferenceChange =
+  | { kind: 'remember_model'; path: string }
+  | { kind: 'forget_model'; expected_path: string }
+  | { kind: 'suggestions'; project_id: string; enabled: boolean | null };
+export function getPreferences(): Promise<LoomPreferences> {
+  return call('preferences_get', {});
+}
+export function updatePreferences(change: PreferenceChange): Promise<LoomPreferences> {
+  return call('preferences_update', { change });
+}
+
+
 export function documentReferenceDiagnostics(projectId: string, sessionId: string, text: string): Promise<import('./referenceDiagnostics').ReferenceDiagnostic[]> {
   return call('document_reference_diagnostics', { projectId, sessionId, text });
 }
