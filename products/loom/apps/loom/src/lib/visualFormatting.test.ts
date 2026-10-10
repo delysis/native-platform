@@ -18,6 +18,19 @@ function formatted(markdown: string, action: VisualFormatAction, href = ''): Edi
 }
 
 describe('Markdown-safe visual formatting', () => {
+  it.each([
+    ['blockquote', '> Words '],
+    ['bullet_list', '* Words '],
+    ['ordered_list', '1. Words ']
+  ] as const)('preserves the selected terminal separator through %s and its reversal', (action, expected) => {
+    const doc = parseVisualMarkdown('Words ');
+    let state = EditorState.create({ doc, selection: new AllSelection(doc) });
+    expect(applyVisualFormat(state, action, '', transaction => { state = state.apply(transaction); })).toBe(true);
+    expect(serializeVisualMarkdown(state.doc)).toBe(expected);
+    expect(parseVisualMarkdown(expected).eq(state.doc)).toBe(true);
+    expect(applyVisualFormat(state, action, '', transaction => { state = state.apply(transaction); })).toBe(true);
+    expect(serializeVisualMarkdown(state.doc)).toBe('Words ');
+  });
   it('retains source EOF bytes through structural formatting and reopening', () => {
     const doc = parseVisualMarkdown('Words\r\n\r\n');
     let state = EditorState.create({ doc, selection: TextSelection.create(doc, 1, 6) });

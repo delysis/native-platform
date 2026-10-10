@@ -337,6 +337,23 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(serializedMarkdown).toBe('Words');
   });
 
+  it('preserves a live trailing separator through palette structures and reversal', async () => {
+    render('Words ');
+    await page.getByRole('textbox', { name: 'Manuscript editor' }).click();
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await page.getByRole('button', { name: 'Format text' }).click();
+    for (const [label, expected] of [
+      ['Block quote', '> Words '],
+      ['Bulleted list', '* Words '],
+      ['Numbered list', '1. Words ']
+    ] as const) {
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe(expected);
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe('Words ');
+    }
+  });
+
   it('preserves a full selection across repeated AX-style inline toggles', async () => {
     render('Words');
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });

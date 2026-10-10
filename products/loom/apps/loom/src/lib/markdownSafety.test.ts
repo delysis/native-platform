@@ -66,6 +66,19 @@ describe('visual Markdown safety gate', () => {
     expect(parseVisualMarkdown(serializeVisualMarkdown(edited)).eq(edited)).toBe(true);
   });
 
+  it.each(['> Words ', '* Words ', '1. Words ', '> * Words ', '* > Words ', '> # Words '])(
+    'retains the separator inside nested prose %j', source => {
+      expect(serializeVisualMarkdown(parseVisualMarkdown(source))).toBe(source);
+    }
+  );
+
+  it.each(['> Words  ', '* Words  ', '> ```text\n> code \n> ```', '    code '])(
+    'keeps hard-break and code parsing unchanged for %j', source => {
+      expect(parseVisualMarkdown(source).content.toJSON())
+        .toEqual(defaultMarkdownParser.parse(source).content.toJSON());
+    }
+  );
+
   it('keeps prose spaces when an audio attachment follows the paragraph on reopen', () => {
     const source = 'The quiet moon.  @Missing\n\n@“Notes.md” \n\n![Audio](loom-attachment:recording "loom-waveform:0000")\n';
     expect(canUseVisualMarkdown(source, false)).toBe(true);

@@ -57,12 +57,13 @@ export function canRoundTripMarkdownExactly(markdown: string): boolean {
 function preserveProseEndSpaces(markdown: string): string {
   const lines = markdown.split('\n');
   for (const token of defaultMarkdownParser.tokenizer.parse(markdown, {})) {
-    if (token.level !== 0 || !token.map ||
+    if (!token.map ||
         (token.type !== 'paragraph_open' && token.type !== 'heading_open')) continue;
     const index = token.map[1] - 1;
     const line = lines[index];
     // Preserve an ordinary separator at every prose block boundary, including
-    // before media. Do not reinterpret hard breaks, nested syntax or code.
+    // before media and inside quotes/lists. Token maps identify prose even
+    // when nested; fenced and indented code never enter this branch.
     if (line?.endsWith(' ') && !line.endsWith('  ')) lines[index] = `${line.slice(0, -1)}&#32;`;
   }
   return lines.join('\n');
