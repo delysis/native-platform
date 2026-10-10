@@ -270,7 +270,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
                 );
                 ensure!(
                     table.get("rev").and_then(toml::Value::as_str)
-                        == Some("eb0e47b57c2fba97ed13e8fe5e949d11798232cb"),
+                        == Some("b508f1c7652c751513c361c7e4fdeb090fbed577"),
                     "unsealed llama-cpp-rs dependency: {}",
                     manifest.display()
                 );
