@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 46,
+  "expected_test_count": 48,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
