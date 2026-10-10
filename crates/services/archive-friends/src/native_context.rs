@@ -2,7 +2,7 @@
 //! execution and checks its document/session authority again before use.
 use crate::{
     Cancellation, FriendsConfig, FriendsError, PromptPack, compile, continuation_context,
-    fingerprint, invalid, mentions, retrieve,
+    fingerprint, invalid, retrieve,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -239,19 +239,21 @@ fn invitation_window(config: &FriendsConfig, prefix: &str) -> Result<Option<Stri
             "archive context currently supports manuscript prefixes up to 2 MiB",
         ));
     }
-    let parsed = mentions(prefix);
+    let parsed = workspace_document::references::document_references(prefix)
+        .map_err(|error| invalid(error.to_string()))?;
+    let reserved: Vec<_> = config
+        .friends
+        .iter()
+        .flat_map(|(alias, friend)| [alias.clone(), friend.handle.clone()])
+        .collect();
     let mut aliases = Vec::new();
-    for m in parsed {
-        let suffix = &prefix[m.end..];
-        if suffix.starts_with('/')
-            || suffix
-                .strip_prefix('.')
-                .is_some_and(|s| s.starts_with(char::is_alphanumeric))
-        {
+    for reference in &parsed {
+        if !is_friend_invitation(prefix, reference, &reserved) {
             continue;
         }
         if let Some((alias, _)) = config.friends.iter().find(|(a, f)| {
-            a.eq_ignore_ascii_case(&m.handle) || f.handle.eq_ignore_ascii_case(&m.handle)
+            a.eq_ignore_ascii_case(&reference.name)
+                || f.handle.eq_ignore_ascii_case(&reference.name)
         }) && !aliases.contains(alias)
         {
             aliases.push(alias.clone());
@@ -265,8 +267,15 @@ fn invitation_window(config: &FriendsConfig, prefix: &str) -> Result<Option<Stri
         start += 1;
     }
     let mut topic = prefix[start..].to_string();
-    for m in mentions(&topic).iter().rev() {
-        topic.replace_range(m.start..m.end, " ");
+    // Keep the full document's lexical state: the topic window can begin
+    // inside a fence or quote and must not reinterpret its contents as prose.
+    for reference in parsed.iter().rev() {
+        if reference.range.start >= start && is_friend_invitation(prefix, reference, &reserved) {
+            topic.replace_range(
+                reference.range.start - start..reference.range.end - start,
+                " ",
+            );
+        }
     }
     let invited = aliases
         .into_iter()
@@ -274,4 +283,63 @@ fn invitation_window(config: &FriendsConfig, prefix: &str) -> Result<Option<Stri
         .collect::<Vec<_>>()
         .join(" ");
     Ok(Some(format!("{invited}\n{topic}")))
+}
+
+/// Only an authored bare configured handle opts into archive context. Quoted,
+/// scoped, path and retained-link references continue to name workspace values.
+/// Use the original UTF-8 source and the shared grammar's exact range.
+pub fn is_friend_invitation(
+    source: &str,
+    reference: &workspace_document::references::DocumentReference,
+    reserved_handles: &[String],
+) -> bool {
+    let Some(raw) = source.get(reference.range.clone()) else {
+        return false;
+    };
+    let Some(handle) = raw.strip_prefix('@') else {
+        return false;
+    };
+    crate::config::valid_handle(handle)
+        && handle == reference.name
+        && reserved_handles
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(handle))
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    #[test]
+    fn topic_window_keeps_full_document_code_state() {
+        let mut config = FriendsConfig::default();
+        config.friends.insert(
+            "a".into(),
+            crate::FriendConfig {
+                handle: "a".into(),
+                label: None,
+                account_id: None,
+            },
+        );
+        let source = format!("@a invited\n~~~\n{}\n@a code\n~~~", "x".repeat(14_100));
+        let window = invitation_window(&config, &source)
+            .expect("controlled grammar fixture")
+            .expect("authored invitation");
+        assert!(window.starts_with("@a\n"));
+        assert!(window.contains("@a code"));
+    }
+    #[test]
+    fn aliases_preserve_explicit_workspace_reference_domains() {
+        let source = "☀ @visa @VISA @\"visa\" @“visa” @visa.md @visa/path @project:visa [visa](loom://document/visa)";
+        let references = workspace_document::references::document_references(source)
+            .expect("controlled grammar fixture");
+        let handles = vec!["visa".to_string()];
+        let invited: Vec<_> = references
+            .iter()
+            .filter(|reference| is_friend_invitation(source, reference, &handles))
+            .map(|reference| &source[reference.range.clone()])
+            .collect();
+        assert_eq!(invited, ["@visa", "@VISA"]);
+        assert!(references.iter().any(|reference| reference.name == "visa"
+            && !is_friend_invitation(source, reference, &handles)));
+    }
 }

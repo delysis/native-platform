@@ -25,5 +25,10 @@ regular-file/size bounds and rejection of symbolic links, multiple hard links
 and FIFOs. They do not qualify Windows filesystem behavior, concurrent hostile
 parent replacement or an integrated native editor journey.
 
+Invitations use the shared workspace reference grammar. Only bare configured
+handles invite archive context; quoted/scoped/path names and retained links
+remain workspace references. Code and historical quotes cannot invite a voice.
+The topic window retains the full document lexical state.
+
 The Loom host adapter remains pending. This crate alone does not establish
 packaged acceptance or authorize promoting the completion integration.

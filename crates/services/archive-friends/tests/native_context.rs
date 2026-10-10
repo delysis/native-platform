@@ -57,6 +57,10 @@ fn native_context_retains_authored_citations_bytes_scope_cache_and_queued_cancel
         "ordinary prose @unconfigured",
         "Read @a.md or @a/notes",
         "Read @“a”",
+        "> Historical quotation @a",
+        "~~~text\n@a\n~~~",
+        "[A link](https://example.com/@a)",
+        "    @a indented code",
     ] {
         assert!(
             provider
