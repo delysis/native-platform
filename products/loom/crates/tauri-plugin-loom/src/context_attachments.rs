@@ -1695,14 +1695,31 @@ fn select_excerpts(
 
     let mut chosen = Vec::new();
     let mut used = 0_usize;
+    let mut deferred = Vec::new();
     for (_, start, end) in ranked {
         let marker = excerpt_marker(start, end, text.len());
         let addition = marker.len() + end.saturating_sub(start) + usize::from(!chosen.is_empty());
         if used.saturating_add(addition) > budget {
+            deferred.push((start, end));
             continue;
         }
         used += addition;
         chosen.push((start, end));
+    }
+    // Reserve the original marker width before shortening one deferred chunk.
+    // The new end cannot need more digits, and cuts retain whole UTF-8 scalars.
+    for (start, end) in deferred {
+        let overhead =
+            excerpt_marker(start, end, text.len()).len() + usize::from(!chosen.is_empty());
+        let available = budget.saturating_sub(used).saturating_sub(overhead);
+        let mut cut = start + available.min(end - start);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut > start {
+            chosen.push((start, cut));
+            break;
+        }
     }
     chosen.sort_unstable();
 
@@ -2804,6 +2821,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn small_context_budget_keeps_a_receipted_utf8_slice() {
+        let source = "🖋Opening\r\nαβγ source detail\r\n".repeat(300);
+        let (rendered, evidence) = select_excerpts("attachment", &source, "detail", 200);
+        assert!(!rendered.is_empty());
+        assert!(rendered.len() <= 200);
+        assert_eq!(evidence.len(), 1);
+        let slice = &evidence[0];
+        let start = usize::try_from(slice.start_byte).expect("start");
+        let end = usize::try_from(slice.end_byte).expect("end");
+        assert_eq!(
+            slice.source_text_sha256,
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(
+            slice.excerpt_sha256,
+            format!("{:x}", Sha256::digest(&source.as_bytes()[start..end]))
+        );
+        assert!(rendered.ends_with(&source[start..end]));
     }
 
     #[test]
