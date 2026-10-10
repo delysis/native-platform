@@ -14,7 +14,7 @@ afterEach(async () => {
 
 // Real component + real ProseMirror + real WebKit layout. Input is deliberately
 // a component fixture: this does not certify model execution or the App route.
-async function render() {
+async function render(ghostText = ' world again', value = 'hello') {
   const outer = document.createElement('div');
   const pane = document.createElement('section');
   pane.className = 'editor-pane';
@@ -26,9 +26,10 @@ async function render() {
   let insertions = 0;
   let visibleKey = '';
   const editor = mount(LoomEditor, { target: pane, props: {
-    value: 'hello', autofocus: true,
-    ghostText: ' world again', ghostCandidateId: 'run:r1', ghostPresentationKey: 'stream:r1:7',
-    ghostAnchorByteOffset: 5, ghostInsertsOnAccept: true, surfaceKey: 'test:document:revision',
+    value, autofocus: true,
+    ghostText, ghostCandidateId: 'run:r1', ghostPresentationKey: 'stream:r1:7',
+    ghostAnchorByteOffset: new TextEncoder().encode(value).byteLength,
+    ghostInsertsOnAccept: true, surfaceKey: 'test:document:revision',
     onChange: () => { changes += 1; },
     onGhostInsert: () => { insertions += 1; return false; },
     onGhostPresentationRejected: () => {},
@@ -38,7 +39,7 @@ async function render() {
   mounted = editor;
   await expect.poll(() => editor.focusAtDocumentEnd()).toBe(true);
   editor.refreshGhostPresentation();
-  await expect.poll(() => witness.inline?.text).toBe(' world again');
+  await expect.poll(() => witness.inline?.text).toBe(ghostText);
   const glyph = pane.querySelector<HTMLElement>('.loom-visual-ghost')!;
   return { editor, outer, pane, glyph, witness: () => witness,
     visibleKey: () => visibleKey,
@@ -46,6 +47,17 @@ async function render() {
 }
 
 describe('rendered inline ghost witness', () => {
+  it('renders a numeric continuation as literal prose at its exact paragraph caret', async () => {
+    const text = '3. 5-meter-long desk. The office was empty.';
+    const state = await render(text, 'The lantern lit the ');
+    expect(state.glyph.textContent).toBe(text);
+    await expect.poll(state.visibleKey).toBe('stream:r1:7');
+    expect(state.witness().inline?.text).toBe(text);
+    expect(state.pane.querySelector('.ProseMirror')?.textContent).toContain('The lantern lit the ');
+    expect(state.changes()).toBe(0);
+    expect(state.insertions()).toBe(0);
+  });
+
   it('publishes one DOM observation for glyph evidence and visibility authority', async () => {
     const state = await render();
     await expect.poll(state.visibleKey).toBe('stream:r1:7');

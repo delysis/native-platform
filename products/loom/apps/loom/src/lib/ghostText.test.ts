@@ -707,6 +707,19 @@ describe('faithful visual ghost projection', () => {
     expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');
   });
 
+  it('keeps numeric punctuation literal at a proven prose caret without admitting a list at block start', () => {
+    const text = '3. 5-meter-long desk. The office was empty.';
+    const markdown = 'The lantern lit the ';
+    const doc = parseVisualMarkdown(markdown);
+    const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
+    expect(visualGhostTextSafePrefix(text)).toBe(text);
+    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, markdown.length, text)).toBe(true);
+    const empty = parseVisualMarkdown('');
+    expect(visualGhostTextIsFaithfulAtSelection(
+      EditorState.create({ doc: empty, selection: Selection.atEnd(empty) }), '', 0, text
+    )).toBe(false);
+  });
+
   it('never salvages prose from a markup-led stored candidate', () => {
     for (const observed of [
       '<strong>I’m going to college</strong> moreover prose follows.',
