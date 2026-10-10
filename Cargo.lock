@@ -4316,6 +4316,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-preferences"
+version = "0.1.0"
+dependencies = [
+ "atomic-write-file",
+ "loom-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "loom-store"
 version = "0.1.0"
 dependencies = [
