@@ -1,0 +1,11 @@
+# Current integration reference
+
+This candidate is based on native-platform main `a70a7e1383c7a7adecb7fb233d2efdd4e526a7fc`. The reusable EASL implementation is consumed from its canonical repository at `6d7c913a5b8d6874ab56f5168d222dc95964afb9`, including the same Parley and Harfrust revisions. There is no separately editable service copy here.
+
+The native build retains its exact source-hash refusal. Its current App reference is `d400ca552068039ee4861a927bc991af50a4361430032f162a3e10ab8d26b7ca` and its CSS reference is `fcbf399ce3ae2081fb881218b18fd73d1fca3ce410c72af68c931ffaaf26b761`. The production asset extractor compared all nine semantic SVG assets against the earlier reference and found them byte-identical: outline, add, record, Ghost, Loompad, three pane positions, and selector. This binds assets and source provenance; it does not establish frontend parity or packaged acceptance.
+
+The current browser application additionally has richer sidebar selection, renaming and material operations, model download controls, and newer completion/admission behavior. Those services are not supplied by this experimental native adapter. Its recording and assistance controls remain unavailable; Ghost/Loompad icons do not imply inference, cancellation, or promotion authority. The native editor's source/semantic editing, formatting, pane routing and authored-byte behavior are the component scope. The retained Mine configuration consumer is experimental and does not replace the current Tauri workspace or model authorities.
+
+The source checkpoint passed 297 service tests and 120 native adapter component tests. Two manual rendering/performance tests remain unrun and registered with their explicit promotion prohibitions. Strict lint passed for the affected owned packages. Consolidated current-tree validation and native application interaction remain outstanding. No hosted CI, physical IME/VoiceOver, ordinary Loom replacement, frontend parity or distribution acceptance is claimed.
+
+Earlier audit and handoff files are historical evidence and proposals. Their obsolete paths, baseline counts and requested follow-ups do not authorize product changes or establish current qualification. Failed source-reference, compilation and encrypted-storage receipts remain preserved externally.

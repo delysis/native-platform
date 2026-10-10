@@ -5,10 +5,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 mod build_assets;
 
-const REFERENCE: &str =
-    "90349a54061790954cf8a88160e4e29a8a325d4d + Mine a43231626f5deb4ad8f6f08beb36dca40a236270";
-const APP_SHA256: &str = "3d45a082bb51a6f11a06b865e5e6c5a198e1c836dbb58fe3ded8562d931a1725";
-const CSS_SHA256: &str = "033cb7338db5f570352b7ea29f9406ce6c0482c1758cf34c49395cc949339bea";
+const REFERENCE: &str = "native-platform a70a7e1383c7a7adecb7fb233d2efdd4e526a7fc; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9";
+const APP_SHA256: &str = "d400ca552068039ee4861a927bc991af50a4361430032f162a3e10ab8d26b7ca";
+const CSS_SHA256: &str = "fcbf399ce3ae2081fb881218b18fd73d1fca3ce410c72af68c931ffaaf26b761";
 
 fn main() {
     let review = std::env::var_os("CARGO_FEATURE_REVIEW_ONLY").is_some();

@@ -1,13 +1,13 @@
 # Loom interface in EASL — experiment
 
-An incomplete native view of current Loom. The application reference combines
-main `90349a54061790954cf8a88160e4e29a8a325d4d` with Mine draft PR 47 at
-`a43231626f5deb4ad8f6f08beb36dca40a236270`. Mine remains unmerged upstream.
-The combined titlebar matches that main revision byte-for-byte. This experiment
-does not establish frontend parity.
-See [HANDOFF-2026-09-17.md](HANDOFF-2026-09-17.md) for the handoff and prioritized remaining work,
-[PARITY.md](PARITY.md) for the current gaps, and
-[REFERENCE-AUDIT.md](REFERENCE-AUDIT.md) for the obsolete baseline incident.
+An incomplete experimental native view, reconciled against native-platform main
+`a70a7e1383c7a7adecb7fb233d2efdd4e526a7fc`. It consumes canonical EASL at
+`6d7c913a5b8d6874ab56f5168d222dc95964afb9`. See
+[the current integration reference](CURRENT-INTEGRATION-2026-10-10.md) for exact
+source identities, checked components and unqualified behavior. The build binds
+the current source and unchanged titlebar assets; it does not establish frontend
+parity. Earlier handoffs, parity inventories and the reference audit are preserved
+historical evidence, not current completion instructions or acceptance receipts.
 
 `ui/loom.easl` describes geometry, typography, controls and transient view state.
 Native Rust handles shaping, source transactions and application services. Manuscript strings
@@ -21,7 +21,7 @@ in EASL. This experiment consumes selection/replacement policy through `Editing`
 and pointer-hit policy through `HitTesting`, using actual shaped caret stops.
 `Navigation` supplies EASL vertical/page and logical line/document movement;
 its painter has not yet adopted the general atlas library. See the
-[EASL text library target](../../../../crates/services/easl/TEXT-LIBRARY.md).
+[EASL text library target](https://github.com/delysis/easl/blob/6d7c913a5b8d6874ab56f5168d222dc95964afb9/TEXT-LIBRARY.md).
 The current VM boundary above describes this implementation, not a requirement
 that all reusable view algorithms remain in Rust.
 

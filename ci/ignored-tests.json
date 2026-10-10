@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 44,
+  "expected_test_count": 46,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -241,6 +241,22 @@
         "windows"
       ],
       "harness": "libtest"
+    },
+    {
+      "package": "loom-easl-interface",
+      "selector": "lib",
+      "name": "loom_easl_interface",
+      "kinds": [
+        "lib"
+      ],
+      "src_path": "products/loom/experiments/easl-interface/src/lib.rs",
+      "manifest_path": "products/loom/experiments/easl-interface/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
     }
   ],
   "reviewed_build_scripts": [
@@ -278,6 +294,11 @@
       "package": "mom-llama-app",
       "src_path": "products/mom/apps/mom-llama/src-tauri/build.rs",
       "sha256": "487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f"
+    },
+    {
+      "package": "loom-easl-interface",
+      "src_path": "products/loom/experiments/easl-interface/build.rs",
+      "sha256": "e441bbe1ed5456cdc88fbd08d9a9e72bd3972e8cd5e35efeb5d03234c73d8531"
     }
   ],
   "entries": [
@@ -1023,6 +1044,38 @@
       ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test cannot promote peer/network, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "renderer::tests::render_appearance_review",
+      "package": "loom-easl-interface",
+      "target": "lib",
+      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
+      "prerequisite": "requires an isolated EASL_REVIEW_DIRECTORY and local system fonts",
+      "required_environment": [
+        "EASL_REVIEW_DIRECTORY"
+      ],
+      "evidence_class": "synthetic-native-rendering",
+      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "renderer::tests::profile_native_view",
+      "package": "loom-easl-interface",
+      "target": "lib",
+      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
+      "prerequisite": "manual optimized native renderer timing with local system fonts",
+      "required_environment": [],
+      "evidence_class": "synthetic-native-performance",
+      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
       "platforms": [
         "linux",
         "macos",
