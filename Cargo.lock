@@ -5430,6 +5430,7 @@ dependencies = [
  "attachment-native-types",
  "chacha20poly1305",
  "crossbeam-channel",
+ "desktop-generation-policy",
  "desktop-model-defaults",
  "desktop-model-discovery",
  "fs2",

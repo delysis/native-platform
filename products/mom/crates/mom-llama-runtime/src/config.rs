@@ -893,7 +893,18 @@ fn validate_settings_update(values: &BTreeMap<String, Value>) -> Option<Blocker>
             }
         }
     }
-    None
+    let requested_sampling = || {
+        use desktop_generation_policy::{GenerationTask, SamplingOverrides, resolve_sampling};
+        let inherited = SamplingOverrides::from_settings(values)?;
+        let custom = match values.get("customJson") {
+            Some(Value::String(raw)) => SamplingOverrides::from_json(raw)?,
+            _ => SamplingOverrides::default(),
+        };
+        resolve_sampling(GenerationTask::Chat, &[inherited, custom]).map(|_| ())
+    };
+    requested_sampling()
+        .err()
+        .map(|error| Blocker::new("generation_profile_invalid", error.to_string(), Vec::new()))
 }
 
 fn apply_custom_json_sampling(settings: &Settings, sampling: &mut SamplingConfig) {
@@ -1498,6 +1509,20 @@ mod tests {
         )]))
         .expect("unknown custom JSON authority must block");
         assert_eq!(blocker.code, "custom_json_key_not_allowlisted");
+    }
+
+    #[test]
+    fn malformed_sampling_updates_are_rejected_before_persistence() {
+        for (key, value) in [
+            ("temperature", json!("not-a-number")),
+            ("samplers", json!("temperature,unknown-sampler")),
+            ("customJson", json!(r#"{"top_k":"wrong-type"}"#)),
+        ] {
+            assert!(
+                validate_settings_update(&BTreeMap::from([(key.to_owned(), value)])).is_some(),
+                "{key} must not silently inherit defaults"
+            );
+        }
     }
 
     #[test]
