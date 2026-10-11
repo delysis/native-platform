@@ -31,7 +31,7 @@ function fixture(media: ComputeModel['media'] = []) {
 async function open(sharing: ComputeSharing) {
   const target = document.createElement('div'); target.style.width = '250px'; document.body.append(target);
   mounted = mount(ComputeHostControls, { target, props: { cabal, scope, sharing } });
-  await page.getByText('Share idle compute', { exact: true }).click();
+  await page.getByLabelText('Share idle compute', { exact: true }).click();
   return target;
 }
 async function review() {
