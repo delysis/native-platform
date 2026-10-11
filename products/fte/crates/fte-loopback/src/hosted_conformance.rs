@@ -154,23 +154,30 @@ async fn hosted_usage_overflow_has_an_unavailable_public_total() {
         .await;
         assert_eq!(status, StatusCode::OK, "{text}");
         if stream {
-            // The stream's terminal usage projection uses the same checked total.
-            let usage = text
+            let terminal = text
                 .lines()
                 .filter_map(|line| line.strip_prefix("data: "))
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .find_map(|value| value.get("usage").cloned())
-                .expect("terminal usage frame");
-            assert_eq!(usage["prompt_tokens"], u64::MAX);
-            assert_eq!(usage["completion_tokens"], 1);
-            assert_eq!(usage["total_tokens"], Value::Null);
+                .find(|value| value["choices"][0]["finish_reason"] == "stop")
+                .expect("terminal completion frame");
+            assert!(terminal.get("usage").is_none(), "{text}");
         } else {
             let value: Value = serde_json::from_str(&text).expect("public JSON response");
-            assert_eq!(value["usage"]["prompt_tokens"], u64::MAX);
-            assert_eq!(value["usage"]["completion_tokens"], 1);
-            assert_eq!(value["usage"]["total_tokens"], Value::Null);
+            assert!(value.get("usage").is_none(), "{text}");
         }
     }
+    let provider = json!({"status":"completed","output":[],"usage":{"input_tokens":u64::MAX,"output_tokens":1}});
+    let (status, text) = hosted_exchange(
+        "responses",
+        "application/json",
+        provider.to_string().into_bytes(),
+        "/v1/responses",
+        json!({"model":"fixture-model","input":"hello","store":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let response: Value = serde_json::from_str(&text).expect("public response");
+    assert_eq!(response["usage"], Value::Null);
 }
 
 #[tokio::test]

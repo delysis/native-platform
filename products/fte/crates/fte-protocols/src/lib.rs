@@ -1670,11 +1670,13 @@ pub fn openai_chat_json(response: &GatewayResponse) -> Value {
         }
         json!({"index":group.index,"message":message,"finish_reason":openai_finish(&group.finish_reason)})
     }).collect::<Vec<_>>();
-    json!({
+    let mut body = json!({
         "id":format!("chatcmpl_{}", response.id), "object":"chat.completion", "model":response.model,
         "choices":choices, "usage":openai_legacy_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
-    })
+    });
+    omit_unavailable_legacy_usage(&mut body);
+    body
 }
 
 #[must_use]
@@ -1683,11 +1685,22 @@ pub fn openai_completion_json(response: &GatewayResponse) -> Value {
         let text = group.output_indices.iter().filter_map(|index| response.output.get(*index)).map(output_item_text).collect::<String>();
         json!({"index":group.index,"text":text,"finish_reason":openai_finish(&group.finish_reason),"logprobs":Value::Null})
     }).collect::<Vec<_>>();
-    json!({
+    let mut body = json!({
         "id":format!("cmpl_{}", response.id), "object":"text_completion", "model":response.model,
         "choices":choices, "usage":openai_legacy_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
-    })
+    });
+    omit_unavailable_legacy_usage(&mut body);
+    body
+}
+
+fn omit_unavailable_legacy_usage(body: &mut Value) {
+    // CompletionUsage is optional, but its total_tokens field is not nullable.
+    if body.get("usage") == Some(&Value::Null)
+        && let Some(body) = body.as_object_mut()
+    {
+        body.remove("usage");
+    }
 }
 
 fn anthropic_stop(response: &GatewayResponse) -> (&'static str, Option<&str>) {
@@ -2114,10 +2127,14 @@ fn output_item_text(item: &OutputItem) -> String {
 fn openai_usage(usage: &GatewayUsage) -> Value {
     let input = usage.input_tokens.unwrap_or_default();
     let output = usage.output_tokens.unwrap_or_default();
+    let Some(total) = input.checked_add(output) else {
+        // ResponseUsage permits null; retain the original counters in GatewayUsage.
+        return Value::Null;
+    };
     json!({
         "input_tokens":input,
         "output_tokens":output,
-        "total_tokens":input.checked_add(output),
+        "total_tokens":total,
         "input_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2131,10 +2148,13 @@ fn openai_usage(usage: &GatewayUsage) -> Value {
 fn openai_legacy_usage(usage: &GatewayUsage) -> Value {
     let prompt = usage.input_tokens.unwrap_or_default();
     let completion = usage.output_tokens.unwrap_or_default();
+    let Some(total) = prompt.checked_add(completion) else {
+        return Value::Null;
+    };
     json!({
         "prompt_tokens":prompt,
         "completion_tokens":completion,
-        "total_tokens":prompt.checked_add(completion),
+        "total_tokens":total,
         "prompt_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2181,11 +2201,18 @@ mod tests {
                     "completion_tokens",
                 ),
             ] {
-                assert_eq!(body[input_key], input);
-                assert_eq!(body[output_key], output);
-                assert_eq!(body["total_tokens"], json!(total));
-                assert_eq!(body["x_usage_provenance"], "exact");
+                if let Some(total) = total {
+                    assert_eq!(body[input_key], input);
+                    assert_eq!(body[output_key], output);
+                    assert_eq!(body["total_tokens"], total);
+                    assert_eq!(body["x_usage_provenance"], "exact");
+                } else {
+                    assert_eq!(body, Value::Null);
+                }
             }
+            assert_eq!(usage.input_tokens, Some(input));
+            assert_eq!(usage.output_tokens, Some(output));
+            assert_eq!(usage.provenance, UsageProvenance::Exact);
         }
     }
 
