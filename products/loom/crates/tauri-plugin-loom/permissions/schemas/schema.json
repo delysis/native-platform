@@ -313,10 +313,10 @@
           "markdownDescription": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`"
         },
         {
-          "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
+          "description": "Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
           "type": "string",
           "const": "verified-model-download",
-          "markdownDescription": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
+          "markdownDescription": "Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
         },
         {
           "description": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-audio-record-start`\n- `allow-audio-record-stop`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`",

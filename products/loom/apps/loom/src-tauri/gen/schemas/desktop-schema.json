@@ -2289,10 +2289,10 @@
           "markdownDescription": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`\n- `allow-terminal-recover`\n- `allow-terminal-run-peer`"
         },
         {
-          "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
+          "description": "Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
           "type": "string",
           "const": "loom:verified-model-download",
-          "markdownDescription": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
+          "markdownDescription": "Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
         },
         {
           "description": "Enables the application_close command without any pre-configured scope.",
