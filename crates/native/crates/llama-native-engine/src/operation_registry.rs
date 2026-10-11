@@ -162,6 +162,14 @@ impl ActiveRequest {
         self.identity.clone()
     }
 
+    pub(crate) fn is_released(&self) -> bool {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            == RequestPhase::Released
+    }
+
     #[must_use]
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RequestSnapshot {

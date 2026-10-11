@@ -42,7 +42,7 @@ impl AdmissionClock for SystemAdmissionClock {
 }
 
 struct PreemptionWatch {
-    foreground_sequence: u64,
+    foreground: Arc<ActiveRequest>,
     cancelled_at: Duration,
 }
 
@@ -56,6 +56,20 @@ struct AdmissionState {
     disabled: bool,
     admitted: Option<AdmittedSpeculative>,
     preemption: Option<PreemptionWatch>,
+}
+
+impl AdmissionState {
+    fn retire_released_preemption(&mut self) {
+        if self
+            .preemption
+            .as_ref()
+            .is_some_and(|watch| watch.foreground.is_released())
+        {
+            // A rejected or abandoned foreground request never ran. Its
+            // existing executor lease supplies release evidence, not latency.
+            self.preemption = None;
+        }
+    }
 }
 
 pub(crate) struct SpeculativeAdmission {
@@ -88,6 +102,7 @@ impl SpeculativeAdmission {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retire_released_preemption();
         if state.disabled {
             return Err(NativeError::new(
                 NativeErrorCode::QueueFull,
@@ -109,11 +124,12 @@ impl SpeculativeAdmission {
 
     /// Cancel the exact admitted speculative request and bind the first
     /// foreground request responsible for measuring readmission latency.
-    pub(crate) fn preempt_for_foreground(&self, foreground_sequence: u64) -> usize {
+    pub(crate) fn preempt_for_foreground(&self, foreground: Arc<ActiveRequest>) -> usize {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retire_released_preemption();
         if state.preemption.is_some() {
             return 0;
         }
@@ -127,7 +143,7 @@ impl SpeculativeAdmission {
         let cancelled_at = self.clock.now();
         let cancelled = control.cancel_all();
         state.preemption = Some(PreemptionWatch {
-            foreground_sequence,
+            foreground,
             cancelled_at,
         });
         cancelled
@@ -143,7 +159,7 @@ impl SpeculativeAdmission {
         let Some(preemption) = state.preemption.as_ref() else {
             return;
         };
-        if preemption.foreground_sequence != foreground_sequence {
+        if preemption.foreground.identity().sequence != foreground_sequence {
             return;
         }
         let elapsed = self.clock.now().saturating_sub(preemption.cancelled_at);
@@ -157,10 +173,11 @@ impl SpeculativeAdmission {
         if closing {
             return SpeculativeAdmissionStatus::Closing;
         }
-        let state = self
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retire_released_preemption();
         if state.disabled {
             SpeculativeAdmissionStatus::DisabledForResidentFingerprint
         } else if state.admitted.is_some() || state.preemption.is_some() {
