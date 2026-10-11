@@ -181,6 +181,14 @@ mod tests {
                 "unversioned",
                 "CREATE TABLE gateway_responses(id TEXT PRIMARY KEY);",
             ),
+            (
+                "foreign-lookalike",
+                "CREATE TABLE sqliteXmetadata(value TEXT); INSERT INTO sqliteXmetadata VALUES ('preserved');",
+            ),
+            (
+                "foreign-case-lookalike",
+                "CREATE TABLE SQLiteYmetadata(value TEXT); INSERT INTO SQLiteYmetadata VALUES ('preserved');",
+            ),
         ] {
             let path = std::env::temp_dir()
                 .join(format!("fte-store-{label}-{}.sqlite", RequestId::new().0));
