@@ -11,7 +11,6 @@ workspace-document.workspace = true
 atomic-write-file.workspace = true
 fs4.workspace = true
 loom-document = { path = "../loom-document" }
-loom-host = { path = "../loom-host" }
 loom-types = { path = "../loom-types" }
 rusqlite.workspace = true
 serde.workspace = true
@@ -39,7 +38,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 winx = "0.36.4"
 
 [dev-dependencies]
-loom-host = { path = "../loom-host", features = ["test-fixtures"] }
 tempfile.workspace = true
 
 [lints.rust]

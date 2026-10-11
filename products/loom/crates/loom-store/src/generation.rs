@@ -997,38 +997,16 @@ impl ProjectStore {
             }),
             created_at_ms,
         )?;
-        transaction.execute(
-            "INSERT INTO operations(operation_id, operation_kind, metadata_json, created_at_ms)
-             VALUES (?1, 'generate', ?2, ?3)",
-            params![
-                operation_id.to_string(),
-                serde_json::to_string(&json!({
-                    "run_id": run_id,
-                    "terminal_status": status,
-                    "promotable": false,
-                }))?,
-                created_at_ms,
-            ],
+        insert_terminal_evidence_operation(
+            &transaction,
+            operation_id,
+            run_id,
+            run.run_artifact_id,
+            status,
+            token_trace_artifact_id,
+            output_artifact_id,
+            created_at_ms,
         )?;
-        transaction.execute(
-            "INSERT INTO operation_inputs(operation_id, position, artifact_id) VALUES (?1, 0, ?2)",
-            params![operation_id.to_string(), run.run_artifact_id.to_string()],
-        )?;
-        for (position, artifact_id) in [token_trace_artifact_id, output_artifact_id]
-            .into_iter()
-            .enumerate()
-        {
-            transaction.execute(
-                "INSERT INTO operation_outputs(operation_id, position, artifact_id) VALUES (?1, ?2, ?3)",
-                params![
-                    operation_id.to_string(),
-                    i64::try_from(position).map_err(|_| StoreError::CorruptDatabase(
-                        "terminal evidence output position overflow".into()
-                    ))?,
-                    artifact_id.to_string(),
-                ],
-            )?;
-        }
         let event = GenerationTerminalEvent {
             event_id: GenerationEventId::new(),
             run_id,

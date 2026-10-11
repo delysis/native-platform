@@ -5904,7 +5904,6 @@ dependencies = [
  "fs4",
  "libc",
  "loom-document",
- "loom-host",
  "loom-types",
  "rusqlite",
  "rustix 1.1.4",
