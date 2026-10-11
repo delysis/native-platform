@@ -2161,7 +2161,7 @@ impl InspectionState {
             );
             self.issue(
                 error.code,
-                IssueClass::Budget,
+                error.class,
                 IssueSeverity::Blocked,
                 Some(parent.clone()),
                 error.message,
