@@ -1,14 +1,14 @@
 use crate::engine::ValidationBlocker;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use desktop_generation_policy::{GenerationTask, SamplingOverrides, resolve_sampling};
 use llama_native_types::{NativeDevice, SamplingConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
@@ -1015,30 +1015,6 @@ std::thread_local! {
 
 fn data_dir_override() -> Option<PathBuf> {
     DATA_DIR_OVERRIDE.with(|override_path| override_path.borrow().clone())
-}
-
-pub fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
-pub fn read_json_or_default<T>(path: &Path) -> Result<T>
-where
-    T: for<'de> Deserialize<'de> + Default,
-{
-    if !path.exists() {
-        return Ok(T::default());
-    }
-    serde_json::from_str(&fs::read_to_string(path)?)
-        .with_context(|| format!("failed to parse {}", path.display()))
 }
 
 #[cfg(test)]

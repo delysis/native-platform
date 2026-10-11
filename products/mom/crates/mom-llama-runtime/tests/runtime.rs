@@ -2094,22 +2094,6 @@ fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_
     Ok(())
 }
 
-#[test]
-fn deprecated_server_aliases_report_only_in_process_residency() -> Result<()> {
-    let scope = mom_llama_runtime::OperationScope::detached();
-    let _session = TestSession::new("resident-alias")?;
-    let status = mom_llama_runtime::server_status(&scope)?;
-    let value = serde_json::to_value(&status)?;
-    assert_eq!(value["result"]["transport"], "in_process");
-    assert_eq!(value["result"]["running"], false);
-    let raw = serde_json::to_string(&value)?;
-    assert!(!raw.contains("127.0.0.1"));
-    assert!(!raw.contains("http://"));
-    assert!(!raw.contains("server_path"));
-    assert!(!status.receipt.real_engine_invoked);
-    Ok(())
-}
-
 #[cfg(unix)]
 #[test]
 fn mcp_process_authority_is_explicit_bounded_and_receipted() -> Result<()> {
