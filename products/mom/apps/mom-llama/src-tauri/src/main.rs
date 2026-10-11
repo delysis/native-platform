@@ -396,6 +396,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_attachment_library_preview,
         commands::mom_llama_attachment_library_commit,
         commands::mom_llama_information_managed_attachments,
+        commands::mom_llama_information_managed_removals,
         commands::mom_llama_information_search_managed_attachment,
         commands::mom_llama_information_open_managed_citation,
         commands::mom_llama_information_managed_removal_preview,

@@ -164,6 +164,21 @@ manifest, and receipt. The store never opens a source archive during generic
 materialization, and source archives are outside the removal target by
 construction.
 
+The same removal journal retains exact request/receipt identity and, when both
+current two-MiB manifest projection admission and whole encoded 64-KiB intent
+permit it, a canonical-text-free source projection. Otherwise it records explicit
+evidence unavailability without blocking wider valid generic removal. Exact-ID
+and caller-bounded retained-operation reads validate owner, surviving objects and
+saved terminal identity without operation writes or permission repair. Saved
+receipt evidence includes a pending terminal file: its presence does not
+assert settled publication, staging cleanup or product acknowledgement. Every
+surviving original manifest is hash-verified and its full text-free projection
+must equal retained evidence. After that manifest is gone, metadata relies on
+private native journal ownership, not a separate cryptographic origin proof.
+Native products still own renewed consent and narrower producer/policy qualification;
+these reads do not authorize a removal or automatically resume it. Prior
+incompatible fields are refused without migration or rewriting.
+
 ## Attachment canonical-text producer boundary
 
 `information-native-attachment-bridge` is a service adapter downstream of

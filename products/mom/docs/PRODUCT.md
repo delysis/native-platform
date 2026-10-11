@@ -47,8 +47,17 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
 - “Add to Library” re-presents the exact Attachment root, graph, canonical
   artifact, processor policy, text bytes/hash, title, and explicit private-use
   rights through the Attachment-to-Information bridge. Information's active
-  receipt and manifest are the sole discoverability authority; the managed copy
+  receipt and manifest are the active library discoverability authority; the managed copy
   can be searched, cited, and removed independently without changing its source.
+  Retained removals can be reviewed by exact operation ID after restart or
+  consent expiry only when their original text-free qualification evidence fits
+  the current journal budget. Review issues a fresh process-local nonce beside
+  the unchanged original impact; opening/listing never grants or resumes work.
+  Wider metadata and incompatible prior records remain preserved and refused
+  for fresh product recovery. An already qualified live retry stays valid.
+  A saved receipt can still require publication or staging cleanup, so it does
+  not suppress explicit continuation. Requalification checks producer and
+  rights policy; its fingerprint rejects changes observed after a fresh preview.
 - Product state, receipts and cache policy are Rust-owned.
 
 The exact user-supplied therapeutic Persona templates are documented in

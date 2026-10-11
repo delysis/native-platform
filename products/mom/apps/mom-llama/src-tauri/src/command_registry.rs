@@ -96,6 +96,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_library_preview", false, false),
     long("mom_llama_attachment_library_commit", true, false),
     read("mom_llama_information_managed_attachments", false, false),
+    read("mom_llama_information_managed_removals", false, false),
     long(
         "mom_llama_information_search_managed_attachment",
         false,

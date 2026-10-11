@@ -172,6 +172,14 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Refresh attachment library",
     },
     ControlSpec {
+        affordance: "information.managed_removals",
+        command: "mom_llama.information_managed_removals",
+        tauri_command: "mom_llama_information_managed_removals",
+        cli: "app-only; bounded text-free retained removal diagnostics",
+        effect: "mom_llama.effects.information_managed_read.v1",
+        label: "Removals",
+    },
+    ControlSpec {
         affordance: "information.search_managed_attachment",
         command: "mom_llama.information_search_managed_attachment",
         tauri_command: "mom_llama_information_search_managed_attachment",
@@ -2698,6 +2706,7 @@ fn information_library_settings(active: Option<&Conversation>) -> Markup {
     let model_grant = control("information.model_grant");
     let chat_send = control("information.chat_send");
     let managed = control("information.managed_attachments");
+    let removals = control("information.managed_removals");
     let conversation_id = active
         .map(|conversation| conversation.id.as_str())
         .unwrap_or("");
@@ -2792,16 +2801,23 @@ fn information_library_settings(active: Option<&Conversation>) -> Markup {
         }
         section class="settings-card managed-attachment-library" {
             h3 { "Attachment library" }
-            p class="field-help" {
-                "Canonical attachment text is copied into an independently removable, immutable Information representation. The original Attachment graph and source bytes are unchanged."
-            }
             button type="button" class="small-button"
                 data-affordance=(managed.affordance) data-command=(managed.command)
                 data-tauri-command=(managed.tauri_command) data-cli=(managed.cli)
-                data-effect=(managed.effect) data-action="information-managed-refresh" {
-                "Refresh attachment library"
+                data-effect=(managed.effect) data-action="information-managed-refresh"
+                title="Refresh active items and retained removal diagnostics"
+                aria-label="Refresh attachment library and retained removal diagnostics" {
+                (icon_markup("refresh-cw")) "Refresh"
+            }
+            template id="information-managed-icons" {
+                span data-information-icon="review" { (icon_markup("trash-2")) }
+                span data-information-icon="commit" { (icon_markup("check")) }
             }
             div id="information-managed-list" class="information-results" aria-live="polite" {}
+            div id="information-removal-list" class="information-results" aria-live="polite"
+                data-affordance=(removals.affordance) data-command=(removals.command)
+                data-tauri-command=(removals.tauri_command) data-cli=(removals.cli)
+                data-effect=(removals.effect) {}
         }
     }
 }
