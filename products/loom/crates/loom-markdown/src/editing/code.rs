@@ -1,5 +1,7 @@
 //! Literal code editing: only the affected block is replaced. Code delimiters
 //! never enter the view, and inserted fence-like text cannot escape its block.
+use unicode_segmentation::UnicodeSegmentation;
+
 use super::{escape_link_attribute, preferred_newline};
 use crate::transaction::EditorSelection;
 use crate::{Bias, BlockStyle, EditorDocument, Error, NodeKind, Selection};
@@ -97,8 +99,18 @@ impl EditorDocument {
             {
                 return Err(Error::SerializationMismatch);
             }
+            // Insertion or deletion can merge neighboring graphemes. Match
+            // ordinary visual editing: keep the resulting caret after the
+            // merged grapheme without weakening validation of the input range.
+            let caret = projection
+                .text()
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .chain([projection.text().len()])
+                .find(|&i| i >= range.start + inserted.len())
+                .ok_or(Error::InvalidRange)?;
             Ok(Some(EditorSelection::Visual(
-                Selection::caret(range.start + inserted.len()),
+                Selection::caret(caret),
                 Bias::After,
             )))
         })

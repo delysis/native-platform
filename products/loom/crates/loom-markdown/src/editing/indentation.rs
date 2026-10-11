@@ -8,9 +8,9 @@ impl EditorDocument {
         let bytes = self.source().as_bytes();
         let start = bytes[..range.start]
             .iter()
-            .rposition(|byte| *byte == b'\n')
+            .rposition(|byte| matches!(*byte, b'\r' | b'\n'))
             .map_or(0, |index| index + 1);
-        let end = if range.end > range.start && bytes[range.end - 1] == b'\n' {
+        let end = if range.end > range.start && matches!(bytes[range.end - 1], b'\r' | b'\n') {
             range.end - 1
         } else {
             range.end
@@ -30,10 +30,22 @@ impl EditorDocument {
             if length != 0 {
                 transaction.replace(line..line + length, "")?;
             }
-            let Some(offset) = bytes[line..end].iter().position(|byte| *byte == b'\n') else {
+            let Some(offset) = bytes[line..end]
+                .iter()
+                .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            else {
                 break;
             };
             line += offset + 1;
+            // CRLF is one physical ending, not an empty intervening line.
+            if bytes[line - 1] == b'\r' && bytes.get(line) == Some(&b'\n') {
+                line += 1;
+            }
+            // An exclusive selection ending at the next line's start must not
+            // outdent that line, including when its preceding ending is CRLF.
+            if line > end {
+                break;
+            }
         }
         if transaction.edits().is_empty() {
             return Ok(false);
