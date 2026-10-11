@@ -2897,6 +2897,7 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      documentEpoch += 1;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);
       window.clearInterval(loompadIdleTimer);
@@ -7821,7 +7822,7 @@
   }
 
   function scheduleSave(): void {
-    if (!desktop || !document) return;
+    if (!componentMounted || !desktop || !document) return;
     if (cabalEditor) return;
     if (saveTimer !== undefined) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => void saveNow(), saveDelayMs);
@@ -8036,6 +8037,7 @@
   function scheduleDraftJournal(delay = draftIntervalMs): void {
     if (cabalEditor) return;
     if (
+      !componentMounted ||
       !desktop ||
       !project ||
       !document ||
@@ -8051,6 +8053,7 @@
   }
 
   async function persistTransientDraft(): Promise<boolean> {
+    if (!componentMounted) return false;
     if (cabalEditor) return cabalEditor.flush();
     if (draftInFlight) {
       return draftInFlight;
@@ -8178,9 +8181,11 @@
   }
 
   async function saveNow(): Promise<void> {
+    if (!componentMounted) return;
     if (cabalEditor) { await cabalEditor.flush(); return; }
     if (!document || !desktop || editVersion === savedVersion) return;
-    if (!(await flushDraftJournal())) return;
+    const epoch = documentEpoch;
+    if (!(await flushDraftJournal()) || !componentMounted || documentEpoch !== epoch) return;
     if (saveInFlight) {
       saveQueued = true;
       await saveInFlight;

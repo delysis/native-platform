@@ -1,7 +1,8 @@
 import { mount, tick, unmount } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
-import type { OpenDocument, ProjectSnapshot } from './types';
+import type { CommandReceipt, OpenDocument, ProjectSnapshot, TransientDraftWriteReceipt } from './types';
+import { currentProjectSession } from './ipc';
 import type { MaterialEntry } from './materials';
 import { workspaceCopyDestination } from './workspaceTree';
 import '../app.css';
@@ -23,8 +24,16 @@ import App from '../App.svelte';
 let mounted: ReturnType<typeof mount> | null = null;
 let oldStorage: Array<[string, string]> = [];
 let oldNative: PropertyDescriptor | undefined;
+let disposeFixture: (() => Promise<void>) | null = null;
+interface HeldDraft {
+  args: Record<string, unknown>;
+  resolve: (receipt: TransientDraftWriteReceipt) => void;
+  reject: (error: unknown) => void;
+}
+const fixtureDisposed = { code: 'fixture_disposed', message: 'The fixture transport has been disposed', retryable: false };
 afterEach(async () => {
   if (mounted) await unmount(mounted); mounted = null;
+  await disposeFixture?.(); disposeFixture = null;
   transport.listeners.clear(); transport.invoke.mockReset();
   if (oldNative) Object.defineProperty(window, '__TAURI_INTERNALS__', oldNative); else Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
   localStorage.clear(); for (const [key, value] of oldStorage) localStorage.setItem(key, value);
@@ -59,6 +68,15 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
   const materials: MaterialEntry[] = [{ id: 'material-' + 'a'.repeat(64), name: 'Paper.pdf', reference: '@"material-' + 'a'.repeat(64) + '"', kind: 'attachment', retention: 'ordinary',
     pinned: false, available: true, source_path: '/external/Paper.pdf', workspace_path: placement, attachment_id: 'b'.repeat(64), metadata_revision: 'd'.repeat(64) }];
   let draftVersion = 0;
+  let fixtureClosed = false;
+  const heldDrafts = new Set<HeldDraft>();
+  disposeFixture = async () => {
+    fixtureClosed = true;
+    for (const held of [...heldDrafts]) held.reject(fixtureDisposed);
+    // Keep the native fixture installed until the unchanged session FIFO drains.
+    const drained = await currentProjectSession();
+    expect(drained.project_id).toBe(project.project_id);
+  };
   const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
   transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
     calls.push({ command, args });
@@ -99,11 +117,20 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
       // Existing dirty-editor cases keep timer-driven persistence pending. Only
       // the exact authorized edit below receives a mock transport receipt.
       case 'plugin:loom|document_draft_upsert': {
-        if (allowedDraft === null) return new Promise(() => {});
+        if (fixtureClosed) throw fixtureDisposed;
+        if (allowedDraft === null) return new Promise<TransientDraftWriteReceipt>((resolve, reject) => {
+          const held: HeldDraft = {
+            args: { ...args },
+            resolve: receipt => { heldDrafts.delete(held); resolve(receipt); },
+            reject: error => { heldDrafts.delete(held); reject(error); }
+          };
+          heldDrafts.add(held);
+        });
         // Same exact-byte draft transport fixture as appCompletion.browser.test.
         // It journals only the explicitly authorized user edit, never a rename.
         expect(args.text).toBe(allowedDraft); expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
         const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(allowedDraft))), byte => byte.toString(16).padStart(2, '0')).join('');
+        if (fixtureClosed) throw fixtureDisposed;
         return { document_id: args.documentId, source_revision_id: args.sourceRevisionId, blob_id: hash,
           version: String(++draftVersion), kind: args.kind, updated_at_unix_ms: Date.now(), replayed: false };
       }
@@ -117,7 +144,7 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
     await expect.element(page.getByRole('textbox', { name: 'Message', exact: true })).toBeVisible();
   }
   await page.getByRole('button', { name: 'Open manuscript outline', exact: true }).click();
-  return { calls, project, opened, materials };
+  return { calls, project, opened, materials, heldDrafts, retireFixture: () => { fixtureClosed = true; } };
 }
 
 it('missing bookmark has readable disambiguated names, exact path tooltip and a handled remove menu without native calls', async () => {
@@ -294,4 +321,116 @@ it('removing a source opened through its sidebar row closes that same source vie
   expect(removed).toHaveLength(1); expect(removed[0].args.id).toBe(before.id);
   expect(removed[0].args.expectedMetadataRevision).toBe(before.metadata_revision);
   expect(calls.some(call => /document_(rename|checkpoint|delete)|workspace_copy_files/.test(call.command))).toBe(false);
+});
+
+
+async function acceptHeldDraft(held: HeldDraft, text: string, sourceRevisionId: string): Promise<void> {
+  expect(held.args).toMatchObject({ projectId: 'project-1', sessionId: 'session-1', documentId: 'document-1',
+    relativePath: 'Draft.md', text, kind: 'prose', sourceRevisionId });
+  const blob = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, '0')).join('');
+  held.resolve({ document_id: 'document-1', source_revision_id: sourceRevisionId, blob_id: blob,
+    version: String(BigInt(String(held.args.expectedVersion)) + 1n), kind: 'prose', updated_at_unix_ms: Date.now(), replayed: false });
+}
+
+it.each(['success', 'contention'] as const)('mounted persistence remains live; late %s cannot create work after teardown, including a waiting Save', async outcome => {
+  const { calls, project, opened, heldDrafts, retireFixture } = await setup();
+  const liveText = 'Original manuscript plus live edit';
+  const lateText = liveText + ' plus teardown edit';
+  const nativeInvoke = transport.invoke.getMockImplementation()!;
+  transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
+    if (command !== 'plugin:loom|document_checkpoint') return nativeInvoke(command, args);
+    calls.push({ command, args });
+    if (args.text !== liveText) throw { code: 'fixture_unexpected_checkpoint', message: 'No checkpoint is authorized after teardown', retryable: false };
+    expect(args).toMatchObject({ projectId: project.project_id, sessionId: project.session_id,
+      documentId: opened.summary.document_id, relativePath: 'Draft.md', kind: 'prose',
+      expectedRevisionId: opened.summary.revision_id, expectedVisibleBlobId: opened.visible_blob_id, draftVersion: '1' });
+    const blob = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(liveText))), byte => byte.toString(16).padStart(2, '0')).join('');
+    return { command_id: String(args.commandId), command_kind: 'checkpoint', project_id: project.project_id,
+      schema_version: 1, source_revision_id: opened.summary.revision_id, result_revision_id: 'checkpoint-1', result_blob_id: blob,
+      request_fingerprint: null, replayed: false, visible_projection: { status: 'applied' }, artifact_ids: [], completed_at_unix_ms: Date.now() } satisfies CommandReceipt;
+  });
+  const editor = document.querySelector<HTMLElement>('.ProseMirror')!;
+  await tick(); await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  editor.focus(); await userEvent.keyboard('{End} plus live edit');
+  await expect.poll(() => editor.textContent).toBe(liveText);
+  // This reaches the default held-draft branch through actual timer/editor/IPC work.
+  await expect.poll(() => heldDrafts.size).toBe(1);
+  expect(calls.filter(call => call.command === 'plugin:loom|document_draft_upsert')).toHaveLength(1);
+  expect(key(document.body, 's', { metaKey: true }).defaultPrevented).toBe(true);
+  await tick();
+  expect(calls.filter(call => call.command === 'plugin:loom|document_checkpoint')).toHaveLength(0);
+  if (outcome === 'contention') {
+    [...heldDrafts][0].reject({ code: 'project_busy', message: 'Owned fixture contention before write admission', retryable: true });
+    await expect.poll(() => calls.filter(call => call.command === 'plugin:loom|document_draft_upsert').length).toBe(2);
+    expect(heldDrafts.size).toBe(1);
+    // A mounted definite refusal must still retry and permit an explicit Save.
+    expect(key(document.body, 's', { metaKey: true }).defaultPrevented).toBe(true);
+  }
+  await acceptHeldDraft([...heldDrafts][0], liveText, 'revision-1');
+  await expect.poll(() => calls.filter(call => call.command === 'plugin:loom|document_checkpoint').length).toBe(1);
+  await currentProjectSession(); await tick();
+  await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  expect(editor.textContent).toBe(liveText);
+
+  editor.focus(); await userEvent.keyboard('{End} plus teardown edit');
+  await expect.poll(() => editor.textContent).toBe(lateText);
+  await expect.poll(() => heldDrafts.size).toBe(1);
+  const held = [...heldDrafts][0];
+  expect(held.args.text).toBe(lateText); expect(held.args.sourceRevisionId).toBe('checkpoint-1');
+  const before = { drafts: calls.filter(call => call.command === 'plugin:loom|document_draft_upsert').length,
+    checkpoints: calls.filter(call => call.command === 'plugin:loom|document_checkpoint').length };
+  expect(key(document.body, 's', { metaKey: true }).defaultPrevented).toBe(true);
+  await tick();
+  expect(calls.filter(call => call.command === 'plugin:loom|document_checkpoint')).toHaveLength(before.checkpoints);
+  await unmount(mounted!); mounted = null;
+  retireFixture();
+  expect(editor.isConnected).toBe(false);
+  const timerWindow: Pick<Window, 'setTimeout' | 'clearTimeout'> = window;
+  const postUnmountTimers: Array<{ handle: ReturnType<Window['setTimeout']>; delay: number }> = [];
+  const schedule = timerWindow.setTimeout.bind(timerWindow);
+  const timerObservation = vi.spyOn(timerWindow, 'setTimeout').mockImplementation((handler, delay, ...args) => {
+    const handle = schedule(handler, delay, ...args);
+    if (delay !== undefined && [750, 900, 200, 250].includes(delay)) postUnmountTimers.push({ handle, delay });
+    return handle;
+  });
+  try {
+    if (outcome === 'success') await acceptHeldDraft(held, lateText, 'checkpoint-1');
+    else held.reject({ code: 'project_busy', message: 'Owned fixture late contention before write admission', retryable: true });
+    // Keep real transport and FIFO alive through the late continuation. A frame
+    // drains Promise continuations; the next FIFO read observes any new command.
+    await currentProjectSession(); await tick();
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    await currentProjectSession(); await tick();
+    expect({ timerDelays: postUnmountTimers.map(timer => timer.delay),
+      drafts: calls.filter(call => call.command === 'plugin:loom|document_draft_upsert').length,
+      checkpoints: calls.filter(call => call.command === 'plugin:loom|document_checkpoint').length
+    }, 'settled late result must not resurrect renderer timers, drafts or a waiting checkpoint').toEqual({
+      timerDelays: [], drafts: before.drafts, checkpoints: before.checkpoints
+    });
+    expect(heldDrafts.size).toBe(0);
+  } finally {
+    // Preserve the failed assertion; retire only timer handles observed in this
+    // dead-view interval so an expected BEFORE failure cannot poison the next case.
+    for (const timer of postUnmountTimers) timerWindow.clearTimeout(timer.handle);
+    timerObservation.mockRestore();
+    await disposeFixture?.();
+  }
+});
+
+
+it('teardown settles an actually admitted fixture draft and drains queued session reads without resetting IPC', async () => {
+  const { heldDrafts, project } = await setup();
+  const editor = document.querySelector<HTMLElement>('.ProseMirror')!;
+  await tick(); await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  editor.focus(); await userEvent.keyboard('{End} plus held fixture edit');
+  await expect.poll(() => editor.textContent).toBe('Original manuscript plus held fixture edit');
+  await expect.poll(() => heldDrafts.size).toBe(1);
+  let readSettled = false;
+  const queued = currentProjectSession().then(value => { readSettled = true; return value; });
+  await tick(); expect(readSettled).toBe(false);
+  await unmount(mounted!); mounted = null;
+  await disposeFixture?.();
+  expect((await queued).project_id).toBe(project.project_id);
+  expect(heldDrafts.size).toBe(0);
+  expect((await currentProjectSession()).project_id).toBe(project.project_id);
 });
