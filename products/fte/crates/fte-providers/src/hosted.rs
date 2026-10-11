@@ -1747,6 +1747,16 @@ fn anthropic_messages_from_items(
                         "assistant",
                         vec![json!({"type":"thinking","thinking":thinking,"signature":signature})],
                     );
+                } else if summary.is_empty()
+                    && let Some(Value::String(data)) = opaque_continuation
+                        .as_ref()
+                        .and_then(|opaque| opaque.get("redacted_thinking"))
+                {
+                    append_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        vec![json!({"type":"redacted_thinking","data":data})],
+                    );
                 } else if !summary.is_empty() {
                     return Err(capability_error(
                         request_id,

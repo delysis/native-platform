@@ -1944,20 +1944,7 @@ fn anthropic_output_blocks(item: &OutputItem) -> Vec<Value> {
     match item {
         OutputItem::Message { content, .. } => content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(json!({"type":"text","text":text})),
-                ContentBlock::Thinking { text, signature } => Some(json!({
-                    "type":"thinking",
-                    "thinking":text,
-                    "signature":signature,
-                })),
-                ContentBlock::RedactedThinking { data } => {
-                    Some(json!({"type":"redacted_thinking","data":data}))
-                }
-                ContentBlock::Image { .. }
-                | ContentBlock::Audio { .. }
-                | ContentBlock::Document { .. } => None,
-            })
+            .filter_map(anthropic_content_block_json)
             .collect(),
         OutputItem::FunctionCall {
             call_id,
@@ -1970,9 +1957,16 @@ fn anthropic_output_blocks(item: &OutputItem) -> Vec<Value> {
             "name":name,
             "input":arguments,
         })],
-        OutputItem::Reasoning { summary, .. } => {
-            vec![json!({"type":"thinking","thinking":summary.join("\n"),"signature":Value::Null})]
-        }
+        OutputItem::Reasoning {
+            summary,
+            opaque_continuation,
+            ..
+        } => anthropic_content_block_json(&anthropic_reasoning_part(
+            summary,
+            opaque_continuation.as_ref(),
+        ))
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -2362,15 +2356,8 @@ impl AnthropicStreamEncoder {
         let Some(start) = anthropic_content_block_start(part) else {
             return;
         };
-        let completed = match part {
-            ContentBlock::Text { text } => json!({"type":"text","text":text}),
-            ContentBlock::Thinking { text, signature } => {
-                json!({"type":"thinking","thinking":text,"signature":signature})
-            }
-            ContentBlock::RedactedThinking { data } => {
-                json!({"type":"redacted_thinking","data":data})
-            }
-            _ => return,
+        let Some(completed) = anthropic_content_block_json(part) else {
+            return;
         };
         self.complete_block(key, start, completed, events);
     }
@@ -2452,6 +2439,21 @@ fn anthropic_reasoning_part(summary: &[String], opaque: Option<&Value>) -> Conte
                 .and_then(|value| value.get("signature"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+        }
+    }
+}
+
+fn anthropic_content_block_json(part: &ContentBlock) -> Option<Value> {
+    match part {
+        ContentBlock::Text { text } => Some(json!({"type":"text","text":text})),
+        ContentBlock::Thinking { text, signature } => {
+            Some(json!({"type":"thinking","thinking":text,"signature":signature}))
+        }
+        ContentBlock::RedactedThinking { data } => {
+            Some(json!({"type":"redacted_thinking","data":data}))
+        }
+        ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::Document { .. } => {
+            None
         }
     }
 }
