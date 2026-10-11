@@ -1,6 +1,6 @@
 //! Fixed native metadata observations, never a renderer-selected filesystem API.
-//! Legacy bindings are observed and archived through native descriptors;
-//! workspace configuration remains owned by the project store.
+//! Retired binding files are refused in place through native descriptors;
+//! current workspace configuration remains owned by the project store.
 use std::path::Path;
 
 #[cfg(unix)]
@@ -10,14 +10,11 @@ use super::{Result, invalid};
 #[cfg(unix)]
 mod native {
     use std::fs::File;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
 
-    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, unlinkat};
-
-    #[cfg(test)]
-    use rustix::fs::renameat;
+    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, statat};
 
     use super::{MAX_STATE_BYTES, Path, Result, digest, invalid};
 
@@ -30,18 +27,6 @@ mod native {
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC)
         .union(OFlags::NONBLOCK);
-
-    #[derive(Debug)]
-    pub(crate) struct Snapshot {
-        pub(crate) bytes: Vec<u8>,
-        pub(crate) revision: String,
-        stored_bytes: Vec<u8>,
-        // Retaining descriptors prevents inode reuse within a commit.
-        root: File,
-        sidecar: File,
-        directory: File,
-        file: File,
-    }
 
     fn directory(path: &Path) -> Result<File> {
         let mut components = path.components();
@@ -109,10 +94,6 @@ mod native {
             metadata.ctime(),
             metadata.ctime_nsec()
         ))
-    }
-
-    fn read_stable(file: &mut File) -> Result<(Vec<u8>, String)> {
-        read_stable_bounded(file, stored_limit())
     }
 
     fn read_stable_bounded(file: &mut File, maximum: u64) -> Result<(Vec<u8>, String)> {
@@ -194,159 +175,18 @@ mod native {
         }
     }
 
-    impl Snapshot {
-        pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
-            // A missing project/sidecar is not an empty material collection.
-            let root = directory(path)?;
-            let sidecar = child(&root, ".loom", DIRECTORY)?;
-            let Some(directory) = optional_child(&sidecar, "materials", DIRECTORY)? else {
-                return Ok(None);
-            };
-            // NONBLOCK prevents a substituted FIFO/device from hanging a read.
-            let Some(mut file) = optional_child(&directory, NAME, READ_FILE)? else {
-                return Ok(None);
-            };
-            let (bytes, file_stamp) = read_stable(&mut file)?;
-            let witness = format!(
-                "{}:{}:{}:{file_stamp}",
-                identity(&root)?,
-                identity(&sidecar)?,
-                identity(&directory)?
-            );
-            let revision = digest(&[witness.as_bytes(), b"\0", &bytes].concat());
-            let codec = crate::private_sidecar::PayloadCodec::open(path)?;
-            let namespace = ".loom/materials/bindings.json";
-            let stored_bytes = bytes;
-            let bytes = codec.open_bytes(namespace, &stored_bytes, MAX_STATE_BYTES)?;
-            let value = Self {
-                bytes,
-                revision,
-                stored_bytes,
-                root,
-                sidecar,
-                directory,
-                file,
-            };
-            value.ensure_paths(path)?;
-            Ok(Some(value))
-        }
-
-        fn ensure_paths(&self, path: &Path) -> Result<()> {
-            let root = directory(path)?;
-            let sidecar = child(&root, ".loom", DIRECTORY)?;
-            let directory = child(&sidecar, "materials", DIRECTORY)?;
-            let file = child(&directory, NAME, READ_FILE)?;
-            if !same_file(&self.root, &root)?
-                || !same_file(&self.sidecar, &sidecar)?
-                || !same_file(&self.directory, &directory)?
-                || !same_file(&self.file, &file)?
-            {
-                return Err(invalid("material metadata target was replaced"));
-            }
-            Ok(())
-        }
-
-        pub(crate) fn ensure_current(&self, root: &Path) -> Result<()> {
-            self.ensure_paths(root)?;
-            let current =
-                Self::open(root)?.ok_or_else(|| invalid("material metadata disappeared"))?;
-            if current.revision != self.revision {
-                return Err(invalid("material metadata changed before commit"));
-            }
-            Ok(())
-        }
-
-        /// Retain exactly the observed generation before retiring its old name.
-        /// Both installation and unlink stay in the held native directory.
-        pub(crate) fn preserve(&self, root: &Path) -> Result<()> {
-            self.ensure_current(root)?;
-            let name = format!("bindings-{}.json", digest(&self.stored_bytes));
-            match openat(
-                &self.directory,
-                name.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            ) {
-                Ok(descriptor) => {
-                    let mut file = File::from(descriptor);
-                    file.write_all(&self.stored_bytes)?;
-                    file.sync_all()?;
-                }
-                Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => return Err(std::io::Error::from(error).into()),
-            }
-            let mut retained = child(&self.directory, name.as_str(), READ_FILE)?;
-            if read_stable(&mut retained)?.0 != self.stored_bytes {
-                return Err(invalid("preserved material metadata identity mismatch"));
-            }
-            self.directory.sync_all()?;
-            self.ensure_current(root)?;
-            unlinkat(&self.directory, NAME, AtFlags::empty()).map_err(std::io::Error::from)?;
-            self.directory.sync_all()?;
-            Ok(())
-        }
-
-        #[cfg(test)]
-        pub(crate) fn replace(&self, root: &Path, bytes: &[u8]) -> Result<Self> {
-            self.replace_before_commit(root, bytes, || Ok(()))
-        }
-
-        #[cfg(test)]
-        fn replace_before_commit(
-            &self,
-            root: &Path,
-            bytes: &[u8],
-            before_commit: impl FnOnce() -> Result<()>,
-        ) -> Result<Self> {
-            if bytes.len() as u64 > MAX_STATE_BYTES {
-                return Err(invalid("workspace material metadata limit reached"));
-            }
-            self.ensure_current(root)?;
-            let codec = crate::private_sidecar::PayloadCodec::open(root)?;
-            let stored = codec.seal(".loom/materials/bindings.json", bytes)?;
-            let temporary = format!(".bindings-{}.pending", loom_types::CommandId::new());
-            let descriptor = openat(
-                &self.directory,
-                temporary.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .map_err(std::io::Error::from)?;
-            let mut file = File::from(descriptor);
-            let result = (|| {
-                file.write_all(&stored)?;
-                file.sync_all()?;
-                before_commit()?;
-                self.ensure_current(root)?;
-                let mut prepared = child(&self.directory, temporary.as_str(), READ_FILE)?;
-                let (prepared_bytes, _) = read_stable(&mut prepared)?;
-                if !same_file(&file, &prepared)? || prepared_bytes != stored {
-                    return Err(invalid("prepared material metadata was replaced"));
-                }
-                // One atomic replacement in the held private directory. The
-                // project lease/WRITE_LOCK serialize authorized metadata writers;
-                // no promise of CAS against an uncooperative private-store writer.
-                renameat(&self.directory, temporary.as_str(), &self.directory, NAME)
-                    .map_err(std::io::Error::from)?;
-                self.directory.sync_all()?;
-                let result = Self::open(root)?
-                    .ok_or_else(|| invalid("committed material metadata disappeared"))?;
-                if !same_file(&file, &result.file)? || result.bytes != bytes {
-                    return Err(invalid(
-                        "material metadata commit needs a fresh observation",
-                    ));
-                }
-                Ok(result)
-            })();
-            // Ordinary failures clean only our still-owned private staging file.
-            // Unknown replacements are retained. A process crash can leave a
-            // hidden orphan, which is never read as committed metadata/evidence.
-            if let Ok(pending) = child(&self.directory, temporary.as_str(), READ_FILE)
-                && same_file(&file, &pending).unwrap_or(false)
-            {
-                let _ = unlinkat(&self.directory, temporary.as_str(), AtFlags::empty());
-            }
-            result
+    /// Presence is enough to refuse the retired format. Never open, decode,
+    /// archive or unlink its bytes, including a substituted special file.
+    pub(crate) fn refuse_legacy_bindings(path: &Path) -> Result<()> {
+        let root = directory(path)?;
+        let sidecar = child(&root, ".loom", DIRECTORY)?;
+        let Some(directory) = optional_child(&sidecar, "materials", DIRECTORY)? else {
+            return Ok(());
+        };
+        match statat(&directory, NAME, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Err(invalid("retired material bindings are unsupported")),
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(std::io::Error::from(error).into()),
         }
     }
 
@@ -359,66 +199,8 @@ mod native {
         fn fixture() -> tempfile::TempDir {
             let parent = std::env::temp_dir().canonicalize().unwrap();
             let root = tempfile::tempdir_in(parent).unwrap();
-            fs::create_dir_all(root.path().join(".loom/materials")).unwrap();
-            fs::write(
-                root.path().join(".loom/materials/bindings.json"),
-                b"original",
-            )
-            .unwrap();
+            fs::create_dir(root.path().join(".loom")).unwrap();
             root
-        }
-
-        #[test]
-        fn migration_preserves_observed_bytes_and_refuses_replaced_or_forged_archives() -> Result<()>
-        {
-            let root = fixture();
-            let snapshot = Snapshot::open(root.path())?.expect("legacy metadata exists");
-            let bindings = root.path().join(".loom/materials/bindings.json");
-            let archive = root
-                .path()
-                .join(".loom/materials")
-                .join(format!("bindings-{}.json", digest(b"original")));
-            fs::write(&archive, b"forged")?;
-            assert!(snapshot.preserve(root.path()).is_err());
-            assert_eq!(fs::read(&bindings)?, b"original");
-            assert_eq!(fs::read(&archive)?, b"forged");
-            fs::remove_file(&archive)?;
-            fs::rename(&bindings, bindings.with_extension("saved"))?;
-            fs::write(&bindings, b"original")?;
-            assert!(snapshot.preserve(root.path()).is_err());
-            assert!(!archive.exists());
-            let fresh = Snapshot::open(root.path())?.expect("replacement metadata exists");
-            fresh.preserve(root.path())?;
-            assert_eq!(fs::read(&archive)?, b"original");
-            assert!(!bindings.exists());
-            Ok(())
-        }
-
-        #[test]
-        fn encrypted_migration_preserves_ciphertext_and_authenticates_before_adoption() -> Result<()>
-        {
-            let root = fixture();
-            let vault = desktop_vault::ProjectVault::initialize_with_key(root.path(), [41; 32])
-                .map_err(|error| invalid(error.to_string()))?;
-            let namespace = ".loom/materials/bindings.json";
-            let plaintext = b"synthetic private migration sentinel";
-            let stored = vault
-                .seal(namespace, plaintext)
-                .map_err(|error| invalid(error.to_string()))?;
-            let path = root.path().join(namespace);
-            fs::write(&path, &stored)?;
-            let snapshot = Snapshot::open(root.path())?.expect("encrypted metadata exists");
-            assert_eq!(snapshot.bytes, plaintext);
-            snapshot.preserve(root.path())?;
-            let archive = root
-                .path()
-                .join(".loom/materials")
-                .join(format!("bindings-{}.json", digest(&stored)));
-            assert_eq!(fs::read(archive)?, stored);
-            assert!(!path.exists());
-            fs::write(&path, plaintext)?;
-            assert!(Snapshot::open(root.path()).is_err());
-            Ok(())
         }
 
         #[test]
@@ -455,167 +237,15 @@ mod native {
             assert!(WorkspaceSnapshot::open(root.path()).is_err());
             Ok(())
         }
-
-        #[test]
-        fn replaced_same_bytes_and_in_place_edits_are_stale() {
-            let root = fixture();
-            let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-            let path = root.path().join(".loom/materials/bindings.json");
-            fs::rename(&path, path.with_extension("saved")).unwrap();
-            fs::write(&path, b"original").unwrap();
-            assert!(snapshot.replace(root.path(), b"renamed").is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"original");
-            let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-            fs::write(&path, b"external").unwrap();
-            assert!(snapshot.replace(root.path(), b"renamed").is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"external");
-        }
-
-        #[test]
-        fn commit_failure_and_racing_replacement_preserve_old_and_foreign_bytes() {
-            for replace in [false, true] {
-                let root = fixture();
-                let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-                let path = root.path().join(".loom/materials/bindings.json");
-                assert!(
-                    snapshot
-                        .replace_before_commit(root.path(), b"renamed", || {
-                            if !replace {
-                                return Err(invalid("injected pre-commit failure"));
-                            }
-                            fs::rename(&path, path.with_extension("saved"))?;
-                            fs::write(&path, b"foreign")?;
-                            Ok(())
-                        })
-                        .is_err()
-                );
-                assert_eq!(
-                    fs::read(path).unwrap(),
-                    if replace {
-                        &b"foreign"[..]
-                    } else {
-                        &b"original"[..]
-                    }
-                );
-            }
-        }
-
-        #[test]
-        fn symlink_and_parent_replacement_never_write_the_destination() {
-            for component in [".loom", ".loom/materials", ".loom/materials/bindings.json"] {
-                let root = fixture();
-                let outside = fixture();
-                let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-                let path = root.path().join(component);
-                fs::rename(&path, path.with_extension("saved")).unwrap();
-                symlink(outside.path().join(component), &path).unwrap();
-                assert!(snapshot.replace(root.path(), b"renamed").is_err());
-                assert_eq!(
-                    fs::read(outside.path().join(".loom/materials/bindings.json")).unwrap(),
-                    b"original"
-                );
-            }
-        }
-
-        #[test]
-        fn directory_swap_during_prepare_rejects_commit_without_redirecting_writes() {
-            let root = fixture();
-            let outside = fixture();
-            let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-            let parent = root.path().join(".loom/materials");
-            assert!(
-                snapshot
-                    .replace_before_commit(root.path(), b"renamed", || {
-                        fs::rename(&parent, parent.with_extension("saved"))?;
-                        symlink(outside.path().join(".loom/materials"), &parent)?;
-                        Ok(())
-                    })
-                    .is_err()
-            );
-            assert_eq!(
-                fs::read(outside.path().join(".loom/materials/bindings.json")).unwrap(),
-                b"original"
-            );
-            assert_eq!(
-                fs::read(parent.with_extension("saved").join("bindings.json")).unwrap(),
-                b"original"
-            );
-        }
-
-        #[test]
-        fn replaced_prepared_file_and_hardlinked_bindings_fail_closed() {
-            let root = fixture();
-            let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-            assert!(
-                snapshot
-                    .replace_before_commit(root.path(), b"renamed", || {
-                        for entry in fs::read_dir(root.path().join(".loom/materials"))? {
-                            let entry = entry?;
-                            if entry.file_name().to_string_lossy().ends_with(".pending") {
-                                fs::rename(entry.path(), entry.path().with_extension("saved"))?;
-                                fs::write(entry.path(), b"foreign")?;
-                            }
-                        }
-                        Ok(())
-                    })
-                    .is_err()
-            );
-            let path = root.path().join(".loom/materials/bindings.json");
-            assert_eq!(fs::read(&path).unwrap(), b"original");
-            fs::hard_link(&path, root.path().join("outside-link")).unwrap();
-            assert!(Snapshot::open(root.path()).is_err());
-            assert_eq!(
-                fs::read(root.path().join("outside-link")).unwrap(),
-                b"original"
-            );
-        }
-
-        #[test]
-        fn commit_is_readable_on_reopen_and_old_observations_cannot_replay() {
-            let root = fixture();
-            let snapshot = Snapshot::open(root.path()).unwrap().unwrap();
-            let committed = snapshot.replace(root.path(), b"renamed").unwrap();
-            assert_ne!(snapshot.revision, committed.revision);
-            assert!(snapshot.replace(root.path(), b"another name").is_err());
-            drop(committed);
-            assert_eq!(
-                Snapshot::open(root.path()).unwrap().unwrap().bytes,
-                b"renamed"
-            );
-        }
     }
 }
 
 #[cfg(unix)]
-pub(crate) use native::{Snapshot, WorkspaceSnapshot};
+pub(crate) use native::{WorkspaceSnapshot, refuse_legacy_bindings};
 
 #[cfg(not(unix))]
-#[derive(Debug)]
-pub(crate) struct Snapshot {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) revision: String,
-}
-#[cfg(not(unix))]
-impl Snapshot {
-    pub(crate) fn open(_: &Path) -> Result<Option<Self>> {
-        Err(invalid(
-            "material metadata mutation is unsupported on this platform",
-        ))
-    }
-    pub(crate) fn ensure_current(&self, _: &Path) -> Result<()> {
-        Err(invalid(
-            "material metadata mutation is unsupported on this platform",
-        ))
-    }
-    pub(crate) fn preserve(&self, _: &Path) -> Result<()> {
-        Err(invalid(
-            "material metadata migration is unsupported on this platform",
-        ))
-    }
-    #[cfg(test)]
-    pub(crate) fn replace(&self, _: &Path, _: &[u8]) -> Result<Self> {
-        Err(invalid(
-            "material metadata mutation is unsupported on this platform",
-        ))
-    }
+pub(crate) fn refuse_legacy_bindings(_: &Path) -> Result<()> {
+    Err(invalid(
+        "material metadata admission is unsupported on this platform",
+    ))
 }

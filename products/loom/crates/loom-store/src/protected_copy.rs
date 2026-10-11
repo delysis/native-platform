@@ -568,11 +568,10 @@ fn known_attachment_payload(relative: &str) -> bool {
 // Only committed material names are portable payloads. Unknown files and
 // interrupted staging must still fail closed, never be swept up by a prefix.
 fn known_material_payload(relative: &str) -> bool {
-    relative == ".loom/materials/bindings.json"
-        || relative
-            .strip_prefix(".loom/materials/evidence/")
-            .and_then(|name| name.strip_suffix(".json"))
-            .is_some_and(canonical_blob_name)
+    relative
+        .strip_prefix(".loom/materials/evidence/")
+        .and_then(|name| name.strip_suffix(".json"))
+        .is_some_and(canonical_blob_name)
 }
 
 fn known_function_receipt(relative: &str) -> bool {
@@ -679,16 +678,13 @@ mod tests {
     fn material_copy_classification_rejects_staging_and_unknown_names() {
         let owners = CopyOwners::default();
         let id = BlobId::digest(b"private material evidence");
+        let relative = format!(".loom/materials/evidence/{id}.json");
+        assert!(matches!(
+            payload_kind(&relative, &owners).unwrap(),
+            PayloadKind::Protected(namespace) if namespace == relative
+        ));
         for relative in [
             ".loom/materials/bindings.json".to_owned(),
-            format!(".loom/materials/evidence/{id}.json"),
-        ] {
-            assert!(matches!(
-                payload_kind(&relative, &owners).unwrap(),
-                PayloadKind::Protected(namespace) if namespace == relative
-            ));
-        }
-        for relative in [
             ".loom/materials/bindings.json.tmp".to_owned(),
             ".loom/materials/unknown.json".to_owned(),
             ".loom/materials/evidence/not-a-digest.json".to_owned(),
@@ -708,10 +704,18 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("source");
         let source = source_project(&root, true);
-        let relative = ".loom/materials/bindings.json";
-        create_copy_parents(&root, relative).unwrap();
-        let leaked = b"{\"schema\":\"loom.materials.v1\",\"items\":[]}";
-        fs::write(root.join(relative), leaked).unwrap();
+        let text = "private retained material evidence";
+        let leaked = serde_json::to_vec(&serde_json::json!({
+            "complete": true, "warnings": [], "id": "", "reference": "",
+            "material_id": format!("material-{}", BlobId::digest(b"fixture source")),
+            "retention": "ordinary", "title": "Retained evidence", "text": text,
+            "source_revision": "fixture revision", "text_sha256": BlobId::digest(text.as_bytes()),
+            "locator": {"kind": "test"}, "source_evidence": null,
+        }))
+        .unwrap();
+        let relative = format!(".loom/materials/evidence/{}.json", BlobId::digest(&leaked));
+        create_copy_parents(&root, &relative).unwrap();
+        fs::write(root.join(&relative), &leaked).unwrap();
         let destination = parent.path().join("protected");
         assert!(
             source
@@ -788,7 +792,7 @@ mod tests {
         (source, draft, saved.revision_id)
     }
 
-    fn private_payload_paths(attachment_id: BlobId) -> [String; 8] {
+    fn private_payload_paths(attachment_id: BlobId) -> [String; 7] {
         [
             format!(".loom/function-runs/{}.finished.json", CommandId::new()),
             ".loom/co-writers.json".into(),
@@ -796,7 +800,6 @@ mod tests {
             format!(".loom/attachments/manifests/{attachment_id}.json"),
             format!(".loom/attachments/manifests/source-{attachment_id}.json"),
             format!(".loom/attachments/objects/{attachment_id}"),
-            ".loom/materials/bindings.json".into(),
             format!(".loom/materials/evidence/{attachment_id}.json"),
         ]
     }
@@ -1088,5 +1091,53 @@ mod tests {
             fs::read(root.join(".loom/deleted").join(&capture)).unwrap(),
             b"Deleted manuscript text"
         );
+    }
+
+    #[test]
+    fn retired_bindings_and_archives_refuse_protected_copy_before_stage_or_vault() {
+        for encrypted in [false, true] {
+            for archived in [false, true] {
+                let parent = tempfile::tempdir().unwrap();
+                let root = parent.path().join("source");
+                let source = source_project(&root, encrypted);
+                let plain = b"{\"schema\":\"loom.materials.v1\",\"items\":[]}";
+                let relative = if archived {
+                    format!(".loom/materials/bindings-{}.json", BlobId::digest(plain))
+                } else {
+                    ".loom/materials/bindings.json".into()
+                };
+                create_copy_parents(&root, &relative).unwrap();
+                crate::private_io::write(
+                    source.vault.as_ref(),
+                    &root.join(&relative),
+                    &relative,
+                    plain,
+                )
+                .unwrap();
+                let stored = fs::read(root.join(&relative)).unwrap();
+                let counts = source.counts().unwrap();
+                let destination = parent.path().join("protected");
+                let requested_vault = std::cell::Cell::new(false);
+                let result = source.protected_copy_using(&destination, |stage| {
+                    requested_vault.set(true);
+                    ProjectVault::initialize_with_key(stage, [73; 32])
+                });
+                assert!(
+                    result.is_err() && !requested_vault.get(),
+                    "retired preflight: encrypted={encrypted}, archived={archived}, vault={}, result={result:?}",
+                    requested_vault.get()
+                );
+                assert_eq!(fs::read(root.join(relative)).unwrap(), stored);
+                assert_eq!(source.counts().unwrap(), counts);
+                assert!(!destination.exists());
+                assert!(!parent.path().read_dir().unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".mine-protected-copy-")
+                }));
+            }
+        }
     }
 }

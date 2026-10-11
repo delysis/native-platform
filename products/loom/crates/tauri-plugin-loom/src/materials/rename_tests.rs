@@ -214,16 +214,6 @@ fn malformed_inputs_and_current_schema_rejection_do_not_write_or_repair_state() 
             .is_err()
         );
     }
-    // Retired JSON metadata still has strict schema validation at adoption.
-    let (_, definitions) = crate::workspace_template::materials::current(&store).unwrap();
-    let legacy = json!({"schema":SCHEMA,"items":definitions.unwrap()});
-    let mut obsolete = legacy.clone();
-    obsolete["schema"] = json!("loom.materials.obsolete");
-    let mut aliases = legacy;
-    aliases["aliases"] = json!([]);
-    for invalid_case in [obsolete, aliases] {
-        assert!(decode_bindings(&store, &serde_json::to_vec(&invalid_case).unwrap()).is_err());
-    }
     let current = configuration(&original_bytes);
     let mut unknown = current.clone();
     unknown["materials"][0]["aliases"] = json!([]);
