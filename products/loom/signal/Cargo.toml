@@ -45,6 +45,11 @@ unsafe_code = "forbid"
 debug = "line-tables-only"
 incremental = false
 
+# Match the root workspace: stripping a Mach-O compiler plugin can misalign
+# its LINKEDIT string pool. Host build dependencies must remain loadable.
+[profile.release.build-override]
+strip = "none"
+
 [patch."https://github.com/whisperfish/presage"]
 presage = { path = "vendor/presage" }
 presage-store-sqlite = { path = "vendor/presage-store-sqlite" }
