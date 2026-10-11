@@ -283,9 +283,7 @@ impl LlamaBackend {
         request: ExactContinuationRequest,
     ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
         let model = self.inspect_model(&request.model)?;
-        validate_request(&request, &model, self.event_capacity)?;
-        let context_binding =
-            continuation_context_binding(&request.context_preamble, &request.media)?;
+        let context_binding = validate_request(&request, &model, self.event_capacity)?;
         let exact_prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
         let model_environment = model_environment_from_verified(&model)?;
         let native_request = build_native_request(&request, &model);
@@ -1181,6 +1179,7 @@ fn run_generation_worker(
                 }
                 break build_result(
                     &request,
+                    &context_binding,
                     identities,
                     runtime_evidence,
                     exact_prompt_blob_id,
@@ -1321,7 +1320,7 @@ struct BackendReceipt<'a> {
     exact_prompt_blob_id: BlobId,
     model_environment_id: loom_types::ModelEnvironmentId,
     input_contract: WriterInputContract,
-    context_binding: ContinuationContextBinding,
+    context_binding: &'a ContinuationContextBinding,
     output: &'a GenerationOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
@@ -1452,6 +1451,7 @@ pub fn validate_candidate_receipt_binding(
 #[allow(clippy::too_many_arguments)]
 fn build_result(
     request: &ExactContinuationRequest,
+    context_binding: &ContinuationContextBinding,
     identities: &[CaseIdentity],
     runtime_evidence: RuntimeEvidenceClass,
     exact_prompt_blob_id: BlobId,
@@ -1519,6 +1519,7 @@ fn build_result(
             let case_events = raw_events.remove(&identity.case_id).unwrap_or_default();
             build_candidate_material(
                 request,
+                context_binding,
                 identity,
                 runtime_evidence,
                 evidence_kind,
@@ -1615,6 +1616,7 @@ fn validate_word_choice_output(
 #[allow(clippy::too_many_arguments)]
 fn build_candidate_material(
     request: &ExactContinuationRequest,
+    context_binding: &ContinuationContextBinding,
     identity: &CaseIdentity,
     runtime_evidence: RuntimeEvidenceClass,
     evidence_kind: InferenceEvidenceKind,
@@ -1642,7 +1644,7 @@ fn build_candidate_material(
         exact_prompt_blob_id,
         model_environment_id: model.model_environment_id,
         input_contract: writer_input_contract_for_request(request, model),
-        context_binding: continuation_context_binding(&request.context_preamble, &request.media)?,
+        context_binding,
         output: &output,
         first_word_choices: request.first_word_choices,
         function_input: (request.prompt_recipe.mode == PromptMode::Function).then(|| {
@@ -1783,7 +1785,7 @@ fn validate_request(
     request: &ExactContinuationRequest,
     model: &VerifiedModelDescriptor,
     event_capacity: usize,
-) -> Result<(), LlamaBackendError> {
+) -> Result<ContinuationContextBinding, LlamaBackendError> {
     if request.request_id.trim().is_empty() {
         return Err(LlamaBackendError::InvalidRequest(
             "request ID cannot be empty".to_string(),
@@ -1825,7 +1827,7 @@ fn validate_request(
             "text completion cannot accept an unverified predeclared token prompt".to_string(),
         ));
     }
-    let _ = continuation_context_binding(&request.context_preamble, &request.media)?;
+    let context_binding = continuation_context_binding(&request.context_preamble, &request.media)?;
     if request.cases.is_empty() || request.cases.len() > model.capabilities.max_cases as usize {
         return Err(LlamaBackendError::InvalidRequest(format!(
             "case count must be in 1..={} for this loaded model",
@@ -1879,7 +1881,7 @@ fn validate_request(
             ));
         }
     }
-    Ok(())
+    Ok(context_binding)
 }
 
 fn build_native_request(
