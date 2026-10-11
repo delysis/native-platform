@@ -3323,8 +3323,6 @@ name = "fte-providers"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
- "fte-store",
  "fte-types",
  "futures",
  "reqwest 0.12.28",
@@ -3368,10 +3366,8 @@ name = "fte-types"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]
@@ -10334,14 +10330,10 @@ dependencies = [
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
 dependencies = [
- "fte-backend-llama",
  "fte-loopback",
- "fte-providers",
  "fte-router",
  "fte-store",
  "fte-types",
- "llama-native-host",
- "llama-native-types",
  "serde",
  "tauri",
  "tauri-plugin",
