@@ -1003,6 +1003,7 @@ fn step(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_registry::RequestTerminalClass;
 
     fn cooperative_owner_job(request_id: &str) -> (NativeModelHandle, Job, GenerationTicket) {
         let (handle, job, ticket) = cooperative_queued_job(request_id);
