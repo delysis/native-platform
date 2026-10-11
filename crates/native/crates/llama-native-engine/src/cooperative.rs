@@ -363,6 +363,35 @@ impl Job {
         })
     }
 
+    fn finish(self, result: NativeResult<GenerationCompletion>) {
+        // This lane owns one case. Cancelled partial output remains a
+        // successful envelope; authority qualification is independent.
+        let terminal = match &result {
+            Ok(completion)
+                if completion
+                    .outputs
+                    .iter()
+                    .any(|output| output.state == GenerationState::Cancelled) =>
+            {
+                RequestTerminalClass::Cancelled
+            }
+            Ok(_) => RequestTerminalClass::Completed,
+            Err(error) if error.code == NativeErrorCode::Cancelled => {
+                RequestTerminalClass::Cancelled
+            }
+            Err(_) => RequestTerminalClass::Failed,
+        };
+        let _ = self.lease.finished(terminal);
+        if result.is_err() {
+            if terminal == RequestTerminalClass::Cancelled {
+                emit_cancelled_case_events(&self.event_tx, &self.request);
+            } else {
+                emit_failed_case_events(&self.event_tx, &self.request);
+            }
+        }
+        let _ = self.result_tx.send(result);
+    }
+
     fn reject(self, error: NativeError) {
         if error.code == NativeErrorCode::Cancelled {
             self.cancel.store(true, Ordering::Release);
@@ -559,17 +588,11 @@ impl Sequence {
 
     fn finish(mut self, runtime: &Runtime<'_, '_>) {
         let result = self.completion(runtime);
-        let _ = self.job.lease.completed_or_failed(result.is_ok());
-        if result.is_err() {
-            emit_failed_case_events(&self.job.event_tx, &self.job.request);
-        }
-        let _ = self.job.result_tx.send(result);
+        self.job.finish(result);
     }
 
     fn fail(self, error: NativeError) {
-        let _ = self.job.lease.completed_or_failed(false);
-        emit_failed_case_events(&self.job.event_tx, &self.job.request);
-        let _ = self.job.result_tx.send(Err(error));
+        self.job.finish(Err(error));
     }
 
     fn completion(&mut self, runtime: &Runtime<'_, '_>) -> NativeResult<GenerationCompletion> {
@@ -949,6 +972,259 @@ fn step(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cooperative_owner_job(request_id: &str) -> (NativeModelHandle, Job, GenerationTicket) {
+        let (handle, commands, _speculative) =
+            crate::tests::test_admission_handle(crate::tests::admission_test_status(), 2);
+        let request = GenerationBatchRequest {
+            request_id: request_id.into(),
+            model_id: "model".into(),
+            first_word_choices: None,
+            media: Vec::new(),
+            cases: vec![GenerationCase {
+                case_id: "case".into(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Tokens {
+                        token_ids: vec![1, 2],
+                    }],
+                },
+                sampling: SamplingConfig {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+                cached_prefix: None,
+            }],
+        };
+        let ticket = handle
+            .generate_cooperative(request)
+            .expect("actual cooperative admission");
+        let job = Job::from_command(commands.recv().expect("actual queued command"))
+            .expect("actual cooperative owner");
+        job.lease.running().expect("owner started");
+        (handle, job, ticket)
+    }
+
+    // A result-checkpoint fixture; no sampler, model, token decode or authority seal.
+    fn cooperative_checkpoint_output(
+        request_id: &str,
+        state: GenerationState,
+    ) -> GenerationCompletion {
+        GenerationCompletion::unverified(vec![GenerationOutput {
+            first_word_choice: None,
+            request_id: request_id.into(),
+            branch_id: "case".into(),
+            input_index: 0,
+            model_id: "model".into(),
+            text: "retained partial".into(),
+            generated_token_ids: vec![17],
+            token_observations: None,
+            state,
+            finish_reason: if state == GenerationState::Cancelled {
+                "cancelled"
+            } else {
+                "max_tokens"
+            }
+            .into(),
+            metrics: GenerationMetrics::default(),
+            real_engine_invoked: false,
+            fake_fixture: true,
+            transport: NativeTransport::InProcess,
+        }])
+    }
+
+    #[test]
+    fn cooperative_prefill_cancel_projects_the_selected_cancelled_error() {
+        let (_handle, job, ticket) = cooperative_owner_job("cooperative-prefill-cancel");
+        let control = Arc::clone(&ticket.control);
+        let events = ticket.events.clone();
+        assert!(ticket.cancel_branch("case"));
+        job.finish(Err(cancelled()));
+        assert_eq!(
+            ticket.wait().expect_err("no prefill completion/seal").code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            control
+                .snapshot()
+                .authoritative_terminal
+                .expect("terminal")
+                .class,
+            RequestTerminalClass::Cancelled
+        );
+        let states: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event.event {
+                GenerationEventKind::State { state } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![GenerationState::Cancelled]);
+    }
+
+    #[test]
+    fn cooperative_partial_cancel_retains_output_and_cancelled_registry_terminal() {
+        let (_handle, job, ticket) = cooperative_owner_job("cooperative-partial-cancel");
+        let control = Arc::clone(&ticket.control);
+        assert!(ticket.cancel_branch("case"));
+        job.finish(Ok(cooperative_checkpoint_output(
+            &ticket.request_id,
+            GenerationState::Cancelled,
+        )));
+        let outputs = ticket
+            .wait()
+            .expect("useful partial completion remains available");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].state, GenerationState::Cancelled);
+        assert_eq!(outputs[0].text, "retained partial");
+        assert!(outputs[0].fake_fixture && !outputs[0].real_engine_invoked);
+        assert_eq!(
+            control
+                .snapshot()
+                .authoritative_terminal
+                .expect("terminal")
+                .class,
+            RequestTerminalClass::Cancelled
+        );
+    }
+
+    #[test]
+    fn cooperative_decode_failure_is_not_reclassified_by_a_late_cancel_flag() {
+        let (_handle, job, ticket) = cooperative_owner_job("cooperative-error-cancel");
+        let control = Arc::clone(&ticket.control);
+        let events = ticket.events.clone();
+        assert!(ticket.cancel_branch("case"));
+        job.finish(Err(native_decode_error(
+            "cooperative checkpoint",
+            "selected decode failure",
+        )));
+        assert_eq!(
+            ticket.wait().expect_err("selected error").code,
+            NativeErrorCode::DecodeFailed
+        );
+        assert_eq!(
+            control
+                .snapshot()
+                .authoritative_terminal
+                .expect("terminal")
+                .class,
+            RequestTerminalClass::Failed
+        );
+        let states: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event.event {
+                GenerationEventKind::State { state } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![GenerationState::Failed]);
+    }
+
+    #[test]
+    fn cooperative_completed_output_keeps_execution_and_authority_independent() {
+        for cancel in [false, true] {
+            let (_handle, job, ticket) = cooperative_owner_job("cooperative-completed");
+            let control = Arc::clone(&ticket.control);
+            if cancel {
+                assert!(ticket.cancel_branch("case"));
+            }
+            let completion =
+                cooperative_checkpoint_output(&ticket.request_id, GenerationState::Completed);
+            assert!(completion.authority.is_err());
+            job.finish(Ok(completion));
+            assert_eq!(
+                ticket.wait().expect("execution result")[0].state,
+                GenerationState::Completed
+            );
+            assert_eq!(
+                control
+                    .snapshot()
+                    .authoritative_terminal
+                    .expect("terminal")
+                    .class,
+                RequestTerminalClass::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn cooperative_selected_terminal_precedes_delivery_and_survives_a_dropped_receiver() {
+        for drop_receiver in [false, true] {
+            let (handle, mut job, mut ticket) = cooperative_owner_job("cooperative-final-delivery");
+            let control = Arc::clone(&ticket.control);
+            // Only the private final channel capacity changes at this checkpoint.
+            // The public ticket still consumes the actual owner's selected result.
+            let (sender, receiver) = bounded(0);
+            job.result_tx = sender;
+            ticket.result = receiver;
+            while job
+                .event_tx
+                .try_send(GenerationEvent {
+                    request_id: ticket.request_id.clone(),
+                    branch_id: "case".into(),
+                    sequence_id: 0,
+                    input_index: 0,
+                    event_index: 0,
+                    event: GenerationEventKind::State {
+                        state: GenerationState::Generating,
+                    },
+                })
+                .is_ok()
+            {}
+            let result =
+                cooperative_checkpoint_output(&ticket.request_id, GenerationState::Cancelled);
+            let worker = std::thread::spawn(move || job.finish(Ok(result)));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let terminal = loop {
+                let snapshot = control.snapshot();
+                if let Some(terminal) = snapshot.authoritative_terminal {
+                    break terminal;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owner did not select its terminal"
+                );
+                std::thread::yield_now();
+            };
+            assert_eq!(terminal.class, RequestTerminalClass::Cancelled);
+            assert_eq!(
+                control.snapshot().phase,
+                crate::operation_registry::RequestPhase::Terminal
+            );
+            assert_eq!(
+                handle.inner.requests.active_count().expect("held executor"),
+                1
+            );
+            if drop_receiver {
+                drop(ticket);
+            } else {
+                assert_eq!(
+                    ticket.wait().expect("actual public delivery")[0].state,
+                    GenerationState::Cancelled
+                );
+            }
+            worker.join().expect("owner completed final send attempt");
+            assert_eq!(
+                control.snapshot().phase,
+                crate::operation_registry::RequestPhase::Released
+            );
+            assert_eq!(
+                control
+                    .snapshot()
+                    .authoritative_terminal
+                    .expect("immutable final")
+                    .class,
+                RequestTerminalClass::Cancelled
+            );
+            assert_eq!(
+                handle
+                    .inner
+                    .requests
+                    .active_count()
+                    .expect("released executor"),
+                0
+            );
+        }
+    }
 
     #[test]
     fn reservations_bound_each_stream_and_reuse_only_released_slots() -> NativeResult<()> {

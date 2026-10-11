@@ -7840,7 +7840,7 @@ mod tests {
         }
     }
 
-    fn test_admission_handle(
+    pub(super) fn test_admission_handle(
         status: ResidentModelStatus,
         queue_capacity: usize,
     ) -> (
@@ -7897,7 +7897,7 @@ mod tests {
         assert_eq!(status.active_sequences, 0);
     }
 
-    fn admission_test_status() -> ResidentModelStatus {
+    pub(super) fn admission_test_status() -> ResidentModelStatus {
         ResidentModelStatus {
             model_id: "model".to_owned(),
             model_path: PathBuf::new(),
