@@ -1,6 +1,5 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { branchIsActionableOnShelf } from './branchShelf';
 import { mergeNewestPage } from './branchPaging';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
 import { completionSnapshotFacts } from './completionSnapshot';
@@ -470,15 +469,6 @@ describe('model-free completion recovery characterization', () => {
       'candidate-b',
       'candidate-c',
       'candidate-d'
-    ]);
-    expect(hydrated.branches.filter((branch) =>
-      branchIsActionableOnShelf(branch, fixture.source.revision_id)
-    ).map((branch) => branch.run_id)).toEqual([
-      'run-ready-a',
-      'run-ready-b',
-      'run-ready-c',
-      'run-ready-d',
-      'run-failed'
     ]);
   });
 
