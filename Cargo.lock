@@ -4784,8 +4784,10 @@ dependencies = [
  "information-native-retrieval",
  "information-native-store",
  "information-native-types",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "url",
 ]
 

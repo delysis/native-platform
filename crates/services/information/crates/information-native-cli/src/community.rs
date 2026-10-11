@@ -1,16 +1,15 @@
-use crate::input::{load_rights, load_use_policy, validate_values};
+use crate::input::{compiled_fields, load_rights, load_use_policy, query_id, validate_values};
 use crate::{
-    CliResult, CommunityMessageArgs, CommunitySearchArgs, CommunitySourceArgs, fail, json_value,
+    CliResult, CommunityMessageArgs, CommunitySearchArgs, CommunitySourceArgs, json_value,
 };
 use information_native_backend_community::{
     CommunityArchiveBackend, CommunityArchiveBackendConfig,
 };
 use information_native_retrieval::{LookupRequest, ResourceBackend, RetrievalRouter};
 use information_native_types::{
-    InformationQuery, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, ReleaseId,
-    RepresentationId, ResourceId, RetrievalTarget,
+    InformationQuery, QUERY_SCHEMA, QueryBudget, QueryFilters, ReleaseId, RepresentationId,
+    ResourceId, RetrievalTarget,
 };
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) fn search(args: &CommunitySearchArgs) -> CliResult<serde_json::Value> {
@@ -109,36 +108,4 @@ fn mount(args: &CommunitySourceArgs) -> CliResult<MountedCommunity> {
         release_id,
         representation_id,
     })
-}
-
-fn query_id(value: Option<&String>) -> CliResult<QueryId> {
-    match value {
-        Some(value) => Ok(QueryId::parse(value.clone())?),
-        None => Ok(QueryId::new()),
-    }
-}
-
-fn compiled_fields(
-    values: &[crate::KeyValueArg],
-    max_fields: usize,
-) -> CliResult<BTreeMap<String, String>> {
-    if values.len() > max_fields {
-        return fail(format!(
-            "query has {} field filters, exceeding the {max_fields}-filter limit",
-            values.len()
-        ));
-    }
-    let mut fields = BTreeMap::new();
-    for field in values {
-        if fields
-            .insert(field.key.clone(), field.value.clone())
-            .is_some()
-        {
-            return fail(format!(
-                "query field {:?} was supplied more than once",
-                field.key
-            ));
-        }
-    }
-    Ok(fields)
 }

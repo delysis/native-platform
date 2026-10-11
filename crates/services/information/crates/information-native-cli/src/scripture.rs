@@ -1,4 +1,4 @@
-use crate::input::{load_rights, load_use_policy, validate_values};
+use crate::input::{load_rights, load_use_policy, query_id, validate_values};
 use crate::{
     CliResult, ScriptureOccurrenceArgs, ScripturePassageArgs, ScriptureSearchArgs,
     ScriptureSourceArgs, json_value,
@@ -8,8 +8,8 @@ use information_native_backend_scripture::{
 };
 use information_native_retrieval::{LookupRequest, ResourceBackend, RetrievalRouter};
 use information_native_types::{
-    InformationQuery, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, ReleaseId,
-    RepresentationId, ResourceId, RetrievalTarget,
+    InformationQuery, QUERY_SCHEMA, QueryBudget, QueryFilters, ReleaseId, RepresentationId,
+    ResourceId, RetrievalTarget,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -137,11 +137,4 @@ fn mount(args: &ScriptureSourceArgs) -> CliResult<MountedScripture> {
         release_id,
         representation_id,
     })
-}
-
-fn query_id(value: Option<&String>) -> CliResult<QueryId> {
-    match value {
-        Some(value) => Ok(QueryId::parse(value.clone())?),
-        None => Ok(QueryId::new()),
-    }
 }

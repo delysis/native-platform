@@ -124,7 +124,7 @@ pub(crate) fn block(args: &AlexandriaBlockArgs) -> CliResult<serde_json::Value> 
         release_id: mounted.release_id,
         representation_id: mounted.representation_id,
         purpose: args.purpose.into(),
-        collection: Some("blocks".to_string()),
+        collection: None,
         key: args.block_id.clone(),
         max_context_chars: args.max_context_chars,
         timeout_ms: args.timeout_ms,
