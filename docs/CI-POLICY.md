@@ -9,7 +9,7 @@ boundary it actually exercises.
 
 While GitHub Actions cannot start steps because the account has no credits, use
 `cargo run --locked -p xtask -- local-ci <new-evidence-directory>` from a clean,
-complete checkout. Follow CONTRIBUTING.md for pinned **actual** Rust 1.92.0
+complete checkout. Follow CONTRIBUTING.md for pinned **actual** Rust 1.95.0
 binaries, Node 22, cached pnpm 11.16.0, WebKit and native-tool prerequisites.
 This replaces the hosted development-validation dependency, not hosted check
 statuses, branch protection, merge authorization or cross-platform qualification.
