@@ -10025,10 +10025,22 @@ fn run_desktop_generation<R: Runtime>(
             GenerationTerminalClass::Failed,
         ),
     };
+    finish_desktop_generation_persistence(app, &state, identity, runs, persistence, terminal_class);
+}
+
+fn finish_desktop_generation_persistence<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &PluginState,
+    identity: &GenerationFamilyIdentity,
+    runs: &[(GenerationRunId, BranchId)],
+    persistence: Result<(), IpcFailure>,
+    terminal_class: GenerationTerminalClass,
+) {
     let terminalized = match persistence {
-        Ok(()) => Ok(()),
-        Err(primary) => fail_open_runs(&state, identity, runs, &primary.message, app).map_err(
-            |fallback| {
+        Ok(()) => Ok(terminal_class),
+        Err(primary) => fail_open_runs(state, identity, runs, &primary.message, app)
+            .map(|()| GenerationTerminalClass::Failed)
+            .map_err(|fallback| {
                 IpcFailure::new(
                     "generation_terminal_persistence_failed",
                     format!(
@@ -10037,11 +10049,10 @@ fn run_desktop_generation<R: Runtime>(
                     ),
                     true,
                 )
-            },
-        ),
+            }),
     };
-    let finalized = terminalized.and_then(|()| {
-        release_family_after_terminal_persistence(&state, identity, runs, terminal_class)
+    let finalized = terminalized.and_then(|terminal_class| {
+        release_family_after_terminal_persistence(state, identity, runs, terminal_class)
     });
     if let Err(error) = finalized {
         let _ = state
@@ -16532,5 +16543,412 @@ mod tests {
         let replay = consume_fixture_foreground_command(&state, replay_focus, &input)
             .expect_err("replayed IPC payload must fail");
         assert_eq!(replay.code, "foreground_command_rejected");
+    }
+
+    mod tauri016_persistence {
+        use super::*;
+
+        struct Fixture {
+            app: tauri::App<tauri::test::MockRuntime>,
+            identity: GenerationFamilyIdentity,
+            runs: Vec<(GenerationRunId, BranchId)>,
+            lease: loom_host::GenerationOperationLease,
+            root: PathBuf,
+            _temporary: tempfile::TempDir,
+        }
+
+        impl Fixture {
+            fn new(branches: usize) -> Self {
+                let temporary = tempfile::tempdir().expect("owned fixture directory");
+                let root = temporary.path().join("Persistence Outcome");
+                let mut store = initialize_project(&root, "Persistence Outcome".to_owned())
+                    .expect("initialize owned fixture");
+                let project_id = store.manifest().project_id;
+                let session_id = CommandId::new();
+                let mut runs = Vec::new();
+                let mut document_id = None;
+                for _ in 0..branches {
+                    let (run_id, branch_id, document) = start_persisted_test_generation(&mut store);
+                    if let Some(previous) = document_id {
+                        assert_eq!(previous, document);
+                    }
+                    document_id = Some(document);
+                    runs.push((run_id, branch_id));
+                }
+                let identity = GenerationFamilyIdentity {
+                    request_id: CommandId::new().to_string(),
+                    project_id,
+                    session_id,
+                    document_id: document_id.expect("at least one fixture branch"),
+                };
+                let state = PluginState::default();
+                {
+                    let mut session = state.session.lock().expect("session lock");
+                    session.phase = SessionPhase::Open;
+                    session.store = Some(store);
+                    session.active_session_id = Some(session_id);
+                }
+                state
+                    .generations
+                    .register(loom_host::GenerationFamilyRegistration {
+                        identity: identity.clone(),
+                        branches: runs.clone(),
+                        cancellation: Arc::new(RecordingCancellation::default()),
+                    })
+                    .expect("register actual family");
+                let lease = start_test_generation_lifecycle(
+                    &state.generation_lifecycle,
+                    &identity.request_id,
+                );
+                let app = tauri::test::mock_builder()
+                    .manage(state)
+                    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                    .expect("build existing Tauri fixture runtime");
+                assert!(matches!(
+                    *app.state::<PluginState>().model.lock().expect("model lock"),
+                    ModelRegistry::Empty
+                ));
+                Self {
+                    app,
+                    identity,
+                    runs,
+                    lease,
+                    root,
+                    _temporary: temporary,
+                }
+            }
+
+            fn state(&self) -> State<'_, PluginState> {
+                self.app.state::<PluginState>()
+            }
+
+            fn terminal_insert_fault(&self, enabled: bool) {
+                let connection = rusqlite::Connection::open(self.root.join(".loom/loom.sqlite3"))
+                    .expect("open only the owned fixture database");
+                if enabled {
+                    connection
+                        .execute_batch(
+                            "CREATE TRIGGER owned_terminal_fault
+                             BEFORE INSERT ON generation_terminals
+                             BEGIN SELECT RAISE(ABORT, 'owned terminal insertion failure'); END;",
+                        )
+                        .expect("install bounded terminal-write fault");
+                } else {
+                    connection
+                        .execute_batch("DROP TRIGGER owned_terminal_fault")
+                        .expect("retire only the owned fixture fault");
+                }
+            }
+
+            fn persist(
+                &self,
+                index: usize,
+                status: GenerationTerminalStatus,
+                bytes: &[u8],
+            ) -> Result<(), StoreError> {
+                let state = self.state();
+                let mut session = state.session.lock().expect("session lock");
+                let store = session.store.as_mut().expect("leased fixture Store");
+                let raw_event_stream_blob_id = store.store_provenance_blob(b"[]")?;
+                let token_trace = loom_types::TokenTrace {
+                    generated_token_ids: Vec::new(),
+                    observations: Vec::new(),
+                    raw_event_stream_blob_id,
+                    provenance: None,
+                };
+                let run_id = self.runs[index].0;
+                if status == GenerationTerminalStatus::Completed {
+                    // Diagnostic fixture data is never native or strict research evidence.
+                    store
+                        .finish_unverified_generation_candidate_for_diagnostics(
+                            run_id,
+                            TerminalCandidateInput {
+                                output_bytes: bytes.to_vec(),
+                                token_trace,
+                            },
+                        )
+                        .map(|_| ())
+                } else {
+                    store
+                        .finish_generation_with_evidence(
+                            run_id,
+                            TerminalGenerationInput {
+                                status,
+                                error: (status == GenerationTerminalStatus::Failed)
+                                    .then(|| "owned selected failure".to_owned()),
+                                evidence: TerminalEvidenceInput {
+                                    partial_output_bytes: bytes.to_vec(),
+                                    token_trace,
+                                },
+                            },
+                        )
+                        .map(|_| ())
+                }
+            }
+
+            fn evidence(&self, index: usize) -> loom_store::StoredGenerationTerminalEvidence {
+                self.state()
+                    .session
+                    .lock()
+                    .expect("session lock")
+                    .store
+                    .as_ref()
+                    .expect("leased fixture Store")
+                    .generation_terminal_evidence(self.runs[index].0)
+                    .expect("load actual durable terminal evidence")
+                    .expect("one durable terminal evidence object")
+            }
+
+            fn finish(&self, persistence: Result<(), IpcFailure>, class: GenerationTerminalClass) {
+                finish_desktop_generation_persistence(
+                    self.app.handle(),
+                    &self.state(),
+                    &self.identity,
+                    &self.runs,
+                    persistence,
+                    class,
+                );
+            }
+
+            fn assert_released(&self, class: GenerationTerminalClass) {
+                let state = self.state();
+                let snapshot = state
+                    .generation_lifecycle
+                    .snapshot(&self.lease)
+                    .expect("observe public operation lease")
+                    .expect("retained final snapshot");
+                assert_eq!(snapshot.phase, GenerationOperationPhase::Released);
+                assert_eq!(snapshot.authoritative_terminal, snapshot.final_projection);
+                assert_eq!(
+                    snapshot
+                        .authoritative_terminal
+                        .expect("selected terminal")
+                        .class,
+                    class
+                );
+                assert_eq!(
+                    state
+                        .generation_lifecycle
+                        .active_count()
+                        .expect("active count"),
+                    0
+                );
+                assert!(
+                    state
+                        .generations
+                        .route_for_run(self.runs[0].0)
+                        .expect("observe public route")
+                        .is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn failed_persistence_releases_failed_family() {
+            let fixture = Fixture::new(1);
+            fixture.terminal_insert_fault(true);
+            let error = fixture
+                .persist(
+                    0,
+                    GenerationTerminalStatus::Completed,
+                    b"owned diagnostic output",
+                )
+                .expect_err("real candidate persistence must reach the injected SQLite fault");
+            assert!(
+                error
+                    .to_string()
+                    .contains("owned terminal insertion failure")
+            );
+            fixture.terminal_insert_fault(false);
+            fixture.finish(
+                Err(IpcFailure::store(error)),
+                GenerationTerminalClass::Completed,
+            );
+
+            let durable = fixture.evidence(0);
+            assert_eq!(durable.evidence.status, GenerationTerminalStatus::Failed);
+            assert_eq!(durable.evidence.candidate_id, None);
+            fixture.assert_released(GenerationTerminalClass::Failed);
+            assert_eq!(
+                std::fs::read(fixture.root.join(INITIAL_DOCUMENT)).unwrap(),
+                b"Once "
+            );
+        }
+
+        #[test]
+        fn success_preserves_completed_cancelled_and_failed_outcomes() {
+            for (status, class) in [
+                (
+                    GenerationTerminalStatus::Completed,
+                    GenerationTerminalClass::Completed,
+                ),
+                (
+                    GenerationTerminalStatus::Cancelled,
+                    GenerationTerminalClass::Cancelled,
+                ),
+                (
+                    GenerationTerminalStatus::Failed,
+                    GenerationTerminalClass::Failed,
+                ),
+            ] {
+                let fixture = Fixture::new(1);
+                fixture
+                    .persist(0, status, b"owned exact evidence")
+                    .expect("persist selected outcome");
+                let before = fixture.evidence(0);
+                fixture.finish(Ok(()), class);
+                assert_eq!(fixture.evidence(0), before);
+                assert_eq!(before.output_bytes, b"owned exact evidence");
+                assert_eq!(before.evidence.status, status);
+                fixture.assert_released(class);
+                if let Some(candidate_id) = before.evidence.candidate_id {
+                    let state = fixture.state();
+                    let mut session = state.session.lock().expect("session lock");
+                    let store = session.store.as_mut().expect("leased fixture Store");
+                    let source = store
+                        .read_document(INITIAL_DOCUMENT)
+                        .expect("actual source");
+                    assert!(matches!(
+                        store.promote_candidate(loom_types::PromoteCandidateCommand {
+                            candidate_id,
+                            expected_source_revision_id: source.revision_id,
+                            expected_visible_blob_id: source.blob_id,
+                        }),
+                        Err(StoreError::LegacyCandidateNotAdmitted)
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn failed_persistence_preserves_durable_completed_or_cancelled_sibling() {
+            for (status, selected_class) in [
+                (
+                    GenerationTerminalStatus::Completed,
+                    GenerationTerminalClass::Completed,
+                ),
+                (
+                    GenerationTerminalStatus::Cancelled,
+                    GenerationTerminalClass::Cancelled,
+                ),
+            ] {
+                let fixture = Fixture::new(2);
+                fixture
+                    .persist(0, status, b"preserved partial or completed bytes")
+                    .expect("persist sibling");
+                let before = fixture.evidence(0);
+                fixture.terminal_insert_fault(true);
+                let error = fixture
+                    .persist(
+                        1,
+                        GenerationTerminalStatus::Completed,
+                        b"unpublished diagnostic output",
+                    )
+                    .expect_err("real second-result persistence fails");
+                fixture.terminal_insert_fault(false);
+                fixture.finish(Err(IpcFailure::store(error)), selected_class);
+                assert_eq!(fixture.evidence(0), before);
+                assert_eq!(
+                    fixture.evidence(1).evidence.status,
+                    GenerationTerminalStatus::Failed
+                );
+                fixture.assert_released(GenerationTerminalClass::Failed);
+            }
+        }
+
+        #[test]
+        fn success_preserves_mixed_completed_cancelled_family() {
+            let fixture = Fixture::new(2);
+            fixture
+                .persist(0, GenerationTerminalStatus::Completed, b"completed sibling")
+                .expect("persist completed sibling");
+            fixture
+                .persist(
+                    1,
+                    GenerationTerminalStatus::Cancelled,
+                    b"cancelled partial bytes",
+                )
+                .expect("persist cancelled evidence");
+            let before = [fixture.evidence(0), fixture.evidence(1)];
+            fixture.finish(Ok(()), GenerationTerminalClass::Cancelled);
+            assert_eq!([fixture.evidence(0), fixture.evidence(1)], before);
+            fixture.assert_released(GenerationTerminalClass::Cancelled);
+        }
+
+        #[test]
+        fn fallback_error_retains_live_family_and_lease() {
+            let fixture = Fixture::new(1);
+            fixture.terminal_insert_fault(true);
+            let error = fixture
+                .persist(
+                    0,
+                    GenerationTerminalStatus::Completed,
+                    b"owned diagnostic output",
+                )
+                .expect_err("real candidate persistence fails");
+            fixture.finish(
+                Err(IpcFailure::store(error)),
+                GenerationTerminalClass::Completed,
+            );
+
+            let state = fixture.state();
+            let snapshot = state
+                .generation_lifecycle
+                .snapshot(&fixture.lease)
+                .expect("snapshot")
+                .expect("live authority");
+            assert_eq!(snapshot.phase, GenerationOperationPhase::Running);
+            assert_eq!(snapshot.authoritative_terminal, None);
+            assert_eq!(snapshot.final_projection, None);
+            assert_eq!(
+                state
+                    .generation_lifecycle
+                    .active_count()
+                    .expect("active count"),
+                1
+            );
+            assert!(
+                state
+                    .generations
+                    .route_for_run(fixture.runs[0].0)
+                    .expect("route")
+                    .is_some()
+            );
+            let failures = state
+                .generations
+                .terminal_persistence_failures(
+                    fixture.identity.project_id,
+                    fixture.identity.session_id,
+                )
+                .expect("retained failure evidence");
+            assert_eq!(failures.len(), 1);
+            assert!(
+                failures[0]
+                    .error
+                    .contains("fallback terminal persistence also failed")
+            );
+            assert!(
+                failures[0]
+                    .error
+                    .contains("owned terminal insertion failure")
+            );
+            assert_eq!(
+                state
+                    .session
+                    .lock()
+                    .expect("session lock")
+                    .store
+                    .as_ref()
+                    .expect("Store remains leased")
+                    .generation_terminal_count(fixture.runs[0].0)
+                    .expect("rolled-back terminal count"),
+                0
+            );
+            assert!(matches!(
+                ProjectStore::open(&fixture.root),
+                Err(StoreError::ProjectAlreadyOpen(_))
+            ));
+            fixture.terminal_insert_fault(false);
+        }
     }
 }
