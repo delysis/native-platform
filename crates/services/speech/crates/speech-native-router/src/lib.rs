@@ -471,7 +471,7 @@ fn evaluate_synthesis<'a>(
             format!("{:?} alignment is not supported", request.alignment),
         ));
     }
-    select_voice(request, backend, capability)
+    select_voice(request, backend, capability, features.voice_selection)
 }
 
 fn language_supported(
@@ -504,6 +504,7 @@ fn select_voice<'a>(
     request: &SynthesisRequest,
     backend: &'a SpeechBackendDescriptor,
     capability: &SpeechCapability,
+    voice_selection_supported: bool,
 ) -> Result<Option<&'a VoiceDescriptor>, SpeechRouteRejection> {
     let route_voice = match &request.context.route {
         SpeechRouteSelector::ExactBackend { voice_id, .. } => voice_id.as_deref(),
@@ -533,6 +534,14 @@ fn select_voice<'a>(
     }
     let exact = route_voice.or(request_voice);
     if let Some(exact) = exact {
+        if !voice_selection_supported {
+            return Err(rejection(
+                backend,
+                Some(capability),
+                RouteRejectionCode::VoiceSelectorMismatch,
+                "explicit voice selection is not supported".to_string(),
+            ));
+        }
         return backend
             .voices
             .iter()
@@ -1232,5 +1241,259 @@ mod tests {
                 detail: "client_id must not be empty".to_string(),
             }
         );
+    }
+
+    fn synthesis_voice_fixture(
+        voice_selection: bool,
+    ) -> (SynthesisRequest, PlatformCapabilitySnapshot) {
+        let mut backend = backend(
+            "native.tts",
+            SpeechBackendKind::PlatformOnDevice,
+            capability(
+                "native.tts",
+                SpeechOperationCapability::Synthesis(SynthesisCapabilities {
+                    voice_selection,
+                    returned_audio: vec![AudioOutputKind::Wav],
+                    ..SynthesisCapabilities::default()
+                }),
+                NetworkBehavior::Never,
+            ),
+        );
+        backend.voices = ["installed", "not-installed"]
+            .into_iter()
+            .map(|id| VoiceDescriptor {
+                id: id.to_string(),
+                name: id.to_string(),
+                language: "en-US".to_string(),
+                gender: None,
+                quality: Some(VoiceQuality::Normal),
+                expected_latency: None,
+                network: NetworkBehavior::Never,
+                installed: id == "installed",
+            })
+            .collect();
+        let request = SynthesisRequest {
+            context: context(),
+            input: SynthesisInput::Text {
+                text: "hello".to_string(),
+            },
+            voice: VoiceSelector::Auto,
+            language: None,
+            rate: 1.0,
+            pitch: 1.0,
+            volume: 1.0,
+            output: AudioOutputFormat::Wav,
+            alignment: AlignmentGranularity::None,
+            stream: false,
+        };
+        (request, snapshot(vec![backend]))
+    }
+
+    #[test]
+    fn exact_request_voice_requires_advertised_selection_support() {
+        let (mut request, snapshot) = synthesis_voice_fixture(false);
+        request.voice = VoiceSelector::Exact {
+            voice_id: "installed".to_string(),
+        };
+        let error = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("an installed voice cannot grant an unsupported explicit operation");
+        assert!(matches!(
+            error,
+            SpeechRouteError::NoEligibleRoute {
+                operation: SpeechOperationKind::Synthesis,
+                rejections,
+            } if rejections.len() == 1
+                && rejections[0].backend_id == "native.tts"
+                && rejections[0].capability_id.as_deref() == Some("native.tts.capability")
+                && rejections[0].code == RouteRejectionCode::VoiceSelectorMismatch
+                && rejections[0].detail.contains("not supported")
+        ));
+    }
+
+    #[test]
+    fn exact_route_voice_requires_advertised_selection_support() {
+        let (mut request, snapshot) = synthesis_voice_fixture(false);
+        request.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "native.tts".to_string(),
+            model_id: None,
+            voice_id: Some("installed".to_string()),
+        };
+        let error = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("an exact route cannot grant unsupported voice selection");
+        assert!(matches!(
+            error,
+            SpeechRouteError::NoEligibleRoute {
+                operation: SpeechOperationKind::Synthesis,
+                rejections,
+            } if rejections.len() == 1
+                && rejections[0].backend_id == "native.tts"
+                && rejections[0].capability_id.as_deref() == Some("native.tts.capability")
+                && rejections[0].code == RouteRejectionCode::VoiceSelectorMismatch
+                && rejections[0].detail.contains("not supported")
+        ));
+    }
+
+    #[test]
+    fn supported_exact_selection_keeps_the_installed_voice_identity() {
+        for via_route in [false, true] {
+            let (mut request, snapshot) = synthesis_voice_fixture(true);
+            if via_route {
+                request.context.route = SpeechRouteSelector::ExactBackend {
+                    backend_id: "native.tts".to_string(),
+                    model_id: None,
+                    voice_id: Some("installed".to_string()),
+                };
+            } else {
+                request.voice = VoiceSelector::Exact {
+                    voice_id: "installed".to_string(),
+                };
+            }
+            let plan = SpeechRouter
+                .plan_synthesis(&request, &snapshot)
+                .expect("supported exact selection should remain available");
+            assert_eq!(plan.selected.route.backend_id, "native.tts");
+            assert_eq!(plan.selected.capability_id, "native.tts.capability");
+            assert_eq!(plan.selected.route.voice_id.as_deref(), Some("installed"));
+            assert!(plan.rejections.is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_voice_selection_keeps_default_and_language_routes_without_support() {
+        for exact_backend in [false, true] {
+            let (mut request, snapshot) = synthesis_voice_fixture(false);
+            if exact_backend {
+                request.context.route = SpeechRouteSelector::ExactBackend {
+                    backend_id: "native.tts".to_string(),
+                    model_id: None,
+                    voice_id: None,
+                };
+            }
+            let plan = SpeechRouter
+                .plan_synthesis(&request, &snapshot)
+                .expect("automatic default must not require explicit selection support");
+            assert_eq!(plan.selected.route.backend_id, "native.tts");
+            assert_eq!(plan.selected.route.voice_id, None);
+            request.language = Some("en-US".to_string());
+            let plan = SpeechRouter
+                .plan_synthesis(&request, &snapshot)
+                .expect("automatic language selection retains its existing contract");
+            assert_eq!(plan.selected.route.voice_id.as_deref(), Some("installed"));
+        }
+    }
+
+    #[test]
+    fn supported_exact_selection_still_refuses_missing_or_uninstalled_voices() {
+        for voice_id in ["absent", "not-installed"] {
+            for via_route in [false, true] {
+                let (mut request, snapshot) = synthesis_voice_fixture(true);
+                if via_route {
+                    request.context.route = SpeechRouteSelector::ExactBackend {
+                        backend_id: "native.tts".to_string(),
+                        model_id: None,
+                        voice_id: Some(voice_id.to_string()),
+                    };
+                } else {
+                    request.voice = VoiceSelector::Exact {
+                        voice_id: voice_id.to_string(),
+                    };
+                }
+                let error = SpeechRouter
+                    .plan_synthesis(&request, &snapshot)
+                    .expect_err("feature support cannot install or invent a voice");
+                assert!(matches!(
+                    error,
+                    SpeechRouteError::NoEligibleRoute { rejections, .. }
+                        if rejections.iter().any(|rejection| {
+                            rejection.code == RouteRejectionCode::VoiceSelectorMismatch
+                                && rejection.detail.contains("not installed")
+                        })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn voice_profile_and_conflicting_exact_ids_keep_their_existing_refusals() {
+        let (mut request, snapshot) = synthesis_voice_fixture(false);
+        request.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "native.tts".to_string(),
+            model_id: None,
+            voice_id: Some("installed".to_string()),
+        };
+        request.voice = VoiceSelector::Profile {
+            name: "unresolved".to_string(),
+        };
+        let profile = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("named voice profiles still need resolution");
+        assert!(matches!(
+            profile,
+            SpeechRouteError::NoEligibleRoute { rejections, .. }
+                if rejections.iter().any(|rejection| {
+                    rejection.code == RouteRejectionCode::NamedProfileUnresolved
+                })
+        ));
+        request.voice = VoiceSelector::Exact {
+            voice_id: "not-installed".to_string(),
+        };
+        let conflict = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("conflicting exact identities remain a selector mismatch");
+        assert!(matches!(
+            conflict,
+            SpeechRouteError::NoEligibleRoute { rejections, .. }
+                if rejections.iter().any(|rejection| {
+                    rejection.code == RouteRejectionCode::VoiceSelectorMismatch
+                        && rejection.detail.contains("different voices")
+                })
+        ));
+    }
+
+    #[test]
+    fn supported_voice_selection_keeps_language_privacy_and_runtime_evidence_gates() {
+        let (mut request, mut snapshot) = synthesis_voice_fixture(true);
+        request.voice = VoiceSelector::Exact {
+            voice_id: "installed".to_string(),
+        };
+        request.language = Some("fr-FR".to_string());
+        let language = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("exact voice support cannot bypass the capability language gate");
+        assert!(matches!(
+            language,
+            SpeechRouteError::NoEligibleRoute { rejections, .. }
+                if rejections.iter().any(|rejection| {
+                    rejection.code == RouteRejectionCode::LanguageUnsupported
+                })
+        ));
+        request.language = None;
+        snapshot.source_reports[0].backends[0].kind = SpeechBackendKind::Hosted;
+        let privacy = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("hosted synthesis remains excluded from local-only routing");
+        assert!(matches!(
+            privacy,
+            SpeechRouteError::NoEligibleRoute { rejections, .. }
+                if rejections.iter().any(|rejection| {
+                    rejection.code == RouteRejectionCode::PrivacyMismatch
+                })
+        ));
+        snapshot.source_reports[0].backends[0].kind = SpeechBackendKind::PlatformOnDevice;
+        snapshot.source_reports[0].backends[0].capabilities[0]
+            .evidence
+            .clear();
+        let evidence = SpeechRouter
+            .plan_synthesis(&request, &snapshot)
+            .expect_err("explicit selection cannot replace runtime capability evidence");
+        assert!(matches!(
+            evidence,
+            SpeechRouteError::NoEligibleRoute { rejections, .. }
+                if rejections.iter().any(|rejection| {
+                    rejection.code == RouteRejectionCode::NetworkNotProvenLocal
+                })
+        ));
     }
 }
