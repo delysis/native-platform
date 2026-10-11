@@ -476,13 +476,33 @@ mod tests {
 
     #[test]
     fn external_ffi_git_dependency_requires_the_exact_revision() {
-        let manifest = toml::from_str(
-            r#"dependency = { git = "https://github.com/delysis/llama-cpp-rs", rev = "deadbeef" }"#,
-        )
-        .expect("test manifest parses");
-        let error = check_git_dependencies(&manifest, Path::new("Cargo.toml"))
-            .expect_err("moving external revision must fail");
-        assert!(error.to_string().contains("unsealed Git dependency"));
+        let revision = "b508f1c7652c751513c361c7e4fdeb090fbed577";
+        for suffix in ["", ".git"] {
+            let source = format!(
+                "dependency = {{ git = \"https://github.com/delysis/llama-cpp-rs{suffix}\", rev = \"{revision}\" }}"
+            );
+            let manifest = toml::from_str(&source).expect("pinned manifest");
+            check_git_dependencies(&manifest, Path::new("Cargo.toml"))
+                .expect("sealed external revision");
+        }
+        for fields in [
+            "rev = \"deadbeef\"".to_owned(),
+            "branch = \"main\"".to_owned(),
+            format!("rev = \"{revision}\", tag = \"moving\""),
+            format!("rev = \"{revision}\", branch = \"main\""),
+        ] {
+            let source = format!(
+                "dependency = {{ git = \"https://github.com/delysis/llama-cpp-rs\", {fields} }}"
+            );
+            let manifest = toml::from_str(&source).expect("test manifest");
+            let error = check_git_dependencies(&manifest, Path::new("Cargo.toml"))
+                .expect_err("unsealed external revision must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsealed llama-cpp-rs dependency")
+            );
+        }
     }
 
     #[test]
