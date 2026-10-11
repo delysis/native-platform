@@ -332,6 +332,18 @@ struct Job {
 }
 
 impl Job {
+    fn event(&self, event_index: u64, event: GenerationEventKind) -> GenerationEvent {
+        GenerationEvent {
+            request_id: self.request.request_id.clone(),
+            branch_id: self.request.cases[0].case_id.clone(),
+            // The shared physical slot is deliberately not the caller's index.
+            sequence_id: 0,
+            input_index: 0,
+            event_index,
+            event,
+        }
+    }
+
     fn from_command(command: WorkerCommand) -> NativeResult<Self> {
         let WorkerCommand::GenerateBatch {
             request,
@@ -364,6 +376,10 @@ impl Job {
     }
 
     fn finish(self, result: NativeResult<GenerationCompletion>) {
+        self.publish(result, false);
+    }
+
+    fn publish(self, result: NativeResult<GenerationCompletion>, queued_rejection: bool) {
         // This lane owns one case. Cancelled partial output remains a
         // successful envelope; authority qualification is independent.
         let terminal = match &result {
@@ -381,7 +397,11 @@ impl Job {
             }
             Err(_) => RequestTerminalClass::Failed,
         };
-        let _ = self.lease.finished(terminal);
+        if queued_rejection {
+            let _ = self.lease.reject_queued(terminal);
+        } else {
+            let _ = self.lease.finished(terminal);
+        }
         if result.is_err() {
             if terminal == RequestTerminalClass::Cancelled {
                 emit_cancelled_case_events(&self.event_tx, &self.request);
@@ -395,12 +415,8 @@ impl Job {
     fn reject(self, error: NativeError) {
         if error.code == NativeErrorCode::Cancelled {
             self.cancel.store(true, Ordering::Release);
-            emit_cancelled_case_events(&self.event_tx, &self.request);
-            let _ = self.lease.cancel_queued();
-        } else {
-            emit_failed_case_events(&self.event_tx, &self.request);
         }
-        let _ = self.result_tx.send(Err(error));
+        self.publish(Err(error), true);
         // The executor lease, not the waiting ticket, releases this identity.
     }
 }
@@ -518,15 +534,7 @@ impl Sequence {
     }
 
     fn emit(&mut self, event: GenerationEventKind) {
-        let value = GenerationEvent {
-            request_id: self.job.request.request_id.clone(),
-            branch_id: self.job.request.cases[0].case_id.clone(),
-            // The shared physical slot is deliberately not the caller's index.
-            sequence_id: 0,
-            input_index: 0,
-            event_index: self.event_index,
-            event,
-        };
+        let value = self.job.event(self.event_index, event);
         self.event_index += 1;
         if let Some(events) = &mut self.events {
             events.push(value.clone());
@@ -587,7 +595,16 @@ impl Sequence {
     }
 
     fn finish(mut self, runtime: &Runtime<'_, '_>) {
-        let result = self.completion(runtime);
+        let result = self.completion(|request, outputs, capture| {
+            verify_generation_batch_authority(
+                runtime.model,
+                request,
+                runtime.fingerprint.clone(),
+                outputs,
+                capture,
+                runtime.artifacts,
+            )
+        });
         self.job.finish(result);
     }
 
@@ -595,7 +612,14 @@ impl Sequence {
         self.job.finish(Err(error));
     }
 
-    fn completion(&mut self, runtime: &Runtime<'_, '_>) -> NativeResult<GenerationCompletion> {
+    fn completion(
+        &mut self,
+        verify_authority: impl FnOnce(
+            GenerationBatchRequest,
+            &[GenerationOutput],
+            GenerationAuthorityCapture,
+        ) -> NativeResult<VerifiedGenerationEvidence>,
+    ) -> NativeResult<GenerationCompletion> {
         let finish_reason = self
             .finish
             .ok_or_else(|| internal("cooperative completion has no terminal"))?;
@@ -617,7 +641,15 @@ impl Sequence {
         } else {
             GenerationState::Completed
         };
-        self.emit(GenerationEventKind::State { state });
+        // Authority capture retains the original terminal and event index.
+        // Public progress cannot claim it before final envelope selection.
+        let terminal = self
+            .job
+            .event(self.event_index, GenerationEventKind::State { state });
+        self.event_index += 1;
+        if let Some(events) = &mut self.events {
+            events.push(terminal.clone());
+        }
         let duration_ms = self.started.elapsed().as_millis();
         let completion_tokens = self.token_ids.len();
         let output = GenerationOutput {
@@ -652,10 +684,8 @@ impl Sequence {
         let authority =
             match self.authority_error.take() {
                 Some(error) => Err(error),
-                None => verify_generation_batch_authority(
-                    runtime.model,
+                None => verify_authority(
                     self.job.request.clone(),
-                    runtime.fingerprint.clone(),
                     &outputs,
                     GenerationAuthorityCapture {
                         terminal_sampled_token_ids: vec![self.terminal_token],
@@ -667,13 +697,14 @@ impl Sequence {
                             internal("cooperative authority lost its token trace")
                         })?],
                     },
-                    runtime.artifacts,
                 ),
             };
-        Ok(match authority {
+        let completion = match authority {
             Ok(evidence) => GenerationCompletion::verified(outputs, evidence),
             Err(error) => GenerationCompletion::authority_rejected(outputs, error),
-        })
+        };
+        try_emit_terminal(&self.job.event_tx, terminal);
+        Ok(completion)
     }
 }
 
@@ -974,6 +1005,12 @@ mod tests {
     use super::*;
 
     fn cooperative_owner_job(request_id: &str) -> (NativeModelHandle, Job, GenerationTicket) {
+        let (handle, job, ticket) = cooperative_queued_job(request_id);
+        job.lease.running().expect("owner started");
+        (handle, job, ticket)
+    }
+
+    fn cooperative_queued_job(request_id: &str) -> (NativeModelHandle, Job, GenerationTicket) {
         let (handle, commands, _speculative) =
             crate::tests::test_admission_handle(crate::tests::admission_test_status(), 2);
         let request = GenerationBatchRequest {
@@ -1000,7 +1037,6 @@ mod tests {
             .expect("actual cooperative admission");
         let job = Job::from_command(commands.recv().expect("actual queued command"))
             .expect("actual cooperative owner");
-        job.lease.running().expect("owner started");
         (handle, job, ticket)
     }
 
@@ -1030,6 +1066,321 @@ mod tests {
             fake_fixture: true,
             transport: NativeTransport::InProcess,
         }])
+    }
+
+    // Model-free finalization checkpoint. The sampler is safely allocated and
+    // dropped on this thread, but never samples or touches a model/context.
+    // Production-shaped output fields are not evidence of native execution;
+    // the private authority callable can only refuse authority in these tests.
+    fn model_free_sequence_checkpoint(
+        request_id: &str,
+        finish_reason: &'static str,
+    ) -> (NativeModelHandle, Sequence, GenerationTicket) {
+        let (handle, job, ticket) = cooperative_owner_job(request_id);
+        let mut sequence = Sequence {
+            job,
+            prompt: vec![LlamaToken(1), LlamaToken(2)],
+            prefilled: 2,
+            next_position: 3,
+            pending_token: None,
+            sampler: LlamaSampler::greedy(),
+            decoder: UTF_8.new_decoder(),
+            text: String::new(),
+            token_ids: vec![17, 18],
+            trace: Some(TokenPieceTrace::with_token_capacity(2)),
+            events: Some(Vec::new()),
+            authority_error: None,
+            terminal_token: None,
+            finish: Some(finish_reason),
+            generating: true,
+            event_index: 0,
+            started: Instant::now(),
+            first_token_ms: Some(0),
+        };
+        sequence.emit(GenerationEventKind::State {
+            state: GenerationState::Prefilling,
+        });
+        sequence.emit(GenerationEventKind::State {
+            state: GenerationState::Generating,
+        });
+        for bytes in [b"checkpoint ".as_slice(), "café\r\n".as_bytes()] {
+            sequence
+                .trace
+                .as_mut()
+                .expect("owned trace")
+                .push_piece(bytes)
+                .expect("bounded local piece");
+            let text = decode_generated_utf8_piece(&mut sequence.decoder, bytes, false)
+                .expect("local UTF-8 checkpoint");
+            append_generated_utf8_piece(&mut sequence.text, &text)
+                .expect("bounded checkpoint text");
+            sequence.emit(GenerationEventKind::Delta { text });
+        }
+        sequence.job.lease.progress(2).expect("running progress");
+        (handle, sequence, ticket)
+    }
+
+    fn public_terminals(events: &Receiver<GenerationEvent>) -> Vec<GenerationState> {
+        events
+            .try_iter()
+            .filter_map(|event| match event.event {
+                GenerationEventKind::State { state } if is_terminal_state(state) => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cooperative_queued_failure_survives_late_cancel_and_held_final_delivery() {
+        for drop_receiver in [false, true] {
+            let (handle, mut job, mut ticket) =
+                cooperative_queued_job("cooperative-queued-selected-error");
+            let request = job.request.clone();
+            let control = Arc::clone(&ticket.control);
+            let events = ticket.events.clone();
+            // Hold only the final delivery; admission/command/ticket/lease are real.
+            let (sender, receiver) = bounded(0);
+            job.result_tx = sender;
+            ticket.result = receiver;
+            let worker = std::thread::spawn(move || {
+                job.reject(NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "selected queued error",
+                ));
+            });
+            let selected = events
+                .recv_timeout(Duration::from_secs(3))
+                .expect("actual selected error projection before the final send");
+            let late_cancel = ticket.cancel_branch("case");
+            let held = control.snapshot();
+            let held_count = handle.inner.requests.active_count();
+            let duplicate_code = handle
+                .generate_cooperative(request.clone())
+                .err()
+                .map(|error| error.code);
+            let delivered = if drop_receiver {
+                drop(ticket);
+                None
+            } else {
+                Some(ticket.wait().expect_err("original selected error"))
+            };
+            worker
+                .join()
+                .expect("owner finished its final send attempt");
+            let released = control.snapshot();
+            assert!(late_cancel);
+            assert_eq!(selected.request_id, request.request_id);
+            assert_eq!(selected.branch_id, "case");
+            assert!(matches!(
+                selected.event,
+                GenerationEventKind::State {
+                    state: GenerationState::Failed
+                }
+            ));
+            assert_eq!(
+                held.phase,
+                crate::operation_registry::RequestPhase::Terminal
+            );
+            assert_eq!(held_count, 1);
+            assert_eq!(
+                duplicate_code,
+                Some(NativeErrorCode::DuplicateActiveRequest)
+            );
+            assert!(held.cancellation_requested);
+            assert_eq!(
+                held.authoritative_terminal
+                    .expect("selected terminal")
+                    .class,
+                RequestTerminalClass::Failed
+            );
+            if let Some(error) = delivered {
+                assert_eq!(error.code, NativeErrorCode::PromptTooLarge);
+                assert_eq!(error.message, "selected queued error");
+            }
+            assert_eq!(released.identity, held.identity);
+            assert_eq!(
+                released.phase,
+                crate::operation_registry::RequestPhase::Released
+            );
+            assert_eq!(
+                released
+                    .authoritative_terminal
+                    .expect("retained terminal")
+                    .class,
+                RequestTerminalClass::Failed
+            );
+            assert_eq!(handle.inner.requests.active_count(), 0);
+            assert!(public_terminals(&events).is_empty());
+        }
+    }
+
+    #[test]
+    fn cooperative_queued_cancellation_keeps_its_existing_public_result() {
+        let (handle, job, ticket) = cooperative_queued_job("cooperative-queued-cancel");
+        let control = Arc::clone(&ticket.control);
+        let events = ticket.events.clone();
+        job.reject(cancelled());
+        assert_eq!(
+            ticket.wait().expect_err("queued cancellation").code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(public_terminals(&events), [GenerationState::Cancelled]);
+        assert_eq!(
+            control
+                .snapshot()
+                .authoritative_terminal
+                .expect("terminal")
+                .class,
+            RequestTerminalClass::Cancelled
+        );
+        assert_eq!(handle.inner.requests.active_count(), 0);
+    }
+
+    // These two faults violate private retention invariants. They harden final
+    // envelope selection; they are not valid-input native inference witnesses.
+    fn assert_model_free_retention_fault(mut sequence: Sequence, ticket: GenerationTicket) {
+        let control = Arc::clone(&ticket.control);
+        let events = ticket.events.clone();
+        let result = sequence.completion(|_, _, _| {
+            panic!("missing retained data must refuse before authority verification")
+        });
+        sequence.job.finish(result);
+        assert_eq!(
+            ticket.wait().expect_err("retention invariant failure").code,
+            NativeErrorCode::Internal
+        );
+        assert_eq!(public_terminals(&events), [GenerationState::Failed]);
+        assert_eq!(
+            control
+                .snapshot()
+                .authoritative_terminal
+                .expect("terminal")
+                .class,
+            RequestTerminalClass::Failed
+        );
+    }
+
+    #[test]
+    fn model_free_sequence_missing_events_publishes_only_selected_failure() {
+        let (_handle, mut sequence, ticket) =
+            model_free_sequence_checkpoint("cooperative-lost-events", "max_tokens");
+        sequence.events = None;
+        assert_model_free_retention_fault(sequence, ticket);
+    }
+
+    #[test]
+    fn model_free_sequence_missing_trace_publishes_only_selected_failure() {
+        let (_handle, mut sequence, ticket) =
+            model_free_sequence_checkpoint("cooperative-lost-trace", "cancelled");
+        sequence.trace = None;
+        assert_model_free_retention_fault(sequence, ticket);
+    }
+
+    #[test]
+    fn model_free_sequence_preserves_partial_results_and_retained_terminal_without_authority() {
+        for finish_reason in ["max_tokens", "cancelled"] {
+            for verified_wait in [false, true] {
+                let (handle, mut sequence, ticket) =
+                    model_free_sequence_checkpoint("cooperative-envelope-control", finish_reason);
+                let expected = if finish_reason == "cancelled" {
+                    GenerationState::Cancelled
+                } else {
+                    GenerationState::Completed
+                };
+                let control = Arc::clone(&ticket.control);
+                let events = ticket.events.clone();
+                let result = sequence.completion(|request, outputs, capture| {
+                    assert_eq!(request.request_id, "cooperative-envelope-control");
+                    assert_eq!(outputs[0].text, "checkpoint café\r\n");
+                    assert_eq!(outputs[0].generated_token_ids, [17, 18]);
+                    assert_eq!(capture.terminal_sampled_token_ids, [None]);
+                    assert_eq!(
+                        capture.token_piece_traces[0].raw_piece_bytes(),
+                        "checkpoint café\r\n".as_bytes()
+                    );
+                    assert_eq!(
+                        capture
+                            .events
+                            .last()
+                            .expect("retained terminal")
+                            .event_index,
+                        4
+                    );
+                    assert!(matches!(
+                        capture.events.last().expect("retained terminal").event,
+                        GenerationEventKind::State { state } if state == expected
+                    ));
+                    // No model was loaded/decoded and no seal may be fabricated.
+                    Err(unsupported(
+                        "model-free checkpoint carries no native authority",
+                    ))
+                });
+                assert!(
+                    result
+                        .as_ref()
+                        .expect("selected execution envelope")
+                        .authority
+                        .is_err()
+                );
+                sequence.job.finish(result);
+                if verified_wait {
+                    assert_eq!(
+                        ticket
+                            .wait_verified()
+                            .expect_err("no native authority")
+                            .code,
+                        NativeErrorCode::UnsupportedParameter
+                    );
+                } else {
+                    let outputs = ticket.wait().expect("partial execution envelope");
+                    assert_eq!(outputs[0].text, "checkpoint café\r\n");
+                    assert_eq!(outputs[0].generated_token_ids, [17, 18]);
+                    assert_eq!(outputs[0].state, expected);
+                }
+                assert_eq!(public_terminals(&events), [expected]);
+                assert_eq!(
+                    control
+                        .snapshot()
+                        .authoritative_terminal
+                        .expect("terminal")
+                        .class,
+                    if expected == GenerationState::Cancelled {
+                        RequestTerminalClass::Cancelled
+                    } else {
+                        RequestTerminalClass::Completed
+                    }
+                );
+                assert_eq!(handle.inner.requests.active_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn model_free_sequence_unsealable_and_prefill_controls_keep_their_refusals() {
+        for prefill_cancel in [false, true] {
+            let (_handle, mut sequence, ticket) =
+                model_free_sequence_checkpoint("cooperative-refusal-control", "cancelled");
+            let events = ticket.events.clone();
+            sequence.authority_error = Some(unsupported("not statically sealable"));
+            sequence.events = None;
+            sequence.trace = None;
+            sequence.generating = !prefill_cancel;
+            let result = sequence
+                .completion(|_, _, _| panic!("these paths never call the authority verifier"));
+            sequence.job.finish(result);
+            if prefill_cancel {
+                assert_eq!(
+                    ticket.wait().expect_err("prefill cannot complete").code,
+                    NativeErrorCode::Cancelled
+                );
+            } else {
+                assert_eq!(
+                    ticket.wait().expect("unsealable partial result")[0].text,
+                    "checkpoint café\r\n"
+                );
+            }
+            assert_eq!(public_terminals(&events), [GenerationState::Cancelled]);
+        }
     }
 
     #[test]
