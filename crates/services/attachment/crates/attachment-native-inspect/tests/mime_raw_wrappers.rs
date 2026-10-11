@@ -161,7 +161,9 @@ fn raw_wrapper_depth_is_admitted_before_eager_descent() {
 #[test]
 fn raw_multipart_and_digest_siblings_restore_depth_without_double_charging() {
     for subtype in ["mixed", "digest"] {
-        let mut message = format!("From: source@example.test\r\nSubject: Siblings\r\nContent-Type: multipart/{subtype}; boundary=outer\r\n\r\n");
+        let mut message = format!(
+            "From: source@example.test\r\nSubject: Siblings\r\nContent-Type: multipart/{subtype}; boundary=outer\r\n\r\n"
+        );
         for index in 0..2 {
             let content_type = if subtype == "mixed" {
                 "Content-Type: message/rfc822\r\n"
@@ -185,9 +187,13 @@ fn raw_multipart_and_digest_siblings_restore_depth_without_double_charging() {
         assert_eq!(bundle.graph.usage.entries, 2);
         assert_eq!(bundle.graph.objects.len(), 3);
         assert_eq!(bundle.graph.edges.len(), 2);
-        assert!(bundle.graph.edges.iter().all(|edge| {
-            edge.depth == 1 && edge.outcome == EdgeOutcome::Derived
-        }));
+        assert!(
+            bundle
+                .graph
+                .edges
+                .iter()
+                .all(|edge| { edge.depth == 1 && edge.outcome == EdgeOutcome::Derived })
+        );
         assert!(bundle.graph.issues.is_empty(), "{:#?}", bundle.graph);
     }
 }
@@ -199,7 +205,9 @@ fn missing_empty_and_unmatched_boundaries_charge_the_recovered_attachment() {
         "multipart/mixed; boundary=\"\"",
         "multipart/mixed; boundary=absent",
     ] {
-        let bytes = format!("From: source@example.test\r\nSubject: Recovery\r\nContent-Type: {content_type}\r\n\r\nrecovered evidence\r\n");
+        let bytes = format!(
+            "From: source@example.test\r\nSubject: Recovery\r\nContent-Type: {content_type}\r\n\r\nrecovered evidence\r\n"
+        );
         assert_eq!(
             MessageParser::default()
                 .parse(bytes.as_bytes())
