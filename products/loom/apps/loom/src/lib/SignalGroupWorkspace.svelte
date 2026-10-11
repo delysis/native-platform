@@ -57,48 +57,49 @@
 </script>
 
 <div class="group-workspace">
-  <button type="button" aria-expanded={opened} on:click={toggle}>Workspace in group description</button>
+  <button type="button" aria-expanded={opened} on:click={toggle} aria-label="Workspace in group description" title="Workspace in group description"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h5l2 2h5v8H2z" /></svg>Workspace</button>
   {#if opened}
     <section aria-label="Share a group workspace" aria-busy={busy}>
       {#if loaded}
         {#if workspaces.length}
           <label>Workspace
             <select aria-label="Workspace for group description" bind:value={selected} disabled={busy || review?.state === 'unconfirmed'}>
-              <option value="">Choose a workspace</option>
+              <option value="">Workspace</option>
               {#each workspaces as workspace (workspace.id)}<option value={workspace.id}>{workspace.title}</option>{/each}
             </select>
           </label>
-          <button type="button" disabled={!canPreview} on:click={() => void perform({ kind: 'prepare_group_workspace', conversation_id: conversation, workspace_id: selected })}>Preview description</button>
-        {:else}<p>Invite or join a cabal from this conversation to save its workspace here.</p>{/if}
+          <button type="button" disabled={!canPreview} on:click={() => void perform({ kind: 'prepare_group_workspace', conversation_id: conversation, workspace_id: selected })} aria-label="Preview description" title="Preview description">Preview</button>
+        {:else}<p class="quiet" title="Invite or join a cabal from this conversation to save its workspace here.">Unavailable</p>{/if}
         {#if review}
           <p class="quiet">{review.workspace.title} · This link opens the workspace for people who have already joined it.</p>
           <details><summary>Previous description</summary><p class="description">{review.before || '(Empty)'}</p></details>
           <p class="quiet">Reviewed description</p><p class="description" aria-label="Reviewed group description">{review.after}</p>
           {#if review.state === 'prepared'}
-            <button type="button" disabled={!connected || busy} on:click={() => act('publish_group_workspace')}>Publish description</button>
+            <button type="button" disabled={!connected || busy} on:click={() => act('publish_group_workspace')} aria-label="Publish description" title="Publish description">Publish</button>
           {:else if review.state === 'unconfirmed'}
             <p role="status">The description update is unconfirmed. Check it before deciding to retry.</p>
-            <button type="button" disabled={!connected || busy} on:click={() => act('publish_group_workspace')}>Retry this exact update</button>
+            <button type="button" disabled={!connected || busy} on:click={() => act('publish_group_workspace')} aria-label="Retry this exact update" title="Retry this exact update">Retry</button>
           {:else if review.state === 'conflict'}<p role="status">The group description changed. Preview a new addition to preserve those changes.</p>
           {:else}
             <p role="status">Workspace link published.</p>
             {#if review.notification === 'none'}
-              <p class="quiet">Notify members so their Signal apps refresh the description.</p>
-              <button type="button" disabled={!connected || busy} on:click={() => act('notify_group_workspace')}>Notify group members</button>
+
+              <button type="button" disabled={!connected || busy} on:click={() => act('notify_group_workspace')} aria-label="Notify group members" title="Notify group members">Notify</button>
             {:else if review.notification === 'unconfirmed'}<p role="status">Notification delivery is unconfirmed. Loom will not send it again. The description is saved.</p>
             {:else}<p class="quiet">Group notification sent.</p>{/if}
           {/if}
-          <button type="button" disabled={!connected || busy} on:click={() => act('check_group_workspace')}>Check description</button>
+          <button type="button" disabled={!connected || busy} on:click={() => act('check_group_workspace')} aria-label="Check description" title="Check description">Check</button>
         {/if}
-      {:else if !busy}<button type="button" on:click={load}>Reopen saved review</button>{/if}
-      {#if !connected}<p class="quiet">Reconnect Signal to preview or publish a description.</p>{/if}
-      {#if busy}<p class="quiet" role="status">Updating workspace review…</p>{/if}
+      {:else if !busy}<button type="button" on:click={load} aria-label="Reopen saved review" title="Reopen saved review">Reopen</button>{/if}
+      {#if !connected}<p class="quiet" title="Reconnect Signal to preview or publish a description.">Disconnected</p>{/if}
+      {#if busy}<p class="quiet" role="status">Updating</p>{/if}
       {#if error}<p class="error" role="alert">{error}</p>{/if}
     </section>
   {/if}
 </div>
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   .group-workspace { padding:0 8px 6px; }
   button { border:0; border-radius:5px; background:transparent; color:inherit; padding:5px 7px; font:inherit; cursor:pointer; }
   button:hover:not(:disabled) { background:var(--paper-deep); } button:disabled { opacity:.45; cursor:default; }

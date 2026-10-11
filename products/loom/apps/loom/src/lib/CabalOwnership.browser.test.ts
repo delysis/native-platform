@@ -20,7 +20,7 @@ function render(onTransfer = vi.fn(async (_member: string, _roster: string) => {
   return { snapshot, onTransfer };
 }
 async function review() {
-  await page.getByText('Hand over the keys', { exact:true }).click();
+  await page.getByLabelText('Hand over the keys', { exact:true }).click();
   await page.getByLabelText('Next owner').selectOptions('fern');
   await page.getByRole('button', { name:'Review handoff', exact:true }).click();
 }
@@ -61,6 +61,6 @@ it('a lost reply is not replayed and a new owner removes the old controls', asyn
   expect(onTransfer).toHaveBeenCalledTimes(1);
   await expect.element(page.getByRole('button', { name:'Give Fern the keys', exact:true })).not.toBeInTheDocument();
   snapshot.update(current => ({ ...current, roster_hash:'handed-off', roster:{payload:{...current.roster.payload,owner:'fern'}} }));
-  await expect.element(page.getByText('Hand over the keys', { exact:true })).not.toBeInTheDocument();
+  await expect.element(page.getByLabelText('Hand over the keys', { exact:true })).not.toBeInTheDocument();
   expect(onTransfer).toHaveBeenCalledTimes(1);
 });

@@ -54,11 +54,10 @@
 </script>
 
 <details class="compute-sharing">
-  <summary>Share idle compute</summary>
-  <p class="quiet">Lend your model a little. Your own writing and model work take priority.</p>
+  <summary aria-label="Share idle compute" title="Lend your model. Your own writing and model work take priority.">Compute</summary>
   {#if snapshot?.problem}<p role="alert" class="error">{snapshot.problem}</p>{/if}
-  {#if snapshot?.model}<p class="model"><strong>{snapshot.model.name}</strong><small>{modelModalities(snapshot.model)}<br />{snapshot.idle ? 'Idle · available for granted jobs' : 'Busy · no new peer jobs'}</small></p>
-  {:else}<p class="quiet">Load a text-completion model to share it.</p>{/if}
+  {#if snapshot?.model}<p class="model"><strong>{snapshot.model.name}</strong><small>{modelModalities(snapshot.model)}<br />{snapshot.idle ? 'Idle' : 'Busy'}</small></p>
+  {:else}<p class="quiet" title="Load a text-completion model to share it.">Unloaded</p>{/if}
   {#if snapshot?.grants.length}
     <ul aria-label="Compute grants">
       {#each snapshot.grants as item (item.grant.id)}
@@ -66,7 +65,7 @@
           {#if !item.current}<small>Membership changed · grant inactive</small>
           {:else if !item.jobs_remaining}<small>Budget used</small>
           {:else if item.grant.model.fingerprint !== snapshot.model?.fingerprint}<small>Waiting for this model</small>{/if}
-          <button type="button" disabled={busy} on:click={() => void change(() => sharing.revoke(scope, item.grant.id))}>Revoke grant</button>
+          <button type="button" disabled={busy} on:click={() => void change(() => sharing.revoke(scope, item.grant.id))} aria-label="Revoke grant" title="Revoke grant"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 8h10" /></svg>Revoke</button>
         </li>
       {/each}
     </ul>
@@ -74,22 +73,22 @@
   {#if pending}
     <div class="review" aria-label="Pending compute grant"><p>{pending.memberName} · {pending.modelName}<br />{pending.modalities}<br />{pending.request.jobs} jobs · {pending.request.max_output_tokens} tokens · {pending.request.max_seconds}s</p>
       <p class="quiet">{busy ? 'Saving this grant…' : 'This grant has not been confirmed. Check it or retry the same grant.'}</p>
-      <button type="button" disabled={busy || refreshing} on:click={() => void refresh()}>Check grant</button>
-      <button type="button" disabled={busy} on:click={() => void change(() => sharing.grant(scope))}>Retry grant</button>
-      <button type="button" disabled={busy} on:click={() => void change(() => sharing.revoke(scope, pending!.request.id))}>Revoke pending grant</button>
+      <button type="button" disabled={busy || refreshing} on:click={() => void refresh()} aria-label="Check grant" title="Check grant">Check</button>
+      <button type="button" disabled={busy} on:click={() => void change(() => sharing.grant(scope))} aria-label="Retry grant" title="Retry grant">Retry</button>
+      <button type="button" disabled={busy} on:click={() => void change(() => sharing.revoke(scope, pending!.request.id))} aria-label="Revoke pending grant" title="Revoke pending grant"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 8h10" /></svg>Revoke</button>
     </div>
   {:else if review}
     <div class="review" aria-label="Review compute grant"><p><strong>{review.memberName}</strong> may use <strong>{review.modelName}</strong> for {review.request.jobs} jobs, each up to {review.request.max_output_tokens} tokens and {review.request.max_seconds}s.<br />Inputs: {review.modalities}.</p>
-      <p class="quiet">The grant resumes after restarting Loom when this model is loaded. You can revoke it here at any time.</p>
+
       {#if !reviewCurrent}<p class="error">The model or membership changed. Review a new grant.</p>{/if}
-      <button type="button" disabled={busy || !reviewCurrent} on:click={() => void change(() => sharing.grant(scope, review!))}>Share with {review.memberName}</button>
+      <button type="button" disabled={busy || !reviewCurrent} on:click={() => void change(() => sharing.grant(scope, review!))} aria-label={`Share with ${review.memberName}`} title="The grant resumes after restart with this model loaded; revoke it here at any time."><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 11V2M5 5l3-3 3 3M3 9v5h10V9" /></svg>Share</button>
       <button type="button" disabled={busy} on:click={() => review = null}>Back</button>
     </div>
   {:else if snapshot?.model && !cabal.read_only && !snapshot.problem}
     <form on:submit|preventDefault={prepare}>
-      <label>Friend<select bind:value={memberKey} disabled={busy}><option value="">Choose a cabal member</option>{#each members as member (member.key)}<option value={member.key}>{member.name}</option>{/each}</select></label>
-      <div class="limits"><label>Jobs<input type="number" min="1" max="256" step="1" bind:value={jobs} required disabled={busy} /></label><label>Tokens per job<input type="number" min="1" max="2048" step="1" bind:value={tokens} required disabled={busy} /></label><label>Seconds per job<input type="number" min="1" max="120" step="1" bind:value={seconds} required disabled={busy} /></label></div>
-      <button type="submit" disabled={busy || !memberKey}>Review grant</button>
+      <label>Friend<select bind:value={memberKey} disabled={busy}><option value="">Member</option>{#each members as member (member.key)}<option value={member.key}>{member.name}</option>{/each}</select></label>
+      <div class="limits"><label>Jobs<input type="number" min="1" max="256" step="1" bind:value={jobs} required disabled={busy} /></label><label>Tokens<input aria-label="Tokens per job" type="number" min="1" max="2048" step="1" bind:value={tokens} required disabled={busy} /></label><label>Seconds<input aria-label="Seconds per job" type="number" min="1" max="120" step="1" bind:value={seconds} required disabled={busy} /></label></div>
+      <button type="submit" disabled={busy || !memberKey} aria-label="Review grant" title="Review grant"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2h10v12H3zM5 5h6M5 8h6M5 11h4" /></svg>Review</button>
     </form>
   {/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -97,6 +96,7 @@
 </details>
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   details { margin:12px; border-top:1px solid var(--line); padding-top:12px; font-size:11px; }
   summary { cursor:pointer; color:var(--muted); } p { line-height:1.6; margin:10px 0; overflow-wrap:anywhere; }
   strong { font-weight:500; } small { display:block; color:var(--muted); line-height:1.5; margin-top:3px; }

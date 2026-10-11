@@ -241,16 +241,15 @@
   <header><strong>Signal</strong><span class="connection" role="status">{status.phase === 'connected' ? '' : status.phase}</span><button type="button" aria-label="Close Signal" on:click={onClose}>×</button></header>
   {#if status.phase === 'unlinked' || status.phase === 'linking'}
     <div class="link-device">
-      {#if qr}<img src={qr} alt="Signal linked device QR code" width="232" height="232" />
-        <p>On your phone, open Signal → Settings → Linked devices → Link new device.</p>
+      {#if qr}<img src={qr} alt="Signal linked device QR code" width="232" height="232" title="On your phone, open Signal → Settings → Linked devices → Link new device." />
         <button type="button" on:click={() => void signalRequest({ kind: 'cancel_link' }).then(observe)}>Cancel</button>
-      {:else}<p>Your people, beside your writing.</p><button type="button" on:click={() => void link()} disabled={busy || status.phase === 'linking'}>{status.phase === 'linking' ? 'Connecting…' : 'Link Signal'}</button>{/if}
+      {:else}<button aria-label="Link Signal" title="Link Signal" type="button" on:click={() => void link()} disabled={busy || status.phase === 'linking'}>{status.phase === 'linking' ? 'Connecting' : 'Link'}</button>{/if}
     </div>
   {:else}
     <div class="conversation-picker">
-      <input aria-label="Find a Signal conversation" placeholder="Find someone…" bind:value={search} />
+      <input aria-label="Find a Signal conversation" placeholder="Search" bind:value={search} />
       <select aria-label="Signal conversation" value={selected} on:change={event => void choose(event.currentTarget.value)} disabled={busy || drafting}>
-        <option value="">Choose a conversation</option>
+        <option value="">Conversation</option>
         {#each conversations.filter(item => item.title.toLocaleLowerCase().includes(search.toLocaleLowerCase())) as item (item.id)}<option value={item.id}>{item.title}</option>{/each}
       </select>
     </div>
@@ -263,7 +262,7 @@
             <div><button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(workspace.id, false)}>{workspace.title}</button><button type="button" aria-label={`Forget workspace ${workspace.title}`} disabled={busy} on:click={() => void forgetWorkspace(workspace.id)}>×</button></div>
           {/each}
           {#each signalWorkspaceIds(conversation.description ?? '').filter(id => !links?.workspaces.some(item => item.id === id)) as id}
-            <button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)}>Open workspace</button>
+            <button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)} aria-label="Open workspace" title="Open workspace"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 5h5l2 2h5v7H2zM2 5V3h5l2 2" /></svg>Open</button>
           {/each}
         </div>
       {/if}
@@ -272,8 +271,8 @@
       {/if}
       {#if nextBefore !== null || before !== null}
         <nav class="history" aria-label="Signal message history">
-          {#if nextBefore !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(nextBefore)}>Earlier messages</button>{/if}
-          {#if before !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(null)}>Latest messages</button>{/if}
+          {#if nextBefore !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(nextBefore)} aria-label="Earlier messages" title="Earlier messages">Earlier</button>{/if}
+          {#if before !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(null)} aria-label="Latest messages" title="Latest messages">Latest</button>{/if}
         </nav>
       {/if}
       <div class="messages" bind:this={viewport} role="log" aria-label={`Messages with ${conversation.title}`} aria-live="polite">
@@ -282,40 +281,40 @@
             <div class="byline"><span>{message.outgoing ? 'You' : message.sender_name}</span><time datetime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>
             <p>{message.deleted ? 'Message deleted' : message.text}</p>
             {#if !message.deleted}
-              {#each invitations(message.text) as invitation}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(invitation, true)}>Join cabal</button>{/each}
-              {#each signalWorkspaceIds(message.text) as id}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)}>Open workspace</button>{/each}
+              {#each invitations(message.text) as invitation}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(invitation, true)} aria-label="Join cabal" title="Join cabal"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 8h9M8 5l3 3-3 3M11 2h3v12h-3" /></svg>Join</button>{/each}
+              {#each signalWorkspaceIds(message.text) as id}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)} aria-label="Open workspace" title="Open workspace"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 5h5l2 2h5v7H2zM2 5V3h5l2 2" /></svg>Open</button>{/each}
             {/if}
             {#if message.attachment_count}<small>{message.attachment_count} attachment{message.attachment_count === 1 ? '' : 's'} · Open in Signal</small>{/if}
             {#if message.edited}<small>Edited</small>{/if}
           </article>
         {/each}
-        {#if !visible.length}<p class="quiet">{before !== null || nextBefore !== null ? 'No chat messages in this part of the conversation.' : 'New messages will appear here after Signal syncs this device.'}</p>{/if}
       </div>
-      {#if proposal}<div class="proposal"><p>{proposal}</p><button type="button" disabled={busy || !!uncertain} on:click={() => { changeDraft(proposal); proposal = ''; }}>Use draft</button><button type="button" on:click={() => proposal = ''}>Discard</button></div>{/if}
+      {#if proposal}<div class="proposal"><p>{proposal}</p><button type="button" disabled={busy || !!uncertain} on:click={() => { changeDraft(proposal); proposal = ''; }} aria-label="Use draft" title="Use draft">Use</button><button type="button" on:click={() => proposal = ''}>Discard</button></div>{/if}
       <div class="compose">
-        <textarea bind:this={composer} aria-label="Signal message draft" placeholder="Write a message…" rows="3" value={draft} on:input={event => changeDraft(event.currentTarget.value)} on:keydown={keydown} disabled={busy || !!uncertain}></textarea>
-        {#if saving}<span class="quiet" role="status">Saving draft…</span>{/if}
+        <textarea bind:this={composer} aria-label="Signal message draft" placeholder="Message" rows="3" value={draft} on:input={event => changeDraft(event.currentTarget.value)} on:keydown={keydown} disabled={busy || !!uncertain}></textarea>
+        {#if saving}<span class="quiet" role="status">Saving</span>{/if}
         <div class="actions">
-          <button type="button" title={`Draft locally with ${modelLabel} using up to 20 displayed messages. The draft is retained in this workspace.`} disabled={!canDraft} on:click={() => void draftReply()}>{drafting ? 'Drafting…' : 'Draft locally'}</button>
-          <button type="button" disabled={busy || drafting || !!uncertain} on:click={() => void invite()}>Invite to cabal</button>
-          {#if uncertain}<button type="button" disabled={busy} on:click={() => void send(true)}>Check send</button>
+          <button type="button" aria-label="Draft locally" title={`Draft locally with ${modelLabel} using up to 20 displayed messages. The draft is retained in this workspace.`} disabled={!canDraft} on:click={() => void draftReply()}>{drafting ? 'Drafting' : 'Draft'}</button>
+          <button type="button" disabled={busy || drafting || !!uncertain} on:click={() => void invite()} aria-label="Invite to cabal" title="Invite to cabal"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" /></svg>Invite</button>
+          {#if uncertain}<button type="button" disabled={busy} on:click={() => void send(true)} aria-label="Check send" title="Check send">Check</button>
           {:else}<button type="button" class="send" disabled={busy || drafting || !draft.trim() || status.phase !== 'connected'} on:click={() => void send()}>Send</button>{/if}
         </div>
-        {#if conversation.disappearing}<p class="quiet">Disappearing messages stay out of retained model drafts.</p>{/if}
+        {#if conversation.disappearing}<span class="quiet" aria-label="Disappearing messages stay out of retained model drafts" title="Disappearing messages stay out of retained model drafts">◷</span>{/if}
       </div>
-    {:else}<p class="quiet empty">Choose someone to talk and make things with.</p>{/if}
+    {/if}
   {/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 </section>
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   .signal-pane { display:flex; flex-direction:column; height:100%; min-height:0; font-size:12px; }
   header { display:flex; align-items:center; gap:8px; padding:9px 12px; border-bottom:1px solid var(--line); }
   header strong { font-weight:500; } .connection { margin-left:auto; color:var(--muted); font-size:11px; }
   button { border:0; border-radius:5px; background:transparent; color:inherit; padding:5px 7px; font:inherit; cursor:pointer; }
   button:hover:not(:disabled) { background:var(--paper-deep); } button:disabled { opacity:.45; cursor:default; }
   .link-device { margin:auto; padding:24px; text-align:center; max-width:290px; } .link-device img { display:block; max-width:100%; height:auto; margin:0 auto 16px; border-radius:6px; }
-  .link-device p { line-height:1.6; } .link-device button { background:var(--paper-deep); }
+ .link-device button { background:var(--paper-deep); }
   .conversation-picker { display:flex; flex-direction:column; gap:6px; padding:10px 12px; }
   input, select, textarea { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:5px; color:var(--ink); background:transparent; font:inherit; padding:7px 8px; }
   .description { margin:0; padding:0 12px 10px; color:var(--muted); white-space:pre-wrap; overflow-wrap:anywhere; }
@@ -330,6 +329,6 @@
   .compose { border-top:1px solid var(--line); padding:10px; } textarea { resize:vertical; min-height:70px; max-height:240px; line-height:1.5; }
   .actions { display:flex; gap:2px; margin-top:5px; align-items:center; flex-wrap:wrap; font-size:11px; } .send { margin-left:auto; }
   .proposal { padding:10px 12px; border-top:1px solid var(--line); max-height:200px; overflow:auto; } .proposal p { white-space:pre-wrap; line-height:1.6; }
-  .quiet { color:var(--muted); font-size:11px; line-height:1.5; } .empty { margin:24px 12px; }
+  .quiet { color:var(--muted); font-size:11px; line-height:1.5; }
   .error { padding:8px 12px; margin:0; color:var(--danger); font-size:11px; line-height:1.5; overflow-wrap:anywhere; }
 </style>

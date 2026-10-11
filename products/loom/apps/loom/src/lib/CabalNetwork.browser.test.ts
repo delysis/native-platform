@@ -29,7 +29,7 @@ it('reads only on disclosure and saves exact reviewed relay settings without res
   expect(ipc.invoke).toHaveBeenLastCalledWith('plugin:loom|cabal_network_set', {
     expected: 'first', connection: { mode: 'relays', urls: ['https://our.example', 'https://backup.example'] }
   });
-  await expect.element(page.getByText('Saved. Restart Loom to use these connections; your pairing stays.')).toBeVisible();
+  await expect.element(page.getByRole('status', { name: 'Saved. Restart Loom to use these connections; your pairing stays.' })).toBeVisible();
   expect(ipc.invoke.mock.calls.every(([command]) => command.startsWith('plugin:loom|cabal_network_'))).toBe(true);
 });
 

@@ -62,7 +62,9 @@ describe('Signal history', () => {
       : original(command, id));
     const editor = new SignalDraftEditor(ipc.request); await editor.open('alice');
     const { onDraft } = render(editor);
-    await expect.element(page.getByText('No chat messages in this part of the conversation.')).toBeVisible();
+    await expect.element(page.getByRole('log', { name: 'Messages with alice' })).toHaveTextContent(/^\s*$/);
+    expect(document.querySelectorAll('[role="log"] article')).toHaveLength(0);
+    await expect.element(page.getByRole('button', { name: 'Earlier messages', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await expect.element(page.getByText('Older writing is still here', { exact: true })).toBeVisible();
     expect(ipc.request.mock.calls.filter(([command]) => command.kind === 'messages').at(-1)?.[0].before).toBe(400);

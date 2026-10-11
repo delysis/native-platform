@@ -30,24 +30,23 @@
 
 {#if currentOwner}
   <details>
-    <summary>Hand over the keys</summary>
-    <p>Choose a friend to look after invitations and membership. Everyone keeps their writing and pairing.</p>
-    <label>Next owner
-      <select bind:value={selected} disabled={busy}>
-        <option value="">Choose a member</option>
+    <summary aria-label="Hand over the keys" title="Transfer invitation and membership authority to a friend">Ownership</summary>
+    <label>Owner
+      <select aria-label="Next owner" bind:value={selected} disabled={busy}>
+        <option value="">Member</option>
         {#each cabal.roster.payload.members.filter(member => member.key !== cabal.my_key) as member (member.key)}
           <option value={member.key}>{member.name} · {member.key.slice(0, 12)}</option>
         {/each}
       </select>
     </label>
-    <button type="button" disabled={busy || !selected} on:click={prepare}>Review handoff</button>
+    <button type="button" disabled={busy || !selected} on:click={prepare} aria-label="Review handoff" title="Review handoff"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2h10v12H3zM5 5h6M5 8h6M5 11h4" /></svg>Review</button>
     {#if review}
       <div class="review" aria-label="Ownership handoff review">
         <p><strong>{review.name}</strong> will own this cabal and be able to invite or remove members, including you. You stay a member and can keep writing.</p>
         <p class="identity">Device <code>{review.member}</code></p>
         {#if stale}<p role="status">Membership changed. Review the handoff again.</p>{/if}
-        <button type="button" disabled={busy || stale} on:click={() => void transfer()}>Give {review.name} the keys</button>
-        <button type="button" disabled={busy} on:click={() => review = null}>Keep the keys</button>
+        <button type="button" disabled={busy || stale} on:click={() => void transfer()} aria-label={`Give ${review.name} the keys`} title={`Give ${review.name} the keys`}><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 5h11M10 2l3 3-3 3M14 11H3M6 8l-3 3 3 3" /></svg>Transfer</button>
+        <button type="button" disabled={busy} on:click={() => review = null} aria-label="Keep the keys" title="Keep the keys">Cancel</button>
       </div>
     {/if}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -55,6 +54,7 @@
 {/if}
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   details { margin:12px; border-top:1px solid var(--line); padding-top:12px; }
   summary { cursor:pointer; color:var(--muted); }
   p { line-height:1.6; margin:10px 0; }

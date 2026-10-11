@@ -56,29 +56,26 @@
 <details class="connections" on:toggle={toggle}>
   <summary>Connections</summary>
   {#if settings}
-    <label>Connect through
-      <select bind:value={mode} disabled={busy}>
-        <option value="internet">Community relays</option>
-        <option value="direct">Direct connections</option>
-        <option value="relays">Our own relays</option>
+    <label>Mode
+      <select aria-label="Connect through" title={mode === 'relays' ? 'Use one to four HTTPS relays shared with your friends. Public discovery stays off.' : mode === 'direct' ? 'Use invitation and saved pairing addresses without relays or public discovery. Some networks cannot connect directly.' : 'Use Iroh public discovery and community relays when a direct connection is unavailable.'} bind:value={mode} disabled={busy}>
+        <option value="internet">Community</option>
+        <option value="direct">Direct</option>
+        <option value="relays">Custom</option>
       </select>
     </label>
     {#if mode === 'relays'}
-      <label>Relay addresses<textarea bind:value={relays} rows="3" maxlength="2052" placeholder="https://relay.example.org" disabled={busy}></textarea></label>
-      <p>One to four HTTPS addresses, one per line. Use the same relays as your friends. Public discovery stays off.</p>
-    {:else if mode === 'direct'}
-      <p>Use addresses shared in invitations and saved pairings. No relays or public discovery; some networks cannot connect directly.</p>
-    {:else}
-      <p>Use Iroh’s public discovery and community relays when a direct connection is unavailable.</p>
+      <label>Relays<textarea aria-label="Relay addresses" title="One to four HTTPS addresses, one per line" bind:value={relays} rows="3" maxlength="2052" placeholder="https://relay.example.org" disabled={busy}></textarea></label>
+
     {/if}
-    <button type="button" disabled={busy} on:click={() => void save()}>Save connections</button>
-    {#if settings.active && JSON.stringify(settings.active) !== JSON.stringify(settings.configured)}<p>Changes apply after restarting Loom. Saved pairings remain linked.</p>{/if}
-  {:else if busy}<p role="status">Reading connection settings…</p>{/if}
-  {#if note}<p role="status">{note}</p>{/if}
-  {#if error}<p class="error" role="alert">{error}</p><button type="button" on:click={() => void refresh()}>Reload settings</button>{/if}
+    <button type="button" disabled={busy} on:click={() => void save()} aria-label="Save connections" title="Save connections"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2h9l2 2v10H2V2zM5 2v4h6V2M5 14v-5h6v5" /></svg>Save</button>
+    {#if settings.active && JSON.stringify(settings.active) !== JSON.stringify(settings.configured)}<p title="Changes apply after restarting Loom. Saved pairings remain linked.">Restart</p>{/if}
+  {:else if busy}<p role="status" aria-label="Reading connection settings">Reading</p>{/if}
+  {#if note}<p role="status" aria-label={note} title={note}>{note.startsWith('Saved. Restart') ? 'Restart' : 'Saved'}</p>{/if}
+  {#if error}<p class="error" role="alert">{error}</p><button type="button" on:click={() => void refresh()} aria-label="Reload settings" title="Reload settings">Reload</button>{/if}
 </details>
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   .connections { margin:12px; border-top:1px solid var(--line); padding-top:12px; }
   summary { color:var(--muted); cursor:pointer; }
   label { display:block; margin-block:12px; font-size:11px; }

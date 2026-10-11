@@ -77,7 +77,7 @@
 </script>
 
 <div class="identity">
-  <button type="button" aria-expanded={opened} on:click={toggle}>Safety numbers</button>
+  <button type="button" aria-expanded={opened} on:click={toggle} aria-label="Safety numbers" title="Safety numbers"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 2l5 2v4c0 3-5 6-5 6S3 11 3 8V4z" /></svg>Identity</button>
   {#if opened}
     <section aria-label="Signal safety number" aria-busy={busy}>
       {#if members.length > 1}
@@ -100,7 +100,7 @@
           <button type="button" disabled={!checked || busy} on:click={() => void verify()}>{review.state === 'changed' ? 'Verify and accept new number' : 'Mark verified'}</button>
         {/if}
       {:else if !busy && selected}<p>No saved safety number yet. Refresh to look it up.</p>{/if}
-      {#if selected}<button type="button" disabled={busy || review?.state === 'pending'} on:click={() => void load(true)}>Refresh safety number</button>{/if}
+      {#if selected}<button type="button" disabled={busy || review?.state === 'pending'} on:click={() => void load(true)} aria-label="Refresh safety number" title="Refresh safety number"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 6a5 5 0 1 1 0 5M3 2v4h4" /></svg>Refresh</button>{/if}
       {#if busy}<p class="quiet" role="status">Reading safety number…</p>{/if}
       {#if error}<p class="changed" role="alert">{error}</p>{/if}
     </section>
@@ -108,6 +108,7 @@
 </div>
 
 <style>
+  button svg { width:14px; height:14px; margin-right:5px; vertical-align:-2px; fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
   .identity { padding:0 8px 6px; }
   button { border:0; border-radius:5px; background:transparent; color:inherit; padding:5px 7px; font:inherit; cursor:pointer; }
   button:hover:not(:disabled) { background:var(--paper-deep); } button:disabled { opacity:.45; cursor:default; }
