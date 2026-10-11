@@ -1222,3 +1222,341 @@ async fn hosted_anthropic_stream_rejects_alternative_candidates() {
     );
     assert!(!text.contains("event: message_stop"), "{text}");
 }
+
+// A new Gateway and store binding for each turn; the provider listener remains real HTTP.
+fn continuation_state(
+    url: &str,
+    protocol: &str,
+    store: Arc<dyn fte_types::ResponseStore>,
+) -> AppState {
+    let mut state = tests::regression_state(store);
+    let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+    gateway
+        .bind_response_store(Arc::clone(&state.store))
+        .expect("owned response store");
+    let models = ["fixture-model", "other-model"]
+        .into_iter()
+        .map(|id| ModelDescriptor {
+            id: id.into(),
+            aliases: vec![],
+            display_name: id.into(),
+            backend_id: "fixture".into(),
+            location: BackendLocation::Hosted,
+            capabilities: ModelCapabilities {
+                modalities: vec![fte_types::Modality::Text],
+                prompt_forms: vec![PromptForm::Chat],
+                streaming: true,
+                ..Default::default()
+            },
+            context_tokens: None,
+            max_output_tokens: None,
+            quota: Default::default(),
+            observed: Default::default(),
+        })
+        .collect();
+    let mut config = if protocol == "responses" {
+        HostedProviderConfig::openai("fixture", "Fixture", "fixture", models)
+    } else {
+        HostedProviderConfig::openai_compatible("fixture", "Fixture", "fixture", url, models)
+    };
+    config.endpoints.messages = Some(url.into());
+    config.endpoints.responses = Some(url.into());
+    gateway
+        .register_backend(Arc::new(
+            HostedProviderBackend::new(config, Arc::new(Secrets)).expect("real hosted adapter"),
+        ))
+        .expect("configured route");
+    state.gateway = gateway;
+    state.edge_defaults.privacy = fte_types::PrivacyPolicy::HostedAllowed;
+    state.edge_defaults.profile = fte_types::RouteProfile::Auto;
+    state
+}
+
+fn public_response_value(text: &str, streaming: bool) -> Value {
+    if !streaming {
+        return serde_json::from_str(text).expect("public JSON response");
+    }
+    let events = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect::<Vec<_>>();
+    let completed = events
+        .iter()
+        .filter(|value| value["type"] == "response.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{text}");
+    let response = completed[0]["response"].clone();
+    let created = events
+        .iter()
+        .find(|value| value["type"] == "response.created")
+        .expect("local created identity");
+    assert_eq!(created["response"]["id"], response["id"]);
+    response
+}
+
+async fn continuation_round_trip(streaming: bool, reopen: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("provider listener");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("provider address")
+    );
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let provider_capture = Arc::clone(&captured);
+    let provider = axum::Router::new().fallback(move |Json(body): Json<Value>| {
+        let captured = Arc::clone(&provider_capture);
+        async move {
+            let turn = {
+                let mut requests = captured.lock().expect("actual provider requests");
+                requests.push(body.clone()); requests.len()
+            };
+            let response = json!({"id":format!("upstream_{turn}"),"model":"fixture-model","status":"completed","output":[{"type":"message","id":format!("msg_{turn}"),"role":"assistant","content":[{"type":"output_text","text":format!("turn {turn}")}]}],"usage":{"input_tokens":4,"output_tokens":2}});
+            if body["stream"] == true {
+                ([(header::CONTENT_TYPE,"text/event-stream")], sse(&[json!({"type":"response.completed","response":response})]))
+            } else {
+                ([(header::CONTENT_TYPE,"application/json")], response.to_string().into_bytes())
+            }
+        }
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("provider fixture");
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "fte-continuation-{}",
+        fte_types::RequestId::new().0
+    ));
+    std::fs::create_dir(&directory).expect("owned store directory");
+    let path = directory.join("responses.sqlite");
+    let store = Arc::new(SqliteStore::open(&path).expect("fresh response store"));
+    let state = continuation_state(&url, "responses", store);
+    let first = router(state.clone(), 8192)
+        .oneshot(tests::http_request(
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"first","store":true,"stream":streaming}),
+        ))
+        .await
+        .expect("first public response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = public_response_value(&tests::response_body(first).await, streaming);
+    let local_id = first["id"].as_str().expect("local public ID").to_owned();
+    assert_ne!(local_id, "upstream_1");
+    assert!(first.get("provider_response_id").is_none());
+    let state = if reopen {
+        state
+            .gateway
+            .shutdown()
+            .await
+            .expect("first gateway drained");
+        drop(state);
+        // Reusing the same route IDs with a Chat adapter does not authorize
+        // forwarding an existing Responses handle to that protocol.
+        let chat = continuation_state(
+            &url,
+            "chat",
+            Arc::new(SqliteStore::open(&path).expect("store for changed adapter")),
+        );
+        let rejected = router(chat.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"changed adapter","store":false,"previous_response_id":local_id}))).await.expect("changed adapter refusal");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_str(&tests::response_body(rejected).await).expect("adapter error");
+        assert_eq!(error["error"]["code"], "provider_continuation_unsupported");
+        assert_eq!(
+            captured.lock().expect("no changed adapter dispatch").len(),
+            1
+        );
+        chat.gateway
+            .shutdown()
+            .await
+            .expect("changed adapter drained");
+        drop(chat);
+        continuation_state(
+            &url,
+            "responses",
+            Arc::new(SqliteStore::open(&path).expect("current response store reopened")),
+        )
+    } else {
+        state
+    };
+    let second = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"second","store":true,"previous_response_id":local_id,"stream":streaming}))).await.expect("second public response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = public_response_value(&tests::response_body(second).await, streaming);
+    assert_eq!(second["previous_response_id"], local_id);
+    assert_ne!(second["id"], "upstream_2");
+    assert!(second.get("provider_response_id").is_none());
+    {
+        let requests = captured.lock().expect("captured two turns");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["previous_response_id"], "upstream_1");
+        assert_eq!(requests[1]["model"], "fixture-model");
+    }
+    // IDs from provider traffic are never local continuation authority.
+    for body in [
+        json!({"model":"fixture-model","input":"unknown","store":false,"previous_response_id":"upstream_1"}),
+        json!({"model":"other-model","input":"route drift","store":false,"previous_response_id":local_id}),
+        json!({"model":"fixture-model","input":"forged","store":false,"provider_previous_response_id":"upstream_1"}),
+    ] {
+        let result = router(state.clone(), 8192)
+            .oneshot(tests::http_request("/v1/responses", body))
+            .await
+            .expect("rejected public continuation");
+        assert!(!result.status().is_success());
+        let _ = tests::response_body(result).await;
+        assert_eq!(captured.lock().expect("no rejected dispatch").len(), 2);
+    }
+    // Even if another current stored record carries the same local ID,
+    // its route cannot replace the already witnessed producing owner.
+    let original = state
+        .store
+        .get(&local_id)
+        .expect("stored owner")
+        .expect("retained response");
+    for backend in [false, true] {
+        let mut wrong = original.clone();
+        if backend {
+            wrong.route.backend_id = "wrong-backend".into();
+        } else {
+            wrong.route.model_id = "other-model".into();
+        }
+        state.store.put(&wrong).expect("wrong-owner fixture");
+        let response = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"auto","input":"changed owner","store":false,"previous_response_id":local_id}))).await.expect("source identity refusal");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value =
+            serde_json::from_str(&tests::response_body(response).await).expect("source error");
+        assert_eq!(value["error"]["code"], "previous_response_source_mismatch");
+        assert_eq!(captured.lock().expect("no wrong-owner dispatch").len(), 2);
+    }
+    state
+        .store
+        .put(&original)
+        .expect("restore exact fixture owner");
+    // Retained storage deletion must invalidate the still-cached handle.
+    assert!(
+        state
+            .store
+            .delete(&local_id)
+            .expect("delete retained fixture")
+    );
+    let deleted = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"deleted","store":false,"previous_response_id":local_id}))).await.expect("deleted continuation refusal");
+    assert_eq!(deleted.status(), StatusCode::BAD_REQUEST);
+    let value: Value =
+        serde_json::from_str(&tests::response_body(deleted).await).expect("deleted error");
+    assert_eq!(value["error"]["code"], "previous_response_unavailable");
+    assert_eq!(captured.lock().expect("no deleted dispatch").len(), 2);
+    state.gateway.shutdown().await.expect("gateway drained");
+    drop(state);
+    stop.send(()).expect("stop fixture");
+    server.await.expect("fixture joined");
+    std::fs::remove_dir_all(directory).expect("remove owned store files");
+}
+
+#[tokio::test]
+async fn hosted_continuation_json_in_process() {
+    continuation_round_trip(false, false).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_json_after_reopen() {
+    continuation_round_trip(false, true).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_stream_in_process() {
+    continuation_round_trip(true, false).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_stream_after_reopen() {
+    continuation_round_trip(true, true).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_refuses_missing_and_chat_handles_before_dispatch() {
+    for protocol in ["responses", "chat"] {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider address")
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&calls);
+        let provider = axum::Router::new().fallback(move || {
+            let calls = Arc::clone(&provider_calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                // A Chat completion ID must never become a Responses handle.
+                Json(if protocol == "chat" {
+                    json!({"id":"chatcmpl_upstream","choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2}})
+                } else {
+                    json!({"status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":2}})
+                })
+            }
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("provider fixture");
+        });
+        let state = continuation_state(
+            &url,
+            protocol,
+            Arc::new(SqliteStore::in_memory().expect("store")),
+        );
+        let first = router(state.clone(), 8192)
+            .oneshot(tests::http_request(
+                "/v1/responses",
+                json!({"model":"fixture-model","input":"first","store":true}),
+            ))
+            .await
+            .expect("first public response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = public_response_value(&tests::response_body(first).await, false);
+        let result = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"second","store":false,"previous_response_id":first["id"]}))).await.expect("missing handle refusal");
+        assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+        let result: Value =
+            serde_json::from_str(&tests::response_body(result).await).expect("error response");
+        assert_eq!(result["error"]["code"], "previous_response_handle_missing");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        state.gateway.shutdown().await.expect("gateway drained");
+        stop.send(()).expect("stop fixture");
+        server.await.expect("fixture joined");
+    }
+}
+
+#[tokio::test]
+async fn native_continuation_requires_explicit_items_without_a_provider_handle() {
+    let state = tests::regression_state(Arc::new(SqliteStore::in_memory().expect("native store")));
+    let first = router(state.clone(), 8192)
+        .oneshot(tests::http_request(
+            "/v1/responses",
+            json!({"model":"test-model","input":"first","store":true}),
+        ))
+        .await
+        .expect("native first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = public_response_value(&tests::response_body(first).await, false);
+    let result = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"test-model","input":"second","store":false,"previous_response_id":first["id"]}))).await.expect("native continuation refusal");
+    assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+    let result: Value =
+        serde_json::from_str(&tests::response_body(result).await).expect("native error");
+    assert_eq!(result["error"]["code"], "previous_response_handle_missing");
+    state
+        .gateway
+        .shutdown()
+        .await
+        .expect("native gateway drained");
+}

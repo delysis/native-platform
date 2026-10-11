@@ -2609,6 +2609,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id,
             model: route.model_id.clone(),
             route,
@@ -2837,6 +2838,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: RequestId::new(),
             model: route.model_id.clone(),
             route,
@@ -3276,6 +3278,7 @@ mod tests {
         );
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: "model".to_string(),
             route,
@@ -3336,6 +3339,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route: route.clone(),
@@ -3439,6 +3443,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp_1".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: "model".to_string(),
             route: route.clone(),

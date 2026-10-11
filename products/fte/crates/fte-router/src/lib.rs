@@ -48,10 +48,17 @@ struct GatewayState {
     backend_admission: BTreeMap<String, Arc<Semaphore>>,
     all_admission: Vec<Weak<Semaphore>>,
     backend_circuits: BTreeMap<String, BackendCircuit>,
-    response_affinity: BTreeMap<String, (String, String)>,
+    response_affinity: BTreeMap<String, ResponseAffinity>,
     response_store: Option<Arc<dyn fte_types::ResponseStore>>,
     response_order: VecDeque<String>,
     quotas: BTreeMap<(String, String), Arc<quota::Quota>>,
+}
+
+#[derive(Clone)]
+struct ResponseAffinity {
+    route: ResolvedRoute,
+    provider_response_id: Option<String>,
+    retained: bool,
 }
 
 #[derive(Debug, Default)]
@@ -724,7 +731,7 @@ impl Gateway {
             .event_capacity
             .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY);
         let mut lease = self.reserve_request(&request)?;
-        self.restore_response_affinity(&request)?;
+        let provider_previous_response_id = self.restore_response_affinity(&request)?;
         let candidates = self.resolve_candidates(&request)?;
         let fallback_allowed = request_fallback_allowed(&request);
         let mut last_error = None;
@@ -784,6 +791,7 @@ impl Gateway {
                         .count_tokens(BackendRequest {
                             request: request.clone(),
                             route: route.clone(),
+                            provider_previous_response_id: provider_previous_response_id.clone(),
                         })
                         .await?;
                     if usage.provenance != fte_types::UsageProvenance::Exact
@@ -812,6 +820,7 @@ impl Gateway {
                     .execute(BackendRequest {
                         request: request.clone(),
                         route,
+                        provider_previous_response_id: provider_previous_response_id.clone(),
                     })
                     .await?;
                 Ok((ticket, usage))
@@ -927,6 +936,7 @@ impl Gateway {
         request.validate()?;
         self.lifecycle.ensure_running(&request.request_id)?;
         let mut lease = self.reserve_request(&request)?;
+        let provider_previous_response_id = self.restore_response_affinity(&request)?;
         let (backend, route, admission) = self.resolve(&request)?;
         self.admit(
             &request.request_id,
@@ -952,7 +962,11 @@ impl Gateway {
             Ok(deadline) => deadline,
             Err(error) => return lease.finish_result(Err(error)),
         };
-        let count = backend.count_tokens(BackendRequest { request, route });
+        let count = backend.count_tokens(BackendRequest {
+            request,
+            route,
+            provider_previous_response_id,
+        });
         let counting = async {
             if let Some(limit) = limit {
                 match tokio::time::timeout(limit, count).await {
@@ -1202,19 +1216,6 @@ impl Gateway {
         }
     }
 
-    pub fn record_response_affinity(
-        &self,
-        response_id: &str,
-        route: &ResolvedRoute,
-    ) -> Result<(), GatewayError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
-        record_affinity(&mut state, response_id, route);
-        Ok(())
-    }
-
     pub fn forget_response_affinity(&self, response_id: &str) -> Result<(), GatewayError> {
         let mut state = self
             .state
@@ -1225,13 +1226,22 @@ impl Gateway {
         Ok(())
     }
 
-    fn restore_response_affinity(&self, request: &GatewayRequest) -> Result<(), GatewayError> {
-        let store = self
+    fn restore_response_affinity(
+        &self,
+        request: &GatewayRequest,
+    ) -> Result<Option<String>, GatewayError> {
+        let state = self
             .state
             .read()
-            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?
-            .response_store
-            .clone();
+            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?;
+        let store = state.response_store.clone();
+        let known = request
+            .storage
+            .previous_response_id
+            .as_ref()
+            .and_then(|id| state.response_affinity.get(id))
+            .cloned();
+        drop(state);
         if request.storage.store_response && store.is_none() {
             return Err(GatewayError::invalid_request(
                 &request.request_id,
@@ -1239,12 +1249,73 @@ impl Gateway {
                 "response storage was requested but the application has not supplied a store",
             ));
         }
-        if let (Some(store), Some(id)) = (store, &request.storage.previous_response_id)
-            && let Some(previous) = store.get(id)?
-        {
-            self.record_response_affinity(id, &previous.route)?;
+        let Some(id) = &request.storage.previous_response_id else {
+            return Ok(None);
+        };
+        let previous = store
+            .as_ref()
+            .map(|store| store.get(id))
+            .transpose()?
+            .flatten();
+        let affinity = if let Some(previous) = previous {
+            if previous.id != *id
+                || known.as_ref().is_some_and(|known| {
+                    known.route != previous.route
+                        || known.provider_response_id != previous.provider_response_id
+                })
+            {
+                return Err(GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_source_mismatch",
+                    "the previous response identity differs from its producing route",
+                ));
+            }
+            let affinity = ResponseAffinity {
+                route: previous.route,
+                provider_response_id: previous.provider_response_id,
+                retained: true,
+            };
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| lifecycle_state_poisoned(&request.request_id))?;
+            record_affinity(&mut state, id, affinity.clone());
+            affinity
+        } else {
+            let known = known.ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_affinity_missing",
+                    "the previous response is unavailable or has no route affinity",
+                )
+            })?;
+            if known.retained {
+                return Err(GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_unavailable",
+                    "the retained previous response is unavailable",
+                ));
+            }
+            known
+        };
+        if affinity.route.location != BackendLocation::Hosted {
+            return Err(GatewayError::invalid_request(
+                &request.request_id,
+                "previous_response_handle_missing",
+                "the previous response has no hosted Responses continuation handle",
+            ));
         }
-        Ok(())
+        let handle = affinity
+            .provider_response_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_handle_missing",
+                    "the previous response has no hosted Responses continuation handle",
+                )
+            })?;
+        Ok(Some(handle))
     }
 
     fn reserve_quota(
@@ -1595,7 +1666,15 @@ impl AdmissionLease {
                 .response_state
                 .write()
                 .map_err(|_| lifecycle_state_poisoned(&response.request_id))?;
-            record_affinity(&mut state, &response.id, &response.route);
+            record_affinity(
+                &mut state,
+                &response.id,
+                ResponseAffinity {
+                    route: response.route.clone(),
+                    provider_response_id: response.provider_response_id.clone(),
+                    retained: self.store_response,
+                },
+            );
         }
         Ok(())
     }
@@ -1744,7 +1823,7 @@ fn routing_model(state: &GatewayState, mut model: ModelDescriptor) -> ModelDescr
     model
 }
 
-fn record_affinity(state: &mut GatewayState, id: &str, route: &ResolvedRoute) {
+fn record_affinity(state: &mut GatewayState, id: &str, affinity: ResponseAffinity) {
     const MAX_VOLATILE_RESPONSES: usize = 4096;
     if !state.response_affinity.contains_key(id) {
         if state.response_order.len() == MAX_VOLATILE_RESPONSES
@@ -1754,10 +1833,7 @@ fn record_affinity(state: &mut GatewayState, id: &str, route: &ResolvedRoute) {
         }
         state.response_order.push_back(id.to_owned());
     }
-    state.response_affinity.insert(
-        id.to_owned(),
-        (route.backend_id.clone(), route.model_id.clone()),
-    );
+    state.response_affinity.insert(id.to_owned(), affinity);
 }
 
 fn failed_shutdown_report(error: GatewayError) -> GatewayShutdownReport {
@@ -1890,10 +1966,12 @@ fn candidate_allowed(
     request: &GatewayRequest,
     backend: &BackendDescriptor,
     model: &ModelDescriptor,
-    pinned: Option<&(String, String)>,
+    pinned: Option<&ResponseAffinity>,
 ) -> Result<(), &'static str> {
-    if let Some((backend_id, model_id)) = pinned
-        && (&backend.id, &model.id) != (backend_id, model_id)
+    if let Some(affinity) = pinned
+        && (backend.id != affinity.route.backend_id
+            || model.id != affinity.route.model_id
+            || backend.location != affinity.route.location)
     {
         return Err("response_affinity_mismatch");
     }
@@ -2441,6 +2519,7 @@ mod tests {
     fn completed_response(request_id: RequestId, backend_id: &str) -> fte_types::GatewayResponse {
         fte_types::GatewayResponse {
             id: "fixture-response".to_string(),
+            provider_response_id: None,
             request_id,
             model: format!("{backend_id}-model"),
             route: fte_types::ResolvedRoute {

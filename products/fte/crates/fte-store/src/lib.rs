@@ -55,10 +55,10 @@ impl SqliteStore {
                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
                  );
                  PRAGMA application_id = 1179927890;
-                 PRAGMA user_version = 1;",
+                 PRAGMA user_version = 2;",
                 )
                 .map_err(store_error)?;
-        } else if application_id != 1179927890 || version != 1 || objects != 1 {
+        } else if application_id != 1179927890 || version != 2 || objects != 1 {
             return Err(store_error(
                 "unrecognized response store identity or schema version",
             ));
@@ -103,20 +103,37 @@ impl ResponseStore for SqliteStore {
     }
 
     fn get(&self, id: &str) -> Result<Option<GatewayResponse>, GatewayError> {
-        let payload = self
+        let row = self
             .connection
             .lock()
             .map_err(store_error)?
             .query_row(
-                "SELECT payload_json FROM gateway_responses WHERE id = ?1",
+                "SELECT request_id, backend_id, model_id, payload_json FROM gateway_responses WHERE id = ?1",
                 [id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             )
             .optional()
             .map_err(store_error)?;
-        payload
-            .map(|payload| serde_json::from_str(&payload).map_err(store_error))
-            .transpose()
+        row.map(|(request_id, backend_id, model_id, payload)| {
+            let value: serde_json::Value = serde_json::from_str(&payload).map_err(store_error)?;
+            if value.get("provider_response_id").is_none() {
+                return Err(store_error(
+                    "response payload lacks the current continuation field",
+                ));
+            }
+            let response: GatewayResponse = serde_json::from_value(value).map_err(store_error)?;
+            if response.id != id
+                || response.request_id.0 != request_id
+                || response.route.backend_id != backend_id
+                || response.route.model_id != model_id
+            {
+                return Err(store_error(
+                    "response payload identity differs from its stored owner",
+                ));
+            }
+            Ok(response)
+        })
+        .transpose()
     }
 
     fn delete(&self, id: &str) -> Result<bool, GatewayError> {
@@ -156,7 +173,13 @@ mod tests {
             ),
             (
                 "future",
-                "PRAGMA application_id = 1179927890; PRAGMA user_version = 2;",
+                "PRAGMA application_id = 1179927890; PRAGMA user_version = 3;",
+            ),
+            (
+                "prior",
+                "CREATE TABLE gateway_responses(id TEXT PRIMARY KEY NOT NULL, request_id TEXT NOT NULL, backend_id TEXT NOT NULL, model_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                 INSERT INTO gateway_responses VALUES ('old','request','backend','model','preserved',0);
+                 PRAGMA application_id = 1179927890; PRAGMA user_version = 1;",
             ),
             (
                 "unversioned",
@@ -181,6 +204,7 @@ mod tests {
         let store = SqliteStore::in_memory().expect("open store");
         let response = GatewayResponse {
             id: "resp_test".to_string(),
+            provider_response_id: None,
             request_id: RequestId::new(),
             model: "model".to_string(),
             route: ResolvedRoute {
@@ -203,5 +227,85 @@ mod tests {
         );
         assert!(store.delete("resp_test").expect("delete response"));
         assert!(store.get("resp_test").expect("get missing").is_none());
+    }
+
+    #[test]
+    fn current_store_reopens_and_refuses_response_identity_drift() {
+        let path =
+            std::env::temp_dir().join(format!("fte-continuation-{}.sqlite", RequestId::new().0));
+        let response = GatewayResponse {
+            id: "local_B".into(),
+            provider_response_id: Some("upstream_A".into()),
+            request_id: RequestId::new(),
+            model: "provider-model-version".into(),
+            route: ResolvedRoute {
+                backend_id: "hosted".into(),
+                model_id: "selected-model".into(),
+                display_name: "Model".into(),
+                location: BackendLocation::Hosted,
+                catalog_version: "test".into(),
+            },
+            output: vec![],
+            output_groups: vec![],
+            usage: GatewayUsage::default(),
+            status: TerminalStatus::Completed,
+            previous_response_id: None,
+        };
+        let store = SqliteStore::open(&path).expect("fresh current store");
+        store.put(&response).expect("retained handle");
+        drop(store);
+        let store = SqliteStore::open(&path).expect("current store reopen");
+        assert_eq!(
+            store.get("local_B").expect("same identity"),
+            Some(response.clone())
+        );
+        for pointer in [
+            "/id",
+            "/request_id",
+            "/route/backend_id",
+            "/route/model_id",
+            "/provider_response_id",
+        ] {
+            let mut payload = serde_json::to_value(&response).expect("current payload");
+            if pointer == "/provider_response_id" {
+                payload
+                    .as_object_mut()
+                    .expect("response object")
+                    .remove("provider_response_id");
+            } else {
+                *payload.pointer_mut(pointer).expect("identity field") =
+                    serde_json::json!("wrong_owner");
+            }
+            let encoded = payload.to_string();
+            store
+                .connection
+                .lock()
+                .expect("store connection")
+                .execute(
+                    "UPDATE gateway_responses SET payload_json = ?1 WHERE id = 'local_B'",
+                    [&encoded],
+                )
+                .expect("corrupt owner fixture");
+            assert_eq!(
+                store
+                    .get("local_B")
+                    .expect_err("no identity/default rescue")
+                    .code,
+                "gateway_store_error"
+            );
+            let preserved: String = store
+                .connection
+                .lock()
+                .expect("store connection")
+                .query_row(
+                    "SELECT payload_json FROM gateway_responses WHERE id = 'local_B'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved incompatible bytes");
+            assert_eq!(preserved, encoded);
+        }
+        drop(store);
+        std::fs::remove_file(path).expect("remove owned store");
     }
 }

@@ -569,6 +569,9 @@ pub struct StreamPolicy {
 pub struct BackendRequest {
     pub request: GatewayRequest,
     pub route: ResolvedRoute,
+    /// Resolved by the router from the local previous response and its route.
+    /// Public request IDs never supply this provider-owned handle directly.
+    pub provider_previous_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -687,6 +690,9 @@ impl BackendReadiness {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GatewayResponse {
     pub id: String,
+    /// Upstream Responses handle; `id` remains the local public identity.
+    /// The producing backend/model are owned by `route` in this same record.
+    pub provider_response_id: Option<String>,
     pub request_id: RequestId,
     pub model: String,
     pub route: ResolvedRoute,
@@ -1973,6 +1979,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route,
@@ -2035,6 +2042,7 @@ mod tests {
             };
             let response = GatewayResponse {
                 id: "resp".to_string(),
+                provider_response_id: None,
                 request_id: request_id.clone(),
                 model: route.model_id.clone(),
                 route,
@@ -2119,6 +2127,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route,

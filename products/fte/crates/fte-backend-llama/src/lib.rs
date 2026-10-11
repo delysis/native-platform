@@ -594,7 +594,9 @@ impl GatewayBackend for LlamaNativeBackend {
 
     async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
         let request_id = request.request.request_id.clone();
-        if request.request.storage.previous_response_id.is_some() {
+        if request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some()
+        {
             return Err(GatewayError::invalid_request(
                 &request_id,
                 "native_continuation_unsupported",
@@ -936,6 +938,15 @@ impl GatewayBackend for LlamaNativeBackend {
 
     async fn count_tokens(&self, request: BackendRequest) -> Result<GatewayUsage, GatewayError> {
         let request_id = request.request.request_id.clone();
+        if request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some()
+        {
+            return Err(GatewayError::invalid_request(
+                &request_id,
+                "native_continuation_unsupported",
+                "local conversation continuation requires explicit message items",
+            ));
+        }
         let input = translate_input(&request.request.input, &request_id)?;
         let (host, config, operation) =
             self.admit_request_configuration(&request.route.model_id, &request_id)?;
@@ -1246,6 +1257,7 @@ fn build_response(
     };
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: route.model_id.clone(),
         route,

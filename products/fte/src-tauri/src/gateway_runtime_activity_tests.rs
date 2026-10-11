@@ -91,6 +91,7 @@ impl GatewayBackend for FixtureBackend {
         } else {
             send.send(Ok(GatewayResponse {
                 id: format!("fixture-{}", id.0),
+                provider_response_id: None,
                 request_id: id.clone(),
                 model: request.route.model_id.clone(),
                 route: request.route,

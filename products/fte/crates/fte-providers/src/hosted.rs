@@ -403,8 +403,10 @@ impl HostedProviderBackend {
     }
 
     fn prepare(&self, request: &BackendRequest) -> Result<PreparedHostedRequest, GatewayError> {
-        if request.request.storage.previous_response_id.is_some()
-            && self.config.protocol != HostedProtocol::OpenAi
+        if (request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some())
+            && (self.config.protocol != HostedProtocol::OpenAi
+                || !matches!(request.request.input, GenerationInput::Chat { .. }))
         {
             return Err(capability_error(
                 &request.request.request_id,
@@ -927,8 +929,22 @@ fn openai_responses_body(request: &BackendRequest) -> Result<Value, GatewayError
         "store".to_string(),
         json!(request.request.storage.store_response),
     );
-    if let Some(previous) = &request.request.storage.previous_response_id {
-        body.insert("previous_response_id".to_string(), json!(previous));
+    match (
+        &request.request.storage.previous_response_id,
+        &request.provider_previous_response_id,
+    ) {
+        (Some(_), Some(previous)) if !previous.is_empty() => {
+            body.insert("previous_response_id".to_string(), json!(previous));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(capability_error(
+                &request.request.request_id,
+                &request.route.backend_id,
+                "provider_continuation_unresolved",
+                "continuation requires the router-resolved upstream response handle",
+            ));
+        }
     }
     insert_openai_responses_sampling(&mut body, request)?;
     insert_openai_responses_tools(&mut body, request)?;
@@ -3397,6 +3413,7 @@ impl ProviderStreamState {
         let status = groups_status(&output_groups);
         let response = GatewayResponse {
             id: self.response_id,
+            provider_response_id: None,
             request_id: self.request_id.clone(),
             model: self.route.model_id.clone(),
             route: self.route,
@@ -3595,6 +3612,17 @@ fn parse_openai_responses(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
+    let provider_response_id = match value.get("id") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        None => None,
+        _ => {
+            return Err(provider_response_error(
+                request_id,
+                &route.backend_id,
+                "Responses result has an invalid upstream ID",
+            ));
+        }
+    };
     validate_responses_tool_arguments(value)?;
     let output = value
         .get("output")
@@ -3661,6 +3689,7 @@ fn parse_openai_responses(
     }];
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3825,6 +3854,7 @@ fn hosted_response(
 ) -> GatewayResponse {
     GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3879,6 +3909,7 @@ fn parse_anthropic(
     let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3999,6 +4030,7 @@ fn parse_gemini(
     let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: route.model_id.clone(),
         route: route.clone(),
@@ -4958,6 +4990,7 @@ mod tests {
 
     fn request(input: GenerationInput) -> BackendRequest {
         BackendRequest {
+            provider_previous_response_id: None,
             request: fte_types::GatewayRequest {
                 request_id: RequestId::new(),
                 client_id: "test".to_string(),
@@ -5114,10 +5147,68 @@ mod tests {
                 arguments: json!({"city":"Boston"}),
             }],
         });
-        request.request.storage.previous_response_id = Some("resp_previous".to_string());
+        request.request.storage.previous_response_id = Some("resp_local_previous".to_string());
+        request.provider_previous_response_id = Some("upstream_previous".to_string());
         let body = openai_responses_body(&request).expect("body");
-        assert_eq!(body["previous_response_id"], "resp_previous");
+        assert_eq!(body["previous_response_id"], "upstream_previous");
         assert_eq!(body["input"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn responses_continuation_requires_resolved_handle_and_preserves_local_identity() {
+        let mut request = request(GenerationInput::Chat { items: vec![] });
+        request.request.storage.previous_response_id = Some("local_B".into());
+        assert_eq!(
+            openai_responses_body(&request)
+                .expect_err("no literal public ID forwarding")
+                .code,
+            "provider_continuation_unresolved"
+        );
+        request.provider_previous_response_id = Some("upstream_A".into());
+        assert_eq!(
+            openai_responses_body(&request).expect("resolved body")["previous_response_id"],
+            "upstream_A"
+        );
+        let response = parse_openai_responses(
+            &json!({"id":"upstream_C","status":"completed","output":[]}),
+            &request.request.request_id,
+            "local_D",
+            request.route.clone(),
+            Some("local_B".into()),
+        )
+        .expect("actual response identity");
+        assert_eq!(response.id, "local_D");
+        assert_eq!(response.provider_response_id.as_deref(), Some("upstream_C"));
+        assert_eq!(response.previous_response_id.as_deref(), Some("local_B"));
+        assert_eq!(response.route, request.route);
+        for id in [json!(null), json!(""), json!(42)] {
+            assert!(
+                parse_openai_responses(
+                    &json!({"id":id,"status":"completed","output":[]}),
+                    &request.request.request_id,
+                    "local_D",
+                    request.route.clone(),
+                    None
+                )
+                .is_err()
+            );
+        }
+        let absent = parse_openai_responses(
+            &json!({"status":"completed","output":[]}),
+            &request.request.request_id,
+            "local_D",
+            request.route.clone(),
+            None,
+        )
+        .expect("generation without continuation");
+        assert!(absent.provider_response_id.is_none());
+        request.request.storage.previous_response_id = None;
+        assert_eq!(
+            openai_responses_body(&request)
+                .expect_err("handle without public lineage")
+                .code,
+            "provider_continuation_unresolved"
+        );
     }
 
     #[test]

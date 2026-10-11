@@ -1438,6 +1438,7 @@ mod tests {
     fn scripted_response(output: Vec<OutputItem>) -> GatewayResponse {
         GatewayResponse {
             id: "scripted".into(),
+            provider_response_id: None,
             request_id: RequestId::new(),
             model: "test-model".into(),
             route: fte_types::ResolvedRoute {
@@ -1677,6 +1678,7 @@ mod tests {
             };
             let response = GatewayResponse {
                 id: response_id.clone(),
+                provider_response_id: None,
                 request_id: request_id.clone(),
                 model: route.model_id.clone(),
                 route: route.clone(),
@@ -1788,6 +1790,7 @@ mod tests {
             };
             let response = GatewayResponse {
                 id: response_id.clone(),
+                provider_response_id: None,
                 request_id: request_id.clone(),
                 model: route.model_id.clone(),
                 route: route.clone(),
@@ -2197,18 +2200,14 @@ mod tests {
             .send()
             .await
             .expect("continued stored response after restart");
-        assert_eq!(continuation.status(), StatusCode::OK);
+        assert_eq!(continuation.status(), StatusCode::BAD_REQUEST);
         let continuation = continuation
             .json::<Value>()
             .await
             .expect("continuation JSON");
         assert_eq!(
-            continuation["id"],
-            fixture["loopback"]["expected"]["continuation_response_id"]
-        );
-        assert_eq!(
-            continuation["previous_response_id"],
-            fixture["loopback"]["expected"]["stored_response_id"]
+            continuation["error"]["code"],
+            "previous_response_handle_missing"
         );
 
         restarted.shutdown().await;

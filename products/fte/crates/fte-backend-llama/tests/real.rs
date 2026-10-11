@@ -14,6 +14,7 @@ use std::sync::Arc;
 fn request(model_id: &str, input: GenerationInput, cache: CachePolicy) -> BackendRequest {
     let request_id = RequestId::new();
     BackendRequest {
+        provider_previous_response_id: None,
         route: ResolvedRoute {
             backend_id: BACKEND_ID.to_string(),
             model_id: model_id.to_string(),
