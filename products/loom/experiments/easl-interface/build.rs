@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 mod build_assets;
 
-const REFERENCE: &str = "native-platform main a7248566b5012e32810584725af9e4574699c478 plus reviewed collections 0c4677b343af0d144df6cb4f36260e42a9932385; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9";
-const APP_SHA256: &str = "79d5fe0fd5095fa75d266be8feb4791ed416228b8969353c4909fd15f3069f8d";
-const CSS_SHA256: &str = "a153e13ad1ee00c84d2e02b31fa318d4af556e7f1fe3b3c581ee36bf58dbb81f";
+const REFERENCE: &str = "native-platform main 52ebafce2c82e1655a66d499d66315fd4689c81f plus peer integration ceee4b6a95c234d945d777ff10b8a621bf6d55db; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9";
+const APP_SHA256: &str = "8d717f915bec816e632d155036f741007a771f8b9d753f9320a19b154d7b0b04";
+const CSS_SHA256: &str = "83a038c05a2e36106024c9d9d9f41760f54adbf3db5ac73b20758536907e024c";
 
 fn main() {
     let review = std::env::var_os("CARGO_FEATURE_REVIEW_ONLY").is_some();
@@ -55,6 +55,7 @@ fn main() {
         &serde_json::json!({
             "schema_version": 1,
             "qualification": if review { "unqualified-review-only" } else { "source-gated-not-live-qualified" },
+            "unported_peer_interfaces": ["collaborative manuscripts", "Signal", "cabal context", "peer compute"],
             "expected_app_sha256": APP_SHA256,
             "expected_css_sha256": CSS_SHA256,
             "observed_sources": observed,

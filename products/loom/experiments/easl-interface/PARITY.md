@@ -1,10 +1,19 @@
 # Native Loom frontend parity — reviewed reference
 
-Reference: main `90349a54061790954cf8a88160e4e29a8a325d4d` combined locally with
-`a43231626f5deb4ad8f6f08beb36dca40a236270` (draft Mine PR 47, unmerged upstream).
-The titlebar fragment is unchanged by that integration. Reviewed App/CSS hashes are in
-`build.rs`. This inventory supersedes the September 5 interface inventory;
-retired controls are not requirements. See [REFERENCE-AUDIT.md](REFERENCE-AUDIT.md).
+Reference: native-platform main `52ebafce2c82e1655a66d499d66315fd4689c81f`
+combined locally with peer integration `ceee4b6a95c234d945d777ff10b8a621bf6d55db`.
+The native extractor resolves the same nine byte-identical titlebar SVG assets as
+the previously qualified `d2d86498` interface. The changed recording tooltip
+now identifies shared-document audio; recording remains disabled in this native
+experiment. The CSS additions affect only cabal-context panels, which this
+experiment does not render. Reviewed App/CSS hashes remain enforced in `build.rs`.
+
+The peer integration adds collaborative manuscript updates, Signal, cabal context,
+and peer compute to the Tauri application. Those interfaces are not ported to
+EASL and are listed as unported in its generated reference manifest. Existing
+native pane geometry, focus, source-history and configuration checks establish
+only their own scope. Updating these reviewed reference hashes does not establish
+interface parity or native acceptance of the new services.
 
 The goal remains incomplete. Source identity, contracts, offscreen pixels and
 historical runtime receipts must not be reported as current product acceptance.
