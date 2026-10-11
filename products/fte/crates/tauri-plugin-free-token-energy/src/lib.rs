@@ -3,15 +3,15 @@
 mod storage;
 
 use fte_loopback::{LoopbackConfig, LoopbackServer};
-#[cfg(feature = "hosted-providers")]
-use fte_providers::{HostedProviderBackend, HostedProviderConfig};
-use fte_router::{Gateway, GatewayDefaults};
+use fte_router::Gateway;
+#[cfg(test)]
+use fte_router::GatewayDefaults;
+use fte_store::ResponseStore;
 #[cfg(test)]
 use fte_store::SqliteStore;
-use fte_store::{ResponseStore, SecretResolver};
 use fte_types::{
-    CancelTarget, GatewayBackend, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse,
-    GatewayStatus, LoopbackStatus, ModelDescriptor, RequestId,
+    CancelTarget, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse, GatewayStatus,
+    LoopbackStatus, ModelDescriptor, RequestId,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -23,105 +23,28 @@ use tauri::{Manager, RunEvent, Runtime, State};
 pub struct Builder {
     gateway: Arc<Gateway>,
     store: Option<Arc<dyn ResponseStore>>,
-    secret_resolver: Option<Arc<dyn SecretResolver>>,
     loopback: Option<LoopbackConfig>,
     default_loopback: bool,
     app_data_dir: Option<PathBuf>,
-    #[cfg(feature = "native-llama")]
-    native_backend: Option<Arc<fte_backend_llama::LlamaNativeBackend>>,
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Builder {
+    /// Exposes the application-owned gateway through Tauri and optional loopback.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(gateway: Arc<Gateway>) -> Self {
         Self {
-            gateway: Arc::new(Gateway::new(GatewayDefaults::default())),
+            gateway,
             store: None,
-            secret_resolver: None,
             loopback: None,
             default_loopback: false,
             app_data_dir: None,
-            #[cfg(feature = "native-llama")]
-            native_backend: None,
         }
-    }
-
-    pub fn with_defaults(self, defaults: GatewayDefaults) -> Result<Self, GatewayError> {
-        self.gateway.set_defaults(defaults)?;
-        Ok(self)
-    }
-
-    #[must_use]
-    pub fn with_gateway(mut self, gateway: Arc<Gateway>) -> Self {
-        self.gateway = gateway;
-        self
     }
 
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
         self.store = Some(store);
         self
-    }
-
-    /// Supplies the application-owned hosted credential boundary. Provider
-    /// secrets are resolved per operation by provider adapters and never exposed over
-    /// Tauri IPC or loopback.
-    #[must_use]
-    pub fn with_secret_resolver(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
-        self.secret_resolver = Some(resolver);
-        self
-    }
-
-    /// Registers a hosted provider using the previously supplied secret
-    /// resolver. This keeps provider assembly independent of Tauri state.
-    #[cfg(feature = "hosted-providers")]
-    pub fn register_provider(self, config: HostedProviderConfig) -> Result<Self, GatewayError> {
-        let resolver = self.secret_resolver.clone().ok_or_else(|| {
-            GatewayError::invalid_request(
-                &RequestId::new(),
-                "secret_resolver_missing",
-                "call with_secret_resolver before registering a hosted provider",
-            )
-        })?;
-        self.gateway
-            .register_backend(Arc::new(HostedProviderBackend::new(config, resolver)?))?;
-        Ok(self)
-    }
-
-    /// Registers a product-owned in-process llama host. Enable the
-    /// `native-llama` feature and add one or more exact model profiles with
-    /// `register_native_model` before serving requests.
-    #[cfg(feature = "native-llama")]
-    pub fn with_native_host(
-        mut self,
-        host: Arc<llama_native_host::NativeHost>,
-    ) -> Result<Self, GatewayError> {
-        let backend = Arc::new(fte_backend_llama::LlamaNativeBackend::new(host));
-        self.gateway.register_backend(backend.clone())?;
-        self.native_backend = Some(backend);
-        Ok(self)
-    }
-
-    #[cfg(feature = "native-llama")]
-    pub fn register_native_model(
-        self,
-        model: llama_native_types::NativeModelConfig,
-    ) -> Result<Self, GatewayError> {
-        let backend = self.native_backend.as_ref().ok_or_else(|| {
-            GatewayError::invalid_request(
-                &RequestId::new(),
-                "native_host_missing",
-                "call with_native_host before registering a local model",
-            )
-        })?;
-        backend.configure_model(model)?;
-        Ok(self)
     }
 
     #[must_use]
@@ -145,11 +68,6 @@ impl Builder {
     pub fn with_app_data_dir(mut self, app_data_dir: PathBuf) -> Self {
         self.app_data_dir = Some(app_data_dir);
         self
-    }
-
-    pub fn register_backend(self, backend: Arc<dyn GatewayBackend>) -> Result<Self, GatewayError> {
-        self.gateway.register_backend(backend)?;
-        Ok(self)
     }
 
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
@@ -643,16 +561,16 @@ fn plugin_quiescing_error(request_id: &RequestId) -> GatewayError {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn defaults_preserve_the_injected_gateway() {
+    fn plugin_retains_the_application_owned_gateway() {
         let gateway = std::sync::Arc::new(fte_router::Gateway::new(
             fte_router::GatewayDefaults::default(),
         ));
-        let builder = super::Builder::new()
-            .with_gateway(gateway.clone())
-            .with_defaults(fte_router::GatewayDefaults {
-                catalog_version: "updated".into(),
+        gateway
+            .set_defaults(fte_router::GatewayDefaults {
+                catalog_version: "application-owned".into(),
             })
-            .expect("update gateway defaults");
+            .expect("application owns gateway defaults");
+        let builder = super::Builder::new(gateway.clone()).with_default_loopback();
         assert!(std::sync::Arc::ptr_eq(&gateway, &builder.gateway));
     }
 
@@ -661,7 +579,8 @@ mod tests {
     #[test]
     fn explicit_app_data_directory_is_retained_exactly() {
         let root = PathBuf::from("/tmp/fte-acceptance-plugin-root");
-        let builder = Builder::new().with_app_data_dir(root.clone());
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        let builder = Builder::new(gateway).with_app_data_dir(root.clone());
         assert_eq!(builder.app_data_dir, Some(root));
     }
 

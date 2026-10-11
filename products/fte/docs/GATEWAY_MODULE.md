@@ -31,7 +31,9 @@ Its former standalone repository is frozen. See [Module and Repository Map](MODU
 The native kit does not depend on Free Token Energy. Product state remains in
 the embedding application.
 
-The native host passed to the plugin is explicitly **borrowed**. Gateway
+The application configures `LlamaNativeBackend::new_borrowed` with its native host
+and registers the backend on its Gateway. The plugin receives that same Gateway.
+Gateway
 shutdown closes FTE admission, cancels every FTE request, and waits for model
 acquisition, tokenization, cache, provider, bridge, and token-count work to
 finish. It never unloads or closes the application-owned host. On Tauri exit,
@@ -43,11 +45,8 @@ joined process-exit shutdown fact.
 
 ```rust,ignore
 tauri::Builder::default().plugin(
-    tauri_plugin_free_token_energy::Builder::new()
+    tauri_plugin_free_token_energy::Builder::new(application_gateway)
         .with_store(response_store)
-        .with_secret_resolver(secret_resolver)
-        .with_native_host(native_host)?
-        .register_native_model(model_profile)?
         .with_default_loopback()
         .build(),
 )
@@ -236,9 +235,9 @@ from that store on later requests. Missing storage, failed persistence, and
 protocols that cannot restore continuation IDs return explicit errors. The
 loopback and Tauri edges bind their stores to this same gateway boundary.
 
-`Builder::with_defaults` now returns `Result<Builder, GatewayError>` and updates
-the existing gateway's metadata. Use `?` when composing a builder. Registered
-backends and injected storage are retained.
+`Gateway::set_defaults` returns `Result<(), GatewayError>` and updates the
+application-owned gateway's metadata. Configure that gateway before passing its
+`Arc` to the plugin. Registered backends and injected storage are retained.
 
 Loom embeds the router and provider crates directly for its optional global
 [dotfile](../../loom/docs/inference-dotfile.md). Its native writer keeps its own
