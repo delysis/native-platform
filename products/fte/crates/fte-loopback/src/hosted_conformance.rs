@@ -51,7 +51,12 @@ async fn hosted_exchange_captured(
                     .lock()
                     .expect("captured provider requests")
                     .push(body);
-                if uri.path().ends_with(":countTokens") {
+                if uri.path().ends_with("/count_tokens") {
+                    (
+                        [(header::CONTENT_TYPE, "application/json".to_string())],
+                        br#"{"input_tokens":4}"#.to_vec(),
+                    )
+                } else if uri.path().ends_with(":countTokens") {
                     (
                         [(header::CONTENT_TYPE, "application/json".to_string())],
                         br#"{"totalTokens":4}"#.to_vec(),
@@ -97,7 +102,7 @@ async fn hosted_exchange_captured(
     };
     config.endpoints.messages = Some(url.clone());
     config.endpoints.responses = Some(url.clone());
-    config.endpoints.count_tokens = Some(url.clone());
+    config.endpoints.count_tokens = Some(format!("{url}/count_tokens"));
     config.endpoints.completions = Some(url);
     gateway
         .register_backend(Arc::new(
@@ -138,6 +143,76 @@ fn sse(values: &[Value]) -> Vec<u8> {
         .collect::<String>();
     text.push_str("data: [DONE]\n\n");
     text.into_bytes()
+}
+
+#[tokio::test]
+async fn hosted_json_anthropic_stream_never_emits_a_delta_after_block_stop() {
+    let provider = json!({
+        "content":[
+            {"type":"text","text":"answer"},
+            {"type":"thinking","thinking":"check","signature":"sig_exact"},
+            {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+        ],
+        "stop_reason":"tool_use",
+        "usage":{"input_tokens":4,"output_tokens":3}
+    });
+    let (status, text) = hosted_exchange(
+        "anthropic", "application/json", provider.to_string().into_bytes(), "/v1/messages",
+        json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":true}),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let values = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str::<Value>(line).expect("Anthropic SSE JSON"))
+        .collect::<Vec<_>>();
+    let mut stopped = std::collections::BTreeSet::new();
+    let mut deltas = Vec::new();
+    for value in &values {
+        match value["type"].as_str() {
+            Some("content_block_delta") => {
+                let index = value["index"].as_u64().expect("block index");
+                assert!(
+                    !stopped.contains(&index),
+                    "delta after stopped block: {text}"
+                );
+                deltas.push(value["delta"].clone());
+            }
+            Some("content_block_stop") => {
+                assert!(
+                    stopped.insert(value["index"].as_u64().expect("block index")),
+                    "duplicate block stop: {text}"
+                );
+            }
+            Some("error") => panic!("unexpected stream failure: {text}"),
+            _ => {}
+        }
+    }
+    assert_eq!(stopped.len(), 3);
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| delta["text"] == "answer")
+            .count(),
+        1
+    );
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| delta["signature"] == "sig_exact")
+            .count(),
+        1
+    );
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| delta["partial_json"] == "{\"term\":\"日本語\"}"),
+        "{text}"
+    );
+    assert_eq!(
+        values.last().expect("terminal message")["type"],
+        "message_stop"
+    );
 }
 
 #[tokio::test]

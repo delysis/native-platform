@@ -1800,7 +1800,9 @@ pub struct AnthropicStreamEncoder {
     next_block_index: usize,
     blocks: BTreeMap<AnthropicBlockKey, usize>,
     stopped_blocks: BTreeSet<usize>,
-    delta_blocks: BTreeSet<usize>,
+    block_starts: BTreeMap<usize, Value>,
+    emitted_deltas: BTreeMap<usize, String>,
+    completed_blocks: BTreeMap<usize, Value>,
     items: BTreeMap<usize, OutputItem>,
     terminal: bool,
 }
@@ -1813,10 +1815,17 @@ impl AnthropicStreamEncoder {
             next_block_index: 0,
             blocks: BTreeMap::new(),
             stopped_blocks: BTreeSet::new(),
-            delta_blocks: BTreeSet::new(),
+            block_starts: BTreeMap::new(),
+            emitted_deltas: BTreeMap::new(),
+            completed_blocks: BTreeMap::new(),
             items: BTreeMap::new(),
             terminal: false,
         }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     pub fn encode(&mut self, event: &GatewayEvent) -> Vec<SseEvent> {
@@ -1845,12 +1854,19 @@ impl AnthropicStreamEncoder {
                             &mut events,
                         );
                     }
-                    OutputItem::Reasoning { .. } => {
-                        self.ensure_block(
-                            AnthropicBlockKey::Item(*output_index),
-                            json!({"type":"thinking","thinking":""}),
-                            &mut events,
-                        );
+                    OutputItem::Reasoning {
+                        summary,
+                        opaque_continuation,
+                        ..
+                    } => {
+                        let part = anthropic_reasoning_part(summary, opaque_continuation.as_ref());
+                        if let Some(start) = anthropic_content_block_start(&part) {
+                            self.ensure_block(
+                                AnthropicBlockKey::Item(*output_index),
+                                start,
+                                &mut events,
+                            );
+                        }
                     }
                     OutputItem::Message { .. } => {}
                 }
@@ -1880,11 +1896,7 @@ impl AnthropicStreamEncoder {
                     json!({"type":"text","text":""}),
                     &mut events,
                 );
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":delta}}),
-                });
+                self.emit_delta(index, "text_delta", "text", delta, &mut events);
             }
             GatewayEvent::ReasoningSummaryDelta {
                 output_index,
@@ -1896,11 +1908,7 @@ impl AnthropicStreamEncoder {
                     json!({"type":"thinking","thinking":""}),
                     &mut events,
                 );
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":delta}}),
-                });
+                self.emit_delta(index, "thinking_delta", "thinking", delta, &mut events);
             }
             GatewayEvent::FunctionArgumentsDelta {
                 output_index,
@@ -1919,11 +1927,13 @@ impl AnthropicStreamEncoder {
                     .unwrap_or_else(|| json!({"type":"tool_use","id":"","name":"","input":{}}));
                 let index =
                     self.ensure_block(AnthropicBlockKey::Item(*output_index), block, &mut events);
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":delta}}),
-                });
+                self.emit_delta(
+                    index,
+                    "input_json_delta",
+                    "partial_json",
+                    delta,
+                    &mut events,
+                );
             }
             GatewayEvent::ContentPartCompleted {
                 output_index,
@@ -1939,6 +1949,31 @@ impl AnthropicStreamEncoder {
                 output_index, item, ..
             } => self.complete_output_item(*output_index, item, &mut events),
             GatewayEvent::Completed { response, .. } => {
+                let mut final_blocks = BTreeSet::new();
+                for (output_index, item) in response.output.iter().enumerate() {
+                    match item {
+                        OutputItem::Message { content, .. } => {
+                            for (content_index, part) in content.iter().enumerate() {
+                                if anthropic_content_block_start(part).is_some() {
+                                    final_blocks.insert(AnthropicBlockKey::Content(
+                                        output_index,
+                                        content_index,
+                                    ));
+                                }
+                            }
+                        }
+                        OutputItem::FunctionCall { .. } | OutputItem::Reasoning { .. } => {
+                            final_blocks.insert(AnthropicBlockKey::Item(output_index));
+                        }
+                    }
+                    self.complete_output_item(output_index, item, &mut events);
+                }
+                if self.blocks.keys().any(|key| !final_blocks.contains(key)) {
+                    self.projection_error(&mut events);
+                }
+                if self.terminal {
+                    return events;
+                }
                 self.finish_content_blocks(&mut events);
                 let (stop_reason, stop_sequence) = anthropic_stop(response);
                 events.push(SseEvent {
@@ -1982,11 +2017,146 @@ impl AnthropicStreamEncoder {
         let index = self.next_block_index;
         self.next_block_index += 1;
         self.blocks.insert(key, index);
+        self.block_starts.insert(index, content_block.clone());
         events.push(SseEvent {
             event: "content_block_start".to_string(),
             data: json!({"type":"content_block_start","index":index,"content_block":content_block}),
         });
         index
+    }
+
+    fn projection_error(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.terminal {
+            events.push(SseEvent {
+                event: "error".to_string(),
+                data: json!({"type":"error","error":{"type":"api_error","code":"stream_projection_incomplete","message":"Streamed content conflicts with authoritative block completion"}}),
+            });
+            self.terminal = true;
+        }
+    }
+
+    fn emit_delta(
+        &mut self,
+        index: usize,
+        kind: &str,
+        field: &str,
+        delta: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.terminal {
+            return;
+        }
+        if self.stopped_blocks.contains(&index) {
+            self.projection_error(events);
+            return;
+        }
+        let expected_block = match kind {
+            "text_delta" => "text",
+            "thinking_delta" => "thinking",
+            "input_json_delta" => "tool_use",
+            _ => {
+                self.projection_error(events);
+                return;
+            }
+        };
+        if self
+            .block_starts
+            .get(&index)
+            .and_then(|block| block["type"].as_str())
+            != Some(expected_block)
+        {
+            self.projection_error(events);
+            return;
+        }
+        self.emitted_deltas
+            .entry(index)
+            .or_default()
+            .push_str(delta);
+        let mut value = json!({"type":kind});
+        value[field] = json!(delta);
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({"type":"content_block_delta","index":index,"delta":value}),
+        });
+    }
+
+    fn complete_block(
+        &mut self,
+        key: AnthropicBlockKey,
+        start: Value,
+        completed: Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.terminal {
+            return;
+        }
+        let index = self.ensure_block(key, start.clone(), events);
+        if self.block_starts.get(&index) != Some(&start) {
+            self.projection_error(events);
+            return;
+        }
+        if let Some(previous) = self.completed_blocks.get(&index) {
+            if previous != &completed {
+                self.projection_error(events);
+            }
+            return;
+        }
+        let emitted = self.emitted_deltas.get(&index).cloned().unwrap_or_default();
+        let (kind, field, full) = match completed["type"].as_str() {
+            Some("text") => (
+                "text_delta",
+                "text",
+                completed["text"].as_str().unwrap_or_default().to_string(),
+            ),
+            Some("thinking") => (
+                "thinking_delta",
+                "thinking",
+                completed["thinking"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            Some("tool_use") => {
+                // Complete JSON may differ in whitespace or object-key order.
+                // Compare its value before considering a missing canonical suffix.
+                if serde_json::from_str::<Value>(&emitted).ok().as_ref()
+                    == Some(&completed["input"])
+                {
+                    self.completed_blocks.insert(index, completed);
+                    self.stop_block(index, events);
+                    return;
+                }
+                (
+                    "input_json_delta",
+                    "partial_json",
+                    completed["input"].to_string(),
+                )
+            }
+            Some("redacted_thinking") => {
+                self.completed_blocks.insert(index, completed);
+                self.stop_block(index, events);
+                return;
+            }
+            _ => {
+                self.projection_error(events);
+                return;
+            }
+        };
+        let Some(suffix) = full.strip_prefix(&emitted) else {
+            self.projection_error(events);
+            return;
+        };
+        if !suffix.is_empty() {
+            self.emit_delta(index, kind, field, suffix, events);
+        }
+        if let Some(signature) = completed.get("signature").and_then(Value::as_str) {
+            events.push(SseEvent {
+                event: "content_block_delta".to_string(),
+                data: json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
+            });
+        }
+        self.completed_blocks.insert(index, completed);
+        self.stop_block(index, events);
     }
 
     fn complete_content_part(
@@ -1998,33 +2168,17 @@ impl AnthropicStreamEncoder {
         let Some(start) = anthropic_content_block_start(part) else {
             return;
         };
-        let index = self.ensure_block(key, start, events);
-        if !self.delta_blocks.contains(&index) {
-            match part {
-                ContentBlock::Text { text } if !text.is_empty() => events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
-                }),
-                ContentBlock::Thinking { text, .. } if !text.is_empty() => {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
-                    });
-                }
-                _ => {}
+        let completed = match part {
+            ContentBlock::Text { text } => json!({"type":"text","text":text}),
+            ContentBlock::Thinking { text, signature } => {
+                json!({"type":"thinking","thinking":text,"signature":signature})
             }
-        }
-        if let ContentBlock::Thinking {
-            signature: Some(signature),
-            ..
-        } = part
-        {
-            events.push(SseEvent {
-                event: "content_block_delta".to_string(),
-                data: json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
-            });
-        }
-        self.stop_block(index, events);
+            ContentBlock::RedactedThinking { data } => {
+                json!({"type":"redacted_thinking","data":data})
+            }
+            _ => return,
+        };
+        self.complete_block(key, start, completed, events);
     }
 
     fn complete_output_item(
@@ -2049,32 +2203,23 @@ impl AnthropicStreamEncoder {
                 arguments,
                 ..
             } => {
-                let index = self.ensure_block(
+                self.complete_block(
                     AnthropicBlockKey::Item(output_index),
                     json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":arguments}),
                     events,
                 );
-                if !self.delta_blocks.contains(&index) {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string())}}),
-                    });
-                }
-                self.stop_block(index, events);
             }
-            OutputItem::Reasoning { summary, .. } => {
-                let index = self.ensure_block(
+            OutputItem::Reasoning {
+                summary,
+                opaque_continuation,
+                ..
+            } => {
+                self.complete_content_part(
                     AnthropicBlockKey::Item(output_index),
-                    json!({"type":"thinking","thinking":""}),
+                    &anthropic_reasoning_part(summary, opaque_continuation.as_ref()),
                     events,
                 );
-                if !self.delta_blocks.contains(&index) && !summary.is_empty() {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":summary.join("\n")}}),
-                    });
-                }
-                self.stop_block(index, events);
             }
         }
     }
@@ -2094,6 +2239,25 @@ impl AnthropicStreamEncoder {
         indices.dedup();
         for index in indices {
             self.stop_block(index, events);
+        }
+    }
+}
+
+fn anthropic_reasoning_part(summary: &[String], opaque: Option<&Value>) -> ContentBlock {
+    if let Some(data) = opaque
+        .and_then(|value| value.get("redacted_thinking"))
+        .and_then(Value::as_str)
+    {
+        ContentBlock::RedactedThinking {
+            data: data.to_string(),
+        }
+    } else {
+        ContentBlock::Thinking {
+            text: summary.join("\n"),
+            signature: opaque
+                .and_then(|value| value.get("signature"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }
     }
 }
@@ -2492,6 +2656,187 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_repeated_part_and_item_completion_emits_one_block() {
+        for part in [
+            ContentBlock::Text {
+                text: "日本語".to_string(),
+            },
+            ContentBlock::Thinking {
+                text: "check".to_string(),
+                signature: Some("sig_exact".to_string()),
+            },
+        ] {
+            let request_id = RequestId::new();
+            let mut encoder = AnthropicStreamEncoder::new(1);
+            let completion = GatewayEvent::ContentPartCompleted {
+                request_id: request_id.clone(),
+                output_index: 0,
+                content_index: 0,
+                part: part.clone(),
+            };
+            let first = encoder.encode(&completion);
+            assert_eq!(
+                first.last().expect("block stop").event,
+                "content_block_stop"
+            );
+            assert!(encoder.encode(&completion).is_empty());
+            assert!(
+                encoder
+                    .encode(&GatewayEvent::OutputItemCompleted {
+                        request_id,
+                        output_index: 0,
+                        item: OutputItem::Message {
+                            id: "msg_1".to_string(),
+                            role: MessageRole::Assistant,
+                            content: vec![part],
+                        },
+                    })
+                    .is_empty()
+            );
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|event| event.event == "content_block_stop")
+                    .count(),
+                1
+            );
+            assert!(first.iter().all(|event| event.event != "error"));
+        }
+    }
+
+    #[test]
+    fn anthropic_completion_reconciles_missing_suffix_and_rejects_conflicts() {
+        let request_id = RequestId::new();
+        let mut encoder = AnthropicStreamEncoder::new(1);
+        encoder.encode(&GatewayEvent::TextDelta {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            delta: "日本".to_string(),
+        });
+        let completion = encoder.encode(&GatewayEvent::ContentPartCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: ContentBlock::Text {
+                text: "日本語".to_string(),
+            },
+        });
+        assert_eq!(completion[0].data["delta"]["text"], "語");
+        assert_eq!(completion[1].event, "content_block_stop");
+        let conflict = encoder.encode(&GatewayEvent::ContentPartCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: ContentBlock::Text {
+                text: "contradiction".to_string(),
+            },
+        });
+        assert_eq!(conflict.len(), 1);
+        assert_eq!(
+            conflict[0].data["error"]["code"],
+            "stream_projection_incomplete"
+        );
+        assert!(
+            encoder
+                .encode(&GatewayEvent::TextDelta {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "late".to_string(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anthropic_stopped_thinking_rejects_a_different_signature_and_late_delta() {
+        for conflict_signature in [true, false] {
+            let request_id = RequestId::new();
+            let mut encoder = AnthropicStreamEncoder::new(1);
+            let first = encoder.encode(&GatewayEvent::ContentPartCompleted {
+                request_id: request_id.clone(),
+                output_index: 0,
+                content_index: 0,
+                part: ContentBlock::Thinking {
+                    text: "check".to_string(),
+                    signature: Some("sig_1".to_string()),
+                },
+            });
+            assert_eq!(first[first.len() - 2].data["delta"]["signature"], "sig_1");
+            assert_eq!(
+                first.last().expect("stop after signature").event,
+                "content_block_stop"
+            );
+            let conflict = if conflict_signature {
+                GatewayEvent::ContentPartCompleted {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    part: ContentBlock::Thinking {
+                        text: "check".to_string(),
+                        signature: Some("sig_2".to_string()),
+                    },
+                }
+            } else {
+                GatewayEvent::TextDelta {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "late".to_string(),
+                }
+            };
+            let events = encoder.encode(&conflict);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, "error");
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_completion_compares_json_values_and_deduplicates() {
+        let request_id = RequestId::new();
+        let item = OutputItem::FunctionCall {
+            id: "tool_1".to_string(),
+            call_id: "call_1".to_string(),
+            name: "lookup".to_string(),
+            arguments: json!({"a":1,"b":2}),
+        };
+        let mut encoder = AnthropicStreamEncoder::new(1);
+        encoder.encode(&GatewayEvent::OutputItemAdded {
+            request_id: request_id.clone(),
+            group_index: None,
+            output_index: 0,
+            item: item.clone(),
+        });
+        encoder.encode(&GatewayEvent::FunctionArgumentsDelta {
+            request_id: request_id.clone(),
+            output_index: 0,
+            delta: "{ \"b\":2, \"a\":1 }".to_string(),
+        });
+        let completion = GatewayEvent::OutputItemCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            item,
+        };
+        let stopped = encoder.encode(&completion);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].event, "content_block_stop");
+        assert!(encoder.encode(&completion).is_empty());
+        let conflict = encoder.encode(&GatewayEvent::OutputItemCompleted {
+            request_id,
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "tool_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                arguments: json!({"a":9}),
+            },
+        });
+        assert_eq!(conflict.len(), 1);
+        assert_eq!(conflict[0].event, "error");
+    }
+
+    #[test]
     fn anthropic_stream_order_is_message_block_delta_block_message() {
         let request_id = RequestId::new();
         let route = ResolvedRoute {
@@ -2530,7 +2875,13 @@ mod tests {
             request_id: request_id.clone(),
             model: "model".to_string(),
             route,
-            output: vec![],
+            output: vec![OutputItem::Message {
+                id: "msg_1".to_string(),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
             usage: GatewayUsage::default(),
             output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,

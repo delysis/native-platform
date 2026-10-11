@@ -975,7 +975,7 @@ fn anthropic_stream(
             for encoded in encoder.encode(&event) {
                 yield Ok::<Event, Infallible>(Event::default().event(encoded.event).data(encoded.data.to_string()));
             }
-            if event.is_terminal() {
+            if encoder.is_terminal() || event.is_terminal() {
                 break;
             }
         }
