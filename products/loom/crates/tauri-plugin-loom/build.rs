@@ -1,7 +1,33 @@
+#![forbid(unsafe_code)]
+
 const COMMANDS: &[&str] = &[
     "preferences_get",
     "preferences_update",
     "document_reference_diagnostics",
+    "signal_request",
+    "cabal_network_get",
+    "cabal_network_set",
+    "cabal_snapshot",
+    "cabal_share",
+    "cabal_context_review",
+    "cabal_context_publish",
+    "cabal_join",
+    "cabal_open",
+    "cabal_workspace",
+    "cabal_edit",
+    "cabal_revoke",
+    "cabal_transfer_owner",
+    "cabal_recover",
+    "compute_host_snapshot",
+    "compute_grant",
+    "compute_revoke",
+    "compute_peer_offers",
+    "compute_job_prepare",
+    "compute_job_get",
+    "compute_jobs",
+    "compute_job_submit",
+    "compute_job_check",
+    "compute_job_cancel",
     "material_list",
     "material_resolve_reference",
     "material_read",
@@ -88,6 +114,7 @@ const COMMANDS: &[&str] = &[
     "document_reconciliation_preview",
     "document_reconcile_apply",
     "inference_status",
+    "visual_ghost_rendered",
     "build_model_policy_get",
     "model_catalog_list",
     "model_list",
@@ -113,6 +140,8 @@ const COMMANDS: &[&str] = &[
     "workspace_pane_run",
     "workspace_pane_list",
     "workspace_pane_cancel",
+    "terminal_recover",
+    "terminal_run_peer",
     "shader_preview",
     "generation_cancel",
     "candidate_keep",
@@ -125,6 +154,10 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    println!(
+        "cargo:rustc-env=LOOM_BUILD_TARGET={}",
+        std::env::var("TARGET").expect("Cargo sets TARGET")
+    );
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
     {

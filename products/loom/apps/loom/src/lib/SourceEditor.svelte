@@ -5,6 +5,7 @@
   import { observeInlineGhost, inlineGhostPreview } from './inlineGhostObservation';
   import ReferenceText from './ReferenceText.svelte';
   import { ReferenceDiagnostics, type ReferenceDiagnostic, type ReferenceScope } from './referenceDiagnostics';
+  import { mapRemoteOffset } from './remoteEditor';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
   import {
@@ -57,6 +58,17 @@
   let referenceIssues: ReferenceDiagnostic[] = [];
   $: referenceDiagnostics.update(referenceScope, value, items => referenceIssues = items);
   $: referenceDescription = referenceIssues.find(item => item.start <= selectionStart && item.end >= selectionStart)?.message;
+  export function applyRemoteValue(next: string): void {
+    if (!element || composing) return;
+    const previous = element.value;
+    const start = mapRemoteOffset(previous, next, element.selectionStart);
+    const end = mapRemoteOffset(previous, next, element.selectionEnd);
+    const direction = element.selectionDirection;
+    value = next;
+    element.value = next;
+    element.setSelectionRange(start, end, direction);
+    readSelection(true, true);
+  }
   export let readonly = false;
   export let verse = false;
   export let verseNewline: VerseNewlineKind | null = null;

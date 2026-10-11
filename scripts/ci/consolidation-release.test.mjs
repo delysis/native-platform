@@ -153,7 +153,7 @@ exit "$status"
 `, { FIXTURE_DIR: dir, CARGO_STATUS: String(cargoStatus), JOIN_TEST: joinTest });
       assert.equal(result.status, expected, result.stderr);
       assert.deepEqual(readFileSync(path.join(dir, 'args'), 'utf8').trimEnd().split('\n'), [
-        'run', '1.92.0', 'cargo', 'test', '--locked', '-p', 'mom-llama-app',
+        'run', '1.95.0', 'cargo', 'test', '--locked', '-p', 'mom-llama-app',
         '--lib', joinTest, '--', '--exact', '--format', 'pretty', '--color', 'never',
       ]);
       const receipts = result.stdout.match(/^CHECKS=(.*)$/m)?.[1];

@@ -97,6 +97,8 @@ const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
   'audio_synthesize',
+  // Peer cancellation can wait for a network reply; ordinary saves keep moving.
+  'terminal_cancel',
   'build_model_policy_get',
   'shader_preview',
   'model_catalog_list',
@@ -276,8 +278,8 @@ export function importAttachmentPaths(
   return call('attachment_import_paths', { projectId, sessionId, paths: [...paths], operationId });
 }
 
-export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
-  return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
+export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string, documentId?: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, documentId, attachmentId });
 }
 
 export interface WorkspaceCopyReport {
@@ -1034,7 +1036,7 @@ export function normalizeFailure(error: unknown): LoomFailure {
 }
 
 export function runTerminal(request: TerminalRunRequest): Promise<TerminalRun> {
-  return call('terminal_run', { ...request });
+  return request.remoteTarget ? call('terminal_run_peer', { request }) : call('terminal_run', { ...request });
 }
 
 export function listTerminalRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
@@ -1067,6 +1069,10 @@ export function resolveWorkspaceDocument(projectId: string, sessionId: string, r
 
 export function resolveWorkspaceReference(projectId: string, sessionId: string, reference: string): Promise<{ root_id: string; document_id: string; workspace_session_id: string }> {
   return call('workspace_reference_resolve', { projectId, sessionId, reference });
+}
+
+export function recoverTerminalRun(projectId: string, sessionId: string, runId: string, mode: 'check' | 'resume'): Promise<TerminalRun> {
+  return call('terminal_recover', { projectId, sessionId, runId, mode });
 }
 
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
@@ -1112,8 +1118,11 @@ export function cancelImportAccount(projectId: string, sessionId: string, operat
 export function listMaterials(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry[]> {
   return call('material_list', { projectId, sessionId });
 }
-export function bindAttachmentMaterial(projectId: string, sessionId: string, attachmentId: string, retention: 'ordinary' | 'protected' = 'ordinary'): Promise<import('./materials').MaterialEntry> {
-  return call('material_bind_attachment', { projectId, sessionId, attachmentId, retention });
+export function bindAttachmentMaterial(projectId: string, sessionId: string, attachmentId: string, retention: 'ordinary' | 'protected' = 'ordinary', documentId?: string): Promise<import('./materials').MaterialEntry> {
+  return call('material_bind_attachment', { projectId, sessionId, attachmentId, retention, documentId });
+}
+export function revealMaterialOriginal(projectId: string, sessionId: string, materialId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, materialId });
 }
 export function readMaterial(projectId: string, sessionId: string, materialId: string): Promise<import('./materials').MaterialRead> {
   return call('material_read', { projectId, sessionId, id: materialId });

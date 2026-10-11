@@ -79,7 +79,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
                 .current_dir(root)
                 .args([
                     "run",
-                    "1.92.0",
+                    "1.95.0",
                     "cargo",
                     "test",
                     "--locked",
@@ -126,8 +126,8 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
 
 fn toolchain_program(name: &str) -> Result<PathBuf> {
     let output = Command::new("rustup")
-        .args(["which", "--toolchain", "1.92.0", name])
+        .args(["which", "--toolchain", "1.95.0", name])
         .output()?;
-    ensure!(output.status.success(), "Rust 1.92 {name} is unavailable");
+    ensure!(output.status.success(), "Rust 1.95 {name} is unavailable");
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
 }

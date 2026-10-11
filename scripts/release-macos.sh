@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# Cargo, rustc, rustdoc, and Clippy must resolve from the same pinned toolchain.
+PINNED_CARGO=$(rustup which --toolchain 1.95.0 cargo)
+export PATH="$(dirname "$PINNED_CARGO"):$PATH"
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPONENT=${1:-}
 RELEASE_KIND=${2:-candidate}
@@ -70,7 +74,7 @@ record_check() {
 # Select the actual binaries, not only rustup's proxy override: a standalone
 # Homebrew Cargo earlier on PATH would otherwise escape the pin inside Tauri.
 pin_rust_toolchain() {
-  toolchain_cargo=$(rustup which --toolchain 1.92.0 cargo) || return $?
+  toolchain_cargo=$(rustup which --toolchain 1.95.0 cargo) || return $?
   toolchain_bin=$(dirname "$toolchain_cargo")
   for tool in cargo rustc rustdoc; do
     if [ ! -x "$toolchain_bin/$tool" ]; then
@@ -82,7 +86,7 @@ pin_rust_toolchain() {
   CARGO="$toolchain_bin/cargo"
   RUSTC="$toolchain_bin/rustc"
   RUSTDOC="$toolchain_bin/rustdoc"
-  RUSTUP_TOOLCHAIN=1.92.0
+  RUSTUP_TOOLCHAIN=1.95.0
   export PATH CARGO RUSTC RUSTDOC RUSTUP_TOOLCHAIN
 }
 
@@ -99,7 +103,7 @@ run_exact_test() {
   # An exact filter may exit successfully with an ignored or nonexistent test.
   # Require one executed pass, not just discovery or Cargo's exit status.
   test_status=0
-  test_output=$(run rustup run 1.92.0 cargo test --locked -p "$package" "$@" "$test_name" -- --exact --format pretty --color never) || test_status=$?
+  test_output=$(run rustup run 1.95.0 cargo test --locked -p "$package" "$@" "$test_name" -- --exact --format pretty --color never) || test_status=$?
   printf '%s\n' "$test_output"
   if [ "$test_status" -ne 0 ]; then
     return "$test_status"
@@ -215,7 +219,7 @@ case "$COMPONENT" in
     ;;
 esac
 
-TARGET_DIR=$(rustup run 1.92.0 cargo metadata --locked --no-deps --format-version 1 | node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
+TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 | node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
 BUNDLE="$TARGET_DIR/release/bundle/macos/$APP_NAME.app"
 EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"
 if [ -d "$BUNDLE" ]; then
@@ -253,6 +257,31 @@ require_equal CFBundleShortVersionString "$VERSION" "$OBSERVED_VERSION"
 require_equal CFBundleExecutable "$BINARY_NAME" "$OBSERVED_EXECUTABLE"
 require_equal LSMinimumSystemVersion "$MINIMUM_MACOS" "$OBSERVED_MINIMUM_MACOS"
 
+if [ "$COMPONENT" = loom ]; then
+  node - "$CONFIG" "$BUNDLE" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const [configPath, bundle] = process.argv.slice(2);
+const resources = JSON.parse(fs.readFileSync(configPath, "utf8")).bundle.resources;
+const target = /^host: (.+)$/m.exec(execFileSync("rustc", ["-vV"], { encoding: "utf8" }))?.[1];
+if (!target) throw new Error("Signal build target is unavailable");
+const releaseWorker = fs.readFileSync(path.resolve(path.dirname(configPath), "../../../signal/target/release/loom-signal"));
+const stagedWorker = fs.readFileSync(path.join(path.dirname(configPath), "binaries", `loom-signal-${target}`));
+if (!releaseWorker.equals(stagedWorker)) throw new Error("Signal sidecar must be the release-profile worker");
+if (!fs.statSync(path.join(bundle, "Contents/MacOS/loom-signal")).isFile()) {
+  throw new Error("packaged Signal worker is missing");
+}
+for (const [source, destination] of Object.entries(resources)) {
+  const original = fs.readFileSync(path.resolve(path.dirname(configPath), source));
+  const packaged = fs.readFileSync(path.join(bundle, "Contents/Resources", destination));
+  if (!original.equals(packaged)) throw new Error(`packaged notice mismatch: ${destination}`);
+}
+NODE
+  record_check "$PACKAGE::signal-release-profile"
+  record_check "$PACKAGE::signal-notices"
+fi
+
 EMBEDDED_MODEL=$(node "$ROOT/scripts/find-embedded-model.mjs" "$BUNDLE/Contents")
 if [ -n "$EMBEDDED_MODEL" ]; then
   echo "model weights must remain runtime-discovered, but the bundle contains: $EMBEDDED_MODEL" >&2
@@ -284,6 +313,15 @@ STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 SHORT_REVISION=$(git rev-parse --short=12 HEAD)
 OUTPUT_DIR="$ROOT/dist/macos/$COMPONENT-v$VERSION-$SHORT_REVISION-$STAMP"
 mkdir -p "$OUTPUT_DIR"
+
+SIGNAL_SOURCE_RECEIPT=
+SIGNAL_EXECUTABLE=
+if [ "$COMPONENT" = loom ]; then
+  run cargo run --locked -p xtask -- signal-source "$OUTPUT_DIR"
+  SIGNAL_SOURCE_RECEIPT="$OUTPUT_DIR/loom-signal-source.json"
+  SIGNAL_EXECUTABLE="$BUNDLE/Contents/MacOS/loom-signal"
+  record_check "$PACKAGE::signal-source-offline-resolution"
+fi
 
 NOTARIZATION_STATUS=not-requested
 NOTARIZATION_SUBMISSION_ID=
@@ -365,9 +403,33 @@ DELYSIS_RECEIPT_GATEKEEPER_ASSESSED="$GATEKEEPER_ASSESSED" \
 DELYSIS_RECEIPT_CHECKS="$CHECKS" \
 DELYSIS_RECEIPT_LOOM_POLICY_NAME="$LOOM_POLICY_NAME" \
 DELYSIS_RECEIPT_LOOM_POLICY_FILE_SHA="$LOOM_POLICY_FILE_SHA256" \
+DELYSIS_RECEIPT_SIGNAL_SOURCE="$SIGNAL_SOURCE_RECEIPT" \
+DELYSIS_RECEIPT_SIGNAL_EXECUTABLE="$SIGNAL_EXECUTABLE" \
 DELYSIS_RECEIPT_ARCHIVE_NAME="$(basename "$ARCHIVE")" \
 node <<'NODE' > "$RECEIPT"
+const fs = require("node:fs");
+const crypto = require("node:crypto");
 const e = process.env;
+const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+let signal = null;
+if (e.DELYSIS_RECEIPT_SIGNAL_SOURCE) {
+  const bytes = fs.readFileSync(e.DELYSIS_RECEIPT_SIGNAL_SOURCE);
+  const source = JSON.parse(bytes);
+  if (source.source.revision !== e.DELYSIS_RECEIPT_REVISION ||
+      source.source.tree !== e.DELYSIS_RECEIPT_TREE ||
+      !source.offline_resolution_verified) {
+    throw new Error("Signal source receipt does not match this release");
+  }
+  signal = {
+    build_profile: "release",
+    executable_sha256: digest(fs.readFileSync(e.DELYSIS_RECEIPT_SIGNAL_EXECUTABLE)),
+    source_receipt: "loom-signal-source.json",
+    source_receipt_sha256: digest(bytes),
+    source_archive: source.archive,
+    source_archive_sha256: source.archive_sha256,
+    lock_sha256: source.signal_lock_sha256,
+  };
+}
 const receipt = {
   schema: "delysis.macos-release-receipt.v2",
   created_at: new Date().toISOString(),
@@ -400,6 +462,7 @@ const receipt = {
     archive_sha256: e.DELYSIS_RECEIPT_ARCHIVE_SHA,
   },
   checks_passed: e.DELYSIS_RECEIPT_CHECKS.split("|").filter(Boolean),
+  loom_signal: signal,
   loom_build_model_policy: e.DELYSIS_RECEIPT_LOOM_POLICY_NAME
     ? { name: e.DELYSIS_RECEIPT_LOOM_POLICY_NAME, file_sha256: e.DELYSIS_RECEIPT_LOOM_POLICY_FILE_SHA }
     : null,

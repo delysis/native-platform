@@ -88,6 +88,8 @@ pub(super) struct DocumentRunRequest {
     pub presentation: Option<TerminalPresentation>,
     pub context_references: Option<Vec<String>>,
     pub turn_boundary: Option<TerminalTurnBoundary>,
+    pub literal_input: Option<bool>,
+    pub remote_target: Option<PeerTarget>,
 }
 
 pub(super) enum RunRequest {
@@ -170,6 +172,27 @@ impl RunRequest {
                 }
                 if let Some(boundary) = request.turn_boundary {
                     bytes.extend(serde_json::to_vec(&boundary).map_err(io_failure)?);
+                }
+                if request.literal_input.unwrap_or(false)
+                    && (request.source_start_byte != 0
+                        || request.source_end_byte != 0
+                        || request
+                            .context_references
+                            .as_ref()
+                            .is_some_and(|references| !references.is_empty()))
+                {
+                    return Err(failure(
+                        "Literal input cannot select source text or document references.",
+                    ));
+                }
+                if let Some(literal) = request.literal_input {
+                    bytes.extend(serde_json::to_vec(&literal).map_err(io_failure)?);
+                }
+                if let Some(target) = &request.remote_target {
+                    if request.turn_boundary.is_some() {
+                        return Err(failure("Peer jobs do not accept chat stop sequences."));
+                    }
+                    bytes.extend(serde_json::to_vec(target).map_err(io_failure)?);
                 }
                 Ok(bytes)
             }

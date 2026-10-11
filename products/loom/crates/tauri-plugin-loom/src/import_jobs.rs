@@ -11,14 +11,13 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{JoinHandle, ThreadId},
+    thread::JoinHandle,
 };
 
 #[derive(Debug, Default)]
 pub(super) struct ImportJobs {
     inner: Mutex<Registry>,
     drain: Mutex<()>,
-    join_workers: Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -35,7 +34,7 @@ struct Registry {
 #[derive(Debug)]
 struct SessionWorker {
     session_id: String,
-    handle: JoinHandle<()>,
+    handle: Arc<ImportWorker>,
 }
 
 impl Registry {
@@ -78,6 +77,54 @@ impl Drop for DrainAdmission<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining = false;
+    }
+}
+
+/// Completion and shutdown share one join, not ownership of a taken handle.
+#[derive(Debug)]
+struct ImportWorker {
+    join: Mutex<WorkerJoin>,
+}
+
+#[derive(Debug)]
+struct WorkerJoin {
+    handle: Option<JoinHandle<()>>,
+    panicked: bool,
+}
+
+impl ImportWorker {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            join: Mutex::new(WorkerJoin {
+                handle: Some(handle),
+                panicked: false,
+            }),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        // Admission must neither block on a join nor mistake a handle taken by
+        // a concurrent joiner for a finished worker.
+        self.join
+            .try_lock()
+            .is_ok_and(|join| join.handle.as_ref().is_none_or(JoinHandle::is_finished))
+    }
+
+    fn join(&self) -> Result<(), IpcFailure> {
+        let mut join = self
+            .join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keep this guard until the OS thread has exited. A concurrent drain
+        // waits here even after the completion waiter has taken the handle.
+        if let Some(handle) = join.handle.take() {
+            join.panicked = handle.join().is_err();
+        }
+        if join.panicked {
+            Err(failure("An import worker stopped unexpectedly."))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -207,33 +254,6 @@ impl ImportJobs {
         self.drain(None)
     }
 
-    fn finish_worker(&self, id: ThreadId) -> Result<(), IpcFailure> {
-        // Close must wait for this join, but a coordinator must never wait for
-        // the close lock: close joins the coordinator itself.
-        let _join = self
-            .join_workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let worker = {
-            let mut registry = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry
-                .workers
-                .iter()
-                .position(|worker| worker.handle.thread().id() == id)
-                .map(|index| registry.workers.swap_remove(index))
-        };
-        if let Some(worker) = worker {
-            worker
-                .handle
-                .join()
-                .map_err(|_| failure("An import worker stopped unexpectedly."))?;
-        }
-        Ok(())
-    }
-
     fn drain(&self, session_id: Option<&str>) -> Result<usize, IpcFailure> {
         // A second close must wait for the first join, not mistake its taken
         // handles for an already drained registry. Cancel uses only inner.
@@ -255,8 +275,8 @@ impl ImportJobs {
                     active.signal.send_replace(true);
                 }
             }
-            // A compute call retains its active operation until finish_worker
-            // joins, including thread-local cleanup. No matching active owner or
+            // A compute call retains its active operation until its shared join
+            // finishes, including thread-local cleanup. No matching active owner or
             // registered handle means this session has nothing left to wait for.
             if session_id.is_some_and(|session| {
                 registry
@@ -278,10 +298,6 @@ impl ImportJobs {
         let mut count = coordinators.len();
         let mut panicked = false;
         {
-            let _join = self
-                .join_workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let workers = take_workers(
                 &mut self
                     .inner
@@ -295,8 +311,8 @@ impl ImportJobs {
                 panicked |= worker.handle.join().is_err();
             }
         }
-        // Coordinators may still be returning from compute. Release the
-        // worker-join lock before waiting for them to finish.
+        // No registry lock remains held while joining. Coordinators may still
+        // be returning from the same completed worker join.
         for coordinator in coordinators {
             panicked |= coordinator.handle.join().is_err();
         }
@@ -336,7 +352,7 @@ impl ImportOperation {
                 .map_err(|error| failure(error.to_string()))?;
             registry.coordinators.push(SessionWorker {
                 session_id: self.session_id.clone(),
-                handle: worker,
+                handle: Arc::new(ImportWorker::new(worker)),
             });
         }
         sender
@@ -475,14 +491,15 @@ impl ImportOperation {
         }
     }
 
-    /// The registry keeps the join handle even if the RPC future is abandoned.
+    /// The registry keeps the worker even if the RPC future is abandoned.
+    /// A delivered result is not completion: every outcome awaits thread exit.
     pub(super) async fn compute<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, IpcFailure> + Send + 'static,
     ) -> Result<T, IpcFailure> {
         self.check()?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let worker_id = {
+        let worker = {
             let mut registry = self
                 .jobs
                 .inner
@@ -504,17 +521,33 @@ impl ImportOperation {
                     let _ = sender.send(result);
                 })
                 .map_err(|error| failure(error.to_string()))?;
-            let id = worker.thread().id();
+            let worker = Arc::new(ImportWorker::new(worker));
             registry.workers.push(SessionWorker {
                 session_id: self.session_id.clone(),
-                handle: worker,
+                handle: Arc::clone(&worker),
             });
-            id
+            worker
         };
         let result = receiver.await;
-        self.jobs.finish_worker(worker_id)?;
+        // Join off the async executor, including channel closure after panic.
+        // Abandoning this await leaves the registry's owner intact. Shutdown
+        // either performs this same join or waits for its completed outcome.
+        let joining = Arc::clone(&worker);
+        let joined = tauri::async_runtime::spawn_blocking(move || joining.join())
+            .await
+            .map_err(|_| failure("An import worker stopped unexpectedly."))?;
+        // Only reap after the shared join has finished. A dropped waiter leaves
+        // ownership in the registry; concurrent shutdown may have drained it.
+        self.jobs
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .retain(|registered| !Arc::ptr_eq(&registered.handle, &worker));
+        joined?;
+        let result = result.map_err(|_| failure("An import worker stopped unexpectedly."))?;
         self.check()?;
-        result.map_err(|_| failure("An import worker stopped unexpectedly."))?
+        result
     }
 
     /// Network futures live on an owned worker too. Cancellation drops the
@@ -654,6 +687,199 @@ mod tests {
                 })
             })
             .count()
+    }
+
+    /// Suspend the actual import thread inside `oneshot::Sender::send` (or its
+    /// panic-time drop), after the receiver becomes ready but before thread exit.
+    /// No production hooks or scheduler timing are involved.
+    struct CompletionWake {
+        entered: mpsc::Sender<()>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl std::task::Wake for CompletionWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if let Some(release) = self.release.lock().unwrap().take() {
+                let _ = self.entered.send(());
+                // Dropping the sender also releases the worker after an assertion
+                // failure, so a failed regression cannot strand plugin teardown.
+                let _ = release.recv();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WorkerOutcome {
+        Success,
+        Failure,
+        Panic,
+    }
+
+    #[test]
+    fn compute_completion_waits_for_thread_exit_on_every_outcome() {
+        use std::{future::Future, task::Context};
+
+        for outcome in [
+            WorkerOutcome::Success,
+            WorkerOutcome::Failure,
+            WorkerOutcome::Panic,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (state, project, session) = opened(temporary.path());
+            let operation =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .unwrap();
+            let (start, started) = mpsc::channel();
+            let (entered, completion) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let waker = std::task::Waker::from(Arc::new(CompletionWake {
+                entered,
+                release: Mutex::new(Some(blocked)),
+            }));
+            let mut compute = Box::pin(operation.compute(move || {
+                started.recv().unwrap();
+                match outcome {
+                    WorkerOutcome::Success => Ok(7),
+                    WorkerOutcome::Failure => Err(failure("conversion failed")),
+                    WorkerOutcome::Panic => panic!("conversion panicked"),
+                }
+            }));
+            assert!(
+                compute
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            start.send(()).unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            // The real oneshot is now ready, while the real registered worker
+            // cannot have exited. Before the repair this poll returns Ready.
+            let waiting_for_exit = compute
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            release.send(()).unwrap();
+            assert!(
+                waiting_for_exit.is_pending(),
+                "{outcome:?}: result delivery is not thread exit"
+            );
+
+            let result = tauri::async_runtime::block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), compute)
+                    .await
+                    .expect("completion must finish after the worker exits")
+            });
+            match outcome {
+                WorkerOutcome::Success => assert_eq!(result.unwrap(), 7),
+                WorkerOutcome::Failure => {
+                    assert_eq!(result.unwrap_err().message, "conversion failed");
+                }
+                WorkerOutcome::Panic => assert_eq!(
+                    result.unwrap_err().message,
+                    "An import worker stopped unexpectedly."
+                ),
+            }
+            assert!(state.imports.inner.lock().unwrap().workers.is_empty());
+            drop(operation);
+            // This is the failed folder-import boundary, not a retry loop.
+            let next =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .expect("an awaited and dropped import must immediately release admission");
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn abandoned_completion_remains_owned_when_shutdown_races_the_join() {
+        use std::{future::Future, task::Context};
+
+        for shutdown_first in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (state, project, session) = opened(temporary.path());
+            let operation =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .unwrap();
+            let mut cancelled = operation.signal.subscribe();
+            let (start, started) = mpsc::channel();
+            let (entered, completion) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let waker = std::task::Waker::from(Arc::new(CompletionWake {
+                entered,
+                release: Mutex::new(Some(blocked)),
+            }));
+            let mut compute = Box::pin(operation.compute(move || {
+                started.recv().unwrap();
+                Ok(())
+            }));
+            assert!(
+                compute
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            start.send(()).unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let (finished, notifications) = mpsc::channel();
+            let close = || {
+                let jobs = Arc::clone(&state.imports);
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    let count = jobs.shutdown().unwrap();
+                    finished.send(()).unwrap();
+                    count
+                })
+            };
+            let mut drains = Vec::new();
+            if shutdown_first {
+                drains.push(close());
+                tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), cancelled.changed())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                });
+                // Shutdown has taken the registry's workers, but not finished
+                // their joins. Completion must wait for that same owner.
+                assert!(state.imports.inner.lock().unwrap().workers.is_empty());
+            }
+
+            let waiting_for_exit = compute
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(waiting_for_exit.is_pending());
+            drop(compute);
+            drop(operation);
+            assert!(
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .is_err(),
+                "abandoning completion cannot admit another converter"
+            );
+            assert!(state.application.try_lock().is_ok());
+            assert!(state.session.try_lock().is_ok());
+            while drains.len() < 2 {
+                drains.push(close());
+            }
+            assert!(
+                matches!(
+                    notifications.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "both closes must wait for the original worker to exit"
+            );
+            release.send(()).unwrap();
+            assert_eq!(
+                drains
+                    .into_iter()
+                    .map(|drain| drain.join().unwrap())
+                    .sum::<usize>(),
+                1
+            );
+        }
     }
 
     #[test]

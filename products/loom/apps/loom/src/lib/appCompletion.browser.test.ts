@@ -65,6 +65,7 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     calls.push(command);
     switch (command) {
+      case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
@@ -140,6 +141,7 @@ it.each(['saved', 'failed'] as const)('waits for shared preferences (%s) before 
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     calls.push(command);
     switch (command) {
+      case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return preferences;
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
@@ -234,6 +236,7 @@ it.each([
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     calls.push({ command, args });
     switch (command) {
+      case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|workspace_chat_route': return 'loom';
@@ -380,6 +383,7 @@ it.each([
   const releasePreferences: Array<() => void> = [];
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     switch (command) {
+      case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|project_current': return project;

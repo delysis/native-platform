@@ -20,6 +20,8 @@
   export let uncertain = false;
   export let onCheck: () => void;
   export let modelLabel = '';
+  export let onRecover: (run: TerminalRun, mode: 'check' | 'resume') => void = () => {};
+  export let onCancelRun: (run: TerminalRun) => void = () => {};
   export let onRun: () => void;
   export let onCancel: () => void;
   export let pinnedOutputs = new Set<string>();
@@ -114,13 +116,21 @@
 
 {#if open}
 <section id={embedded ? undefined : "retained-terminal"} class="retained-terminal" class:embedded aria-label="Terminal">
-  {#if !embedded}<header class="terminal-header"><span>Terminal</span><span class="terminal-status" title={modelLabel}>{modelLabel}</span><button class="terminal-close" type="button" aria-label="Close terminal" on:click={onClose}>×</button></header>{/if}
+  {#if !embedded}<header class="terminal-header"><span>Terminal</span><slot name="model"><span class="terminal-status" title={modelLabel}>{modelLabel}</span></slot><button class="terminal-close" type="button" aria-label="Close terminal" on:click={onClose}>×</button></header>{/if}
   <div class="terminal-scroll" bind:this={viewport} on:scroll={trackScroll}>
     {#each history.filter(run => !cleared.has(run.run_id)) as run (run.run_id)}
       <div class="terminal-history">
         <div class="terminal-command"><span aria-hidden="true">› </span>{run.presentation?.input ?? (run.expression || run.title || '')}</div>
         {#if outputs[run.run_id] !== undefined || run.preview}<pre>{outputs[run.run_id] ?? run.preview}</pre>{/if}
         {#if run.error}<p class="terminal-error">{run.error}</p>{/if}
+        {#if run.remote}<small class="terminal-status">{run.remote.model.name} · {run.status === 'completed' ? 'peer result' : 'peer job'}</small>{/if}
+        {#if run.status === 'unconfirmed'}
+          <div class="terminal-recovery">
+            <button type="button" on:click={() => onRecover(run, 'check')} disabled={disabled || busy}>Check</button>
+            <button type="button" on:click={() => onRecover(run, 'resume')} disabled={disabled || busy}>Resume</button>
+            <button type="button" on:click={() => onCancelRun(run)} disabled={disabled || busy}>Cancel remaining steps</button>
+          </div>
+        {/if}
         {#if run.status === 'running'}<span class="terminal-status" role="status">…</span>{/if}
         {#if run.output_document_id}<button type="button" class="terminal-output-link" on:click={() => onOpen(run)} disabled={disabled}>{run.output_relative_path ?? 'Open output'}</button>{/if}
         {#if run.output_document_id && onPin}<button type="button" class="terminal-output-link" aria-label={pinnedOutputs.has(run.output_document_id) ? 'Unpin output from workspace' : 'Pin output in workspace'} aria-pressed={pinnedOutputs.has(run.output_document_id)} on:click={() => onPin?.(run)} disabled={disabled}>{pinnedOutputs.has(run.output_document_id) ? 'Unpin' : 'Pin'}</button>{/if}

@@ -12,6 +12,10 @@ use std::sync::atomic::AtomicUsize;
 #[path = "terminal_scope.rs"]
 mod scope;
 use scope::{DocumentRunRequest, PreparedInput, RunRequest, RunScope, WorkspacePaneRequest};
+#[path = "terminal_remote.rs"]
+mod remote;
+use remote::{PeerTarget, RecoveryMode};
+pub(super) use remote::{terminal_recover, terminal_run_peer};
 
 const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
@@ -46,6 +50,8 @@ pub(super) struct TerminalRun {
     preview: String,
     error: Option<String>,
     created_at_ms: i64,
+    #[serde(default)]
+    remote: Option<remote::PeerModel>,
     /// Derived only at the IPC boundary; retained receipts have no event log.
     #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
     events: Vec<TerminalEvent>,
@@ -222,6 +228,9 @@ struct RunReceipt {
     scope: RunScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_configuration: Option<Value>,
+    remote: Option<PeerTarget>,
+    #[serde(default)]
+    literal_input: bool,
     run: TerminalRun,
     request_fingerprint: BlobId,
     source_document_id: DocumentId,
@@ -256,17 +265,45 @@ struct RunReceipt {
     workspace_chat: Option<crate::WorkspaceChatOutput>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContextLookup {
+    input: BlobId,
+    value: Value,
+    omitted: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct TerminalControl {
     cancelled: Arc<AtomicBool>,
+    settled: AtomicBool,
     current: Mutex<Option<Arc<LlamaGenerationControl>>>,
     joined: AtomicUsize,
     panicked: AtomicBool,
+    remote_cancel: Option<(PathBuf, String)>,
+    cancel_error: Mutex<Option<String>>,
 }
 
 impl TerminalControl {
+    pub(super) fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
     pub(super) fn cancel(&self) {
+        // Joining a finished worker is cleanup, never new user intent. In
+        // particular, checking an unknown result must leave it resumable.
+        if self.is_settled() {
+            return;
+        }
         self.cancelled.store(true, Ordering::Release);
+        if let Some((root, id)) = &self.remote_cancel
+            && let Err(error) = crate::terminal_receipts::request_cancel(root, id)
+        {
+            *self
+                .cancel_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.message);
+        }
         if let Some(current) = self
             .current
             .lock()
@@ -490,6 +527,7 @@ fn read_receipt(root: &Path, id: &str, finished: bool) -> Result<Option<RunRecei
 }
 
 fn settle_interrupted(
+    root: &Path,
     run: &mut TerminalRun,
     scope: RunScope,
     state: &PluginState,
@@ -501,14 +539,28 @@ fn settle_interrupted(
             .map_err(io_failure)?
             .is_none()
     {
-        run.status = "failed".into();
-        run.error = Some("Interrupted before completion; retained results are in Runs.".into());
+        if run.remote.is_some() {
+            run.status = "unconfirmed".into();
+            run.error = Some(
+                match crate::terminal_receipts::observation(root, &run.run_id)? {
+                    Some(message) => {
+                        format!("Last saved report: {message} The final outcome is unconfirmed.")
+                    }
+                    None => {
+                        "The peer outcome is unconfirmed. Check saved jobs before resuming.".into()
+                    }
+                },
+            );
+        } else {
+            run.status = "failed".into();
+            run.error = Some("Interrupted before completion; retained results are in Runs.".into());
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn terminal_run<R: Runtime>(
     project_id: String,
     session_id: String,
@@ -522,6 +574,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     presentation: Option<TerminalPresentation>,
     context_references: Option<Vec<String>>,
     turn_boundary: Option<TerminalTurnBoundary>,
+    literal_input: Option<bool>,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
@@ -540,6 +593,8 @@ pub(super) async fn terminal_run<R: Runtime>(
             presentation,
             context_references,
             turn_boundary,
+            literal_input,
+            remote_target: None,
         }),
         &app,
         &state,
@@ -587,7 +642,18 @@ fn start_run<R: Runtime>(
     let command_id = parse_command_id(command_id)?;
     let mut fingerprint_bytes = request.fingerprint()?;
     let admission = lock_application_admission(state, "an experiment")?;
-    let model_guard = lock_model_lifecycle(state)?;
+    let (literal, remote_target) = match request {
+        RunRequest::Document(request) => (
+            request.literal_input.unwrap_or(false),
+            request.remote_target.clone(),
+        ),
+        RunRequest::Workspace(_) => (false, None),
+    };
+    let model_guard = if remote_target.is_none() {
+        Some(lock_model_lifecycle(state)?)
+    } else {
+        None
+    };
     let mut session = lock_session(state)?;
     if scope == RunScope::Document {
         session
@@ -615,7 +681,7 @@ fn start_run<R: Runtime>(
         }
         *may_have_started = true;
         let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
-        settle_interrupted(&mut result.run, scope, state)?;
+        settle_interrupted(&root, &mut result.run, scope, state)?;
         return Ok(projected_run(&result));
     }
     let PreparedInput {
@@ -643,7 +709,9 @@ fn start_run<R: Runtime>(
     if entry.trim().is_empty() {
         return Err(failure("Write or select an idea to try."));
     }
-    let command = if workspace_chat.is_some() {
+    let command = if literal {
+        NeuralCommand::Prompt(bounded(entry.clone())?)
+    } else if workspace_chat.is_some() {
         NeuralCommand::Prompt(
             presentation
                 .as_ref()
@@ -664,13 +732,17 @@ fn start_run<R: Runtime>(
             names = workspace_chat_reference_names(text, context_references.as_deref())?;
         }
         NeuralCommand::Prompt(text) => {
-            names = prompt_reference_names(
-                text,
-                context_references.as_deref(),
-                presentation
-                    .as_ref()
-                    .map(|presentation| presentation.input.as_str()),
-            )?;
+            names = if literal {
+                BTreeSet::new()
+            } else {
+                prompt_reference_names(
+                    text,
+                    context_references.as_deref(),
+                    presentation
+                        .as_ref()
+                        .map(|presentation| presentation.input.as_str()),
+                )?
+            };
             calls = 1;
         }
         NeuralCommand::Expression(expression) => {
@@ -690,7 +762,10 @@ fn start_run<R: Runtime>(
             "An experiment can contain at most eight model calls.",
         ));
     }
-    let model = if calls == 0 {
+    // A pure reference or literal is a local derivation even when the model
+    // picker names a friend. It carries no remote-execution claim.
+    let remote_target = remote_target.filter(|_| calls != 0);
+    let model = if calls == 0 || remote_target.is_some() {
         None
     } else {
         Some(loaded_model(state)?)
@@ -849,13 +924,13 @@ fn start_run<R: Runtime>(
             }
         }
     }
-    let media = if let Some(model) = &model {
+    let media = if !literal && (model.is_some() || remote_target.is_some()) {
         let media = if scope == RunScope::Document {
             crate::terminal_media::resolve(
                 read_context.documents,
                 &source,
                 &sources,
-                resident_context_tokens(model),
+                model.as_ref().map_or(2048, resident_context_tokens),
             )?
         } else if uses_capture {
             capture_media
@@ -873,7 +948,12 @@ fn start_run<R: Runtime>(
                     .map(|(_, value)| value),
             )?,
         )?;
-        validate_media_against_resident_model(&media, &model.descriptor)?;
+        if let Some(model) = &model {
+            validate_media_against_resident_model(&media, &model.descriptor)?;
+        }
+        if let Some(target) = &remote_target {
+            crate::peer_media::encode(&media, &target.grant.model)?;
+        }
         media
     } else {
         // A reference-only expression still retains the mounted document's
@@ -905,6 +985,8 @@ fn start_run<R: Runtime>(
     let receipt = RunReceipt {
         scope,
         workspace_configuration,
+        remote: remote_target.clone(),
+        literal_input: literal,
         run: TerminalRun {
             run_id: command_id.to_string(),
             status: "running".into(),
@@ -918,6 +1000,7 @@ fn start_run<R: Runtime>(
             preview: String::new(),
             error: None,
             created_at_ms: now_unix_ms(),
+            remote: remote_target.as_ref().map(remote::PeerModel::from),
             events: Vec::new(),
         },
         request_fingerprint: fingerprint,
@@ -945,13 +1028,87 @@ fn start_run<R: Runtime>(
         session_id: parse_command_id(&session_id)?,
         document_id,
     };
+    let response = spawn_worker(
+        app.clone(),
+        state,
+        RunWork {
+            root,
+            identity,
+            owner_project_id,
+            owner_session_id,
+            receipt,
+            input,
+            command,
+            source: Some(source),
+            model,
+            media,
+            recovery: RecoveryMode::Resume,
+        },
+        &admission,
+        session,
+        workspace_chat,
+        may_have_started,
+    );
+    drop(model_guard);
+    response
+}
+
+struct RunWork {
+    owner_project_id: ProjectId,
+    owner_session_id: CommandId,
+    root: PathBuf,
+    identity: GenerationFamilyIdentity,
+    receipt: RunReceipt,
+    input: String,
+    command: NeuralCommand,
+    source: Option<LoadedDocument>,
+    model: Option<LoadedModel>,
+    media: Vec<llama_native_types::MediaInput>,
+    recovery: RecoveryMode,
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_worker<R: Runtime>(
+    app: AppHandle<R>,
+    state: &PluginState,
+    work: RunWork,
+    admission: &std::sync::MutexGuard<'_, ApplicationPhase>,
+    session: std::sync::MutexGuard<'_, Session>,
+    workspace_chat: Option<crate::WorkspaceChatService<R>>,
+    may_have_started: &mut bool,
+) -> Result<TerminalRun, IpcFailure> {
+    let RunWork {
+        owner_project_id,
+        owner_session_id,
+        root,
+        identity,
+        receipt,
+        input,
+        command,
+        source,
+        model,
+        media,
+        recovery,
+    } = work;
     let run_id = GenerationRunId::new();
     let branch_id = BranchId::new();
-    let control = Arc::new(TerminalControl::default());
-    state
-        .generations
-        .reserve(identity.clone(), vec![(run_id, branch_id)])
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    let control = Arc::new(TerminalControl {
+        remote_cancel: receipt
+            .remote
+            .as_ref()
+            .map(|_| (root.clone(), receipt.run.run_id.clone())),
+        ..TerminalControl::default()
+    });
+    let reserved = if receipt.remote.is_some() {
+        state
+            .generations
+            .reserve_remote(identity.clone(), vec![(run_id, branch_id)])
+    } else {
+        state
+            .generations
+            .reserve(identity.clone(), vec![(run_id, branch_id)])
+    };
+    reserved.map_err(|error| IpcFailure::generation_registry(&error))?;
     if let Err(error) = state
         .generations
         .attach_cancellation(&identity.request_id, control.clone())
@@ -988,10 +1145,12 @@ fn start_run<R: Runtime>(
         let _ = state.generations.complete_family(&identity.request_id);
         return Err(error);
     }
+    // Keep the source/session admission through route publication: project
+    // close must see this owner before it revokes and drains the session.
     drop(session);
     let reservation = match state
         .generation_workers
-        .reserve(&identity.request_id, &admission)
+        .reserve(&identity.request_id, admission)
     {
         Ok(value) => value,
         Err(error) => {
@@ -1003,7 +1162,7 @@ fn start_run<R: Runtime>(
     let start = Arc::new(GenerationWorkerStartGate::default());
     let worker_start = Arc::clone(&start);
     let worker_control = Arc::clone(&control);
-    let worker_app = app.clone();
+    let worker_app = app;
     let worker_identity = identity.clone();
     let response = projected_run(&receipt);
     let worker = std::thread::Builder::new()
@@ -1012,13 +1171,15 @@ fn start_run<R: Runtime>(
             worker_start.wait();
             let state = worker_app.state::<PluginState>();
             let mut evaluator = Evaluator {
-                state: &state,
+                state: state.clone(),
                 identity: &worker_identity,
                 owner_project_id,
                 owner_session_id,
                 model: model.as_ref(),
                 control: &worker_control,
-                source: &source,
+                source: source.as_ref(),
+                root: &root,
+                recovery,
                 input,
                 receipt,
                 media,
@@ -1053,6 +1214,7 @@ fn start_run<R: Runtime>(
                     _ => GenerationTerminalClass::Failed,
                 }
             };
+            worker_control.settled.store(true, Ordering::Release);
             if let Err(error) = saved {
                 let _ = state
                     .generations
@@ -1088,18 +1250,19 @@ fn start_run<R: Runtime>(
     }
     start.release();
     ticket.detach();
-    drop(model_guard);
     Ok(response)
 }
 
 struct Evaluator<'a> {
-    state: &'a PluginState,
+    state: State<'a, PluginState>,
     identity: &'a GenerationFamilyIdentity,
     owner_project_id: ProjectId,
     owner_session_id: CommandId,
     model: Option<&'a LoadedModel>,
     control: &'a TerminalControl,
-    source: &'a LoadedDocument,
+    source: Option<&'a LoadedDocument>,
+    root: &'a Path,
+    recovery: RecoveryMode,
     input: String,
     receipt: RunReceipt,
     media: Vec<llama_native_types::MediaInput>,
@@ -1112,7 +1275,7 @@ impl Evaluator<'_> {
         &self,
         operation: impl FnOnce(material_context::ReadContext<'_>) -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
-        let mut session = lock_session_internal(self.state)?;
+        let mut session = lock_session_internal(&self.state)?;
         let context = match self.receipt.scope {
             RunScope::Document => crate::workspace_owner::read_context(
                 &session,
@@ -1136,7 +1299,7 @@ impl Evaluator<'_> {
         &self,
         operation: impl FnOnce(&mut ProjectStore) -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
-        let mut session = lock_session_internal(self.state)?;
+        let mut session = lock_session_internal(&self.state)?;
         operation(self.receipt.scope.store(
             &mut session,
             &self.identity.project_id.to_string(),
@@ -1145,6 +1308,9 @@ impl Evaluator<'_> {
     }
 
     fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<Value, IpcFailure> {
+        if self.receipt.remote.is_some() && self.remote_cancel_requested()? {
+            return self.settle_remote_cancellation().map(Value::Text);
+        }
         match command {
             NeuralCommand::Prompt(text) => {
                 let mut prefix = String::new();
@@ -1167,7 +1333,7 @@ impl Evaluator<'_> {
     }
 
     fn evaluate(&mut self, expression: &NeuralExpression) -> Result<Value, IpcFailure> {
-        if self.control.cancelled.load(Ordering::Acquire) {
+        if self.receipt.remote.is_none() && self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
         match expression {
@@ -1182,11 +1348,7 @@ impl Evaluator<'_> {
             NeuralExpression::Find { source, query } => {
                 let source = self.evaluate(source)?;
                 let query = material_context::exact(&self.evaluate(query)?)?;
-                let value = self.with_read_context(|context| {
-                    context.search_with_cancel(&source, &query, &self.folder_scan_budget, &|| {
-                        self.control.cancelled.load(Ordering::Acquire)
-                    })
-                })?;
+                let (value, _) = self.lookup_context(&source, &query, None)?;
                 self.record_evidence(&value)?;
                 Ok(value)
             }
@@ -1321,15 +1483,21 @@ impl Evaluator<'_> {
         query: &str,
         base_bytes: usize,
     ) -> Result<(), IpcFailure> {
-        let model = self
-            .model
-            .ok_or_else(|| failure("Choose a local model before trying this idea."))?;
         let label = format!("# {name:?}\n\n");
         let used = base_bytes
             .saturating_add(prefix.len())
             .saturating_add(label.len())
             .saturating_add(2);
-        let budget = remaining_context_bytes(resident_context_tokens(model), used);
+        let budget = if self.receipt.remote.is_some() {
+            // The peer enforces its actual resident model's context. This
+            // requester retains the existing bounded exact-prompt contract.
+            MAX_PROMPT_BYTES.saturating_sub(used)
+        } else {
+            let model = self
+                .model
+                .ok_or_else(|| failure("Choose a local model before trying this idea."))?;
+            remaining_context_bytes(resident_context_tokens(model), used)
+        };
         let consulted = self.consult(value, query, budget)?;
         prefix.push_str(&label);
         prefix.push_str(&material_context::exact(&consulted)?);
@@ -1338,43 +1506,96 @@ impl Evaluator<'_> {
     }
 
     fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
-        let (consulted, omitted) = self.with_read_context(|context| {
-            // A captured document is exact admitted data. Reading its frozen
-            // text neither requires nor renews access to its former root.
-            if self.receipt.scope == RunScope::Workspace
-                && let Value::Scoped { origin, value } = value
-                && matches!(
-                    value.as_ref(),
-                    Value::Documents { .. } | Value::Evidence { .. }
-                )
-            {
-                let (result, omitted) = material_context::consult_with_budget_and_cancel(
-                    context.documents,
-                    value,
-                    query,
-                    budget,
-                    &self.folder_scan_budget,
-                    &|| self.control.cancelled.load(Ordering::Acquire),
-                )?;
-                return Ok((
-                    Value::Scoped {
-                        origin: origin.clone(),
-                        value: Box::new(result),
-                    },
-                    omitted,
-                ));
-            }
-            context.consult_with_budget_and_cancel(
-                value,
-                query,
-                budget,
-                &self.folder_scan_budget,
-                &|| self.control.cancelled.load(Ordering::Acquire),
-            )
-        })?;
+        let (consulted, omitted) = self.lookup_context(value, query, Some(budget))?;
         self.receipt.omitted_evidence.extend(omitted);
         self.record_evidence(&consulted)?;
         Ok(consulted)
+    }
+
+    fn lookup_context(
+        &self,
+        value: &Value,
+        query: &str,
+        budget: Option<usize>,
+    ) -> Result<(Value, Vec<String>), IpcFailure> {
+        let resolve = || {
+            match budget {
+                Some(budget) => self.with_read_context(|context| {
+                    // A captured document is exact admitted data. Reading its frozen
+                    // text neither requires nor renews access to its former root.
+                    if self.receipt.scope == RunScope::Workspace
+                        && let Value::Scoped { origin, value } = value
+                        && matches!(
+                            value.as_ref(),
+                            Value::Documents { .. } | Value::Evidence { .. }
+                        )
+                    {
+                        let (result, omitted) = material_context::consult_with_budget_and_cancel(
+                            context.documents,
+                            value,
+                            query,
+                            budget,
+                            &self.folder_scan_budget,
+                            &|| self.control.cancelled.load(Ordering::Acquire),
+                        )?;
+                        return Ok((
+                            Value::Scoped {
+                                origin: origin.clone(),
+                                value: Box::new(result),
+                            },
+                            omitted,
+                        ));
+                    }
+                    context.consult_with_budget_and_cancel(
+                        value,
+                        query,
+                        budget,
+                        &self.folder_scan_budget,
+                        &|| self.control.cancelled.load(Ordering::Acquire),
+                    )
+                }),
+                None => self
+                    .with_read_context(|context| {
+                        context.search_with_cancel(value, query, &self.folder_scan_budget, &|| {
+                            self.control.cancelled.load(Ordering::Acquire)
+                        })
+                    })
+                    .map(|value| (value, Vec::new())),
+            }
+        };
+        if self.receipt.remote.is_none() {
+            return resolve();
+        }
+        let input =
+            BlobId::digest(&serde_json::to_vec(&(value, query, budget)).map_err(io_failure)?);
+        let run = &self.receipt.run.run_id;
+        if let Some(bytes) = crate::terminal_receipts::read_context(self.root, run, input)? {
+            let saved: ContextLookup = serde_json::from_slice(&bytes).map_err(io_failure)?;
+            if saved.input != input {
+                return Err(failure("Saved source lookup belongs to different input."));
+            }
+            return Ok((saved.value, saved.omitted));
+        }
+        if self.recovery == RecoveryMode::Check {
+            return Err(IpcFailure::new(
+                "terminal_remote_unconfirmed",
+                "Saved sources are checked. Resume to continue this experiment.",
+                true,
+            ));
+        }
+        let (value, omitted) = resolve()?;
+        let saved = ContextLookup {
+            input,
+            value,
+            omitted,
+        };
+        crate::terminal_receipts::write_context(
+            self.root,
+            run,
+            input,
+            &serde_json::to_vec(&saved).map_err(io_failure)?,
+        )?;
+        Ok((saved.value, saved.omitted))
     }
 
     fn binding(&self, name: &str) -> Result<Value, IpcFailure> {
@@ -1387,6 +1608,12 @@ impl Evaluator<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn complete(&mut self, prompt: String, mode: PromptMode) -> Result<String, IpcFailure> {
+        if self.receipt.remote.is_some() {
+            return self.complete_remote(prompt, mode);
+        }
+        let source = self
+            .source
+            .ok_or_else(|| failure("The local source is unavailable."))?;
         if self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
@@ -1404,7 +1631,7 @@ impl Evaluator<'_> {
             let environment_artifact = store
                 .record_model_environment(&environment)
                 .map_err(IpcFailure::store)?;
-            let mut inputs = vec![self.source.artifact_id];
+            let mut inputs = vec![source.artifact_id];
             let evidence_values = self
                 .receipt
                 .source_uses
@@ -1456,7 +1683,7 @@ impl Evaluator<'_> {
                 .map_err(IpcFailure::store)?;
             let context = store
                 .record_context_recipe(&ContextRecipe {
-                    source_revision_id: self.source.revision_id,
+                    source_revision_id: source.revision_id,
                     ordered_source_artifact_ids: inputs,
                     token_budget: u64::from(model.profile.context_tokens),
                     retrieval_evidence_blob_id: Some(context_evidence),
@@ -1477,8 +1704,8 @@ impl Evaluator<'_> {
             let generation = GenerationStart {
                 run_id: GenerationRunId::new(),
                 branch_id: BranchId::new(),
-                document_id: self.source.document_id,
-                source_revision_id: self.source.revision_id,
+                document_id: source.document_id,
+                source_revision_id: source.revision_id,
                 target_range: ByteRange::new(0, 0).expect("empty range"),
                 model_environment_artifact_id: environment_artifact.artifact_id,
                 prompt_recipe_artifact_id: prompt_artifact.artifact_id,
@@ -1594,7 +1821,29 @@ impl Evaluator<'_> {
             title.trim()
         };
         let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, slot);
-        let id = self.with_store(|store| {
+        let (id, path) = self.with_store(|store| {
+            if self.receipt.remote.is_some() {
+                // Step zero belongs to a final retained expression, distinct
+                // from every model job (numbered from one).
+                let output_step = if slot == "result" { 0 } else { self.step };
+                let saved = store
+                    .create_derived_document_idempotent(
+                        remote::output_id(&self.receipt.run.run_id, output_step),
+                        &path,
+                        DocumentContent::Prose(text.to_owned()),
+                        evidence,
+                    )
+                    .map_err(IpcFailure::store)?;
+                if saved.visible_projection != loom_store::VisibleProjectionState::Applied {
+                    return Err(failure(
+                        "The retained result needs file recovery before continuing.",
+                    ));
+                }
+                let document = store
+                    .document_for_revision(saved.save.revision_id)
+                    .map_err(IpcFailure::store)?;
+                return Ok((document.document_id, document.relative_path));
+            }
             if generated {
                 store
                     .create_generated_document_if_absent(
@@ -1614,10 +1863,13 @@ impl Evaluator<'_> {
                     )
                     .map_err(IpcFailure::store)?;
             }
-            Ok(store
-                .read_document(&path)
-                .map_err(IpcFailure::store)?
-                .document_id)
+            Ok((
+                store
+                    .read_document(&path)
+                    .map_err(IpcFailure::store)?
+                    .document_id,
+                path.clone(),
+            ))
         })?;
         self.receipt.run.output_document_id = Some(id.to_string());
         self.receipt.run.output_relative_path = Some(path);
@@ -1688,6 +1940,31 @@ impl Evaluator<'_> {
     fn finish(&mut self, outcome: Result<Value, IpcFailure>) -> Result<(), IpcFailure> {
         let outcome =
             outcome.and_then(|value| material_context::exact(&value).map(|text| (value, text)));
+        if self.receipt.remote.is_some() {
+            if let Some(error) = self
+                .control
+                .cancel_error
+                .lock()
+                .map_err(io_failure)?
+                .as_ref()
+            {
+                return Err(failure(error));
+            }
+            if let Err(error) = &outcome
+                && error.code != "terminal_remote_failed"
+                && error.code != "terminal_remote_cancelled"
+            {
+                // Keep the immutable start and exact per-step jobs recoverable.
+                // Neither an IPC timeout nor a lost process proves a peer outcome.
+                self.receipt.run.status = "unconfirmed".into();
+                self.receipt.run.error = Some(error.message.clone());
+                return crate::terminal_receipts::save_observation(
+                    self.root,
+                    &self.receipt.run.run_id,
+                    &error.message,
+                );
+            }
+        }
         match outcome {
             Ok((value, text)) => {
                 self.record_evidence(&value)?;
@@ -1705,7 +1982,10 @@ impl Evaluator<'_> {
                 self.receipt.run.status = "completed".into();
             }
             Err(error) => {
-                self.receipt.run.status = if self.control.cancelled.load(Ordering::Acquire) {
+                self.receipt.run.status = if error.code == "terminal_remote_cancelled"
+                    || (self.receipt.remote.is_none()
+                        && self.control.cancelled.load(Ordering::Acquire))
+                {
                     "cancelled"
                 } else {
                     "failed"
@@ -1773,7 +2053,7 @@ fn list_runs(
         } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)?
             && visible_history(&receipt, scope)
         {
-            settle_interrupted(&mut receipt.run, receipt.scope, state)?;
+            settle_interrupted(store.root(), &mut receipt.run, receipt.scope, state)?;
             runs.push(projected_run(&receipt));
         }
         if runs.len() == MAX_HISTORY {
@@ -1795,12 +2075,13 @@ pub(super) async fn terminal_cancel(
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
     cancel_run(
-        &state,
+        state.clone(),
         &project_id,
         &session_id,
         &run_id,
         RunScope::Document,
     )
+    .await
 }
 
 #[tauri::command]
@@ -1811,16 +2092,17 @@ pub(super) async fn workspace_pane_cancel(
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
     cancel_run(
-        &state,
+        state.clone(),
         &project_id,
         &session_id,
         &run_id,
         RunScope::Workspace,
     )
+    .await
 }
 
-fn cancel_run(
-    state: &PluginState,
+async fn cancel_run(
+    state: State<'_, PluginState>,
     project_id: &str,
     session_id: &str,
     run_id: &str,
@@ -1850,17 +2132,26 @@ fn cancel_run(
         }
         return Ok(());
     }
-    // Preserve inactive receipt validation and the admission race: a family
-    // may become live while we wait for an in-progress admission's store lock.
-    let mut session = lock_session(state)?;
-    let store = scope.store(&mut session, project_id, session_id)?;
-    let receipt = read_receipt(store.root(), run_id, false)?
-        .filter(|receipt| receipt.scope == scope)
-        .ok_or_else(|| failure("This experiment does not exist in the requested scope."))?;
+    // Preserve scope validation and the admission race, then release the store
+    // lock before consulting saved jobs on the peer.
+    let (receipt, project) = {
+        let mut session = lock_session(&state)?;
+        let store = scope.store(&mut session, project_id, session_id)?;
+        let receipt = read_receipt(store.root(), run_id, false)?
+            .filter(|receipt| receipt.scope == scope)
+            .ok_or_else(|| failure("This experiment does not exist in the requested scope."))?;
+        if read_receipt(store.root(), run_id, true)?.is_some() {
+            return Ok(());
+        }
+        if receipt.remote.is_some() {
+            crate::terminal_receipts::request_cancel(store.root(), run_id)?;
+        }
+        (receipt, store.manifest().project_id)
+    };
     if let Some(route) = state
         .generations
         .active_routes_for_document(
-            store.manifest().project_id,
+            project,
             parse_command_id(session_id)?,
             receipt.source_document_id,
         )
@@ -1876,6 +2167,8 @@ fn cancel_run(
                 route.run_id,
             )
             .map_err(|error| IpcFailure::generation_registry(&error))?;
+    } else if receipt.remote.is_some() {
+        remote::cancel_saved_jobs(project_id, session_id, &receipt, state).await?;
     }
     Ok(())
 }

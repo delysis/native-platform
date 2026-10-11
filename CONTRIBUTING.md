@@ -10,7 +10,7 @@ cancellation through the actual adapter, store or worker; do not weaken tests.
 
 Run from a complete native-platform checkout, not a selective source archive.
 Required locally: Git with the history used by the documentation policy; Rust
-1.92.0 with rustfmt and Clippy; Node 22 with npm/npx; pnpm 11.16.0; CMake; and
+1.95.0 with rustfmt and Clippy; Node 22 with npm/npx; pnpm 11.16.0; CMake; and
 macOS developer tools providing `xcrun`, Swift, Clang and an SDK. Install missing
 prerequisites deliberately, outside the gate. The runner installs no toolchain,
 global package manager, browser or system package.
@@ -19,7 +19,7 @@ Pin **actual binaries**, not just rustup's override: Homebrew Cargo may precede
 rustup on PATH. In the coordinator's shell, from the repository root:
 
 ```sh
-export RUSTUP_TOOLCHAIN=1.92.0
+export RUSTUP_TOOLCHAIN=1.95.0
 export CARGO="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" cargo)"
 export RUSTC="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)"
 export RUSTDOC="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustdoc)"

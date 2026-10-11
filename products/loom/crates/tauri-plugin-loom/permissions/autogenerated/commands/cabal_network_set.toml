@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-network-set"
+description = "Enables the cabal_network_set command without any pre-configured scope."
+commands.allow = ["cabal_network_set"]
+
+[[permission]]
+identifier = "deny-cabal-network-set"
+description = "Denies the cabal_network_set command without any pre-configured scope."
+commands.deny = ["cabal_network_set"]

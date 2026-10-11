@@ -649,6 +649,51 @@ fn save_binding_at_path(
     write_bindings(store, &bindings)?;
     Ok(binding)
 }
+/// A link in a document cannot turn a shared hash into a private material grant.
+pub(crate) fn bind_document_attachment(
+    store: &mut ProjectStore,
+    document_id: &str,
+    attachment_id: &str,
+    name: Option<&str>,
+    retention: MaterialRetention,
+) -> Result<MaterialEntry> {
+    let id = document_id
+        .parse::<loom_types::DocumentId>()
+        .map_err(|_| MaterialError::Invalid("Invalid source document.".into()))?;
+    let registered = store
+        .registered_document(id)
+        .map_err(|error| MaterialError::Invalid(error.to_string()))?
+        .ok_or_else(|| MaterialError::NotFound(document_id.into()))?;
+    let document = store
+        .read_document(&registered.relative_path)
+        .map_err(|error| MaterialError::Invalid(error.to_string()))?;
+    if context_attachments::shared::inline_root(store.root(), document_id)? != store.root() {
+        return Err(MaterialError::Invalid(
+            "Shared attachments remain in their cabal namespace.".into(),
+        ));
+    }
+    context_attachments::shared::original_for_document(
+        store.root(),
+        document_id,
+        &document.text,
+        attachment_id,
+    )?;
+    bind_attachment_with_retention(store, attachment_id, name, retention)
+}
+
+pub(crate) fn original_for_export(store: &ProjectStore, id: &str) -> Result<(String, Vec<u8>)> {
+    if !is_material_id(id) {
+        return Err(MaterialError::Invalid(
+            "Use an exact retained material identity.".into(),
+        ));
+    }
+    let material = resolve(store, id)?;
+    let attachment = material.attachment_id.ok_or_else(|| {
+        MaterialError::Invalid("This material has no retained original file.".into())
+    })?;
+    context_attachments::original_for_export(store.root(), &attachment).map_err(Into::into)
+}
+
 pub(crate) fn bind_attachment(
     store: &mut ProjectStore,
     attachment_id: &str,
@@ -1742,6 +1787,85 @@ mod tests {
             .unwrap()
             .is_file()
         );
+    }
+
+    #[test]
+    fn document_links_cannot_bind_private_originals_from_a_shared_namespace() {
+        let (_temp, mut store) = project();
+        let path = store.root().join("private.txt");
+        fs::write(&path, "Private retained original.").unwrap();
+        let attachment = context_attachments::import_path(store.root(), &path).unwrap();
+        for (name, text) in [
+            ("Shared.md", attachment.inline_markdown.clone()),
+            ("Private.md", attachment.inline_markdown.clone()),
+            ("Unrelated.md", "No attachment selected.".into()),
+        ] {
+            store
+                .create_document_if_absent(
+                    name,
+                    loom_document::DocumentContent::Prose(text),
+                    "attachment authority fixture",
+                )
+                .unwrap();
+        }
+        let shared = store
+            .read_document("Shared.md")
+            .unwrap()
+            .document_id
+            .to_string();
+        let private = store
+            .read_document("Private.md")
+            .unwrap()
+            .document_id
+            .to_string();
+        let unrelated = store
+            .read_document("Unrelated.md")
+            .unwrap()
+            .document_id
+            .to_string();
+        context_attachments::shared::configure(
+            store.root(),
+            uuid::Uuid::new_v4(),
+            [private.clone(), unrelated.clone()].into_iter().collect(),
+            [shared.clone()].into_iter().collect(),
+        )
+        .unwrap();
+        assert!(
+            bind_document_attachment(
+                &mut store,
+                &shared,
+                &attachment.id,
+                None,
+                MaterialRetention::Ordinary
+            )
+            .is_err()
+        );
+        assert!(
+            bind_document_attachment(
+                &mut store,
+                &unrelated,
+                &attachment.id,
+                None,
+                MaterialRetention::Ordinary
+            )
+            .is_err()
+        );
+        assert!(list(&store).unwrap().is_empty());
+        let material = bind_document_attachment(
+            &mut store,
+            &private,
+            &attachment.id,
+            None,
+            MaterialRetention::Ordinary,
+        )
+        .unwrap();
+        assert_eq!(
+            original_for_export(&store, &material.id).unwrap().1,
+            b"Private retained original."
+        );
+        assert!(original_for_export(&store, &attachment.id).is_err());
+        remove(&mut store, &material.id).unwrap();
+        assert!(original_for_export(&store, &material.id).is_err());
     }
     #[test]
     fn sqlite_search_preserves_source_and_retains_evidence_after_source_change() {

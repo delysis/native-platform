@@ -268,19 +268,21 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('withdraws stale selection evidence until typed document state settles', async () => {
-    const changes: { witness: VisualSelectionAccessibilityWitness; markdown: string }[] = [];
-    render('Something', [], { onSelectionWitness: (witness, markdown) => changes.push({ witness, markdown }) });
+    const transitions: { witness: VisualSelectionAccessibilityWitness; markdown: string }[] = [];
+    render('Something', [], { onSelectionWitness: (witness, markdown) => transitions.push({ witness, markdown }) });
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     const witness = () => JSON.parse(
       page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
     );
     await editor.click();
-    changes.length = 0;
-    await userEvent.keyboard('{Meta>}a{/Meta}Replacement');
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await expect.poll(witness).toMatchObject({ available: true, allVisibleText: true });
+    transitions.length = 0;
+    await userEvent.keyboard('Replacement');
 
-    // Keyboard automation can finish after projection has settled. Observe the
-    // actual callback boundary instead of racing the editor's debounce timer.
-    expect(changes.some(({ witness, markdown }) => !witness.available && markdown !== 'Replacement')).toBe(true);
+    // WebKit may finish the projection before the keyboard promise resolves.
+    // Observe the actual callback order instead of racing the debounce timer.
+    expect(transitions[0]?.witness.available).toBe(false);
     await expect.poll(serializedMarkdown).toBe('Replacement');
     await expect.poll(witness).toMatchObject({
       available: true,
@@ -290,6 +292,13 @@ describe('real WebKit editor interactions', () => {
       caretByteOffset: 'Replacement'.length
     });
     expect(witness().epoch).toBeGreaterThan(0);
+    const renewed = transitions.filter(({ witness }) => witness.available);
+    expect(renewed.length).toBeGreaterThan(0);
+    for (const { witness, markdown } of renewed) {
+      expect(witness.caretAtEnd).toBe(true);
+      expect(witness.caretByteOffset).toBe(markdown.length);
+    }
+    expect(renewed.at(-1)?.markdown).toBe('Replacement');
   });
 
   it('wires every Aa formatting family to exact Markdown', async () => {

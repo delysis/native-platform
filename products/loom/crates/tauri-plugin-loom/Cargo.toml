@@ -21,7 +21,6 @@ fte-router = { path = "../../../fte/crates/fte-router" }
 fte-providers = { path = "../../../fte/crates/fte-providers" }
 fte-store = { path = "../../../fte/crates/fte-store" }
 url = "2.5.8"
-tokio-util = "0.7.18"
 information-native-acquire.workspace = true
 information-native-backend-sqlite.workspace = true
 information-native-retrieval.workspace = true
@@ -43,6 +42,11 @@ loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
 loom-preferences = { path = "../loom-preferences" }
+loom-cabal = { path = "../loom-cabal" }
+loom-signal-protocol = { path = "../loom-signal-protocol" }
+fs2.workspace = true
+uuid.workspace = true
+tokio-util.workspace = true
 llama-native-types.workspace = true
 notify.workspace = true
 naga = { version = "29.0.3", default-features = false, features = ["wgsl-in", "glsl-out"] }
