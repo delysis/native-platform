@@ -3,14 +3,14 @@
 <!-- current-service-surface: information -->
 <!-- retired-edge-parent: 5390edfcfb6b8412ae45f1e51d44644be3f7e8e3 -->
 
-Applications depend on the host or leaf crates they actually need. Until an
-authorized remote exists, sibling native applications should use explicit
-workspace-relative paths; a future Git dependency must pin an exact revision.
-The native kit does not depend on Loom, a model runtime, or a Tauri app.
+Applications depend on the host or leaf crates they actually need in the
+canonical `delysis/native-platform` workspace. The former standalone repository
+is frozen provenance. The native kit does not depend on Loom, a model runtime,
+or a Tauri app. Workspace members use the root dependency declaration:
 
 ```toml
 [dependencies]
-information-native-host = { path = "../information-native-kit/crates/information-native-host" }
+information-native-host.workspace = true
 ```
 
 ## Retrieval-to-model boundary

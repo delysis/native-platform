@@ -25,14 +25,21 @@ typed failures over abstraction layers that conceal ownership or authority.
 - Backends own their runtime objects and join or stop workers on shutdown.
 - Do not merge text-generation and speech request models merely because fields
   such as request IDs or deadlines look similar.
-- The Tauri plugin default permission remains status-only. High-authority
-  operations require explicit permission sets.
+- Products own explicitly granted Speech IPC operations. There is no generic
+  Speech Tauri plugin in the current workspace; historical permissions do not
+  authorize a current product edge.
 
 ## Required verification
 
+Use the root [CONTRIBUTING.md](../../../CONTRIBUTING.md) tool pins and evidence rules.
+From the repository root, run the affected group:
+
 ```sh
-cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-boundaries.sh
+node scripts/ci/cargo-group.mjs test service-speech
+node scripts/ci/cargo-group.mjs clippy service-speech
+bash crates/services/speech/scripts/check-boundaries.sh
 ```
+
+Also check affected reverse-consumer groups; this command selects only the named
+group. The root clean-tree component gate and separate platform, fuzz, real-model
+and packaged acceptance obligations remain in force.

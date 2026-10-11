@@ -1060,9 +1060,10 @@ impl ProjectStore {
     #[allow(clippy::too_many_lines)]
     /// Records an old one-run/one-candidate result as diagnostic evidence.
     ///
-    /// The returned candidate is never a strict research admission and cannot
-    /// be promoted. New inference paths must use the assembly-first research
-    /// admission APIs.
+    /// The returned evidence does not confer strict research admission.
+    /// User-selected output can be applied through the explicit product lane,
+    /// `accept_diagnostic_candidate_with_command`. Strict research inference
+    /// must use the assembly-first research admission APIs.
     pub fn finish_unverified_generation_candidate_for_diagnostics(
         &mut self,
         run_id: GenerationRunId,

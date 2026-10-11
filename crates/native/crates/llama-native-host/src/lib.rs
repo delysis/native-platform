@@ -296,6 +296,7 @@ struct ResidentModelKey {
     context_tokens: u32,
     batch_tokens: u32,
     max_sequences: u32,
+    kv_unified: bool,
     gpu_layers: i32,
 }
 
@@ -309,6 +310,7 @@ impl From<&NativeModelConfig> for ResidentModelKey {
             context_tokens: config.context_tokens,
             batch_tokens: config.batch_tokens,
             max_sequences: config.max_sequences,
+            kv_unified: config.kv_unified,
             gpu_layers: config.gpu_layers,
         }
     }
@@ -325,6 +327,7 @@ impl std::fmt::Debug for ResidentModelKey {
             .field("context_tokens", &self.context_tokens)
             .field("batch_tokens", &self.batch_tokens)
             .field("max_sequences", &self.max_sequences)
+            .field("kv_unified", &self.kv_unified)
             .field("gpu_layers", &self.gpu_layers)
             .finish()
     }
@@ -1839,6 +1842,38 @@ mod tests {
         let state = host.state.lock().expect("unpoisoned host state");
         assert_eq!(state.phase, HostPhase::Stopped);
         assert!(state.slots.is_empty());
+    }
+
+    #[test]
+    fn resident_lookup_keeps_unified_and_independent_kv_workers_distinct() {
+        let fingerprint = resident_test_fingerprint(&"1".repeat(64));
+        let mut opposite_slots = Vec::new();
+        for unified in [false, true] {
+            let mut resident = resident_test_config(None);
+            resident.kv_unified = unified;
+            let resident_key = ResidentModelKey::from(&resident);
+            assert_eq!(
+                resolve_resident_slot(
+                    std::iter::once((3, &resident_key, &fingerprint)),
+                    &ResidentModelKey::from(&resident),
+                    &resident,
+                )
+                .expect("matching storage mode remains reusable"),
+                Some(3)
+            );
+
+            let mut opposite = resident;
+            opposite.kv_unified = !unified;
+            opposite_slots.push(
+                resolve_resident_slot(
+                    std::iter::once((3, &resident_key, &fingerprint)),
+                    &ResidentModelKey::from(&opposite),
+                    &opposite,
+                )
+                .expect("different storage modes are different residents"),
+            );
+        }
+        assert_eq!(opposite_slots, vec![None, None]);
     }
 
     #[test]

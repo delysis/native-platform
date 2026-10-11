@@ -190,3 +190,151 @@ fn code_projection_preserves_content_and_endings_without_container_prefixes() {
         }
     }
 }
+
+#[test]
+fn code_edits_can_merge_graphemes_and_keep_a_valid_caret_with_exact_undo() {
+    for (content, selection, inserted, expected) in [
+        ("\u{301}", Selection::caret(0), "a", "a\u{301}"),
+        ("🇸", Selection::caret(0), "🇺", "🇺🇸"),
+        (
+            "a\n\u{301}",
+            Selection {
+                anchor: 1,
+                focus: 2,
+            },
+            "",
+            "a\u{301}",
+        ),
+    ] {
+        let source = format!("```\n{content}\n```");
+        let mut document = EditorDocument::new(&source, Dialect::Loom).unwrap();
+        assert_eq!(document.projection().text(), content);
+        document.select_visual(selection, Bias::After).unwrap();
+        assert!(document.replace_visual(selection, inserted).unwrap());
+        assert_eq!(document.projection().text(), expected);
+        assert_eq!(
+            document.visual_selection().unwrap(),
+            Selection::caret(expected.len())
+        );
+        let changed = document.source().to_owned();
+        assert!(document.undo().unwrap());
+        assert_eq!(document.source(), source);
+        assert_eq!(document.visual_selection().unwrap(), selection);
+        assert!(document.redo().unwrap());
+        assert_eq!(document.source(), changed);
+        assert_eq!(
+            document.visual_selection().unwrap(),
+            Selection::caret(expected.len())
+        );
+    }
+}
+
+fn check_code_result_caret_after_prior_blocks(
+    content: &str,
+    relative: Selection,
+    inserted: &str,
+    expected: &str,
+) {
+    use loom_markdown::{BlockStyle, Error};
+
+    let original = format!("before\n\n```\n{content}\n```\n\nafter");
+    let mut document = EditorDocument::new(&original, Dialect::Loom)
+        .expect("offset fixture must be an admitted source document");
+    let code_range = document
+        .projection()
+        .blocks()
+        .iter()
+        .find(|block| matches!(&block.style, BlockStyle::Code(_)))
+        .expect("offset fixture must contain its literal code block")
+        .display
+        .clone();
+    assert!(code_range.start > 0);
+    assert_eq!(&document.projection().text()[code_range.clone()], content);
+    let prefix = document.projection().text()[..code_range.start].to_owned();
+    let suffix = document.projection().text()[code_range.end..].to_owned();
+    let selection = Selection {
+        anchor: code_range.start + relative.anchor,
+        focus: code_range.start + relative.focus,
+    };
+    document
+        .select_visual(selection, Bias::After)
+        .expect("pre-edit offset selection must be valid");
+    assert!(
+        document
+            .replace_visual(selection, inserted)
+            .expect("valid literal edit must accept the merged grapheme")
+    );
+    assert_eq!(
+        document.projection().text(),
+        format!("{prefix}{expected}{suffix}")
+    );
+    let caret = Selection::caret(code_range.start + expected.len());
+    assert_eq!(
+        document
+            .visual_selection()
+            .expect("accepted visual selection"),
+        caret
+    );
+    let changed = document.source().to_owned();
+
+    // A char boundary inside the merged cluster remains an invalid input.
+    let interior = expected
+        .char_indices()
+        .nth(1)
+        .expect("merged cluster must contain a second scalar")
+        .0;
+    assert!(matches!(
+        document.replace_visual(Selection::caret(code_range.start + interior), "x"),
+        Err(Error::InvalidRange)
+    ));
+    assert_eq!(document.source(), changed);
+    assert_eq!(
+        document
+            .visual_selection()
+            .expect("refusal preserves selection"),
+        caret
+    );
+    assert!(
+        document
+            .undo()
+            .expect("accepted code edit owns exact inverse bytes")
+    );
+    assert_eq!(document.source(), original);
+    assert_eq!(
+        document
+            .visual_selection()
+            .expect("undo restores selection"),
+        selection
+    );
+    assert!(document.redo().expect("code edit can be reapplied"));
+    assert_eq!(document.source(), changed);
+    assert_eq!(
+        document
+            .visual_selection()
+            .expect("redo restores result caret"),
+        caret
+    );
+}
+
+#[test]
+fn code_result_caret_after_prior_blocks_combining_insertion() {
+    check_code_result_caret_after_prior_blocks("\u{301}", Selection::caret(0), "a", "a\u{301}");
+}
+
+#[test]
+fn code_result_caret_after_prior_blocks_regional_indicator_pair() {
+    check_code_result_caret_after_prior_blocks("🇸", Selection::caret(0), "🇺", "🇺🇸");
+}
+
+#[test]
+fn code_result_caret_after_prior_blocks_newline_deletion() {
+    check_code_result_caret_after_prior_blocks(
+        "a\n\u{301}",
+        Selection {
+            anchor: 1,
+            focus: 2,
+        },
+        "",
+        "a\u{301}",
+    );
+}

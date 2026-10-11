@@ -280,9 +280,10 @@ validated `managed.documents.v1` value and is never applied to a canonical
 source database.
 
 On Unix, the store enforces owner-only directory and file modes for managed
-state. The portable path/symlink/identity checks still run on Windows, but this
-crate does not claim to audit or rewrite Windows DACLs; a Windows application
-must place the store in an app-private directory whose ACL it owns. Windows
-directory sync is currently a no-op, so rename recovery, registry publication,
-and journal publication there are best-effort across sudden power loss; the
-kit does not claim a power-loss-durable commit boundary on Windows.
+state. `ManagedStore::open` rejects non-Unix platforms before creating or
+opening store state because the required private-store boundary is not
+implemented there. Windows is therefore unsupported, not an app-ACL-dependent
+best-effort mode. Adding support requires an explicit private-storage and
+publication contract with corresponding gates; portable helper branches do
+not provide that qualification. Unix sync calls likewise do not substitute
+for platform-specific crash and power-loss testing.

@@ -169,6 +169,24 @@ pub struct OperationReservation {
     pub lease: OperationLease,
 }
 
+// Delivery and disposal are outside the execution catch. A single unwind there
+// must release the already-terminal attempt and wake the shutdown owner. This
+// guard records an exit, not a join, and never rewrites terminal history.
+// It cannot recover aborts, double panics, or poisoned attempt data.
+#[derive(Debug)]
+struct WorkerExitGuard<'a> {
+    supervisor: &'a OperationSupervisor,
+    lease: &'a OperationLease,
+    worker_id: &'a str,
+}
+
+impl Drop for WorkerExitGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.supervisor.release(self.lease);
+        self.supervisor.record_worker_exit(self.worker_id);
+    }
+}
+
 pub struct SupervisedTask<T> {
     result: tokio::sync::oneshot::Receiver<Result<T, String>>,
     worker_id: String,
@@ -653,11 +671,13 @@ impl OperationSupervisor {
         let join = thread::Builder::new()
             .name(worker_id.clone())
             .spawn(move || {
+                let _exit = WorkerExitGuard {
+                    supervisor: &thread_supervisor,
+                    lease: &thread_lease,
+                    worker_id: &thread_worker_id,
+                };
                 if start_rx.recv().is_err() {
-                    let _ = thread_supervisor
-                        .terminal(&thread_lease, TerminalClass::Failed)
-                        .and_then(|()| thread_supervisor.release(&thread_lease));
-                    thread_supervisor.record_worker_exit(&thread_worker_id);
+                    let _ = thread_supervisor.terminal(&thread_lease, TerminalClass::Failed);
                     return;
                 }
                 let result = catch_unwind(AssertUnwindSafe(|| operation(&thread_lease)));
@@ -687,8 +707,6 @@ impl OperationSupervisor {
                     barriers.1.wait();
                 }
                 let _ = result_tx.send(result);
-                let _ = thread_supervisor.release(&thread_lease);
-                thread_supervisor.record_worker_exit(&thread_worker_id);
             })
             .map_err(|_| {
                 let _ = self
@@ -795,15 +813,20 @@ impl OperationSupervisor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
-        let _ = join.join();
-        let mut state = self.lock_state();
-        if !state.worker_history.note_joined(&worker_id.to_owned()) {
-            return Err(SupervisorError::UnknownOperation);
+        let worker_result = join.join();
+        {
+            let mut state = self.lock_state();
+            if !state.worker_history.note_joined(&worker_id.to_owned()) {
+                return Err(SupervisorError::UnknownOperation);
+            }
+            let _ = joined.set(());
+            state.workers.remove(worker_id);
+            state.exited_worker_ids.remove(worker_id);
+            self.0.changed.notify_all();
         }
-        let _ = joined.set(());
-        state.workers.remove(worker_id);
-        state.exited_worker_ids.remove(worker_id);
-        self.0.changed.notify_all();
+        // The handle has really joined. Its arbitrary panic payload must not
+        // run Drop before that fact is published, or while holding our lock.
+        drop(worker_result);
         Ok(())
     }
 
@@ -1200,5 +1223,327 @@ mod publication_tests {
             supervisor.reap_worker(&worker).expect("join");
             assert!(supervisor.reserve("publication").is_ok());
         }
+    }
+}
+
+#[cfg(all(test, panic = "unwind"))]
+mod cleanup_regressions {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Discarded {
+        dropped: Arc<AtomicBool>,
+        panics: bool,
+    }
+
+    impl Drop for Discarded {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+            assert!(!self.panics, "controlled discarded-result Drop panic");
+        }
+    }
+
+    // Call only after reap_worker has consumed this fixture's known handle.
+    // Capture observations first: this cleanup must not manufacture a pass.
+    fn close_joined_fixture(
+        supervisor: &OperationSupervisor,
+        lease: &OperationLease,
+    ) -> SupervisorShutdownOutcome {
+        if supervisor
+            .snapshot(lease)
+            .expect("fixture retains exact attempt")
+            .phase
+            == OperationPhase::Terminal
+        {
+            supervisor
+                .release(lease)
+                .expect("release terminal attempt after its real join");
+        }
+        supervisor.shutdown()
+    }
+
+    #[test]
+    fn discarded_result_cleanup_preserves_cancelled_terminal() {
+        for panics in [false, true] {
+            let supervisor = OperationSupervisor::new();
+            let reservation = supervisor
+                .reserve("discard")
+                .expect("reserve discard fixture");
+            let lease = reservation.lease.clone();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let output_dropped = Arc::clone(&dropped);
+            let (return_tx, return_rx) = mpsc::channel();
+            let task = supervisor
+                .spawn(reservation, move |_| {
+                    return_rx
+                        .recv()
+                        .expect("fixture releases this worker's execution gate");
+                    Ok(Discarded {
+                        dropped: output_dropped,
+                        panics,
+                    })
+                })
+                .expect("spawn this fixture's owned worker");
+            let worker_id = task.worker_id.clone();
+            drop(task);
+            return_tx
+                .send(())
+                .expect("known worker still owns fixture receiver");
+            supervisor
+                .reap_worker(&worker_id)
+                .expect("join this fixture's known worker");
+            let observed = supervisor
+                .snapshot(&lease)
+                .expect("fixture retains exact attempt");
+            let active = supervisor.active_count();
+            let retained = supervisor.retained_task_count();
+            let closed = close_joined_fixture(&supervisor, &lease);
+            assert!(dropped.load(Ordering::Acquire));
+            assert_eq!(closed.phase, LifecyclePhase::Closed);
+            assert_eq!(closed.active_operations, 0);
+            assert_eq!(observed.phase, OperationPhase::Released, "panics={panics}");
+            assert_eq!(active, 0, "panics={panics}");
+            assert_eq!(retained, 0);
+            assert_eq!(
+                observed
+                    .authoritative_terminal
+                    .expect("executor published an authoritative terminal")
+                    .class,
+                TerminalClass::Cancelled
+            );
+            assert_eq!(observed.authoritative_terminal, observed.final_projection);
+        }
+    }
+
+    #[test]
+    fn loss_after_publication_keeps_completed_history_and_identity() {
+        let supervisor = OperationSupervisor::new();
+        let barriers = Arc::new((Barrier::new(2), Barrier::new(2)));
+        supervisor.lock_state().publication_barriers = Some(Arc::clone(&barriers));
+        let reservation = supervisor
+            .reserve("late-loss")
+            .expect("reserve late-loss fixture");
+        let lease = reservation.lease.clone();
+        let task = supervisor
+            .spawn(reservation, |_| {
+                Ok(Discarded {
+                    dropped: Arc::new(AtomicBool::new(false)),
+                    panics: true,
+                })
+            })
+            .expect("spawn this fixture's owned worker");
+        let worker_id = task.worker_id.clone();
+        barriers.0.wait();
+        let published = supervisor
+            .snapshot(&lease)
+            .expect("fixture retains exact attempt");
+        let refused = supervisor
+            .reserve("late-loss")
+            .expect_err("published identity remains reserved");
+        drop(task);
+        let after_consumer_loss = supervisor
+            .snapshot(&lease)
+            .expect("fixture retains exact attempt");
+        supervisor.lock_state().publication_barriers = None;
+        barriers.1.wait();
+        supervisor
+            .reap_worker(&worker_id)
+            .expect("join this fixture's known worker");
+        let observed = supervisor
+            .snapshot(&lease)
+            .expect("fixture retains exact attempt");
+        let active = supervisor.active_count();
+        let closed = close_joined_fixture(&supervisor, &lease);
+        assert_eq!(closed.phase, LifecyclePhase::Closed);
+        assert_eq!(refused, SupervisorError::DuplicateOperation);
+        assert_eq!(published.identity, observed.identity);
+        assert_eq!(
+            published
+                .authoritative_terminal
+                .expect("executor published an authoritative terminal")
+                .class,
+            TerminalClass::Completed
+        );
+        assert_eq!(
+            published.authoritative_terminal,
+            after_consumer_loss.authoritative_terminal
+        );
+        assert!(!after_consumer_loss.cancellation_requested);
+        assert_eq!(
+            published.authoritative_terminal,
+            observed.authoritative_terminal
+        );
+        assert_eq!(observed.authoritative_terminal, observed.final_projection);
+        assert_eq!(observed.phase, OperationPhase::Released);
+        assert_eq!(active, 0);
+    }
+
+    struct PanicPayload(Arc<AtomicBool>);
+
+    impl Drop for PanicPayload {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            panic!("controlled panic-payload Drop panic");
+        }
+    }
+
+    #[test]
+    fn execution_error_panic_and_payload_disposal_keep_failed_history() {
+        for mode in 0..3 {
+            let supervisor = OperationSupervisor::new();
+            let reservation = supervisor
+                .reserve("execute")
+                .expect("reserve execute fixture");
+            let lease = reservation.lease.clone();
+            let disposed = Arc::new(AtomicBool::new(false));
+            let payload_disposed = Arc::clone(&disposed);
+            let task = supervisor
+                .spawn(reservation, move |_| -> Result<(), String> {
+                    match mode {
+                        0 => Err("controlled operation error".to_owned()),
+                        1 => panic!("controlled execution panic"),
+                        _ => std::panic::panic_any(PanicPayload(payload_disposed)),
+                    }
+                })
+                .expect("spawn this fixture's owned worker");
+            let worker_id = task.worker_id.clone();
+            supervisor
+                .reap_worker(&worker_id)
+                .expect("join this fixture's known worker");
+            let observed = supervisor
+                .snapshot(&lease)
+                .expect("fixture retains exact attempt");
+            let active = supervisor.active_count();
+            drop(task);
+            let closed = close_joined_fixture(&supervisor, &lease);
+            assert_eq!(closed.phase, LifecyclePhase::Closed);
+            assert_eq!(
+                observed
+                    .authoritative_terminal
+                    .expect("executor published an authoritative terminal")
+                    .class,
+                TerminalClass::Failed
+            );
+            assert_eq!(observed.authoritative_terminal, observed.final_projection);
+            assert_eq!(observed.phase, OperationPhase::Released, "mode={mode}");
+            assert_eq!(active, 0);
+            assert_eq!(disposed.load(Ordering::Acquire), mode == 2);
+        }
+    }
+
+    struct OutputWithPayload(Arc<AtomicBool>);
+
+    impl Drop for OutputWithPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(PanicPayload(Arc::clone(&self.0)));
+        }
+    }
+
+    #[test]
+    fn reaper_publishes_real_join_before_disposing_panic_payload() {
+        let supervisor = OperationSupervisor::new();
+        let reservation = supervisor
+            .reserve("reaper")
+            .expect("reserve reaper fixture");
+        let lease = reservation.lease.clone();
+        let disposed = Arc::new(AtomicBool::new(false));
+        let payload_disposed = Arc::clone(&disposed);
+        let (return_tx, return_rx) = mpsc::channel();
+        let task = supervisor
+            .spawn(reservation, move |_| {
+                return_rx
+                    .recv()
+                    .expect("fixture releases this worker's execution gate");
+                Ok(OutputWithPayload(payload_disposed))
+            })
+            .expect("spawn this fixture's owned worker");
+        let worker_id = task.worker_id.clone();
+        let joined = Arc::clone(&task.joined);
+        drop(task);
+        return_tx
+            .send(())
+            .expect("known worker still owns fixture receiver");
+        let result = catch_unwind(AssertUnwindSafe(|| supervisor.reap_worker(&worker_id)));
+        // This payload is dropped only after this known thread's join returned.
+        // Do not infer a join from note_joined or from a timeout.
+        let payload_was_disposed = disposed.load(Ordering::Acquire);
+        let observed = supervisor
+            .snapshot(&lease)
+            .expect("fixture retains exact attempt");
+        let retained = supervisor.retained_task_count();
+        let joined_before_cleanup = joined.get().is_some();
+        if payload_was_disposed && !joined_before_cleanup {
+            // BEFORE-image fixture repair only, after taking all observations.
+            // The real handle was consumed by reap_worker above, not by this code.
+            let mut state = supervisor.lock_state();
+            assert!(
+                state
+                    .workers
+                    .get(&worker_id)
+                    .expect("joined handle retains its original owner entry")
+                    .join
+                    .is_none()
+            );
+            assert!(state.worker_history.note_joined(&worker_id));
+            let _ = joined.set(());
+            state.workers.remove(&worker_id);
+            state.exited_worker_ids.remove(&worker_id);
+            supervisor.0.changed.notify_all();
+        }
+        let closed = close_joined_fixture(&supervisor, &lease);
+        assert_eq!(closed.phase, LifecyclePhase::Closed);
+        assert!(result.is_err());
+        assert!(payload_was_disposed);
+        assert_eq!(observed.phase, OperationPhase::Released);
+        assert_eq!(
+            observed
+                .authoritative_terminal
+                .expect("executor published an authoritative terminal")
+                .class,
+            TerminalClass::Cancelled
+        );
+        assert!(joined_before_cleanup);
+        assert_eq!(retained, 0);
+        assert_eq!(supervisor.reap_worker(&worker_id), Ok(()));
+    }
+
+    #[test]
+    fn cleanup_recovers_owner_lock_but_keeps_poison_disclosed() {
+        let supervisor = OperationSupervisor::new();
+        let reservation = supervisor
+            .reserve("poison")
+            .expect("reserve poison fixture");
+        let lease = reservation.lease.clone();
+        let (return_tx, return_rx) = mpsc::channel();
+        let task = supervisor
+            .spawn(reservation, move |_| {
+                return_rx
+                    .recv()
+                    .expect("fixture releases this worker's execution gate");
+                Ok(Discarded {
+                    dropped: Arc::new(AtomicBool::new(false)),
+                    panics: true,
+                })
+            })
+            .expect("spawn this fixture's owned worker");
+        let worker_id = task.worker_id.clone();
+        supervisor.poison_state_for_test();
+        drop(task);
+        return_tx
+            .send(())
+            .expect("known worker still owns fixture receiver");
+        supervisor
+            .reap_worker(&worker_id)
+            .expect("join this fixture's known worker");
+        let observed = supervisor
+            .snapshot(&lease)
+            .expect("fixture retains exact attempt");
+        let active = supervisor.active_count();
+        let closed = close_joined_fixture(&supervisor, &lease);
+        assert!(closed.state_poisoned);
+        assert_eq!(closed.phase, LifecyclePhase::Closed);
+        assert_eq!(observed.phase, OperationPhase::Released);
+        assert_eq!(active, 0);
     }
 }

@@ -5542,7 +5542,24 @@ mod tests {
 
         let first_host = Arc::clone(&host);
         let first = tokio::spawn(async move { first_host.shutdown().await });
-        tokio::task::yield_now().await;
+        // Abort the elected shutdown caller, not a task that may never have
+        // entered shutdown. A scheduler yield is not an ownership witness.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if host
+                    .lifecycle
+                    .state
+                    .lock()
+                    .expect("read shutdown state")
+                    .shutdown_started
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first caller enters shutdown");
         first.abort();
         first.await.expect_err("first caller is aborted");
         backend.complete(&request_id);

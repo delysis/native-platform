@@ -63,9 +63,10 @@ pub struct AppShutdownSummary {
     /// Resident native workers owned at the terminal drain boundary.
     pub expected_native_worker_count: usize,
     pub joined_native_worker_count: usize,
-    /// All product-owned workers expected during this application lifetime.
+    /// Bounded recent operation-worker history plus separately tracked application
+    /// workers. This is not a census of every worker during the application lifetime.
     pub expected_worker_ids: Vec<String>,
-    /// Exact workers whose handles reached a joined terminal boundary.
+    /// Joined IDs in that diagnostic scope; actual joins remain owned by each drain.
     pub joined_worker_ids: Vec<String>,
     pub application_work_drained: bool,
     pub persona_approval_recovery_complete: bool,

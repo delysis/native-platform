@@ -1591,7 +1591,6 @@ fn network_attempted_for_failure(
             | AcquireError::UnsafeResumeDirectory
             | AcquireError::ResumeDirectoryBusy
             | AcquireError::ResumeStateMismatch
-            | AcquireError::CleanupIdentityChanged
             | AcquireError::UnsafeStagingFile
             | AcquireError::Runtime(_),
         ) => Some(false),
@@ -1608,6 +1607,9 @@ fn network_attempted_for_failure(
         }
         HostError::Acquire(
             AcquireError::InvalidResumeState(_)
+            // Identity rejection can precede contact or follow a full download.
+            // The error alone cannot honestly distinguish those histories.
+            | AcquireError::CleanupIdentityChanged
             | AcquireError::StagingIo(_)
             | AcquireError::NetworkDestinationForbidden { .. }
             | AcquireError::TotalTransferTimeout { .. }
@@ -2088,6 +2090,26 @@ mod tests {
             available_bytes_observed: Some(1024),
             created_at: Utc::now(),
         })?;
+        // A publication identity failure does not identify when contact occurred.
+        // Keep both local and HTTP plans unknown, while preserving a genuinely
+        // preflight failure's affirmative "not attempted" fact.
+        let identity_error = HostError::Acquire(AcquireError::CleanupIdentityChanged);
+        assert_eq!(
+            network_attempted_for_failure(&identity_error, &plan, &[]),
+            None
+        );
+        assert_eq!(
+            identity_error.as_information_error().class,
+            ErrorClass::Integrity
+        );
+        assert_eq!(
+            network_attempted_for_failure(
+                &HostError::Acquire(AcquireError::InvalidExpectedDigest),
+                &plan,
+                &[],
+            ),
+            Some(false),
+        );
         let receipt = host.install(&plan)?;
         assert_eq!(receipt.state, InstallationState::Ready);
         assert_eq!(receipt.downloaded_bytes, u64::try_from(bytes.len())?);
@@ -2223,6 +2245,10 @@ mod tests {
             available_bytes_observed: Some(1024),
             created_at: Utc::now(),
         })?;
+        assert_eq!(
+            network_attempted_for_failure(&identity_error, &blocked_plan, &[]),
+            None,
+        );
         let failure = blocked
             .install(&blocked_plan)
             .expect_err("private-network install unexpectedly succeeded");
@@ -2296,11 +2322,35 @@ mod tests {
             expected_bytes: 10,
             sha256: "0".repeat(64),
         };
-        let acquisition = acquisition_from_fetch(&artifact, fetched)?;
+        let acquisition = acquisition_from_fetch(&artifact, fetched.clone())?;
         assert_eq!(acquisition.attempts.len(), 2);
         assert_eq!(acquisition.attempts[0].byte_start, 0);
         assert_eq!(acquisition.attempts[1].byte_start, 4);
         acquisition.validate()?;
+
+        for peer in ["203.0.113.9:80", "[2001:db8::9]:80"] {
+            let uri = "http://example.test/archive.zim".to_string();
+            let mut http_artifact = artifact.clone();
+            http_artifact.source_uri = uri.clone();
+            let mut http = fetched.clone();
+            http.final_source_uri = Some(uri.clone());
+            let source = http.source_attestation.as_mut().ok_or_else(|| {
+                std::io::Error::other("network fixture lacks its source attestation")
+            })?;
+            source.requested_uri = uri.clone();
+            source.final_uri = uri.clone();
+            source.final_peer_address = peer.to_string();
+            for attempt in &mut http.source_attestations {
+                attempt.source.requested_uri = uri.clone();
+                attempt.source.final_uri = uri.clone();
+                attempt.source.final_peer_address = peer.to_string();
+            }
+            let mapped = acquisition_from_fetch(&http_artifact, http)?;
+            assert_eq!(mapped.final_peer_address.as_deref(), Some(peer));
+            assert_eq!(mapped.attempts.len(), 2);
+            assert_eq!(mapped.attempts[1].byte_start, 4);
+            mapped.validate()?;
+        }
         Ok(())
     }
 

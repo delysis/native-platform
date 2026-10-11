@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use thiserror::Error;
-use url::{Host, Url};
+use url::Url;
 use uuid::Uuid;
 
 pub const CATALOG_SCHEMA: &str = "information_native.catalog.v1";
@@ -2179,16 +2179,8 @@ impl AcquisitionRedirect {
 }
 
 fn is_ip_socket_address(value: &str) -> bool {
-    let Ok(url) = Url::parse(&format!("http://{value}")) else {
-        return false;
-    };
-    url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_some()
-        && matches!(url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_)))
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.path() == "/"
+    // A peer is a socket address, not a URL: URL normalization erases port 80.
+    value.parse::<core::net::SocketAddr>().is_ok()
 }
 
 fn validate_acquisition_url(
@@ -3030,6 +3022,40 @@ mod tests {
     }
 
     #[test]
+    fn socket_peer_addresses_use_socket_grammar() {
+        for valid in [
+            "203.0.113.8:80",
+            "[2001:db8::8]:80",
+            "203.0.113.8:443",
+            "[fe80::1%2]:80",
+            "127.0.0.1:0",
+            "[::1]:65535",
+        ] {
+            assert!(
+                is_ip_socket_address(valid),
+                "rejected socket address: {valid}"
+            );
+        }
+        for invalid in [
+            "example.test:80",
+            "203.0.113.8",
+            "2001:db8::8",
+            "203.0.113.8:65536",
+            "user@203.0.113.8:443",
+            "203.0.113.8:443/",
+            "203.0.113.8:443?query",
+            "203.0.113.8:443#fragment",
+            "127.1:443",
+            " 203.0.113.8:443",
+        ] {
+            assert!(
+                !is_ip_socket_address(invalid),
+                "accepted non-socket value: {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn network_acquisition_history_is_contiguous_and_secret_free() -> Result<(), ContractError> {
         assert!(is_ip_socket_address("203.0.113.8:443"));
         assert!(is_ip_socket_address("[2001:db8::8]:443"));
@@ -3073,6 +3099,26 @@ mod tests {
             sha256: "0".repeat(64),
         };
         acquisition.validate()?;
+
+        for peer in ["203.0.113.8:80", "[2001:db8::8]:80"] {
+            let mut http = acquisition.clone();
+            http.transport = AcquisitionTransport::Http;
+            http.requested_uri = Some("http://example.test/archive.zim".to_string());
+            http.final_uri = Some("http://cdn.example.test/archive.zim".to_string());
+            http.final_peer_address = Some(peer.to_string());
+            for redirect in &mut http.redirect_chain {
+                redirect.from_uri = "http://example.test/archive.zim".to_string();
+                redirect.to_uri = "http://cdn.example.test/archive.zim".to_string();
+                redirect.peer_address = Some(peer.to_string());
+            }
+            for attempt in &mut http.attempts {
+                attempt.requested_uri = "http://example.test/archive.zim".to_string();
+                attempt.final_uri = "http://cdn.example.test/archive.zim".to_string();
+                attempt.final_peer_address = Some(peer.to_string());
+                attempt.redirect_chain = http.redirect_chain.clone();
+            }
+            http.validate()?;
+        }
 
         acquisition.attempts[1].byte_start = 5;
         assert!(acquisition.validate().is_err());

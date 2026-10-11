@@ -5,10 +5,10 @@ accounting, typed capabilities, and inspectable receipts over magical adapters.
 
 ## Ownership
 
-- This repository owns offline information-resource contracts, catalogue
+- This subtree owns offline information-resource contracts, catalogue
   normalization, install planning and execution, managed resource state,
-  read-only retrieval adapters, federated evidence results, and optional Tauri
-  IPC.
+  read-only retrieval adapters, federated evidence results, and the native host.
+  Products own their narrow IPC edges; the former generic Tauri plugin is retired.
 - Product applications own user intent, UI, prompt assembly, model policy,
   credential storage, background scheduling, and destructive confirmation.
 - `attachment-native-kit` owns hostile attachment inspection and bounded nested
@@ -42,9 +42,15 @@ accounting, typed capabilities, and inspectable receipts over magical adapters.
 
 ## Required verification
 
+Use the root [CONTRIBUTING.md](../../../CONTRIBUTING.md) tool pins and evidence rules.
+From the repository root, run the affected group:
+
 ```sh
-cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-boundaries.sh
+node scripts/ci/cargo-group.mjs test service-information
+node scripts/ci/cargo-group.mjs clippy service-information
+bash crates/services/information/scripts/check-boundaries.sh
 ```
+
+Also check affected reverse-consumer groups; this command selects only the named
+group. The root clean-tree component gate and separate platform, fuzz, real-model
+and packaged acceptance obligations remain in force.

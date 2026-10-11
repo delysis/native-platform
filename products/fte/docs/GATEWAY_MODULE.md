@@ -24,9 +24,9 @@ service through an authenticated loopback listener.
   loopback lifecycle, and managed state. It contains no speech dependency or
   permission.
 
-Speech is an independently versioned service in
-[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit).
-See [Module and Repository Map](MODULE_MAP.md).
+Speech is a sibling service in
+[`crates/services/speech`](../../../crates/services/speech).
+Its former standalone repository is frozen. See [Module and Repository Map](MODULE_MAP.md).
 
 The native kit does not depend on Free Token Energy. Product state remains in
 the embedding application.
@@ -55,8 +55,8 @@ tauri::Builder::default().plugin(
 
 `with_default_loopback` makes a hardened configuration available; it does not
 open a port. A caller must explicitly invoke `loopback_start`. Mom Llama
-registers only its product-owned native backend, so its route set remains
-local-only even when no model can load.
+composes Native directly and does not register this plugin or a gateway.
+Loom's optional configured-server edge embeds routing/provider crates directly.
 
 Loopback start, stop, and token rotation participate in the same cleanup
 coordinator as generation. Exit first closes lifecycle admission, waits for
@@ -197,11 +197,10 @@ for providers that advertise them.
 
 ## Development and release dependency boundary
 
-`fte-backend-llama` is the sole cross-repository dependency. The committed
-manifests pin `llama-native-kit` by immutable Git revision. A developer who is
-changing both repositories may copy `.cargo/local-native-kit.toml.example` to
-`.cargo/local-native-kit.toml` and pass `--config .cargo/local-native-kit.toml`
-to Cargo. The local override is ignored by Git and is never a release input.
+`fte-backend-llama` is the sole FTE bridge to the Native crates. These are
+workspace-relative path dependencies under `crates/native`; the root lock owns
+their external bindings. No standalone Git pin or local override file is needed.
+Review the Native implementation and every affected product consumer together.
 
 ## Verification
 

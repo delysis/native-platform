@@ -1639,3 +1639,760 @@ fn join_unit_server(server: JoinHandle<io::Result<()>>) -> Result<(), io::Error>
         .join()
         .map_err(|_| io::Error::other("test server thread panicked"))?
 }
+
+#[cfg(unix)]
+#[test]
+fn publication_identity_rejects_replaced_private_paths() -> TestResult {
+    let client = publication_test_client()?;
+    for network in [false, true] {
+        for replacement in ["regular", "symlink", "missing"] {
+            let directory = private_tempdir()?;
+            let source = directory.path().join("source.bin");
+            let destination = directory.path().join("destination.bin");
+            let displaced = directory.path().join("displaced.bin");
+            fs::write(&source, b"payload")?;
+            let ordinary = directory.path().join("ordinary.bin");
+            let control =
+                client.fetch_file_artifact(&source, &ordinary, 7, &digest(b"payload"), 128)?;
+            assert_eq!(control.sha256, digest(&fs::read(&ordinary)?));
+            let (url, server) = if network {
+                let (url, server) = serve_publication_responses(vec![response(
+                    "200 OK",
+                    &[("Content-Length", "7")],
+                    b"payload",
+                )])?;
+                (url, Some(server))
+            } else {
+                (String::new(), None)
+            };
+            let mut mutation = None;
+            let result = {
+                let mut progress = |event: TransferProgress| {
+                    if event.phase == TransferPhase::Publishing && mutation.is_none() {
+                        mutation = Some((|| -> io::Result<PathBuf> {
+                            let names = unpublished_siblings(directory.path())?;
+                            if names.len() != 1 {
+                                return Err(io::Error::other("expected one private tempfile"));
+                            }
+                            let name = names[0].clone();
+                            fs::rename(&name, &displaced)?;
+                            match replacement {
+                                "regular" => fs::write(&name, b"wrong!!")?,
+                                "symlink" => symlink(&displaced, &name)?,
+                                _ => {}
+                            }
+                            Ok(name)
+                        })());
+                    }
+                    ProgressControl::Continue
+                };
+                if network {
+                    client.fetch_artifact_with_options(
+                        &url,
+                        &destination,
+                        7,
+                        &digest(b"payload"),
+                        128,
+                        &local_options(ResumePolicy::Disabled),
+                        &mut progress,
+                    )
+                } else {
+                    client.fetch_file_artifact_with_progress(
+                        &source,
+                        &destination,
+                        7,
+                        &digest(b"payload"),
+                        128,
+                        &mut progress,
+                    )
+                }
+            };
+            if let Some(server) = server {
+                assert_eq!(join_server(server)?.len(), 1);
+            }
+            let name =
+                mutation.ok_or_else(|| io::Error::other("Publishing was not observed"))??;
+            assert!(
+                matches!(&result, Err(AcquireError::CleanupIdentityChanged)),
+                "{result:?}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&source)?, b"payload");
+            assert_eq!(fs::read(&displaced)?, b"payload");
+            match replacement {
+                "regular" => assert_eq!(fs::read(&name)?, b"wrong!!"),
+                "symlink" => assert!(fs::symlink_metadata(&name)?.file_type().is_symlink()),
+                _ => assert!(!name.exists()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_identity_rejects_replaced_durable_staging() -> TestResult {
+    let directory = private_tempdir()?;
+    let staging = directory.path().join("staging.bin");
+    let displaced = directory.path().join("displaced.bin");
+    let replacement = directory.path().join("replacement.bin");
+    let sidecar = directory.path().join("staging.resume.json");
+    let options = local_options(ResumePolicy::durable(&sidecar));
+    let client = publication_test_client()?;
+    let body = b"network corpus";
+    let (url, server) = serve_publication_responses(vec![response(
+        "200 OK",
+        &[
+            ("Content-Length", "14"),
+            ("Accept-Ranges", "bytes"),
+            ("ETag", "\"v1\""),
+        ],
+        body,
+    )])?;
+    let mut mutation = None;
+    let result = {
+        let mut progress = |event: TransferProgress| {
+            if event.phase == TransferPhase::Downloading
+                && event.downloaded_bytes == 14
+                && mutation.is_none()
+            {
+                mutation = Some((|| -> io::Result<()> {
+                    fs::rename(&staging, &displaced)?;
+                    fs::write(&staging, b"wrong contents")?;
+                    fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))
+                })());
+            }
+            ProgressControl::Continue
+        };
+        client.fetch_artifact_with_options(
+            &url,
+            &staging,
+            14,
+            &digest(body),
+            128,
+            &options,
+            &mut progress,
+        )
+    };
+    assert_eq!(join_server(server)?.len(), 1);
+    mutation.ok_or_else(|| io::Error::other("complete download was not observed"))??;
+    assert!(
+        matches!(&result, Err(AcquireError::CleanupIdentityChanged)),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(&staging)?, b"wrong contents");
+    assert_eq!(fs::read(&displaced)?, body);
+    let state: ResumeSidecar = serde_json::from_slice(&fs::read(&sidecar)?)?;
+    assert!(state.staging_identity.matches_path(&displaced)?);
+    assert_eq!(state.requested_uri, url);
+    assert_eq!(state.source_attestations.len(), 1);
+    assert_eq!(state.source_attestations[0].source.requested_uri, url);
+
+    // The caller restores only its own names. The original bytes and history
+    // remain usable after the listener has been joined and dropped.
+    fs::rename(&staging, &replacement)?;
+    fs::rename(&displaced, &staging)?;
+    let verified = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        14,
+        &digest(body),
+        128,
+        &options,
+        &mut IgnoreProgress,
+    )?;
+    assert_eq!(verified.resumed_bytes, 14);
+    assert_eq!(verified.sha256, digest(&fs::read(&staging)?));
+    assert_eq!(verified.source_attestations.len(), 1);
+    assert_eq!(
+        verified.source_attestations[0].source,
+        state.source_attestations[0].source
+    );
+    assert_eq!(fs::read(&replacement)?, b"wrong contents");
+    assert!(!sidecar.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publication_test_client() -> Result<AcquireClient, AcquireError> {
+    AcquireClient::new_with_timeouts(
+        AcquireConfig {
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(10),
+            ..AcquireConfig::default()
+        },
+        TransferTimeouts::new(Duration::from_secs(2), Duration::from_secs(10)),
+    )
+}
+
+#[cfg(unix)]
+fn serve_publication_responses(responses: Vec<Vec<u8>>) -> io::Result<(String, TestServer)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let server = thread::spawn(move || -> io::Result<Vec<String>> {
+        let mut requests = Vec::with_capacity(responses.len());
+        for response in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "publication fixture received no connection",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            requests.push(read_request(&mut stream)?);
+            stream.write_all(&response)?;
+            stream.flush()?;
+            let _shutdown_result = stream.shutdown(Shutdown::Both);
+        }
+        Ok(requests)
+    });
+    Ok((format!("http://{address}/resource"), server))
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_publication_cancels_before_commit_and_retains_retry_history() -> TestResult {
+    let body = b"network corpus";
+    let client = publication_test_client()?;
+    for (durable, validator) in [(false, true), (true, true), (true, false)] {
+        let directory = private_tempdir()?;
+        let staging = directory.path().join("staging.bin");
+        let sidecar = directory.path().join("staging.resume.json");
+        let options = local_options(if durable {
+            ResumePolicy::durable(&sidecar)
+        } else {
+            ResumePolicy::Disabled
+        });
+        let mut headers = vec![("Content-Length", "14")];
+        if validator {
+            headers.extend([("Accept-Ranges", "bytes"), ("ETag", "\"v1\"")]);
+        }
+        let (url, server) = serve_publication_responses(vec![response("200 OK", &headers, body)])?;
+        let mut events = Vec::new();
+        let result = {
+            let mut progress = |event: TransferProgress| {
+                events.push(event);
+                if event.phase == TransferPhase::Publishing {
+                    ProgressControl::Cancel
+                } else {
+                    ProgressControl::Continue
+                }
+            };
+            client.fetch_artifact_with_options(
+                &url,
+                &staging,
+                14,
+                &digest(body),
+                128,
+                &options,
+                &mut progress,
+            )
+        };
+        assert_eq!(join_server(server)?.len(), 1);
+        assert!(
+            matches!(
+                &result,
+                Err(AcquireError::Cancelled {
+                    downloaded_bytes: 14
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            events.last().map(|event| event.phase),
+            Some(TransferPhase::Publishing)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.phase == TransferPhase::Complete)
+        );
+        assert_eq!(events.last().map(|event| event.resumed_bytes), Some(0));
+        if !durable || !validator {
+            assert!(!staging.exists());
+            assert!(!sidecar.exists());
+            continue;
+        }
+        assert_eq!(fs::read(&staging)?, body);
+        let state: ResumeSidecar = serde_json::from_slice(&fs::read(&sidecar)?)?;
+        assert!(state.staging_identity.matches_path(&staging)?);
+        assert_eq!(state.requested_uri, url);
+        assert_eq!(state.expected_sha256, digest(body));
+        assert_eq!(state.source_attestations.len(), 1);
+        assert_eq!(state.source_attestations[0].byte_start, 0);
+        assert_eq!(state.source_attestations[0].byte_end, 14);
+        assert!(state.source_attestations[0].finished_at_unix_ms.is_some());
+
+        // No listener remains. Complete is observational even when its callback
+        // returns Cancel; this completed partial has one earlier Publishing veto.
+        let mut phases = Vec::new();
+        let verified = {
+            let mut progress = |event: TransferProgress| {
+                phases.push(event.phase);
+                if event.phase == TransferPhase::Complete {
+                    ProgressControl::Cancel
+                } else {
+                    ProgressControl::Continue
+                }
+            };
+            client.fetch_artifact_with_options(
+                &url,
+                &staging,
+                14,
+                &digest(body),
+                128,
+                &options,
+                &mut progress,
+            )?
+        };
+        assert_eq!(phases, [TransferPhase::Publishing, TransferPhase::Complete]);
+        assert_eq!(verified.resumed_bytes, 14);
+        assert_eq!(verified.source_attestations, state.source_attestations);
+        assert_eq!(verified.sha256, digest(&fs::read(&staging)?));
+        assert!(!sidecar.exists());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_durable_retry_cancels_without_mutating_bytes_or_history() -> TestResult {
+    let directory = private_tempdir()?;
+    let staging = directory.path().join("staging.bin");
+    let sidecar = directory.path().join("staging.resume.json");
+    let options = local_options(ResumePolicy::durable(&sidecar));
+    let client = publication_test_client()?;
+    let body = b"network corpus";
+    let (url, server) = serve_publication_responses(vec![response(
+        "200 OK",
+        &[
+            ("Content-Length", "14"),
+            ("Accept-Ranges", "bytes"),
+            ("ETag", "\"v1\""),
+        ],
+        body,
+    )])?;
+    let first = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        14,
+        &digest(body),
+        128,
+        &options,
+        &mut |event: TransferProgress| {
+            if event.phase == TransferPhase::Downloading && event.downloaded_bytes == 14 {
+                ProgressControl::Cancel
+            } else {
+                ProgressControl::Continue
+            }
+        },
+    );
+    assert_eq!(join_server(server)?.len(), 1);
+    assert!(
+        matches!(
+            &first,
+            Err(AcquireError::Cancelled {
+                downloaded_bytes: 14
+            })
+        ),
+        "{first:?}"
+    );
+    let before = fs::read(&sidecar)?;
+    let state: ResumeSidecar = serde_json::from_slice(&before)?;
+    let sidecar_identity = FileIdentity::from_file(&File::open(&sidecar)?)?;
+    let mut events = Vec::new();
+    let cancelled = {
+        let mut progress = |event: TransferProgress| {
+            events.push(event);
+            ProgressControl::Cancel
+        };
+        client.fetch_artifact_with_options(
+            &url,
+            &staging,
+            14,
+            &digest(body),
+            128,
+            &options,
+            &mut progress,
+        )
+    };
+    assert!(
+        matches!(
+            &cancelled,
+            Err(AcquireError::Cancelled {
+                downloaded_bytes: 14
+            })
+        ),
+        "{cancelled:?}"
+    );
+    assert_eq!(
+        events,
+        [TransferProgress {
+            phase: TransferPhase::Publishing,
+            downloaded_bytes: 14,
+            expected_bytes: 14,
+            resumed_bytes: 14,
+        }]
+    );
+    assert_eq!(fs::read(&staging)?, body);
+    assert_eq!(fs::read(&sidecar)?, before);
+    assert!(sidecar_identity.matches_path(&sidecar)?);
+    assert!(state.staging_identity.matches_path(&staging)?);
+
+    let verified = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        14,
+        &digest(body),
+        128,
+        &options,
+        &mut IgnoreProgress,
+    )?;
+    assert_eq!(verified.resumed_bytes, 14);
+    assert_eq!(verified.source_attestations, state.source_attestations);
+    assert!(verified.network_used); // Historical verified HTTP bytes, not a new contact.
+    assert!(!verified.publication.idempotent_recovery);
+    assert!(!sidecar.exists());
+
+    let mut phases = Vec::new();
+    let recovered = {
+        let mut progress = |event: TransferProgress| {
+            phases.push(event.phase);
+            ProgressControl::Cancel
+        };
+        client.fetch_artifact_with_options(
+            &url,
+            &staging,
+            14,
+            &digest(body),
+            128,
+            &options,
+            &mut progress,
+        )?
+    };
+    assert_eq!(phases, [TransferPhase::Complete]);
+    assert!(recovered.publication.idempotent_recovery);
+    assert!(!recovered.network_used);
+    assert!(recovered.source_attestations.is_empty());
+    assert_eq!(fs::read(&staging)?, body);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_publishing_rechecks_identity_after_the_final_callback() -> TestResult {
+    let body = b"network corpus";
+    let client = publication_test_client()?;
+    for completed_retry in [false, true] {
+        let directory = private_tempdir()?;
+        let staging = directory.path().join("staging.bin");
+        let displaced = directory.path().join("displaced.bin");
+        let sidecar = directory.path().join("staging.resume.json");
+        let options = local_options(ResumePolicy::durable(&sidecar));
+        let (url, server) = serve_publication_responses(vec![response(
+            "200 OK",
+            &[
+                ("Content-Length", "14"),
+                ("Accept-Ranges", "bytes"),
+                ("ETag", "\"v1\""),
+            ],
+            body,
+        )])?;
+        let server = if completed_retry {
+            let first = client.fetch_artifact_with_options(
+                &url,
+                &staging,
+                14,
+                &digest(body),
+                128,
+                &options,
+                &mut |event: TransferProgress| {
+                    if event.phase == TransferPhase::Downloading && event.downloaded_bytes == 14 {
+                        ProgressControl::Cancel
+                    } else {
+                        ProgressControl::Continue
+                    }
+                },
+            );
+            assert_eq!(join_server(server)?.len(), 1);
+            assert!(
+                matches!(
+                    &first,
+                    Err(AcquireError::Cancelled {
+                        downloaded_bytes: 14
+                    })
+                ),
+                "{first:?}"
+            );
+            None
+        } else {
+            Some(server)
+        };
+        let mut mutation = None;
+        let result = {
+            let mut progress = |event: TransferProgress| {
+                if event.phase == TransferPhase::Publishing && mutation.is_none() {
+                    mutation = Some((|| -> io::Result<()> {
+                        fs::rename(&staging, &displaced)?;
+                        fs::write(&staging, b"wrong contents")
+                    })());
+                }
+                ProgressControl::Continue
+            };
+            client.fetch_artifact_with_options(
+                &url,
+                &staging,
+                14,
+                &digest(body),
+                128,
+                &options,
+                &mut progress,
+            )
+        };
+        if let Some(server) = server {
+            assert_eq!(join_server(server)?.len(), 1);
+        }
+        mutation.ok_or_else(|| io::Error::other("Publishing was not observed"))??;
+        assert!(
+            matches!(&result, Err(AcquireError::CleanupIdentityChanged)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&staging)?, b"wrong contents");
+        assert_eq!(fs::read(&displaced)?, body);
+        let state: ResumeSidecar = serde_json::from_slice(&fs::read(&sidecar)?)?;
+        assert!(state.staging_identity.matches_path(&displaced)?);
+        assert_eq!(state.source_attestations[0].source.requested_uri, url);
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_complete_cancel_is_observational_and_recovery_is_not_new_work() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+    let client = AcquireClient::with_defaults()?;
+    let mut phases = Vec::new();
+    let verified = {
+        let mut progress = |event: TransferProgress| {
+            phases.push(event.phase);
+            if event.phase == TransferPhase::Complete {
+                ProgressControl::Cancel
+            } else {
+                ProgressControl::Continue
+            }
+        };
+        client.fetch_file_artifact_with_progress(
+            &source,
+            &destination,
+            7,
+            &digest(b"payload"),
+            128,
+            &mut progress,
+        )?
+    };
+    assert!(phases.contains(&TransferPhase::Publishing));
+    assert_eq!(phases.last(), Some(&TransferPhase::Complete));
+    assert_eq!(verified.sha256, digest(&fs::read(&destination)?));
+    fs::remove_file(&source)?;
+    phases.clear();
+    let recovered = {
+        let mut progress = |event: TransferProgress| {
+            phases.push(event.phase);
+            ProgressControl::Cancel
+        };
+        client.fetch_file_artifact_with_progress(
+            &source,
+            &destination,
+            7,
+            &digest(b"payload"),
+            128,
+            &mut progress,
+        )?
+    };
+    assert_eq!(phases, [TransferPhase::Complete]);
+    assert!(recovered.publication.idempotent_recovery);
+    assert_eq!(fs::read(&destination)?, b"payload");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_stream_complete_cancel_is_observational() -> TestResult {
+    let directory = private_tempdir()?;
+    let staging = directory.path().join("staging.bin");
+    let sidecar = directory.path().join("staging.resume.json");
+    let options = local_options(ResumePolicy::durable(&sidecar));
+    let client = publication_test_client()?;
+    let body = b"network corpus";
+    let (url, server) = serve_publication_responses(vec![response(
+        "200 OK",
+        &[
+            ("Content-Length", "14"),
+            ("Accept-Ranges", "bytes"),
+            ("ETag", "\"v1\""),
+        ],
+        body,
+    )])?;
+    let mut phases = Vec::new();
+    let result = {
+        let mut progress = |event: TransferProgress| {
+            phases.push(event.phase);
+            if event.phase == TransferPhase::Complete {
+                ProgressControl::Cancel
+            } else {
+                ProgressControl::Continue
+            }
+        };
+        client.fetch_artifact_with_options(
+            &url,
+            &staging,
+            14,
+            &digest(body),
+            128,
+            &options,
+            &mut progress,
+        )
+    };
+    assert_eq!(join_server(server)?.len(), 1);
+    let verified = result?;
+    assert!(phases.contains(&TransferPhase::Publishing));
+    assert_eq!(phases.last(), Some(&TransferPhase::Complete));
+    assert_eq!(verified.sha256, digest(&fs::read(&staging)?));
+    assert!(verified.publication.visible);
+    assert!(!sidecar.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_resumed_publishing_veto_preserves_both_source_attempts() -> TestResult {
+    let directory = private_tempdir()?;
+    let staging = directory.path().join("staging.bin");
+    let sidecar = directory.path().join("staging.resume.json");
+    let options = local_options(ResumePolicy::durable(&sidecar));
+    let client = publication_test_client()?;
+    let body = b"network corpus";
+    let (url, server) = serve_publication_responses(vec![
+        response(
+            "200 OK",
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Accept-Ranges", "bytes"),
+                ("ETag", "\"v1\""),
+            ],
+            b"7\r\nnetwork\r\n",
+        ),
+        response(
+            "206 Partial Content",
+            &[
+                ("Content-Length", "7"),
+                ("Content-Range", "bytes 7-13/14"),
+                ("ETag", "\"v1\""),
+            ],
+            b" corpus",
+        ),
+    ])?;
+    let first = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        14,
+        &digest(body),
+        128,
+        &options,
+        &mut |event: TransferProgress| {
+            if event.phase == TransferPhase::Downloading && event.downloaded_bytes == 7 {
+                ProgressControl::Cancel
+            } else {
+                ProgressControl::Continue
+            }
+        },
+    );
+    let mut publishing = None;
+    let second = {
+        let mut progress = |event: TransferProgress| {
+            if event.phase == TransferPhase::Publishing {
+                publishing = Some(event);
+                ProgressControl::Cancel
+            } else {
+                ProgressControl::Continue
+            }
+        };
+        client.fetch_artifact_with_options(
+            &url,
+            &staging,
+            14,
+            &digest(body),
+            128,
+            &options,
+            &mut progress,
+        )
+    };
+    let requests = join_server(server)?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        matches!(
+            &first,
+            Err(AcquireError::Cancelled {
+                downloaded_bytes: 7
+            })
+        ),
+        "{first:?}"
+    );
+    assert!(
+        matches!(
+            &second,
+            Err(AcquireError::Cancelled {
+                downloaded_bytes: 14
+            })
+        ),
+        "{second:?}"
+    );
+    assert!(requests[1].to_ascii_lowercase().contains("range: bytes=7-"));
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("if-range: \"v1\"")
+    );
+    assert_eq!(publishing.map(|event| event.resumed_bytes), Some(7));
+    let state: ResumeSidecar = serde_json::from_slice(&fs::read(&sidecar)?)?;
+    assert!(state.staging_identity.matches_path(&staging)?);
+    assert_eq!(fs::read(&staging)?, body);
+    assert_eq!(state.source_attestations.len(), 2);
+    assert_eq!(state.source_attestations[0].byte_start, 0);
+    assert_eq!(state.source_attestations[0].byte_end, 7);
+    assert_eq!(state.source_attestations[1].byte_start, 7);
+    assert_eq!(state.source_attestations[1].byte_end, 14);
+    assert!(
+        state
+            .source_attestations
+            .iter()
+            .all(|attempt| attempt.finished_at_unix_ms.is_some())
+    );
+    let verified = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        14,
+        &digest(body),
+        128,
+        &options,
+        &mut IgnoreProgress,
+    )?;
+    assert_eq!(verified.resumed_bytes, 14);
+    assert_eq!(verified.source_attestations, state.source_attestations);
+    assert!(!sidecar.exists());
+    Ok(())
+}

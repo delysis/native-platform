@@ -7,3 +7,13 @@ The application supplies a settings directory. Each update reloads the current f
 Storage is bounded to 128 KiB, 1,024 project choices and a 4,096-byte absolute model path. Compare-and-clear preserves newer model choices. Temporary acceptance models cannot become startup preferences. Rust revisions are `u64`; JavaScript DTOs carry decimal strings.
 
 The current Loom Tauri adapter and renderer consume this service. Native application admission covers accepted storage work. Product/native qualification remains separate from component checks. The current EASL presentation draft has no model/suggestion service consumer; no unused worker is added there.
+
+Each successfully acquired transaction has one private, non-clone lock owner.
+It attempts explicit unlock at lexical scope exit, after protected work, on
+ordinary returns, errors and unwinding. A successfully unlocked transaction is
+not prolonged by passive duplicated or inherited descriptors. `Drop` cannot
+return an unlock error: it does not panic or replace the operation's publication
+result. Normal file close remains the fallback, not a guarantee of prompt release
+if unlocking fails while another descriptor survives. The sidecar is not unlinked,
+and failed acquisitions never construct the unlocking owner. This is not a
+crash/abort cleanup or a universal filesystem/platform qualification guarantee.

@@ -67,7 +67,7 @@ fn validate_schema_snapshot(
 
 fn schema_objects(connection: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     connection
-        .prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' ORDER BY name")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect()
 }
@@ -75,6 +75,50 @@ fn schema_objects(connection: &Connection) -> rusqlite::Result<Vec<(String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_prefix_lookalikes_are_rejected_without_mutation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("store.sqlite3");
+        let mut connection = Connection::open(&path).expect("database");
+        initialize_schema(&mut connection, true).expect("initialize current schema");
+        validate_current_schema(&connection).expect("current schema including internal objects");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 CREATE TABLE sqliteX_shadow(value TEXT);
+                 INSERT INTO sqliteX_shadow VALUES ('preserve');
+                 CREATE TRIGGER sqliteX_guard BEFORE INSERT ON documents
+                 BEGIN SELECT RAISE(ABORT, 'foreign trigger retained'); END;",
+            )
+            .expect("legal non-internal objects");
+        drop(connection);
+        let before = std::fs::read(&path).expect("before bytes");
+        let mut connection = Connection::open(&path).expect("reopen fixture");
+        assert!(matches!(
+            validate_current_schema(&connection),
+            Err(StoreError::CorruptDatabase(_))
+        ));
+        assert!(matches!(
+            initialize_schema(&mut connection, false),
+            Err(StoreError::CorruptDatabase(_))
+        ));
+        let retained: String = connection
+            .query_row("SELECT value FROM sqliteX_shadow", [], |row| row.get(0))
+            .expect("retained foreign data");
+        assert_eq!(retained, "preserve");
+        let triggers: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'sqliteX_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retained foreign trigger");
+        assert_eq!(triggers, 1);
+        drop(connection);
+        assert_eq!(std::fs::read(&path).expect("after bytes"), before);
+        assert!(!path.with_extension("sqlite3-wal").exists());
+    }
 
     #[test]
     fn incompatible_databases_are_rejected_without_mutation_or_wal_creation() {

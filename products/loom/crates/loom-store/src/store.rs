@@ -3757,7 +3757,7 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<()> {
     if manifest.format != PROJECT_FORMAT {
         return Err(StoreError::UnsupportedFormat(manifest.format.clone()));
     }
-    if manifest.schema_version > CURRENT_SCHEMA_VERSION {
+    if manifest.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedSchema {
             found: manifest.schema_version,
             supported: CURRENT_SCHEMA_VERSION,
@@ -4426,6 +4426,47 @@ mod tests {
                 .expect("immutable source"),
             text.as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noncurrent_manifests_are_rejected_without_rewriting_project_bytes() {
+        for version in [0, CURRENT_SCHEMA_VERSION + 1] {
+            let (_directory, store) = new_store();
+            let root = store.root().to_path_buf();
+            let mut manifest = store.manifest().clone();
+            validate_manifest(&manifest).expect("current manifest");
+            drop(store);
+            let manuscript = root.join("Preserve.md");
+            fs::write(&manuscript, b"Keep exact writing.\r\n").expect("manuscript");
+            manifest.schema_version = version;
+            let manifest_path = root.join(".loom/project.json");
+            let database_path = root.join(".loom/loom.sqlite3");
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&manifest).expect("manifest JSON"),
+            )
+            .expect("noncurrent manifest fixture");
+            let manifest_before = fs::read(&manifest_path).expect("manifest before");
+            let database_before = fs::read(&database_path).expect("database before");
+            assert!(matches!(
+                ProjectStore::open(&root),
+                Err(StoreError::UnsupportedSchema { found, supported })
+                    if found == version && supported == CURRENT_SCHEMA_VERSION
+            ));
+            assert_eq!(
+                fs::read(&manifest_path).expect("manifest after"),
+                manifest_before
+            );
+            assert_eq!(
+                fs::read(&database_path).expect("database after"),
+                database_before
+            );
+            assert_eq!(
+                fs::read(&manuscript).expect("retained writing"),
+                b"Keep exact writing.\r\n"
+            );
+        }
     }
 
     #[cfg(not(unix))]

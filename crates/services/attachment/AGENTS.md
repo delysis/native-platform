@@ -37,9 +37,15 @@ ownership and authority.
 
 ## Required verification
 
+Use the root [CONTRIBUTING.md](../../../CONTRIBUTING.md) tool pins and evidence rules.
+From the repository root, run the affected group:
+
 ```sh
-cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-boundaries.sh
+node scripts/ci/cargo-group.mjs test service-attachment
+node scripts/ci/cargo-group.mjs clippy service-attachment
+bash crates/services/attachment/scripts/check-boundaries.sh
 ```
+
+Also check affected reverse-consumer groups; this command selects only the named
+group. The root clean-tree component gate and separate platform, fuzz, real-model
+and packaged acceptance obligations remain in force.
