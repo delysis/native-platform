@@ -7,3 +7,5 @@
 *.tmp
 products/loom/apps/loom/.vitest-attachments/
 products/loom/apps/loom/src/lib/__screenshots__/
+products/loom/apps/loom/src-tauri/binaries/
+products/loom/signal/target/

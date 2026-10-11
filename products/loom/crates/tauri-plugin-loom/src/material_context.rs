@@ -657,7 +657,7 @@ pub(super) fn native_media<'a>(
                         }
                         continue;
                     }
-                    let resolved = crate::context_attachments::resolve_media_for_document(
+                    let resolved = crate::context_attachments::resolve_inline_media(
                         store.root(),
                         &document.document_id.to_string(),
                         &document.text,

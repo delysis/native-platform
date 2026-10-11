@@ -13,16 +13,16 @@ function dependencyThunkFor(compiled: string, assignment: string): string {
 describe('App ghost reactivity wiring', () => {
   const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
   let compiled: string;
-
+  // Compiling the full app is fixture preparation. On a busy native build host
+  // it can exceed the runner's default ten seconds; keep a separate bounded
+  // setup budget without changing the behavior assertions' normal timeout.
   beforeAll(() => {
-    // Compile the real app as fixture setup; assertion time does not include
-    // the compiler's CPU cost on shared CI runners.
     compiled = compile(source, {
       filename: 'App.svelte',
       generate: 'client',
       dev: false
     }).js.code;
-  });
+  }, 60_000);
 
   it('tracks late branch hydration and caret changes in both ghost effects', () => {
     const visualEvaluation = dependencyThunkFor(compiled, '$.set(visualFamilyEvaluation');
@@ -483,7 +483,7 @@ describe('App ghost reactivity wiring', () => {
     const capabilities = readFileSync(new URL('./sidebarInteractions.ts', import.meta.url), 'utf8');
     const sharedKeys = readFileSync(new URL('./interactionPrimitives.ts', import.meta.url), 'utf8');
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
 
@@ -574,7 +574,7 @@ describe('App ghost reactivity wiring', () => {
   it('keeps normal watcher refreshes editable and locks only the missing-document boundary', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
     const missingBoundary = source.slice(
@@ -588,6 +588,7 @@ describe('App ghost reactivity wiring', () => {
 
     expect(readonly).toContain('missingDocumentBoundaryInFlight');
     expect(readonly).toContain('missingDocumentCapturePending !== null');
+    expect(readonly).toContain('editorReadonly = editorNavigationLocked || cabalWriteBlocked');
     expect(readonly).not.toContain('projectFilesystemRefreshInFlight');
     expect(refresh).toContain('projectFilesystemRefreshInFlight = true');
     expect(missingBoundary).toContain('missingDocumentBoundaryInFlight = true');

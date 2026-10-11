@@ -4,7 +4,7 @@
   import CollectionMembers from './CollectionMembers.svelte';
   import type { CollectionMember, MaterialPdfPage } from './types';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { readMaterialPdfPage, readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
+  import { readMaterialPdfPage, readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, revealMaterialOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
   import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch, type MaterialNavigation } from './materials';
   import { canEditMaterialMetadata, materialMetadataRevision, materialSourceIsUnchanged } from './materialMetadata';
 
@@ -204,8 +204,13 @@
   async function original(): Promise<void> {
     if (busy || !originalId) return;
     busy = true;
-    try { await revealAttachmentOriginal(projectId, sessionId, originalId); }
-
+    try {
+      if (material.kind === 'attachment' && originalId === material.attachment_id) {
+        await revealMaterialOriginal(projectId, sessionId, material.id);
+      } else {
+        await revealAttachmentOriginal(projectId, sessionId, originalId);
+      }
+    }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { if (mounted) busy = false; }
   }

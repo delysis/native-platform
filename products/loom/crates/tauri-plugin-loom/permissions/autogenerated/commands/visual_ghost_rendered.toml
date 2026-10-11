@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-visual-ghost-rendered"
+description = "Enables the visual_ghost_rendered command without any pre-configured scope."
+commands.allow = ["visual_ghost_rendered"]
+
+[[permission]]
+identifier = "deny-visual-ghost-rendered"
+description = "Denies the visual_ghost_rendered command without any pre-configured scope."
+commands.deny = ["visual_ghost_rendered"]

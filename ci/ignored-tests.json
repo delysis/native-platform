@@ -1,15 +1,21 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 48,
+  "expected_test_count": 51,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
       "selector": "test:residual_training",
       "name": "residual_training",
-      "kinds": ["test"],
+      "kinds": [
+        "test"
+      ],
       "src_path": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
       "manifest_path": "crates/native/crates/llama-native-engine/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
       "harness": "libtest"
     },
     {
@@ -314,7 +320,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "b6d98dd95658f3a012de414ba180f6c249288d92c69cb47587c485529d738494"
+      "sha256": "a0f19f864adb8d1b77460e644260767fc13e2350eed3b27eb0a3bab982729b7e"
     },
     {
       "package": "mom-llama-app",
@@ -324,7 +330,7 @@
     {
       "package": "loom-easl-interface",
       "src_path": "products/loom/experiments/easl-interface/build.rs",
-      "sha256": "285604668fb6d41f692a272e3270b6d51b5aec6de5e82bbf2d8947dd7392fda7"
+      "sha256": "3f00e65888d2aea1d14ee43579ea03a42dcd1cd4c1a444825f38a047cdde8ec9"
     }
   ],
   "entries": [
@@ -337,8 +343,8 @@
       "required_environment": [
         "MOM_LLAMA_MODEL_PATH"
       ],
-      "evidence_class": "real-model-runtime",
-      "promotion_prohibition": "Passing this vocabulary test alone cannot promote inference quality, product, packaged-app, cross-platform, or release readiness.",
+      "evidence_class": "real-model-metadata",
+      "promotion_prohibition": "Passing vocabulary decoding cannot promote live inference, product, packaged-app, cross-platform, or release readiness.",
       "platforms": [
         "linux",
         "macos",
@@ -488,10 +494,17 @@
       "target": "test:residual_training",
       "source": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
       "prerequisite": "requires LLAMA_RESIDUAL_MODEL and LLAMA_RESIDUAL_POOLING_OUTPUT_DIR",
-      "required_environment": ["LLAMA_RESIDUAL_MODEL", "LLAMA_RESIDUAL_POOLING_OUTPUT_DIR"],
+      "required_environment": [
+        "LLAMA_RESIDUAL_MODEL",
+        "LLAMA_RESIDUAL_POOLING_OUTPUT_DIR"
+      ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing these exposed smoke pairs and zero-search pooling checks cannot promote behavioral-transfer claims, scientific validity, cross-model qualification, or release readiness.",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
     },
     {
       "test_id": "local_training_holdout_isolation_and_join",
@@ -499,10 +512,16 @@
       "target": "test:residual_training",
       "source": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
       "prerequisite": "requires LLAMA_RESIDUAL_MODEL pointing to a local GGUF",
-      "required_environment": ["LLAMA_RESIDUAL_MODEL"],
+      "required_environment": [
+        "LLAMA_RESIDUAL_MODEL"
+      ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this authored-contrast runtime check cannot promote scientific validity, personality construct validity, steering generalization, cross-platform support, or release readiness.",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
     },
     {
       "test_id": "tests::real_per_token_embeddings_preserve_generation_context",
@@ -1128,6 +1147,58 @@
         "linux",
         "macos",
         "windows"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and executes a real local model through authenticated peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at the pinned Gemma 4 catalog model with its projector; executes real image and audio inference through peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::batch::native_qualification::independent_peers_share_native_decode",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_batch_qualification.rs",
+      "prerequisite": "requires a real GGUF and instrumented native decode observations; run scripts/qualify-peer-native.mjs",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH",
+        "LOOM_NATIVE_BATCH_TRACE_PATH",
+        "LOOM_NATIVE_BATCH_MAPPING_PATH",
+        "LOOM_NATIVE_BATCH_OUTPUT_PATH",
+        "LOOM_QUALIFICATION_SOURCE_SHA"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this instrumented production peer executor test cannot promote packaged-app, physical-network, continuous-admission, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos"
       ]
     }
   ]

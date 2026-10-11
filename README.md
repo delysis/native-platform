@@ -15,8 +15,11 @@ source: it is the separately reviewed unsafe upstream boundary.
 The [current architecture index](docs/architecture/CURRENT-DECISIONS.md) records
 scope changes since the sealed ADR import.
 
-- Rust 1.92.0, edition 2024, resolver 3.
-- All first-party packages are members of one root Cargo workspace; [the package groups](ci/package-groups.json) record the current inventory.
+- Rust 1.95.0, edition 2024, resolver 3.
+- First-party packages share the root Cargo workspace, except Loom's isolated
+  Signal worker. Both use the root compiler pin. [Package groups](ci/package-groups.json)
+  record the root inventory; [Signal's manifest](products/loom/signal/Cargo.toml)
+  owns its separately locked SQLCipher dependency graph.
 - One root `Cargo.lock` resolves exact `rusqlite 0.39.0` and one
   `libsqlite3-sys 0.37.0` native link.
 - One pnpm 11.16.0 workspace and root `pnpm-lock.yaml` own the FTE, Mom, and
@@ -25,8 +28,8 @@ scope changes since the sealed ADR import.
   and optional secondary gates.
 - `ci/ignored-tests.json` registers every opt-in test with its exact source,
   prerequisite, evidence class, and prohibition on automatic promotion.
-- The Attachment fuzz target is the only deliberately excluded auxiliary
-  Cargo workspace. The externally sourced GLib security backport is excluded
+- The Attachment fuzz target and Loom Signal worker own isolated Cargo
+  workspaces. The externally sourced GLib security backport is excluded
   from first-party workspace membership; see [its patch record](vendor/glib/PATCH.md).
 
 Check the live repository invariants with:
@@ -39,9 +42,15 @@ When a system Cargo installation precedes rustup on PATH, select the whole
 toolchain before running these commands:
 
 ```sh
-export PATH="$(dirname "$(rustup which --toolchain 1.92.0 cargo)"):$PATH"
+export PATH="$(dirname "$(rustup which --toolchain 1.95.0 cargo)"):$PATH"
 rustc --version
 cargo clippy --version
+```
+
+Before compiling Loom with plain Cargo, build its bundled Signal worker:
+
+```sh
+node scripts/build-loom-signal.mjs
 ```
 
 Then test and lint only the affected package group during normal development:

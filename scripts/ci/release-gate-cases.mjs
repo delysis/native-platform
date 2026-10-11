@@ -109,7 +109,7 @@ function runToolchainSelection(t, missing = false) {
   }
   write(path.join(shadow, "rustup"), missing
     ? "exit 7"
-    : 'test "$*" = "which --toolchain 1.92.0 cargo" || exit 8; printf "%s\\n" "$TEST_PINNED_CARGO"');
+    : 'test "$*" = "which --toolchain 1.95.0 cargo" || exit 8; printf "%s\\n" "$TEST_PINNED_CARGO"');
   const source = fs.readFileSync(releasePath, "utf8");
   const definition = source.match(/^pin_rust_toolchain\(\) \{[\s\S]*?^\}/m)?.[0];
   // Without an explicit selection the nested build inherits the ambient tools.
@@ -132,7 +132,7 @@ test("release pins tools inherited by nested pnpm/Tauri invocations", (t) => {
   const result = runToolchainSelection(t);
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "pinned-cargo\npinned-rustc\npinned-rustdoc\npinned-cargo\npinned-rustc\npinned-rustdoc\n1.92.0\n");
+  assert.equal(result.stdout, "pinned-cargo\npinned-rustc\npinned-rustdoc\npinned-cargo\npinned-rustc\npinned-rustdoc\n1.95.0\n");
   const source = fs.readFileSync(releasePath, "utf8");
   const selection = source.indexOf("\npin_rust_toolchain\n");
   assert.ok(selection > 0 && selection < source.indexOf("run pnpm install"), "selection must execute before nested package commands");

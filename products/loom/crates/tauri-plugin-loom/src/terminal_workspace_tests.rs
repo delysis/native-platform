@@ -289,14 +289,17 @@ fn frozen_active_document_remains_usable_after_its_session_closes() {
         !control.cancelled.load(Ordering::Acquire),
         "Closing the child must not cancel owner pane runs."
     );
+    let evaluator_root = fixture.root();
     let mut evaluator = Evaluator {
-        state: &state,
+        state: state.clone(),
         identity: &identity,
         owner_project_id,
         owner_session_id,
         model: None,
         control: &control,
-        source: &source,
+        source: Some(&source),
+        root: &evaluator_root,
+        recovery: RecoveryMode::Resume,
         input: String::new(),
         receipt,
         media: Vec::new(),

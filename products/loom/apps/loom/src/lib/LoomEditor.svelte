@@ -11,6 +11,7 @@
   import {
     boundaryKeyKind, textBoundaryDelta, type BoundaryObservation
   } from './completionBoundaryDiagnostics';
+  import { applyRemoteDocument } from './remoteEditor';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
   import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
   import { objectNavigation } from './objectNavigation';
@@ -93,6 +94,7 @@
   export let value = '';
   export let referenceScope: ReferenceScope | null = null;
   const referenceDiagnostics = new ReferenceDiagnostics();
+  export let collaborative = false;
   export let label = 'Manuscript editor';
   export let readonly = false;
   export let autofocus = false;
@@ -1399,7 +1401,8 @@
     clearFormattingSelection();
     invalidateSelectionAccessibility();
     lastEmitted = normalized;
-    const next = stateFor(normalized);
+    const replacement = stateFor(normalized);
+    const next = collaborative ? applyRemoteDocument(view.state, replacement.doc) : replacement;
     observeVisualBoundary('visual_external_value', view.state.doc, next.doc, {
       incoming_utf8_bytes: new TextEncoder().encode(value).byteLength,
       normalization_exact: value === normalized, focused: view.hasFocus()

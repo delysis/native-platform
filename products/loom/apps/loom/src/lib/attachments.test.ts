@@ -15,6 +15,7 @@ import {
 
 const projectId = '01J00000000000000000000000';
 const sessionId = '01J00000000000000000000001';
+const documentId = '01J00000000000000000000002';
 
 const receipt: ImageAttachmentReceipt = {
   relative_path: 'assets/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.png',
@@ -41,14 +42,14 @@ describe('image attachments', () => {
     );
   });
 
-  it('builds only exact project/session-scoped content-addressed asset tokens', () => {
-    const expected = `v1-${projectId}-${sessionId}-${receipt.sha256}.png`;
-    expect(projectAssetProtocolToken(projectId, sessionId, receipt.markdown_path)).toBe(expected);
-    expect(projectAssetProtocolToken(projectId, sessionId, `../../${receipt.relative_path}`))
+  it('builds only exact project/session/document-scoped content-addressed asset tokens', () => {
+    const expected = `v3-${projectId}-${sessionId}-${documentId}-${receipt.sha256}.png`;
+    expect(projectAssetProtocolToken(projectId, sessionId, documentId, receipt.markdown_path)).toBe(expected);
+    expect(projectAssetProtocolToken(projectId, sessionId, documentId, `../../${receipt.relative_path}`))
       .toBe(expected);
-    expect(projectAssetProtocolToken(projectId, sessionId, '../outside/passwords.png')).toBeNull();
-    expect(projectAssetProtocolToken(projectId, sessionId, '../assets/not-a-digest.png')).toBeNull();
-    expect(projectAssetProtocolToken(projectId.toLowerCase(), sessionId, receipt.markdown_path))
+    expect(projectAssetProtocolToken(projectId, sessionId, documentId, '../outside/passwords.png')).toBeNull();
+    expect(projectAssetProtocolToken(projectId, sessionId, documentId, '../assets/not-a-digest.png')).toBeNull();
+    expect(projectAssetProtocolToken(projectId.toLowerCase(), sessionId, documentId, receipt.markdown_path))
       .toBeNull();
   });
 

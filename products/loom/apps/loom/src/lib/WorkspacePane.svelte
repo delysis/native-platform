@@ -39,6 +39,8 @@
   export let value = '';
   export let referenceScope: import('./referenceDiagnostics').ReferenceScope | null = null;
   export let readonly = false;
+  export let collaborative = false;
+  export let onImmediateDocumentMutation: () => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
   export let beforeRun: () => Promise<WorkspacePanePreparation | null>;
@@ -106,6 +108,9 @@
   $: preview = mounted && config.kind === 'browser' ? previewUrl(runs, outputDocuments, configuredDocument) : '';
 
   export function flush(): boolean { return !composing && (editor?.flushPending() ?? true); }
+  export function applyRemoteValue(text: string): void {
+    if (editingCurrent && !composing) sourceEditor?.applyRemoteValue(decodeSourceForEditor(text).display);
+  }
 
   export function focusInput(): void {
     if (config.kind === 'editor') { editor?.focusCurrentSelection(); sourceEditor?.focusCurrentSelection(); }
@@ -414,14 +419,14 @@
 </script>
 
 {#if config.visible}
-<section data-workspace-pane={paneId} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy} on:focusin={onFocus}>
+<section data-workspace-pane={paneId} data-loom-document={source?.summary.document_id} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy} on:focusin={onFocus}>
   {#if paneError && config.kind !== 'terminal'}<p class="error" role="alert">{paneError}{#if $draft.pending}<button on:click={() => void checkResult()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}
       <div class="editor">
         {#key editorKey}
           {#if visual}
-            <LoomEditor {referenceScope} bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
+            <LoomEditor {referenceScope} bind:this={editor} {value} {readonly} {collaborative} {onImmediateDocumentMutation} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
           {:else}
             <SourceEditor {referenceScope} bind:this={sourceEditor} element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
           {/if}

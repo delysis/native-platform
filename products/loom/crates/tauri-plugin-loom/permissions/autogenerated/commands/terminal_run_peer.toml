@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-terminal-run-peer"
+description = "Enables the terminal_run_peer command without any pre-configured scope."
+commands.allow = ["terminal_run_peer"]
+
+[[permission]]
+identifier = "deny-terminal-run-peer"
+description = "Denies the terminal_run_peer command without any pre-configured scope."
+commands.deny = ["terminal_run_peer"]

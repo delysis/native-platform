@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-join"
+description = "Enables the cabal_join command without any pre-configured scope."
+commands.allow = ["cabal_join"]
+
+[[permission]]
+identifier = "deny-cabal-join"
+description = "Denies the cabal_join command without any pre-configured scope."
+commands.deny = ["cabal_join"]

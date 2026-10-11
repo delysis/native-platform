@@ -37,6 +37,7 @@
   export let onImageAttachmentsCommitted: (count: number) => void = () => {};
   export let onImageAttachmentError: (message: string) => void = () => {};
   export let resolveImageAssetUrl: (markdownPath: string) => string | null = () => null;
+  export let onSelectionWitness: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void = () => {};
 
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
@@ -70,7 +71,6 @@
   let latestSelectionCallback = 'none';
   let selectionAccessibility: VisualSelectionAccessibilityWitness =
     unavailableVisualSelectionWitness();
-  export let onSelectionWitness: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void = () => {};
   let formatting: VisualFormatState = {
     block: 'body',
     bold: false,
