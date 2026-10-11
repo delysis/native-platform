@@ -311,15 +311,20 @@ fn escaped_manifest_expansion_is_rejected_before_publication_while_ordinary_text
         } else {
             "x".repeat(MAX_ATTACHMENT_TEXT_BYTES)
         };
-        let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
+        // Stored layers keep this repeat-data fixture within the default expansion policy.
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::none());
         compressed.write_all(source_text.as_bytes())?;
+        let inner = compressed.finish()?;
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::none());
+        compressed.write_all(&inner)?;
         let source_bytes = compressed.finish()?;
-        let source = temporary.path().join("original-source.txt.gz");
+        let source = temporary.path().join("original-source.txt.gz.gz");
         fs::write(&source, &source_bytes)?;
         let source_before = source_identity(&source)?;
         let (bundle, receipt, artifact_id) = canonical_attachment(&source_bytes)?;
         let request = exact_request(&bundle, &receipt, artifact_id)?;
         assert_eq!(request.canonical_text.len(), MAX_ATTACHMENT_TEXT_BYTES);
+        assert_eq!(request.canonical_text, source_text);
         let root = temporary.path().join("managed");
         let store = ManagedStore::open(&root)?;
         let outcome = materialize_attachment_text(&store, &bundle, &receipt, &request);
