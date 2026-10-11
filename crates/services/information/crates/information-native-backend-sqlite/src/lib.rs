@@ -766,7 +766,11 @@ impl AlexandriaBackend {
             remaining_chars =
                 remaining_chars.saturating_sub(snippet_chars.saturating_add(context_chars));
             let (themes, themes_truncated) = fetch_themes(connection, &raw.block_id)?;
-            if snippet_truncated || context_truncated || themes_truncated {
+            if snippet_truncated
+                || context_truncated
+                || themes_truncated
+                || !raw.rights_status_complete
+            {
                 complete = false;
             }
             let rank = u32::try_from(index.saturating_add(1)).map_err(|_| {
@@ -788,7 +792,7 @@ impl AlexandriaBackend {
         }
         if !complete {
             warnings.push(
-                "one or more result, context, theme, or query limits made this response partial"
+                "this response is partial because of a result, context, theme, query limit, or incomplete rights metadata"
                     .to_string(),
             );
         }
@@ -904,11 +908,15 @@ impl AlexandriaBackend {
             context_budget,
         )?;
         let (themes, themes_truncated) = fetch_themes(connection, &raw.block_id)?;
-        let complete = !(snippet_truncated || context_truncated || themes_truncated);
+        let complete = raw.rights_status_complete
+            && !(snippet_truncated || context_truncated || themes_truncated);
         let warnings = if complete {
             Vec::new()
         } else {
-            vec!["read text or theme metadata was truncated to its budget".to_string()]
+            vec![
+                "read text or theme metadata was truncated, or rights metadata was incomplete"
+                    .to_string(),
+            ]
         };
         let hit = self.block_evidence(
             raw,
@@ -963,6 +971,10 @@ impl AlexandriaBackend {
         metadata.insert("canonical_path".to_string(), json!(raw.canonical_path));
         metadata.insert("rights_status".to_string(), json!(&raw.rights_status));
         metadata.insert(
+            "rights_status_complete".to_string(),
+            json!(raw.rights_status_complete),
+        );
+        metadata.insert(
             "themes".to_string(),
             JsonValue::Array(
                 themes
@@ -998,7 +1010,15 @@ impl AlexandriaBackend {
                     "Alexandria document has an empty rights status",
                 )
             })?;
-        let classified_rights = classify_rights_status(status);
+        let classified_rights = if raw.rights_status_complete {
+            classify_rights_status(status)
+        } else {
+            ClassifiedDocumentRights {
+                redistribution: RedistributionPolicy::Unknown,
+                license_url: None,
+                obligations: Vec::new(),
+            }
+        };
         rights.push(RightsStatement {
             scope: format!("document:{}", raw.doc_id),
             expression: status.to_string(),
@@ -1668,6 +1688,7 @@ struct RawHit {
     source_uri: String,
     canonical_path: Option<String>,
     rights_status: Option<String>,
+    rights_status_complete: bool,
     score: f64,
     snippet: String,
 }
@@ -1697,7 +1718,16 @@ fn run_fts_query(
             substr(d.canonical_path, 1, 4096),
             substr(d.rights_status, 1, 512),
             bm25(blocks_fts) AS native_score,
-            substr(snippet(blocks_fts, 2, '[', ']', ' ... ', 32), 1, ?)
+            substr(snippet(blocks_fts, 2, '[', ']', ' ... ', 32), 1, ?),
+            CASE
+                WHEN typeof(d.rights_status) = 'text'
+                     AND octet_length(d.rights_status) <= 2048
+                THEN CASE
+                    WHEN length(d.rights_status) <= 512
+                         AND instr(d.rights_status, char(0)) = 0
+                    THEN 1 ELSE 0 END
+                ELSE 0
+            END
         FROM blocks_fts
         JOIN blocks b ON b.block_id = blocks_fts.block_id
         JOIN documents d ON d.doc_id = b.doc_id
@@ -1769,6 +1799,7 @@ fn raw_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHit> {
         rights_status: row.get(13)?,
         score: row.get(14)?,
         snippet: option_string_or_empty(row.get::<_, Option<String>>(15)?),
+        rights_status_complete: row.get(16)?,
     })
 }
 
@@ -1796,7 +1827,16 @@ fn load_block(
                 substr(d.canonical_path, 1, 4096),
                 substr(d.rights_status, 1, 512),
                 1.0,
-                substr(b.text, 1, ?2)
+                substr(b.text, 1, ?2),
+                CASE
+                    WHEN typeof(d.rights_status) = 'text'
+                         AND octet_length(d.rights_status) <= 2048
+                    THEN CASE
+                        WHEN length(d.rights_status) <= 512
+                             AND instr(d.rights_status, char(0)) = 0
+                        THEN 1 ELSE 0 END
+                    ELSE 0
+                END
             FROM blocks b
             JOIN documents d ON d.doc_id = b.doc_id
             WHERE b.block_id = ?1
@@ -2264,6 +2304,7 @@ mod tests {
     const FIXTURE_FINGERPRINT: &str = "volatile-sqlite-snapshot-v1:fixture-operation";
 
     mod count_tests;
+    mod rights_tests;
 
     fn fixture_ids() -> Result<(ResourceId, ReleaseId, RepresentationId), Box<dyn Error>> {
         Ok((
