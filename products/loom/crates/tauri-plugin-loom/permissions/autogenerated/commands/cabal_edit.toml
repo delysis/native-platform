@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-edit"
+description = "Enables the cabal_edit command without any pre-configured scope."
+commands.allow = ["cabal_edit"]
+
+[[permission]]
+identifier = "deny-cabal-edit"
+description = "Denies the cabal_edit command without any pre-configured scope."
+commands.deny = ["cabal_edit"]

@@ -4,3 +4,5 @@
 /fixtures/w1/state/loom-prior-v10/.loom/project.json text eol=lf
 /crates/loom-store/migrations/*.sql text eol=lf
 /crates/tauri-plugin-loom/tests/fixtures/*.pdf binary
+# These upstream bytes are identified by their original SHA-256 receipts.
+/signal/notices/** -text whitespace=cr-at-eol

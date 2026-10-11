@@ -3,6 +3,7 @@
 mod archive_friends;
 mod attachments;
 mod audio_io;
+mod cabals;
 mod co_writer;
 mod connected_collections;
 mod connected_imports;
@@ -23,12 +24,14 @@ mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod peer_compute;
+mod peer_media;
 mod preferences;
 mod private_sidecar;
 mod reference_diagnostics;
-
 mod server_weave;
 mod shader_preview;
+mod signal;
 mod speech_input;
 mod terminal;
 mod terminal_media;
@@ -99,9 +102,16 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
-    read_image_asset, store_image_asset,
+    store_image_asset,
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
+use crate::cabals::{
+    cabal_context_publish, cabal_context_review, cabal_edit, cabal_join, cabal_network_get,
+    cabal_network_set, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
+    cabal_transfer_owner, cabal_workspace, compute_grant, compute_host_snapshot,
+    compute_job_cancel, compute_job_check, compute_job_get, compute_job_prepare,
+    compute_job_submit, compute_jobs, compute_peer_offers, compute_revoke,
+};
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
     delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
@@ -121,13 +131,14 @@ use crate::model_download::{
     ModelLibraryError, ReservationOutcome, model_target_path,
 };
 use crate::shader_preview::shader_preview;
+use crate::signal::signal_request;
 use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
 use crate::terminal::{
-    terminal_cancel, terminal_list, terminal_run, workspace_pane_cancel, workspace_pane_list,
-    workspace_pane_run,
+    terminal_cancel, terminal_list, terminal_recover, terminal_run, terminal_run_peer,
+    workspace_pane_cancel, workspace_pane_list, workspace_pane_run,
 };
 use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
@@ -151,7 +162,7 @@ pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
 const LOOM_ASSET_SCHEME: &str = "loom-asset";
-const LOOM_ASSET_TOKEN_VERSION: &str = "v1";
+const LOOM_ASSET_TOKEN_VERSION: &str = "v3";
 const LOOM_CONTEXT_MEDIA_TOKEN_VERSION: &str = "v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -502,9 +513,9 @@ struct PreparedProject {
 #[derive(Debug)]
 pub struct PluginState {
     startup_at: Instant,
-    close_requested: AtomicBool,
+    close_requested: Arc<AtomicBool>,
     exit_authorized: AtomicBool,
-    application: Mutex<ApplicationPhase>,
+    application: Arc<Mutex<ApplicationPhase>>,
     session: Mutex<Session>,
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
@@ -514,19 +525,22 @@ pub struct PluginState {
     inference: Option<Arc<inference::Service>>,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
-    model: Mutex<ModelRegistry>,
-    model_lifecycle: Mutex<()>,
+    model: Arc<Mutex<ModelRegistry>>,
+    model_lifecycle: Arc<Mutex<()>>,
+    peer_compute: Arc<peer_compute::IdleComputeOwner>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     automatic_budget: AutomaticBudgetAuthority,
     loompad_budget: Mutex<LoompadBudget>,
     foreground_commands: ForegroundCommandRegistry,
-    generations: GenerationRegistry,
+    generations: Arc<GenerationRegistry>,
     generation_lifecycle: GenerationSupervisor,
     generation_workers: GenerationWorkerRegistry,
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
     speech_input: Arc<SpeechInputService>,
+    signal: Arc<signal::SignalService>,
+    cabals: Arc<cabals::CabalService>,
     audio_capture: audio_io::CapturePersistence,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
@@ -587,11 +601,11 @@ impl PluginState {
         )));
         let generation_lifecycle = GenerationSupervisor::new(64)
             .expect("the production generation progress capacity is valid");
-        Self {
+        let state = Self {
             startup_at: Instant::now(),
-            close_requested: AtomicBool::new(false),
+            close_requested: Arc::new(AtomicBool::new(false)),
             exit_authorized: AtomicBool::new(false),
-            application: Mutex::new(ApplicationPhase::default()),
+            application: Arc::new(Mutex::new(ApplicationPhase::default())),
             session: Mutex::new(Session::default()),
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
@@ -601,24 +615,31 @@ impl PluginState {
             inference: None,
             native_runtime,
             backend,
-            model: Mutex::new(ModelRegistry::default()),
-            model_lifecycle: Mutex::new(()),
+            model: Arc::new(Mutex::new(ModelRegistry::default())),
+            model_lifecycle: Arc::new(Mutex::new(())),
+            peer_compute: Arc::new(peer_compute::IdleComputeOwner::default()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             automatic_budget: AutomaticBudgetAuthority::default(),
             loompad_budget: Mutex::new(LoompadBudget::default()),
             foreground_commands: ForegroundCommandRegistry::default(),
-            generations: GenerationRegistry::default(),
+            generations: Arc::new(GenerationRegistry::default()),
             generation_workers: GenerationWorkerRegistry::new(generation_lifecycle.clone()),
             generation_lifecycle,
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
             speech_input: Arc::new(SpeechInputService::new(app_local_data_root.clone())),
+            signal: Arc::new(signal::SignalService::default()),
+            cabals: Arc::new(cabals::CabalService::default()),
             audio_capture: audio_io::CapturePersistence::default(),
             app_local_data_root,
             isolate_model_discovery,
             build_model_policy,
-        }
+        };
+        state
+            .cabals
+            .set_compute_executor(Arc::new(peer_compute::NativeExecutor::from_state(&state)));
+        state
     }
 }
 
@@ -645,13 +666,16 @@ impl Drop for PluginState {
             .as_mut()
             .and_then(|owner| owner.filesystem_watcher.take());
         drop(owner_filesystem_watcher);
-        if let Ok(phase) = self.application.get_mut() {
+        if let Ok(mut phase) = self.application.lock() {
             *phase = ApplicationPhase::Closing;
         }
+        self.peer_compute.close_and_drain();
         if let Err(error) = self.generation_lifecycle.quiesce() {
             eprintln!("Loom could not quiesce generation lifecycle during plugin drop: {error}");
         }
         let _desktop_workers = self.join_desktop_workers_for_exit();
+        tauri::async_runtime::block_on(self.signal.shutdown());
+        tauri::async_runtime::block_on(self.cabals.shutdown());
         if let Err(error) = tauri::async_runtime::block_on(self.speech_input.shutdown()) {
             eprintln!("Loom speech input did not stop during plugin drop: {error}");
         }
@@ -1476,7 +1500,8 @@ impl GenerationWorkerRegistry {
                 .workers
                 .iter()
                 .filter_map(|(request_id, slot)| match slot {
-                    GenerationWorkerSlot::Running { worker, .. } if worker.is_finished() => {
+                    GenerationWorkerSlot::Running { worker, owner, .. }
+                        if worker.is_finished() || matches!(owner, GenerationWorkerOwner::Terminal(control) if control.is_settled()) => {
                         Some(request_id.clone())
                     }
                     GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running { .. } => None,
@@ -2169,6 +2194,30 @@ impl Builder {
             .invoke_handler(tauri::generate_handler![
                 preferences::preferences_get,
                 preferences::preferences_update,
+                signal_request,
+                cabal_network_get,
+                cabal_network_set,
+                cabal_snapshot,
+                cabal_share,
+                cabal_context_review,
+                cabal_context_publish,
+                cabal_join,
+                cabal_open,
+                cabal_workspace,
+                cabal_edit,
+                cabal_revoke,
+                cabal_transfer_owner,
+                cabal_recover,
+                compute_host_snapshot,
+                compute_grant,
+                compute_revoke,
+                compute_peer_offers,
+                compute_job_prepare,
+                compute_job_get,
+                compute_jobs,
+                compute_job_submit,
+                compute_job_check,
+                compute_job_cancel,
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
@@ -2282,6 +2331,8 @@ impl Builder {
                 workspace_pane_run,
                 workspace_pane_list,
                 workspace_pane_cancel,
+                terminal_recover,
+                terminal_run_peer,
                 shader_preview,
                 generation_cancel,
                 candidate_keep,
@@ -2321,6 +2372,7 @@ impl Builder {
                 }
                 state.emit_timing("native_plugin_ready");
                 app.manage(state);
+                signal::resume(app);
                 Ok(())
             })
             .on_window_ready(|window| {
@@ -4494,6 +4546,7 @@ fn ingest_image_attachment_for_session(
 struct LoomAssetRequest {
     project_id: ProjectId,
     session_id: CommandId,
+    document_id: DocumentId,
     file_name: String,
 }
 
@@ -4528,13 +4581,14 @@ enum LoomAssetReadFailure {
 fn loom_asset_token(
     project_id: ProjectId,
     session_id: CommandId,
+    document_id: DocumentId,
     file_name: &str,
 ) -> Option<String> {
     if !is_canonical_image_asset_file_name(file_name) {
         return None;
     }
     Some(format!(
-        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{file_name}"
+        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{document_id}-{file_name}"
     ))
 }
 
@@ -4620,9 +4674,11 @@ fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
     if token.is_empty() || token.contains('/') || !token.is_ascii() || token.contains('%') {
         return None;
     }
-    let identity = token.strip_prefix("v1-")?;
+    let identity = token.strip_prefix("v3-")?;
     let (project_id_text, remainder) = identity.split_once('-')?;
-    let (session_id_text, file_name) = remainder.split_once('-')?;
+    let (session_id_text, remainder) = remainder.split_once('-')?;
+    let (document_id_text, file_name) = remainder.split_once('-')?;
+    let document_id = document_id_text.parse::<DocumentId>().ok()?;
     if file_name.contains('-') {
         return None;
     }
@@ -4631,13 +4687,14 @@ fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
     if project_id.to_string() != project_id_text || session_id.to_string() != session_id_text {
         return None;
     }
-    let canonical_token = loom_asset_token(project_id, session_id, file_name)?;
+    let canonical_token = loom_asset_token(project_id, session_id, document_id, file_name)?;
     if canonical_token != token {
         return None;
     }
     Some(LoomAssetRequest {
         project_id,
         session_id,
+        document_id,
         file_name: file_name.to_owned(),
     })
 }
@@ -4646,25 +4703,54 @@ fn read_authorized_loom_asset(
     state: &PluginState,
     request: &LoomAssetRequest,
 ) -> Result<LoadedProtocolAsset, LoomAssetReadFailure> {
-    read_authorized_loom_asset_with(state, request, read_image_asset).map(|asset| {
-        LoadedProtocolAsset {
+    read_authorized_loom_asset_with(state, request, context_attachments::shared::read_image).map(
+        |asset| LoadedProtocolAsset {
             bytes: asset.bytes,
             media_type: asset.media_type.to_owned(),
-        }
-    })
+        },
+    )
 }
 
 fn read_authorized_loom_asset_with(
     state: &PluginState,
     request: &LoomAssetRequest,
-    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, AttachmentStoreError>,
+    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, ContextAttachmentError>,
 ) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
     let authority = capture_loom_asset_authority(state, request)?;
+    {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+        let store = session
+            .store
+            .as_ref()
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        if session.active_session_id != Some(request.session_id)
+            || store.manifest().project_id != request.project_id
+        {
+            return Err(LoomAssetReadFailure::NotFound);
+        }
+        let registered = store
+            .registered_document(request.document_id)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        let document = store
+            .read_document(&registered.relative_path)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?;
+        if !crate::attachments::inline_image_assets(&document.text).contains(&request.file_name) {
+            return Err(LoomAssetReadFailure::NotFound);
+        }
+    }
+    let root = context_attachments::shared::inline_root(
+        &authority.project_root,
+        &request.document_id.to_string(),
+    )
+    .map_err(|_| LoomAssetReadFailure::NotFound)?;
     // Hashing and structural image decode are bounded, but still substantially
     // slower than an in-memory authority check. Never serialize unrelated
     // session work behind that filesystem and decoder latency.
-    let asset = reader(&authority.project_root, &request.file_name)
-        .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    let asset = reader(&root, &request.file_name).map_err(|_| LoomAssetReadFailure::NotFound)?;
     if !loom_asset_authority_is_current(state, &authority)? {
         return Err(LoomAssetReadFailure::NotFound);
     }
@@ -4762,12 +4848,17 @@ fn read_authorized_context_media(
     if !selected && !selected_inline {
         return Err(LoomAssetReadFailure::NotFound);
     }
-    let media = read_context_media(
-        &authority.project_root,
-        &request.attachment_id,
-        &request.media_sha256,
-    )
-    .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    let media_root = if selected {
+        authority.project_root.clone()
+    } else {
+        context_attachments::shared::inline_root(
+            &authority.project_root,
+            &request.document_id.to_string(),
+        )
+        .map_err(|_| LoomAssetReadFailure::NotFound)?
+    };
+    let media = read_context_media(&media_root, &request.attachment_id, &request.media_sha256)
+        .map_err(|_| LoomAssetReadFailure::NotFound)?;
     if !loom_asset_authority_is_current(state, &authority)? {
         return Err(LoomAssetReadFailure::NotFound);
     }
@@ -5046,7 +5137,9 @@ async fn document_export_choose<R: Runtime>(
 async fn attachment_reveal_original<R: Runtime>(
     project_id: String,
     session_id: String,
-    attachment_id: String,
+    document_id: Option<String>,
+    attachment_id: Option<String>,
+    material_id: Option<String>,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
@@ -5055,8 +5148,35 @@ async fn attachment_reveal_original<R: Runtime>(
         let mut session = lock_session(&state)?;
         let store =
             material_commands::require_source_store(&mut session, &project_id, &session_id)?;
-        context_attachments::original_for_export(store.root(), &attachment_id)
-            .map_err(|error| IpcFailure::context_attachment(&error))?
+        match (&document_id, &attachment_id, &material_id) {
+            (None, None, Some(material_id)) => {
+                materials::original_for_export(store, material_id).map_err(IpcFailure::from)?
+            }
+            (None, Some(attachment_id), None) => {
+                context_attachments::original_for_export(store.root(), attachment_id)
+                    .map_err(|error| IpcFailure::context_attachment(&error))?
+            }
+            (Some(document_id), Some(attachment_id), None) => {
+                let id = document_id
+                    .parse::<DocumentId>()
+                    .map_err(|_| stale_document_action_failure())?;
+                let registered = store
+                    .registered_document(id)
+                    .map_err(IpcFailure::store)?
+                    .ok_or_else(stale_document_action_failure)?;
+                let document = store
+                    .read_document(&registered.relative_path)
+                    .map_err(IpcFailure::store)?;
+                context_attachments::shared::original_for_document(
+                    store.root(),
+                    document_id,
+                    &document.text,
+                    attachment_id,
+                )
+                .map_err(|error| IpcFailure::context_attachment(&error))?
+            }
+            _ => return Err(stale_document_action_failure()),
+        }
     };
     // Neither application nor project locks remain held across the OS dialog.
     let Some(destination) = app
@@ -10666,6 +10786,9 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     *phase = ApplicationPhase::Closing;
+    state.peer_compute.close_and_drain();
+    tauri::async_runtime::block_on(state.signal.shutdown());
+    tauri::async_runtime::block_on(state.cabals.shutdown());
     state
         .prepared_project
         .lock()
@@ -10996,6 +11119,8 @@ fn application_close<R: Runtime>(
         IpcFailure::new("generation_lifecycle_not_drained", error.to_string(), true)
     })?;
     let permit = close_attempt.authorize(proof);
+    tauri::async_runtime::block_on(state.signal.shutdown());
+    tauri::async_runtime::block_on(state.cabals.shutdown());
     exit_application(&app, permit);
     Ok(())
 }
@@ -11353,8 +11478,15 @@ fn lock_model_registry(
     })
 }
 
-fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_, ()>, IpcFailure> {
-    state
+#[derive(Debug)]
+struct ModelLifecycleGuard<'a> {
+    _model: std::sync::MutexGuard<'a, ()>,
+    _foreground: peer_compute::ForegroundModel,
+}
+
+fn lock_model_lifecycle(state: &PluginState) -> Result<ModelLifecycleGuard<'_>, IpcFailure> {
+    let foreground = state.peer_compute.foreground();
+    let model = state
         .model_lifecycle
         .try_lock()
         .map_err(|error| match error {
@@ -11368,13 +11500,17 @@ fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_,
                 "the model lifecycle entered an invalid state; restart Loom",
                 false,
             ),
-        })
+        })?;
+    Ok(ModelLifecycleGuard {
+        _model: model,
+        _foreground: foreground,
+    })
 }
 
 fn ensure_no_active_generations(state: &PluginState, action: &str) -> Result<(), IpcFailure> {
     if state
         .generations
-        .active_branch_count()
+        .active_local_branch_count()
         .map_err(|error| IpcFailure::generation_registry(&error))?
         == 0
     {
@@ -15557,8 +15693,16 @@ mod tests {
     fn asset_read_releases_session_lock_and_revalidates_authority() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Asset Read Authority");
-        let store =
+        let mut store =
             initialize_project(&root, "Asset Read Authority".to_owned()).expect("initialize");
+        store
+            .create_document_if_absent(
+                "picture.md",
+                DocumentContent::Prose(format!("![Image](../assets/{}.png)", "a".repeat(64))),
+                "fixture",
+            )
+            .unwrap();
+        let document_id = store.read_document("picture.md").unwrap().document_id;
         let project_id = store.manifest().project_id;
         let expected_root = store.root().to_path_buf();
         let session_id = CommandId::new();
@@ -15572,6 +15716,7 @@ mod tests {
         let request = LoomAssetRequest {
             project_id,
             session_id,
+            document_id,
             file_name: format!("{}.png", "a".repeat(64)),
         };
 
@@ -15649,7 +15794,20 @@ mod tests {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("asset file name");
-        let token_a = loom_asset_token(project_a, session_a, file_name).expect("asset token");
+        let document_id = {
+            let mut session = state.session.lock().unwrap();
+            let store = session.store.as_mut().unwrap();
+            store
+                .create_document_if_absent(
+                    "picture.md",
+                    DocumentContent::Prose(format!("![Image]({})", stored.markdown_path)),
+                    "fixture",
+                )
+                .unwrap();
+            store.read_document("picture.md").unwrap().document_id
+        };
+        let token_a =
+            loom_asset_token(project_a, session_a, document_id, file_name).expect("asset token");
         let mac_uri_a = format!("loom-asset://localhost/{token_a}");
         let windows_uri_a = format!("http://loom-asset.localhost/{token_a}");
 
@@ -15769,7 +15927,8 @@ mod tests {
             http::StatusCode::NOT_FOUND,
             "the old project A session token stays revoked after reopen"
         );
-        let token_a2 = loom_asset_token(project_a, session_a2, file_name).expect("reopen token");
+        let token_a2 =
+            loom_asset_token(project_a, session_a2, document_id, file_name).expect("reopen token");
         let reopened_response = loom_asset_protocol_response(
             &relaunched_state,
             "main",
@@ -15786,8 +15945,10 @@ mod tests {
     fn asset_protocol_parser_rejects_noncanonical_tokens_origins_and_paths() {
         let project_id = ProjectId::new();
         let session_id = CommandId::new();
+        let document_id = DocumentId::new();
         let file_name = format!("{}.png", "a".repeat(64));
-        let token = loom_asset_token(project_id, session_id, &file_name).expect("canonical token");
+        let token = loom_asset_token(project_id, session_id, document_id, &file_name)
+            .expect("canonical token");
         let mac_uri = format!("loom-asset://localhost/{token}")
             .parse::<http::Uri>()
             .expect("mac URI");
@@ -15806,7 +15967,7 @@ mod tests {
             format!("loom-asset://localhost/%25{token}"),
             format!("loom-asset://localhost/{project_id}/{session_id}/{file_name}"),
             format!("loom-asset://localhost/v1-{project_id}-{session_id}-../{file_name}"),
-            format!("loom-asset://localhost/V1-{project_id}-{session_id}-{file_name}"),
+            format!("loom-asset://localhost/V3-{project_id}-{session_id}-{file_name}"),
             format!(
                 "loom-asset://localhost/v1-{}-{session_id}-{file_name}",
                 project_id.to_string().to_ascii_lowercase()

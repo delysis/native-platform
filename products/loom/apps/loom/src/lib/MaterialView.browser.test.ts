@@ -4,8 +4,8 @@ import { page } from 'vitest/browser';
 import MaterialView from './MaterialView.svelte';
 import type { MaterialEntry, MaterialEvidence, MaterialRead, MaterialNavigation } from './materials';
 import '../app.css';
-const ipc = vi.hoisted(() => ({ read: vi.fn(), pdf: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
-vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, readMaterialPdfPage: ipc.pdf, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
+const ipc = vi.hoisted(() => ({ read: vi.fn(), pdf: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), materialOriginal: vi.fn(), remove: vi.fn() }));
+vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, readMaterialPdfPage: ipc.pdf, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original, revealMaterialOriginal: ipc.materialOriginal }));
 const material: MaterialEntry = { id: 'material-' + 'a'.repeat(64), name: 'Research', reference: '@"materials/Research#a"', kind: 'library', pinned: false, available: true, source_path: '/private/library.sqlite', attachment_id: null, metadata_revision: 'a'.repeat(64) };
 const evidence: MaterialEvidence = { id: 'b'.repeat(64), reference: '@"evidence/b"', material_id: material.id, title: 'A source', text: 'Exact café evidence.\nSecond line.', source_revision: 'revision', text_sha256: 'hash', locator: { document_id: 'source', block_id: 7 } };
 let view: ReturnType<typeof mount> | undefined;
@@ -124,6 +124,13 @@ describe('named material viewing', () => {
     await page.getByRole('button', { name: 'Show extracted text' }).click();
     await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe(read.text);
     await expect.element(page.getByText('The extracted text has no page mapping. Showing the whole document.')).toBeVisible();
+  });
+  it('reveals an original using the retained material identity', async () => {
+    const retained: MaterialEntry = { ...material, kind: 'attachment', attachment_id: 'a'.repeat(64) };
+    render({ material: retained }, { material: retained, text: '', complete: true, warnings: [], source_revision: 'revision', evidence: [] });
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Export original' }).click();
+    expect(ipc.materialOriginal).toHaveBeenCalledWith('project', 'session', material.id);
   });
   it('navigates only mapped PDF pages and quotes the exact displayed page with retained lineage', async () => {
     const read = pdfSource();

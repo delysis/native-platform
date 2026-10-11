@@ -112,6 +112,7 @@ impl TerminalFixture {
             presentation,
             context,
             boundary,
+            None,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
         ))
@@ -261,68 +262,78 @@ fn owner_source_find_retains_scoped_evidence_and_output_in_active_child() {
 
 #[test]
 fn live_terminal_stop_latches_while_store_is_locked_and_rejects_stale_scope() {
-    let fixture = TerminalFixture::new();
-    let state = fixture.app.state::<PluginState>();
-    let command = CommandId::new();
-    let request = format!("terminal-{command}");
-    let native_run = GenerationRunId::new();
-    let control = Arc::new(TerminalControl::default());
-    state
-        .generations
-        .reserve(
-            GenerationFamilyIdentity {
-                request_id: request.clone(),
-                project_id: fixture.project_id.parse().unwrap(),
-                session_id: fixture.session_id.parse().unwrap(),
-                document_id: fixture.source.document_id,
-            },
-            vec![(native_run, BranchId::new())],
-        )
-        .unwrap();
-    state
-        .generations
-        .attach_cancellation(&request, control.clone())
-        .unwrap();
-    for (project, session) in [
-        (fixture.project_id.clone(), CommandId::new().to_string()),
-        (ProjectId::new().to_string(), fixture.session_id.clone()),
-    ] {
-        assert!(
-            tauri::async_runtime::block_on(terminal_cancel(
+    for remote in [false, true] {
+        let fixture = TerminalFixture::new();
+        let state = fixture.app.state::<PluginState>();
+        let command = CommandId::new();
+        let request = format!("terminal-{command}");
+        let native_run = GenerationRunId::new();
+        let control = Arc::new(TerminalControl {
+            remote_cancel: remote.then(|| (fixture.root(), command.to_string())),
+            ..TerminalControl::default()
+        });
+        state
+            .generations
+            .reserve(
+                GenerationFamilyIdentity {
+                    request_id: request.clone(),
+                    project_id: fixture.project_id.parse().unwrap(),
+                    session_id: fixture.session_id.parse().unwrap(),
+                    document_id: fixture.source.document_id,
+                },
+                vec![(native_run, BranchId::new())],
+            )
+            .unwrap();
+        state
+            .generations
+            .attach_cancellation(&request, control.clone())
+            .unwrap();
+        for (project, session) in [
+            (fixture.project_id.clone(), CommandId::new().to_string()),
+            (ProjectId::new().to_string(), fixture.session_id.clone()),
+        ] {
+            assert!(
+                tauri::async_runtime::block_on(terminal_cancel(
+                    project,
+                    session,
+                    command.to_string(),
+                    fixture.app.state::<PluginState>()
+                ))
+                .is_err()
+            );
+            assert!(!control.cancelled.load(Ordering::Acquire));
+        }
+        let held = state.session.lock().unwrap();
+        let app = fixture.app.handle().clone();
+        let project = fixture.project_id.clone();
+        let session = fixture.session_id.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = tauri::async_runtime::block_on(terminal_cancel(
                 project,
                 session,
                 command.to_string(),
-                fixture.app.state::<PluginState>()
-            ))
-            .is_err()
+                app.state::<PluginState>(),
+            ));
+            send.send(result).unwrap();
+        });
+        let completed = receive.recv_timeout(Duration::from_secs(1));
+        let latched_while_locked = control.cancelled.load(Ordering::Acquire);
+        drop(held); // Release before joining even when the regression reappears.
+        worker.join().unwrap();
+        state.generations.complete_family(&request).unwrap();
+        assert!(
+            completed
+                .expect("Stop must not wait for the store lock")
+                .is_ok()
         );
-        assert!(!control.cancelled.load(Ordering::Acquire));
+        assert!(latched_while_locked);
+        assert_eq!(
+            crate::terminal_receipts::cancel_requested(&fixture.root(), &command.to_string())
+                .unwrap(),
+            remote
+        );
     }
-    let held = state.session.lock().unwrap();
-    let app = fixture.app.handle().clone();
-    let project = fixture.project_id.clone();
-    let session = fixture.session_id.clone();
-    let (send, receive) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let result = tauri::async_runtime::block_on(terminal_cancel(
-            project,
-            session,
-            command.to_string(),
-            app.state::<PluginState>(),
-        ));
-        send.send(result).unwrap();
-    });
-    let completed = receive.recv_timeout(Duration::from_secs(1));
-    let latched_while_locked = control.cancelled.load(Ordering::Acquire);
-    drop(held); // Release before joining even when the regression reappears.
-    worker.join().unwrap();
-    state.generations.complete_family(&request).unwrap();
-    assert!(
-        completed
-            .expect("Stop must not wait for the store lock")
-            .is_ok()
-    );
-    assert!(latched_while_locked);
 }
 
 #[test]
@@ -489,14 +500,17 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
     };
     let control = TerminalControl::default();
     let (owner_project_id, owner_session_id) = fixture.owner_identity();
+    let root = fixture.root();
     let mut evaluator = Evaluator {
-        state: &state,
+        state: state.clone(),
         identity: &identity,
         owner_project_id,
         owner_session_id,
         model: None,
         control: &control,
-        source: &fixture.source,
+        source: Some(&fixture.source),
+        root: &root,
+        recovery: RecoveryMode::Resume,
         input: String::new(),
         receipt,
         media: Vec::new(),
@@ -584,14 +598,17 @@ fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
     };
     let control = TerminalControl::default();
     let (owner_project_id, owner_session_id) = fixture.owner_identity();
+    let root = fixture.root();
     let mut evaluator = Evaluator {
-        state: &state,
+        state: state.clone(),
         identity: &identity,
         owner_project_id,
         owner_session_id,
         model: None,
         control: &control,
-        source: &fixture.source,
+        source: Some(&fixture.source),
+        root: &root,
+        recovery: RecoveryMode::Resume,
         input: String::new(),
         receipt,
         media: Vec::new(),

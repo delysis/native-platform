@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-compute-job-get"
+description = "Enables the compute_job_get command without any pre-configured scope."
+commands.allow = ["compute_job_get"]
+
+[[permission]]
+identifier = "deny-compute-job-get"
+description = "Denies the compute_job_get command without any pre-configured scope."
+commands.deny = ["compute_job_get"]

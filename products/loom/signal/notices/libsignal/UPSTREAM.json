@@ -1,0 +1,7 @@
+{
+  "source": "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232",
+  "files": {
+    "LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "acknowledgments/acknowledgments-desktop.md": "6d345aec8925a4e965f138cb1b3d0f8fb92522448448ed54abfb494cb9dde25d"
+  }
+}

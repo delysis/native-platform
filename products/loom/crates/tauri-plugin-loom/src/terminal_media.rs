@@ -2,8 +2,6 @@
 //! Ordinary links never grant file access; only retained attachment identities
 //! recognized by the existing context registry supply bytes.
 
-use std::collections::HashSet;
-
 use llama_native_types::MediaInput;
 #[cfg(test)]
 use llama_native_types::MediaKind;
@@ -17,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::IpcFailure;
-use super::context_attachments::resolve_media_for_document;
+use super::context_attachments::{resolve_inline_media, resolve_media_for_document};
 use super::document_bindings::ResolvedDocument;
 
 /// The sole ordered media admission/budget implementation for source documents,
@@ -116,24 +114,66 @@ pub(super) fn resolve(
     if references.len() > 32 {
         return Err(limit());
     }
-    let documents = std::iter::once((source.document_id, source.text.as_str())).chain(
-        references
-            .iter()
-            .map(|document| (document.document_id, document.text.as_str())),
-    );
-    let mut media = MediaAccumulator::default();
-    let mut seen_documents = HashSet::new();
-    for (document_id, text) in documents {
-        if !seen_documents.insert(document_id) {
-            continue;
+    if store.read_blob(source.blob_id).map_err(IpcFailure::store)? != source.text.as_bytes() {
+        return Err(invalid("Source text differs from its retained blob."));
+    }
+    for document in references {
+        if document.document_id == source.document_id
+            && (document.revision_id != source.revision_id || document.blob_id != source.blob_id)
+        {
+            return Err(invalid(
+                "Source and reference name conflicting document revisions.",
+            ));
         }
-        let resolved = resolve_media_for_document(store.root(), &document_id.to_string(), text)
+    }
+    let mut media = MediaAccumulator::default();
+    media.extend(
+        resolve_media_for_document(store.root(), &source.document_id.to_string(), &source.text)
             .map_err(|error| {
                 IpcFailure::new("terminal_media_unavailable", error.to_string(), false)
-            })?;
-        media.extend(resolved)?;
-    }
+            })?,
+    )?;
+    // Only the explicitly admitted source includes its scratch context.
+    append_references(store, references, &mut media)?;
     Ok(media.finish())
+}
+
+pub(super) fn append_references(
+    store: &ProjectStore,
+    references: &[ResolvedDocument],
+    media: &mut MediaAccumulator,
+) -> Result<(), IpcFailure> {
+    if references.len() > 32 {
+        return Err(limit());
+    }
+    let mut seen_documents = std::collections::HashMap::new();
+    for document in references {
+        if store
+            .read_blob(document.blob_id)
+            .map_err(IpcFailure::store)?
+            != document.text.as_bytes()
+        {
+            return Err(invalid("Reference text differs from its retained blob."));
+        }
+        let identity = (document.revision_id, document.blob_id);
+        if let Some(previous) = seen_documents.insert(document.document_id, identity) {
+            if previous != identity {
+                return Err(invalid("Conflicting revisions in one reference operation."));
+            }
+            continue;
+        }
+        media.extend(
+            resolve_inline_media(
+                store.root(),
+                &document.document_id.to_string(),
+                &document.text,
+            )
+            .map_err(|error| {
+                IpcFailure::new("terminal_media_unavailable", error.to_string(), false)
+            })?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Apply the same aggregate budget after combining independently resolved inputs.
@@ -245,7 +285,7 @@ mod tests {
     use loom_document::DocumentContent;
 
     use super::*;
-    use crate::context_attachments::import_recorded_wav;
+    use crate::context_attachments::{import_recorded_wav, set_document_context_snapshot};
     use crate::document_bindings::resolve_references;
 
     fn wav(sample: i16) -> Vec<u8> {
@@ -390,10 +430,24 @@ mod tests {
         let source = store.read_document("source.md").expect("source");
         let references =
             resolve_references(&store, &["reference".into()]).expect("explicit reference");
+        let private = import_recorded_wav(store.root(), "private.wav".into(), &wav(7))
+            .expect("private scratch audio");
+        set_document_context_snapshot(
+            store.root(),
+            &references[0].document_id.to_string(),
+            "Private scratch context is not part of this reference.",
+            &[private.id],
+        )
+        .expect("private referenced context");
         let media = resolve(&store, &source, &references, 32_768).expect("native media");
         assert_eq!(media.len(), 2);
         assert_eq!(media[0].bytes, first_bytes);
         assert_eq!(media[1].bytes, second_bytes);
+        let value = crate::material_context::resolve(&store, "reference").unwrap();
+        let referenced_media = crate::material_context::native_media(&store, [&value]).unwrap();
+        assert_eq!(referenced_media.len(), 2);
+        assert_eq!(referenced_media[0].bytes, second_bytes);
+        assert_eq!(referenced_media[1].bytes, first_bytes);
         assert_eq!(
             resolve(&store, &source, &[], 32_768)
                 .expect("source only")

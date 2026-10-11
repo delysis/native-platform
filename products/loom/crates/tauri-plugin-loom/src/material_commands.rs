@@ -220,21 +220,27 @@ pub(super) async fn material_read_evidence(
 pub(super) async fn material_bind_attachment(
     project_id: String,
     session_id: String,
+    document_id: Option<String>,
     attachment_id: String,
     name: Option<String>,
     retention: Option<MaterialRetention>,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
-        let item = match retention.unwrap_or_default() {
-            MaterialRetention::Ordinary => {
-                materials::bind_attachment(store, &attachment_id, name.as_deref())
-            }
-            protected @ MaterialRetention::Protected => materials::bind_attachment_with_retention(
+        let retention = retention.unwrap_or_default();
+        let item = match document_id.as_deref() {
+            Some(document_id) => materials::bind_document_attachment(
+                store,
+                document_id,
+                &attachment_id,
+                name.as_deref(),
+                retention,
+            ),
+            None => materials::bind_attachment_with_retention(
                 store,
                 &attachment_id,
                 name.as_deref(),
-                protected,
+                retention,
             ),
         };
         observe_entry(store, item)

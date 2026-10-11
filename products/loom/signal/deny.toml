@@ -1,0 +1,28 @@
+# This policy applies only to the isolated AGPL Signal worker.
+[advisories]
+git-fetch-with-cli = true
+ignore = [
+    { id = "RUSTSEC-2023-0089", reason = "Maintenance notice in phonenumber's postcard/heapless build graph. Review upstream atomic-polyfill removal by 2026-12-14." },
+    { id = "RUSTSEC-2025-0141", reason = "Signal's pinned protocol implementation uses bincode 1.3.3. Maintenance notice, not a reported runtime vulnerability; review upstream format support by 2026-12-14." },
+    { id = "RUSTSEC-2026-0173", reason = "Maintenance notice for proc-macro-error2 through libcrux's hax build macros. Review upstream replacement by 2026-12-14." },
+]
+
+[licenses]
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause",
+    "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0",
+    "MPL-2.0", "AGPL-3.0-only",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Upstream libsignal and SPQR select release tags. Cargo.lock binds them to
+# exact commits, and all build/audit commands require that lock unchanged.
+required-git-spec = "tag"
+allow-git = [
+    "https://github.com/whisperfish/presage",
+    "https://github.com/whisperfish/libsignal-service-rs",
+    "https://github.com/signalapp/libsignal",
+    "https://github.com/signalapp/SparsePostQuantumRatchet.git",
+]

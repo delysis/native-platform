@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+exclude = ["vendor/presage", "vendor/presage-store-sqlite"]
+
+[package]
+name = "loom-signal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+loom-signal-protocol = { path = "../crates/loom-signal-protocol" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "3a45e915520348cbd93fc13de47c482b8e855c99" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "3a45e915520348cbd93fc13de47c482b8e855c99" }
+base64 = "0.22"
+prost = "0.14"
+rand = "0.9"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+anyhow = "1.0"
+fs2 = "0.4"
+futures = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = "0.7"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
+presage-store-sqlite = { path = "vendor/presage-store-sqlite" }
