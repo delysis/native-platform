@@ -16547,6 +16547,7 @@ mod tests {
 
     mod tauri016_persistence {
         use super::*;
+        use loom_store::StoreError;
 
         struct Fixture {
             app: tauri::App<tauri::test::MockRuntime>,
