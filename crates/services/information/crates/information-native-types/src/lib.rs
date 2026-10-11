@@ -1158,7 +1158,14 @@ impl ManagedDocumentsSearchHit {
         for statement in &self.rights {
             statement.validate()?;
         }
-        self.use_policy.validate_with_rights(&self.rights)
+        self.use_policy.validate_with_rights(&self.rights)?;
+        if self.use_policy.permission_for(RetrievalPurpose::LocalUi) != UsePermission::Allowed {
+            return Err(ContractError::InvalidContract(
+                "managed local-search hit does not allow its local UI retrieval purpose"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

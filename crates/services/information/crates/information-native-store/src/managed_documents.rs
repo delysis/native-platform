@@ -13,8 +13,8 @@ use information_native_types::{
     ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest,
     ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
     ManagedDocumentsV1, ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId,
-    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RightsStatement,
-    UsePolicy,
+    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RetrievalPurpose,
+    RightsStatement, UsePermission, UsePolicy,
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -919,6 +919,7 @@ fn search_database(
              JOIN segments s ON s.rowid = segments_fts.rowid
              JOIN documents d ON d.document_id = s.document_id
              WHERE segments_fts MATCH ?1
+               AND json_extract(d.use_policy_json, '$.local_search') = 'allowed'
              ORDER BY bm25(segments_fts), s.document_id, s.ordinal
              LIMIT ?2",
         )
@@ -946,6 +947,14 @@ fn search_database(
     for row in rows {
         let row =
             row.map_err(|source| sqlite_error("read managed documents search row", source))?;
+        let use_policy: UsePolicy =
+            decode_json(&row.use_policy_json, "managed document use policy")?;
+        if use_policy.permission_for(RetrievalPurpose::LocalUi) != UsePermission::Allowed {
+            return Err(StoreError::RegistryCorrupt(
+                "managed local search returned a document without local-search permission"
+                    .to_string(),
+            ));
+        }
         let lineage: Vec<ManagedDocumentLineage> =
             decode_json(&row.lineage_json, "managed document lineage")?;
         let source_artifacts = source_artifacts_for_lineage(manifest, &lineage)?;
@@ -967,7 +976,7 @@ fn search_database(
             source_artifacts,
             lineage,
             rights: decode_json(&row.rights_json, "managed document rights")?,
-            use_policy: decode_json(&row.use_policy_json, "managed document use policy")?,
+            use_policy,
         });
     }
     Ok(ManagedDocumentsSearchResult {
@@ -2199,6 +2208,108 @@ mod tests {
             store.search_managed_documents(&request),
             Err(StoreError::ManagedDocumentsNotFound(_))
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_local_search_filters_actual_purpose_before_the_hit_limit()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let source = temporary.path().join("original.txt");
+        fs::write(&source, b"preserve the canonical source")?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        let mut materialization = fixture_materialization()?;
+        let original = materialization.documents[0].clone();
+        materialization.documents.clear();
+        for (id, local_search) in [
+            ("a-denied", UsePermission::Forbidden),
+            ("b-unknown", UsePermission::Unknown),
+            ("c-allowed", UsePermission::Allowed),
+        ] {
+            let mut document = original.clone();
+            document.document_id = ManagedDocumentId::parse(id)?;
+            document.segments[0].segment_id = ManagedSegmentId::parse(format!("{id}-segment"))?;
+            document.use_policy.local_search = local_search;
+            materialization.documents.push(document);
+        }
+        materialization.refresh_content_sha256()?;
+        materialization.validate()?; // producer policy may legitimately deny local search
+        let receipt = store.materialize_documents(&materialization)?;
+        let database = store
+            .root
+            .join(&receipt.managed_relative_path)
+            .join(DATABASE_FILE);
+        let bytes_before = fs::read(&database)?;
+        let connection = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let matching: i64 = connection.query_row(
+            "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'contemplative'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            matching, 3,
+            "denied source evidence remains stored and indexed"
+        );
+        drop(connection);
+        let request = ManagedDocumentsSearchRequest {
+            schema: MANAGED_DOCUMENTS_SEARCH_SCHEMA.to_string(),
+            materialization_id: receipt.materialization_id,
+            content_sha256: receipt.content_sha256,
+            query: "contemplative".to_string(),
+            max_hits: 1,
+            max_snippet_chars: 256,
+        };
+        let result = store.search_managed_documents(&request)?;
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "filtering must precede LIMIT; a denied hit cannot crowd out allowed evidence"
+        );
+        assert_eq!(result.hits[0].document_id.as_str(), "c-allowed");
+        assert_eq!(
+            result.hits[0]
+                .use_policy
+                .permission_for(RetrievalPurpose::LocalUi),
+            UsePermission::Allowed
+        );
+        assert_eq!(
+            result.hits[0].use_policy.model_context,
+            UsePermission::Unknown
+        );
+        assert_eq!(
+            result.hits[0].use_policy.excerpt_export,
+            UsePermission::Forbidden
+        );
+        for denied in [UsePermission::Forbidden, UsePermission::Unknown] {
+            let mut invalid = result.clone();
+            invalid.hits[0].use_policy.local_search = denied;
+            assert!(
+                invalid.validate(&request).is_err(),
+                "the typed result contract also rejects {denied:?}"
+            );
+        }
+        assert_eq!(fs::read(&database)?, bytes_before);
+        assert_eq!(fs::read(&source)?, b"preserve the canonical source");
+        let mut denied_materialization = materialization.clone();
+        denied_materialization.materialization_id = ManagedMaterializationId::new();
+        denied_materialization.documents.pop();
+        denied_materialization.refresh_content_sha256()?;
+        let denied = store.materialize_documents(&denied_materialization)?;
+        let denied_request = ManagedDocumentsSearchRequest {
+            materialization_id: denied.materialization_id,
+            content_sha256: denied.content_sha256,
+            ..request
+        };
+        assert!(
+            store
+                .search_managed_documents(&denied_request)?
+                .hits
+                .is_empty()
+        );
         Ok(())
     }
 
