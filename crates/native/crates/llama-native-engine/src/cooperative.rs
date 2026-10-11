@@ -1190,10 +1190,7 @@ mod tests {
                 control.snapshot().phase,
                 crate::operation_registry::RequestPhase::Terminal
             );
-            assert_eq!(
-                handle.inner.requests.active_count().expect("held executor"),
-                1
-            );
+            assert_eq!(handle.inner.requests.active_count(), 1);
             if drop_receiver {
                 drop(ticket);
             } else {
@@ -1215,14 +1212,7 @@ mod tests {
                     .class,
                 RequestTerminalClass::Cancelled
             );
-            assert_eq!(
-                handle
-                    .inner
-                    .requests
-                    .active_count()
-                    .expect("released executor"),
-                0
-            );
+            assert_eq!(handle.inner.requests.active_count(), 0);
         }
     }
 
