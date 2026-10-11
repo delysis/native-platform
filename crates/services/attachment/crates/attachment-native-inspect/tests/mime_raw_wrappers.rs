@@ -40,7 +40,7 @@ fn inspect(bytes: &[u8], limits: BudgetLimits) -> AttachmentBundle {
 }
 
 fn assert_early_refusal(bundle: &AttachmentBundle, code: &str) {
-    assert_eq!(bundle.graph.coverage, Coverage::Partial);
+    assert!(matches!(bundle.graph.coverage, Coverage::Partial { .. }));
     assert_eq!(bundle.graph.objects.len(), 1);
     assert!(bundle.graph.edges.is_empty());
     assert_eq!(bundle.graph.usage.entries, 0);
