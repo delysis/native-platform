@@ -17,11 +17,11 @@ use chrono::{DateTime, Utc};
 use information_native_store::{ManagedStore, StoreError};
 use information_native_types::{
     ArtifactId as InformationArtifactId, ContractError as InformationContractError,
-    EvidenceLocator, MANAGED_DOCUMENTS_SCHEMA, ManagedDocument, ManagedDocumentId,
-    ManagedDocumentLineage, ManagedDocumentVisibility, ManagedDocumentsReceipt, ManagedDocumentsV1,
-    ManagedMaterializationId, ManagedSegmentId, ManagedSourceArtifact, ManagedTextSegment,
-    Provenance, RedistributionPolicy, ReleaseId, RepresentationId, ResourceId, RightsStatement,
-    UsePermission, UsePolicy, managed_text_sha256,
+    EvidenceLocator, MANAGED_DOCUMENTS_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
+    ManagedDocument, ManagedDocumentId, ManagedDocumentLineage, ManagedDocumentVisibility,
+    ManagedDocumentsReceipt, ManagedDocumentsV1, ManagedMaterializationId, ManagedSegmentId,
+    ManagedSourceArtifact, ManagedTextSegment, Provenance, RedistributionPolicy, ReleaseId,
+    RepresentationId, ResourceId, RightsStatement, UsePermission, UsePolicy, managed_text_sha256,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -252,10 +252,7 @@ impl AttachmentTextMaterializationRequest {
         title: String,
         rights: ConfirmedRights,
     ) -> Result<Self, BridgeError> {
-        bundle.validate()?;
-        receipt.validate_against(bundle, None)?;
         validate_title(&title)?;
-        rights.private_use_policy()?;
         let artifact = bundle
             .artifacts
             .iter()
@@ -264,6 +261,10 @@ impl AttachmentTextMaterializationRequest {
         let ArtifactPayload::Text { text, .. } = &artifact.payload else {
             return Err(BridgeError::UnsupportedArtifact);
         };
+        validate_text_length(text)?;
+        bundle.validate()?;
+        receipt.validate_against(bundle, None)?;
+        rights.private_use_policy()?;
         Ok(Self {
             schema: ATTACHMENT_TEXT_MATERIALIZATION_SCHEMA.to_string(),
             root_sha256: bundle.graph.root.0.clone(),
@@ -392,6 +393,8 @@ fn prepare_materialization(
     if request.schema != ATTACHMENT_TEXT_MATERIALIZATION_SCHEMA {
         return Err(BridgeError::InvalidRequest("schema is not supported"));
     }
+    validate_text_length(&request.canonical_text)?;
+    validate_title(&request.title)?;
     bundle.validate()?;
     receipt.validate_against(bundle, None)?;
     if !canonical_sha256(&request.root_sha256)
@@ -466,12 +469,7 @@ fn validate_text(
     request: &AttachmentTextMaterializationRequest,
     artifact_text: &str,
 ) -> Result<(), BridgeError> {
-    if request.canonical_text.is_empty() || request.canonical_text.len() > MAX_ATTACHMENT_TEXT_BYTES
-    {
-        return Err(BridgeError::InvalidRequest(
-            "canonical text is empty or exceeds the one MiB bridge limit",
-        ));
-    }
+    validate_text_length(&request.canonical_text)?;
     if request.canonical_text != artifact_text {
         return Err(BridgeError::IdentityMismatch(IdentityField::CanonicalText));
     }
@@ -487,6 +485,15 @@ fn validate_text(
     {
         return Err(BridgeError::IdentityMismatch(
             IdentityField::CanonicalTextSha256,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_text_length(text: &str) -> Result<(), BridgeError> {
+    if text.is_empty() || text.len() > MAX_ATTACHMENT_TEXT_BYTES {
+        return Err(BridgeError::InvalidRequest(
+            "canonical text is empty or exceeds the one MiB bridge limit",
         ));
     }
     Ok(())
@@ -630,6 +637,10 @@ fn build_documents(
         documents: vec![document],
         content_sha256: "0".repeat(64),
     };
+    // Publication and bounded discovery use the same exact serialized-byte
+    // ceiling. Reject escaped text or metadata expansion before content hashing
+    // and before the store creates any managed staging state.
+    documents.validate_manifest_projection_bytes(MAX_MANAGED_MANIFEST_PROJECTION_BYTES)?;
     documents.refresh_content_sha256()?;
     documents.validate()?;
     Ok(documents)

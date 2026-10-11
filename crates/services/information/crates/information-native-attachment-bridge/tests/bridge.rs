@@ -4,12 +4,13 @@ use chrono::{DateTime, Utc};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use information_native_attachment_bridge::{
-    AttachmentTextMaterializationRequest, ConfirmedRights, materialize_attachment_text,
+    AttachmentTextMaterializationRequest, BridgeError, ConfirmedRights, MAX_ATTACHMENT_TEXT_BYTES,
+    materialize_attachment_text,
 };
 use information_native_store::ManagedStore;
 use information_native_types::{
-    MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedDocumentsSearchRequest, RedistributionPolicy,
-    RightsStatement,
+    ContractError, MANAGED_DOCUMENTS_SEARCH_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
+    ManagedDocumentsSearchRequest, RedistributionPolicy, RightsStatement,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -296,5 +297,92 @@ fn serialized_request_is_an_exact_path_free_contract() -> Result<(), Box<dyn Err
     for forbidden in ["source_path", "archive_path", "managed_path", "source_url"] {
         assert!(!serialized.contains(forbidden));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn escaped_manifest_expansion_is_rejected_before_publication_while_ordinary_text_reopens()
+-> Result<(), Box<dyn Error>> {
+    for escaped in [true, false] {
+        let temporary = tempdir()?;
+        let source_text = if escaped {
+            "\"".repeat(MAX_ATTACHMENT_TEXT_BYTES)
+        } else {
+            "x".repeat(MAX_ATTACHMENT_TEXT_BYTES)
+        };
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
+        compressed.write_all(source_text.as_bytes())?;
+        let source_bytes = compressed.finish()?;
+        let source = temporary.path().join("original-source.txt.gz");
+        fs::write(&source, &source_bytes)?;
+        let source_before = source_identity(&source)?;
+        let (bundle, receipt, artifact_id) = canonical_attachment(&source_bytes)?;
+        let request = exact_request(&bundle, &receipt, artifact_id)?;
+        assert_eq!(request.canonical_text.len(), MAX_ATTACHMENT_TEXT_BYTES);
+        let root = temporary.path().join("managed");
+        let store = ManagedStore::open(&root)?;
+        let outcome = materialize_attachment_text(&store, &bundle, &receipt, &request);
+        if escaped {
+            assert!(
+                matches!(outcome,
+                Err(BridgeError::Information(ContractError::LimitExceeded(ref message)))
+                    if message.contains("manifest") && message.contains("projection limit")),
+                "escaped text must fail explicitly before an undiscoverable activation: {outcome:?}"
+            );
+            assert_no_publish(&store)?;
+            assert!(
+                !store.root().join("managed-documents-v1").exists(),
+                "manifest admission refusal precedes creation of any managed document state"
+            );
+        } else {
+            let published = outcome?;
+            let manifest = store
+                .root()
+                .join(&published.managed.managed_relative_path)
+                .join("manifest.json");
+            assert!(fs::metadata(manifest)?.len() <= MAX_MANAGED_MANIFEST_PROJECTION_BYTES);
+            drop(store);
+            let reopened = ManagedStore::open(&root)?;
+            let projection = reopened.project_active_managed_document(
+                &published.managed.materialization_id,
+                MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
+            )?;
+            assert_eq!(projection.content_sha256, published.managed.content_sha256);
+            assert_eq!(
+                projection.text_bytes,
+                u64::try_from(MAX_ATTACHMENT_TEXT_BYTES)?
+            );
+            assert_eq!(projection.documents.len(), 1);
+        }
+        assert_eq!(source_identity(&source)?, source_before);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn bridge_manifest_budget_also_bounds_confirmed_metadata_without_publishing()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempdir()?;
+    let source_bytes = nested_archive_bytes()?;
+    let (bundle, receipt, artifact_id) = canonical_attachment(&source_bytes)?;
+    let mut rights = confirmed_rights()?.statements;
+    rights[0].expression = "\"".repeat(MAX_ATTACHMENT_TEXT_BYTES);
+    let confirmed = ConfirmedRights::private(Utc::now(), rights)?;
+    let request = AttachmentTextMaterializationRequest::exact(
+        &bundle,
+        &receipt,
+        artifact_id,
+        "Bounded metadata".to_string(),
+        confirmed,
+    )?;
+    let store = ManagedStore::open(temporary.path().join("managed"))?;
+    assert!(matches!(
+        materialize_attachment_text(&store, &bundle, &receipt, &request),
+        Err(BridgeError::Information(ContractError::LimitExceeded(_)))
+    ));
+    assert_no_publish(&store)?;
+    assert!(!store.root().join("managed-documents-v1").exists());
     Ok(())
 }

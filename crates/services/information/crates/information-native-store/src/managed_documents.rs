@@ -8,12 +8,13 @@ use super::{
 use chrono::{DateTime, Utc};
 use information_native_types::{
     EvidenceLocator, MANAGED_DOCUMENTS_RECEIPT_SCHEMA, MANAGED_DOCUMENTS_REMOVAL_SCHEMA,
-    MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedActivationId, ManagedDocumentId,
-    ManagedDocumentLineage, ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan,
-    ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest, ManagedDocumentsSearchHit,
-    ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult, ManagedDocumentsV1,
-    ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId, ManagedSourceArtifact,
-    Provenance, ReleaseId, RepresentationId, ResourceId, RightsStatement, UsePolicy,
+    MANAGED_DOCUMENTS_SEARCH_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES, ManagedActivationId,
+    ManagedDocumentId, ManagedDocumentLineage, ManagedDocumentsReceipt,
+    ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest,
+    ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
+    ManagedDocumentsV1, ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId,
+    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RightsStatement,
+    UsePolicy,
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -39,7 +40,6 @@ const RECEIPT_FILE: &str = "receipt.json";
 const EXPECTED_ACTIVE_FILES: [&str; 3] = [DATABASE_FILE, MANIFEST_FILE, RECEIPT_FILE];
 const MAX_ACTIVE_PROJECTION_ENTRIES: usize = 256;
 const MAX_RECEIPT_PROJECTION_BYTES: u64 = 64 * 1024;
-const MAX_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Path-free projection for one active immutable managed representation.
 /// Canonical text remains inside the managed database. The producing method's
@@ -269,9 +269,9 @@ impl ManagedStore {
         materialization_id: &ManagedMaterializationId,
         max_manifest_bytes: u64,
     ) -> Result<ActiveManagedMaterialization, StoreError> {
-        if max_manifest_bytes == 0 || max_manifest_bytes > MAX_MANIFEST_PROJECTION_BYTES {
+        if max_manifest_bytes == 0 || max_manifest_bytes > MAX_MANAGED_MANIFEST_PROJECTION_BYTES {
             return Err(StoreError::RegistryCorrupt(format!(
-                "managed documents manifest projection cap must be between 1 and {MAX_MANIFEST_PROJECTION_BYTES} bytes"
+                "managed documents manifest projection cap must be between 1 and {MAX_MANAGED_MANIFEST_PROJECTION_BYTES} bytes"
             )));
         }
         let _lock = self.try_lock()?;
@@ -2390,7 +2390,7 @@ mod tests {
             );
             let projected = reopened.project_active_managed_document(
                 &materialization.materialization_id,
-                MAX_MANIFEST_PROJECTION_BYTES,
+                MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
             )?;
             assert_eq!(projected.content_sha256, materialization.content_sha256);
             assert_eq!(projected.documents[0].title, "Fixture Document");

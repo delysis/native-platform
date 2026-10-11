@@ -14,11 +14,11 @@ use information_native_store::{
 use information_native_types::{
     CATALOG_SCHEMA, CatalogTrust, EvidenceHit, EvidenceLocator, ExternalAccessMode,
     ExternalRegistration, FormatKind, InformationCatalog, InformationQuery, InstallationId,
-    MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedActivationId, ManagedDocumentsRemovalRequest,
-    ManagedDocumentsSearchRequest, ManagedMaterializationId, ManagedRemovalId, Provenance,
-    Publisher, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, QuerySyntax, RedistributionPolicy,
-    ReleaseId, RepresentationFormat, RepresentationId, ResourceId, RetrievalPurpose,
-    RetrievalTarget, RightsStatement, UsePermission, UsePolicy,
+    MANAGED_DOCUMENTS_SEARCH_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES, ManagedActivationId,
+    ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedMaterializationId,
+    ManagedRemovalId, Provenance, Publisher, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId,
+    QuerySyntax, RedistributionPolicy, ReleaseId, RepresentationFormat, RepresentationId,
+    ResourceId, RetrievalPurpose, RetrievalTarget, RightsStatement, UsePermission, UsePolicy,
 };
 use mom_llama_runtime::{
     AttachmentLibraryInput, AttachmentPreviewAnchor, attachment_library_input,
@@ -36,7 +36,7 @@ const MODEL_GRANT_TTL_MS: u64 = 60 * 60 * 1_000;
 const PREVIEW_TTL_MS: u64 = 30 * 60 * 1_000;
 const MAX_PENDING_CAPABILITIES: usize = 32;
 const MAX_ACTIVE_MANAGED_PROJECTION: usize = 256;
-const MAX_ATTACHMENT_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
+
 const MAX_MODEL_EVIDENCE_PACKET_BYTES: usize = 256 * 1024;
 
 pub struct MomInformation {
@@ -662,7 +662,7 @@ impl MomInformation {
                 .host
                 .project_active_managed_document(
                     &receipt.materialization_id,
-                    MAX_ATTACHMENT_MANIFEST_PROJECTION_BYTES,
+                    MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
                 )
                 .map_err(display_error)?;
             if let Some(attachment) = project_attachment_materialization(entry)? {
