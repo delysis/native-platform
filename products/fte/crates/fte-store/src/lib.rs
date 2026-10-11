@@ -34,7 +34,7 @@ impl SqliteStore {
             .map_err(store_error)?;
         let objects: i64 = transaction
             .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
                 [],
                 |row| row.get(0),
             )
