@@ -283,6 +283,7 @@
   };
   const attachmentTranscripts = new WeakMap();
   let activeSpeechPlayback = null;
+  let speechPlaybackEpoch = null;
 
   const restoreReadAloudButton = (button) => {
     if (!button) return;
@@ -296,6 +297,8 @@
   };
 
   const stopSpeechPlayback = async ({ notifyNative = true } = {}) => {
+    // Revoke pending byte verification and publication as well as live media.
+    speechPlaybackEpoch = {};
     const playback = activeSpeechPlayback;
     activeSpeechPlayback = null;
     if (!playback) return;
@@ -312,10 +315,15 @@
 
   const renderSpeechPlayback = async (button, result, bytes) => {
     const binding = result.binding;
+    const epoch = speechPlaybackEpoch;
     if (await sha256Hex(bytes) !== binding.wav_sha256) {
       throw new Error("speech_provenance_mismatch: Complete WAV bytes changed at IPC.");
     }
-    await stopSpeechPlayback();
+    if (epoch !== speechPlaybackEpoch || button.dataset.playback !== result.playback_id) return;
+    const stopped = stopSpeechPlayback();
+    const publicationEpoch = speechPlaybackEpoch;
+    await stopped;
+    if (publicationEpoch !== speechPlaybackEpoch || button.dataset.playback !== result.playback_id) return;
     const row = button.closest(".message-row");
     if (
       !row?.isConnected
@@ -357,7 +365,9 @@
       const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
       progress.textContent = `${current.toFixed(1)} / ${duration.toFixed(1)} seconds`;
     });
-    audio.addEventListener("ended", () => void stopSpeechPlayback());
+    audio.addEventListener("ended", () => {
+      if (activeSpeechPlayback?.audio === audio) void stopSpeechPlayback();
+    });
     await audio.play().catch(() => {});
   };
 
@@ -2678,19 +2688,20 @@
       }
       if (button.dataset.playback) {
         const playback = button.dataset.playback;
-        delete button.dataset.playback;
-        await invoke("mom_llama_speech_stop", { playback });
         restoreReadAloudButton(button);
+        await invoke("mom_llama_speech_stop", { playback });
         return;
       }
       if (button.dataset.operation) {
         const operation = button.dataset.operation;
-        delete button.dataset.operation;
-        await invoke("mom_llama_speech_stop", { operation });
         restoreReadAloudButton(button);
+        await invoke("mom_llama_speech_stop", { operation });
         return;
       }
-      await stopSpeechPlayback();
+      const stopped = stopSpeechPlayback();
+      const epoch = speechPlaybackEpoch;
+      await stopped;
+      if (epoch !== speechPlaybackEpoch || !button.isConnected) return;
       const conversation = selectedConversation();
       const message = button.dataset.message;
       const operation = speechOperationToken();
@@ -2710,7 +2721,8 @@
         if (response?.status === "blocked" || !response?.result) return;
         const result = response.result;
         retainedPlayback = result.playback_id;
-        if (button.dataset.operation === operation) delete button.dataset.operation;
+        if (button.dataset.operation !== operation || epoch !== speechPlaybackEpoch) return;
+        delete button.dataset.operation;
         button.dataset.playback = result.playback_id;
         if (
           selectedConversation() !== conversation
@@ -2734,17 +2746,20 @@
         if (retainedPlayback) {
           await invoke("mom_llama_speech_stop", { playback: retainedPlayback }).catch(() => {});
         }
-        if (button.dataset.operation === operation) delete button.dataset.operation;
-        if (activeSpeechPlayback?.button !== button) restoreReadAloudButton(button);
+        if (activeSpeechPlayback?.button !== button
+          && (button.dataset.operation === operation
+            || (retainedPlayback && button.dataset.playback === retainedPlayback))) {
+          restoreReadAloudButton(button);
+        }
       }
     },
     "attachment-transcribe": async (button) => {
       if (button.dataset.operation) {
         const operation = button.dataset.operation;
         delete button.dataset.operation;
-        await invoke("mom_llama_speech_stop", { operation });
         commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
         button.textContent = "Transcribe audio";
+        await invoke("mom_llama_speech_stop", { operation });
         return;
       }
       const preview = button.closest("[data-attachment-preview]");
@@ -2778,9 +2793,11 @@
         ) return;
         renderAttachmentTranscript(button, result);
       } finally {
-        if (button.dataset.operation === operation) delete button.dataset.operation;
-        commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
-        button.textContent = "Transcribe audio";
+        if (button.dataset.operation === operation) {
+          delete button.dataset.operation;
+          commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
+          button.textContent = "Transcribe audio";
+        }
       }
     },
     "speech-transcript-insert": async (button) => {
