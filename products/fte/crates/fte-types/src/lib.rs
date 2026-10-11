@@ -14,6 +14,11 @@ use uuid::Uuid;
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
+/// Application-owned hosted credentials, resolved per provider operation.
+pub trait SecretResolver: Send + Sync {
+    fn resolve(&self, provider: &str) -> Result<Option<String>, GatewayError>;
+}
+
 /// Injected response persistence. The gateway owns ordering relative to its
 /// terminal event; products own the storage implementation and its lifetime.
 pub trait ResponseStore: Send + Sync {

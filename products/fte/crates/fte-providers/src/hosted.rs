@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use fte_store::SecretResolver;
+use fte_types::SecretResolver;
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendReadiness, BackendRequest, CancelTarget,
     CompletionPrompt, ErrorClass, FinishReason, GatewayBackend, GatewayError, GatewayEvent,

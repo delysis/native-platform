@@ -7,7 +7,7 @@ service through an authenticated loopback listener.
 
 ## Crates
 
-- `fte-types`: canonical requests, typed Items/events, usage, errors, routing,
+- `fte-types`: injected secret and response-store contracts, canonical requests, typed Items/events, usage, errors, routing,
   storage, deadline, tool, and cache policy.
 - `fte-protocols`: strict OpenAI Completions, Chat Completions, Responses, and
   Anthropic Messages/count-token codecs. Unknown fields fail before routing.
@@ -16,7 +16,7 @@ service through an authenticated loopback listener.
   fallback, and setup-failure circuit breakers.
 - `fte-providers`: protocol-native OpenAI Responses, Anthropic Messages,
   Gemini GenerateContent, and explicitly compatible OpenAI provider adapters.
-- `fte-store`: additive SQLite Responses state and injected secret boundary.
+- `fte-store`: additive SQLite Responses state.
 - `fte-backend-llama`: the only bridge between the gateway and the versioned
   llama-native host. Local execution is in-process and credentialless.
 - `fte-loopback`: authenticated Axum REST/SSE edge, disabled until started.

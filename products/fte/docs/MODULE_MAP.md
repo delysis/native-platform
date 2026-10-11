@@ -8,11 +8,11 @@ FTE desktop capability.
 
 | Crate | Owner boundary |
 |---|---|
-| `fte-types` | Protocol-neutral generation requests, items, events, usage, errors, and policies. |
+| `fte-types` | Protocol-neutral requests, items, events, usage, errors, policies, and injected secret/response-store contracts. |
 | `fte-protocols` | OpenAI and Anthropic edge codecs. |
 | `fte-router` | Text/model route planning, admission, retries, deadlines, and accounting. |
 | `fte-providers` | Hosted generation provider adapters. |
-| `fte-store` | Response-chain state and injected secret/cache storage traits. |
+| `fte-store` | SQLite response-chain state. |
 | `fte-backend-llama` | The only bridge from FTE to `llama-native-kit`. |
 | `fte-loopback` | Authenticated OpenAI/Anthropic-compatible REST and SSE edge. |
 | `tauri-plugin-free-token-energy` | Text/model gateway IPC, loopback control, and their lifecycle only. |
