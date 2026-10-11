@@ -506,17 +506,18 @@ impl ProjectStore {
         if let Some(outcome) = self.replay_idempotent_save(command_id, fingerprint)? {
             return Ok(outcome);
         }
-        let save = self.create_document_with_identity(
+        let (save, outbox_id) = self.create_document_with_identity(
             &path,
             content,
             reason,
             |_| Ok(DocumentOrigin::Human),
             Some((command_id, fingerprint)),
-            before_projection,
         )?;
+        let visible_projection =
+            self.settle_outbox_entry_with_boundary(outbox_id, &path, before_projection);
         Ok(crate::IdempotentSaveOutcome {
             save,
-            visible_projection: VisibleProjectionState::Applied,
+            visible_projection,
             request_fingerprint: fingerprint,
             replayed: false,
         })
@@ -623,17 +624,17 @@ impl ProjectStore {
         if let Some(outcome) = self.replay_idempotent_save(command_id, fingerprint)? {
             return Ok(outcome);
         }
-        let save = self.create_document_with_identity(
+        let (save, outbox_id) = self.create_document_with_identity(
             &path,
             content,
             "retained remote experiment",
             |_| Ok(DocumentOrigin::Derived { evidence_blob_id }),
             Some((command_id, fingerprint)),
-            |_| Ok(()),
         )?;
+        let visible_projection = self.settle_outbox_entry(outbox_id, &path);
         Ok(crate::IdempotentSaveOutcome {
             save,
-            visible_projection: VisibleProjectionState::Applied,
+            visible_projection,
             request_fingerprint: fingerprint,
             replayed: false,
         })
@@ -651,29 +652,34 @@ impl ProjectStore {
     where
         F: FnOnce(&Path) -> Result<()>,
     {
-        self.create_document_with_identity(
+        let (save, outbox_id) = self.create_document_with_identity(
             relative_path,
             content,
             reason,
             prepare_origin,
             None,
-            before_projection_boundary,
-        )
+        )?;
+        match self.process_outbox_entry_with_boundary(outbox_id, before_projection_boundary)? {
+            OutboxResult::Applied | OutboxResult::AlreadyApplied => {}
+            OutboxResult::Conflict { relative_path } => {
+                return Err(StoreError::VisibleFileConflict {
+                    outbox_id,
+                    path: relative_path,
+                });
+            }
+        }
+        Ok(save)
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn create_document_with_identity<F>(
+    #[allow(clippy::too_many_lines)]
+    fn create_document_with_identity(
         &mut self,
         relative_path: impl AsRef<Path>,
         content: DocumentContent,
         reason: impl Into<String>,
         prepare_origin: impl FnOnce(&Self) -> Result<DocumentOrigin>,
         identity: Option<(CommandId, BlobId)>,
-        before_projection_boundary: F,
-    ) -> Result<SaveOutcome>
-    where
-        F: FnOnce(&Path) -> Result<()>,
-    {
+    ) -> Result<(SaveOutcome, i64)> {
         let started_at_ms = now_unix_ms();
         let relative_path = normalize_document_path(relative_path.as_ref())?;
         let reason = reason.into();
@@ -814,22 +820,16 @@ impl ProjectStore {
         }
         transaction.commit()?;
 
-        match self.process_outbox_entry_with_boundary(outbox_id, before_projection_boundary)? {
-            OutboxResult::Applied | OutboxResult::AlreadyApplied => {}
-            OutboxResult::Conflict { relative_path } => {
-                return Err(StoreError::VisibleFileConflict {
-                    outbox_id,
-                    path: relative_path,
-                });
-            }
-        }
-        Ok(SaveOutcome {
-            blob_id,
-            artifact_id,
-            operation_id,
-            revision_id,
-            receipt,
-        })
+        Ok((
+            SaveOutcome {
+                blob_id,
+                artifact_id,
+                operation_id,
+                revision_id,
+                receipt,
+            },
+            outbox_id,
+        ))
     }
 
     /// Registers an existing visible manuscript as a new human-authored document
@@ -4357,7 +4357,20 @@ mod tests {
                 )))
             },
         );
-        assert!(result.is_err());
+        let first = result.expect("committed creation retains its pending receipt");
+        assert!(!first.replayed);
+        assert_eq!(first.save.receipt.command_id, command);
+        assert!(matches!(
+            &first.visible_projection,
+            VisibleProjectionState::PendingRetry { relative_path, error, .. }
+                if relative_path == "First.md"
+                    && error == "I/O failure: power loss before visible write"
+        ));
+        let committed = store
+            .load_receipt(command)
+            .expect("first committed receipt");
+        assert_eq!(committed, Some(first.save.receipt.clone()));
+        assert_eq!(store.pending_outbox_count().expect("pending creation"), 1);
         assert!(!store.root().join("First.md").exists());
         let root = store.root().to_path_buf();
         drop(store);
@@ -4371,6 +4384,8 @@ mod tests {
             )
             .expect("exact retry");
         assert!(replay.replayed);
+        assert_eq!(replay.save, first.save);
+        assert_eq!(replay.request_fingerprint, first.request_fingerprint);
         assert_eq!(replay.visible_projection, VisibleProjectionState::Applied);
         let original = store.read_document("First.md").expect("created file");
         assert_eq!(original.text, text);
@@ -8028,5 +8043,224 @@ mod tests {
                 .expect("reconstruct"),
             original.as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exercise_public_idempotent_creation_projection_failure(derived: bool) {
+        let (directory, mut store) = new_store();
+        let evidence = store
+            .store_provenance_blob(b"owned derived-source receipt")
+            .expect("source evidence");
+        let create = |store: &mut ProjectStore, command, path: &str, text: &str| {
+            let content = DocumentContent::Verse(text.into());
+            if derived {
+                store.create_derived_document_idempotent(command, path, content, evidence)
+            } else {
+                store.create_document_idempotent(command, path, content, "public creation")
+            }
+        };
+        let ordinary_command = CommandId::new();
+        let ordinary = create(
+            &mut store,
+            ordinary_command,
+            "manuscript/Ordinary.md",
+            "Ordinary writing.\r\n",
+        )
+        .expect("ordinary public creation");
+        assert!(!ordinary.replayed);
+        assert_eq!(ordinary.visible_projection, VisibleProjectionState::Applied);
+        assert_eq!(ordinary.save.receipt.command_id, ordinary_command);
+        assert_eq!(
+            store
+                .load_receipt(ordinary_command)
+                .expect("ordinary receipt"),
+            Some(ordinary.save.receipt.clone())
+        );
+        assert_eq!(
+            fs::read(store.root().join("manuscript/Ordinary.md")).expect("ordinary file"),
+            b"Ordinary writing.\r\n"
+        );
+        assert_eq!(store.pending_outbox_count().expect("ordinary outbox"), 0);
+
+        let staging = store.root().join(".loom/backups/outbox");
+        let held_directory = directory.path().join("retained-outbox-directory");
+        fs::rename(&staging, &held_directory).expect("retain owned staging directory");
+        let blocker_bytes = b"owned projection-directory blocker\r\n";
+        fs::write(&staging, blocker_bytes).expect("block only owned projection directory");
+        let command = CommandId::new();
+        let path = "manuscript/Pending.md";
+        let text = "An exact retained first line.\r\n";
+        let counts_before = store.counts().expect("counts before creation");
+        let result = create(&mut store, command, path, text);
+        let receipt = store
+            .load_receipt(command)
+            .expect("committed receipt readback")
+            .expect("first semantic creation committed");
+        assert_eq!(receipt.command_id, command);
+        assert_eq!(receipt.resulting_revision_ids.len(), 1);
+        let revision = receipt.resulting_revision_ids[0];
+        let (outbox_id, outbox_path, target, expected, state): (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = store
+            .connection
+            .query_row(
+                "SELECT outbox_id, relative_path, target_blob_id, expected_visible_blob_id, state
+                 FROM visible_file_outbox WHERE revision_id = ?1",
+                [revision.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("capture actual first committed outbox");
+        assert_eq!(outbox_path, path);
+        assert_eq!(target, BlobId::digest(text.as_bytes()).to_string());
+        assert_eq!(expected, None);
+        assert_eq!(state, "pending");
+        assert_eq!(store.pending_outbox_count().expect("first outbox"), 1);
+        let counts = store.counts().expect("committed counts");
+        assert_eq!(counts.artifacts, counts_before.artifacts + 1);
+        assert_eq!(counts.operations, counts_before.operations + 1);
+        assert_eq!(counts.revisions, counts_before.revisions + 1);
+        assert_eq!(counts.receipts, counts_before.receipts + 1);
+        assert_eq!(
+            store
+                .reconstruct_revision(revision)
+                .expect("immutable first writing"),
+            text.as_bytes()
+        );
+        assert!(!store.root().join(path).exists());
+        assert_eq!(
+            fs::read(&staging).expect("unchanged blocker"),
+            blocker_bytes
+        );
+        assert!(
+            result.is_ok(),
+            "first public creation lost its committed outcome: result={result:?}; receipt={receipt:?}; outbox_id={outbox_id}; path={outbox_path}; target={target}; state={state}"
+        );
+        let first = result.expect("committed creation has a typed pending outcome");
+        assert!(!first.replayed);
+        assert_eq!(first.save.receipt, receipt);
+        assert_eq!(first.save.revision_id, revision);
+        assert_eq!(first.save.artifact_id, receipt.resulting_artifact_ids[0]);
+        assert_eq!(first.save.operation_id, receipt.resulting_operation_ids[0]);
+        assert_eq!(first.save.blob_id, BlobId::digest(text.as_bytes()));
+        assert_eq!(
+            first.visible_projection,
+            VisibleProjectionState::PendingRetry {
+                outbox_id,
+                relative_path: path.into(),
+                error: StoreError::NotDirectory(staging.clone()).to_string(),
+            }
+        );
+        assert_eq!(
+            store
+                .revision_provenance(revision)
+                .expect("creation origin")
+                .segments[0]
+                .contribution,
+            if derived {
+                ContributionKind::Source
+            } else {
+                ContributionKind::Human
+            }
+        );
+        assert!(matches!(
+            create(&mut store, command, path, "A different request.\n"),
+            Err(StoreError::IdempotencyConflict { command_id }) if command_id == command
+        ));
+        assert_eq!(store.counts().expect("no mismatched creation"), counts);
+        let retry = create(&mut store, command, path, text).expect("explicit exact retry");
+        assert!(retry.replayed);
+        assert_eq!(retry.save, first.save);
+        assert_eq!(retry.request_fingerprint, first.request_fingerprint);
+        assert_eq!(retry.visible_projection, first.visible_projection);
+        assert_eq!(store.counts().expect("no duplicate retry"), counts);
+        assert_eq!(
+            fs::read(&staging).expect("retry preserves blocker"),
+            blocker_bytes
+        );
+
+        let retained_blocker = directory.path().join("retained-blocker-bytes");
+        fs::rename(&staging, &retained_blocker).expect("retain blocker bytes");
+        fs::rename(&held_directory, &staging).expect("restore original staging directory");
+        let external = b"External writing appeared before recovery.\r\n";
+        fs::write(store.root().join(path), external).expect("owned external writing");
+        let conflict = create(&mut store, command, path, text).expect("exact conflict replay");
+        assert!(conflict.replayed);
+        assert_eq!(conflict.save, first.save);
+        assert_eq!(
+            conflict.visible_projection,
+            VisibleProjectionState::PendingConflict {
+                outbox_id,
+                relative_path: path.into(),
+            }
+        );
+        assert_eq!(
+            fs::read(store.root().join(path)).expect("external survives"),
+            external
+        );
+        let later = b"Later human writing must survive exact replay.\r\n";
+        fs::write(store.root().join(path), later).expect("later owned writing");
+        let root = store.root().to_path_buf();
+        drop(store);
+        let mut reopened = ProjectStore::open(&root).expect("reopen original project");
+        let replay = create(&mut reopened, command, path, text).expect("reopened exact retry");
+        assert!(replay.replayed);
+        assert_eq!(replay.save, first.save);
+        assert_eq!(replay.request_fingerprint, first.request_fingerprint);
+        assert_eq!(replay.visible_projection, conflict.visible_projection);
+        assert_eq!(
+            reopened.counts().expect("no duplicate reopened creation"),
+            counts
+        );
+        assert_eq!(
+            reopened
+                .load_receipt(command)
+                .expect("unchanged durable receipt"),
+            Some(receipt)
+        );
+        assert_eq!(
+            reopened
+                .pending_outbox_count()
+                .expect("exact pending outbox"),
+            1
+        );
+        assert_eq!(
+            fs::read(root.join(path)).expect("later writing survives"),
+            later
+        );
+        assert_eq!(
+            reopened
+                .reconstruct_revision(revision)
+                .expect("retained immutable writing"),
+            text.as_bytes()
+        );
+        assert_eq!(
+            fs::read(retained_blocker).expect("retained original blocker bytes"),
+            blocker_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_human_creation_returns_first_committed_pending_outcome() {
+        exercise_public_idempotent_creation_projection_failure(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_derived_creation_returns_first_committed_pending_outcome() {
+        exercise_public_idempotent_creation_projection_failure(true);
     }
 }
