@@ -2322,11 +2322,35 @@ mod tests {
             expected_bytes: 10,
             sha256: "0".repeat(64),
         };
-        let acquisition = acquisition_from_fetch(&artifact, fetched)?;
+        let acquisition = acquisition_from_fetch(&artifact, fetched.clone())?;
         assert_eq!(acquisition.attempts.len(), 2);
         assert_eq!(acquisition.attempts[0].byte_start, 0);
         assert_eq!(acquisition.attempts[1].byte_start, 4);
         acquisition.validate()?;
+
+        for peer in ["203.0.113.9:80", "[2001:db8::9]:80"] {
+            let uri = "http://example.test/archive.zim".to_string();
+            let mut http_artifact = artifact.clone();
+            http_artifact.source_uri = uri.clone();
+            let mut http = fetched.clone();
+            http.final_source_uri = Some(uri.clone());
+            let source = http.source_attestation.as_mut().ok_or_else(|| {
+                std::io::Error::other("network fixture lacks its source attestation")
+            })?;
+            source.requested_uri = uri.clone();
+            source.final_uri = uri.clone();
+            source.final_peer_address = peer.to_string();
+            for attempt in &mut http.source_attestations {
+                attempt.source.requested_uri = uri.clone();
+                attempt.source.final_uri = uri.clone();
+                attempt.source.final_peer_address = peer.to_string();
+            }
+            let mapped = acquisition_from_fetch(&http_artifact, http)?;
+            assert_eq!(mapped.final_peer_address.as_deref(), Some(peer));
+            assert_eq!(mapped.attempts.len(), 2);
+            assert_eq!(mapped.attempts[1].byte_start, 4);
+            mapped.validate()?;
+        }
         Ok(())
     }
 

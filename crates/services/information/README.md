@@ -118,11 +118,12 @@ real-partition acceptance is included yet.
 - Apps explicitly select evidence and delimit it as untrusted model input.
 - Unsupported operations are capability errors, never empty success.
 
-On Unix the store syncs both parents around activation and syncs registry and
-journal publication. Windows retains the portable structural and recovery
-checks, but directory sync is currently a no-op: those publications are
-best-effort across sudden power loss, and this release does not claim a
-power-loss-durable Windows commit boundary.
+On Unix the store enforces owner-private storage, syncs both parents around
+activation, and syncs registry and journal publication. `ManagedStore::open`
+rejects non-Unix platforms before creating or opening store state. In
+particular, Windows managed-store operation is unsupported; there is no
+best-effort Windows commit mode. Directory-sync calls are not evidence of
+power-loss qualification on any platform.
 
 The current host install call is synchronous and callback-driven internally;
 it does not yet expose a durable background-job, progress-stream, or cancel IPC
