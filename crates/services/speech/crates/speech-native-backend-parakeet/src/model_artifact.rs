@@ -423,6 +423,20 @@ fn copy_manifest_files(
             if read == 0 {
                 break;
             }
+            let read_bytes = u64::try_from(read)
+                .map_err(|_| artifact_error("Parakeet model read length overflowed"))?;
+            file_bytes = file_bytes
+                .checked_add(read_bytes)
+                .ok_or_else(|| artifact_error("Parakeet model file length overflowed"))?;
+            combined_bytes = combined_bytes
+                .checked_add(read_bytes)
+                .ok_or_else(|| artifact_error("Parakeet model bundle length overflowed"))?;
+            if file_bytes > expected.bytes || combined_bytes > manifest.combined_bytes {
+                return Err(artifact_error(format!(
+                    "Parakeet model artifact {} exceeds its manifest-bound length",
+                    expected.name
+                )));
+            }
             destination.write_all(&buffer[..read]).map_err(|error| {
                 artifact_error(format!(
                     "Could not copy Parakeet model artifact {}: {error}",
@@ -431,14 +445,6 @@ fn copy_manifest_files(
             })?;
             individual.update(&buffer[..read]);
             combined.update(&buffer[..read]);
-            let read = u64::try_from(read)
-                .map_err(|_| artifact_error("Parakeet model read length overflowed"))?;
-            file_bytes = file_bytes
-                .checked_add(read)
-                .ok_or_else(|| artifact_error("Parakeet model file length overflowed"))?;
-            combined_bytes = combined_bytes
-                .checked_add(read)
-                .ok_or_else(|| artifact_error("Parakeet model bundle length overflowed"))?;
         }
         destination.sync_all().map_err(|error| {
             artifact_error(format!(
@@ -567,16 +573,22 @@ fn verify_model_bytes(
             if read == 0 {
                 break;
             }
-            individual.update(&buffer[..read]);
-            combined.update(&buffer[..read]);
-            let read = u64::try_from(read)
+            let read_bytes = u64::try_from(read)
                 .map_err(|_| artifact_error("Parakeet model read length overflowed"))?;
             file_bytes = file_bytes
-                .checked_add(read)
+                .checked_add(read_bytes)
                 .ok_or_else(|| artifact_error("Parakeet model file length overflowed"))?;
             combined_bytes = combined_bytes
-                .checked_add(read)
+                .checked_add(read_bytes)
                 .ok_or_else(|| artifact_error("Parakeet model bundle length overflowed"))?;
+            if file_bytes > expected.bytes || combined_bytes > manifest.combined_bytes {
+                return Err(artifact_error(format!(
+                    "Parakeet model artifact {} exceeds its manifest-bound length",
+                    expected.name
+                )));
+            }
+            individual.update(&buffer[..read]);
+            combined.update(&buffer[..read]);
         }
         if file_bytes != expected.bytes || digest_hex(individual) != expected.sha256 {
             return Err(artifact_error(format!(
