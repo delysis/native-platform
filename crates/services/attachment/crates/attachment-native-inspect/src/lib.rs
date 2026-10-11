@@ -2150,6 +2150,7 @@ impl InspectionState {
         if let Err(error) = mime_preflight::preflight(
             bytes,
             max_parts,
+            self.policy.limits.max_depth.saturating_sub(depth),
             self.policy.limits.max_container_metadata_bytes,
             self.budget.remaining_derived_bytes(),
         ) {

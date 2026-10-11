@@ -25,11 +25,13 @@ pub(crate) struct MimePreflightError {
 struct Boundary {
     value: Vec<u8>,
     digest: bool,
+    message_depth: u16,
 }
 
 pub(crate) fn preflight(
     bytes: &[u8],
     max_parts: u32,
+    max_message_depth: u16,
     max_metadata_bytes: u64,
     max_potential_derived_bytes: u64,
 ) -> Result<MimePreflight, MimePreflightError> {
@@ -39,6 +41,8 @@ pub(crate) fn preflight(
     let mut metadata_bytes = 0_u64;
     let mut cursor = 0_usize;
     let mut in_nested_message = false;
+    let mut header_charged_by_delimiter = false;
+    let mut message_depth = 0_u16;
 
     loop {
         let Some(headers) = read_headers(
@@ -55,24 +59,31 @@ pub(crate) fn preflight(
             .header_value(&HeaderName::ContentType)
             .and_then(|value| value.as_content_type());
 
-        if let Some(content_type) = content_type.filter(|value| value.ctype() == "multipart")
-            && let Some(boundary) = content_type
+        if let Some(content_type) = content_type.filter(|value| value.ctype() == "multipart") {
+            if let Some(boundary) = content_type
                 .attribute("boundary")
                 .filter(|value| !value.is_empty())
-        {
-            let mut stream = MessageStream::new(&bytes[cursor..]);
-            if stream.seek_next_part(boundary.as_bytes()) {
-                // The parser's first match enters a child unconditionally. It
-                // only tests a closing suffix after parsing that first child.
-                stream.skip_crlf();
-                cursor += stream.offset();
+            {
+                let mut stream = MessageStream::new(&bytes[cursor..]);
+                if stream.seek_next_part(boundary.as_bytes()) {
+                    // The parser's first match enters a child unconditionally.
+                    // It checks the closing suffix after that first child.
+                    stream.skip_crlf();
+                    cursor += stream.offset();
+                    charge_part(&mut parts, max_parts)?;
+                    boundaries.push(Boundary {
+                        value: boundary.as_bytes().to_vec(),
+                        digest: content_type.subtype() == Some("digest"),
+                        message_depth,
+                    });
+                    in_nested_message = false;
+                    header_charged_by_delimiter = true;
+                    continue;
+                }
+            }
+            // No, empty, or unmatched boundaries recover as one attachment.
+            if !header_charged_by_delimiter {
                 charge_part(&mut parts, max_parts)?;
-                boundaries.push(Boundary {
-                    value: boundary.as_bytes().to_vec(),
-                    digest: content_type.subtype() == Some("digest"),
-                });
-                in_nested_message = false;
-                continue;
             }
         }
         if content_type.is_some_and(|value| {
@@ -95,7 +106,22 @@ pub(crate) fn preflight(
                     message: "A transfer-encoded nested email cannot be inspected before decoding its hidden MIME structure. Its original bytes were retained without parsing.",
                 });
             }
+            // A delimiter already charged this same MessagePart. Raw inner
+            // headers start a new message and have no delimiter of their own.
+            if !header_charged_by_delimiter {
+                charge_part(&mut parts, max_parts)?;
+            }
+            message_depth = message_depth
+                .checked_add(1)
+                .filter(|depth| *depth <= max_message_depth)
+                .ok_or_else(|| {
+                    budget(
+                        "mime_message_depth_exceeded",
+                        "The email's nested message structure exceeds the remaining attachment depth. It was not parsed.",
+                    )
+                })?;
             in_nested_message = true;
+            header_charged_by_delimiter = false;
             continue;
         } else {
             // Ancestor delimiters are searched after the current part closes,
@@ -110,7 +136,9 @@ pub(crate) fn preflight(
                         boundaries.pop();
                     }
                     Some(false) => {
+                        message_depth = boundary.message_depth;
                         charge_part(&mut parts, max_parts)?;
+                        header_charged_by_delimiter = true;
                         break;
                     }
                     None => {
@@ -234,7 +262,7 @@ mod tests {
     #[test]
     fn counts_declared_parts_with_bounded_headers() {
         let message = b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\none\r\n--x\r\nContent-Type: text/plain\r\n\r\ntwo\r\n--x--\r\n";
-        let summary = preflight(message, 2, 1024, 1024).expect("bounded MIME");
+        let summary = preflight(message, 2, 8, 1024, 1024).expect("bounded MIME");
         assert_eq!(summary.parts, 2);
         assert!(summary.metadata_bytes > 0);
         assert!(summary.potential_derived_bytes >= 10);
@@ -243,7 +271,7 @@ mod tests {
     #[test]
     fn blocks_width_before_a_structured_parser_can_run() {
         let message = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Disposition: attachment\r\n\r\na\r\n--x\r\nContent-Disposition: attachment\r\n\r\nb\r\n";
-        let error = preflight(message, 1, 1024, 1024).expect_err("too wide");
+        let error = preflight(message, 1, 8, 1024, 1024).expect_err("too wide");
         assert_eq!(error.code, "mime_part_limit_exceeded");
     }
 }
