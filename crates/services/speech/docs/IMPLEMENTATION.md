@@ -29,8 +29,9 @@ This slice establishes five reusable crates:
   relays backend finals through host-owned monitor tasks.
 - `speech-native-backend-parakeet`: an executable, embedded Parakeet Realtime EOU 120M
   backend over `parakeet-rs` and ONNX Runtime. It loads one shared model handle
-  from exact manifest-verified content-addressed managed bytes and creates
-  independent decoder state per request.
+  from exact manifest-verified bytes in the selected pinned shared Hub snapshot
+  or content-addressed managed storage, with independent decoder state per
+  request.
 
 On macOS, `AppleCapabilitySource` now performs a real, noninteractive runtime
 inventory through safe Speech and AVSpeechSynthesizer bindings. It does not ask
@@ -146,16 +147,20 @@ current model is `parakeet-realtime-eou-120m-v1-onnx` from immutable revision
 The checked-in manifest binds the ordered three-file bundle to 480,708,981
 bytes and combined SHA-256
 `c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756`.
-Discovery performs a bounded metadata-only presence/shape probe, in order:
+Source selection chooses `ParakeetBackendConfig::model_dir` first, then
+`SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the current `FTE_PARAKEET_MODEL_DIR`
+alias), otherwise the exact manifest revision in the selected shared Hub cache.
+The Hub root comes from `desktop-model-defaults`: `HF_HUB_CACHE`, then
+`HUGGINGFACE_HUB_CACHE`, then `HF_HOME/hub`, then
+`XDG_CACHE_HOME/huggingface/hub`, otherwise `.cache/huggingface/hub` under the
+available home directory. An override selects one cache; discovery does not
+search the other roots after it.
 
-1. the exact content-addressed bundle already in application-managed storage;
-2. `ParakeetBackendConfig::model_dir`, when explicitly injected;
-3. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
-   `FTE_PARAKEET_MODEL_DIR` alias retained for the 0.1 line);
-4. the exact immutable revision under `HUGGINGFACE_HUB_CACHE`;
-5. the exact immutable revision under `HF_HOME/hub`;
-6. the exact immutable revision under the standard
-   `~/.cache/huggingface/hub` location.
+The bounded metadata-only startup probe checks, in order:
+
+1. the selected exact manifest-pinned Hub snapshot, when it matches that cache;
+2. the exact content-addressed bundle already in managed storage;
+3. the selected other candidate, if present.
 
 The startup probe checks only the exact names, regular-file/private-file shape,
 and manifest lengths; it does not read model bytes or construct ONNX sessions.
@@ -165,20 +170,22 @@ evidence, never runtime proof. The router admits that state only for an exact
 embedded-backend plus exact-model selector; automatic, fallback, hosted, and
 non-embedded routes cannot select it.
 
-Mutable refs and arbitrary snapshots are never admission authority. On the
-first exact dispatch, one supervised single-flight loader streams a candidate
-through the per-file length/SHA-256 manifest into private staging, reverifies
-it there, and atomically publishes it under the combined content hash in
-application-managed storage. Cache data is copied, never hard-linked. The
-managed bundle is reverified immediately before and after session construction.
+Mutable refs, arbitrary snapshots, and cache locators alone are never admission
+authority. On the first exact dispatch, one supervised single-flight loader
+verifies the selected manifest-pinned shared Hub snapshot in place, including
+its blob aliases and exact per-file and combined length/SHA-256. Otherwise it
+reverifies an existing managed bundle, or streams the selected other candidate
+through the manifest into private staging, verifies the staged bytes, and
+atomically publishes them under the combined content hash in managed storage.
+That copy path never hard-links candidate bytes. Both shared and managed model
+bytes are verified immediately before and after ONNX session construction.
 Only then does the descriptor transition to resident `Available` with confirmed
-runtime evidence. Concurrent first-use requests share that publication;
-cancellation and quiesce wake waiters, and shutdown joins the non-preemptible
-loader before completing. The managed root may be injected in
-`ParakeetBackendConfig` or set with `SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`;
-otherwise the platform application-data location is used. When exact files are
-absent, the descriptor reports an application-managed
-`asset_install_required` blocker. Neither discovery nor first use downloads
+runtime evidence. Concurrent first-use requests share that load; cancellation
+and quiesce wake waiters, and shutdown joins the non-preemptible loader before
+completing. The managed root is selected from `ParakeetBackendConfig`, then
+`SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`, otherwise `local/speech/models` under the
+selected shared Hub cache. When exact files are absent, the descriptor reports
+an `asset_install_required` blocker. Neither discovery nor first use downloads
 anything.
 
 The model is English-only and advertises PCM/WAV input, streaming, and partial

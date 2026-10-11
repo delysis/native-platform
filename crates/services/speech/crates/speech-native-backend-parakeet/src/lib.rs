@@ -1,9 +1,12 @@
 //! Embedded, network-free Parakeet speech recognition.
 //!
-//! The backend accepts one exact Parakeet Realtime EOU ONNX manifest, copies
-//! verified candidates out of mutable caches into private content-addressed
-//! application storage, and creates independent decoder state per request. It
-//! intentionally advertises only what the 120M model proves: English PCM/WAV
+//! The backend accepts one exact Parakeet Realtime EOU ONNX manifest. It verifies
+//! the selected manifest-pinned shared Hub snapshot in place, or reuses a verified
+//! managed bundle. Other candidates are copied and verified in private
+//! content-addressed storage. Model bytes are verified before and after load;
+//! mutable refs and cache locators alone confer no authority. Decoder state is
+//! independent per request. The backend intentionally advertises only what the
+//! 120M model proves: English PCM/WAV
 //! transcription with partial streaming results, without timestamps,
 //! diarization, translation, or hotword biasing.
 
@@ -47,11 +50,14 @@ const MAX_AUDIO_MS: u64 = 2 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParakeetBackendConfig {
-    /// Optional source candidate. Its bytes remain untrusted until copied and
-    /// verified against the checked-in model manifest.
+    /// Optional source candidate. Its bytes remain untrusted until verified
+    /// against the checked-in model manifest. The selected manifest-pinned Hub
+    /// snapshot is verified in place; other candidates are copied and verified
+    /// in managed storage before loading.
     pub model_dir: Option<PathBuf>,
     /// Optional injected root for private, content-addressed managed models.
-    /// Platform data storage is used when this is omitted.
+    /// When omitted, SPEECH_NATIVE_PARAKEET_MANAGED_ROOT or local/speech/models
+    /// under the selected shared Hub cache supplies the root.
     pub managed_model_root: Option<PathBuf>,
 }
 

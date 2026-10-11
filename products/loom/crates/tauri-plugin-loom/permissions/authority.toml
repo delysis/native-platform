@@ -40,7 +40,7 @@ permissions = [
 
 [[set]]
 identifier = "verified-model-download"
-description = "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling."
+description = "Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling."
 permissions = [
   "allow-model-download-start",
   "allow-model-download-cancel",
