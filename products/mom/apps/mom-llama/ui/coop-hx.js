@@ -3658,6 +3658,7 @@
       keyCode: event.keyCode,
       isComposing: event.isComposing,
       shiftKey: event.shiftKey,
+      altKey: event.altKey,
       metaKey: event.metaKey,
       ctrlKey: event.ctrlKey,
       sendOnEnter: document.querySelector('[data-setting-key="sendOnEnter"]')?.checked !== false,

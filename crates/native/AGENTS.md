@@ -1,9 +1,9 @@
 # Llama Native Kit implementation contract
 
-This repository owns only the reusable, process-free llama.cpp runtime.
-Product behavior belongs in downstream repositories. In particular, Mom Llama
-belongs in `delysis/mom-llama`, and routing/protocol/speech behavior belongs in
-`delysis/free-token-energy`.
+This subtree owns the reusable, process-free llama.cpp runtime in the canonical
+`delysis/native-platform` workspace. Product behavior belongs in `products/mom`,
+`products/loom` and `products/fte`; Speech belongs in `crates/services/speech`.
+The old standalone repositories are frozen provenance, not destinations for fixes.
 
 ## Non-negotiables
 
@@ -24,11 +24,15 @@ belongs in `delysis/mom-llama`, and routing/protocol/speech behavior belongs in
 
 ## Verification
 
-Run, at minimum:
+Use the root [CONTRIBUTING.md](../../CONTRIBUTING.md) tool pins and evidence rules.
+From the repository root, run the affected group:
 
 ```sh
-cargo fmt --all --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-./scripts/check-architecture.sh
+node scripts/ci/cargo-group.mjs test native
+node scripts/ci/cargo-group.mjs clippy native
+bash crates/native/scripts/check-architecture.sh
 ```
+
+Also check affected reverse-consumer groups; this command selects only the named
+group. The root clean-tree component gate and separate platform, fuzz, real-model
+and packaged acceptance obligations remain in force.

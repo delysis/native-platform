@@ -26,7 +26,7 @@
 
   const submitEffect = (event) => {
     const submit = event.sendOnEnter
-      ? event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey
+      ? event.key === "Enter" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey
       : event.key === "Enter" && (event.metaKey || event.ctrlKey);
     return submit ? effect("submit") : null;
   };
@@ -47,7 +47,7 @@
           [effect("mention_active_changed", { activeIndex })],
         );
       }
-      if (event.key === "Enter" && !event.shiftKey) {
+      if (event.key === "Enter" && !event.shiftKey && !event.altKey) {
         return result(state, [effect("mention_accept", { activeIndex: state.activeIndex })]);
       }
       if (event.key === "Escape") {
@@ -56,7 +56,8 @@
     }
 
     if (state.kind === StateKind.AiPresented) {
-      if (event.key === "ArrowRight") {
+      if (event.key === "ArrowRight"
+        && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) {
         return result(idleState(), [effect("ai_accept", {
           requestId: state.requestId,
           anchor: state.anchor,
@@ -131,6 +132,7 @@
           keyCode: event.keyCode,
           isComposing: event.isComposing,
           shiftKey: Boolean(event.shiftKey),
+          altKey: Boolean(event.altKey),
           metaKey: Boolean(event.metaKey),
           ctrlKey: Boolean(event.ctrlKey),
           sendOnEnter: event.sendOnEnter !== false,
