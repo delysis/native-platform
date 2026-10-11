@@ -546,8 +546,12 @@ fn independent_peers_share_native_decode() -> Outcome<()> {
     )?;
     let original = writing.read_document("Draft.md")?;
     let device = output.join("device");
+    let library = device.join("models");
+    std::fs::create_dir_all(&library)?;
+    let isolated_model = library.join(model_path.file_name().ok_or("model path has no filename")?);
+    std::fs::hard_link(&model_path, &isolated_model)?;
     let state =
-        PluginState::with_app_local_data_root(Some(device), false, BuildModelPolicy::default());
+        PluginState::with_app_local_data_root(Some(device), true, BuildModelPolicy::default());
     {
         let mut session = state.session.lock().map_err(|_| "session lock failed")?;
         session.store = Some(writing);
@@ -557,7 +561,7 @@ fn independent_peers_share_native_decode() -> Outcome<()> {
     let app = tauri::test::mock_app();
     assert!(app.manage(state));
     tauri::async_runtime::block_on(crate::model_load(
-        model_path
+        isolated_model
             .to_str()
             .ok_or("model path is not UTF-8")?
             .to_owned(),
