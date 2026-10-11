@@ -1423,7 +1423,8 @@ fn store_information_error(error: &StoreError) -> InformationError {
             false,
         ),
         StoreError::CommittedDurabilityUnknown { .. }
-        | StoreError::ManagedDocumentsCommitted { .. } => (
+        | StoreError::ManagedDocumentsCommitted { .. }
+        | StoreError::ManagedDocumentsRemovalIncomplete { .. } => (
             ErrorClass::Io,
             "information_store_commit_durability_unknown",
             true,

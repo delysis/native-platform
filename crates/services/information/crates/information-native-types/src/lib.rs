@@ -91,6 +91,8 @@ string_id!(ArtifactId);
 string_id!(InstallationId);
 string_id!(QueryId);
 string_id!(ManagedMaterializationId);
+string_id!(ManagedRemovalId);
+string_id!(ManagedActivationId);
 string_id!(ManagedDocumentId);
 string_id!(ManagedSegmentId);
 
@@ -115,6 +117,33 @@ impl QueryId {
 }
 
 impl Default for QueryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedActivationId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::parse(Uuid::new_v4().to_string())
+            .expect("UUID managed activation ids are always valid")
+    }
+}
+
+impl Default for ManagedActivationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedRemovalId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::parse(Uuid::new_v4().to_string()).expect("UUID managed removal ids are always valid")
+    }
+}
+
+impl Default for ManagedRemovalId {
     fn default() -> Self {
         Self::new()
     }
@@ -885,6 +914,7 @@ pub fn default_managed_document_use_policy() -> UsePolicy {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsReceipt {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
     pub materialization_id: ManagedMaterializationId,
     pub resource_id: ResourceId,
     pub release_id: ReleaseId,
@@ -1056,6 +1086,9 @@ impl ManagedDocumentsSearchHit {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalPlan {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
@@ -1068,6 +1101,7 @@ pub struct ManagedDocumentsRemovalPlan {
 impl ManagedDocumentsRemovalPlan {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)?;
         require_text(
@@ -1087,14 +1121,41 @@ impl ManagedDocumentsRemovalPlan {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalRequest {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub operation_id: ManagedRemovalId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
+    pub observed_managed_bytes: u64,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
 }
 
+impl ManagedDocumentsRemovalPlan {
+    /// Bind fresh caller consent to this exact activation and byte impact.
+    #[must_use]
+    pub fn confirmed_request(
+        &self,
+        operation_id: ManagedRemovalId,
+    ) -> ManagedDocumentsRemovalRequest {
+        ManagedDocumentsRemovalRequest {
+            schema: self.schema.clone(),
+            activation_id: self.activation_id.clone(),
+            operation_id,
+            activated_at: self.activated_at,
+            manifest_sha256: self.manifest_sha256.clone(),
+            observed_managed_bytes: self.observed_managed_bytes,
+            materialization_id: self.materialization_id.clone(),
+            content_sha256: self.content_sha256.clone(),
+            database_sha256: self.database_sha256.clone(),
+        }
+    }
+}
+
 impl ManagedDocumentsRemovalRequest {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)
     }
@@ -1104,6 +1165,10 @@ impl ManagedDocumentsRemovalRequest {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalReceipt {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub operation_id: ManagedRemovalId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
@@ -1115,6 +1180,7 @@ pub struct ManagedDocumentsRemovalReceipt {
 impl ManagedDocumentsRemovalReceipt {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)?;
         if self.external_source_bytes_removed {

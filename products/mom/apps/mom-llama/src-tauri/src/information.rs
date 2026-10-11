@@ -14,11 +14,11 @@ use information_native_store::{
 use information_native_types::{
     CATALOG_SCHEMA, CatalogTrust, EvidenceHit, EvidenceLocator, ExternalAccessMode,
     ExternalRegistration, FormatKind, InformationCatalog, InformationQuery, InstallationId,
-    MANAGED_DOCUMENTS_REMOVAL_SCHEMA, MANAGED_DOCUMENTS_SEARCH_SCHEMA,
-    ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedMaterializationId,
-    Provenance, Publisher, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, QuerySyntax,
-    RedistributionPolicy, ReleaseId, RepresentationFormat, RepresentationId, ResourceId,
-    RetrievalPurpose, RetrievalTarget, RightsStatement, UsePermission, UsePolicy,
+    MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedActivationId, ManagedDocumentsRemovalRequest,
+    ManagedDocumentsSearchRequest, ManagedMaterializationId, ManagedRemovalId, Provenance,
+    Publisher, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, QuerySyntax, RedistributionPolicy,
+    ReleaseId, RepresentationFormat, RepresentationId, ResourceId, RetrievalPurpose,
+    RetrievalTarget, RightsStatement, UsePermission, UsePolicy,
 };
 use mom_llama_runtime::{
     AttachmentLibraryInput, AttachmentPreviewAnchor, attachment_library_input,
@@ -76,7 +76,8 @@ struct PendingAttachmentPreview {
 #[derive(Clone)]
 struct PendingRemovalPreview {
     preview: ManagedRemovalPreview,
-    completed: Option<ManagedRemovalOutput>,
+    request: ManagedDocumentsRemovalRequest,
+    accepted: bool,
     expires_at_unix_ms: u64,
 }
 
@@ -209,6 +210,9 @@ pub struct ManagedEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedRemovalPreview {
     pub preview_id: String,
+    pub activation_id: ManagedActivationId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
     pub materialization_id: String,
     pub content_sha256: String,
     pub database_sha256: String,
@@ -744,15 +748,21 @@ impl MomInformation {
             .plan_managed_documents_removal(&id)
             .map_err(display_error)?;
         let mut preview = ManagedRemovalPreview {
-            preview_id: InstallationId::new().to_string(),
+            preview_id: ManagedRemovalId::new().to_string(),
+            activation_id: plan.activation_id.clone(),
+            activated_at: plan.activated_at,
+            manifest_sha256: plan.manifest_sha256.clone(),
             materialization_id: plan.materialization_id.to_string(),
-            content_sha256: plan.content_sha256,
-            database_sha256: plan.database_sha256,
+            content_sha256: plan.content_sha256.clone(),
+            database_sha256: plan.database_sha256.clone(),
             observed_managed_bytes: plan.observed_managed_bytes,
             external_source_bytes_removed: plan.external_source_bytes_removed,
             impact_sha256: String::new(),
         };
         preview.impact_sha256 = removal_sha256(&preview)?;
+        let request = plan.confirmed_request(
+            ManagedRemovalId::parse(preview.preview_id.clone()).map_err(display_error)?,
+        );
         let now = now_unix_ms();
         let mut grants = self
             .grants
@@ -766,7 +776,8 @@ impl MomInformation {
             preview.preview_id.clone(),
             PendingRemovalPreview {
                 preview: preview.clone(),
-                completed: None,
+                request,
+                accepted: false,
                 expires_at_unix_ms: now.saturating_add(PREVIEW_TTL_MS),
             },
         );
@@ -803,61 +814,62 @@ impl MomInformation {
                 "The managed removal preview does not match its opaque capability.".to_string(),
             );
         }
-        if let Some(completed) = &capability.completed {
-            return Ok(completed.clone());
-        }
         let id = ManagedMaterializationId::parse(preview.materialization_id.clone())
             .map_err(display_error)?;
-        match self.host.active_managed_document(&id) {
-            Ok(active) => {
-                let record = project_attachment_materialization(active)?.ok_or_else(|| {
-                    "The exact managed representation is not an Attachment library item."
-                        .to_string()
-                })?;
-                if record.content_sha256 != preview.content_sha256
-                    || record.database_sha256 != preview.database_sha256
-                {
-                    return Err(
-                        "The managed representation changed after removal preview.".to_string()
-                    );
-                }
-            }
-            Err(HostError::Store(StoreError::ManagedDocumentsNotFound(_))) => {
-                return Err("The managed representation disappeared after preview; no removal success was fabricated."
-                    .to_string());
-            }
-            Err(error) => return Err(display_error(error)),
-        }
-        match self.host.plan_managed_documents_removal(&id) {
-            Ok(plan)
-                if plan.content_sha256 == preview.content_sha256
-                    && plan.database_sha256 == preview.database_sha256
-                    && plan.observed_managed_bytes == preview.observed_managed_bytes => {}
-            Ok(_) => {
+        // Fresh consent is checked against the active Attachment producer.
+        // An accepted continuation uses the exact stored request; deliberately
+        // hidden bytes are not required to become discoverable again.
+        if !capability.accepted {
+            let active = self
+                .host
+                .active_managed_document(&id)
+                .map_err(display_error)?;
+            let activated_at = active.activated_at;
+            let activation_id = active.activation_id.clone();
+            let record = project_attachment_materialization(active)?.ok_or_else(|| {
+                "The exact managed representation is not an Attachment library item.".to_string()
+            })?;
+            if record.content_sha256 != preview.content_sha256
+                || record.database_sha256 != preview.database_sha256
+                || activation_id != preview.activation_id
+                || activated_at != preview.activated_at
+            {
                 return Err("The managed representation changed after removal preview.".to_string());
             }
-            Err(HostError::Store(StoreError::ManagedDocumentsNotFound(_))) => {
-                return Err("The managed representation disappeared after preview; no removal success was fabricated."
-                    .to_string());
+            let plan = self
+                .host
+                .plan_managed_documents_removal(&id)
+                .map_err(display_error)?;
+            if plan.confirmed_request(capability.request.operation_id.clone()) != capability.request
+            {
+                return Err("The managed representation changed after removal preview.".to_string());
+            }
+        }
+        let receipt = match self.host.remove_managed_documents(&capability.request) {
+            Ok(receipt) => {
+                capability.accepted = true;
+                receipt
+            }
+            Err(HostError::Store(StoreError::ManagedDocumentsRemovalIncomplete {
+                request,
+                source,
+            })) => {
+                if *request == capability.request {
+                    capability.accepted = true;
+                }
+                return Err(display_error(
+                    StoreError::ManagedDocumentsRemovalIncomplete { request, source },
+                ));
             }
             Err(error) => return Err(display_error(error)),
-        }
-        let receipt = self
-            .host
-            .remove_managed_documents(&ManagedDocumentsRemovalRequest {
-                schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-                materialization_id: id,
-                content_sha256: preview.content_sha256.clone(),
-                database_sha256: preview.database_sha256.clone(),
-            })
-            .map_err(display_error)?;
+        };
+        observe_removal_delivery()?;
         let output = ManagedRemovalOutput {
             materialization_id: receipt.materialization_id.to_string(),
             removed_managed_bytes: receipt.removed_managed_bytes,
             external_source_bytes_removed: receipt.external_source_bytes_removed,
             already_absent: false,
         };
-        capability.completed = Some(output.clone());
         Ok(output)
     }
 
@@ -1284,6 +1296,24 @@ fn preview_sha256(preview: &AttachmentLibraryPreview) -> Result<String, String> 
     serde_json::to_vec(&value)
         .map(|bytes| sha256(&bytes))
         .map_err(display_error)
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOVAL_DELIVERY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn observe_removal_delivery() -> Result<(), String> {
+    #[cfg(test)]
+    REMOVAL_DELIVERY_FAULT.with(|fault| {
+        if fault.replace(false) {
+            return Err(
+                "Injected lost managed removal response after durable completion.".to_string(),
+            );
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn removal_sha256(preview: &ManagedRemovalPreview) -> Result<String, String> {
@@ -1751,36 +1781,205 @@ mod tests {
         assert!(error.contains("model-context ceiling"));
     }
 
+    #[cfg(unix)]
+    fn materialize_removal_fixture(
+        information: &MomInformation,
+        source_bytes: &[u8],
+    ) -> information_native_types::ManagedDocumentsV1 {
+        use information_native_types::{
+            ArtifactId, MANAGED_DOCUMENTS_SCHEMA, ManagedDocument, ManagedDocumentId,
+            ManagedDocumentLineage, ManagedDocumentsV1, ManagedSegmentId, ManagedSourceArtifact,
+            ManagedTextSegment, default_managed_document_rights,
+            default_managed_document_use_policy,
+        };
+        // Exercise the actual public Information materializer and Mom's exact
+        // Attachment projection, with inert source-neutral fixture documents.
+        let root = sha256(source_bytes);
+        let binding = "2".repeat(64);
+        let artifact = "text-artifact";
+        let source_id = ArtifactId::parse("source-artifact").expect("source id");
+        let text = String::from_utf8(source_bytes.to_vec()).expect("fixture text");
+        let text_sha256 = sha256(text.as_bytes());
+        let locator = EvidenceLocator::Record {
+            collection: Some("fixture".to_string()),
+            key: artifact.to_string(),
+        };
+        let mut segment = ManagedTextSegment {
+            segment_id: ManagedSegmentId::parse("fixture-segment").expect("segment id"),
+            ordinal: 0,
+            text,
+            text_sha256: text_sha256.clone(),
+            locator: locator.clone(),
+        };
+        segment.refresh_text_sha256();
+        let mut documents = ManagedDocumentsV1 {
+            schema: MANAGED_DOCUMENTS_SCHEMA.to_string(),
+            materialization_id: ManagedMaterializationId::parse(format!(
+                "attachment-text:{binding}"
+            ))
+            .expect("materialization id"),
+            resource_id: ResourceId::parse(format!("attachment-root:{root}")).expect("resource id"),
+            release_id: ReleaseId::parse(format!("attachment-release:{binding}"))
+                .expect("release id"),
+            representation_id: RepresentationId::parse(format!("attachment-text:{binding}"))
+                .expect("representation id"),
+            created_at: Utc::now(),
+            provenance: Provenance {
+                publisher: "attachment-native-kit".to_string(),
+                source_uri: format!("urn:sha256:{root}"),
+                upstream_record_id: Some(artifact.to_string()),
+                source_inputs: vec![artifact.to_string()],
+                transformation: Some(ATTACHMENT_TEXT_TRANSFORMATION.to_string()),
+                metadata: BTreeMap::from([
+                    ("attachment_root_sha256".to_string(), root.clone().into()),
+                    ("attachment_graph_sha256".to_string(), "3".repeat(64).into()),
+                    ("attachment_artifact_id".to_string(), artifact.into()),
+                    (
+                        "attachment_canonical_text_sha256".to_string(),
+                        text_sha256.clone().into(),
+                    ),
+                    ("binding_sha256".to_string(), binding.clone().into()),
+                    ("confirmed_rights_sha256".to_string(), "4".repeat(64).into()),
+                    (
+                        "attachment_processor".to_string(),
+                        serde_json::json!({
+                            "name": "fixture-text", "version": "1", "policy_fingerprint": "fixture-policy"
+                        }),
+                    ),
+                ]),
+            },
+            source_artifacts: vec![ManagedSourceArtifact {
+                artifact_id: source_id.clone(),
+                source_uri: format!("urn:sha256:{root}"),
+                bytes: u64::try_from(source_bytes.len()).expect("source length"),
+                sha256: root,
+                immutable: true,
+            }],
+            documents: vec![ManagedDocument {
+                document_id: ManagedDocumentId::parse("fixture-document").expect("document id"),
+                title: "Removal Fixture".to_string(),
+                creator: None,
+                source_uri: None,
+                locator: locator.clone(),
+                immutable: true,
+                visibility: Default::default(),
+                lineage: vec![ManagedDocumentLineage {
+                    source_artifact_id: source_id,
+                    source_record_id: artifact.to_string(),
+                    source_record_sha256: text_sha256,
+                    source_locator: locator,
+                    transformation: format!(
+                        "{ATTACHMENT_TEXT_TRANSFORMATION} via fixture-text@1 under fixture-policy"
+                    ),
+                }],
+                rights: default_managed_document_rights(),
+                use_policy: default_managed_document_use_policy(),
+                segments: vec![segment],
+            }],
+            content_sha256: String::new(),
+        };
+        documents.refresh_content_sha256().expect("content hash");
+        information
+            .host
+            .materialize_documents(&documents)
+            .expect("public materialization");
+        documents
+    }
+
     #[test]
     #[cfg(unix)]
-    fn removal_commit_requires_exact_live_server_capability_and_retries_cached_result() {
-        let information = MomInformation::empty_for_tests();
-        let mut preview = ManagedRemovalPreview {
-            preview_id: "opaque-preview".to_string(),
-            materialization_id: "attachment-text:binding".to_string(),
-            content_sha256: "1".repeat(64),
-            database_sha256: "2".repeat(64),
-            observed_managed_bytes: 123,
-            external_source_bytes_removed: false,
-            impact_sha256: String::new(),
-        };
-        preview.impact_sha256 = removal_sha256(&preview).expect("preview hash");
+    fn removal_commit_replays_durable_completion_after_a_lost_authorized_response() {
+        let temporary = tempfile::tempdir().expect("temporary app");
+        let source = temporary.path().join("original-source.txt");
+        let source_bytes = b"preserved original attachment text";
+        std::fs::write(&source, source_bytes).expect("source fixture");
+        let data_dir = temporary.path().join("mom");
+        let information = MomInformation::open(&data_dir).expect("Information owner");
+        let documents = materialize_removal_fixture(&information, source_bytes);
+        let preview = information
+            .preview_managed_removal(documents.materialization_id.as_str())
+            .expect("actual public removal preview");
+        assert_eq!(information.managed_attachments().expect("before").len(), 1);
+        REMOVAL_DELIVERY_FAULT.with(|fault| fault.set(true));
+        let failure = information
+            .commit_managed_removal(&preview)
+            .expect_err("lost response");
+        assert!(failure.contains("lost managed removal response"));
         assert!(
             information
+                .managed_attachments()
+                .expect("hidden after removal")
+                .is_empty()
+        );
+        let output = information
+            .commit_managed_removal(&preview)
+            .expect("same authorized retry");
+        assert_eq!(output.removed_managed_bytes, preview.observed_managed_bytes);
+        assert!(!output.external_source_bytes_removed);
+        assert!(!output.already_absent);
+        assert_eq!(
+            information
                 .commit_managed_removal(&preview)
-                .expect_err("no preview")
+                .expect("terminal replay"),
+            output
+        );
+        assert_eq!(std::fs::read(&source).expect("source after"), source_bytes);
+        information
+            .host
+            .materialize_documents(&documents)
+            .expect("new generation");
+        assert!(
+            information.commit_managed_removal(&preview).is_err(),
+            "an old admitted operation cannot remove a new activation"
+        );
+        assert_eq!(
+            information
+                .managed_attachments()
+                .expect("replacement survived")
+                .len(),
+            1
+        );
+        drop(information);
+        let reopened = MomInformation::open(&data_dir).expect("reopened product owner");
+        assert!(
+            reopened
+                .commit_managed_removal(&preview)
+                .expect_err("no restored live grant")
                 .contains("No live server-side preview")
         );
-
-        information.grants.lock().expect("grants").removals.insert(
-            preview.preview_id.clone(),
-            PendingRemovalPreview {
-                preview: preview.clone(),
-                completed: None,
-                expires_at_unix_ms: now_unix_ms().saturating_add(10_000),
-            },
+        let fresh = reopened
+            .preview_managed_removal(documents.materialization_id.as_str())
+            .expect("fresh explicit preview");
+        assert_ne!(fresh.activation_id, preview.activation_id);
+        reopened
+            .commit_managed_removal(&fresh)
+            .expect("fresh consent removes replacement");
+        assert_eq!(
+            std::fs::read(source).expect("source survives fresh removal"),
+            source_bytes
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removal_commit_requires_exact_live_server_capability_and_preserves_denial_controls() {
+        let temporary = tempfile::tempdir().expect("temporary app");
+        let information =
+            MomInformation::open(&temporary.path().join("mom")).expect("Information owner");
+        let documents = materialize_removal_fixture(&information, b"bounded private source text");
+        let preview = information
+            .preview_managed_removal(documents.materialization_id.as_str())
+            .expect("public preview");
         let mut forged = preview.clone();
+        forged.preview_id = ManagedRemovalId::new().to_string();
+        forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
+        assert!(
+            information
+                .commit_managed_removal(&forged)
+                .expect_err("unknown preview")
+                .contains("No live server-side preview")
+        );
+        forged = preview.clone();
         forged.materialization_id = "attachment-text:other".to_string();
         forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
         assert!(
@@ -1789,41 +1988,37 @@ mod tests {
                 .expect_err("cross-target preview")
                 .contains("does not match")
         );
-
+        forged = preview.clone();
+        forged.activation_id = ManagedActivationId::new();
+        forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
+        assert!(information.commit_managed_removal(&forged).is_err());
         information
             .grants
             .lock()
             .expect("grants")
             .removals
             .get_mut(&preview.preview_id)
-            .expect("pending")
+            .expect("pending preview")
             .expires_at_unix_ms = 0;
         assert!(
             information
                 .commit_managed_removal(&preview)
-                .expect_err("stale preview")
+                .expect_err("expired preview")
                 .contains("No live server-side preview")
-        );
-
-        let output = ManagedRemovalOutput {
-            materialization_id: preview.materialization_id.clone(),
-            removed_managed_bytes: 123,
-            external_source_bytes_removed: false,
-            already_absent: false,
-        };
-        information.grants.lock().expect("grants").removals.insert(
-            preview.preview_id.clone(),
-            PendingRemovalPreview {
-                preview: preview.clone(),
-                completed: Some(output.clone()),
-                expires_at_unix_ms: now_unix_ms().saturating_add(10_000),
-            },
         );
         assert_eq!(
             information
-                .commit_managed_removal(&preview)
-                .expect("cached retry"),
-            output
+                .managed_attachments()
+                .expect("denied actions preserved active bytes")
+                .len(),
+            1
         );
+        let fresh = information
+            .preview_managed_removal(documents.materialization_id.as_str())
+            .expect("fresh preview");
+        information
+            .commit_managed_removal(&fresh)
+            .expect("authorized neighboring control");
+        assert!(information.managed_attachments().expect("after").is_empty());
     }
 }
