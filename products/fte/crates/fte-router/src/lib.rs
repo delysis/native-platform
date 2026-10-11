@@ -140,7 +140,6 @@ impl LifecycleControl {
     fn register_request(
         &self,
         request_id: &RequestId,
-        progress_capacity: usize,
     ) -> Result<operation_lifecycle::OperationLease, GatewayError> {
         let state = self.lock_state(request_id)?;
         if state.phase != GatewayLifecycle::Running {
@@ -159,7 +158,7 @@ impl LifecycleControl {
         }
         let (guard, lease) = self
             .operations
-            .reserve_with_capacity(&request_id.0, progress_capacity.min(4096))
+            .reserve(&request_id.0)
             .map_err(|error| operation_registry_error(request_id, error))?;
         lease
             .queue()
@@ -1335,13 +1334,7 @@ impl Gateway {
     }
 
     fn reserve_request(&self, request: &GatewayRequest) -> Result<AdmissionLease, GatewayError> {
-        let operation = self.lifecycle.register_request(
-            &request.request_id,
-            request
-                .stream
-                .event_capacity
-                .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY),
-        )?;
+        let operation = self.lifecycle.register_request(&request.request_id)?;
         Ok(AdmissionLease {
             _permit: None,
             cancellation: operation.cancellation(),
@@ -2934,86 +2927,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_operation_release_replaces_backend_success() {
-        let gateway = Gateway::new(GatewayDefaults::default());
-        let request_id = RequestId::new();
-        let operation = gateway
-            .lifecycle
-            .register_request(&request_id, 1)
-            .expect("register operation");
-        operation.start().expect("start operation");
-        let retained_operation = operation.clone();
-        let attempt = operation.start_attempt().expect("start active attempt");
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("admission permit");
-        let lease = AdmissionLease {
-            _permit: Some(permit),
-            cancellation: operation.cancellation(),
-            started: true,
-            response_state: Arc::clone(&gateway.state),
-            store_response: false,
-            quota: None,
-            operation: Mutex::new(Some(operation)),
-            lifecycle: Arc::clone(&gateway.lifecycle),
-        };
-        let (_event_tx, event_rx) = mpsc::channel(1);
-        let (final_tx, final_rx) = oneshot::channel();
-        let mut ticket = GatewayTicket::new(
-            request_id.clone(),
-            event_rx,
-            final_rx,
-            Arc::new(NoopCancellation),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_admission_lease_and_deadlines(
-            Box::new(lease),
-            fte_types::DeadlinePolicy::default(),
-            Duration::ZERO,
-            32,
-        );
-
-        final_tx
-            .send(Ok(completed_response(request_id, "fixture")))
-            .expect("publish backend success");
-        let event = ticket
-            .events
-            .recv()
-            .await
-            .expect("lifecycle failure terminal event");
-        let GatewayEvent::Failed { error, .. } = event else {
-            panic!("failed atomic lifecycle finish must project Failed: {event:?}");
-        };
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert!(ticket.events.recv().await.is_none());
-        let error = ticket
-            .final_response()
-            .await
-            .expect_err("failed release must replace backend success");
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert_eq!(
-            retained_operation
-                .snapshot()
-                .expect("registry remains valid")
-                .expect("operation remains registered")
-                .phase,
-            operation_lifecycle::OperationPhase::Running
-        );
-
-        let shutdown_error = gateway
-            .shutdown()
-            .await
-            .expect_err("failed release must also fail shutdown");
-        assert_eq!(shutdown_error.code, "gateway_operation_lifecycle_failed");
-
-        attempt.finish().expect("finish retained attempt");
-        retained_operation
-            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
-            .expect("release retained operation after test");
-    }
-
-    #[tokio::test]
     async fn count_token_deadlines_finalize_admission_explicitly() {
         for deadline_ms in [1, 5] {
             let gateway = Gateway::new(GatewayDefaults::default());
@@ -3035,59 +2948,6 @@ mod tests {
             assert_eq!(error.code, "request_total_deadline_exceeded");
             assert_eq!(gateway.status().active_requests, 0);
         }
-    }
-
-    #[tokio::test]
-    async fn count_token_lifecycle_failure_replaces_timeout() {
-        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
-        gateway
-            .register_backend(Arc::new(HangingBackend {
-                cancelled: Arc::new(AtomicUsize::new(0)),
-            }))
-            .expect("register hanging backend");
-        let mut request = request();
-        let request_id = request.request_id.clone();
-        request.model = ModelSelector::ExactRoute {
-            backend_id: "hanging".to_string(),
-            model_id: "hanging-model".to_string(),
-        };
-        request.deadline.total_ms = Some(50);
-        let count_gateway = Arc::clone(&gateway);
-        let count = tokio::spawn(async move { count_gateway.count_tokens(request).await });
-        let operation = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(operation) = gateway
-                    .lifecycle
-                    .operations
-                    .current_lease(&request_id.0)
-                    .expect("registry remains valid")
-                {
-                    break operation;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("count-token admission becomes active");
-        let attempt = operation.start_attempt().expect("sabotage active attempt");
-
-        let error = count
-            .await
-            .expect("count task")
-            .expect_err("lifecycle failure replaces timeout");
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert_eq!(gateway.status().active_requests, 1);
-        let snapshot = operation
-            .snapshot()
-            .expect("registry remains valid")
-            .expect("failed finalization remains active");
-        assert_eq!(snapshot.phase, operation_lifecycle::OperationPhase::Running);
-        assert!(snapshot.terminal.is_none());
-
-        attempt.finish().expect("finish sabotage attempt");
-        operation
-            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
-            .expect("clean up sabotaged operation");
     }
 
     #[test]

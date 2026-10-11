@@ -130,8 +130,7 @@
         "response.output_text.delta",
         "response.completed"
       ],
-      "stored_response_id": "resp_socket_test",
-      "continuation_response_id": "resp_socket_continuation"
+      "stored_response_id": "resp_socket_test"
     }
   },
   "omitted_claims": [

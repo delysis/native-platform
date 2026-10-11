@@ -1,18 +1,15 @@
-//! Generation-safe ownership for gateway operations and backend attempts.
+//! Generation-safe ownership for admitted gateway operations.
 //!
-//! This is the router's production registry.  It deliberately owns lifecycle
-//! facts that cannot be inferred from a consumer ticket: public-operation
-//! identity, executor release authority, terminal linearization, attempts,
-//! bounded progress, and retained task accounting.
+//! Guards public-operation identity, cancellation, and terminal/release
+//! transitions. Backend workers and the ticket executor own physical completion.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
     pub operation_id: String,
-    pub attempt_id: String,
     pub sequence: u64,
 }
 
@@ -38,7 +35,6 @@ pub struct OperationSnapshot {
     pub phase: OperationPhase,
     pub cancellation_requested: bool,
     pub terminal: Option<TerminalClass>,
-    pub progress: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +49,6 @@ pub enum RegistryError {
 #[derive(Clone)]
 pub struct OperationRegistry {
     inner: Arc<Mutex<RegistryState>>,
-    progress_capacity: usize,
 }
 
 struct RegistryState {
@@ -67,10 +62,6 @@ struct OperationRecord {
     cancellation_requested: bool,
     cancellation: CancellationToken,
     terminal: Option<TerminalClass>,
-    progress: VecDeque<u64>,
-    progress_capacity: usize,
-    next_attempt_sequence: u64,
-    attempts: BTreeMap<u64, OperationIdentity>,
     released: Arc<Mutex<Option<OperationSnapshot>>>,
 }
 
@@ -87,35 +78,19 @@ pub struct ConsumerGuard {
     cancel_on_drop: bool,
 }
 
-#[derive(Clone)]
-pub struct AttemptLease {
-    registry: OperationRegistry,
-    operation: OperationIdentity,
-    identity: OperationIdentity,
-}
-
 impl OperationRegistry {
-    pub fn new(next_sequence: u64, progress_capacity: usize) -> Self {
+    pub fn new(next_sequence: u64) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryState {
                 next_sequence,
                 operations: BTreeMap::new(),
             })),
-            progress_capacity,
         }
     }
 
     pub fn reserve(
         &self,
         operation_id: &str,
-    ) -> Result<(ConsumerGuard, OperationLease), RegistryError> {
-        self.reserve_with_capacity(operation_id, self.progress_capacity)
-    }
-
-    pub fn reserve_with_capacity(
-        &self,
-        operation_id: &str,
-        progress_capacity: usize,
     ) -> Result<(ConsumerGuard, OperationLease), RegistryError> {
         let mut state = self.lock()?;
         if state.operations.contains_key(operation_id) {
@@ -125,7 +100,6 @@ impl OperationRegistry {
         state.next_sequence = sequence.checked_add(1).ok_or(RegistryError::Exhausted)?;
         let identity = OperationIdentity {
             operation_id: operation_id.to_owned(),
-            attempt_id: format!("operation-{sequence}"),
             sequence,
         };
         let released = Arc::new(Mutex::new(None));
@@ -138,10 +112,6 @@ impl OperationRegistry {
                 cancellation_requested: false,
                 cancellation: cancellation.clone(),
                 terminal: None,
-                progress: VecDeque::with_capacity(progress_capacity),
-                progress_capacity,
-                next_attempt_sequence: 1,
-                attempts: BTreeMap::new(),
                 released: Arc::clone(&released),
             },
         );
@@ -261,7 +231,7 @@ impl OperationRegistry {
 
 impl Default for OperationRegistry {
     fn default() -> Self {
-        Self::new(1, 32)
+        Self::new(1)
     }
 }
 
@@ -318,10 +288,7 @@ impl OperationLease {
         let mut state = self.registry.lock()?;
         let _released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.phase != OperationPhase::Running
-            || record.terminal.is_some()
-            || !record.attempts.is_empty()
-        {
+        if record.phase != OperationPhase::Running || record.terminal.is_some() {
             return Err(RegistryError::InvalidTransition);
         }
         record.terminal = Some(terminal);
@@ -338,7 +305,6 @@ impl OperationLease {
             OperationPhase::Queued | OperationPhase::Running
         ) || (record.phase == OperationPhase::Queued && terminal == TerminalClass::Completed)
             || record.terminal.is_some()
-            || !record.attempts.is_empty()
         {
             return Err(RegistryError::InvalidTransition);
         }
@@ -354,7 +320,7 @@ impl OperationLease {
         let mut state = self.registry.lock()?;
         let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.phase != OperationPhase::Terminal || !record.attempts.is_empty() {
+        if record.phase != OperationPhase::Terminal {
             return Err(RegistryError::InvalidTransition);
         }
         record.phase = OperationPhase::Released;
@@ -370,51 +336,6 @@ impl OperationLease {
         record.cancellation_requested = true;
         record.cancellation.cancel();
         Ok(())
-    }
-
-    pub fn publish_progress(&self, sequence: u64) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock()?;
-        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.phase != OperationPhase::Running || record.terminal.is_some() {
-            return Err(RegistryError::InvalidTransition);
-        }
-        if record.progress_capacity != 0 {
-            if record.progress.len() == record.progress_capacity {
-                record.progress.pop_front();
-            }
-            record.progress.push_back(sequence);
-        }
-        Ok(())
-    }
-
-    pub fn start_attempt(&self) -> Result<AttemptLease, RegistryError> {
-        let mut state = self.registry.lock()?;
-        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.phase != OperationPhase::Running {
-            return Err(RegistryError::InvalidTransition);
-        }
-        let sequence = record.next_attempt_sequence;
-        record.next_attempt_sequence = sequence.checked_add(1).ok_or(RegistryError::Exhausted)?;
-        let identity = OperationIdentity {
-            operation_id: self.identity.operation_id.clone(),
-            attempt_id: format!("{}-attempt-{sequence}", self.identity.attempt_id),
-            sequence,
-        };
-        record.attempts.insert(sequence, identity.clone());
-        Ok(AttemptLease {
-            registry: self.registry.clone(),
-            operation: self.identity.clone(),
-            identity,
-        })
-    }
-
-    pub fn active_attempts(&self) -> Result<Vec<OperationIdentity>, RegistryError> {
-        let mut state = self.registry.lock()?;
-        Ok(OperationRegistry::record_mut(&mut state, &self.identity)?
-            .attempts
-            .values()
-            .cloned()
-            .collect())
     }
 
     fn transition(
@@ -464,34 +385,11 @@ impl Drop for ConsumerGuard {
     }
 }
 
-impl AttemptLease {
-    pub fn identity(&self) -> OperationIdentity {
-        self.identity.clone()
-    }
-
-    pub fn cancellation_requested(&self) -> Result<bool, RegistryError> {
-        let mut state = self.registry.lock()?;
-        Ok(OperationRegistry::record_mut(&mut state, &self.operation)?.cancellation_requested)
-    }
-
-    pub fn finish(self) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock()?;
-        let record = OperationRegistry::record_mut(&mut state, &self.operation)?;
-        record
-            .attempts
-            .remove(&self.identity.sequence)
-            .filter(|current| *current == self.identity)
-            .map(|_| ())
-            .ok_or(RegistryError::Stale)
-    }
-}
-
 fn snapshot(record: &OperationRecord) -> OperationSnapshot {
     OperationSnapshot {
         identity: record.identity.clone(),
         phase: record.phase,
         cancellation_requested: record.cancellation_requested,
         terminal: record.terminal,
-        progress: record.progress.iter().copied().collect(),
     }
 }
