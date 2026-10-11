@@ -5,6 +5,7 @@
 //! exposed as request-local sequence identities. No prefix is shared between
 //! requests, even when their token prefixes happen to match.
 use super::*;
+use crate::operation_registry::RequestTerminalClass;
 use std::collections::BTreeMap;
 use std::sync::{Weak, atomic::AtomicU64};
 
