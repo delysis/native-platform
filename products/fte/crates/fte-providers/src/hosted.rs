@@ -1102,6 +1102,7 @@ fn completion_prompt_json(
 }
 
 fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     let GenerationInput::Chat { items } = &request.request.input else {
         return Err(capability_error(
             &request.request.request_id,
@@ -1139,20 +1140,32 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                     .collect::<Vec<_>>()
             ),
         );
-        let choice = match request.request.tool_policy.execution {
-            fte_types::ToolExecutionPolicy::Deny => json!({"type":"none"}),
-            fte_types::ToolExecutionPolicy::ClientOnly | fte_types::ToolExecutionPolicy::Ask => {
-                json!({"type":"auto"})
-            }
-            fte_types::ToolExecutionPolicy::AllowGateway => {
+        let mut choice = match &request.request.tool_policy.selection {
+            fte_types::ToolSelection::None => json!({"type":"none"}),
+            fte_types::ToolSelection::Auto => json!({"type":"auto"}),
+            fte_types::ToolSelection::Required => json!({"type":"any"}),
+            fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
+        };
+        if let Some(disable_parallel) = request
+            .request
+            .provider_extensions
+            .get("anthropic.disable_parallel_tool_use")
+        {
+            if !disable_parallel.is_boolean()
+                || matches!(
+                    request.request.tool_policy.selection,
+                    fte_types::ToolSelection::None
+                )
+            {
                 return Err(capability_error(
                     &request.request.request_id,
                     &request.route.backend_id,
-                    "gateway_tool_execution_not_bound",
-                    "hosted tool execution requires an explicit gateway-owned tool adapter",
+                    "anthropic_parallel_tool_policy_invalid",
+                    "disable_parallel_tool_use needs a boolean and an enabled tool choice",
                 ));
             }
-        };
+            choice["disable_parallel_tool_use"] = disable_parallel.clone();
+        }
         body.insert("tool_choice".to_string(), choice);
     }
     apply_anthropic_cache_breakpoints(
@@ -1167,6 +1180,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             "anthropic.metadata",
             "anthropic.service_tier",
             "anthropic.beta",
+            "anthropic.disable_parallel_tool_use",
         ],
     )?;
     for name in ["thinking", "metadata", "service_tier"] {
@@ -1182,6 +1196,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
 }
 
 fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     validate_provider_extensions(
         request,
         &[
@@ -1189,6 +1204,7 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
             "anthropic.metadata",
             "anthropic.service_tier",
             "anthropic.beta",
+            "anthropic.disable_parallel_tool_use",
         ],
     )?;
     let GenerationInput::Chat { items } = &request.request.input else {
@@ -1221,6 +1237,7 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
 }
 
 fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     let GenerationInput::Chat { items } = &request.request.input else {
         return Err(capability_error(
             &request.request.request_id,
@@ -1388,24 +1405,30 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             json!([{"functionDeclarations":declarations}]),
         );
         if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
+            if !matches!(
+                request.request.tool_policy.selection,
+                fte_types::ToolSelection::Auto
+            ) {
+                return Err(capability_error(
+                    &request.request.request_id,
+                    &request.route.backend_id,
+                    "tool_policy_ambiguous",
+                    "an explicit provider tool configuration cannot override canonical tool selection",
+                ));
+            }
             body.insert("toolConfig".to_string(), tool_config.clone());
         } else {
-            let mode = match request.request.tool_policy.execution {
-                fte_types::ToolExecutionPolicy::Deny => "NONE",
-                fte_types::ToolExecutionPolicy::ClientOnly
-                | fte_types::ToolExecutionPolicy::Ask => "AUTO",
-                fte_types::ToolExecutionPolicy::AllowGateway => {
-                    return Err(capability_error(
-                        &request.request.request_id,
-                        &request.route.backend_id,
-                        "gateway_tool_execution_not_bound",
-                        "hosted tool execution requires an explicit gateway-owned tool adapter",
-                    ));
+            let config = match &request.request.tool_policy.selection {
+                fte_types::ToolSelection::None => json!({"mode":"NONE"}),
+                fte_types::ToolSelection::Auto => json!({"mode":"AUTO"}),
+                fte_types::ToolSelection::Required => json!({"mode":"ANY"}),
+                fte_types::ToolSelection::Named { name } => {
+                    json!({"mode":"ANY","allowedFunctionNames":[name]})
                 }
             };
             body.insert(
                 "toolConfig".to_string(),
-                json!({"functionCallingConfig":{"mode":mode}}),
+                json!({"functionCallingConfig":config}),
             );
         }
     } else if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
@@ -1897,7 +1920,7 @@ fn insert_openai_responses_tools(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
 ) -> Result<(), GatewayError> {
-    insert_tool_policy(body, request)?;
+    insert_tool_policy(body, request, WireProtocol::OpenAiResponses)?;
     if !request.request.tools.is_empty() {
         body.insert(
             "tools".to_string(),
@@ -1924,7 +1947,7 @@ fn insert_openai_chat_tools(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
 ) -> Result<(), GatewayError> {
-    insert_tool_policy(body, request)?;
+    insert_tool_policy(body, request, WireProtocol::OpenAiChat)?;
     if !request.request.tools.is_empty() {
         body.insert(
             "tools".to_string(),
@@ -1952,26 +1975,40 @@ fn insert_openai_chat_tools(
 fn insert_tool_policy(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
+    protocol: WireProtocol,
 ) -> Result<(), GatewayError> {
+    reject_unbound_tool_execution(request)?;
     if request.request.tools.is_empty() {
         return Ok(());
     }
-    let choice = match request.request.tool_policy.execution {
-        fte_types::ToolExecutionPolicy::Deny => json!("none"),
-        fte_types::ToolExecutionPolicy::ClientOnly | fte_types::ToolExecutionPolicy::Ask => {
-            json!("auto")
+    let choice = match &request.request.tool_policy.selection {
+        fte_types::ToolSelection::None => json!("none"),
+        fte_types::ToolSelection::Auto => json!("auto"),
+        fte_types::ToolSelection::Required => json!("required"),
+        fte_types::ToolSelection::Named { name }
+            if matches!(protocol, WireProtocol::OpenAiChat) =>
+        {
+            json!({"type":"function","function":{"name":name}})
         }
-        fte_types::ToolExecutionPolicy::AllowGateway => {
-            return Err(capability_error(
-                &request.request.request_id,
-                &request.route.backend_id,
-                "gateway_tool_execution_not_bound",
-                "hosted tool execution requires an explicit gateway-owned tool adapter",
-            ));
-        }
+        fte_types::ToolSelection::Named { name } => json!({"type":"function","name":name}),
     };
     body.insert("tool_choice".to_string(), choice);
     Ok(())
+}
+
+fn reject_unbound_tool_execution(request: &BackendRequest) -> Result<(), GatewayError> {
+    if request.request.tool_policy.execution == fte_types::ToolExecutionPolicy::AllowGateway {
+        return Err(capability_error(
+            &request.request.request_id,
+            &request.route.backend_id,
+            "gateway_tool_execution_not_bound",
+            "hosted tool execution requires an explicit gateway-owned tool adapter",
+        ));
+    }
+    request
+        .request
+        .tool_policy
+        .validate_tools(&request.request.tools, &request.request.request_id)
 }
 
 fn anthropic_tools_value(tools: &[fte_types::ToolDefinition]) -> Value {
@@ -5282,6 +5319,60 @@ mod tests {
             .insert("gemini.cachedContent".to_string(), json!("foreign"));
         let error = anthropic_body(&request).expect_err("foreign extension must fail");
         assert_eq!(error.code, "hosted_provider_extension_unsupported");
+    }
+
+    #[test]
+    fn gemini_tool_selection_and_execution_authority_are_independent() {
+        let mut request = request(GenerationInput::Chat {
+            items: vec![fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::User,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+        });
+        request.request.tools.push(fte_types::ToolDefinition {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: json!({}),
+            strict: false,
+            owner: fte_types::ToolOwner::Client,
+        });
+        for (selection, expected) in [
+            (fte_types::ToolSelection::None, json!({"mode":"NONE"})),
+            (fte_types::ToolSelection::Auto, json!({"mode":"AUTO"})),
+            (fte_types::ToolSelection::Required, json!({"mode":"ANY"})),
+            (
+                fte_types::ToolSelection::Named {
+                    name: "lookup".to_string(),
+                },
+                json!({"mode":"ANY","allowedFunctionNames":["lookup"]}),
+            ),
+        ] {
+            request.request.tool_policy.selection = selection;
+            assert_eq!(
+                gemini_body(&request).expect("Gemini choice")["toolConfig"]["functionCallingConfig"],
+                expected
+            );
+        }
+        request.request.tool_policy.execution = fte_types::ToolExecutionPolicy::AllowGateway;
+        request.request.provider_extensions.insert(
+            "gemini.toolConfig".to_string(),
+            json!({"functionCallingConfig":{"mode":"AUTO"}}),
+        );
+        for result in [
+            gemini_body(&request),
+            anthropic_body(&request),
+            openai_responses_body(&request),
+        ] {
+            assert_eq!(
+                result
+                    .expect_err("provider configuration cannot grant gateway tool execution")
+                    .code,
+                "gateway_tool_execution_not_bound"
+            );
+        }
     }
 
     #[test]

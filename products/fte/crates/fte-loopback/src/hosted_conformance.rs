@@ -147,6 +147,71 @@ fn sse(values: &[Value]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn public_tool_selection_survives_without_gateway_execution_authority() {
+    for (protocol, path) in [
+        ("chat", "/v1/chat/completions"),
+        ("responses", "/v1/responses"),
+        ("anthropic", "/v1/messages"),
+    ] {
+        for choice in ["omitted", "none", "auto", "required", "named"] {
+            let (mut body, provider) = match protocol {
+                "chat" => (
+                    json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}]}),
+                    json!({"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}),
+                ),
+                "responses" => (
+                    json!({"model":"fixture-model","input":"hello","store":false,"tools":[{"type":"function","name":"lookup","parameters":{}}]}),
+                    json!({"status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1}}),
+                ),
+                _ => (
+                    json!({"model":"fixture-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"lookup","input_schema":{}}]}),
+                    json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":1}}),
+                ),
+            };
+            let expected = match (protocol, choice) {
+                ("anthropic", "omitted" | "auto") => json!({"type":"auto"}),
+                ("anthropic", "none") => json!({"type":"none"}),
+                ("anthropic", "required") => json!({"type":"any","disable_parallel_tool_use":true}),
+                ("anthropic", "named") => {
+                    json!({"type":"tool","name":"lookup","disable_parallel_tool_use":false})
+                }
+                ("chat", "named") => json!({"type":"function","function":{"name":"lookup"}}),
+                ("responses", "named") => json!({"type":"function","name":"lookup"}),
+                (_, "omitted") => json!("auto"),
+                (_, choice) => json!(choice),
+            };
+            if choice != "omitted" {
+                body["tool_choice"] = expected.clone();
+            }
+            let (status, text, captured) = hosted_exchange_captured(
+                protocol,
+                "application/json",
+                provider.to_string().into_bytes(),
+                path,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{protocol}/{choice}: {text}");
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0]["tool_choice"], expected, "{protocol}/{choice}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_undeclared_tool_choices_fail_before_hosted_dispatch() {
+    for choice in [
+        json!({"anything":"ignored"}),
+        json!({"type":"function","function":{"name":"missing"}}),
+        json!({"type":"function","function":{"name":"lookup","extra":true}}),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured("chat", "application/json", b"{}".to_vec(), "/v1/chat/completions", json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}],"tool_choice":choice})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(captured.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn anthropic_mixed_history_keeps_order_media_and_cache_targets_in_both_bodies() {
     let provider = json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":1}});
     let (status, text, captured) = hosted_exchange_captured(

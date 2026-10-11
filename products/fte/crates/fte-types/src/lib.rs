@@ -102,6 +102,8 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     pub fn validate(&self) -> Result<(), GatewayError> {
+        self.tool_policy
+            .validate_tools(&self.tools, &self.request_id)?;
         if let ModelSelector::Priority { routes } = &self.model
             && (routes.is_empty()
                 || routes.len() > 16
@@ -360,9 +362,48 @@ pub enum ToolOwner {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPolicy {
+    /// Model selection is independent of authority to execute its chosen tool.
+    #[serde(default)]
+    pub selection: ToolSelection,
     #[serde(default)]
     pub execution: ToolExecutionPolicy,
     pub max_turns: Option<u32>,
+}
+
+impl ToolPolicy {
+    pub fn validate_tools(
+        &self,
+        tools: &[ToolDefinition],
+        request_id: &RequestId,
+    ) -> Result<(), GatewayError> {
+        let valid = match &self.selection {
+            ToolSelection::None | ToolSelection::Auto => true,
+            ToolSelection::Required => !tools.is_empty(),
+            ToolSelection::Named { name } => {
+                !name.trim().is_empty() && tools.iter().any(|tool| tool.name == *name)
+            }
+        };
+        if !valid {
+            return Err(GatewayError::invalid_request(
+                request_id,
+                "tool_choice_definition_missing",
+                "required or named tool selection needs matching supplied tool definitions",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolSelection {
+    None,
+    #[default]
+    Auto,
+    Required,
+    Named {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

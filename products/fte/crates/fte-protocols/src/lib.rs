@@ -10,7 +10,7 @@ use fte_types::{
     GenerationInput, InputItem, MessageRole, ModelSelector, OutputGroup, OutputItem, PrivacyPolicy,
     ProviderCacheBreakpoint, ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile,
     RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, TerminalStatus, ToolDefinition,
-    ToolExecutionPolicy, ToolOwner, ToolPolicy, UsageProvenance,
+    ToolExecutionPolicy, ToolOwner, ToolPolicy, ToolSelection, UsageProvenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -191,7 +191,11 @@ impl OpenAiChatRequest {
             .into_iter()
             .map(OpenAiFunctionTool::into_canonical)
             .collect::<Result<_, _>>()?;
-        let tool_policy = parse_openai_tool_choice(self.tool_choice.as_ref(), !tools.is_empty())?;
+        let tool_policy = parse_openai_tool_choice(
+            self.tool_choice.as_ref(),
+            &tools,
+            OpenAiToolChoiceSurface::Chat,
+        )?;
         let mut request = base_request(
             request_id,
             self.user.unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string()),
@@ -575,8 +579,11 @@ impl OpenAiResponsesRequest {
             previous_response_id: self.previous_response_id,
         };
         request.tools = tools;
-        request.tool_policy =
-            parse_openai_tool_choice(self.tool_choice.as_ref(), !request.tools.is_empty())?;
+        request.tool_policy = parse_openai_tool_choice(
+            self.tool_choice.as_ref(),
+            &request.tools,
+            OpenAiToolChoiceSurface::Responses,
+        )?;
         if let Some(text) = self.text {
             reject_if(
                 &request.request_id,
@@ -889,7 +896,27 @@ impl AnthropicMessagesRequest {
             defaults,
         );
         request.tools = tools;
-        request.tool_policy = parse_anthropic_tool_choice(self.tool_choice.as_ref());
+        request.tool_policy =
+            parse_anthropic_tool_choice(self.tool_choice.as_ref(), !request.tools.is_empty());
+        request
+            .tool_policy
+            .validate_tools(&request.tools, &request.request_id)?;
+        if let Some(disable_parallel) = self
+            .tool_choice
+            .as_ref()
+            .and_then(AnthropicToolChoice::disable_parallel_tool_use)
+        {
+            reject_if(
+                &request.request_id,
+                request.tools.is_empty(),
+                "anthropic_parallel_tool_policy_invalid",
+                "parallel tool policy requires supplied tools",
+            )?;
+            request.provider_extensions.insert(
+                "anthropic.disable_parallel_tool_use".to_string(),
+                Value::Bool(disable_parallel),
+            );
+        }
         if !cache_breakpoints.is_empty() {
             request.cache.mode = CacheMode::ProviderNative;
             request.cache.requirement = CacheRequirement::Required;
@@ -1295,7 +1322,7 @@ impl AnthropicTool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AnthropicToolChoice {
     Auto {
         disable_parallel_tool_use: Option<bool>,
@@ -1308,6 +1335,24 @@ pub enum AnthropicToolChoice {
         disable_parallel_tool_use: Option<bool>,
     },
     None,
+}
+
+impl AnthropicToolChoice {
+    fn disable_parallel_tool_use(&self) -> Option<bool> {
+        match self {
+            Self::Auto {
+                disable_parallel_tool_use,
+            }
+            | Self::Any {
+                disable_parallel_tool_use,
+            }
+            | Self::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+            Self::None => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1419,19 +1464,48 @@ fn parse_role(request_id: &RequestId, role: &str) -> Result<MessageRole, Gateway
     }
 }
 
+#[derive(Clone, Copy)]
+enum OpenAiToolChoiceSurface {
+    Chat,
+    Responses,
+}
+
 fn parse_openai_tool_choice(
     choice: Option<&Value>,
-    has_tools: bool,
+    tools: &[ToolDefinition],
+    surface: OpenAiToolChoiceSurface,
 ) -> Result<ToolPolicy, GatewayError> {
     let request_id = RequestId::new();
-    let execution = match choice {
-        None if has_tools => ToolExecutionPolicy::ClientOnly,
-        None => ToolExecutionPolicy::Deny,
-        Some(Value::String(value)) if value == "none" => ToolExecutionPolicy::Deny,
-        Some(Value::String(value)) if matches!(value.as_str(), "auto" | "required") => {
-            ToolExecutionPolicy::ClientOnly
+    let selection = match choice {
+        None if !tools.is_empty() => ToolSelection::Auto,
+        None => ToolSelection::None,
+        Some(Value::String(value)) if value == "none" => ToolSelection::None,
+        Some(Value::String(value)) if value == "auto" => ToolSelection::Auto,
+        Some(Value::String(value)) if value == "required" => ToolSelection::Required,
+        Some(Value::Object(object))
+            if object.len() == 2
+                && object.get("type").and_then(Value::as_str) == Some("function") =>
+        {
+            let name = match surface {
+                OpenAiToolChoiceSurface::Chat => object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .filter(|function| function.len() == 1)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str),
+                OpenAiToolChoiceSurface::Responses => object.get("name").and_then(Value::as_str),
+            }
+            .ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request_id,
+                    "tool_choice_invalid",
+                    "named tool_choice has an invalid dialect shape",
+                )
+            })?;
+            ToolSelection::Named {
+                name: name.to_string(),
+            }
         }
-        Some(Value::Object(_)) => ToolExecutionPolicy::ClientOnly,
         Some(_) => {
             return Err(GatewayError::invalid_request(
                 &request_id,
@@ -1440,18 +1514,30 @@ fn parse_openai_tool_choice(
             ));
         }
     };
-    Ok(ToolPolicy {
-        execution,
+    let policy = ToolPolicy {
+        selection,
+        execution: ToolExecutionPolicy::ClientOnly,
         max_turns: None,
-    })
+    };
+    policy.validate_tools(tools, &request_id)?;
+    Ok(policy)
 }
 
-fn parse_anthropic_tool_choice(choice: Option<&AnthropicToolChoice>) -> ToolPolicy {
+fn parse_anthropic_tool_choice(
+    choice: Option<&AnthropicToolChoice>,
+    has_tools: bool,
+) -> ToolPolicy {
     ToolPolicy {
-        execution: match choice {
-            Some(AnthropicToolChoice::None) | None => ToolExecutionPolicy::Deny,
-            Some(_) => ToolExecutionPolicy::ClientOnly,
+        selection: match choice {
+            None if !has_tools => ToolSelection::None,
+            Some(AnthropicToolChoice::None) => ToolSelection::None,
+            Some(AnthropicToolChoice::Any { .. }) => ToolSelection::Required,
+            Some(AnthropicToolChoice::Tool { name, .. }) => {
+                ToolSelection::Named { name: name.clone() }
+            }
+            Some(AnthropicToolChoice::Auto { .. }) | None => ToolSelection::Auto,
         },
+        execution: ToolExecutionPolicy::ClientOnly,
         max_turns: None,
     }
 }
@@ -2569,6 +2655,41 @@ mod tests {
         };
         assert_eq!(prompts.len(), 2);
         assert!(matches!(prompts[0], CompletionPrompt::Tokens { .. }));
+    }
+
+    #[test]
+    fn required_or_named_tool_selection_keeps_client_execution_ownership() {
+        for choice in [
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+            json!("none"),
+        ] {
+            let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}],"tool_choice":choice})).expect("tool choice DTO");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("preserved choice");
+            assert_eq!(
+                request.tool_policy.execution,
+                ToolExecutionPolicy::ClientOnly
+            );
+            assert_eq!(request.tools[0].owner, ToolOwner::Client);
+        }
+        let request: OpenAiResponsesRequest = serde_json::from_value(json!({"model":"auto","input":"hello","tools":[{"type":"function","name":"lookup","parameters":{}}],"tool_choice":{"type":"function","function":{"name":"lookup"}}})).expect("malformed dialect object DTO");
+        assert_eq!(
+            request
+                .into_gateway(EdgeDefaults::default())
+                .expect_err("Chat shape cannot silently become a Responses choice")
+                .code,
+            "tool_choice_invalid"
+        );
+        let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[{"role":"user","content":"hello"}],"tool_choice":"required"})).expect("required without definitions DTO");
+        assert_eq!(
+            request
+                .into_gateway(EdgeDefaults::default())
+                .expect_err("required without definitions")
+                .code,
+            "tool_choice_definition_missing"
+        );
     }
 
     #[test]
