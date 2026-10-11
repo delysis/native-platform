@@ -258,8 +258,11 @@ pub enum TransferPhase {
     Starting,
     Resuming,
     Downloading,
-    /// Exact length and digest have passed; destination publication has not.
+    /// Exact length and digest have passed; acquisition has not committed.
+    /// Durable staging bytes may already exist, but retry state is still owned.
     Publishing,
+    /// Acquisition committed, or a previously published artifact was recovered.
+    /// This observation cannot cancel or roll back publication.
     Complete,
 }
 
@@ -277,9 +280,13 @@ pub enum ProgressControl {
     Cancel,
 }
 
-/// A synchronous callback invoked between received chunks.
+/// A synchronous callback invoked between received chunks and at phase boundaries.
 ///
-/// Returning [`ProgressControl::Cancel`] prevents validation or publication.
+/// Returning [`ProgressControl::Cancel`] before commit stops the acquisition.
+/// [`TransferPhase::Publishing`] is the final veto for newly completed work;
+/// cancellation retains a validator-backed durable partial and its source history.
+/// [`TransferPhase::Complete`] is observational: its return value is ignored,
+/// including when reporting idempotent recovery of an already-published artifact.
 /// Cancellation of a pending DNS lookup, connect, or read occurs at the next
 /// configured timeout boundary.
 pub trait ProgressCallback {
@@ -733,6 +740,15 @@ impl AcquireClient {
                         "completed partial lacks source attestation history".to_string(),
                     )
                 })?;
+            notify_progress(
+                progress,
+                TransferProgress {
+                    phase: TransferPhase::Publishing,
+                    downloaded_bytes: expected_bytes,
+                    expected_bytes,
+                    resumed_bytes: expected_bytes,
+                },
+            )?;
             let finished_at_unix_ms = unix_time_millis()?;
             let publication = prepared.files.complete(expected_bytes, &expected_digest)?;
             let _control = progress.on_progress(TransferProgress {
@@ -1036,6 +1052,17 @@ impl AcquireClient {
                 actual: actual_digest,
             });
         }
+        // Keep the attempt active through the veto: failure settlement must
+        // persist its final byte range and source history before retaining it.
+        notify_progress(
+            progress,
+            TransferProgress {
+                phase: TransferPhase::Publishing,
+                downloaded_bytes: received,
+                expected_bytes,
+                resumed_bytes,
+            },
+        )?;
         let finished_at_unix_ms = unix_time_millis()?;
         prepared.finish_active_attestation(received, finished_at_unix_ms)?;
         let attestation = prepared
@@ -1565,7 +1592,7 @@ pub enum AcquireError {
     InvalidResumeState(String),
     #[error("resume state does not describe this source, length, and digest")]
     ResumeStateMismatch,
-    #[error("staging or sidecar path changed identity before safe cleanup")]
+    #[error("staging or sidecar path changed identity before publication or safe cleanup")]
     CleanupIdentityChanged,
     #[error("staging path is not a private regular file")]
     UnsafeStagingFile,
@@ -2113,6 +2140,9 @@ impl TransferFiles {
         expected_sha256: &str,
     ) -> Result<PublicationReceipt, AcquireError> {
         self.staging.sync_partial()?;
+        // Validation used the open file; completion must still name that file.
+        // Check before removing retry evidence or committing keep/receipt state.
+        self.staging.ensure_current()?;
         let path = self.staging.path.clone();
         let identity = self.staging.identity;
 
@@ -2221,16 +2251,19 @@ impl UnpublishedFile {
         F: FnOnce(&Path) -> io::Result<()>,
     {
         self.file_mut()?.flush().map_err(staging_io)?;
-        self.temporary
-            .as_ref()
-            .ok_or_else(|| {
-                staging_io(io::Error::other(
-                    "unpublished file disappeared before publication",
-                ))
-            })?
-            .as_file()
-            .sync_all()
-            .map_err(staging_io)?;
+        let temporary = self.temporary.as_ref().ok_or_else(|| {
+            staging_io(io::Error::other(
+                "unpublished file disappeared before publication",
+            ))
+        })?;
+        temporary.as_file().sync_all().map_err(staging_io)?;
+        // persist_noclobber moves a path, not the verified open file. Reject a
+        // replacement made by the completed callback before handing it that
+        // path. This is not atomic protection against concurrent path writers.
+        #[cfg(unix)]
+        if !self.identity.matches_path(temporary.path())? {
+            return Err(AcquireError::CleanupIdentityChanged);
+        }
         let temporary = self.temporary.take().ok_or_else(|| {
             staging_io(io::Error::other(
                 "unpublished file disappeared before publication",

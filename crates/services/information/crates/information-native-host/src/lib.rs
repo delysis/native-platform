@@ -1591,7 +1591,6 @@ fn network_attempted_for_failure(
             | AcquireError::UnsafeResumeDirectory
             | AcquireError::ResumeDirectoryBusy
             | AcquireError::ResumeStateMismatch
-            | AcquireError::CleanupIdentityChanged
             | AcquireError::UnsafeStagingFile
             | AcquireError::Runtime(_),
         ) => Some(false),
@@ -1608,6 +1607,9 @@ fn network_attempted_for_failure(
         }
         HostError::Acquire(
             AcquireError::InvalidResumeState(_)
+            // Identity rejection can precede contact or follow a full download.
+            // The error alone cannot honestly distinguish those histories.
+            | AcquireError::CleanupIdentityChanged
             | AcquireError::StagingIo(_)
             | AcquireError::NetworkDestinationForbidden { .. }
             | AcquireError::TotalTransferTimeout { .. }
@@ -2088,6 +2090,26 @@ mod tests {
             available_bytes_observed: Some(1024),
             created_at: Utc::now(),
         })?;
+        // A publication identity failure does not identify when contact occurred.
+        // Keep both local and HTTP plans unknown, while preserving a genuinely
+        // preflight failure's affirmative "not attempted" fact.
+        let identity_error = HostError::Acquire(AcquireError::CleanupIdentityChanged);
+        assert_eq!(
+            network_attempted_for_failure(&identity_error, &plan, &[]),
+            None
+        );
+        assert_eq!(
+            identity_error.as_information_error().class,
+            ErrorClass::Integrity
+        );
+        assert_eq!(
+            network_attempted_for_failure(
+                &HostError::Acquire(AcquireError::InvalidExpectedDigest),
+                &plan,
+                &[],
+            ),
+            Some(false),
+        );
         let receipt = host.install(&plan)?;
         assert_eq!(receipt.state, InstallationState::Ready);
         assert_eq!(receipt.downloaded_bytes, u64::try_from(bytes.len())?);
@@ -2223,6 +2245,10 @@ mod tests {
             available_bytes_observed: Some(1024),
             created_at: Utc::now(),
         })?;
+        assert_eq!(
+            network_attempted_for_failure(&identity_error, &blocked_plan, &[]),
+            None,
+        );
         let failure = blocked
             .install(&blocked_plan)
             .expect_err("private-network install unexpectedly succeeded");
