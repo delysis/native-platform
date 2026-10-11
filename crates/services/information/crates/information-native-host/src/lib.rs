@@ -42,8 +42,7 @@ use information_native_types::{
     ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
     ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
     ManagedDocumentsV1, ManagedMaterializationId, PlannedArtifact, ReleaseId, RepresentationFormat,
-    RepresentationId, ResourceId, ResourceRecord, RetrievalPurpose, RightsStatement,
-    SourceIdentity, UsePolicy,
+    RepresentationId, ResourceId, ResourceRecord, RightsStatement, SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -150,22 +149,6 @@ pub struct MaterializedZimDocuments {
 #[serde(default, deny_unknown_fields)]
 pub struct MountInstallationOptions {
     pub allow_private_model_context: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "name", content = "arguments", rename_all = "snake_case")]
-pub enum InformationToolCall {
-    OfflineInformationSearch(InformationQuery),
-    OfflineInformationRead(ReadRequest),
-    OfflineInformationLookup(LookupRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
-pub enum InformationToolResult {
-    Search(EvidenceSet),
-    Read(BackendReadResult),
-    Lookup(BackendReadResult),
 }
 
 pub struct InformationHost {
@@ -910,26 +893,6 @@ impl InformationHost {
         request: &ManagedDocumentsRemovalRequest,
     ) -> Result<ManagedDocumentsRemovalReceipt, HostError> {
         Ok(self.store.remove_managed_documents(request)?)
-    }
-
-    pub fn execute_tool(
-        &self,
-        call: InformationToolCall,
-    ) -> Result<InformationToolResult, HostError> {
-        match call {
-            InformationToolCall::OfflineInformationSearch(mut query) => {
-                query.purpose = RetrievalPurpose::ModelContext;
-                self.search(&query).map(InformationToolResult::Search)
-            }
-            InformationToolCall::OfflineInformationRead(mut request) => {
-                request.purpose = RetrievalPurpose::ModelContext;
-                self.read(&request).map(InformationToolResult::Read)
-            }
-            InformationToolCall::OfflineInformationLookup(mut request) => {
-                request.purpose = RetrievalPurpose::ModelContext;
-                self.lookup(&request).map(InformationToolResult::Lookup)
-            }
-        }
     }
 
     #[must_use]
@@ -1817,8 +1780,8 @@ mod tests {
         CoverageDescriptor, FormatKind, InformationCapability, Publisher, QUERY_SCHEMA,
         QueryBudget, QueryFilters, QueryId, QuerySyntax, RedistributionPolicy,
         RepresentationDescriptor, RepresentationFormat, RepresentationId, ResourceDescriptor,
-        ResourceId, ResourceKind, ResourceRelease, RetrievalTarget, RightsStatement,
-        RuntimeRequirement, SubsetSupport, UsePermission, UsePolicy,
+        ResourceId, ResourceKind, ResourceRelease, RetrievalPurpose, RetrievalTarget,
+        RightsStatement, RuntimeRequirement, SubsetSupport, UsePermission, UsePolicy,
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
