@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 mod build_assets;
 
-const REFERENCE: &str = "native-platform main 52ebafce2c82e1655a66d499d66315fd4689c81f plus peer integration ceee4b6a95c234d945d777ff10b8a621bf6d55db; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9";
-const APP_SHA256: &str = "8d717f915bec816e632d155036f741007a771f8b9d753f9320a19b154d7b0b04";
+const REFERENCE: &str = "native-platform renderer 554267979ab3be12044af645ba8dabb4a304f863; native lifetime/assets source review against d08b3c14fc9d28210f2897b938b3ae3bf63fd9f4; EASL 6d7c913a5b8d6874ab56f5168d222dc95964afb9; native parity unqualified";
+const APP_SHA256: &str = "c6d54342254e0e6ab235df57c461759369d9a8e6e155708999490fb30f7e0287";
 const CSS_SHA256: &str = "83a038c05a2e36106024c9d9d9f41760f54adbf3db5ac73b20758536907e024c";
 
 fn main() {
