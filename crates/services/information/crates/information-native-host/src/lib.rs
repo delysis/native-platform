@@ -551,36 +551,6 @@ impl InformationHost {
         Ok(descriptor)
     }
 
-    pub fn mount_registered_community_archive(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-        allow_private_model_context: bool,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, COMMUNITY_PROFILE_NAME)?;
-        let mut config = CommunityArchiveBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        config.allow_private_model_context = allow_private_model_context;
-        self.mount_community_archive(config)
-    }
-
     pub fn mount_encyclopedia(
         &self,
         config: EncyclopediaBackendConfig,
@@ -591,34 +561,6 @@ impl InformationHost {
         Ok(descriptor)
     }
 
-    pub fn mount_registered_encyclopedia(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, ENCYCLOPEDIA_PROFILE_NAME)?;
-        let mut config = EncyclopediaBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        self.mount_encyclopedia(config)
-    }
-
     pub fn mount_scripture(
         &self,
         config: ScriptureBackendConfig,
@@ -627,34 +569,6 @@ impl InformationHost {
         let descriptor = backend.descriptor().clone();
         self.register_backend(backend)?;
         Ok(descriptor)
-    }
-
-    pub fn mount_registered_scripture(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, SCRIPTURE_PROFILE_NAME)?;
-        let mut config = ScriptureBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        self.mount_scripture(config)
     }
 
     /// Bind a durable managed package or external registration into the live
@@ -1246,18 +1160,6 @@ fn platform_http_resume_policy(sidecar: &Path) -> ResumePolicy {
         let _sidecar = sidecar;
         ResumePolicy::Disabled
     }
-}
-
-fn require_registered_profile(
-    registration: &ExternalRegistration,
-    expected_profile: &str,
-) -> Result<(), HostError> {
-    if registration.format.kind != FormatKind::SqliteFts5
-        || registration.format.profile.as_deref() != Some(expected_profile)
-    {
-        return Err(HostError::BackendFormatMismatch);
-    }
-    Ok(())
 }
 
 fn mount_artifact_error(message: impl Into<String>) -> HostError {
