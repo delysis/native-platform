@@ -640,13 +640,8 @@ impl MomInformation {
             .host
             .list_active_managed_documents(MAX_ACTIVE_MANAGED_PROJECTION)
             .map_err(display_error)?;
-        if !projection.complete {
-            return Err(
-                "Information returned a partial active representation projection.".to_string(),
-            );
-        }
         let mut attachments = Vec::new();
-        for receipt in projection.entries {
+        for receipt in projection {
             // Prefix filtering only avoids opening unrelated large manifests.
             // It grants no authority: the bounded manifest projection below
             // must still prove exact bridge publisher, transformation, binding,

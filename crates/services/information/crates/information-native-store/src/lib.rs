@@ -14,8 +14,7 @@
 
 mod managed_documents;
 pub use managed_documents::{
-    ActiveManagedDocument, ActiveManagedDocumentsProjection, ActiveManagedMaterialization,
-    ActiveManagedReceipt, ActiveManagedSegment,
+    ActiveManagedDocument, ActiveManagedMaterialization, ActiveManagedReceipt, ActiveManagedSegment,
 };
 
 use chrono::{DateTime, Utc};

@@ -86,13 +86,6 @@ pub struct ActiveManagedSegment {
     pub locator: EvidenceLocator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ActiveManagedDocumentsProjection {
-    pub complete: bool,
-    pub entries: Vec<ActiveManagedReceipt>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveManagedReceipt {
@@ -202,7 +195,7 @@ impl ManagedStore {
     pub fn list_active_managed_documents(
         &self,
         max_entries: usize,
-    ) -> Result<ActiveManagedDocumentsProjection, StoreError> {
+    ) -> Result<Vec<ActiveManagedReceipt>, StoreError> {
         if max_entries == 0 || max_entries > MAX_ACTIVE_PROJECTION_ENTRIES {
             return Err(StoreError::RegistryCorrupt(format!(
                 "managed documents projection cap must be between 1 and {MAX_ACTIVE_PROJECTION_ENTRIES}"
@@ -232,14 +225,10 @@ impl ManagedStore {
                 paths.len()
             )));
         }
-        let entries = paths
+        paths
             .iter()
             .map(|path| active_receipt_projection(self, path))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ActiveManagedDocumentsProjection {
-            complete: true,
-            entries,
-        })
+            .collect()
     }
 
     /// Resolve one exact active representation through full receipt, manifest,
@@ -1958,12 +1947,7 @@ mod tests {
             );
             assert!(!path_exists(&pending)?);
             assert_eq!(fs::read(&source)?, source_bytes);
-            assert!(
-                reopened
-                    .list_active_managed_documents(1)?
-                    .entries
-                    .is_empty()
-            );
+            assert!(reopened.list_active_managed_documents(1)?.is_empty());
         }
         Ok(())
     }
@@ -2319,7 +2303,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let temporary = tempdir()?;
         let store = ManagedStore::open(temporary.path().join("managed"))?;
-        assert!(store.list_active_managed_documents(1)?.entries.is_empty());
+        assert!(store.list_active_managed_documents(1)?.is_empty());
         let root = active_root(&store);
         fs::create_dir(root.join("first"))?;
         fs::create_dir(root.join("second"))?;
@@ -2387,7 +2371,7 @@ mod tests {
         fs::write(&database, b"corrupted after activation")?;
 
         let listed = store.list_active_managed_documents(8)?;
-        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.len(), 1);
         assert!(
             store
                 .active_managed_document(&materialization.materialization_id)
@@ -2471,14 +2455,13 @@ mod tests {
             }
 
             let immediately_visible = store.list_active_managed_documents(8)?;
-            assert!(immediately_visible.complete);
             let expected_visible = usize::from(matches!(
                 boundary,
                 PublishBoundary::ActivationRenamed
                     | PublishBoundary::ActivationHardened
                     | PublishBoundary::ActivationSynced
             ));
-            assert_eq!(immediately_visible.entries.len(), expected_visible);
+            assert_eq!(immediately_visible.len(), expected_visible);
 
             let receipt = store.materialize_documents(&materialization)?;
             assert_eq!(receipt.content_sha256, materialization.content_sha256);
@@ -2494,9 +2477,9 @@ mod tests {
             assert_eq!(store.search_managed_documents(&request)?.hits.len(), 1);
             let reopened = ManagedStore::open(temporary.path().join("managed"))?;
             let listed = reopened.list_active_managed_documents(8)?;
-            assert_eq!(listed.entries.len(), 1);
+            assert_eq!(listed.len(), 1);
             assert_eq!(
-                listed.entries[0].materialization_id,
+                listed[0].materialization_id,
                 materialization.materialization_id
             );
             let projected = reopened.project_active_managed_document(

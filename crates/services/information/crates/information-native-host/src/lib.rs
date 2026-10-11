@@ -30,8 +30,8 @@ use information_native_retrieval::{
     ResourceBackend, RetrievalRouter,
 };
 use information_native_store::{
-    ActiveManagedDocumentsProjection, ActiveManagedMaterialization, ExternalRegistrationRequest,
-    ManagedStore, PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
+    ActiveManagedMaterialization, ActiveManagedReceipt, ExternalRegistrationRequest, ManagedStore,
+    PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
     TransferSummary,
 };
 use information_native_types::{
@@ -875,7 +875,7 @@ impl InformationHost {
     pub fn list_active_managed_documents(
         &self,
         max_entries: usize,
-    ) -> Result<ActiveManagedDocumentsProjection, HostError> {
+    ) -> Result<Vec<ActiveManagedReceipt>, HostError> {
         Ok(self.store.list_active_managed_documents(max_entries)?)
     }
 
