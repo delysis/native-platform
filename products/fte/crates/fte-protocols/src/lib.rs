@@ -190,7 +190,7 @@ impl OpenAiChatRequest {
             .unwrap_or_default()
             .into_iter()
             .map(OpenAiFunctionTool::into_canonical)
-            .collect();
+            .collect::<Result<_, _>>()?;
         let tool_policy = parse_openai_tool_choice(self.tool_choice.as_ref(), !tools.is_empty())?;
         let mut request = base_request(
             request_id,
@@ -224,12 +224,14 @@ impl OpenAiChatRequest {
         request.response_format = self
             .response_format
             .map(OpenAiResponseFormat::into_canonical)
+            .transpose()?
             .unwrap_or_default();
         request.storage.store_response = self.store.unwrap_or(false);
-        if self.parallel_tool_calls == Some(false) {
-            request
-                .provider_extensions
-                .insert("openai.parallel_tool_calls".to_string(), Value::Bool(false));
+        if let Some(parallel) = self.parallel_tool_calls {
+            request.provider_extensions.insert(
+                "openai.parallel_tool_calls".to_string(),
+                Value::Bool(parallel),
+            );
         }
         Ok(request)
     }
@@ -248,6 +250,12 @@ pub struct OpenAiMessage {
 impl OpenAiMessage {
     fn into_items(self) -> Result<Vec<InputItem>, GatewayError> {
         let request_id = RequestId::new();
+        reject_if(
+            &request_id,
+            self.name.is_some(),
+            "chat_participant_name_unsupported",
+            "participant names cannot be preserved on the canonical chat surface",
+        )?;
         if self.tool_call_id.is_some() && self.tool_calls.is_some() {
             return Err(GatewayError::invalid_request(
                 &request_id,
@@ -311,7 +319,6 @@ impl OpenAiMessage {
             return Ok(items);
         }
         let role = parse_role(&request_id, &self.role)?;
-        let _ = self.name;
         let content = match self.content {
             Some(content) => content.into_blocks()?,
             None => Vec::new(),
@@ -428,14 +435,20 @@ pub struct OpenAiFunctionTool {
 }
 
 impl OpenAiFunctionTool {
-    fn into_canonical(self) -> ToolDefinition {
-        ToolDefinition {
+    fn into_canonical(self) -> Result<ToolDefinition, GatewayError> {
+        reject_if(
+            &RequestId::new(),
+            self.kind != "function",
+            "chat_tool_definition_type_unsupported",
+            "Chat Completions tool definitions support only function tools",
+        )?;
+        Ok(ToolDefinition {
             name: self.function.name,
             description: self.function.description,
             input_schema: self.function.parameters,
             strict: self.function.strict.unwrap_or(false),
             owner: ToolOwner::Client,
-        }
+        })
     }
 }
 
@@ -458,16 +471,24 @@ pub enum OpenAiResponseFormat {
 }
 
 impl OpenAiResponseFormat {
-    fn into_canonical(self) -> ResponseFormat {
-        match self {
+    fn into_canonical(self) -> Result<ResponseFormat, GatewayError> {
+        Ok(match self {
             Self::Text => ResponseFormat::Text,
             Self::JsonObject => ResponseFormat::JsonObject,
-            Self::JsonSchema { json_schema } => ResponseFormat::JsonSchema {
-                name: json_schema.name,
-                schema: json_schema.schema,
-                strict: json_schema.strict.unwrap_or(false),
-            },
-        }
+            Self::JsonSchema { json_schema } => {
+                reject_if(
+                    &RequestId::new(),
+                    json_schema.description.is_some(),
+                    "json_schema_description_unsupported",
+                    "JSON-schema descriptions cannot be preserved on the canonical response format",
+                )?;
+                ResponseFormat::JsonSchema {
+                    name: json_schema.name,
+                    schema: json_schema.schema,
+                    strict: json_schema.strict.unwrap_or(false),
+                }
+            }
+        })
     }
 }
 
@@ -557,7 +578,13 @@ impl OpenAiResponsesRequest {
         request.tool_policy =
             parse_openai_tool_choice(self.tool_choice.as_ref(), !request.tools.is_empty())?;
         if let Some(text) = self.text {
-            request.response_format = text.format.unwrap_or_default().into_canonical();
+            reject_if(
+                &request.request_id,
+                text.verbosity.is_some(),
+                "responses_text_verbosity_unsupported",
+                "text verbosity is not implemented on this public surface",
+            )?;
+            request.response_format = text.format.unwrap_or_default().into_canonical()?;
         }
         if let Some(key) = self.prompt_cache_key {
             request.cache.mode = CacheMode::ProviderNative;
@@ -699,11 +726,19 @@ impl OpenAiResponseInputItem {
                 id,
                 summary,
                 encrypted_content,
-            } => Ok(InputItem::Reasoning {
-                id,
-                summary: summary.into_iter().map(|value| value.text).collect(),
-                opaque_continuation: encrypted_content.map(Value::String),
-            }),
+            } => {
+                reject_if(
+                    &request_id,
+                    summary.iter().any(|value| value.kind != "summary_text"),
+                    "responses_reasoning_summary_type_unsupported",
+                    "reasoning summary entries must use summary_text",
+                )?;
+                Ok(InputItem::Reasoning {
+                    id,
+                    summary: summary.into_iter().map(|value| value.text).collect(),
+                    opaque_continuation: encrypted_content.map(Value::String),
+                })
+            }
         }
     }
 }
@@ -769,21 +804,29 @@ pub enum OpenAiTextFormat {
 }
 
 impl OpenAiTextFormat {
-    fn into_canonical(self) -> ResponseFormat {
-        match self {
+    fn into_canonical(self) -> Result<ResponseFormat, GatewayError> {
+        Ok(match self {
             Self::Text => ResponseFormat::Text,
             Self::JsonObject => ResponseFormat::JsonObject,
             Self::JsonSchema {
                 name,
+                description,
                 schema,
                 strict,
-                ..
-            } => ResponseFormat::JsonSchema {
-                name,
-                schema,
-                strict: strict.unwrap_or(false),
-            },
-        }
+            } => {
+                reject_if(
+                    &RequestId::new(),
+                    description.is_some(),
+                    "json_schema_description_unsupported",
+                    "JSON-schema descriptions cannot be preserved on the canonical response format",
+                )?;
+                ResponseFormat::JsonSchema {
+                    name,
+                    schema,
+                    strict: strict.unwrap_or(false),
+                }
+            }
+        })
     }
 }
 
@@ -2461,6 +2504,109 @@ mod tests {
         };
         assert_eq!(prompts.len(), 2);
         assert!(matches!(prompts[0], CompletionPrompt::Tokens { .. }));
+    }
+
+    #[test]
+    fn chat_known_fields_are_handled_or_explicitly_rejected() {
+        let ordinary = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        for (body, code) in [
+            (
+                json!({"model":"auto","messages":[{"role":"user","content":"hello","name":"participant"}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[{"role":"tool","tool_call_id":"call_1","content":"result","name":"participant"}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[{"role":"assistant","name":"participant","tool_calls":[{"type":"function","id":"call_1","function":{"name":"lookup","arguments":"{}"}}]}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[],"tools":[{"type":"not_function","function":{"name":"lookup","parameters":{}}}]}),
+                "chat_tool_definition_type_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","description":"must not vanish","schema":{}}}}),
+                "json_schema_description_unsupported",
+            ),
+        ] {
+            let request: OpenAiChatRequest = serde_json::from_value(body).expect("known field DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported known field must fail")
+                    .code,
+                code
+            );
+        }
+        let request: OpenAiChatRequest =
+            serde_json::from_value(ordinary).expect("ordinary chat DTO");
+        request
+            .into_gateway(EdgeDefaults::default())
+            .expect("ordinary chat remains supported");
+        for parallel in [false, true] {
+            let request: OpenAiChatRequest = serde_json::from_value(
+                json!({"model":"auto","messages":[],"parallel_tool_calls":parallel}),
+            )
+            .expect("parallel flag DTO");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("parallel flag supported");
+            assert_eq!(
+                request.provider_extensions["openai.parallel_tool_calls"],
+                parallel
+            );
+        }
+        let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[],"tools":[{"type":"function","function":{"name":"lookup","description":"kept","parameters":{}}}],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{}}}})).expect("valid tools and format DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("valid tools and format remain supported");
+        assert_eq!(request.tools[0].description.as_deref(), Some("kept"));
+        assert!(matches!(
+            request.response_format,
+            ResponseFormat::JsonSchema { .. }
+        ));
+    }
+
+    #[test]
+    fn responses_known_text_and_summary_fields_do_not_vanish() {
+        for (body, code) in [
+            (
+                json!({"model":"auto","input":"hello","text":{"verbosity":"high"}}),
+                "responses_text_verbosity_unsupported",
+            ),
+            (
+                json!({"model":"auto","input":"hello","text":{"format":{"type":"json_schema","name":"answer","description":"must not vanish","schema":{}}}}),
+                "json_schema_description_unsupported",
+            ),
+            (
+                json!({"model":"auto","input":[{"type":"reasoning","summary":[{"type":"not_summary_text","text":"must not reinterpret"}]}]}),
+                "responses_reasoning_summary_type_unsupported",
+            ),
+        ] {
+            let request: OpenAiResponsesRequest =
+                serde_json::from_value(body).expect("known field DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported known field must fail")
+                    .code,
+                code
+            );
+        }
+        let request: OpenAiResponsesRequest = serde_json::from_value(json!({"model":"auto","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"kept"}]}],"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}})).expect("valid known field DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("supported text and summary remain supported");
+        assert!(matches!(
+            request.response_format,
+            ResponseFormat::JsonSchema { .. }
+        ));
+        let GenerationInput::Chat { items } = request.input else {
+            panic!("typed reasoning input");
+        };
+        assert!(matches!(&items[0], InputItem::Reasoning { summary, .. } if summary == &["kept"]));
     }
 
     #[test]

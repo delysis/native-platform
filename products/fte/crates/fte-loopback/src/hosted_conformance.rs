@@ -146,6 +146,43 @@ fn sse(values: &[Value]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn unsupported_known_fields_fail_before_hosted_dispatch() {
+    for (path, body, code) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[{"role":"user","content":"hello","name":"participant"}]}),
+            "chat_participant_name_unsupported",
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[],"tools":[{"type":"other","function":{"name":"lookup","parameters":{}}}]}),
+            "chat_tool_definition_type_unsupported",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"hello","text":{"verbosity":"high"}}),
+            "responses_text_verbosity_unsupported",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"hello","text":{"format":{"type":"json_schema","name":"answer","description":"must not vanish","schema":{}}}}),
+            "json_schema_description_unsupported",
+        ),
+    ] {
+        let (status, text, captured) =
+            hosted_exchange_captured("responses", "application/json", b"{}".to_vec(), path, body)
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        let error: Value = serde_json::from_str(&text).expect("typed public field error");
+        assert_eq!(error["error"]["code"], code);
+        assert!(
+            captured.is_empty(),
+            "unsupported field reached provider: {captured:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hosted_json_anthropic_stream_never_emits_a_delta_after_block_stop() {
     let provider = json!({
         "content":[
