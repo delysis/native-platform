@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import * as qualifier from "../qualify-peer-native.mjs";
 
 const { decodeSite, instrumentDecodeSource, parseTraceLine } = qualifier;
+
+test("qualification markers match the current production source files", () => {
+  for (const [filename, instrumentSource, marker] of [
+    ["../../crates/native/crates/llama-native-engine/src/lib.rs", instrumentDecodeSource, "LOOM_NATIVE_BATCH_TRACE"],
+    ["../../products/loom/crates/loom-backend-llama/src/independent.rs", qualifier.instrumentIndependentSource, "LOOM_NATIVE_BATCH_MAPPING"],
+  ]) {
+    const source = readFileSync(new URL(filename, import.meta.url), "utf8");
+    const changed = instrumentSource(source);
+    assert.equal(changed.split(marker).length, 2);
+    assert.throws(() => instrumentSource(source + source));
+    assert.throws(() => instrumentSource(changed));
+  }
+});
 
 test("qualification instrumentation binds exactly one real decode site", () => {
   const source = `before\n${decodeSite}\nafter\n`;

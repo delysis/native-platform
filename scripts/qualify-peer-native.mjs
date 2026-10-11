@@ -10,9 +10,9 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 export const nativeTestName = "peer_compute::batch::native_qualification::independent_peers_share_native_decode";
-export const decodeSite = `        context
-            .decode(&mut batch)
-            .map_err(|error| native_decode_error("failed to decode generation batch", error))?;`;
+export const decodeSite = `            context
+                .decode(&mut batch)
+                .map_err(|error| native_decode_error("failed to decode generation batch", error))?;`;
 export const independentSite = "        let ticket = handle.generate_batch(native_request.clone())?;";
 
 function instrument(source, site, marker, observation) {
