@@ -546,6 +546,11 @@ fn retrieve_with_mentions(
                         .then_with(|| a.id.cmp(&b.id))
                 });
                 for e in ranked.into_iter().take(per_pass) {
+                    // Strata share the same per-author budget as topical/recent
+                    // passes, including when the minimum per-pass share is one.
+                    if by_id.len() >= config.retrieval.candidates_per_friend {
+                        break;
+                    }
                     by_id.entry(e.id.clone()).or_insert_with(|| e.clone());
                 }
             }

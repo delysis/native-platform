@@ -267,3 +267,135 @@ fn help_inspection_is_scoped_cancellable_and_never_opens_the_archive() {
     );
     provider.cancel_and_drain_for_exit();
 }
+
+#[test]
+fn sampling_strata_share_the_admitted_candidate_budget() {
+    let (temp, mut config) = fixture();
+    let archive = temp.path().join("snapshot.sqlite");
+    let db = rusqlite::Connection::open(&archive).expect("controlled test fixture");
+    db.execute_batch("DELETE FROM messages; DELETE FROM messages_fts;")
+        .expect("controlled test fixture");
+    let terms = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ];
+    let texts = terms
+        .iter()
+        .map(|term| format!("{term} authored evidence."))
+        .chain(["longform ".repeat(200), "Unrelated recent context.".into()]);
+    for (index, text) in texts.enumerate() {
+        let id = i64::try_from(index + 1).expect("small fixture identity");
+        db.execute(
+            "INSERT INTO messages VALUES (1,1,NULL,0,?1,?2,?3)",
+            rusqlite::params![format!("2026-01-{:02}T00:00:00Z", index + 1), id, text],
+        )
+        .expect("controlled test fixture");
+    }
+    db.execute_batch(
+        "INSERT INTO messages_fts(rowid,username,text) SELECT rowid,'a',text FROM messages;",
+    )
+    .expect("controlled test fixture");
+    drop(db);
+    config.retrieval.max_queries = terms.len();
+    config.retrieval.queries = terms.into_iter().map(str::to_owned).collect();
+    let dotfile = temp.path().join(DOTFILE);
+    for limit in [8, 9, 12] {
+        config.retrieval.candidates_per_friend = limit;
+        config.sampling = None;
+        fs::write(&dotfile, toml::to_string(&config).expect("fixture config"))
+            .expect("fixture config write");
+        let ordinary = NativeContextProvider::default()
+            .prepare(scope(), "candidate-budget", &dotfile, "@a")
+            .expect("ordinary preparation")
+            .expect("explicit invitation");
+        assert_eq!(ordinary.pack.circle.evidence.len(), limit.min(9));
+
+        config.sampling = Some(archive_friends::SamplingSettings::default());
+        fs::write(&dotfile, toml::to_string(&config).expect("fixture config"))
+            .expect("fixture config write");
+        let sampled = NativeContextProvider::default()
+            .prepare(scope(), "candidate-budget", &dotfile, "@a")
+            .expect("sampled preparation")
+            .expect("explicit invitation");
+        assert!(
+            sampled.pack.circle.evidence.len() <= limit,
+            "candidate cap {limit}"
+        );
+        assert!(
+            sampled
+                .pack
+                .circle
+                .evidence
+                .iter()
+                .all(|e| e.account_id == "101")
+        );
+        if limit == 12 {
+            assert_eq!(
+                sampled.pack.circle.evidence.len(),
+                10,
+                "retain a stratum when it fits"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_quiescent_persist_journal_remains_a_valid_read_only_snapshot() {
+    let (temp, config) = fixture();
+    let dotfile = temp.path().join(DOTFILE);
+    fs::write(
+        &dotfile,
+        toml::to_string(&config).expect("serialize owned configuration"),
+    )
+    .expect("write owned configuration");
+    let archive = temp.path().join("snapshot.sqlite");
+    let db = rusqlite::Connection::open(&archive).expect("open owned synthetic archive");
+    let mode: String = db
+        .pragma_update_and_check(None, "journal_mode", "PERSIST", |row| row.get(0))
+        .expect("select retained rollback journal mode");
+    assert_eq!(mode.to_ascii_lowercase(), "persist");
+    db.execute(
+        "UPDATE messages SET text = text || ' retained.' WHERE tweet_id = 1",
+        [],
+    )
+    .expect("commit an ordinary owned transaction");
+    db.close().expect("close the sole writer after commit");
+    let journal = temp.path().join("snapshot.sqlite-journal");
+    let journal_before = fs::read(&journal).expect("retain actual SQLite PERSIST journal");
+    assert!(
+        journal_before.len() > 512,
+        "journal must be nonempty, not a zero-byte proxy"
+    );
+    assert!(
+        journal_before[..28].iter().all(|&byte| byte == 0),
+        "committed PERSIST journal header must be cleared"
+    );
+    let source_before = fs::read(&archive).expect("retain the quiescent original");
+    let provider = NativeContextProvider::default();
+    let prepared = provider
+        .prepare(scope(), "cold-persist-journal", &dotfile, "@a friendship")
+        .expect("a closed committed archive is a valid immutable source")
+        .expect("explicit invitation produces context");
+    prepared
+        .pack
+        .verify()
+        .expect("actual pack remains internally consistent");
+    assert!(
+        prepared
+            .pack
+            .circle
+            .evidence
+            .iter()
+            .any(|e| e.text.contains("retained."))
+    );
+    prepared
+        .validate_snapshot(&dotfile, "cold-persist-journal")
+        .expect("final admission retains the same frozen source");
+    assert_eq!(
+        fs::read(&archive).expect("read preserved source"),
+        source_before
+    );
+    assert_eq!(
+        fs::read(&journal).expect("read preserved cold journal"),
+        journal_before
+    );
+}
