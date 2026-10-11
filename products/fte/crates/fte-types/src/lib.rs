@@ -940,6 +940,9 @@ pub trait TicketLifecycleLease: Send + Sync {
     fn finish(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
     /// Record an early terminal while the executor may still be draining.
     fn terminal(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
+    /// Settle authoritative usage discovered while draining an already-public
+    /// terminal. This must not publish a response or change that terminal.
+    fn settle_usage(&self, _result: &Result<GatewayResponse, GatewayError>) {}
     /// Release only after final publication and executor completion.
     fn release(&self) -> Result<(), GatewayError>;
 }
@@ -1176,6 +1179,12 @@ impl GatewayTicket {
                 fn release(&self) -> Result<(), GatewayError> {
                     self.lease.as_ref().map_or(Ok(()), |lease| lease.release())
                 }
+
+                fn settle_usage(&self, result: &Result<GatewayResponse, GatewayError>) {
+                    if let Some(lease) = &self.lease {
+                        lease.settle_usage(result);
+                    }
+                }
             }
 
             let release = ExecutorRelease {
@@ -1361,7 +1370,10 @@ impl GatewayTicket {
                         observe_terminal(&mut observer, &result);
                         let _ = final_tx.send(result);
                         if retains_executor {
-                            let _ = upstream_final.await;
+                            let late_result = upstream_final.await.unwrap_or_else(|_| {
+                                Err(GatewayError::unavailable(&request_for_task, "backend_result_channel_closed", "the backend stopped before returning an authoritative result"))
+                            });
+                            release.settle_usage(&late_result);
                             let _ = release.release();
                         }
                         return;

@@ -416,7 +416,7 @@ fn observe_gateway_outcome(
                 .usage
                 .input_tokens
                 .zip(response.usage.output_tokens)
-                .map(|(input, output)| input.saturating_add(output)),
+                .and_then(|(input, output)| input.checked_add(output)),
             match response.status {
                 TerminalStatus::Completed | TerminalStatus::Incomplete => 200,
                 TerminalStatus::Cancelled => 499,
@@ -1648,6 +1648,12 @@ impl Drop for AdmissionLease {
 }
 
 impl TicketLifecycleLease for AdmissionLease {
+    fn settle_usage(&self, result: &Result<fte_types::GatewayResponse, GatewayError>) {
+        if let Some(quota) = &self.quota {
+            quota.finish(result);
+        }
+    }
+
     fn finish(
         &self,
         result: &Result<fte_types::GatewayResponse, GatewayError>,
@@ -1665,9 +1671,7 @@ impl TicketLifecycleLease for AdmissionLease {
             }
             Err(_) => operation_lifecycle::TerminalClass::Failed,
         };
-        if let Some(quota) = &self.quota {
-            quota.finish(result);
-        }
+        self.settle_usage(result);
         let publication = self.publish_response(result);
         let terminal = if publication.is_err() {
             operation_lifecycle::TerminalClass::Failed
@@ -3183,6 +3187,151 @@ mod tests {
         assert_eq!(gateway.status().active_requests, 0);
         assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Closed);
         drop(ticket);
+    }
+
+    #[tokio::test]
+    async fn deadline_drain_settles_late_usage_without_republishing_the_response() {
+        struct FiniteBackend(DelayedFinalBackend);
+        #[async_trait]
+        impl GatewayBackend for FiniteBackend {
+            fn descriptor(&self) -> BackendDescriptor {
+                let mut descriptor = self.0.descriptor();
+                descriptor.models[0].quota.tokens_per_minute = Some(100);
+                descriptor
+            }
+            fn readiness(&self) -> BackendReadiness {
+                self.0.readiness()
+            }
+            async fn execute(
+                &self,
+                request: BackendRequest,
+            ) -> Result<GatewayTicket, GatewayError> {
+                self.0.execute(request).await
+            }
+            fn cancel(&self, id: &RequestId, target: CancelTarget) -> usize {
+                self.0.cancel(id, target)
+            }
+        }
+        struct Observer(Arc<Mutex<Vec<u16>>>);
+        impl GatewayOutcomeObserver for Observer {
+            fn observe(&self, outcome: &GatewayOutcome) {
+                self.0
+                    .lock()
+                    .expect("observer records")
+                    .push(outcome.status);
+            }
+        }
+        struct Store(AtomicUsize);
+        impl fte_types::ResponseStore for Store {
+            fn put(&self, _: &fte_types::GatewayResponse) -> Result<(), GatewayError> {
+                self.0.fetch_add(1, AtomicOrdering::AcqRel);
+                Ok(())
+            }
+            fn get(&self, _: &str) -> Result<Option<fte_types::GatewayResponse>, GatewayError> {
+                Ok(None)
+            }
+            fn delete(&self, _: &str) -> Result<bool, GatewayError> {
+                Ok(false)
+            }
+        }
+        // The backend final is held behind an explicit sender until the public
+        // timeout has already been observed. No scheduler timing decides usage.
+        for variant in 0..5 {
+            let completion = Arc::new(Mutex::new(None));
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let store = Arc::new(Store(AtomicUsize::new(0)));
+            let gateway = Gateway::new(GatewayDefaults::default())
+                .with_outcome_observer(Arc::new(Observer(Arc::clone(&observations))));
+            gateway
+                .bind_response_store(store.clone())
+                .expect("bind store");
+            gateway
+                .register_backend(Arc::new(FiniteBackend(DelayedFinalBackend {
+                    completion: Arc::clone(&completion),
+                    cancellations: Arc::new(AtomicUsize::new(0)),
+                })))
+                .expect("finite backend");
+            let mut request = request();
+            request.model = ModelSelector::ExactRoute {
+                backend_id: "delayed-final".to_string(),
+                model_id: "delayed-final-model".to_string(),
+            };
+            request.sampling.max_output_tokens = Some(20);
+            request.storage.store_response = true;
+            request.deadline.first_token_ms = Some(5);
+            let request_id = request.request_id.clone();
+            let ticket = gateway
+                .execute(request)
+                .await
+                .expect("finite request admitted");
+            let error = ticket
+                .final_response()
+                .await
+                .expect_err("immutable public deadline");
+            assert_eq!(error.code, "first_output_deadline_exceeded");
+            assert_eq!(gateway.status().active_requests, 1);
+            assert_eq!(
+                observations.lock().expect("observer records").as_slice(),
+                &[504]
+            );
+            let sender = completion
+                .lock()
+                .expect("backend sender")
+                .take()
+                .expect("held authoritative final");
+            if variant == 4 {
+                drop(sender);
+            } else if variant == 3 {
+                sender
+                    .send(Err(GatewayError::unavailable(
+                        &request_id,
+                        "fixture_error",
+                        "upstream error",
+                    )))
+                    .expect("deliver upstream error");
+            } else {
+                let mut response = completed_response(request_id, "delayed-final");
+                if variant == 1 {
+                    response.status = TerminalStatus::Cancelled;
+                }
+                response.usage = GatewayUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(7),
+                    provenance: if variant == 2 {
+                        fte_types::UsageProvenance::Unknown
+                    } else {
+                        fte_types::UsageProvenance::Exact
+                    },
+                    ..Default::default()
+                };
+                sender.send(Ok(response)).expect("deliver late final");
+            }
+            gateway.shutdown().await.expect("drain retained executor");
+            assert_eq!(gateway.status().active_requests, 0);
+            assert_eq!(
+                observations.lock().expect("observer records").as_slice(),
+                &[504]
+            );
+            assert_eq!(
+                store.0.load(AtomicOrdering::Acquire),
+                0,
+                "no late response store write"
+            );
+            let state = gateway.state.read().expect("route state");
+            assert!(
+                state.response_affinity.is_empty(),
+                "no late continuation affinity"
+            );
+            let headroom = state
+                .quotas
+                .get(&(
+                    "delayed-final".to_string(),
+                    "delayed-final-model".to_string(),
+                ))
+                .expect("finite route quota")
+                .headroom();
+            assert_eq!(headroom, Some(if variant < 2 { 0.88 } else { 0.0 }));
+        }
     }
 
     #[tokio::test]
