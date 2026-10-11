@@ -83,10 +83,11 @@ async fn hosted_exchange_captured(
         backend_id: "fixture".into(),
         location: BackendLocation::Hosted,
         capabilities: ModelCapabilities {
-            modalities: vec![fte_types::Modality::Text],
+            modalities: vec![fte_types::Modality::Text, fte_types::Modality::Image],
             prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
             streaming: true,
             tools: true,
+            provider_cache: true,
             ..Default::default()
         },
         context_tokens: None,
@@ -143,6 +144,71 @@ fn sse(values: &[Value]) -> Vec<u8> {
         .collect::<String>();
     text.push_str("data: [DONE]\n\n");
     text.into_bytes()
+}
+
+#[tokio::test]
+async fn anthropic_mixed_history_keeps_order_media_and_cache_targets_in_both_bodies() {
+    let provider = json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":1}});
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic", "application/json", provider.to_string().into_bytes(), "/v1/messages",
+        json!({
+            "model":"fixture-model", "max_tokens":16, "stream":true,
+            "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"text","text":"A"},
+                    {"type":"tool_use","id":"call_1","name":"lookup","input":{"n":1}},
+                    {"type":"text","text":"B","cache_control":{"type":"ephemeral","ttl":"1h"}}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"C","cache_control":{"type":"ephemeral"}},
+                    {"type":"tool_use","id":"call_2","name":"lookup","input":{"n":2}},
+                    {"type":"text","text":"D"}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","is_error":true,"cache_control":{"type":"ephemeral"},"content":[
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQ=="}},
+                        {"type":"text","text":"result"}
+                    ]},
+                    {"type":"tool_result","tool_use_id":"call_2","content":"second"},
+                    {"type":"text","text":"E"}
+                ]}
+            ]
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured.len(),
+        2,
+        "one count request and one generation request"
+    );
+    assert_eq!(captured[0]["messages"], captured[1]["messages"]);
+    assert_eq!(captured[0]["system"], captured[1]["system"]);
+    for body in &captured {
+        let assistant = body["messages"][0]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(assistant.len(), 6);
+        assert_eq!(assistant[0]["text"], "A");
+        assert_eq!(assistant[1]["id"], "call_1");
+        assert_eq!(assistant[2]["text"], "B");
+        assert_eq!(assistant[2]["cache_control"]["ttl"], "1h");
+        assert_eq!(assistant[3]["text"], "C");
+        assert_eq!(assistant[3]["cache_control"]["ttl"], "5m");
+        assert_eq!(assistant[4]["id"], "call_2");
+        assert_eq!(assistant[5]["text"], "D");
+        let user = body["messages"][1]["content"]
+            .as_array()
+            .expect("user blocks");
+        assert_eq!(user.len(), 3);
+        assert_eq!(user[0]["tool_use_id"], "call_1");
+        assert_eq!(user[0]["is_error"], true);
+        assert_eq!(user[0]["cache_control"]["ttl"], "5m");
+        assert_eq!(user[0]["content"][0]["source"]["data"], "AQ==");
+        assert_eq!(user[0]["content"][1]["text"], "result");
+        assert_eq!(user[1]["tool_use_id"], "call_2");
+        assert_eq!(user[2]["text"], "E");
+    }
 }
 
 #[tokio::test]

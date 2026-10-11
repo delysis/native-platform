@@ -1261,7 +1261,10 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 }
             }
             fte_types::InputItem::FunctionResult {
-                call_id, output, ..
+                call_id,
+                output,
+                is_error,
+                ..
             } => {
                 let Some(name) = call_names.get(call_id) else {
                     return Err(capability_error(
@@ -1273,7 +1276,7 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 };
                 contents.push(json!({
                     "role":"user",
-                    "parts":[{"functionResponse":{"id":call_id,"name":name,"response":{"content":content_text(output)}}}]
+                    "parts":[{"functionResponse":{"id":call_id,"name":name,"response":{"content":text_only_tool_result(output, *is_error, &request.request.request_id, &request.route.backend_id)?}}}]
                 }));
             }
             fte_types::InputItem::Reasoning {
@@ -1490,12 +1493,12 @@ fn openai_input_item(item: &fte_types::InputItem) -> Result<Value, GatewayError>
             id,
             call_id,
             output,
-            ..
+            is_error,
         } => Ok(json!({
             "id":id,
             "type":"function_call_output",
             "call_id":call_id,
-            "output":content_text(output),
+            "output":text_only_tool_result(output, *is_error, &request_id, "openai")?,
         })),
         fte_types::InputItem::Reasoning {
             id,
@@ -1593,9 +1596,9 @@ fn openai_chat_messages(
                 }
             }
             fte_types::InputItem::FunctionResult {
-                call_id, output, ..
+                call_id, output, is_error, ..
             } => messages.push(json!({
-                "role":"tool","tool_call_id":call_id,"content":content_text(output),
+                "role":"tool","tool_call_id":call_id,"content":text_only_tool_result(output, *is_error, request_id, "openai-compatible")?,
             })),
             fte_types::InputItem::Reasoning { .. }
             | fte_types::InputItem::ProviderOpaque { .. } => {
@@ -1644,36 +1647,53 @@ fn anthropic_messages_from_items(
                     .map(anthropic_content)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            fte_types::InputItem::Message { role, content, .. } => messages.push(json!({
-                "role":role_name(*role),
-                "content":content.iter().map(anthropic_content).collect::<Result<Vec<_>,_>>()?
-            })),
+            fte_types::InputItem::Message { role, content, .. } => {
+                append_anthropic_content(
+                    &mut messages,
+                    role_name(*role),
+                    content
+                        .iter()
+                        .map(anthropic_content)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
             fte_types::InputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
                 ..
             } => {
-                let block =
-                    json!({"type":"tool_use","id":call_id,"name":name,"input":arguments});
-                if !append_to_last_role(
-                    &mut messages,
-                    "assistant",
-                    "content",
-                    block.clone(),
-                ) {
-                    messages.push(json!({"role":"assistant","content":[block]}));
-                }
+                let block = json!({"type":"tool_use","id":call_id,"name":name,"input":arguments});
+                append_anthropic_content(&mut messages, "assistant", vec![block]);
             }
             fte_types::InputItem::FunctionResult {
                 call_id,
                 output,
                 is_error,
                 ..
-            } => messages.push(json!({
-                "role":"user",
-                "content":[{"type":"tool_result","tool_use_id":call_id,"content":content_text(output),"is_error":is_error}]
-            })),
+            } => {
+                let content = output
+                    .iter()
+                    .map(|block| match block {
+                        fte_types::ContentBlock::Text { .. }
+                        | fte_types::ContentBlock::Image { .. }
+                        | fte_types::ContentBlock::Document { .. } => anthropic_content(block),
+                        _ => Err(capability_error(
+                            request_id,
+                            "anthropic",
+                            "anthropic_tool_result_content_unsupported",
+                            "Anthropic tool results cannot preserve this canonical content block",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                append_anthropic_content(
+                    &mut messages,
+                    "user",
+                    vec![
+                        json!({"type":"tool_result","tool_use_id":call_id,"content":content,"is_error":is_error}),
+                    ],
+                );
+            }
             fte_types::InputItem::Reasoning {
                 summary,
                 opaque_continuation,
@@ -1683,10 +1703,11 @@ fn anthropic_messages_from_items(
                     && let (Some(Value::String(thinking)), Some(Value::String(signature))) =
                         (opaque.get("thinking"), opaque.get("signature"))
                 {
-                    messages.push(json!({
-                        "role":"assistant",
-                        "content":[{"type":"thinking","thinking":thinking,"signature":signature}]
-                    }));
+                    append_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        vec![json!({"type":"thinking","thinking":thinking,"signature":signature})],
+                    );
                 } else if !summary.is_empty() {
                     return Err(capability_error(
                         request_id,
@@ -1696,8 +1717,9 @@ fn anthropic_messages_from_items(
                     ));
                 }
             }
-            fte_types::InputItem::ProviderOpaque { provider, item }
-                if provider == "anthropic" => messages.push(item.clone()),
+            fte_types::InputItem::ProviderOpaque { provider, item } if provider == "anthropic" => {
+                messages.push(item.clone())
+            }
             fte_types::InputItem::ProviderOpaque { .. } => {
                 return Err(capability_error(
                     request_id,
@@ -1709,6 +1731,14 @@ fn anthropic_messages_from_items(
         }
     }
     Ok((system, messages))
+}
+
+fn append_anthropic_content(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+    for block in content {
+        if !append_to_last_role(messages, role, "content", block.clone()) {
+            messages.push(json!({"role":role,"content":[block]}));
+        }
+    }
 }
 
 fn anthropic_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
@@ -2019,6 +2049,14 @@ fn apply_anthropic_cache_breakpoints(
         let root_index = path.next().and_then(|value| value.parse::<usize>().ok());
         let content_marker = path.next();
         let content_index = path.next().and_then(|value| value.parse::<usize>().ok());
+        if path.next().is_some() {
+            return Err(capability_error(
+                request_id,
+                "anthropic",
+                "anthropic_cache_breakpoint_unmappable",
+                "a cache breakpoint path contains trailing coordinates",
+            ));
+        }
         let target = match (root, root_index, content_marker, content_index) {
             ("system", Some(index), None, None) => body
                 .get_mut("system")
@@ -2119,6 +2157,27 @@ fn content_text(content: &[fte_types::ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn text_only_tool_result(
+    content: &[fte_types::ContentBlock],
+    is_error: bool,
+    request_id: &RequestId,
+    provider: &str,
+) -> Result<String, GatewayError> {
+    if is_error
+        || content
+            .iter()
+            .any(|block| !matches!(block, fte_types::ContentBlock::Text { .. }))
+    {
+        return Err(capability_error(
+            request_id,
+            provider,
+            "tool_result_content_unsupported",
+            "this provider tool-result field cannot preserve multimodal content or an explicit error flag",
+        ));
+    }
+    Ok(content_text(content))
 }
 
 struct ProviderJsonRequest {
@@ -5223,6 +5282,103 @@ mod tests {
             .insert("gemini.cachedContent".to_string(), json!("foreign"));
         let error = anthropic_body(&request).expect_err("foreign extension must fail");
         assert_eq!(error.code, "hosted_provider_extension_unsupported");
+    }
+
+    #[test]
+    fn text_only_tool_result_adapters_refuse_media_or_error_flags() {
+        for (output, is_error) in [
+            (
+                vec![fte_types::ContentBlock::Image {
+                    source: fte_types::MediaSource::Bytes {
+                        mime_type: "image/png".to_string(),
+                        data_base64: "AQ==".to_string(),
+                    },
+                    detail: None,
+                }],
+                false,
+            ),
+            (
+                vec![fte_types::ContentBlock::Text {
+                    text: "error".to_string(),
+                }],
+                true,
+            ),
+        ] {
+            let request = request(GenerationInput::Chat {
+                items: vec![
+                    fte_types::InputItem::FunctionCall {
+                        id: None,
+                        call_id: "call_1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: json!({}),
+                    },
+                    fte_types::InputItem::FunctionResult {
+                        id: None,
+                        call_id: "call_1".to_string(),
+                        output,
+                        is_error,
+                    },
+                ],
+            });
+            for result in [
+                openai_responses_body(&request),
+                gemini_body(&request),
+                openai_chat_messages(
+                    match &request.request.input {
+                        GenerationInput::Chat { items } => items,
+                        _ => unreachable!(),
+                    },
+                    &request.request.request_id,
+                )
+                .map(Value::Array),
+            ] {
+                assert_eq!(
+                    result
+                        .expect_err("unsupported tool result must not be projected to text")
+                        .code,
+                    "tool_result_content_unsupported"
+                );
+            }
+            let body =
+                anthropic_body(&request).expect("Anthropic preserves image and error results");
+            assert_eq!(body["messages"][1]["content"][0]["is_error"], is_error);
+            if !is_error {
+                assert_eq!(
+                    body["messages"][1]["content"][0]["content"][0]["source"]["data"],
+                    "AQ=="
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dangling_or_trailing_anthropic_cache_paths_fail_before_dispatch() {
+        for path in ["messages.0.content.99", "messages.0.content.0.trailing"] {
+            let mut request = request(GenerationInput::Chat {
+                items: vec![fte_types::InputItem::Message {
+                    id: None,
+                    role: fte_types::MessageRole::User,
+                    content: vec![fte_types::ContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                }],
+            });
+            request
+                .request
+                .cache
+                .provider_breakpoints
+                .push(fte_types::ProviderCacheBreakpoint {
+                    path: path.to_string(),
+                    ttl: None,
+                });
+            for body in [anthropic_body(&request), anthropic_count_body(&request)] {
+                assert_eq!(
+                    body.expect_err("invalid marker must not be silently ignored")
+                        .code,
+                    "anthropic_cache_breakpoint_unmappable"
+                );
+            }
+        }
     }
 
     #[test]

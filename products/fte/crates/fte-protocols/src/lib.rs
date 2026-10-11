@@ -860,7 +860,7 @@ impl AnthropicMessagesRequest {
             items.push(InputItem::Message {
                 id: None,
                 role: MessageRole::System,
-                content: system.into_blocks(),
+                content: system.into_blocks()?,
             });
         }
         for message in self.messages {
@@ -922,12 +922,19 @@ pub enum AnthropicSystem {
 }
 
 impl AnthropicSystem {
-    fn into_blocks(self) -> Vec<ContentBlock> {
+    fn into_blocks(self) -> Result<Vec<ContentBlock>, GatewayError> {
         match self {
-            Self::Text(text) => vec![ContentBlock::Text { text }],
+            Self::Text(text) => Ok(vec![ContentBlock::Text { text }]),
             Self::Blocks(blocks) => blocks
                 .into_iter()
-                .filter_map(AnthropicContentBlock::into_system_block)
+                .map(|block| match block {
+                    AnthropicContentBlock::Text { text, .. } => Ok(ContentBlock::Text { text }),
+                    _ => Err(GatewayError::invalid_request(
+                        &RequestId::new(),
+                        "anthropic_system_content_unsupported",
+                        "Anthropic system content supports only text blocks",
+                    )),
+                })
                 .collect(),
         }
     }
@@ -944,6 +951,12 @@ impl AnthropicMessage {
     fn into_items(self) -> Result<Vec<InputItem>, GatewayError> {
         let request_id = RequestId::new();
         let role = parse_role(&request_id, &self.role)?;
+        reject_if(
+            &request_id,
+            !matches!(role, MessageRole::User | MessageRole::Assistant),
+            "anthropic_message_role_invalid",
+            "Anthropic messages must use user or assistant roles",
+        )?;
         match self.content {
             AnthropicContent::Text(text) => Ok(vec![InputItem::Message {
                 id: None,
@@ -951,27 +964,33 @@ impl AnthropicMessage {
                 content: vec![ContentBlock::Text { text }],
             }]),
             AnthropicContent::Blocks(blocks) => {
+                reject_if(
+                    &request_id,
+                    blocks.is_empty(),
+                    "anthropic_message_content_empty",
+                    "Anthropic messages require at least one content block",
+                )?;
                 let mut message_blocks = Vec::new();
                 let mut items = Vec::new();
                 for block in blocks {
                     match block {
-                        AnthropicContentBlock::Text {
-                            text,
-                            cache_control,
-                        } => {
-                            if cache_control.is_some() {
-                                // Cache breakpoints are preserved on the request below via
-                                // provider extensions once a hosted Anthropic route is selected.
-                            }
+                        AnthropicContentBlock::Text { text, .. } => {
                             message_blocks.push(ContentBlock::Text { text });
                         }
                         AnthropicContentBlock::Image { source } => {
                             message_blocks.push(ContentBlock::Image {
-                                source: source.into_media_source(),
+                                source: source.into_media_source()?,
                                 detail: None,
                             });
                         }
                         AnthropicContentBlock::ToolUse { id, name, input } => {
+                            reject_if(
+                                &request_id,
+                                role != MessageRole::Assistant,
+                                "anthropic_tool_use_role_invalid",
+                                "tool_use requires an assistant message",
+                            )?;
+                            push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                             items.push(InputItem::FunctionCall {
                                 id: None,
                                 call_id: id,
@@ -985,10 +1004,17 @@ impl AnthropicMessage {
                             is_error,
                             ..
                         } => {
+                            reject_if(
+                                &request_id,
+                                role != MessageRole::User,
+                                "anthropic_tool_result_role_invalid",
+                                "tool_result requires a user message",
+                            )?;
+                            push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                             items.push(InputItem::FunctionResult {
                                 id: None,
                                 call_id: tool_use_id,
-                                output: content.into_blocks(),
+                                output: content.into_blocks()?,
                                 is_error: is_error.unwrap_or(false),
                             });
                         }
@@ -1006,19 +1032,24 @@ impl AnthropicMessage {
                         }
                     }
                 }
-                if !message_blocks.is_empty() {
-                    items.insert(
-                        0,
-                        InputItem::Message {
-                            id: None,
-                            role,
-                            content: message_blocks,
-                        },
-                    );
-                }
+                push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                 Ok(items)
             }
         }
+    }
+}
+
+fn push_anthropic_message_segment(
+    items: &mut Vec<InputItem>,
+    content: &mut Vec<ContentBlock>,
+    role: MessageRole,
+) {
+    if !content.is_empty() {
+        items.push(InputItem::Message {
+            id: None,
+            role,
+            content: std::mem::take(content),
+        });
     }
 }
 
@@ -1030,12 +1061,12 @@ pub enum AnthropicContent {
 }
 
 impl AnthropicContent {
-    fn into_blocks(self) -> Vec<ContentBlock> {
+    fn into_blocks(self) -> Result<Vec<ContentBlock>, GatewayError> {
         match self {
-            Self::Text(text) => vec![ContentBlock::Text { text }],
+            Self::Text(text) => Ok(vec![ContentBlock::Text { text }]),
             Self::Blocks(blocks) => blocks
                 .into_iter()
-                .filter_map(AnthropicContentBlock::into_system_block)
+                .map(AnthropicContentBlock::into_tool_result_block)
                 .collect(),
         }
     }
@@ -1072,22 +1103,29 @@ pub enum AnthropicContentBlock {
 }
 
 impl AnthropicContentBlock {
-    fn into_system_block(self) -> Option<ContentBlock> {
+    fn into_tool_result_block(self) -> Result<ContentBlock, GatewayError> {
         match self {
-            Self::Text { text, .. } => Some(ContentBlock::Text { text }),
-            Self::Image { source } => Some(ContentBlock::Image {
-                source: source.into_media_source(),
+            Self::Text {
+                text,
+                cache_control,
+            } => {
+                reject_if(
+                    &RequestId::new(),
+                    cache_control.is_some(),
+                    "anthropic_nested_cache_control_unsupported",
+                    "nested tool result cache control is not implemented; mark the tool_result block",
+                )?;
+                Ok(ContentBlock::Text { text })
+            }
+            Self::Image { source } => Ok(ContentBlock::Image {
+                source: source.into_media_source()?,
                 detail: None,
             }),
-            Self::Thinking {
-                thinking,
-                signature,
-            } => Some(ContentBlock::Thinking {
-                text: thinking,
-                signature,
-            }),
-            Self::RedactedThinking { data } => Some(ContentBlock::RedactedThinking { data }),
-            Self::ToolUse { .. } | Self::ToolResult { .. } => None,
+            _ => Err(GatewayError::invalid_request(
+                &RequestId::new(),
+                "anthropic_tool_result_content_unsupported",
+                "tool results support text and image blocks on this public surface",
+            )),
         }
     }
 }
@@ -1102,11 +1140,22 @@ pub struct AnthropicMediaSource {
 }
 
 impl AnthropicMediaSource {
-    fn into_media_source(self) -> fte_types::MediaSource {
-        fte_types::MediaSource::Bytes {
+    fn into_media_source(self) -> Result<fte_types::MediaSource, GatewayError> {
+        reject_if(
+            &RequestId::new(),
+            self.kind != "base64"
+                || !matches!(
+                    self.media_type.as_str(),
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                )
+                || self.data.is_empty(),
+            "anthropic_image_source_invalid",
+            "image source requires non-empty base64 data and a supported image media type",
+        )?;
+        Ok(fte_types::MediaSource::Bytes {
             mime_type: self.media_type,
             data_base64: self.data,
-        }
+        })
     }
 }
 
@@ -1134,17 +1183,33 @@ fn anthropic_cache_breakpoints(
             }
         }
     }
-    for (message_index, message) in request.messages.iter().enumerate() {
+    let mut message_index = 0usize;
+    let mut content_offset = 0usize;
+    let mut previous_role = None;
+    for message in &request.messages {
+        if let Some(previous) = previous_role
+            && previous != message.role.as_str()
+        {
+            message_index += 1;
+            content_offset = 0;
+        }
+        previous_role = Some(message.role.as_str());
         if let AnthropicContent::Blocks(blocks) = &message.content {
             for (content_index, block) in blocks.iter().enumerate() {
                 if let Some(control) = block.cache_control() {
                     breakpoints.push(parse_anthropic_cache_control(
                         request_id,
-                        format!("messages.{message_index}.content.{content_index}"),
+                        format!(
+                            "messages.{message_index}.content.{}",
+                            content_offset + content_index
+                        ),
                         control,
                     )?);
                 }
             }
+            content_offset += blocks.len();
+        } else {
+            content_offset += 1;
         }
     }
     if let Some(tools) = &request.tools {
@@ -2768,6 +2833,78 @@ mod tests {
         assert_eq!(
             gateway.cache.provider_ttl,
             Some(ProviderCacheTtl::TwentyFourHours)
+        );
+    }
+
+    #[test]
+    fn anthropic_mixed_blocks_keep_canonical_order_and_rebind_consecutive_roles() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model":"auto","max_tokens":16,
+            "messages":[
+                {"role":"assistant","content":[{"type":"text","text":"A"},{"type":"tool_use","id":"call_1","name":"lookup","input":{}},{"type":"text","text":"B","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":[{"type":"text","text":"C","cache_control":{"type":"ephemeral","ttl":"1h"}}]}
+            ]
+        })).expect("mixed Anthropic DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("ordered canonical request");
+        assert_eq!(
+            request.cache.provider_breakpoints[0].path,
+            "messages.0.content.2"
+        );
+        assert_eq!(
+            request.cache.provider_breakpoints[1].path,
+            "messages.0.content.3"
+        );
+        let GenerationInput::Chat { items } = request.input else {
+            panic!("canonical chat");
+        };
+        assert!(
+            matches!(&items[0], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "A"))
+        );
+        assert!(
+            matches!(&items[1], InputItem::FunctionCall { call_id, .. } if call_id == "call_1")
+        );
+        assert!(
+            matches!(&items[2], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "B"))
+        );
+        assert!(
+            matches!(&items[3], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "C"))
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_result_media_and_nested_content_are_not_reinterpreted() {
+        for (content, code) in [
+            (
+                json!([{"type":"image","source":{"type":"not_base64","media_type":"image/png","data":"AQ=="}}]),
+                "anthropic_image_source_invalid",
+            ),
+            (
+                json!([{"type":"tool_use","id":"nested","name":"lookup","input":{}}]),
+                "anthropic_tool_result_content_unsupported",
+            ),
+            (
+                json!([{"type":"text","text":"nested marker","cache_control":{"type":"ephemeral"}}]),
+                "anthropic_nested_cache_control_unsupported",
+            ),
+        ] {
+            let request: AnthropicMessagesRequest = serde_json::from_value(json!({"model":"auto","max_tokens":16,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":content}]}]})).expect("known nested content DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported nested content fails")
+                    .code,
+                code
+            );
+        }
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({"model":"auto","max_tokens":16,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQ=="}}]}]}]})).expect("image result DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("image result canonical lowering");
+        assert_eq!(
+            request.input.required_modalities(),
+            vec![fte_types::Modality::Text, fte_types::Modality::Image]
         );
     }
 
