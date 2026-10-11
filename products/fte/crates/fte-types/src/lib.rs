@@ -156,6 +156,26 @@ impl GatewayRequest {
                 "at least one chat item is required",
             ));
         }
+        if let GenerationInput::Chat { items } = &self.input {
+            for item in items {
+                let (role, content) = match item {
+                    InputItem::Message { role, content, .. } => (Some(*role), content),
+                    InputItem::FunctionResult { output, .. } => (None, output),
+                    _ => continue,
+                };
+                if content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Refusal { .. }))
+                    && (role != Some(MessageRole::Assistant) || content.len() != 1)
+                {
+                    return Err(GatewayError::invalid_request(
+                        &self.request_id,
+                        "refusal_history_shape_unsupported",
+                        "refusal history requires a single assistant refusal block",
+                    ));
+                }
+            }
+        }
         if self.deadline.total_ms == Some(0) {
             return Err(GatewayError::invalid_request(
                 &self.request_id,
@@ -281,6 +301,10 @@ pub enum MessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
+        text: String,
+    },
+    /// Historical assistant refusal, preserved rather than ordinary text.
+    Refusal {
         text: String,
     },
     Image {

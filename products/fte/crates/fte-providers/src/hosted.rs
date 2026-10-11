@@ -1484,6 +1484,12 @@ fn gemini_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
 fn gemini_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "gemini",
+            "refusal_history_unsupported",
+            "Gemini cannot preserve a tagged assistant refusal in history",
+        )),
         fte_types::ContentBlock::Image { source, .. }
         | fte_types::ContentBlock::Audio { source, .. }
         | fte_types::ContentBlock::Document { source, .. } => match source {
@@ -1564,6 +1570,12 @@ fn openai_input_item(item: &fte_types::InputItem) -> Result<Value, GatewayError>
 fn openai_input_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"type":"input_text","text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "openai",
+            "responses_refusal_history_unsupported",
+            "this Responses input owner has no admitted refusal replay contract",
+        )),
         fte_types::ContentBlock::Image { source, detail } => {
             Ok(json!({"type":"input_image","image_url":media_url(source),"detail":detail}))
         }
@@ -1615,10 +1627,27 @@ fn openai_chat_messages(
     let mut messages = Vec::new();
     for item in items {
         match item {
-            fte_types::InputItem::Message { role, content, .. } => messages.push(json!({
-                "role":role_name(*role),
-                "content":content.iter().map(openai_chat_content).collect::<Result<Vec<_>,_>>()?,
-            })),
+            fte_types::InputItem::Message { role, content, .. } => {
+                if let Some(fte_types::ContentBlock::Refusal { text }) = content
+                    .iter()
+                    .find(|block| matches!(block, fte_types::ContentBlock::Refusal { .. }))
+                {
+                    if *role != fte_types::MessageRole::Assistant || content.len() != 1 {
+                        return Err(capability_error(
+                            request_id,
+                            "openai-compatible",
+                            "refusal_history_shape_unsupported",
+                            "refusal history requires a single assistant refusal block",
+                        ));
+                    }
+                    messages.push(json!({"role":"assistant","content":null,"refusal":text}));
+                } else {
+                    messages.push(json!({
+                        "role":role_name(*role),
+                        "content":content.iter().map(openai_chat_content).collect::<Result<Vec<_>,_>>()?,
+                    }));
+                }
+            }
             fte_types::InputItem::FunctionCall {
                 call_id,
                 name,
@@ -1793,6 +1822,12 @@ fn append_anthropic_content(messages: &mut Vec<Value>, role: &str, content: Vec<
 fn anthropic_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"type":"text","text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "anthropic",
+            "refusal_history_unsupported",
+            "Anthropic cannot preserve a tagged assistant refusal in history",
+        )),
         fte_types::ContentBlock::Image { source, .. } => {
             Ok(json!({"type":"image","source":anthropic_media(source)}))
         }

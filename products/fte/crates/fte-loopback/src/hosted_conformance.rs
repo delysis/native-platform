@@ -1886,3 +1886,230 @@ async fn hosted_anthropic_canonical_reasoning_replays_ordinary_producer_state() 
             && opaque["redacted_thinking"] == "fixture_canonical_cipher_日本語/+=one"
     ));
 }
+
+#[tokio::test]
+async fn hosted_chat_refusal_history_roundtrips_without_losing_designation() {
+    let ordinary = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Ordinary 日本語."},"finish_reason":"stop"}]});
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        ordinary.to_string().into_bytes(),
+        "/v1/chat/completions",
+        chat_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ordinary_response: Value = serde_json::from_str(&text).expect("ordinary response");
+    let ordinary_message = ordinary_response["choices"][0]["message"].clone();
+    assert_eq!(ordinary_message, ordinary["choices"][0]["message"]);
+    assert_eq!(captured.len(), 1);
+    let ordinary_history = json!({"model":"fixture-model","messages":[
+        {"role":"user","content":"hello"}, ordinary_message, {"role":"user","content":"follow up"}
+    ]});
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        ordinary.to_string().into_bytes(),
+        "/v1/chat/completions",
+        ordinary_history,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured[0]["messages"][1],
+        json!({
+            "role":"assistant","content":[{"type":"text","text":"Ordinary 日本語."}]
+        })
+    );
+
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/chat-refusal.json"))
+            .expect("shared provider/UI refusal fixture");
+    for refusal in [
+        fixture["choices"][0]["message"]["refusal"]
+            .as_str()
+            .expect("refusal"),
+        "",
+    ] {
+        let mut provider = fixture.clone();
+        provider["choices"][0]["message"]["refusal"] = json!(refusal);
+        let (first_status, first_text, first_capture) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/chat/completions",
+            chat_request(false),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let first: Value =
+            serde_json::from_str(&first_text).expect("real hosted refusal projection");
+        let returned = first["choices"][0]["message"].clone();
+        assert_eq!(returned, provider["choices"][0]["message"]);
+        assert_eq!(first["choices"][0]["finish_reason"], "stop");
+        assert_eq!(first_capture.len(), 1);
+        let history = json!({"model":"fixture-model","messages":[
+            {"role":"user","content":"hello"}, returned, {"role":"user","content":"follow up"}
+        ]});
+        let (replay_status, replay_text, replay_capture) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            ordinary.to_string().into_bytes(),
+            "/v1/chat/completions",
+            history.clone(),
+        )
+        .await;
+        assert_eq!(
+            replay_status,
+            StatusCode::OK,
+            "refusal history: {}",
+            json!({
+                "first_response":first_text,"first_provider_requests":first_capture,
+                "replay_status":replay_status.as_u16(),"replay_response":replay_text,
+                "replay_provider_requests":replay_capture
+            })
+        );
+        assert_eq!(replay_capture.len(), 1);
+        assert_eq!(replay_capture[0]["messages"][1], returned);
+        let canonical = serde_json::from_value::<fte_protocols::OpenAiChatRequest>(history.clone())
+            .expect("strict public Chat history")
+            .into_gateway(fte_protocols::EdgeDefaults::default())
+            .expect("typed refusal history");
+        assert_eq!(
+            serde_json::to_value(&canonical.input).expect("canonical history")["items"][1],
+            json!({
+                "type":"message","id":null,"role":"assistant",
+                "content":[{"type":"refusal","text":refusal}]
+            })
+        );
+        for (protocol, code) in [
+            ("responses", "responses_refusal_history_unsupported"),
+            ("anthropic", "refusal_history_unsupported"),
+            ("gemini", "refusal_history_unsupported"),
+        ] {
+            let (status, text, captured) = hosted_exchange_captured(
+                protocol,
+                "application/json",
+                b"{}".to_vec(),
+                "/v1/chat/completions",
+                history.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{protocol}: {text}");
+            let error: Value = serde_json::from_str(&text).expect("typed unsupported history");
+            assert_eq!(error["error"]["code"], code);
+            assert!(
+                captured.is_empty(),
+                "unsupported history dispatched: {captured:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_refusal_history_preserves_ordinary_controls_and_refuses_unsupported_shapes() {
+    let answer = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#.to_vec();
+    let tool = json!({"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"term\":\"日本語\"}"}});
+    for message in [
+        json!({"role":"assistant","content":"ordinary","refusal":null}),
+        json!({"role":"assistant","content":null}),
+        json!({"role":"assistant","content":null,"tool_calls":[tool.clone()]}),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            answer.clone(),
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[message.clone()]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ordinary history: {message}: {text}"
+        );
+        assert_eq!(captured.len(), 1);
+        if message.get("tool_calls").is_some() {
+            assert_eq!(
+                captured[0]["messages"][0]["tool_calls"],
+                json!([tool.clone()])
+            );
+        } else if message["content"].is_null() {
+            assert_eq!(captured[0]["messages"][0]["content"], json!([]));
+        } else {
+            assert_eq!(
+                captured[0]["messages"][0]["content"],
+                json!([{"type":"text","text":"ordinary"}])
+            );
+        }
+        assert!(captured[0]["messages"][0].get("refusal").is_none());
+    }
+    for (message, expected) in [
+        (
+            json!({"role":"user","content":null,"refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"tool","tool_call_id":"call_1","content":null,"refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":"ordinary","refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","tool_calls":[tool]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"no"}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"one"},{"type":"refusal","refusal":"two"}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":7}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","unsupported":true}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","encrypted_content":"must not vanish"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            answer.clone(),
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[message.clone()]}),
+        )
+        .await;
+        assert_eq!(status, expected, "unsupported history: {message}: {text}");
+        assert!(captured.is_empty());
+    }
+    let prompt = "\n  raw tail\t";
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        br#"{"choices":[{"index":0,"text":" continuation\n","finish_reason":"stop"}]}"#.to_vec(),
+        "/v1/completions",
+        json!({"model":"fixture-model","prompt":prompt}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(captured[0]["prompt"], prompt);
+    let completion: Value = serde_json::from_str(&text).expect("raw completion");
+    assert_eq!(completion["choices"][0]["text"], " continuation\n");
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat", "application/json", answer, "/v1/completions",
+        json!({"model":"fixture-model","prompt":prompt,"messages":[{"role":"assistant","refusal":"no"}]}),
+    ).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+    assert!(captured.is_empty());
+}

@@ -373,11 +373,15 @@ async function refreshLogs() {
 }
 
 async function loadProfile() {
-  const profile = await invoke('get_master_profile');
-  for (const [elementId, field] of Object.entries(PROFILE_FIELDS)) {
-    document.getElementById(elementId).value = profile[field] || '';
+  try {
+    const profile = await invoke('get_master_profile');
+    for (const [elementId, field] of Object.entries(PROFILE_FIELDS)) {
+      const input = document.getElementById(elementId);
+      if (!input.dataset.profileEdited) input.value = profile[field] || '';
+    }
+  } catch (error) {
+    showToast(`Could not load profile: ${errorMessage(error)}`, 'error');
   }
-  return profile;
 }
 
 async function saveProfileInput(input) {
@@ -422,7 +426,7 @@ async function openProviderConsole(providerId) {
   }
 }
 
-function providerCard(provider, profile) {
+function providerCard(provider) {
   const requiresCredential = provider.credential_required !== false;
   const isLocal = provider.backend_kind === 'local_embedded' || provider.backend_kind === 'local_service';
   const details = PROVIDER_DETAILS[provider.id] || {
@@ -432,14 +436,12 @@ function providerCard(provider, profile) {
   };
   const card = document.createElement('article');
   card.className = 'card provider-card';
+  card.dataset.providerId = provider.id;
 
   const heading = document.createElement('div');
   heading.className = 'provider-card-heading';
   const name = document.createElement('h2');
-  name.textContent = provider.name;
   const badge = document.createElement('span');
-  badge.className = `badge ${provider.status === 'ready' ? 'badge-free' : 'badge-muted'}`;
-  badge.textContent = statusLabel(provider.status);
   heading.append(name, badge);
 
   const description = document.createElement('p');
@@ -450,27 +452,47 @@ function providerCard(provider, profile) {
   providerMeta.className = 'provider-meta';
   const modelCount = document.createElement('span');
   modelCount.className = 'provider-meta-item';
-  modelCount.textContent = `${formatNumber(provider.model_count)} model${provider.model_count === 1 ? '' : 's'}`;
   providerMeta.append(modelCount);
-  if (provider.text_completion_model_count) {
-    const completionCount = document.createElement('span');
-    completionCount.className = 'provider-meta-item';
-    completionCount.textContent = `${formatNumber(provider.text_completion_model_count)} raw completion${provider.text_completion_model_count === 1 ? '' : 's'}`;
-    providerMeta.append(completionCount);
-  }
+  const completionCount = document.createElement('span');
+  completionCount.className = 'provider-meta-item';
+  providerMeta.append(completionCount);
 
+  let labelText, keyInput, saveButton, removeButton, keyLabel, actionRow;
+  card.updateProvider = (next) => {
+    if (!keyInput && next.credential_required !== false) return false;
+    provider = next;
+    name.textContent = provider.name;
+    badge.className = `badge ${provider.status === 'ready' ? 'badge-free' : 'badge-muted'}`;
+    badge.textContent = statusLabel(provider.status);
+    modelCount.textContent = `${formatNumber(provider.model_count)} model${provider.model_count === 1 ? '' : 's'}`;
+    completionCount.hidden = !provider.text_completion_model_count;
+    completionCount.textContent = `${formatNumber(provider.text_completion_model_count)} raw completion${provider.text_completion_model_count === 1 ? '' : 's'}`;
+    if (keyInput) {
+      keyLabel.hidden = actionRow.hidden = helperRow.hidden = provider.credential_required === false;
+      if (consoleButton) consoleButton.hidden = keyLabel.hidden;
+      labelText.textContent = provider.configured ? 'Replace saved API key' : 'API key';
+      keyInput.placeholder = provider.configured ? 'Enter a replacement key' : 'Paste API key';
+      saveButton.textContent = provider.configured ? 'Update key' : 'Save key';
+      removeButton.hidden = !provider.configured;
+    }
+    return true;
+  };
   card.append(heading, description, providerMeta);
-  if (!requiresCredential) return card;
+  if (!requiresCredential) {
+    card.updateProvider(provider);
+    return card;
+  }
 
   const helperRow = document.createElement('div');
   helperRow.className = 'helper-row';
-  for (const [label, value] of [['Email', profile.email], ['Name', profile.name]]) {
-    if (!value) continue;
+  for (const [label, inputId] of [['Email', 'profile-email'], ['Name', 'profile-name']]) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn-helper';
-    button.textContent = `Copy ${label.toLowerCase()}`;
-    button.addEventListener('click', () => copyText(value || '', label, button));
+    button.textContent = `⧉ ${label}`;
+    button.title = `Copy current ${label.toLowerCase()}`;
+    button.setAttribute('aria-label', button.title);
+    button.addEventListener('click', () => copyText(document.getElementById(inputId).value, label, button));
     helperRow.append(button);
   }
 
@@ -482,26 +504,24 @@ function providerCard(provider, profile) {
     consoleButton.addEventListener('click', () => openProviderConsole(provider.id));
   }
 
-  const keyLabel = document.createElement('label');
+  keyLabel = document.createElement('label');
   keyLabel.className = 'key-label';
-  const labelText = document.createElement('span');
-  labelText.textContent = provider.configured ? 'Replace saved API key' : 'API key';
-  const keyInput = document.createElement('input');
+  labelText = document.createElement('span');
+  keyInput = document.createElement('input');
   keyInput.type = 'password';
   keyInput.className = 'input-field';
   keyInput.autocomplete = 'off';
-  keyInput.placeholder = provider.configured ? 'Enter a replacement key' : 'Paste API key';
   keyInput.maxLength = 16384;
   keyLabel.append(labelText, keyInput);
 
-  const actionRow = document.createElement('div');
+  actionRow = document.createElement('div');
   actionRow.className = 'provider-actions';
-  const saveButton = document.createElement('button');
+  saveButton = document.createElement('button');
   saveButton.type = 'button';
   saveButton.className = 'btn-primary';
-  saveButton.textContent = provider.configured ? 'Update key' : 'Save key';
   saveButton.addEventListener('click', async () => {
-    const keyValue = keyInput.value.trim();
+    const draft = keyInput.value;
+    const keyValue = draft.trim();
     if (!keyValue) {
       showToast('Enter an API key first.', 'error');
       keyInput.focus();
@@ -510,7 +530,7 @@ function providerCard(provider, profile) {
     saveButton.disabled = true;
     try {
       await invoke('save_key', { providerId: provider.id, keyValue });
-      keyInput.value = '';
+      if (keyInput.value === draft) keyInput.value = '';
       showToast(`${provider.name} key saved locally.`);
       await Promise.all([renderProviderGrid(), refreshDashboard()]);
     } catch (error) {
@@ -521,57 +541,59 @@ function providerCard(provider, profile) {
   });
   actionRow.append(saveButton);
 
-  if (provider.configured) {
-    const removeButton = document.createElement('button');
-    removeButton.type = 'button';
-    removeButton.className = 'btn-danger';
-    removeButton.textContent = 'Remove';
-    removeButton.addEventListener('click', async () => {
-      if (!window.confirm(`Remove the saved ${provider.name} API key from this device?`)) {
-        return;
-      }
-      removeButton.disabled = true;
-      try {
-        await invoke('delete_key', { providerId: provider.id });
-        showToast(`${provider.name} key removed.`);
-        await Promise.all([renderProviderGrid(), refreshDashboard()]);
-      } catch (error) {
-        showToast(`Could not remove key: ${errorMessage(error)}`, 'error');
-      } finally {
-        removeButton.disabled = false;
-      }
-    });
-    actionRow.append(removeButton);
-  }
+  removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn-danger';
+  removeButton.textContent = 'Remove';
+  removeButton.addEventListener('click', async () => {
+    if (!window.confirm(`Remove the saved ${provider.name} API key from this device?`)) {
+      return;
+    }
+    removeButton.disabled = true;
+    try {
+      await invoke('delete_key', { providerId: provider.id });
+      showToast(`${provider.name} key removed.`);
+      await Promise.all([renderProviderGrid(), refreshDashboard()]);
+    } catch (error) {
+      showToast(`Could not remove key: ${errorMessage(error)}`, 'error');
+    } finally {
+      removeButton.disabled = false;
+    }
+  });
+  actionRow.append(removeButton);
 
   if (helperRow.childElementCount > 0) card.append(helperRow);
   if (consoleButton) card.append(consoleButton);
   card.append(keyLabel, actionRow);
+  card.updateProvider(provider);
   return card;
 }
 
 async function renderProviderGrid() {
   const grid = document.getElementById('onboarding-grid');
-  grid.replaceChildren(
-    makeEmptyState('Loading providers', 'Reading the local model catalog and saved configuration.'),
-  );
+  const refresh = Symbol();
+  grid.providerRefresh = refresh;
   try {
-    const [profile, providers] = await Promise.all([
-      loadProfile(),
-      invoke('get_providers'),
-    ]);
-    grid.replaceChildren();
-    if (providers.length === 0) {
-      grid.append(makeEmptyState('No providers registered', 'The local gateway did not report any provider adapters.'));
-      return;
-    }
+    const providers = await invoke('get_providers');
+    if (grid.providerRefresh !== refresh) return;
+    const cards = new Map([...grid.children]
+      .filter((card) => card.dataset.providerId)
+      .map((card) => [card.dataset.providerId, card]));
+    if (cards.size === 0) grid.replaceChildren();
     for (const provider of providers) {
-      grid.append(providerCard(provider, profile));
+      const card = cards.get(provider.id);
+      if (!card || !card.updateProvider(provider)) {
+        card?.remove();
+        grid.append(providerCard(provider));
+      }
+      cards.delete(provider.id);
+    }
+    for (const card of cards.values()) card.remove();
+    if (providers.length === 0) {
+      grid.replaceChildren(makeEmptyState('No providers registered', 'The local gateway did not report any provider adapters.'));
     }
   } catch (error) {
-    grid.replaceChildren(
-      makeEmptyState('Could not load providers', errorMessage(error), 'error-copy'),
-    );
+    showToast(`Could not load providers: ${errorMessage(error)}`, 'error');
   }
 }
 
@@ -674,7 +696,7 @@ async function sendMessage() {
           stream: false,
       });
       const responseMessage = response.choices?.[0]?.message;
-      const content = contentToText(responseMessage?.content);
+      const content = contentToText(responseMessage?.content ?? responseMessage?.refusal);
       chatMessages.push(responseMessage || { role: 'assistant', content });
       appendMessage('assistant', content);
     }
@@ -859,7 +881,7 @@ function showView(viewName) {
   setText('workspace-context', activeItem?.dataset.label || 'Workspace');
   if (!isDesktopRuntime) return;
   if (viewName === 'dashboard') refreshDashboard();
-  if (viewName === 'setup') Promise.all([renderProviderGrid(), refreshLocalModelStatus()]);
+  if (viewName === 'setup') Promise.all([renderProviderGrid(), refreshLocalModelStatus(), loadProfile()]);
   if (viewName === 'logs') refreshLogs();
   if (viewName === 'settings') refreshProxyStatus();
 }
@@ -870,7 +892,11 @@ function bindEvents() {
   }
   for (const inputId of Object.keys(PROFILE_FIELDS)) {
     const input = document.getElementById(inputId);
-    input.addEventListener('change', () => saveProfileInput(input));
+    input.addEventListener('input', () => { input.dataset.profileEdited = 'true'; });
+    input.addEventListener('change', () => {
+      input.dataset.profileEdited = 'true';
+      return saveProfileInput(input);
+    });
   }
   document.getElementById('refresh-dashboard').addEventListener('click', refreshDashboard);
   document.getElementById('refresh-logs').addEventListener('click', refreshLogs);

@@ -246,6 +246,7 @@ impl OpenAiChatRequest {
 pub struct OpenAiMessage {
     pub role: String,
     pub content: Option<OpenAiContent>,
+    pub refusal: Option<String>,
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<OpenAiToolCall>>,
@@ -266,6 +267,25 @@ impl OpenAiMessage {
                 "chat_tool_message_ambiguous",
                 "a Chat Completions message cannot be both a tool result and an assistant tool call",
             ));
+        }
+        if let Some(text) = self.refusal {
+            reject_if(
+                &request_id,
+                self.role != "assistant",
+                "chat_refusal_role_invalid",
+                "refusal is valid only on an assistant-role message",
+            )?;
+            reject_if(
+                &request_id,
+                self.content.is_some() || self.tool_calls.is_some() || self.tool_call_id.is_some(),
+                "chat_refusal_history_shape_unsupported",
+                "refusal history cannot be combined with content or tool fields",
+            )?;
+            return Ok(vec![InputItem::Message {
+                id: None,
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Refusal { text }],
+            }]);
         }
         if let Some(call_id) = self.tool_call_id {
             reject_if(
@@ -1603,6 +1623,7 @@ fn openai_output_item(item: &OutputItem) -> Value {
             "role": match role { MessageRole::Assistant => "assistant", _ => "assistant" },
             "content": content.iter().filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(json!({"type":"output_text","text":text,"annotations":[]})),
+                ContentBlock::Refusal { text } => Some(json!({"type":"refusal","refusal":text})),
                 _ => None,
             }).collect::<Vec<_>>()
         }),
@@ -1637,6 +1658,7 @@ fn openai_output_content_part(part: &ContentBlock) -> Option<Value> {
         ContentBlock::Text { text } => {
             Some(json!({"type":"output_text","text":text,"annotations":[]}))
         }
+        ContentBlock::Refusal { text } => Some(json!({"type":"refusal","refusal":text})),
         ContentBlock::Thinking { text, signature } => {
             Some(json!({"type":"reasoning_text","text":text,"signature":signature}))
         }
@@ -1831,6 +1853,11 @@ fn output_groups(response: &GatewayResponse, completion: bool) -> Vec<OutputGrou
             .any(|item| matches!(item, OutputItem::FunctionCall { .. }))
         {
             FinishReason::ToolCalls
+        } else if response.output.iter().any(|item| {
+            matches!(item, OutputItem::Message { content, .. }
+                if content.iter().any(|block| matches!(block, ContentBlock::Refusal { .. })))
+        }) {
+            FinishReason::Refusal
         } else {
             FinishReason::Stop
         },
@@ -1914,6 +1941,14 @@ fn anthropic_stop(response: &GatewayResponse) -> (&'static str, Option<&str>) {
             .any(|item| matches!(item, OutputItem::FunctionCall { .. })) =>
         {
             ("tool_use", None)
+        }
+        _ if response.output_groups.is_empty()
+            && response.output.iter().any(|item| {
+                matches!(item, OutputItem::Message { content, .. }
+                if content.iter().any(|block| matches!(block, ContentBlock::Refusal { .. })))
+            }) =>
+        {
+            ("refusal", None)
         }
         _ => ("end_turn", None),
     }
@@ -2445,7 +2480,9 @@ fn anthropic_reasoning_part(summary: &[String], opaque: Option<&Value>) -> Conte
 
 fn anthropic_content_block_json(part: &ContentBlock) -> Option<Value> {
     match part {
-        ContentBlock::Text { text } => Some(json!({"type":"text","text":text})),
+        ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
+            Some(json!({"type":"text","text":text}))
+        }
         ContentBlock::Thinking { text, signature } => {
             Some(json!({"type":"thinking","thinking":text,"signature":signature}))
         }
@@ -2460,7 +2497,9 @@ fn anthropic_content_block_json(part: &ContentBlock) -> Option<Value> {
 
 fn anthropic_content_block_start(part: &ContentBlock) -> Option<Value> {
     match part {
-        ContentBlock::Text { .. } => Some(json!({"type":"text","text":""})),
+        ContentBlock::Text { .. } | ContentBlock::Refusal { .. } => {
+            Some(json!({"type":"text","text":""}))
+        }
         ContentBlock::Thinking { .. } => Some(json!({"type":"thinking","thinking":""})),
         ContentBlock::RedactedThinking { data } => {
             Some(json!({"type":"redacted_thinking","data":data}))
@@ -2476,7 +2515,7 @@ fn output_item_text(item: &OutputItem) -> String {
         OutputItem::Message { content, .. } => content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect(),
@@ -3529,5 +3568,92 @@ mod tests {
                 .is_none(),
             "a response stream may emit exactly one terminal event"
         );
+    }
+
+    #[test]
+    fn public_refusal_history_keeps_typed_serde_and_canonical_admission() {
+        for text in ["", "Cannot comply 日本語🔒.\nKeep this exact."] {
+            let request = serde_json::from_value::<OpenAiChatRequest>(json!({
+                "model":"auto","messages":[{"role":"assistant","content":null,"refusal":text}]
+            }))
+            .expect("public refusal input")
+            .into_gateway(EdgeDefaults::default())
+            .expect("canonical refusal");
+            request.validate().expect("sole assistant refusal");
+            let value = serde_json::to_value(&request).expect("canonical current shape");
+            assert_eq!(
+                value["input"]["items"][0]["content"],
+                json!([{"type":"refusal","text":text}])
+            );
+            let reopened: GatewayRequest =
+                serde_json::from_value(value.clone()).expect("current canonical serde");
+            assert_eq!(request, reopened);
+            let GenerationInput::Chat { items } = &request.input else {
+                panic!("Chat input");
+            };
+            let InputItem::Message { content, .. } = &items[0] else {
+                panic!("assistant message");
+            };
+            let response = GatewayResponse {
+                id: "fixture-refusal".into(),
+                provider_response_id: None,
+                request_id: request.request_id.clone(),
+                model: "fixture-model".into(),
+                route: ResolvedRoute {
+                    backend_id: "fixture".into(),
+                    model_id: "fixture-model".into(),
+                    display_name: "Fixture".into(),
+                    location: BackendLocation::Hosted,
+                    catalog_version: "fixture".into(),
+                },
+                output: vec![OutputItem::Message {
+                    id: "msg_refusal".into(),
+                    role: MessageRole::Assistant,
+                    content: content.clone(),
+                }],
+                output_groups: Vec::new(),
+                usage: GatewayUsage::default(),
+                status: TerminalStatus::Completed,
+                previous_response_id: None,
+            };
+            assert_eq!(
+                openai_chat_json(&response)["choices"][0]["message"],
+                json!({"role":"assistant","content":null,"refusal":text})
+            );
+            assert_eq!(
+                openai_responses_json(&response)["output"][0]["content"],
+                json!([{"type":"refusal","refusal":text}])
+            );
+            let anthropic = anthropic_message_json(&response);
+            assert_eq!(anthropic["stop_reason"], "refusal");
+            assert_eq!(anthropic["content"], json!([{"type":"text","text":text}]));
+            let event = GatewayEvent::ContentPartCompleted {
+                request_id: request.request_id.clone(),
+                output_index: 0,
+                content_index: 0,
+                part: content[0].clone(),
+            };
+            let (_, data) =
+                openai_response_event(&event).expect("documented Responses refusal part");
+            assert_eq!(data["part"], json!({"type":"refusal","refusal":text}));
+            for item in [
+                json!({"type":"message","id":null,"role":"user","content":[{"type":"refusal","text":text}]}),
+                json!({"type":"message","id":null,"role":"assistant","content":[{"type":"refusal","text":text},{"type":"text","text":"mixed"}]}),
+                json!({"type":"message","id":null,"role":"assistant","content":[{"type":"refusal","text":text},{"type":"refusal","text":text}]}),
+                json!({"type":"function_result","id":null,"call_id":"call_1","output":[{"type":"refusal","text":text}],"is_error":false}),
+            ] {
+                let mut invalid = value.clone();
+                invalid["input"]["items"] = json!([item]);
+                let invalid: GatewayRequest =
+                    serde_json::from_value(invalid).expect("typed invalid role/shape");
+                assert_eq!(
+                    invalid
+                        .validate()
+                        .expect_err("unsupported canonical refusal")
+                        .code,
+                    "refusal_history_shape_unsupported"
+                );
+            }
+        }
     }
 }
