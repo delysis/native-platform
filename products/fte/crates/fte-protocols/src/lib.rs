@@ -702,8 +702,7 @@ impl OpenAiResponseInputItem {
             } => Ok(InputItem::Reasoning {
                 id,
                 summary: summary.into_iter().map(|value| value.text).collect(),
-                opaque_continuation: encrypted_content
-                    .map(|content| json!({"encrypted_content": content})),
+                opaque_continuation: encrypted_content.map(Value::String),
             }),
         }
     }
@@ -2118,7 +2117,7 @@ fn openai_usage(usage: &GatewayUsage) -> Value {
     json!({
         "input_tokens":input,
         "output_tokens":output,
-        "total_tokens":input + output,
+        "total_tokens":input.checked_add(output),
         "input_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2135,7 +2134,7 @@ fn openai_legacy_usage(usage: &GatewayUsage) -> Value {
     json!({
         "prompt_tokens":prompt,
         "completion_tokens":completion,
-        "total_tokens":prompt + completion,
+        "total_tokens":prompt.checked_add(completion),
         "prompt_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2159,6 +2158,59 @@ fn anthropic_usage(usage: &GatewayUsage) -> Value {
 mod tests {
     use super::*;
     use fte_types::{BackendLocation, ResolvedRoute};
+
+    #[test]
+    fn public_usage_totals_are_unavailable_on_overflow_without_losing_counters() {
+        for (input, output, total) in [
+            (0, 0, Some(0)),
+            (u64::MAX, 0, Some(u64::MAX)),
+            (u64::MAX - 1, 1, Some(u64::MAX)),
+            (u64::MAX, 1, None),
+        ] {
+            let usage = GatewayUsage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                provenance: UsageProvenance::Exact,
+                ..GatewayUsage::default()
+            };
+            for (body, input_key, output_key) in [
+                (openai_usage(&usage), "input_tokens", "output_tokens"),
+                (
+                    openai_legacy_usage(&usage),
+                    "prompt_tokens",
+                    "completion_tokens",
+                ),
+            ] {
+                assert_eq!(body[input_key], input);
+                assert_eq!(body[output_key], output);
+                assert_eq!(body["total_tokens"], json!(total));
+                assert_eq!(body["x_usage_provenance"], "exact");
+            }
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_replay_preserves_the_opaque_string() {
+        for encrypted in ["", "opaque_日本語🔒"] {
+            let request: OpenAiResponsesRequest = serde_json::from_value(json!({
+                "model":"auto",
+                "input":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}],
+                "store":false
+            }))
+            .expect("decode reasoning replay");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("canonical reasoning replay");
+            let GenerationInput::Chat { items } = request.input else {
+                panic!("reasoning must remain typed Items");
+            };
+            assert!(matches!(
+                &items[0],
+                InputItem::Reasoning { opaque_continuation: Some(Value::String(value)), .. }
+                    if value == encrypted
+            ));
+        }
+    }
 
     #[test]
     fn openai_surfaces_use_their_protocol_specific_usage_keys() {

@@ -19,6 +19,18 @@ async fn hosted_exchange(
     path: &str,
     body: Value,
 ) -> (StatusCode, String) {
+    let (status, text, _) =
+        hosted_exchange_captured(protocol, content_type, bytes, path, body).await;
+    (status, text)
+}
+
+async fn hosted_exchange_captured(
+    protocol: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    path: &str,
+    body: Value,
+) -> (StatusCode, String, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("provider listener");
@@ -27,20 +39,28 @@ async fn hosted_exchange(
         listener.local_addr().expect("hosted conformance fixture")
     );
     let content_type = content_type.to_owned();
-    let provider = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-        let bytes = bytes.clone();
-        let content_type = content_type.clone();
-        async move {
-            if uri.path().ends_with(":countTokens") {
-                (
-                    [(header::CONTENT_TYPE, "application/json".to_string())],
-                    br#"{"totalTokens":4}"#.to_vec(),
-                )
-            } else {
-                ([(header::CONTENT_TYPE, content_type)], bytes)
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_for_provider = Arc::clone(&captured);
+    let provider =
+        axum::Router::new().fallback(move |uri: axum::http::Uri, Json(body): Json<Value>| {
+            let bytes = bytes.clone();
+            let content_type = content_type.clone();
+            let captured = Arc::clone(&captured_for_provider);
+            async move {
+                captured
+                    .lock()
+                    .expect("captured provider requests")
+                    .push(body);
+                if uri.path().ends_with(":countTokens") {
+                    (
+                        [(header::CONTENT_TYPE, "application/json".to_string())],
+                        br#"{"totalTokens":4}"#.to_vec(),
+                    )
+                } else {
+                    ([(header::CONTENT_TYPE, content_type)], bytes)
+                }
             }
-        }
-    });
+        });
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         axum::serve(listener, provider)
@@ -103,7 +123,8 @@ async fn hosted_exchange(
         .expect("hosted conformance fixture");
     stop.send(()).expect("hosted conformance fixture");
     server.await.expect("hosted conformance fixture");
-    (status, text)
+    let captured = captured.lock().expect("captured provider requests").clone();
+    (status, text, captured)
 }
 
 fn chat_request(stream: bool) -> Value {
@@ -117,6 +138,59 @@ fn sse(values: &[Value]) -> Vec<u8> {
         .collect::<String>();
     text.push_str("data: [DONE]\n\n");
     text.into_bytes()
+}
+
+#[tokio::test]
+async fn hosted_usage_overflow_has_an_unavailable_public_total() {
+    let provider = json!({"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":u64::MAX,"completion_tokens":1}});
+    for stream in [false, true] {
+        let (status, text) = hosted_exchange(
+            "chat",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/chat/completions",
+            chat_request(stream),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        if stream {
+            // The stream's terminal usage projection uses the same checked total.
+            let usage = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|value| value.get("usage").cloned())
+                .expect("terminal usage frame");
+            assert_eq!(usage["prompt_tokens"], u64::MAX);
+            assert_eq!(usage["completion_tokens"], 1);
+            assert_eq!(usage["total_tokens"], Value::Null);
+        } else {
+            let value: Value = serde_json::from_str(&text).expect("public JSON response");
+            assert_eq!(value["usage"]["prompt_tokens"], u64::MAX);
+            assert_eq!(value["usage"]["completion_tokens"], 1);
+            assert_eq!(value["usage"]["total_tokens"], Value::Null);
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_responses_reasoning_replay_keeps_the_wire_string() {
+    for encrypted in ["", "opaque_日本語🔒"] {
+        let provider = json!({"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}]});
+        let (status, text, captured) = hosted_exchange_captured(
+            "responses",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/responses",
+            json!({"model":"fixture-model","input":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}],"store":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["input"][0]["encrypted_content"], encrypted);
+        let value: Value = serde_json::from_str(&text).expect("public reasoning response");
+        assert_eq!(value["output"][0]["encrypted_content"], encrypted);
+    }
 }
 
 #[tokio::test]
