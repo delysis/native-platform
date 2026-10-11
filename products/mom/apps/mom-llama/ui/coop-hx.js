@@ -924,6 +924,7 @@
   const setModalVisibility = (id, visible) => {
     const modal = document.getElementById(id);
     if (!modal) return;
+    if (id === "attachment-library-modal" && !visible) clearAttachmentLibraryPreview(modal);
     modal.hidden = !visible;
     modal.classList.toggle("is-hidden", !visible);
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
@@ -934,7 +935,10 @@
     if (element) element.textContent = value == null ? "" : String(value);
   };
 
+  let attachmentLibraryPreviewEpoch = null;
+
   const clearAttachmentLibraryPreview = (modal) => {
+    attachmentLibraryPreviewEpoch = {};
     delete modal.dataset.previewId;
     delete modal.dataset.impactSha256;
     modal.querySelector('[data-action="attachment-library-commit"]')?.setAttribute("disabled", "");
@@ -968,6 +972,8 @@
     if (!document.getElementById("attachment-library-rights")?.checked) {
       throw new Error("Confirm private local-use rights before reviewing this publish.");
     }
+    clearAttachmentLibraryPreview(modal);
+    const epoch = attachmentLibraryPreviewEpoch;
     const preview = await invoke("mom_llama_attachment_library_preview", {
       anchor: {
         attachment_id: modal.dataset.attachment || "",
@@ -978,6 +984,10 @@
       title: document.getElementById("attachment-library-item-title")?.value || "Attachment text",
       confirmedPrivateUse: true,
     });
+    if (epoch !== attachmentLibraryPreviewEpoch
+      || document.getElementById("attachment-library-modal") !== modal
+      || modal.hidden
+      || !document.getElementById("attachment-library-rights")?.checked) return;
     modal.dataset.previewId = preview.preview_id;
     modal.dataset.impactSha256 = preview.impact_sha256;
     setText("attachment-library-root", preview.root_sha256);
@@ -1005,12 +1015,16 @@
     if (!modal?.dataset.previewId || !modal.dataset.impactSha256) {
       throw new Error("Review the exact attachment library item before publishing it.");
     }
+    const epoch = attachmentLibraryPreviewEpoch;
     const result = await invoke("mom_llama_attachment_library_commit", {
       previewId: modal.dataset.previewId,
       impactSha256: modal.dataset.impactSha256,
     });
     report(result);
-    setModalVisibility("attachment-library-modal", false);
+    if (epoch === attachmentLibraryPreviewEpoch
+      && document.getElementById("attachment-library-modal") === modal) {
+      setModalVisibility("attachment-library-modal", false);
+    }
     await refreshManagedAttachments();
   };
 
@@ -3542,6 +3556,11 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.matches("#attachment-library-item-title, #attachment-library-rights")) {
+      const modal = document.getElementById("attachment-library-modal");
+      if (modal) clearAttachmentLibraryPreview(modal);
+      return;
+    }
     if (event.target.matches("[data-model-search]")) {
       const query = event.target.value.trim().toLocaleLowerCase();
       event.target.closest(".model-picker-popover")
