@@ -94,7 +94,7 @@ Continuous typing is durable without manufacturing a semantic revision on every 
 
 ## Projection and human-edit provenance
 
-- Prose canonicalizes CRLF and bare CR to LF.
+- Current visible-source projection preserves authored prose bytes, including LF, CRLF and bare CR. Native save captures and source-bound identities use those exact bytes. Explicit line-ending normalization is a separate undoable editor command. The Tauri visual editor applies its own canonical-roundtrip admission policy.
 - Verse preserves exact UTF-8 bytes, including line endings, trailing spaces, empty stanzas, and combining marks.
 - Hybrid projection concatenates explicit prose/verse blocks and emits exact byte-range metadata. Full persistence of hybrid block metadata remains an additive follow-up.
 - Revision slices use UTF-8 byte ranges and may not split a code point.
