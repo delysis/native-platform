@@ -634,7 +634,15 @@ test("the only platform-limited tests match their source cfg gates", () => {
       "peer_compute::tests::real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence",
       ["linux", "macos"],
     ],
+    [
+      "peer_compute::batch::native_qualification::independent_peers_share_native_decode",
+      ["linux", "macos"],
+    ],
   ]);
+  assert.match(
+    fs.readFileSync(path.join(root, "products/loom/crates/tauri-plugin-loom/src/peer_compute_batch.rs"), "utf8"),
+    /#\[cfg\(all\(test, unix\)\)\][\s\S]*?mod native_qualification;/,
+  );
 });
 
 test("Cargo test-harness parsing preserves exact full test IDs", () => {
