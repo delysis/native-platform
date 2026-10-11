@@ -12,7 +12,7 @@
 
 use information_native_retrieval::{
     BackendDescriptor, BackendHealth, BackendHealthStatus, BackendReadResult, BackendSearchResult,
-    LookupRequest, ReadRequest, ResourceBackend,
+    LookupRequest, ReadRequest, ResourceBackend, strip_backend_sql_profile_whitespace,
 };
 use information_native_types::{
     ErrorClass, EvidenceHit, EvidenceLocator, EvidenceScore, ExternalAccessMode,
@@ -1385,7 +1385,7 @@ fn validate_encyclopedia_schema(connection: &Connection) -> Result<(), Informati
                 "articles_fts is missing from the encyclopedia profile",
             )
         })?;
-    let normalized = strip_ascii_whitespace(&fts_sql).to_ascii_lowercase();
+    let normalized = strip_backend_sql_profile_whitespace(&fts_sql).to_ascii_lowercase();
     let expected = "createvirtualtablearticles_ftsusingfts5(title,plain_text,content='articles',content_rowid='id')";
     if normalized != expected {
         return Err(integrity_error(
@@ -1486,31 +1486,6 @@ fn require_table_shape(
         ));
     }
     Ok(())
-}
-
-fn strip_ascii_whitespace(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    let mut quoted = None;
-    while let Some(character) = characters.next() {
-        if let Some(delimiter) = quoted {
-            normalized.push(character);
-            if character == delimiter {
-                if characters.peek() == Some(&delimiter) {
-                    normalized.push(delimiter);
-                    let _ = characters.next();
-                } else {
-                    quoted = None;
-                }
-            }
-        } else if matches!(character, '\'' | '"' | '`') {
-            quoted = Some(character);
-            normalized.push(character);
-        } else if !character.is_ascii_whitespace() {
-            normalized.push(character);
-        }
-    }
-    normalized
 }
 
 fn validate_query_for_backend(
@@ -2944,42 +2919,6 @@ mod tests {
         assert_eq!(FileIdentity::observe(&path)?, identity_before);
         assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
         Ok(())
-    }
-
-    #[test]
-    fn fts_normalization_preserves_quoted_whitespace_and_doubled_quotes() {
-        for (input, expected) in [
-            (
-                " content = 'art icles' , content_rowid = 'id' ",
-                "content='art icles',content_rowid='id'",
-            ),
-            (
-                " content = 'art'' icles' , content_rowid = 'id' ",
-                "content='art'' icles',content_rowid='id'",
-            ),
-            (
-                " content = \"art\"\" icles\" , content_rowid = 'id' ",
-                "content=\"art\"\" icles\",content_rowid='id'",
-            ),
-            (
-                " content = `art`` icles` , content_rowid = 'id' ",
-                "content=`art`` icles`,content_rowid='id'",
-            ),
-            (
-                " content = '' , content_rowid = 'id' ",
-                "content='',content_rowid='id'",
-            ),
-            (
-                " content = 'articles' , content_rowid = 'id' ",
-                "content='articles',content_rowid='id'",
-            ),
-        ] {
-            assert_eq!(
-                strip_ascii_whitespace(input),
-                expected,
-                "quoted SQL characters are identity: {input}"
-            );
-        }
     }
 
     #[test]

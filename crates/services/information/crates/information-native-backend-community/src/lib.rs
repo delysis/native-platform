@@ -14,7 +14,7 @@
 
 use information_native_retrieval::{
     BackendDescriptor, BackendHealth, BackendHealthStatus, BackendReadResult, BackendSearchResult,
-    LookupRequest, ReadRequest, ResourceBackend,
+    LookupRequest, ReadRequest, ResourceBackend, strip_backend_sql_profile_whitespace,
 };
 use information_native_types::{
     ErrorClass, EvidenceHit, EvidenceLocator, EvidenceScore, ExternalAccessMode,
@@ -1488,8 +1488,8 @@ fn validate_schema_object(
 }
 
 fn compact_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_ascii_whitespace())
+    strip_backend_sql_profile_whitespace(sql)
+        .chars()
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -1928,7 +1928,7 @@ fn run_fts_query(
         SELECT
             m.rowid,
             m.tweet_id,
-            substr(m.note_id, 1, 512),
+            substr(m.note_id, 1, 513),
             substr(k.name, 1, 128),
             substr(sc.name, 1, 128),
             m.archive_rowid,
@@ -2233,7 +2233,7 @@ fn load_message_by_predicate(
         SELECT
             m.rowid,
             m.tweet_id,
-            substr(m.note_id, 1, 512),
+            substr(m.note_id, 1, 513),
             substr(k.name, 1, 128),
             substr(sc.name, 1, 128),
             m.archive_rowid,
@@ -2466,7 +2466,10 @@ fn aggregate_source_hashes(hashes: &[String]) -> String {
 fn validate_raw_message(raw: &RawMessage) -> Result<(), InformationError> {
     if raw.rowid <= 0
         || raw.tweet_id.is_some_and(|value| value <= 0)
-        || raw.note_id.as_ref().is_some_and(|value| value.is_empty())
+        || raw
+            .note_id
+            .as_ref()
+            .is_some_and(|value| validate_note_id(value).is_err())
         || raw.kind.trim().is_empty()
         || raw.source_collection.trim().is_empty()
         || raw.source_ordinal.is_some_and(|value| value < 0)
@@ -2817,6 +2820,278 @@ mod tests {
             max_context_chars: 4_096,
             timeout_ms: 5_000,
         }
+    }
+
+    fn fixture_with_note_id(note_id: &str) -> Result<(TempDir, PathBuf), Box<dyn Error>> {
+        let (temporary, path) = fixture()?;
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "UPDATE messages SET tweet_id = NULL, note_id = ?1, kind_id = 3,
+             source_collection_id = 3 WHERE rowid = 1",
+            [note_id],
+        )?;
+        connection.execute(
+            "UPDATE message_sources SET source_collection_id = 3 WHERE message_rowid = 1",
+            [],
+        )?;
+        drop(connection);
+        Ok((temporary, path))
+    }
+
+    #[test]
+    fn external_content_fts_accepts_formatting_and_rejects_literal_space_alias()
+    -> Result<(), Box<dyn Error>> {
+        {
+            let (_temporary, path) = fixture()?;
+            let connection = Connection::open(&path)?;
+            let formatted = EXPECTED_MESSAGES_FTS_SQL
+                .replace("CREATE VIRTUAL TABLE", "CrEaTe\tViRtUaL\nTaBlE")
+                .replace(" USING fts5(", " UsInG\tfts5(\n")
+                .replace("content=", "content = ")
+                .replace("content_rowid=", "content_rowid = ");
+            connection.execute_batch(&format!(
+                "DROP TABLE messages_fts; {formatted};
+                 INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+            ))?;
+            drop(connection);
+            let bytes_before = fs::read(&path)?;
+            let identity_before = FileIdentity::observe(&path)?;
+            let sidecars_before = SidecarSet::observe(&path)?;
+            let backend = CommunityArchiveBackend::open(config(&path)?)?;
+            let search = backend.search(&query(
+                &backend,
+                "quiet contemplation",
+                RetrievalPurpose::LocalUi,
+            ))?;
+            assert!(search.complete);
+            assert_eq!(search.hits.len(), 1);
+            let hit = &search.hits[0];
+            assert_eq!(hit.document_id.as_deref(), Some("tweet:101"));
+            assert_eq!(
+                hit.source_fingerprint,
+                Some(format!("sha256:{}", "a".repeat(64)))
+            );
+            assert_eq!(hit.use_policy.local_search, UsePermission::Allowed);
+            assert_eq!(hit.use_policy.model_context, UsePermission::Forbidden);
+            assert_eq!(hit.use_policy.excerpt_export, UsePermission::Forbidden);
+            assert_eq!(hit.use_policy.redistribution, UsePermission::Forbidden);
+            assert_eq!(
+                hit.excerpt_sha256,
+                evidence_text_sha256(&hit.snippet, &hit.context)
+            );
+            hit.validate()?;
+            let read = backend.read(&read_request(
+                &backend,
+                RetrievalPurpose::LocalUi,
+                hit.locator.clone(),
+            ))?;
+            assert_eq!(
+                read.hit.snippet,
+                "quiet contemplation and practical attention"
+            );
+            assert_eq!(read.hit.locator, hit.locator);
+            let export = backend
+                .lookup(&lookup_request(
+                    &backend,
+                    RetrievalPurpose::ExcerptExport,
+                    "rowid:1",
+                ))
+                .expect_err("formatting must not widen private export authority");
+            assert_eq!(export.class, ErrorClass::Permission);
+            assert!(!serde_json::to_string(hit)?.contains(PRIVATE_ARCHIVE_PATH));
+            drop(backend);
+            assert_eq!(fs::read(&path)?, bytes_before);
+            assert_eq!(FileIdentity::observe(&path)?, identity_before);
+            assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
+        }
+
+        let (_temporary, path) = fixture()?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            DROP TABLE messages_fts;
+            CREATE TABLE "messages_fts_co ntent" (
+                rowid INTEGER PRIMARY KEY, text TEXT, username TEXT, account_display_name TEXT
+            );
+            INSERT INTO "messages_fts_co ntent" VALUES
+                (1, 'Bindingwitness exists only in the whitespace-distinct backing table.',
+                 'example', 'Example Person');
+            "#,
+        )?;
+        let alias_sql = EXPECTED_MESSAGES_FTS_SQL.replace(
+            "content='messages_fts_content'",
+            "content='messages_fts_co ntent'",
+        );
+        connection.execute_batch(&format!(
+            "{alias_sql}; INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+        ))?;
+        drop(connection);
+        let bytes_before = fs::read(&path)?;
+        let identity_before = FileIdentity::observe(&path)?;
+        let sidecars_before = SidecarSet::observe(&path)?;
+        let outcome = match CommunityArchiveBackend::open(config(&path)?) {
+            Err(error) => Err(error),
+            Ok(backend) => {
+                let search = backend.search(&query(
+                    &backend,
+                    "bindingwitness",
+                    RetrievalPurpose::LocalUi,
+                ));
+                let lookup = backend.lookup(&lookup_request(
+                    &backend,
+                    RetrievalPurpose::LocalUi,
+                    "rowid:1",
+                ));
+                Ok(format!(
+                    "public open accepted wrong FTS binding; search={search:?}; lookup={lookup:?}"
+                ))
+            }
+        };
+        assert_eq!(fs::read(&path)?, bytes_before);
+        assert_eq!(FileIdentity::observe(&path)?, identity_before);
+        assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
+        let error = outcome
+            .expect_err("compiled profile must refuse a whitespace-distinct FTS content table");
+        assert_eq!(error.class, ErrorClass::Integrity);
+        assert_eq!(error.code, "community_profile_sql_mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn stored_note_ids_preserve_exact_public_identity_or_refuse_publication()
+    -> Result<(), Box<dyn Error>> {
+        let valid_note_id = format!("note:_-{}", "a".repeat(505));
+        assert_eq!(valid_note_id.len(), 512);
+        {
+            let (_temporary, path) = fixture_with_note_id(&valid_note_id)?;
+            let bytes_before = fs::read(&path)?;
+            let identity_before = FileIdentity::observe(&path)?;
+            let sidecars_before = SidecarSet::observe(&path)?;
+            let backend = CommunityArchiveBackend::open(config(&path)?)?;
+            let search = backend.search(&query(
+                &backend,
+                "quiet contemplation",
+                RetrievalPurpose::LocalUi,
+            ))?;
+            assert!(search.complete);
+            assert_eq!(search.hits.len(), 1);
+            let hit = &search.hits[0];
+            assert_eq!(hit.metadata.get("note_id"), Some(&json!(&valid_note_id)));
+            let upstream = format!("note:{valid_note_id}");
+            assert_eq!(hit.document_id.as_deref(), Some(upstream.as_str()));
+            assert_eq!(
+                hit.provenance.upstream_record_id.as_deref(),
+                Some(upstream.as_str())
+            );
+            assert_eq!(hit.passage_id.as_deref(), Some("message-rowid:1"));
+            assert_eq!(
+                hit.locator,
+                EvidenceLocator::Record {
+                    collection: Some("messages".to_string()),
+                    key: format!("rowid:1;note_id:{valid_note_id}"),
+                }
+            );
+            assert_eq!(
+                hit.provenance.source_inputs,
+                vec![format!("sha256:{}", "a".repeat(64))]
+            );
+            assert_eq!(hit.use_policy.model_context, UsePermission::Forbidden);
+            assert_eq!(hit.use_policy.excerpt_export, UsePermission::Forbidden);
+            assert!(!serde_json::to_string(hit)?.contains(PRIVATE_ARCHIVE_PATH));
+            hit.validate()?;
+            for key in [format!("note_id:{valid_note_id}"), "rowid:1".to_string()] {
+                let lookup =
+                    backend.lookup(&lookup_request(&backend, RetrievalPurpose::LocalUi, &key))?;
+                assert_eq!(lookup.hit.locator, hit.locator);
+                assert_eq!(
+                    lookup.hit.metadata.get("note_id"),
+                    hit.metadata.get("note_id")
+                );
+                assert_eq!(
+                    lookup.hit.snippet,
+                    "quiet contemplation and practical attention"
+                );
+            }
+            let read = backend.read(&read_request(
+                &backend,
+                RetrievalPurpose::LocalUi,
+                hit.locator.clone(),
+            ))?;
+            assert_eq!(read.hit.locator, hit.locator);
+            assert_eq!(
+                read.hit.metadata.get("note_id"),
+                hit.metadata.get("note_id")
+            );
+            assert_eq!(
+                read.hit.snippet,
+                "quiet contemplation and practical attention"
+            );
+            drop(backend);
+            assert_eq!(fs::read(&path)?, bytes_before);
+            assert_eq!(FileIdentity::observe(&path)?, identity_before);
+            assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
+        }
+
+        for invalid_note_id in [
+            format!("{valid_note_id}a"),
+            format!("{valid_note_id}b"),
+            String::new(),
+            "bad;note".to_string(),
+            "bad.note".to_string(),
+            "métadata".to_string(),
+        ] {
+            let (_temporary, path) = fixture_with_note_id(&invalid_note_id)?;
+            let bytes_before = fs::read(&path)?;
+            let identity_before = FileIdentity::observe(&path)?;
+            let sidecars_before = SidecarSet::observe(&path)?;
+            let backend = CommunityArchiveBackend::open(config(&path)?)?;
+            let input_error = backend
+                .lookup(&lookup_request(
+                    &backend,
+                    RetrievalPurpose::LocalUi,
+                    &format!("note_id:{invalid_note_id}"),
+                ))
+                .expect_err("malformed caller note IDs must retain their input refusal");
+            assert_eq!(input_error.class, ErrorClass::InvalidInput);
+            assert_eq!(input_error.code, "invalid_community_note_id");
+            let search = backend.search(&query(
+                &backend,
+                "quiet contemplation",
+                RetrievalPurpose::LocalUi,
+            ));
+            let lookup = backend.lookup(&lookup_request(
+                &backend,
+                RetrievalPurpose::LocalUi,
+                "rowid:1",
+            ));
+            let read = backend.read(&read_request(
+                &backend,
+                RetrievalPurpose::LocalUi,
+                EvidenceLocator::Record {
+                    collection: Some("messages".to_string()),
+                    key: "rowid:1".to_string(),
+                },
+            ));
+            drop(backend);
+            assert_eq!(fs::read(&path)?, bytes_before);
+            assert_eq!(FileIdentity::observe(&path)?, identity_before);
+            assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
+            assert!(
+                search.is_err(),
+                "stored note ID must not publish altered identity: bytes={}, chars={}; search={search:?}; lookup={lookup:?}; read={read:?}",
+                invalid_note_id.len(),
+                invalid_note_id.chars().count(),
+            );
+            let error = search.expect_err("malformed stored note ID search must refuse");
+            assert_eq!(error.class, ErrorClass::Integrity);
+            assert_eq!(error.code, "community_message_row_invalid");
+            for (operation, outcome) in [("lookup", lookup), ("read", read)] {
+                let error = outcome.expect_err(operation);
+                assert_eq!(error.class, ErrorClass::Integrity, "{operation}");
+                assert_eq!(error.code, "community_message_row_invalid", "{operation}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
