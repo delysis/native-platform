@@ -1825,6 +1825,11 @@ impl TryFrom<&GenerationOutput> for StrictGenerationOutputWire {
                 "strict controlled output cannot discard token replay accounting",
             ));
         }
+        if value.first_word_choice.is_some() {
+            return Err(invalid(
+                "strict controlled output cannot discard first-word choice evidence",
+            ));
+        }
         let token_observations = value
             .token_observations
             .as_ref()
@@ -3363,6 +3368,7 @@ fn output_digest(
         digest.usize(generation.metrics.cache.supplied_prefix_tokens);
         digest.usize(generation.metrics.cache.restored_prefix_tokens);
         digest.usize(generation.metrics.cache.batch_shared_prefix_tokens);
+        digest.usize(generation.metrics.cache.resident_prefix_tokens);
         digest.bool(generation.real_engine_invoked);
         digest.bool(generation.fake_fixture);
         digest.u32(generation.transport as u32);
@@ -4082,6 +4088,140 @@ mod tests {
                 "text": "hidden re-tokenization"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn controlled_receipt_binds_resident_prefix_tokens() {
+        let request = ControlledGenerationBatchRequest::new(
+            "resident-metric".to_string(),
+            vec![case("case", true)],
+            cfg_program(),
+        )
+        .expect("valid fixture request");
+        let mut generation = fixture_generation("resident-metric", "case");
+        generation.metrics.cache.resident_prefix_tokens = 1;
+        let output = ControlledGenerationBatchOutput::new(
+            request.clone(),
+            vec![
+                ControlledGenerationCaseOutput::new("case".to_string(), generation, Vec::new())
+                    .expect("valid fixture case"),
+            ],
+            backend_declaration(&request),
+        )
+        .expect("unverified fixture output");
+        assert!(output.cases()[0].generation().fake_fixture);
+        assert!(!output.cases()[0].generation().real_engine_invoked);
+        assert_eq!(
+            output.cases()[0].generation().transport,
+            NativeTransport::FakeFixture
+        );
+        assert!(output.cases()[0].generation().first_word_choice.is_none());
+        let json = serde_json::to_value(&output).expect("serialize ordinary fixture");
+        let decoded: ControlledGenerationBatchOutput =
+            serde_json::from_value(json.clone()).expect("unchanged fixture round trip");
+        assert_eq!(decoded, output);
+
+        let mut tampered = json;
+        tampered["cases"][0]["generation"]["metrics"]["cache"]["resident_prefix_tokens"] =
+            serde_json::json!(2);
+        let observed = serde_json::from_value::<ControlledGenerationBatchOutput>(tampered);
+        assert!(
+            observed.is_err(),
+            "changing resident_prefix_tokens from 1 to 2 must invalidate the original receipt: {observed:?}"
+        );
+        assert!(
+            observed
+                .expect_err("changed metric must fail")
+                .to_string()
+                .contains("controlled-generation receipt does not match")
+        );
+
+        let mut changed_generation = output.cases()[0].generation().clone();
+        changed_generation.metrics.cache.resident_prefix_tokens = 2;
+        let changed = ControlledGenerationBatchOutput::new(
+            request.clone(),
+            vec![
+                ControlledGenerationCaseOutput::new(
+                    "case".to_string(),
+                    changed_generation,
+                    Vec::new(),
+                )
+                .expect("valid changed fixture case"),
+            ],
+            backend_declaration(&request),
+        )
+        .expect("new unverified fixture receipt");
+        assert_ne!(
+            changed.receipt().output_sha256(),
+            output.receipt().output_sha256()
+        );
+        let decoded: ControlledGenerationBatchOutput = serde_json::from_value(
+            serde_json::to_value(&changed).expect("serialize newly constructed fixture"),
+        )
+        .expect("new receipt permits its own changed metric");
+        assert_eq!(decoded, changed);
+    }
+
+    #[test]
+    fn controlled_wire_refuses_first_word_choice_without_dropping_generic_evidence() {
+        let mut generation = fixture_generation("first-word-wire", "case");
+        let ordinary =
+            ControlledGenerationCaseOutput::new("case".to_string(), generation.clone(), Vec::new())
+                .expect("ordinary None case");
+        let decoded: ControlledGenerationCaseOutput = serde_json::from_value(
+            serde_json::to_value(&ordinary).expect("serialize ordinary None case"),
+        )
+        .expect("ordinary None round trip");
+        assert_eq!(decoded, ordinary);
+        assert!(decoded.generation().first_word_choice.is_none());
+
+        generation.first_word_choice = Some(crate::FirstWordChoiceEvidence {
+            policy: crate::FirstWordChoicePolicy::DistinctV2,
+            attempts: vec![crate::FirstWordChoiceAttempt {
+                seed: 7,
+                initial_token_exclusions: Vec::new(),
+                token_ids: vec![10, 11],
+                terminal_token_id: None,
+                word_key: Some("two".to_string()),
+                outcome: crate::FirstWordChoiceAttemptOutcome::Accepted,
+            }],
+            selected_attempt: Some(0),
+            total_attempted_tokens: 2,
+            exhausted: false,
+        });
+        let generic: GenerationOutput = serde_json::from_value(
+            serde_json::to_value(&generation).expect("generic fixture retains Some evidence"),
+        )
+        .expect("generic Some round trip");
+        assert_eq!(generic, generation);
+        assert!(generic.fake_fixture);
+        assert!(!generic.real_engine_invoked);
+        assert_eq!(generic.transport, NativeTransport::FakeFixture);
+        let controlled =
+            ControlledGenerationCaseOutput::new("case".to_string(), generation, Vec::new())
+                .expect("raw fixture case is not a strict-wire credential");
+        let observed = serde_json::to_value(&controlled);
+        assert!(
+            observed.is_err(),
+            "unsupported controlled Some evidence must refuse rather than disappear: {observed:?}"
+        );
+        assert!(
+            observed
+                .expect_err("unsupported first-word evidence must fail")
+                .to_string()
+                .contains("strict controlled output cannot discard first-word choice evidence")
+        );
+
+        let mut replay = fixture_generation("replay-wire", "case");
+        replay.metrics.cache.replayed_prefix_tokens = 1;
+        let replay = ControlledGenerationCaseOutput::new("case".to_string(), replay, Vec::new())
+            .expect("raw replay fixture");
+        assert!(
+            serde_json::to_value(replay)
+                .expect_err("existing replay refusal remains")
+                .to_string()
+                .contains("strict controlled output cannot discard token replay accounting")
         );
     }
 }
