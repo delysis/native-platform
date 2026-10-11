@@ -8,6 +8,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("private project storage failed: {0}")]
+    Vault(#[from] desktop_vault::VaultError),
+    #[error("authenticated database encryption is unavailable in this build")]
+    EncryptionUnavailable,
+    #[error("document snapshot failed: {0}")]
+    DocumentSnapshot(#[from] workspace_document::SnapshotError),
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("SQLite failure: {0}")]

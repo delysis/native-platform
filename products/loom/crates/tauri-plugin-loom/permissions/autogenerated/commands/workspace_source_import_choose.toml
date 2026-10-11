@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-source-import-choose"
+description = "Enables the workspace_source_import_choose command without any pre-configured scope."
+commands.allow = ["workspace_source_import_choose"]
+
+[[permission]]
+identifier = "deny-workspace-source-import-choose"
+description = "Denies the workspace_source_import_choose command without any pre-configured scope."
+commands.deny = ["workspace_source_import_choose"]

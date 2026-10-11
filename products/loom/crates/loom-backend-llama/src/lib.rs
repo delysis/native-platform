@@ -1,13 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
-mod discovery;
 mod download;
 mod fit;
 mod model;
 mod runtime;
 
-pub use discovery::{
+pub use desktop_model_discovery::{
     DEFAULT_MAX_DISCOVERY_DEPTH, DEFAULT_MAX_DISCOVERY_ENTRIES, DiscoveredGguf, DiscoveryError,
     DiscoveryWarning, GgufHeaderStatus, ModelDiscoveryOptions, ModelDiscoveryReport,
     ModelDiscoverySource, default_hugging_face_cache_roots, discover_gguf_models,

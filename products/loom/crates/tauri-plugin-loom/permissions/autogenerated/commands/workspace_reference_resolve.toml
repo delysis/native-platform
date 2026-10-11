@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-reference-resolve"
+description = "Enables the workspace_reference_resolve command without any pre-configured scope."
+commands.allow = ["workspace_reference_resolve"]
+
+[[permission]]
+identifier = "deny-workspace-reference-resolve"
+description = "Denies the workspace_reference_resolve command without any pre-configured scope."
+commands.deny = ["workspace_reference_resolve"]

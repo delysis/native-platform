@@ -13,7 +13,7 @@ use speech_native_types::{
     AudioInput, DiarizationPolicy, EncodedAudioFormat, SpeechBackendReadiness,
     SpeechDeadlinePolicy, SpeechPrivacyPolicy, SpeechRequestContext, SpeechRequestId,
     SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, TimestampGranularity,
-    TranscriptionInput, TranscriptionRequest, TranscriptionTask,
+    TranscriptionInput, TranscriptionRequest, TranscriptionResponse, TranscriptionTask,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
@@ -717,6 +717,7 @@ async fn run_transcription(
     request: TranscriptionRequest,
     session: Arc<AsyncMutex<SpeechInputSnapshot>>,
 ) {
+    let request_id = request.context.request_id.clone();
     let Some(started) = admit_transcription(&session, host.transcribe(request)).await else {
         return;
     };
@@ -728,27 +729,43 @@ async fn run_transcription(
         }
     };
     match ticket.final_response().await {
-        Ok(response) if response.text.len() <= MAX_TRANSCRIPT_BYTES => {
-            let mut snapshot = session.lock().await;
-            if snapshot.phase == SpeechInputPhase::CancelRequested {
-                snapshot.phase = SpeechInputPhase::Cancelled;
-            } else {
-                snapshot.transcript = response.text;
-                snapshot.phase = SpeechInputPhase::Completed;
-            }
-        }
-        Ok(_) => {
-            fail_session(
-                &session,
-                "speech_transcript_too_large",
-                "the transcript exceeded Loom's 4 MB limit".to_owned(),
-            )
-            .await;
-        }
+        Ok(response) => publish_transcription_response(&session, response, &request_id).await,
         Err(error) if error.class == speech_native_types::SpeechErrorClass::Cancelled => {
             session.lock().await.phase = SpeechInputPhase::Cancelled;
         }
         Err(error) => fail_session(&session, &error.code, error.safe_detail).await,
+    }
+}
+
+async fn publish_transcription_response(
+    session: &AsyncMutex<SpeechInputSnapshot>,
+    response: TranscriptionResponse,
+    request_id: &SpeechRequestId,
+) {
+    if desktop_speech::validate_parakeet_response(&response, request_id).is_err() {
+        fail_session(
+            session,
+            "speech_provenance_mismatch",
+            "The transcription response did not match its admitted local request and model.".into(),
+        )
+        .await;
+        return;
+    }
+    if response.text.len() > MAX_TRANSCRIPT_BYTES {
+        fail_session(
+            session,
+            "speech_transcript_too_large",
+            "the transcript exceeded Loom's 4 MB limit".to_owned(),
+        )
+        .await;
+        return;
+    }
+    let mut snapshot = session.lock().await;
+    if snapshot.phase == SpeechInputPhase::CancelRequested {
+        snapshot.phase = SpeechInputPhase::Cancelled;
+    } else {
+        snapshot.transcript = response.text;
+        snapshot.phase = SpeechInputPhase::Completed;
     }
 }
 
@@ -783,6 +800,49 @@ fn prune_terminal_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn transcription_publication_refuses_mismatched_or_unqualified_response() {
+        use speech_native_types::{NetworkBehavior, SpeechBackendKind, SpeechResolvedRoute};
+        let id = SpeechRequestId("request".into());
+        for corruption in 0..5 {
+            let service = SpeechInputService::new(None);
+            let session = test_session(&service);
+            let mut response = TranscriptionResponse {
+                request_id: id.clone(),
+                route: SpeechResolvedRoute {
+                    backend_id: PARAKEET_BACKEND_ID.into(),
+                    model_id: Some(PARAKEET_MODEL_ID.into()),
+                    voice_id: None,
+                    backend_kind: SpeechBackendKind::EmbeddedModel,
+                    network: NetworkBehavior::Never,
+                },
+                text: "synthetic envelope fixture".into(),
+                language: None,
+                segments: Vec::new(),
+                usage: speech_native_types::SpeechUsage::default(),
+            };
+            response.usage.real_local_inference = true;
+            match corruption {
+                1 => response.request_id = SpeechRequestId("different".into()),
+                2 => response.route.model_id = Some("different-model".into()),
+                3 => response.usage.real_local_inference = false,
+                4 => response.route.network = NetworkBehavior::Required,
+                _ => {}
+            }
+            publish_transcription_response(&session, response, &id).await;
+            let snapshot = session.lock().await;
+            if corruption == 0 {
+                assert_eq!(snapshot.phase, SpeechInputPhase::Completed);
+            } else {
+                assert_eq!(
+                    snapshot.phase,
+                    SpeechInputPhase::Failed,
+                    "corruption {corruption}"
+                );
+                assert!(snapshot.transcript.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn microphone_request_is_complete_wav_exact_local_only_and_never_downloads() {

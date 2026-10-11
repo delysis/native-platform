@@ -44,9 +44,18 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         name: String,
+        /// Protect private history, drafts and inference data using Keychain.
+        #[arg(long)]
+        encrypted: bool,
     },
     /// Inspect a project and record an open receipt.
     Open { path: PathBuf },
+    /// Make a protected copy; preserve the original project and ordinary files.
+    ProtectCopy {
+        project: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Checkpoint an existing visible manuscript file.
     Checkpoint {
         project: PathBuf,
@@ -65,6 +74,16 @@ enum Command {
         #[arg(long, value_enum)]
         kind: CliDocumentKind,
         #[arg(long, default_value = "human import")]
+        reason: String,
+    },
+    /// Import a self-contained snapshot, retaining all branches as source evidence.
+    /// The selected transcript is explicitly written to a readable manuscript.
+    ImportSnapshot {
+        project: PathBuf,
+        source: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value = "explicit document snapshot import")]
         reason: String,
     },
     /// Export the latest checkpointed visible manuscript.
@@ -226,8 +245,20 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Init { path, name } => {
-            let (store, receipt) = ProjectStore::initialize(path, name)?;
+        Command::ProtectCopy { project, to } => {
+            let store = ProjectStore::open_for_protected_copy(project)?;
+            print_json(&store.export_encrypted_copy(to)?)?;
+        }
+        Command::Init {
+            path,
+            name,
+            encrypted,
+        } => {
+            let (store, receipt) = if encrypted {
+                ProjectStore::initialize_encrypted(path, name)?
+            } else {
+                ProjectStore::initialize(path, name)?
+            };
             print_json(&ProjectView {
                 root: store.root(),
                 manifest: store.manifest(),
@@ -265,6 +296,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mut store = ProjectStore::open(project)?;
             print_json(&store.import_file(source, to, kind.into(), reason)?)?;
+        }
+        Command::ImportSnapshot {
+            project,
+            source,
+            to,
+            reason,
+        } => {
+            let snapshot = read_bounded_utf8_file(&source)?;
+            let mut store = ProjectStore::open(project)?;
+            print_json(&store.import_document_snapshot_if_absent(to, &snapshot, reason)?)?;
         }
         Command::Export { project, file, to } => {
             let mut store = ProjectStore::open(project)?;
@@ -540,6 +581,138 @@ mod tests {
         fn visible_path(&self) -> PathBuf {
             self.root.join("manuscript/001.md")
         }
+    }
+
+    #[test]
+    fn protected_commands_require_explicit_destinations_and_encryption_opt_in() {
+        Cli::command().debug_assert();
+        let plain = Cli::try_parse_from(["loom", "init", "Novel", "--name", "Novel"])
+            .expect("plaintext default remains available");
+        assert!(matches!(
+            plain.command,
+            Command::Init {
+                encrypted: false,
+                ..
+            }
+        ));
+        let protected =
+            Cli::try_parse_from(["loom", "init", "Novel", "--name", "Novel", "--encrypted"])
+                .expect("explicit encryption request");
+        assert!(matches!(
+            protected.command,
+            Command::Init {
+                encrypted: true,
+                ..
+            }
+        ));
+        for args in [
+            vec!["loom", "protect-copy", "Novel"],
+            vec!["loom", "import-snapshot", "Novel", "snapshot.json"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("destination must be explicit");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("--to"));
+        }
+    }
+
+    #[test]
+    fn snapshot_command_imports_exact_utf8_and_refuses_replacement() {
+        let fixture = Fixture::new("existing writing");
+        drop(fixture.store);
+        let input = tempdir().expect("snapshot input");
+        let source = input.path().join("snapshot.json");
+        let text = "café\r\n尾\n";
+        let snapshot = serde_json::json!({
+            "schema_version": 1,
+            "document_id": "source-writing",
+            "selection": {"kind": "sequence"},
+            "lineage": {"revision": null, "source": null},
+            "metadata": {"tool_grants": ["never-execute"]},
+            "parts": [{
+                "id": "source-part", "parent_id": null, "kind": {"kind": "text"},
+                "source": {"kind": "artifact", "occurrence_id": "source-part",
+                    "start_byte": 0, "end_byte": text.len()},
+                "content": {"storage": "inline", "text": text},
+                "metadata": {"receipt": "retain"}
+            }]
+        })
+        .to_string();
+        fs::write(&source, &snapshot).expect("snapshot");
+        let command = || {
+            Cli::try_parse_from([
+                "loom",
+                "import-snapshot",
+                fixture.root.to_str().expect("root"),
+                source.to_str().expect("source"),
+                "--to",
+                "new.md",
+            ])
+            .expect("parse actual command")
+        };
+        run(command()).expect("import snapshot through CLI");
+        let store = ProjectStore::open(&fixture.root).expect("reopen imported project");
+        let imported = store.read_document("new.md").expect("imported writing");
+        assert_eq!(
+            fs::read(fixture.root.join("new.md")).expect("visible"),
+            text.as_bytes()
+        );
+        let evidence = store
+            .imported_document_snapshot(imported.revision_id)
+            .expect("source evidence")
+            .expect("complete snapshot");
+        assert_eq!(
+            serde_json::to_value(evidence).expect("source"),
+            serde_json::from_str::<serde_json::Value>(&snapshot).expect("expected")
+        );
+        let counts = store.counts().expect("before repeated import");
+        drop(store);
+        assert!(run(command()).is_err());
+        assert_eq!(
+            ProjectStore::open(&fixture.root)
+                .expect("reopen")
+                .counts()
+                .expect("after repeated import"),
+            counts
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("manuscript/001.md")).expect("old writing"),
+            "existing writing"
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_command_preserves_existing_project_and_writing() {
+        let fixture = Fixture::new("original café\n");
+        let counts = fixture.store.counts().expect("before");
+        drop(fixture.store);
+        let input = tempdir().expect("snapshot input");
+        let source = input.path().join("invalid.json");
+        fs::write(&source, "{}").expect("invalid snapshot");
+        let cli = Cli::try_parse_from([
+            "loom",
+            "import-snapshot",
+            fixture.root.to_str().expect("root"),
+            source.to_str().expect("source"),
+            "--to",
+            "new.md",
+        ])
+        .expect("parse actual command");
+        assert!(run(cli).is_err());
+        assert!(!fixture.root.join("new.md").exists());
+        assert_eq!(
+            ProjectStore::open(&fixture.root)
+                .expect("reopen")
+                .counts()
+                .expect("after"),
+            counts
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("manuscript/001.md")).expect("writing"),
+            "original café\n"
+        );
     }
 
     #[test]

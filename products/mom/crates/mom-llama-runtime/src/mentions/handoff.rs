@@ -233,11 +233,9 @@ pub(super) fn handoff_messages(
         ),
     };
     let template = profile_chat_template(&snapshot.profile);
-    let sampling = snapshot
-        .profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let sampling = settings
+        .sampling_for_profile(snapshot.profile.sampling.as_ref())
+        .map_err(|validation| validation.blocker)?;
     sampling
         .validate()
         .map_err(|error| blocker("mention_sampling_invalid", error.message))?;

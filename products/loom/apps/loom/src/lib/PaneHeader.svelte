@@ -3,6 +3,7 @@
   export let choices: Array<[string, { title?: string | null }]> = [];
   export let selected = '';
   export let selectionDisabled = false;
+  export let collapsible = true;
   export let onSelect: (id: string) => void = () => {};
   export let onCollapse: () => void;
 </script>
@@ -13,9 +14,9 @@
       {#each choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
     </select>
   {:else}<span>{title}</span>{/if}
-  <button type="button" aria-label={`Collapse ${title}`} title={`Collapse ${title}`} on:click={onCollapse}>
+  {#if collapsible}<button type="button" aria-label={`Collapse ${title}`} title={`Collapse ${title}`} on:click={onCollapse}>
     <svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" /></svg>
-  </button>
+  </button>{/if}
 </header>
 
 <style>

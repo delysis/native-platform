@@ -495,12 +495,23 @@ pub(crate) fn model_configuration_for_profile(
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<NativeModelConfig, ValidationBlocker> {
-    validate_model_path(model_path)?;
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
-    config.context_tokens = settings.context_tokens;
-    config.batch_tokens = settings.batch_tokens;
-    config.max_sequences = settings.max_parallel_sequences.clamp(1, 4);
+    desktop_generation_policy::ModelExecutionLimits {
+        context_tokens: settings.context_tokens,
+        batch_tokens: settings.batch_tokens,
+        parallel_sequences: settings.max_parallel_sequences,
+    }
+    .apply_to(&mut config)
+    .map_err(|error| ValidationBlocker {
+        readiness: "blocked_invalid_generation_profile".into(),
+        blocker: Blocker::new(
+            "model_execution_limits_invalid",
+            error.to_string(),
+            vec!["Correct the model execution limits.".into()],
+        ),
+    })?;
+    validate_model_path(model_path)?;
     // This boundary consumes an exact profile. In particular, a frozen/imported
     // `None` must remain `None` if a sibling projector appears later. Ordinary
     // model selection resolves and persists its pair before reaching the host.
@@ -736,6 +747,31 @@ mod tests {
     use crate::config::KvCachePolicy;
     use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata, PrefixCacheValue};
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
+
+    #[test]
+    fn invalid_execution_limits_are_refused_before_model_path_access() {
+        let directory = tempfile::tempdir().expect("isolated admission fixture");
+        let missing = directory.path().join("absent.gguf");
+        let base = crate::config::Settings::defaults_for_data_dir(directory.path().to_path_buf());
+        let mut wrong = Vec::new();
+        for (context, batch, parallel) in [(511, 128, 1), (512, 0, 1), (512, 128, 0), (512, 128, 5)]
+        {
+            let mut settings = base.clone();
+            settings.context_tokens = context;
+            settings.batch_tokens = batch;
+            settings.max_parallel_sequences = parallel;
+            let error = super::model_configuration_for_profile(&settings, &missing, None)
+                .expect_err("invalid profile");
+            if error.blocker.code != "model_execution_limits_invalid" {
+                wrong.push((context, batch, parallel, error.blocker.code));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "invalid limits reached model-path admission: {wrong:?}"
+        );
+        assert!(!missing.exists());
+    }
 
     fn cache_value() -> PrefixCacheValue {
         let token_ids = vec![1, 2, 3];

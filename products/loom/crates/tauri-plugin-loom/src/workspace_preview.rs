@@ -64,13 +64,18 @@ fn html_body(text: &str) -> &[u8] {
 
 fn read_preview(state: &PluginState, request: &PreviewRequest) -> Option<Vec<u8>> {
     let session = state.session.lock().ok()?;
-    if session.phase != SessionPhase::Open || session.active_session_id != Some(request.session) {
+    let store = if workspace_owner::is_bound(&session, request.project, request.session) {
+        workspace_owner::store(&session).ok()?
+    } else if session.phase == SessionPhase::Open
+        && session.active_session_id == Some(request.session)
+    {
+        session
+            .store
+            .as_ref()
+            .filter(|store| store.manifest().project_id == request.project)?
+    } else {
         return None;
-    }
-    let store = session.store.as_ref()?;
-    if store.manifest().project_id != request.project {
-        return None;
-    }
+    };
     let summary = store.registered_document(request.document).ok()??;
     let loaded = store.read_document(summary.relative_path).ok()?;
     if loaded.revision_id != request.revision
@@ -122,6 +127,64 @@ pub(super) fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_preview_survives_root_switch_but_not_owner_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut owner, _) =
+            ProjectStore::initialize(directory.path().join("Owner"), "Owner").unwrap();
+        owner
+            .create_document_if_absent(
+                "Page.md",
+                DocumentContent::Prose("<p>Owner</p>".into()),
+                "page",
+            )
+            .unwrap();
+        let loaded = owner.read_document("Page.md").unwrap();
+        let (child, _) = ProjectStore::initialize(directory.path().join("Child"), "Child").unwrap();
+        let state = PluginState::with_app_local_data_root(
+            Some(directory.path().join("app")),
+            true,
+            BuildModelPolicy::default(),
+        );
+        let selected = {
+            let mut session = state.session.lock().unwrap();
+            workspace_owner::establish(&mut session, &owner);
+            let selected = PreviewRequest {
+                project: owner.manifest().project_id,
+                session: session.workspace.as_ref().unwrap().session_id,
+                document: loaded.document_id,
+                revision: loaded.revision_id,
+                blob: loaded.blob_id,
+            };
+            session.phase = SessionPhase::Open;
+            session.active_session_id = Some(CommandId::new());
+            session.store = Some(owner);
+            selected
+        };
+        assert_eq!(read_preview(&state, &selected).unwrap(), b"<p>Owner</p>");
+        {
+            let mut session = state.session.lock().unwrap();
+            workspace_owner::park_active(&mut session);
+            session.phase = SessionPhase::Closed;
+            session.active_session_id = None;
+        }
+        assert_eq!(read_preview(&state, &selected).unwrap(), b"<p>Owner</p>");
+        {
+            let mut session = state.session.lock().unwrap();
+            session.store = Some(child);
+            session.phase = SessionPhase::Open;
+            session.active_session_id = Some(CommandId::new());
+        }
+        assert_eq!(read_preview(&state, &selected).unwrap(), b"<p>Owner</p>");
+        let wrong_session = PreviewRequest {
+            session: CommandId::new(),
+            ..selected
+        };
+        assert!(read_preview(&state, &wrong_session).is_none());
+        state.session.lock().unwrap().workspace = None;
+        assert!(read_preview(&state, &selected).is_none());
+    }
 
     #[test]
     #[cfg(unix)]

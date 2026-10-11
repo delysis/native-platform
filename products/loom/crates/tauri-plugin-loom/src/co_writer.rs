@@ -20,6 +20,7 @@ const PROFILE_SCHEMA: &str = "loom.co-writer-profiles.v2";
 const MAX_PROFILES: usize = 64;
 const MAX_NAME_BYTES: usize = 96;
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
+const MAX_PROFILE_STORE_BYTES: u64 = 128 * 1024 * 1024;
 static PROFILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,8 +192,8 @@ fn profile_summary(profile: StoredCoWriterProfile) -> CoWriterSummary {
 
 fn read_profiles(project_root: &Path) -> Result<CoWriterProfiles, CoWriterError> {
     let path = profile_path(project_root)?;
-    match fs::read(path) {
-        Ok(bytes) => {
+    match crate::private_sidecar::read(project_root, &path, MAX_PROFILE_STORE_BYTES)? {
+        Some(bytes) => {
             let store: CoWriterProfiles = serde_json::from_slice(&bytes)?;
             if store.schema != PROFILE_SCHEMA
                 || store.profiles.len() > MAX_PROFILES
@@ -212,11 +213,10 @@ fn read_profiles(project_root: &Path) -> Result<CoWriterProfiles, CoWriterError>
             }
             Ok(store)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CoWriterProfiles {
+        None => Ok(CoWriterProfiles {
             schema: PROFILE_SCHEMA.to_owned(),
             profiles: BTreeMap::new(),
         }),
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -229,8 +229,15 @@ fn is_sha256(value: &str) -> bool {
 
 fn write_profiles(project_root: &Path, store: &CoWriterProfiles) -> Result<(), CoWriterError> {
     let path = profile_path(project_root)?;
+    let bytes = serde_json::to_vec_pretty(store)?;
+    if bytes.len() as u64 > MAX_PROFILE_STORE_BYTES {
+        return Err(CoWriterError::Invalid);
+    }
+    let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
+    let namespace = crate::private_sidecar::namespace(project_root, &path)?;
+    let sealed = codec.seal(&namespace, &bytes)?;
     let mut file = AtomicWriteFile::options().open(&path)?;
-    file.write_all(&serde_json::to_vec_pretty(store)?)?;
+    file.write_all(&sealed)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -259,6 +266,37 @@ fn profile_path(project_root: &Path) -> Result<PathBuf, CoWriterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_co_writer_profiles_preserve_context_without_plaintext() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [31; 32]).unwrap();
+        let sentinel = "synthetic private co-writer context f37a";
+        set_document_context_snapshot(project.path(), "source", sentinel, &[]).unwrap();
+        let saved = save_from_document(project.path(), "source", "Private", 41).unwrap();
+        let path = profile_path(project.path()).unwrap();
+        let stored = fs::read(&path).unwrap();
+        assert!(
+            !stored
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes()),
+            "encrypted project published plaintext co-writer context"
+        );
+        assert_eq!(list(project.path()).unwrap(), vec![saved.clone()]);
+        assert_eq!(
+            apply_to_document(project.path(), "target", &saved.id)
+                .unwrap()
+                .markdown,
+            sentinel
+        );
+        let mut tampered = stored;
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&path, &tampered).unwrap();
+        assert!(list(project.path()).is_err());
+        assert!(save_from_document(project.path(), "source", "Other", 42).is_err());
+        assert_eq!(fs::read(path).unwrap(), tampered);
+    }
 
     #[test]
     fn named_profile_round_trips_and_replaces_document_context() {

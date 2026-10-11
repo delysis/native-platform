@@ -10,3 +10,9 @@ pub mod references;
 
 pub use history::{BranchIndex, HistoryError, HistoryNode};
 pub use projection::*;
+
+mod snapshot;
+pub use snapshot::{
+    DocumentLineage, DocumentSelection, DocumentSnapshot, PartContent, RevisionLineage,
+    SnapshotError, SnapshotPart, SourceKind, SourceLineage, SourceReference,
+};

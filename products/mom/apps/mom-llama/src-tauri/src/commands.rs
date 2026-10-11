@@ -1118,6 +1118,17 @@ pub fn mom_llama_draft_clear(
     command_value(mom_llama_runtime::draft_clear(conversation.as_deref()))
 }
 
+fn resolve_conversation_export_format(
+    format: Option<&str>,
+) -> Result<ConversationExportFormat, String> {
+    match format {
+        Some("document") => Ok(ConversationExportFormat::Document),
+        Some("markdown") => Ok(ConversationExportFormat::Markdown),
+        None | Some("json") => Ok(ConversationExportFormat::Json),
+        Some(_) => Err("Unknown conversation export format.".to_owned()),
+    }
+}
+
 #[tauri::command]
 pub fn mom_llama_conversation_export(
     runtime: State<'_, AppRuntimeHandle>,
@@ -1125,10 +1136,7 @@ pub fn mom_llama_conversation_export(
     format: Option<String>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_conversation_export"))?;
-    let format = match format.as_deref() {
-        Some("markdown") => ConversationExportFormat::Markdown,
-        _ => ConversationExportFormat::Json,
-    };
+    let format = resolve_conversation_export_format(format.as_deref())?;
     command_value(mom_llama_runtime::conversation_export(
         &conversation,
         format,
@@ -1945,6 +1953,27 @@ mod tests {
         let rest = &source[start..];
         let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    #[test]
+    fn document_export_route_preserves_the_requested_format() {
+        assert_eq!(
+            super::resolve_conversation_export_format(Some("document")),
+            Ok(super::ConversationExportFormat::Document)
+        );
+        assert_eq!(
+            super::resolve_conversation_export_format(None),
+            Ok(super::ConversationExportFormat::Json)
+        );
+        assert_eq!(
+            super::resolve_conversation_export_format(Some("markdown")),
+            Ok(super::ConversationExportFormat::Markdown)
+        );
+    }
+
+    #[test]
+    fn unknown_export_route_does_not_silently_select_json() {
+        assert!(super::resolve_conversation_export_format(Some("misspelled")).is_err());
     }
 
     #[test]

@@ -105,6 +105,7 @@ mod unix {
     #[derive(Debug)]
     pub(super) struct Directory {
         root: File,
+        project_root: PathBuf,
         metadata: File,
         runs: File,
         pub(super) path: PathBuf,
@@ -130,6 +131,7 @@ mod unix {
             );
             let directory = Self {
                 root: root_file,
+                project_root: root.to_path_buf(),
                 metadata,
                 runs,
                 path: root.join(".loom/function-runs"),
@@ -139,6 +141,14 @@ mod unix {
         }
 
         fn ensure_binding(&self) -> Result<(), IpcFailure> {
+            let root = File::from(
+                open(&self.project_root, DIRECTORY_FLAGS, Mode::empty()).map_err(io_failure)?,
+            );
+            if !same_file(&root, &self.root)? {
+                return Err(failure(
+                    "Function receipt project root changed during the operation.",
+                ));
+            }
             let metadata = File::from(
                 openat(&self.root, ".loom", DIRECTORY_FLAGS, Mode::empty()).map_err(io_failure)?,
             );
@@ -162,13 +172,23 @@ mod unix {
                 Err(error) => return Err(io_failure(error)),
             };
             let metadata = file.metadata().map_err(io_failure)?;
-            if !metadata.is_file() || metadata.len() > MAX_BYTES as u64 {
+            let codec = crate::private_sidecar::PayloadCodec::open(&self.project_root)
+                .map_err(io_failure)?;
+            let limit = codec.stored_limit(MAX_BYTES as u64);
+            if !metadata.is_file() || metadata.len() > limit {
                 return Err(failure("Function receipt is not a bounded regular file."));
             }
             let mut bytes = Vec::new();
             (&file)
-                .take(MAX_BYTES as u64 + 1)
+                .take(limit.saturating_add(1))
                 .read_to_end(&mut bytes)
+                .map_err(io_failure)?;
+            if bytes.len() as u64 > limit {
+                return Err(failure("Function receipt exceeds its retained byte bound."));
+            }
+            let namespace = format!(".loom/function-runs/{name}");
+            let bytes = codec
+                .open_bytes(&namespace, &bytes, MAX_BYTES as u64)
                 .map_err(io_failure)?;
             validate_bytes(&bytes)?;
             let current = File::from(
@@ -192,6 +212,9 @@ mod unix {
         if let Some(existing) = directory.read(name)? {
             return verify_collision(&directory, &existing, bytes);
         }
+        let codec = crate::private_sidecar::PayloadCodec::open(root).map_err(io_failure)?;
+        let namespace = format!(".loom/function-runs/{name}");
+        let stored = codec.seal(&namespace, bytes).map_err(io_failure)?;
         let temporary = format!(".pending-{}", loom_types::CommandId::new());
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -205,10 +228,11 @@ mod unix {
             .map_err(io_failure)?,
         );
         let result = (|| {
-            file.write_all(bytes).map_err(io_failure)?;
+            file.write_all(&stored).map_err(io_failure)?;
             file.sync_all().map_err(io_failure)?;
             before_publish()?;
             directory.ensure_binding()?;
+            codec.validate_root(root).map_err(io_failure)?;
             match linkat(
                 &directory.runs,
                 temporary.as_str(),
@@ -270,6 +294,65 @@ mod tests {
         let root = tempfile::tempdir().expect("project root");
         fs::create_dir(root.path().join(".loom")).expect("project metadata");
         root
+    }
+
+    #[test]
+    fn encrypted_receipts_preserve_idempotence_without_plaintext() {
+        let root = fixture();
+        desktop_vault::ProjectVault::initialize_with_key(root.path(), [41; 32]).unwrap();
+        let id = loom_types::CommandId::new().to_string();
+        let bytes = br#"{"output":"synthetic private terminal output 6df1"}"#;
+        write(root.path(), &id, false, bytes).unwrap();
+        let path = directory(root.path())
+            .unwrap()
+            .join(file_name(&id, false).unwrap());
+        let stored = fs::read(&path).unwrap();
+        assert!(
+            !stored.windows(bytes.len()).any(|value| value == bytes),
+            "encrypted project retained a plaintext function receipt"
+        );
+        assert_eq!(
+            read(root.path(), &id, false).unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
+        write(root.path(), &id, false, bytes).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), stored);
+        assert!(write(root.path(), &id, false, br#"{"output":"changed"}"#).is_err());
+        assert_eq!(fs::read(&path).unwrap(), stored);
+        let mut corrupt = stored;
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(&path, &corrupt).unwrap();
+        assert!(read(root.path(), &id, false).is_err());
+        assert!(write(root.path(), &id, false, bytes).is_err());
+        assert_eq!(fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn vault_header_loss_before_receipt_publication_refuses_commit() {
+        let root = fixture();
+        desktop_vault::ProjectVault::initialize_with_key(root.path(), [43; 32]).unwrap();
+        let name = file_name(&loom_types::CommandId::new().to_string(), false).unwrap();
+        let result = unix::write(root.path(), &name, b"{}", || {
+            fs::remove_file(root.path().join(".loom/vault.json")).unwrap();
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "receipt published after its vault header disappeared"
+        );
+        assert!(!root.path().join(".loom/function-runs").join(name).exists());
+    }
+
+    #[test]
+    fn newly_protected_project_refuses_pending_plaintext_receipt() {
+        let root = fixture();
+        let name = file_name(&loom_types::CommandId::new().to_string(), false).unwrap();
+        let result = unix::write(root.path(), &name, b"{}", || {
+            desktop_vault::ProjectVault::initialize_with_key(root.path(), [47; 32]).unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!root.path().join(".loom/function-runs").join(name).exists());
     }
 
     #[test]

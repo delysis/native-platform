@@ -2,8 +2,13 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
+      "desktop-generation-policy",
       "desktop-launch",
       "desktop-model-defaults",
+      "desktop-model-discovery",
+      "desktop-speech",
+      "desktop-vault",
+      "operation-lifecycle",
       "workspace-document"
     ],
     "native": [
@@ -62,12 +67,18 @@
       "mom-llama-runtime"
     ],
     "product-loom": [
+      "archive-friends",
+      "loom-preferences",
       "loom-app",
       "loom-backend-llama",
       "loom-cli",
+      "loom-config",
       "loom-document",
+      "loom-easl-interface",
       "loom-host",
+      "loom-markdown",
       "loom-store",
+      "loom-text-session",
       "loom-types",
       "tauri-plugin-loom"
     ],
@@ -77,13 +88,17 @@
   },
   "secondary": {
     "portable": [
+      "archive-friends",
+      "loom-preferences",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
+      "desktop-generation-policy",
       "desktop-launch",
       "desktop-model-defaults",
+      "desktop-model-discovery",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",
@@ -105,40 +120,51 @@
       "information-native-types",
       "llama-native-cache",
       "llama-native-types",
+      "loom-config",
       "loom-document",
       "loom-host",
+      "loom-markdown",
       "loom-store",
+      "loom-text-session",
       "loom-types",
       "mom-llama-runtime",
+      "operation-lifecycle",
       "speech-native-host",
       "speech-native-router",
       "speech-native-types",
       "workspace-document"
     ],
     "platform-linux": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
+      "loom-easl-interface",
       "mom-llama-app"
     ],
     "platform-macos": [
+      "desktop-speech",
+      "desktop-vault",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
+      "loom-easl-interface",
       "mom-llama-app",
       "speech-native-backend-parakeet",
       "speech-native-platform"
     ],
     "platform-windows": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
+      "loom-easl-interface",
       "mom-llama-app"
     ],
     "frontend": [

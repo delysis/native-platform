@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-collection-cancel"
+description = "Enables the collection_cancel command without any pre-configured scope."
+commands.allow = ["collection_cancel"]
+
+[[permission]]
+identifier = "deny-collection-cancel"
+description = "Denies the collection_cancel command without any pre-configured scope."
+commands.deny = ["collection_cancel"]

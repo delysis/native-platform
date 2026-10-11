@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-material-resolve-reference"
+description = "Enables the material_resolve_reference command without any pre-configured scope."
+commands.allow = ["material_resolve_reference"]
+
+[[permission]]
+identifier = "deny-material-resolve-reference"
+description = "Denies the material_resolve_reference command without any pre-configured scope."
+commands.deny = ["material_resolve_reference"]

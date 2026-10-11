@@ -40,6 +40,10 @@ pub enum NeuralExpression {
         source: Box<Self>,
         query: Box<Self>,
     },
+    /// Full-scope host count; never the size of a retrieved evidence set.
+    Count {
+        source: Box<Self>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +260,25 @@ fn reference_link_at(
         return Some((end, None));
     }
     let target = &line[target_start + 1..target_end.unwrap_or(line.len())];
+    if let Some(hex) = target.strip_prefix("loom-document:") {
+        let name = if target_end.is_some()
+            && line.as_bytes().get(label_start + 1) == Some(&b'@')
+            && hex.len() <= 8192
+            && hex.len().is_multiple_of(2)
+            && hex.is_ascii()
+        {
+            (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|name| name.contains("::") && !name.chars().any(char::is_control))
+        } else {
+            None
+        };
+        return Some((end, name));
+    }
     let (hash, prefix) = if let Some(value) = target.strip_prefix("loom-material:") {
         (value.strip_prefix("material-").unwrap_or(""), "material-")
     } else if let Some(value) = target.strip_prefix("loom-evidence:") {
@@ -282,7 +305,7 @@ fn reference_at(source: &str, start: usize) -> Option<DocumentReference> {
     let mut end = parser.offset;
     // A sentence's final full stop is prose punctuation. Quote a name ending
     // in a full stop to refer to it literally.
-    if source.as_bytes().get(start + 1) != Some(&b'"') {
+    if !source[start + 1..].starts_with(['"', '“']) {
         let bare_len = name.trim_end_matches('.').len();
         end -= name.len() - bare_len;
         name.truncate(bare_len);
@@ -363,6 +386,7 @@ fn expression_depth(expression: &NeuralExpression) -> usize {
         NeuralExpression::Find { source, query } => {
             1 + expression_depth(source).max(expression_depth(query))
         }
+        NeuralExpression::Count { source } => 1 + expression_depth(source),
         _ => 1,
     }
 }
@@ -464,8 +488,21 @@ impl Parser<'_> {
                 source: Box::new(source),
                 query: Box::new(query),
             })
+        } else if self.take("count") {
+            self.whitespace();
+            if !self.take("(") {
+                return Err(self.error("expected ( after count"));
+            }
+            let [source]: [NeuralExpression; 1] = self
+                .arguments(depth)?
+                .try_into()
+                .map_err(|_| self.error("count requires exactly one library source"))?;
+            Ok(NeuralExpression::Count {
+                source: Box::new(source),
+            })
         } else {
-            Err(self.error("expected @document, @function(...), find(...), or quoted text"))
+            Err(self
+                .error("expected @document, @function(...), find(...), count(...), or quoted text"))
         }
     }
 
@@ -488,7 +525,7 @@ impl Parser<'_> {
     }
 
     fn name(&mut self) -> Result<String, NeuralSyntaxError> {
-        if self.source[self.offset..].starts_with('"') {
+        if self.source[self.offset..].starts_with(['"', '“']) {
             let name = self.quoted()?;
             if name.trim().is_empty() {
                 return Err(self.error("document name is empty"));
@@ -496,7 +533,11 @@ impl Parser<'_> {
             return Ok(name);
         }
         let start = self.offset;
-        for character in self.source[self.offset..].chars() {
+        while let Some(character) = self.source[self.offset..].chars().next() {
+            if self.source[self.offset..].starts_with("::") {
+                self.offset += 2;
+                continue;
+            }
             if character.is_alphanumeric()
                 || matches!(character, '_' | '-' | '/' | '.' | '#')
                 || matches!(character, '\u{0300}'..='\u{036f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}')
@@ -513,12 +554,17 @@ impl Parser<'_> {
     }
 
     fn quoted(&mut self) -> Result<String, NeuralSyntaxError> {
-        self.take("\"");
+        let closing = if self.take("“") {
+            '”'
+        } else {
+            self.take("\"");
+            '"'
+        };
         let mut text = String::new();
         while let Some(character) = self.source[self.offset..].chars().next() {
             self.offset += character.len_utf8();
             match character {
-                '"' => return Ok(text),
+                character if character == closing => return Ok(text),
                 '\\' => {
                     let escaped = self.source[self.offset..]
                         .chars()
@@ -547,7 +593,84 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mounted_names_are_explicit_and_colons_in_prose_remain_punctuation() {
+        let references =
+            super::document_references("Use @Research::Notes and @Local: unchanged.").unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Research::Notes", "Local"]
+        );
+        assert!(super::parse_neural_command("=@Research::Explain(@Research::Notes)").is_ok());
+        let linked = "[@Misleading](loom-document:52657365617263683a3a4e6f746573)";
+        assert_eq!(
+            super::document_references(linked).unwrap()[0].name,
+            "Research::Notes"
+        );
+        assert!(
+            super::document_references("[Open](loom-document:52657365617263683a3a4e6f746573)")
+                .unwrap()
+                .is_empty()
+        );
+    }
     use super::*;
+
+    #[test]
+    fn count_is_a_host_operation_with_exactly_one_source() {
+        let count = NeuralExpression::Count {
+            source: Box::new(NeuralExpression::Reference {
+                name: "Research".into(),
+            }),
+        };
+        assert_eq!(
+            parse_neural_command("=count(@Research)").unwrap(),
+            NeuralCommand::Expression(count.clone())
+        );
+        assert_eq!(
+            parse_neural_command("=count(@Research) |> @Explain").unwrap(),
+            NeuralCommand::Expression(NeuralExpression::Call {
+                function: "Explain".into(),
+                arguments: vec![count]
+            })
+        );
+        assert!(matches!(
+            parse_neural_command("=@count(@Research)").unwrap(),
+            NeuralCommand::Expression(NeuralExpression::Call { .. })
+        ));
+        for unsupported in [
+            "=count()",
+            "=count(@Research, \"2020\")",
+            "=sum(@Research)",
+            "=date_range(@Research, \"2020\")",
+            "=counted(@Research)",
+        ] {
+            assert!(
+                parse_neural_command(unsupported).is_err(),
+                "accepted {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn smart_quoted_reference_names_preserve_original_byte_ranges() {
+        let source = "🌙 @Missing @“Notes.md” @“A title.”";
+        let refs = document_references(source).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Missing", "Notes.md", "A title."]
+        );
+        assert_eq!(
+            refs.iter()
+                .map(|reference| &source[reference.range.clone()])
+                .collect::<Vec<_>>(),
+            ["@Missing", "@“Notes.md”", "@“A title.”"]
+        );
+    }
 
     fn reference(name: &str) -> NeuralExpression {
         NeuralExpression::Reference {

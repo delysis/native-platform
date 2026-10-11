@@ -127,7 +127,8 @@
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
-    anchorByteOffset: number
+    anchorByteOffset: number,
+    selectionPinned = false
   ): void {
     controller = rejectVisualPresentation(controller, {
       mode,
@@ -136,7 +137,8 @@
       presentationKey,
       surfaceKey,
       currentSurfaceKey: contextKey,
-      anchorByte: anchorByteOffset
+      anchorByte: anchorByteOffset,
+      selectionPinned
     });
   }
 

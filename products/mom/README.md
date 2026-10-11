@@ -33,6 +33,18 @@ imported monorepo paths and one root lock. FTE remains in the root workspace for
 its standalone product, but no FTE crate or permission is in Mom's dependency
 graph. No retired first-party Git source remains in Mom's dependency graph.
 
+## Document exports
+
+`conversation export --format document` emits a shared document snapshot with
+all branches, source lineage, execution-profile data, attachments and private
+message metadata. The snapshot preserves these as source evidence and does not
+grant tool or model authority to its destination. `--format markdown` renders
+the selected branch; `--format json` retains the existing full-conversation codec.
+
+Malformed conversation IDs, ownership, ancestry or selected heads are refused
+at the persisted codec boundary. Reading a corrupt product record preserves it
+intact; it never repairs or quarantines author content.
+
 ## Gates
 
 ```sh

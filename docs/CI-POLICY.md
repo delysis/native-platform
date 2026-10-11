@@ -137,7 +137,7 @@ target, a ten-second input timeout, and a 2 GiB memory limit. Crashing inputs ar
 uploaded on failure. It uses the independent, locked fuzz workspace. A bounded
 fuzz run is not proof that arbitrary inputs are safe.
 
-`ci-required` gates pull requests on the planner, fast policy/frontend checks,
+The `ci-required` workflow aggregates the planner, fast policy/frontend checks,
 and selected macOS jobs. Linux, Windows, fuzzing, and cross-platform inventory
 remain scheduled and report failures. They start after `ci-required` finishes,
 so they cannot consume runner capacity ahead of the same run's development
@@ -176,3 +176,19 @@ non-Unix tests assert that boundary, while portable protocol/schema tests remain
 enabled. No platform is certified by compiling it. Signing, OS credentials,
 loaded-model shutdown, and visible packaged interactions require their own
 current evidence.
+
+Loom handoff additionally requires the actual packaged writing journey with the
+cached Gemma writer. `scripts/smoke-macos-app.sh loom` fails before launch without
+an approved cached writer; text-only writers need no projector and real
+completions are mandatory. Exercise visible ghost
+text, a four-candidate family, Option-Up/Down cycling, acceptance, exact reversal,
+and saved writing after reopening. Bind the result to the delivered executable,
+not a separate development server or an older app. Missing local acceptance is
+unfinished work, even when macOS CI passes. Run focused checks while editing and
+one warm-model acceptance session after the build settles. Keep Linux/Windows
+advisory; do not turn this into a full-workspace build for every edit.
+
+The main ruleset no longer requires that hosted status, following explicit owner
+authorization on 2026-10-10. The workflow remains disabled and no hosted pass is
+claimed. PR review, deletion and non-fast-forward protections remain enabled;
+local component qualification and exact packaged acceptance stay distinct.

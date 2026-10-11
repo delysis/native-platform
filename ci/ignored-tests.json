@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 46,
+  "expected_test_count": 48,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -251,6 +251,38 @@
         "windows"
       ],
       "harness": "libtest"
+    },
+    {
+      "package": "loom-easl-interface",
+      "selector": "lib",
+      "name": "loom_easl_interface",
+      "kinds": [
+        "lib"
+      ],
+      "src_path": "products/loom/experiments/easl-interface/src/lib.rs",
+      "manifest_path": "products/loom/experiments/easl-interface/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "desktop-model-discovery",
+      "selector": "lib",
+      "name": "desktop_model_discovery",
+      "kinds": [
+        "lib"
+      ],
+      "src_path": "crates/desktop-model-discovery/src/lib.rs",
+      "manifest_path": "crates/desktop-model-discovery/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
     }
   ],
   "reviewed_build_scripts": [
@@ -282,12 +314,17 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "e0860fdb6af31054ecd44970df7fab7a749e43332dbc9660e8a7b48cb6f56625"
+      "sha256": "b6d98dd95658f3a012de414ba180f6c249288d92c69cb47587c485529d738494"
     },
     {
       "package": "mom-llama-app",
       "src_path": "products/mom/apps/mom-llama/src-tauri/build.rs",
       "sha256": "487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f"
+    },
+    {
+      "package": "loom-easl-interface",
+      "src_path": "products/loom/experiments/easl-interface/build.rs",
+      "sha256": "285604668fb6d41f692a272e3270b6d51b5aec6de5e82bbf2d8947dd7392fda7"
     }
   ],
   "entries": [
@@ -810,9 +847,9 @@
     },
     {
       "test_id": "discovery::tests::real_default_cache_discovers_official_gemma_4_12b_qat",
-      "package": "loom-backend-llama",
+      "package": "desktop-model-discovery",
       "target": "lib",
-      "source": "products/loom/crates/loom-backend-llama/src/discovery.rs",
+      "source": "crates/desktop-model-discovery/src/discovery.rs",
       "prerequisite": "requires the official Gemma 4 12B QAT Q4_0 GGUF in the local Hugging Face cache",
       "required_environment": [],
       "evidence_class": "real-model-discovery",
@@ -1055,6 +1092,38 @@
       ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test cannot promote peer/network, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "renderer::tests::render_appearance_review",
+      "package": "loom-easl-interface",
+      "target": "lib",
+      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
+      "prerequisite": "requires an isolated EASL_REVIEW_DIRECTORY and local system fonts",
+      "required_environment": [
+        "EASL_REVIEW_DIRECTORY"
+      ],
+      "evidence_class": "synthetic-native-rendering",
+      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "renderer::tests::profile_native_view",
+      "package": "loom-easl-interface",
+      "target": "lib",
+      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
+      "prerequisite": "manual optimized native renderer timing with local system fonts",
+      "required_environment": [],
+      "evidence_class": "synthetic-native-performance",
+      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
       "platforms": [
         "linux",
         "macos",

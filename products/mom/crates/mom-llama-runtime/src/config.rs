@@ -2,7 +2,8 @@ use crate::engine::ValidationBlocker;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Context, Result};
-use llama_native_types::{NativeDevice, SamplerKind, SamplingConfig};
+use desktop_generation_policy::{GenerationTask, SamplingOverrides, resolve_sampling};
+use llama_native_types::{NativeDevice, SamplingConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -118,47 +119,52 @@ impl Settings {
         }
     }
 
-    pub fn sampling_config(&self) -> SamplingConfig {
-        let mut sampling = SamplingConfig {
-            seed: upstream_setting_i64(self, "seed")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(u32::MAX),
-            temperature: upstream_setting_f32(self, "temperature")
-                .unwrap_or(self.default_temperature),
-            dynamic_temperature_range: upstream_setting_f32(self, "dynatemp_range").unwrap_or(0.0),
-            dynamic_temperature_exponent: upstream_setting_f32(self, "dynatemp_exponent")
-                .unwrap_or(1.0),
-            top_k: upstream_setting_i64(self, "top_k")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(40),
-            top_p: upstream_setting_f32(self, "top_p").unwrap_or(self.default_top_p),
-            min_p: upstream_setting_f32(self, "min_p").unwrap_or(0.0),
-            typical_p: upstream_setting_f32(self, "typ_p").unwrap_or(1.0),
-            xtc_probability: upstream_setting_f32(self, "xtc_probability").unwrap_or(0.0),
-            xtc_threshold: upstream_setting_f32(self, "xtc_threshold").unwrap_or(0.1),
-            repeat_last_n: upstream_setting_i64(self, "repeat_last_n")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(64),
-            repeat_penalty: upstream_setting_f32(self, "repeat_penalty").unwrap_or(1.0),
-            frequency_penalty: upstream_setting_f32(self, "frequency_penalty").unwrap_or(0.0),
-            presence_penalty: upstream_setting_f32(self, "presence_penalty").unwrap_or(0.0),
-            dry_multiplier: upstream_setting_f32(self, "dry_multiplier").unwrap_or(0.0),
-            dry_base: upstream_setting_f32(self, "dry_base").unwrap_or(1.75),
-            dry_allowed_length: upstream_setting_i64(self, "dry_allowed_length")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(2),
-            dry_penalty_last_n: upstream_setting_i64(self, "dry_penalty_last_n")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(-1),
-            sampler_order: sampler_order(self),
-            max_tokens: upstream_setting_i64(self, "max_tokens")
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(self.default_max_tokens),
-            stop: Vec::new(),
+    pub fn sampling_config(&self) -> std::result::Result<SamplingConfig, ValidationBlocker> {
+        if let Some(value) = self.upstream_settings.get("customJson")
+            && let Some(blocker) =
+                validate_settings_update(&BTreeMap::from([("customJson".into(), value.clone())]))
+        {
+            return Err(ValidationBlocker {
+                readiness: "blocked_invalid_generation_profile".into(),
+                blocker,
+            });
+        }
+        let inherited = SamplingOverrides::from_settings(&self.upstream_settings)
+            .map_err(invalid_generation_profile)?;
+        let custom = match self.upstream_settings.get("customJson") {
+            None => SamplingOverrides::default(),
+            Some(Value::String(raw)) => {
+                SamplingOverrides::from_json(raw).map_err(invalid_generation_profile)?
+            }
+            Some(_) => return Err(invalid_generation_profile("customJson must be text")),
         };
-        apply_custom_json_sampling(self, &mut sampling);
-        sampling
+        resolve_sampling(
+            GenerationTask::Chat,
+            &[
+                SamplingOverrides {
+                    temperature: Some(self.default_temperature),
+                    top_p: Some(self.default_top_p),
+                    max_tokens: Some(self.default_max_tokens),
+                    ..SamplingOverrides::default()
+                },
+                inherited,
+                custom,
+            ],
+        )
+        .map_err(invalid_generation_profile)
+    }
+
+    pub fn sampling_for_profile(
+        &self,
+        frozen: Option<&SamplingConfig>,
+    ) -> std::result::Result<SamplingConfig, ValidationBlocker> {
+        match frozen {
+            Some(sampling) => {
+                sampling.validate().map_err(invalid_generation_profile)?;
+                Ok(sampling.clone())
+            }
+            None => self.sampling_config(),
+        }
     }
 }
 
@@ -245,33 +251,14 @@ const CUSTOM_JSON_SAMPLING_KEYS: &[&str] = &[
     "dry_penalty_last_n",
 ];
 
-fn sampler_order(settings: &Settings) -> Vec<SamplerKind> {
-    let Some(value) = settings
-        .upstream_settings
-        .get("samplers")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return SamplingConfig::default().sampler_order;
-    };
-    let parsed = value
-        .split([',', ';', ' '])
-        .filter_map(|name| match name.trim().to_ascii_lowercase().as_str() {
-            "penalties" => Some(SamplerKind::Penalties),
-            "dry" => Some(SamplerKind::Dry),
-            "top_k" | "top-k" => Some(SamplerKind::TopK),
-            "typ_p" | "typical" | "typical_p" => Some(SamplerKind::TypicalP),
-            "top_p" | "top-p" => Some(SamplerKind::TopP),
-            "min_p" | "min-p" => Some(SamplerKind::MinP),
-            "xtc" => Some(SamplerKind::Xtc),
-            "temperature" | "temp" => Some(SamplerKind::Temperature),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if parsed.is_empty() {
-        SamplingConfig::default().sampler_order
-    } else {
-        parsed
+fn invalid_generation_profile(error: impl std::fmt::Display) -> ValidationBlocker {
+    ValidationBlocker {
+        readiness: "blocked_invalid_generation_profile".into(),
+        blocker: Blocker::new(
+            "generation_profile_invalid",
+            error.to_string(),
+            vec!["Correct the requested sampling or model execution settings.".into()],
+        ),
     }
 }
 
@@ -893,82 +880,18 @@ fn validate_settings_update(values: &BTreeMap<String, Value>) -> Option<Blocker>
             }
         }
     }
-    None
-}
-
-fn apply_custom_json_sampling(settings: &Settings, sampling: &mut SamplingConfig) {
-    let Some(Value::String(raw)) = settings.upstream_settings.get("customJson") else {
-        return;
+    let requested_sampling = || {
+        use desktop_generation_policy::{GenerationTask, SamplingOverrides, resolve_sampling};
+        let inherited = SamplingOverrides::from_settings(values)?;
+        let custom = match values.get("customJson") {
+            Some(Value::String(raw)) => SamplingOverrides::from_json(raw)?,
+            _ => SamplingOverrides::default(),
+        };
+        resolve_sampling(GenerationTask::Chat, &[inherited, custom]).map(|_| ())
     };
-    let Ok(Value::Object(custom)) = serde_json::from_str::<Value>(raw) else {
-        return;
-    };
-    let f32_value = |key: &str| {
-        custom
-            .get(key)
-            .and_then(Value::as_f64)
-            .map(|value| value as f32)
-    };
-    let i64_value = |key: &str| custom.get(key).and_then(Value::as_i64);
-    if let Some(value) = f32_value("temperature") {
-        sampling.temperature = value;
-    }
-    if let Some(value) = f32_value("dynatemp_range") {
-        sampling.dynamic_temperature_range = value;
-    }
-    if let Some(value) = f32_value("dynatemp_exponent") {
-        sampling.dynamic_temperature_exponent = value;
-    }
-    if let Some(value) = i64_value("top_k").and_then(|value| i32::try_from(value).ok()) {
-        sampling.top_k = value;
-    }
-    if let Some(value) = f32_value("top_p") {
-        sampling.top_p = value;
-    }
-    if let Some(value) = f32_value("min_p") {
-        sampling.min_p = value;
-    }
-    if let Some(value) = f32_value("xtc_probability") {
-        sampling.xtc_probability = value;
-    }
-    if let Some(value) = f32_value("xtc_threshold") {
-        sampling.xtc_threshold = value;
-    }
-    if let Some(value) = f32_value("typ_p") {
-        sampling.typical_p = value;
-    }
-    if let Some(value) = i64_value("max_tokens")
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-    {
-        sampling.max_tokens = value;
-    }
-    if let Some(value) = i64_value("repeat_last_n").and_then(|value| i32::try_from(value).ok()) {
-        sampling.repeat_last_n = value;
-    }
-    if let Some(value) = f32_value("repeat_penalty") {
-        sampling.repeat_penalty = value;
-    }
-    if let Some(value) = f32_value("presence_penalty") {
-        sampling.presence_penalty = value;
-    }
-    if let Some(value) = f32_value("frequency_penalty") {
-        sampling.frequency_penalty = value;
-    }
-    if let Some(value) = f32_value("dry_multiplier") {
-        sampling.dry_multiplier = value;
-    }
-    if let Some(value) = f32_value("dry_base") {
-        sampling.dry_base = value;
-    }
-    if let Some(value) = i64_value("dry_allowed_length").and_then(|value| i32::try_from(value).ok())
-    {
-        sampling.dry_allowed_length = value;
-    }
-    if let Some(value) = i64_value("dry_penalty_last_n").and_then(|value| i32::try_from(value).ok())
-    {
-        sampling.dry_penalty_last_n = value;
-    }
+    requested_sampling()
+        .err()
+        .map(|error| Blocker::new("generation_profile_invalid", error.to_string(), Vec::new()))
 }
 
 fn sync_generation_defaults_from_upstream(settings: &mut Settings) {
@@ -1270,7 +1193,13 @@ mod tests {
     fn generation_defaults_leave_room_for_reasoning_models_to_answer() {
         let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
         assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
-        assert_eq!(settings.sampling_config().max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            settings
+                .sampling_config()
+                .expect("valid sampling")
+                .max_tokens,
+            DEFAULT_MAX_TOKENS
+        );
         assert_eq!(
             settings.upstream_settings.get("disableReasoningParsing"),
             Some(&json!(false))
@@ -1487,7 +1416,7 @@ mod tests {
             )]))
             .is_none()
         );
-        let sampling = settings.sampling_config();
+        let sampling = settings.sampling_config().expect("valid sampling");
         assert_eq!(sampling.temperature, 0.25);
         assert_eq!(sampling.top_k, 7);
         assert_eq!(sampling.max_tokens, 33);
@@ -1498,6 +1427,55 @@ mod tests {
         )]))
         .expect("unknown custom JSON authority must block");
         assert_eq!(blocker.code, "custom_json_key_not_allowlisted");
+    }
+
+    #[test]
+    fn valid_frozen_sampling_is_exact_and_independent_of_invalid_global_settings() {
+        let mut settings = Settings::defaults_for_data_dir(std::env::temp_dir());
+        settings
+            .upstream_settings
+            .insert("temperature".into(), json!("malformed"));
+        let frozen = SamplingConfig {
+            temperature: -1.0,
+            max_tokens: 77,
+            ..SamplingConfig::default()
+        };
+        let resolved = settings
+            .sampling_for_profile(Some(&frozen))
+            .expect("valid frozen profile");
+        assert_eq!(
+            serde_json::to_value(&resolved).expect("resolved"),
+            serde_json::to_value(&frozen).expect("frozen")
+        );
+        assert!(settings.sampling_for_profile(None).is_err());
+        let invalid = SamplingConfig {
+            top_p: 1.5,
+            ..frozen
+        };
+        assert!(settings.sampling_for_profile(Some(&invalid)).is_err());
+    }
+
+    #[test]
+    fn malformed_stored_sampling_cannot_silently_become_valid_defaults() {
+        let mut settings = Settings::defaults_for_data_dir(std::env::temp_dir());
+        settings
+            .upstream_settings
+            .insert("temperature".into(), json!("malformed"));
+        assert!(settings.sampling_config().is_err());
+    }
+
+    #[test]
+    fn malformed_sampling_updates_are_rejected_before_persistence() {
+        for (key, value) in [
+            ("temperature", json!("not-a-number")),
+            ("samplers", json!("temperature,unknown-sampler")),
+            ("customJson", json!(r#"{"top_k":"wrong-type"}"#)),
+        ] {
+            assert!(
+                validate_settings_update(&BTreeMap::from([(key.to_owned(), value)])).is_some(),
+                "{key} must not silently inherit defaults"
+            );
+        }
     }
 
     #[test]

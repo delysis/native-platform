@@ -128,7 +128,7 @@ impl<'a, Source, Metadata> Document<'a, Source, Metadata> {
     pub fn push_slice(
         &mut self,
         source: Source,
-        bytes: &'a [u8],
+        bytes: &[u8],
         range: Range<u64>,
         kind: PartKind,
         metadata: Metadata,
@@ -138,7 +138,18 @@ impl<'a, Source, Metadata> Document<'a, Source, Metadata> {
         let selected = bytes.get(start..end).ok_or(DocumentError::InvalidRange)?;
         self.check_capacity(selected.len())?;
         let text = std::str::from_utf8(selected).map_err(|_| DocumentError::InvalidUtf8)?;
-        self.push(source, range, Cow::Borrowed(text), kind, metadata)
+        self.push(source, range, Cow::Owned(text.to_owned()), kind, metadata)
+    }
+
+    pub(crate) fn push_owned_part(
+        &mut self,
+        source: Source,
+        range: Range<u64>,
+        text: String,
+        kind: PartKind,
+        metadata: Metadata,
+    ) -> Result<(), DocumentError> {
+        self.push(source, range, Cow::Owned(text), kind, metadata)
     }
 
     fn push(
