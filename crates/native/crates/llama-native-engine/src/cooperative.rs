@@ -1012,8 +1012,12 @@ mod tests {
     }
 
     fn cooperative_queued_job(request_id: &str) -> (NativeModelHandle, Job, GenerationTicket) {
-        let (handle, commands, _speculative) =
+        let (mut handle, commands, _speculative) =
             crate::tests::test_admission_handle(crate::tests::admission_test_status(), 2);
+        let inner = Arc::get_mut(&mut handle.inner).expect("unique admission fixture handle");
+        Arc::get_mut(&mut inner.worker_identity)
+            .expect("unique admission fixture worker")
+            .kv_unified = false;
         let request = GenerationBatchRequest {
             request_id: request_id.into(),
             model_id: "model".into(),
