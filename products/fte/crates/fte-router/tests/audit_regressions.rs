@@ -5,7 +5,9 @@ mod tests {
     use async_trait::async_trait;
     use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
     use fte_protocols::{EdgeDefaults, OpenAiChatRequest};
-    use fte_providers::{HostedAuth, HostedProviderBackend, HostedProviderConfig};
+    use fte_providers::{
+        HostedAuth, HostedEndpoints, HostedProtocol, HostedProviderBackend, HostedProviderConfig,
+    };
     use fte_router::{Gateway, GatewayDefaults};
     use fte_store::SecretResolver;
     use fte_types::*;
@@ -55,7 +57,7 @@ mod tests {
 
     struct Probe {
         descriptor: BackendDescriptor,
-        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<BackendRequest>>>,
     }
 
     #[async_trait]
@@ -67,9 +69,13 @@ mod tests {
             BackendReadiness::Ready
         }
         async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let request_id = request.request.request_id.clone();
+            self.requests
+                .lock()
+                .expect("probe request lock")
+                .push(request);
             Err(GatewayError::invalid_request(
-                &request.request.request_id,
+                &request_id,
                 "audit_backend_reached",
                 "synthetic probe reached",
             ))
@@ -80,18 +86,18 @@ mod tests {
     }
 
     async fn dispatch_count(request: GatewayRequest, descriptor: BackendDescriptor) -> usize {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let gateway = Gateway::new(GatewayDefaults::default());
         gateway
             .register_backend(Arc::new(Probe {
                 descriptor,
-                calls: calls.clone(),
+                requests: requests.clone(),
             }))
             .expect("register probe");
         let result = gateway.execute(request).await;
         assert!(result.is_err(), "probe always returns an error");
         gateway.shutdown().await.expect("shutdown");
-        calls.load(Ordering::SeqCst)
+        requests.lock().expect("probe request lock").len()
     }
 
     #[tokio::test]
@@ -186,14 +192,60 @@ mod tests {
     }
 
     async fn fixture_with_limits(limits: QuotaLimits) -> Fixture {
+        fixture_with_responses(limits, false).await
+    }
+
+    async fn respond_responses(
+        State(headers): State<Arc<Mutex<Vec<String>>>>,
+        incoming: HeaderMap,
+        Json(wire_request): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(wire_request["model"], "fixture-model");
+        assert_eq!(wire_request["store"], true);
+        assert_eq!(wire_request["stream"], false);
+        assert!(wire_request["input"].is_array());
+        assert_eq!(wire_request["input"][0]["role"], "user");
+        assert_eq!(
+            wire_request["input"][0]["content"][0]["text"],
+            "synthetic audit input"
+        );
+        assert!(wire_request.get("messages").is_none());
+        assert!(wire_request.get("previous_response_id").is_none());
+        headers.lock().expect("fixture header lock").push(
+            incoming
+                .get("authorization")
+                .expect("fixture auth")
+                .to_str()
+                .expect("fixture auth string")
+                .to_owned(),
+        );
+        Json(json!({
+            "id":"resp_upstream_fixture", "object":"response", "created_at":0,
+            "status":"completed", "model":"fixture-model",
+            "error":null, "incomplete_details":null,
+            "output":[{
+                "id":"msg_fixture", "type":"message", "role":"assistant", "status":"completed",
+                "content":[{"type":"output_text","text":"synthetic output","annotations":[],"logprobs":[]}]
+            }],
+            "usage":{
+                "input_tokens":3, "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},
+                "output_tokens":2, "output_tokens_details":{"reasoning_tokens":0}, "total_tokens":5
+            }
+        }))
+    }
+
+    async fn fixture_with_responses(limits: QuotaLimits, responses: bool) -> Fixture {
         let observed_headers = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("local fixture listener");
         let address = listener.local_addr().expect("local address");
-        let app = Router::new()
-            .route("/chat", post(respond))
-            .with_state(observed_headers.clone());
+        let app = if responses {
+            Router::new().route("/responses", post(respond_responses))
+        } else {
+            Router::new().route("/chat", post(respond))
+        }
+        .with_state(observed_headers.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("fixture serve");
         });
@@ -207,6 +259,13 @@ mod tests {
             format!("http://{address}/chat"),
             descriptor().models,
         );
+        if responses {
+            config.protocol = HostedProtocol::OpenAi;
+            config.endpoints = HostedEndpoints {
+                responses: Some(format!("http://{address}/responses")),
+                ..HostedEndpoints::default()
+            };
+        }
         config.models[0].quota = limits;
         config.request_timeout = Duration::from_secs(2);
         let backend =
@@ -253,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_gateway_persists_before_publishing_completion_and_restores_after_restart() {
-        let fixture = fixture().await;
+        let fixture = fixture_with_responses(QuotaLimits::default(), true).await;
         let directory = tempfile::tempdir().expect("temporary store directory");
         let path = directory.path().join("responses.db");
         let store = Arc::new(fte_store::SqliteStore::open(&path).expect("store"));
@@ -264,39 +323,112 @@ mod tests {
         let mut first = request("fixture-model");
         first.storage.store_response = true;
         let mut ticket = fixture.gateway.execute(first).await.expect("execute");
-        let mut completed_id = None;
+        let mut completed_response = None;
         while let Some(event) = ticket.events.recv().await {
             if let GatewayEvent::Completed { response, .. } = event {
-                assert!(store.get(&response.id).expect("stored response").is_some());
-                completed_id = Some(response.id);
+                assert_eq!(
+                    response.provider_response_id.as_deref(),
+                    Some("resp_upstream_fixture")
+                );
+                assert_ne!(response.id, "resp_upstream_fixture");
+                assert_eq!(response.route.backend_id, "fixture");
+                assert_eq!(response.route.model_id, "fixture-model");
+                assert_eq!(response.route.location, BackendLocation::Hosted);
+                let stored = store
+                    .get(&response.id)
+                    .expect("stored response")
+                    .expect("persisted before Completed");
+                assert_eq!(&stored, response.as_ref());
+                completed_response = Some(*response);
                 break;
             }
         }
         let response = ticket.final_response().await.expect("final response");
-        assert_eq!(completed_id.as_deref(), Some(response.id.as_str()));
+        assert_eq!(completed_response.as_ref(), Some(&response));
+        assert_eq!(fixture.observed_headers.lock().expect("headers").len(), 1);
         fixture.gateway.shutdown().await.expect("shutdown");
         fixture.server.abort();
+        drop(fixture);
+        drop(store);
 
         // A fresh router has no volatile affinity. Reopening its injected store
         // must pin the continuation before it calls the original route.
         let reopened = Gateway::new(GatewayDefaults::default());
+        let reopened_store = Arc::new(fte_store::SqliteStore::open(&path).expect("reopen on disk"));
+        assert_eq!(
+            reopened_store.get(&response.id).expect("reopened response"),
+            Some(response.clone())
+        );
         reopened
-            .bind_response_store(Arc::new(
-                fte_store::SqliteStore::open(&path).expect("reopen on disk"),
-            ))
+            .bind_response_store(reopened_store)
             .expect("rebind on new router");
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         reopened
             .register_backend(Arc::new(Probe {
                 descriptor: descriptor(),
-                calls: calls.clone(),
+                requests: requests.clone(),
             }))
             .expect("register original route");
+        let mut alternative = descriptor();
+        alternative.id = "alternative".into();
+        alternative.models[0].id = "alternative-model".into();
+        alternative.models[0].backend_id = alternative.id.clone();
+        alternative.models[0].observed = RouteObservations {
+            quality: Some(1.0),
+            latency_ms: Some(0),
+            quota_headroom: Some(1.0),
+            ..Default::default()
+        };
+        let alternative_requests = Arc::new(Mutex::new(Vec::new()));
+        reopened
+            .register_backend(Arc::new(Probe {
+                descriptor: alternative,
+                requests: alternative_requests.clone(),
+            }))
+            .expect("register preferred alternative route");
+        let error = reopened
+            .execute(request("auto"))
+            .await
+            .expect_err("ordinary auto probe error");
+        assert_eq!(error.code, "audit_backend_reached");
+        assert_eq!(
+            alternative_requests
+                .lock()
+                .expect("alternative requests")
+                .len(),
+            1
+        );
+        assert!(requests.lock().expect("original requests").is_empty());
+
         let mut next = request("auto");
-        next.storage.previous_response_id = Some(response.id);
+        next.storage.previous_response_id = Some(response.id.clone());
         let error = reopened.execute(next).await.expect_err("probe error");
         assert_eq!(error.code, "audit_backend_reached");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let requests = requests.lock().expect("original requests");
+            assert_eq!(requests.len(), 1);
+            let continuation = &requests[0];
+            assert_eq!(continuation.route, response.route);
+            assert_eq!(
+                continuation.request.storage.previous_response_id.as_deref(),
+                Some(response.id.as_str())
+            );
+            assert_eq!(
+                continuation.provider_previous_response_id.as_deref(),
+                Some("resp_upstream_fixture")
+            );
+            assert_ne!(
+                continuation.request.storage.previous_response_id,
+                continuation.provider_previous_response_id
+            );
+        }
+        assert_eq!(
+            alternative_requests
+                .lock()
+                .expect("alternative requests")
+                .len(),
+            1
+        );
         reopened.shutdown().await.expect("shutdown reopened");
     }
 
