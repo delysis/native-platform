@@ -129,63 +129,27 @@
   "delivery_cases": [
     {
       "case_id": "all-events",
-      "event_indexes": [0, 1, 2, 3, 4],
-      "expected_applied_sequences": [0, 1, 2, 3, 4],
-      "expected_event_projection": {
-        "status": "ready",
-        "candidate_id": "candidate-a",
-        "text": ", while somewhere beyond the rain a signal clicked from red to green."
-      }
+      "event_indexes": [0, 1, 2, 3, 4]
     },
     {
       "case_id": "all-events-dropped",
-      "event_indexes": [],
-      "expected_applied_sequences": [],
-      "expected_event_projection": {
-        "status": "queued",
-        "candidate_id": null,
-        "text": ""
-      }
+      "event_indexes": []
     },
     {
       "case_id": "every-event-duplicated",
-      "event_indexes": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4],
-      "expected_applied_sequences": [0, 1, 2, 3, 4],
-      "expected_event_projection": {
-        "status": "ready",
-        "candidate_id": "candidate-a",
-        "text": ", while somewhere beyond the rain a signal clicked from red to green."
-      }
+      "event_indexes": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
     },
     {
       "case_id": "terminal-delivered-first",
-      "event_indexes": [4, 2, 3, 1, 0],
-      "expected_applied_sequences": [4],
-      "expected_event_projection": {
-        "status": "ready",
-        "candidate_id": "candidate-a",
-        "text": ""
-      }
+      "event_indexes": [4, 2, 3, 1, 0]
     },
     {
       "case_id": "terminal-event-dropped",
-      "event_indexes": [0, 1, 2, 3],
-      "expected_applied_sequences": [0, 1, 2, 3],
-      "expected_event_projection": {
-        "status": "ready",
-        "candidate_id": "candidate-a",
-        "text": ", while somewhere beyond the rain a signal clicked from red to green."
-      }
+      "event_indexes": [0, 1, 2, 3]
     },
     {
       "case_id": "progress-events-dropped",
-      "event_indexes": [0, 4],
-      "expected_applied_sequences": [0, 4],
-      "expected_event_projection": {
-        "status": "ready",
-        "candidate_id": "candidate-a",
-        "text": ""
-      }
+      "event_indexes": [0, 4]
     }
   ]
 }

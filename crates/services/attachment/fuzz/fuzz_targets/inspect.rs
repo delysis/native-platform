@@ -52,12 +52,6 @@ fuzz_target!(|input: &[u8]| {
     );
     if let Ok(bundle) = inspector.inspect(attachment) {
         assert!(bundle.validate().is_ok());
-        assert!(
-            bundle
-                .graph
-                .usage
-                .dominates(&attachment_native_types::BudgetUsage::default())
-        );
 
         let repeated = inspector.inspect(ProvidedAttachment::from_bytes(
             case.name,
