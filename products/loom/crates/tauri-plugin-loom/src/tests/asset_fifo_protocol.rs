@@ -1,5 +1,5 @@
 use super::*;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Instant;
