@@ -34,14 +34,12 @@ addressed from any ordinary composer using its `@handle`.
 
 The application seeds no Consult groups. Groups are user-owned ordered
 patterns of one to four Persona references and are configured in
-**Settings → Consult groups**. Previous application-owned default groups are
-removed during the catalog migration; user-created groups are preserved.
+**Settings → Consult groups**. Existing groups are preserved.
 
-The migration replaces only stable application-owned seed IDs. It does not
-delete or rewrite user-created Personas. Legacy custom Consult panels are
-migrated into Persona templates and user-owned groups. Existing group
-references to a built-in seed remain valid because the canonical IDs are
-stable.
+On a new catalog revision, maintenance seeds previously unseen built-ins and
+updates only catalog-managed entries that still match their last applied
+content hash. User-created or edited Personas are preserved; deleted built-ins
+are not reseeded. Stable canonical IDs retain existing group references.
 
 Persona-prefix cache reuse requires the exact Persona ID, version, active
 source branch, execution profile, model/build/tokenizer/template/projector
