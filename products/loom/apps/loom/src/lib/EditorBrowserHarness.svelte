@@ -25,6 +25,8 @@
     type VisualSelectionAccessibilityWitness
   } from './completionAccessibility';
 
+  export let onImmediateDocumentMutation: () => void = () => {};
+
   export let initialValue = 'alpha beta gamma';
   export let completionCandidates: CompletionCandidate[] = [];
   export let completionFrames: readonly (readonly CompletionCandidate[])[] = [];
@@ -45,6 +47,18 @@
   export function insertSourceQuotation(reference: Element, quotation: string): boolean {
     const anchor = editor.captureTextInsertionAnchor(reference);
     return Boolean(anchor && editor.insertMarkdownAtAnchor(anchor, quotation));
+  }
+  export async function insertPreparedText(prepared: Promise<string>): Promise<boolean> {
+    const anchor = editor.captureTextInsertionAnchor();
+    const text = await prepared;
+    return Boolean(anchor && editor.insertTextAtAnchor(anchor, text));
+  }
+  export async function insertPreparedMarkdown(
+    prepared: Promise<string>, clientX: number, clientY: number
+  ): Promise<boolean> {
+    const anchor = editor.captureAttachmentAnchor(clientX, clientY);
+    const markdown = await prepared;
+    return Boolean(anchor && editor.insertMarkdownAtAnchor(anchor, markdown));
   }
   const completionContextKey = completionSessionContextKey(
     'browser-session',
@@ -280,7 +294,10 @@
       {onImageAttachmentError}
       {resolveImageAssetUrl}
       onChange={change}
-      onImmediateDocumentMutation={immediateMutation}
+      onImmediateDocumentMutation={() => {
+        immediateMutation();
+        onImmediateDocumentMutation();
+      }}
       onCaretNavigation={caretNavigation}
       onSelectionChange={selectionChanged}
       onSelectionAccessibilityChange={(witness) => {
