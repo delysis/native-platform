@@ -1506,10 +1506,11 @@ fn check_object_metadata(
     if !is_sha256(sha256) || expected_bytes > MAX_ATTACHMENT_BYTES {
         return Err(ContextAttachmentError::ContextInvalid);
     }
+    let stored_bytes =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.stored_limit(expected_bytes);
     let metadata =
         fs::symlink_metadata(attachment_root(project_root)?.join("objects").join(sha256))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != stored_bytes {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(())
@@ -3139,6 +3140,331 @@ mod tests {
                 .join(format!("{id}.json"))
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_selected_object_refusals(
+        project_root: &Path,
+        document_id: &str,
+        attachment_id: &str,
+        object: &Path,
+        stored: &[u8],
+        cold: &ResolvedContext,
+    ) {
+        // Shape cannot authenticate same-length content. A warm hit returns
+        // its already verified derivative; a fresh read must reject tamper.
+        assert_eq!(
+            &resolve_for_generation(project_root, document_id, "clock").unwrap(),
+            cold
+        );
+        let mut changed = stored.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(object, &changed).unwrap();
+        SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+        let retained = resolve_for_generation(project_root, document_id, "clock").unwrap();
+        assert_eq!(&retained, cold);
+        assert_eq!(SOURCE_WORK.with(std::cell::Cell::get).read, 0);
+        assert!(original_for_export(project_root, attachment_id).is_err());
+        assert!(resolve_for_generation(project_root, document_id, "tamper misses cache").is_err());
+        assert_eq!(fs::read(object).unwrap(), changed);
+        fs::write(object, &stored[..stored.len() - 1]).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert_eq!(fs::read(object).unwrap(), &stored[..stored.len() - 1]);
+        fs::remove_file(object).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert!(!object.exists());
+        fs::create_dir(object).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert!(object.is_dir());
+        fs::remove_dir(object).unwrap();
+        let peer = object.with_extension("encoded-peer");
+        fs::write(&peer, stored).unwrap();
+        std::os::unix::fs::symlink(&peer, object).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert!(
+            fs::symlink_metadata(object)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&peer).unwrap(), stored);
+        fs::remove_file(object).unwrap();
+        fs::write(object, stored).unwrap();
+        fs::remove_file(peer).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_selected_header_refusals(project_root: &Path, document_id: &str) {
+        let header_path = project_root.join(".loom/vault.json");
+        let header = fs::read(&header_path).unwrap();
+        assert!(desktop_vault::ProjectVault::open_with_key(project_root, [72; 32]).is_err());
+        assert_eq!(fs::read(&header_path).unwrap(), header);
+        let mut changed_header = header.clone();
+        *changed_header.last_mut().unwrap() ^= 1;
+        fs::write(&header_path, &changed_header).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert_eq!(fs::read(&header_path).unwrap(), changed_header);
+        fs::remove_file(&header_path).unwrap();
+        assert!(resolve_for_generation(project_root, document_id, "clock").is_err());
+        assert!(!header_path.exists());
+        fs::write(&header_path, &header).unwrap();
+        desktop_vault::ProjectVault::open_with_key(project_root, [71; 32])
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn selected_context_project(
+        secured: bool,
+    ) -> (tempfile::TempDir, loom_store::ProjectStore, String) {
+        let project = tempfile::tempdir().unwrap();
+        let mut store = if secured {
+            fs::create_dir(project.path().join(".loom")).unwrap();
+            let vault =
+                desktop_vault::ProjectVault::initialize_with_key(project.path(), [71; 32]).unwrap();
+            loom_store::ProjectStore::initialize_with_vault(
+                project.path(),
+                "Selected context",
+                vault,
+            )
+            .unwrap()
+            .0
+        } else {
+            loom_store::ProjectStore::initialize(project.path(), "Selected context")
+                .unwrap()
+                .0
+        };
+        store
+            .create_document_if_absent(
+                "Writing.md",
+                loom_document::DocumentContent::Prose("Manuscript".into()),
+                "owned context fixture",
+            )
+            .unwrap();
+        let document_id = store
+            .read_document("Writing.md")
+            .unwrap()
+            .document_id
+            .to_string();
+        (project, store, document_id)
+    }
+
+    #[cfg(unix)]
+    fn assert_selected_warm_hit(project_root: &Path, document_id: &str, cold: &ResolvedContext) {
+        SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+        let warm = resolve_for_generation(project_root, document_id, "clock").unwrap();
+        let work = SOURCE_WORK.with(std::cell::Cell::get);
+        assert_eq!(&warm, cold);
+        assert_eq!(work.read, 0);
+        assert_eq!(work.hashed, 0);
+        assert_eq!(work.prepared_copied, warm.context_preamble.len());
+    }
+
+    #[cfg(unix)]
+    fn reopen_selected_context(
+        project: &Path,
+        project_root: &Path,
+        document_id: &str,
+        snapshot: &DocumentContextSnapshot,
+        text: &str,
+    ) -> loom_store::ProjectStore {
+        let reopened = loom_store::ProjectStore::open_folder(project).unwrap();
+        assert_eq!(project_root, reopened.root());
+        assert_eq!(
+            reopened
+                .read_document("Writing.md")
+                .unwrap()
+                .document_id
+                .to_string(),
+            document_id
+        );
+        assert_eq!(
+            &document_context_snapshot(reopened.root(), document_id).unwrap(),
+            snapshot
+        );
+        SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+        let reopened_cold =
+            resolve_for_generation(reopened.root(), document_id, "fresh query").unwrap();
+        assert!(reopened_cold.context_preamble.contains(text));
+        assert_eq!(SOURCE_WORK.with(std::cell::Cell::get).read, text.len());
+        reopened
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_context_encoded_extent_preserves_cold_warm_reopen_and_refusals() {
+        for secured in [false, true] {
+            let (project, store, document_id) = selected_context_project(secured);
+            let project_root = store.root().to_owned();
+            // A real external file follows the same preparation/publication path
+            // as the native importer, without a picker, worker, or model fixture.
+            let source_directory = tempfile::tempdir().unwrap();
+            let source = source_directory.path().join("source.txt");
+            let text = "Synthetic exact source: clock beneath the sea, 尾.";
+            fs::write(&source, text).unwrap();
+            let attachment = prepare_path_bounded(&project_root, &source, 1024)
+                .unwrap()
+                .publish()
+                .unwrap();
+            assert_eq!(attachment.byte_count, text.len() as u64);
+            assert_eq!(attachment.text_bytes, text.len() as u64);
+            let exported = original_for_export(&project_root, &attachment.id).unwrap();
+            assert_eq!(exported, ("source.txt".into(), text.as_bytes().to_vec()));
+            let root = attachment_root(&project_root).unwrap();
+            let object = root.join("objects").join(&attachment.id);
+            let stored = fs::read(&object).unwrap();
+            assert_eq!(
+                stored.len() as u64,
+                text.len() as u64 + if secured { 48 } else { 0 }
+            );
+            let snapshot = set_document_context_snapshot(
+                &project_root,
+                &document_id,
+                "Author direction.",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            assert_eq!(snapshot.materials.len(), 1);
+            assert_eq!(snapshot.materials[0].attachment_id, attachment.id);
+            assert_eq!(
+                snapshot.attachments[0].source_revision,
+                snapshot.materials[0].source_revision
+            );
+            let context_path = root.join("document-context.json");
+            let context_bytes = fs::read(&context_path).unwrap();
+            let manifest_path = root
+                .join("manifests")
+                .join(format!("{}.json", attachment.id));
+            let manifest_bytes = fs::read(&manifest_path).unwrap();
+            let manuscript = project.path().join("Writing.md");
+            let manuscript_bytes = fs::read(&manuscript).unwrap();
+
+            SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+            let result = resolve_for_generation(&project_root, &document_id, "clock");
+            // Retain the actual error in the first protected-boundary diagnostic;
+            // preservation is checked before the causal success assertion.
+            assert_eq!(fs::read(&source).unwrap(), text.as_bytes());
+            assert_eq!(fs::read(&object).unwrap(), stored);
+            assert_eq!(fs::read(&context_path).unwrap(), context_bytes);
+            assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+            assert_eq!(fs::read(&manuscript).unwrap(), manuscript_bytes);
+            assert!(
+                result.is_ok(),
+                "selected context failed: secured={secured}, plaintext={}, stored={}, result={result:?}",
+                text.len(),
+                stored.len()
+            );
+            let cold = result.unwrap();
+            assert!(cold.context_preamble.contains(text));
+            assert!(cold.context_preamble.contains("Author direction."));
+            assert_eq!(cold.attachment_ids, vec![attachment.id.clone()]);
+            assert_eq!(cold.retrieval_evidence.materials, snapshot.materials);
+            assert!(cold.media.is_empty());
+            assert_eq!(SOURCE_WORK.with(std::cell::Cell::get).read, text.len());
+            assert_selected_warm_hit(&project_root, &document_id, &cold);
+
+            drop(store);
+            let reopened = reopen_selected_context(
+                project.path(),
+                &project_root,
+                &document_id,
+                &snapshot,
+                text,
+            );
+            assert_eq!(fs::read(&object).unwrap(), stored);
+            assert_eq!(fs::read(&context_path).unwrap(), context_bytes);
+            assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+
+            assert_selected_object_refusals(
+                reopened.root(),
+                &document_id,
+                &attachment.id,
+                &object,
+                &stored,
+                &cold,
+            );
+            if secured {
+                assert_selected_header_refusals(reopened.root(), &document_id);
+            }
+            assert_eq!(
+                resolve_for_generation(reopened.root(), &document_id, "clock").unwrap(),
+                cold
+            );
+            let exported = original_for_export(reopened.root(), &attachment.id).unwrap();
+            assert_eq!(exported.1, text.as_bytes());
+            assert_eq!(fs::read(&source).unwrap(), text.as_bytes());
+            assert_eq!(fs::read(&object).unwrap(), stored);
+            assert_eq!(fs::read(&context_path).unwrap(), context_bytes);
+            assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+            assert_eq!(fs::read(&manuscript).unwrap(), manuscript_bytes);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_recorded_media_uses_encoded_extent_and_authenticates_each_read() {
+        for secured in [false, true] {
+            let (project, store, document_id) = selected_context_project(secured);
+            let project_root = store.root().to_owned();
+            let wav = wav_fixture();
+            let audio = import_recorded_wav(&project_root, "capture.wav".into(), &wav).unwrap();
+            assert_eq!(audio.text_bytes, 0);
+            assert_eq!(audio.media_kinds, ["audio"]);
+            let snapshot = add_document_context_snapshot(
+                &project_root,
+                &document_id,
+                std::slice::from_ref(&audio.id),
+            )
+            .unwrap();
+            let root = attachment_root(&project_root).unwrap();
+            let object = root.join("objects").join(&audio.id);
+            let stored = fs::read(&object).unwrap();
+            assert_eq!(stored.len(), wav.len() + if secured { 48 } else { 0 });
+            let context_path = root.join("document-context.json");
+            let context_bytes = fs::read(&context_path).unwrap();
+            let result = resolve_media_for_document(store.root(), &document_id, "");
+            assert_eq!(fs::read(&object).unwrap(), stored);
+            assert_eq!(fs::read(&context_path).unwrap(), context_bytes);
+            assert!(
+                result.is_ok(),
+                "selected native-media context failed: secured={secured}, plaintext={}, stored={}, result={result:?}",
+                wav.len(),
+                stored.len()
+            );
+            let media = result.unwrap();
+            assert_eq!(media.len(), 1);
+            assert_eq!(media[0].kind, MediaKind::Audio);
+            assert_eq!(media[0].bytes, wav);
+            assert_eq!(original_for_export(store.root(), &audio.id).unwrap().1, wav);
+            drop(store);
+            let reopened = loom_store::ProjectStore::open_folder(project.path()).unwrap();
+            assert_eq!(project_root.as_path(), reopened.root());
+            assert_eq!(
+                document_context_snapshot(reopened.root(), &document_id).unwrap(),
+                snapshot
+            );
+            let resolved = resolve_for_generation(reopened.root(), &document_id, "").unwrap();
+            assert_eq!(resolved.media, media);
+            assert!(resolved.context_preamble.is_empty());
+            let mut changed = stored.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            fs::write(&object, &changed).unwrap();
+            assert!(resolve_media_for_document(reopened.root(), &document_id, "").is_err());
+            assert!(resolve_for_generation(reopened.root(), &document_id, "").is_err());
+            assert_eq!(fs::read(&object).unwrap(), changed);
+            fs::write(&object, &stored).unwrap();
+            remove_document_context_snapshot(reopened.root(), &document_id, &audio.id).unwrap();
+            assert!(
+                resolve_media_for_document(reopened.root(), &document_id, "")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                original_for_export(reopened.root(), &audio.id).unwrap().1,
+                wav
+            );
+            assert_eq!(fs::read(&object).unwrap(), stored);
+        }
     }
 
     #[test]

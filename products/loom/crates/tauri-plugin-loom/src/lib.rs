@@ -73,9 +73,8 @@ use loom_backend_llama::{
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
     ActiveGenerationRoute, AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
-    ForegroundCommandRegistry, ForegroundWindowId, GenerationFamilyIdentity,
-    GenerationOperationPhase, GenerationOperationSnapshot, GenerationRegistry,
-    GenerationRegistryError, GenerationSupervisor, GenerationTerminalClass,
+    GenerationFamilyIdentity, GenerationOperationPhase, GenerationOperationSnapshot,
+    GenerationRegistry, GenerationRegistryError, GenerationSupervisor, GenerationTerminalClass,
     GenerationTerminalRecord,
 };
 use loom_store::{
@@ -86,12 +85,14 @@ use loom_store::{
     TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput, TransientDraft,
     VisibleProjectionState,
 };
+#[cfg(test)]
+use loom_types::BuildWriterProfileId;
 use loom_types::{
     ArtifactId, AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
-    BuildWriterProfileId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
-    CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
-    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ModelRole, ProjectId,
-    PromptMode, PromptRecipe, RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
+    ByteRange, CancelGenerationCommand, CandidateId, CommandId, CommandReceipt, ContextRecipe,
+    DocumentId, DocumentKind, GenerationEventKind, GenerationRunId, GenerationStart,
+    GenerationTerminalStatus, LoomEvent, ModelEnvironment, ModelRole, ProjectId, PromptMode,
+    PromptRecipe, RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
 };
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
@@ -152,8 +153,6 @@ const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
 const COMPLETION_SNAPSHOT_BRANCH_LIMIT: usize = 24;
 const COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS: usize = 3;
-#[cfg(test)]
-const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
 pub const ARCHIVE_FRIENDS_MENU_ID: &str = "loom.help.archive-friends";
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
 pub const FILE_NEW_DOCUMENT_MENU_ID: &str = "loom.file.new-document";
@@ -531,7 +530,6 @@ pub struct PluginState {
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     automatic_budget: AutomaticBudgetAuthority,
     loompad_budget: Mutex<LoompadBudget>,
-    foreground_commands: ForegroundCommandRegistry,
     generations: Arc<GenerationRegistry>,
     generation_lifecycle: GenerationSupervisor,
     generation_workers: GenerationWorkerRegistry,
@@ -621,7 +619,6 @@ impl PluginState {
             user_model_paths: Mutex::new(BTreeSet::new()),
             automatic_budget: AutomaticBudgetAuthority::default(),
             loompad_budget: Mutex::new(LoompadBudget::default()),
-            foreground_commands: ForegroundCommandRegistry::default(),
             generations: Arc::new(GenerationRegistry::default()),
             generation_workers: GenerationWorkerRegistry::new(generation_lifecycle.clone()),
             generation_lifecycle,
@@ -648,7 +645,6 @@ impl Drop for PluginState {
         self.archive_friends.cancel_all();
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
-        let _ = self.foreground_commands.revoke_all();
         self.prepared_project
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -710,8 +706,11 @@ mod automatic_writer_authority {
     #[derive(Debug)]
     pub(super) struct PolicyBoundAutomaticWriter {
         loaded: LoadedModel,
+        #[cfg(test)]
         profile_id: BuildWriterProfileId,
+        #[cfg(test)]
         rank: u32,
+        #[cfg(test)]
         policy_identity: BuildModelPolicyIdentity,
     }
 
@@ -736,32 +735,18 @@ mod automatic_writer_authority {
         Manual(LoadedModel),
     }
 
-    #[derive(Debug)]
-    enum SubmittedWeaveAuthority {
-        AutomaticPolicy {
-            profile_id: BuildWriterProfileId,
-            rank: u32,
-            policy_identity: BuildModelPolicyIdentity,
-        },
-        AutomaticVerifiedText {
-            model_sha256: String,
-        },
-        Manual,
-    }
-
     /// An exact request whose model authority was preserved through request
     /// construction. Its payload is intentionally not exposed to the plugin;
     /// submission consumes this wrapper and is the only escape hatch.
     #[derive(Debug)]
     pub(super) struct AuthorizedWeaveRequest {
         request: ExactContinuationRequest,
-        authority: SubmittedWeaveAuthority,
     }
 
     /// The only model authority accepted by the shared Weave submission path.
     /// Manual requests retain their explicit escape hatch; automatic requests
-    /// necessarily carry either exact build-policy identity or a non-forgeable
-    /// native-verified text-only capability witness until request creation.
+    /// necessarily pass either exact build-policy checks or a non-forgeable
+    /// native-verified text-only capability check before request creation.
     #[derive(Debug)]
     pub(super) struct AuthorizedWeaveModel {
         policy: ValidatedWeavePolicy,
@@ -802,27 +787,13 @@ mod automatic_writer_authority {
             )?;
             Ok(Self {
                 loaded,
+                #[cfg(test)]
                 profile_id: writer.typed_profile_id(),
+                #[cfg(test)]
                 rank: matched.rank(),
+                #[cfg(test)]
                 policy_identity: policy.identity(),
             })
-        }
-
-        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
-            let Self {
-                loaded,
-                profile_id,
-                rank,
-                policy_identity,
-            } = self;
-            (
-                loaded.profile,
-                SubmittedWeaveAuthority::AutomaticPolicy {
-                    profile_id,
-                    rank,
-                    policy_identity,
-                },
-            )
         }
     }
 
@@ -863,16 +834,6 @@ mod automatic_writer_authority {
             }
             Ok(Self { loaded })
         }
-
-        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
-            let Self { loaded } = self;
-            (
-                loaded.profile,
-                SubmittedWeaveAuthority::AutomaticVerifiedText {
-                    model_sha256: loaded.descriptor.model_sha256,
-                },
-            )
-        }
     }
 
     impl AutomaticSuggestionAuthority {
@@ -895,13 +856,6 @@ mod automatic_writer_authority {
                 Self::VerifiedText(writer) => &writer.loaded,
             }
         }
-
-        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
-            match self {
-                Self::Policy(writer) => writer.into_request_parts(),
-                Self::VerifiedText(writer) => writer.into_request_parts(),
-            }
-        }
     }
 
     impl AuthorizedWeaveRequest {
@@ -909,19 +863,7 @@ mod automatic_writer_authority {
             self,
             backend: &LlamaBackend,
         ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
-            let Self { request, authority } = self;
-            match authority {
-                SubmittedWeaveAuthority::AutomaticPolicy {
-                    profile_id: _profile_id,
-                    rank: _rank,
-                    policy_identity: _policy_identity,
-                } => {}
-                SubmittedWeaveAuthority::AutomaticVerifiedText {
-                    model_sha256: _model_sha256,
-                } => {}
-                SubmittedWeaveAuthority::Manual => {}
-            }
-            backend.start_exact_continuation(request)
+            backend.start_exact_continuation(self.request)
         }
     }
 
@@ -998,11 +940,12 @@ mod automatic_writer_authority {
         ) -> AuthorizedWeaveRequest {
             let Self { policy, kind } = self;
             let first_word_choices = policy.first_word_choices();
-            let (model, authority) = match kind {
-                AuthorizedWeaveModelKind::Automatic(writer) => writer.into_request_parts(),
-                AuthorizedWeaveModelKind::Manual(loaded) => {
-                    (loaded.profile, SubmittedWeaveAuthority::Manual)
-                }
+            let model = match kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => match writer {
+                    AutomaticSuggestionAuthority::Policy(writer) => writer.loaded.profile,
+                    AutomaticSuggestionAuthority::VerifiedText(writer) => writer.loaded.profile,
+                },
+                AuthorizedWeaveModelKind::Manual(loaded) => loaded.profile,
             };
             AuthorizedWeaveRequest {
                 request: ExactContinuationRequest {
@@ -1015,7 +958,6 @@ mod automatic_writer_authority {
                     prompt_recipe,
                     cases,
                 },
-                authority,
             }
         }
 
@@ -2379,18 +2321,8 @@ impl Builder {
                 if window.label() != "main" {
                     return;
                 }
-                let app = window.app_handle().clone();
-                let event_app = app.clone();
-                let window_id = ForegroundWindowId::new(window.label())
-                    .expect("Tauri window labels are bounded application constants");
-                let event_window_id = window_id.clone();
+                let event_app = window.app_handle().clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::Focused(focused) = event {
-                        let _ = event_app
-                            .state::<PluginState>()
-                            .foreground_commands
-                            .observe_window_focus(event_window_id.clone(), *focused);
-                    }
                     if let WindowEvent::CloseRequested { api, .. } = event
                         && !prepare_application_exit_request(&event_app)
                     {
@@ -2398,15 +2330,6 @@ impl Builder {
                         emit_application_close_request(&event_app);
                     }
                 });
-                // Install the event listener first, then sample native state.
-                // This closes the registration/sampling window: a transition
-                // is either observed by the callback or by this later sample.
-                if let Ok(focused) = window.is_focused() {
-                    let _ = app
-                        .state::<PluginState>()
-                        .foreground_commands
-                        .observe_window_focus(window_id, focused);
-                }
             })
             .on_event(|app, event| {
                 if let RunEvent::Exit = event {
@@ -3845,18 +3768,6 @@ fn close_project_with_wait(
     state.imports.revoke_session(&session_id);
     state.previews.revoke_session(&session_id);
 
-    // Project close removes command authority before waiting for inference.
-    // A slow or failed drain must never leave a promotion nonce usable.
-    state
-        .foreground_commands
-        .revoke_application_session(typed_session_id)
-        .map_err(|error| {
-            IpcFailure::new(
-                "foreground_command_state_unavailable",
-                error.to_string(),
-                false,
-            )
-        })?;
     tauri::async_runtime::block_on(state.speech_input.cancel_scope(&project_id, &session_id))
         .map_err(|error| IpcFailure::speech_input(&error))?;
     cancel_and_drain_generation_session(
@@ -10607,104 +10518,6 @@ async fn candidate_promote(
     Ok(receipt)
 }
 
-/// Test-only narrow edge used to prove that renderer bytes alone cannot mint
-/// foreground authority. The production research command above additionally
-/// consumes the live research lease and commits the selected manuscript.
-#[cfg(test)]
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FixtureForegroundCommandInput {
-    nonce: String,
-    application_session_id: String,
-    document_id: String,
-    candidate_fingerprint: String,
-    command_id: String,
-    promotion_fingerprint: String,
-}
-
-#[cfg(test)]
-#[derive(Debug, Serialize)]
-struct FixtureForegroundCommandReceipt {
-    claim: &'static str,
-    monotonic_event_index: u64,
-}
-
-#[cfg(test)]
-#[tauri::command]
-#[allow(dead_code, clippy::needless_pass_by_value)]
-fn fixture_foreground_command_consume<R: Runtime>(
-    input: FixtureForegroundCommandInput,
-    window: tauri::Window<R>,
-    state: State<'_, PluginState>,
-) -> Result<FixtureForegroundCommandReceipt, IpcFailure> {
-    let native_focus = state
-        .foreground_commands
-        .sample_tauri_window_focus(&window)
-        .map_err(|error| {
-            IpcFailure::new("foreground_focus_unavailable", error.to_string(), true)
-        })?;
-    consume_fixture_foreground_command(&state, native_focus, &input)
-}
-
-#[cfg(test)]
-fn consume_fixture_foreground_command(
-    state: &PluginState,
-    native_focus: loom_host::NativeWindowFocusSample,
-    input: &FixtureForegroundCommandInput,
-) -> Result<FixtureForegroundCommandReceipt, IpcFailure> {
-    let application_session_id = parse_command_id(&input.application_session_id)?;
-    let active_session_id = lock_session_internal(state)?.active_session_id;
-    if active_session_id != Some(application_session_id) {
-        return Err(IpcFailure::new(
-            "stale_project_session",
-            "the foreground command belongs to another project session",
-            false,
-        ));
-    }
-    let binding = loom_host::ForegroundCommandBinding {
-        application_session_id,
-        window_id: native_focus.window_id().clone(),
-        document_id: input.document_id.parse().map_err(|_| {
-            IpcFailure::new(
-                "invalid_document_id",
-                "document ID is not a valid ULID",
-                false,
-            )
-        })?,
-        candidate_fingerprint: input.candidate_fingerprint.parse().map_err(|_| {
-            IpcFailure::new(
-                "invalid_candidate_fingerprint",
-                "candidate fingerprint is not a valid SHA-256 digest",
-                false,
-            )
-        })?,
-        command_id: parse_command_id(&input.command_id)?,
-        promotion_fingerprint: input.promotion_fingerprint.parse().map_err(|_| {
-            IpcFailure::new(
-                "invalid_promotion_fingerprint",
-                "promotion fingerprint is not a valid SHA-256 digest",
-                false,
-            )
-        })?,
-    };
-    let command = state
-        .foreground_commands
-        .consume_with_native_focus(
-            loom_host::ForegroundCommandAttempt {
-                nonce: parse_command_id(&input.nonce)?,
-                binding,
-            },
-            native_focus,
-        )
-        .map_err(|error| {
-            IpcFailure::new("foreground_command_rejected", error.to_string(), false)
-        })?;
-    Ok(FixtureForegroundCommandReceipt {
-        claim: "trusted_application_host_accepted_one_focused_command",
-        monotonic_event_index: command.monotonic_event_index(),
-    })
-}
-
 fn parse_command_id(value: &str) -> Result<CommandId, IpcFailure> {
     value.parse::<CommandId>().map_err(|_| {
         IpcFailure::new(
@@ -10810,8 +10623,6 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    // Close authority before any potentially slow worker or model drain.
-    let _ = state.foreground_commands.revoke_all();
     // Owning `phase` is an application-wide admission barrier. Worker
     // reservations borrow an admission guard until their JoinHandle and
     // cancellation authority are attached, making a detached start
@@ -10863,15 +10674,6 @@ fn begin_application_close(state: &PluginState) -> Result<ApplicationCloseAttemp
     match *phase {
         ApplicationPhase::Running => {
             *phase = ApplicationPhase::Closing;
-            if let Err(error) = state.foreground_commands.revoke_all() {
-                *phase = ApplicationPhase::Running;
-                state.close_requested.store(false, Ordering::Release);
-                return Err(IpcFailure::new(
-                    "foreground_command_state_unavailable",
-                    error.to_string(),
-                    false,
-                ));
-            }
             Ok(ApplicationCloseAttempt {
                 state,
                 phase,
@@ -15477,24 +15279,6 @@ mod tests {
                 cancellation: cancellation.clone(),
             })
             .expect("register active family");
-        let window_id = ForegroundWindowId::new("main").expect("window identity");
-        state
-            .foreground_commands
-            .observe_window_focus(window_id.clone(), true)
-            .expect("focus fixture window");
-        let foreground_binding = loom_host::ForegroundCommandBinding {
-            application_session_id: session_id,
-            window_id,
-            document_id: DocumentId::new(),
-            candidate_fingerprint: BlobId::digest(b"close-timeout-candidate"),
-            command_id: CommandId::new(),
-            promotion_fingerprint: BlobId::digest(b"close-timeout-promotion"),
-        };
-        let foreground_challenge = state
-            .foreground_commands
-            .issue(foreground_binding.clone(), FOREGROUND_COMMAND_TEST_TTL)
-            .expect("issue foreground challenge before close");
-
         let error = close_project_with_wait(
             &state,
             project_id.to_string(),
@@ -15510,20 +15294,6 @@ mod tests {
         assert!(session.agency.focus_mode());
         assert!(!session.agency.automation_enabled());
         drop(session);
-        let native_focus = state
-            .foreground_commands
-            .bind_test_native_window_focus_sample(foreground_binding.window_id.clone(), true);
-        assert_eq!(
-            state.foreground_commands.consume_with_native_focus(
-                loom_host::ForegroundCommandAttempt {
-                    nonce: foreground_challenge.nonce,
-                    binding: foreground_binding,
-                },
-                native_focus,
-            ),
-            Err(loom_host::ForegroundCommandError::StaleNonce),
-            "close must revoke authority before a generation drain can time out",
-        );
         assert_eq!(
             *cancellation.branches.lock().expect("cancelled branches"),
             vec![branch_id]
@@ -16491,58 +16261,6 @@ mod tests {
             value["visible_projection"]["relative_path"],
             "manuscript/001-opening.md"
         );
-    }
-
-    #[test]
-    fn fixture_tauri_command_consumes_authority_at_native_edge() {
-        let state = PluginState::default();
-        let application_session_id = CommandId::new();
-        state
-            .session
-            .lock()
-            .expect("session lock")
-            .active_session_id = Some(application_session_id);
-        let window_id = ForegroundWindowId::new("main").expect("fixture window");
-        state
-            .foreground_commands
-            .observe_window_focus(window_id.clone(), true)
-            .expect("focus fixture window");
-        let binding = loom_host::ForegroundCommandBinding {
-            application_session_id,
-            window_id: window_id.clone(),
-            document_id: DocumentId::new(),
-            candidate_fingerprint: BlobId::digest(b"fixture candidate"),
-            command_id: CommandId::new(),
-            promotion_fingerprint: BlobId::digest(b"fixture pending promotion"),
-        };
-        let challenge = state
-            .foreground_commands
-            .issue(binding.clone(), Duration::from_secs(30))
-            .expect("issue fixture challenge");
-        let input = FixtureForegroundCommandInput {
-            nonce: challenge.nonce.to_string(),
-            application_session_id: binding.application_session_id.to_string(),
-            document_id: binding.document_id.to_string(),
-            candidate_fingerprint: binding.candidate_fingerprint.to_string(),
-            command_id: binding.command_id.to_string(),
-            promotion_fingerprint: binding.promotion_fingerprint.to_string(),
-        };
-        let native_focus = state
-            .foreground_commands
-            .bind_test_native_window_focus_sample(window_id.clone(), true);
-        let receipt = consume_fixture_foreground_command(&state, native_focus, &input)
-            .expect("consume at fixture Tauri edge");
-        assert_eq!(
-            receipt.claim,
-            "trusted_application_host_accepted_one_focused_command"
-        );
-        assert_eq!(receipt.monotonic_event_index, 1);
-        let replay_focus = state
-            .foreground_commands
-            .bind_test_native_window_focus_sample(window_id, true);
-        let replay = consume_fixture_foreground_command(&state, replay_focus, &input)
-            .expect_err("replayed IPC payload must fail");
-        assert_eq!(replay.code, "foreground_command_rejected");
     }
 
     mod tauri016_persistence {

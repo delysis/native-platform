@@ -9,7 +9,7 @@ use fte_providers::{
     HostedAuth, HostedEndpoints, HostedProtocol, HostedProviderBackend, HostedProviderConfig,
 };
 use fte_router::{Gateway, GatewayDefaults};
-use fte_store::SecretResolver;
+use fte_types::SecretResolver;
 use fte_types::{
     BackendLocation, Modality, ModelCapabilities, ModelDescriptor, PromptForm, QuotaLimits,
     RouteTarget,
