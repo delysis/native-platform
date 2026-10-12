@@ -14,6 +14,11 @@ if grep -ERn 'fte[-_]speech|speech[-_]native|speech_(status|plan|synthesize|tran
   "$core_plugin/permissions" "$repo_root/src-tauri/Cargo.toml" \
   "$repo_root/src-tauri/src" "$repo_root/src-tauri/capabilities"; then
   fail "the core Free Token Energy plugin contains speech dependencies, commands, or permissions"
+else
+  scan_status=$?
+  if (( scan_status != 1 )); then
+    fail "the module boundary scan did not complete (grep exit $scan_status)"
+  fi
 fi
 
 printf 'module boundaries verified: FTE contains no local speech runtime or authority\n'

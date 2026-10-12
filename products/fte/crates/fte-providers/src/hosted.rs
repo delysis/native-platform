@@ -1140,50 +1140,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
         body.insert("system".to_string(), Value::Array(system));
     }
     insert_anthropic_sampling(&mut body, request)?;
-    if !request.request.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            json!(
-                request
-                    .request
-                    .tools
-                    .iter()
-                    .map(|tool| json!({
-                        "name":tool.name,
-                        "description":tool.description,
-                        "input_schema":tool.input_schema
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        let mut choice = match &request.request.tool_policy.selection {
-            fte_types::ToolSelection::None => json!({"type":"none"}),
-            fte_types::ToolSelection::Auto => json!({"type":"auto"}),
-            fte_types::ToolSelection::Required => json!({"type":"any"}),
-            fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
-        };
-        if let Some(disable_parallel) = request
-            .request
-            .provider_extensions
-            .get("anthropic.disable_parallel_tool_use")
-        {
-            if !disable_parallel.is_boolean()
-                || matches!(
-                    request.request.tool_policy.selection,
-                    fte_types::ToolSelection::None
-                )
-            {
-                return Err(capability_error(
-                    &request.request.request_id,
-                    &request.route.backend_id,
-                    "anthropic_parallel_tool_policy_invalid",
-                    "disable_parallel_tool_use needs a boolean and an enabled tool choice",
-                ));
-            }
-            choice["disable_parallel_tool_use"] = disable_parallel.clone();
-        }
-        body.insert("tool_choice".to_string(), choice);
-    }
+    insert_anthropic_tools(&mut body, request)?;
     apply_anthropic_cache_breakpoints(
         &mut body,
         &request.request.cache.provider_breakpoints,
@@ -1238,17 +1195,19 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
     }
-    if !request.request.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            anthropic_tools_value(&request.request.tools),
-        );
-    }
+    insert_anthropic_tools(&mut body, request)?;
     apply_anthropic_cache_breakpoints(
         &mut body,
         &request.request.cache.provider_breakpoints,
         &request.request.request_id,
     )?;
+    if let Some(thinking) = request
+        .request
+        .provider_extensions
+        .get("anthropic.thinking")
+    {
+        body.insert("thinking".to_string(), thinking.clone());
+    }
     Ok(Value::Object(body))
 }
 
@@ -1477,6 +1436,15 @@ fn gemini_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
         if let Some(value) = full.get(key) {
             count.insert(key.to_string(), value.clone());
         }
+    }
+    if count.contains_key("systemInstruction") || count.contains_key("tools") {
+        let model = request
+            .route
+            .model_id
+            .strip_prefix("models/")
+            .unwrap_or(&request.route.model_id);
+        count.insert("model".to_string(), json!(format!("models/{model}")));
+        return Ok(json!({"generateContentRequest":count}));
     }
     Ok(Value::Object(count))
 }
@@ -2070,6 +2038,47 @@ fn reject_unbound_tool_execution(request: &BackendRequest) -> Result<(), Gateway
         .request
         .tool_policy
         .validate_tools(&request.request.tools, &request.request.request_id)
+}
+
+fn insert_anthropic_tools(
+    body: &mut Map<String, Value>,
+    request: &BackendRequest,
+) -> Result<(), GatewayError> {
+    if request.request.tools.is_empty() {
+        return Ok(());
+    }
+    body.insert(
+        "tools".to_string(),
+        anthropic_tools_value(&request.request.tools),
+    );
+    let mut choice = match &request.request.tool_policy.selection {
+        fte_types::ToolSelection::None => json!({"type":"none"}),
+        fte_types::ToolSelection::Auto => json!({"type":"auto"}),
+        fte_types::ToolSelection::Required => json!({"type":"any"}),
+        fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
+    };
+    if let Some(disable_parallel) = request
+        .request
+        .provider_extensions
+        .get("anthropic.disable_parallel_tool_use")
+    {
+        if !disable_parallel.is_boolean()
+            || matches!(
+                request.request.tool_policy.selection,
+                fte_types::ToolSelection::None
+            )
+        {
+            return Err(capability_error(
+                &request.request.request_id,
+                &request.route.backend_id,
+                "anthropic_parallel_tool_policy_invalid",
+                "disable_parallel_tool_use needs a boolean and an enabled tool choice",
+            ));
+        }
+        choice["disable_parallel_tool_use"] = disable_parallel.clone();
+    }
+    body.insert("tool_choice".to_string(), choice);
+    Ok(())
 }
 
 fn anthropic_tools_value(tools: &[fte_types::ToolDefinition]) -> Value {

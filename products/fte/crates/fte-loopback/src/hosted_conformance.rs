@@ -2113,3 +2113,257 @@ async fn chat_refusal_history_preserves_ordinary_controls_and_refuses_unsupporte
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
     assert!(captured.is_empty());
 }
+
+#[tokio::test]
+async fn hosted_gemini_count_keeps_plain_contents_and_wraps_system_context() {
+    let ordinary = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"Count this ordinary prompt."}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        ordinary.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    let contents = json!([{"role":"user","parts":[{"text":"Count this ordinary prompt."}]}]);
+    assert_eq!(captured, vec![json!({"contents":contents})]);
+
+    let mut with_system = ordinary;
+    with_system["system"] = json!("系統 instruction ∆");
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        with_system,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    assert_eq!(
+        captured,
+        vec![json!({
+            "generateContentRequest":{
+                "model":"models/fixture-model",
+                "contents":contents,
+                "systemInstruction":{"parts":[{"text":"系統 instruction ∆"}]}
+            }
+        })],
+        "only the documented nested envelope may carry system context"
+    );
+}
+
+#[tokio::test]
+async fn hosted_gemini_count_keeps_plain_contents_and_wraps_tool_context() {
+    let ordinary = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"Count this ordinary prompt."}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        ordinary.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    let contents = json!([{"role":"user","parts":[{"text":"Count this ordinary prompt."}]}]);
+    assert_eq!(captured, vec![json!({"contents":contents})]);
+
+    let mut with_tools = ordinary;
+    with_tools["tools"] = json!([{
+        "name":"lookup", "description":"Look up an owned record.",
+        "input_schema":{"type":"object","properties":{"name":{"type":"string"}}}
+    }]);
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        with_tools,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    assert_eq!(
+        captured,
+        vec![json!({
+            "generateContentRequest":{
+                "model":"models/fixture-model",
+                "contents":contents,
+                "tools":[{"functionDeclarations":[{
+                    "name":"lookup", "description":"Look up an owned record.",
+                    "parameters":{"type":"object","properties":{"name":{"type":"string"}}}
+                }]}]
+            }
+        })],
+        "only the documented nested envelope may carry function declarations"
+    );
+}
+
+#[tokio::test]
+async fn hosted_anthropic_count_preserves_direct_thinking_and_strict_admission() {
+    let plain = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"count me"}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        b"{}".to_vec(),
+        "/v1/messages/count_tokens",
+        plain.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count response")["input_tokens"],
+        4
+    );
+    assert_eq!(captured.len(), 1);
+    let plain_count = captured[0].clone();
+    assert_eq!(
+        plain_count,
+        json!({
+            "model":"fixture-model",
+            "messages":[{"role":"user","content":[{"type":"text","text":"count me"}]}]
+        })
+    );
+    for field in ["tool_choice", "disable_parallel_tool_use"] {
+        let mut unsupported = plain.clone();
+        unsupported[field] = if field == "tool_choice" {
+            json!({"type":"auto"})
+        } else {
+            json!(true)
+        };
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            b"{}".to_vec(),
+            "/v1/messages/count_tokens",
+            unsupported,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {text}");
+        assert!(
+            captured.is_empty(),
+            "unsupported direct-count field was dispatched: {captured:?}"
+        );
+    }
+    for thinking in [
+        json!({"type":"enabled","budget_tokens":1024}),
+        json!({"type":"adaptive"}),
+        json!({"type":"disabled"}),
+    ] {
+        let mut body = plain.clone();
+        body["thinking"] = thinking.clone();
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            b"{}".to_vec(),
+            "/v1/messages/count_tokens",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thinking}: {text}");
+        let mut expected = plain_count.clone();
+        expected["thinking"] = thinking;
+        assert_eq!(
+            captured,
+            vec![expected],
+            "direct count lost admitted thinking: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_anthropic_count_preflight_keeps_generation_tools_and_choice() {
+    let provider = json!({
+        "content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":4,"output_tokens":1}
+    });
+    let plain = json!({
+        "model":"fixture-model","max_tokens":16,"stream":true,"temperature":0.5,
+        "messages":[{"role":"user","content":"hello"}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        provider.to_string().into_bytes(),
+        "/v1/messages",
+        plain.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured.len(),
+        2,
+        "ordinary count and generation: {captured:?}"
+    );
+    assert_eq!(captured[0]["messages"], captured[1]["messages"]);
+    assert!(captured[0].get("tool_choice").is_none());
+    for field in ["max_tokens", "stream", "temperature"] {
+        assert!(captured[0].get(field).is_none(), "count included {field}");
+        assert_eq!(captured[1][field], plain[field]);
+    }
+    for choice in [
+        None,
+        Some(json!({"type":"none"})),
+        Some(json!({"type":"auto","disable_parallel_tool_use":false})),
+        Some(json!({"type":"any","disable_parallel_tool_use":true})),
+        Some(json!({"type":"tool","name":"lookup","disable_parallel_tool_use":false})),
+    ] {
+        let expected = choice.clone().unwrap_or_else(|| json!({"type":"auto"}));
+        let mut body = plain.clone();
+        body["tools"] = json!([{"name":"lookup","input_schema":{"type":"object"}}]);
+        if let Some(choice) = choice {
+            body["tool_choice"] = choice;
+        }
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/messages",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{expected}: {text}");
+        assert_eq!(captured.len(), 2, "count and generation: {captured:?}");
+        assert_eq!(
+            captured[1]["tool_choice"], expected,
+            "generation choice: {captured:?}"
+        );
+        assert_eq!(
+            captured[0]["tool_choice"], expected,
+            "count choice: {captured:?}"
+        );
+        let mut count_projection = captured[1].clone();
+        let fields = count_projection.as_object_mut().expect("generation body");
+        for field in ["max_tokens", "stream", "temperature"] {
+            fields.remove(field);
+        }
+        assert_eq!(
+            captured[0], count_projection,
+            "count and generation prompt diverged: {text}"
+        );
+    }
+}
