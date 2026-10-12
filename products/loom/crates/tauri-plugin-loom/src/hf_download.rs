@@ -306,6 +306,19 @@ mod tests {
         let paths = paths(root.path(), &url, sha, "model.gguf").expect("shared HF fixture");
         real_directory(paths.blob.parent().expect("shared HF fixture")).expect("shared HF fixture");
         fs::write(&paths.blob, bytes).expect("shared HF fixture");
+        let blob_identity = same_file::Handle::from_path(&paths.blob).expect("shared HF fixture");
+        let hard_link_peer = root.path().join("identity-peer.gguf");
+        fs::hard_link(&paths.blob, &hard_link_peer).expect("owned hard-link identity control");
+        assert_eq!(
+            blob_identity,
+            same_file::Handle::from_path(&hard_link_peer).expect("owned hard-link identity control")
+        );
+        let independent_copy = root.path().join("independent-copy.gguf");
+        fs::write(&independent_copy, bytes).expect("owned equal-byte identity control");
+        assert_ne!(
+            blob_identity,
+            same_file::Handle::from_path(&independent_copy).expect("owned equal-byte identity control")
+        );
         let request = GgufDownloadRequest::new(&url, &paths.snapshot, sha, 1024);
         for _ in 0..2 {
             let result = download_in_cache(
@@ -317,9 +330,21 @@ mod tests {
             .await
             .expect("shared HF fixture");
             assert_eq!(result.target_path, paths.snapshot);
+            assert_eq!(result.bytes, u64::try_from(bytes.len()).expect("owned fixture length"));
+            assert_eq!(result.sha256, sha);
+            assert_eq!(
+                same_file::Handle::from_path(&paths.snapshot).expect("shared HF fixture"),
+                blob_identity
+            );
+            #[cfg(unix)]
             assert_eq!(
                 fs::canonicalize(&paths.snapshot).expect("shared HF fixture"),
                 fs::canonicalize(&paths.blob).expect("shared HF fixture")
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                fs::read_link(&paths.snapshot).expect("shared HF fixture"),
+                PathBuf::from("../../blobs").join(sha.to_string())
             );
         }
         fs::write(&paths.blob, b"GGUFcorrupt-fixture").expect("shared HF fixture");
