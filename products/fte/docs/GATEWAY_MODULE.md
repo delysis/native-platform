@@ -119,6 +119,13 @@ Anthropic, and Gemini tools use that same typed output. Invalid or truncated
 terminal tool JSON fails explicitly; it is never replaced with an empty object.
 Gateway-owned tool execution remains separate from returning a client tool call.
 
+Gemini output Parts carrying `thoughtSignature` or `thought_signature` fail with
+`gemini_signed_part_unsupported` before that response or stream frame is
+normalized. The output projection supports unsigned tools and thought summaries.
+Earlier stream progress remains provisional, and
+the failure does not store a successful response. This refusal occurs after
+provider work and can reduce availability on signature-producing model modes.
+
 Alternative choices retain their group index through text progress and final
 projection. `GatewayResponse.output_groups` connects each alternative to its
 Items and stop reason. `OutputItemAdded.group_index` supplies the corresponding

@@ -2573,7 +2573,6 @@ struct ProviderStreamState {
     text: BTreeMap<usize, String>,
     function_arguments: BTreeMap<usize, String>,
     reasoning: BTreeMap<usize, String>,
-    gemini_signatures: BTreeMap<usize, Value>,
     anthropic_usage: Map<String, Value>,
     anthropic_signatures: BTreeMap<usize, String>,
     gemini_text_outputs: HashMap<usize, usize>,
@@ -2607,7 +2606,6 @@ impl ProviderStreamState {
             text: BTreeMap::new(),
             function_arguments: BTreeMap::new(),
             reasoning: BTreeMap::new(),
-            gemini_signatures: BTreeMap::new(),
             anthropic_usage: Map::new(),
             anthropic_signatures: BTreeMap::new(),
             gemini_text_outputs: HashMap::new(),
@@ -3192,6 +3190,7 @@ impl ProviderStreamState {
         value: Value,
         events: &mpsc::Sender<GatewayEvent>,
     ) -> Result<bool, GatewayError> {
+        reject_gemini_signed_parts(&value, &self.request_id, &self.route.backend_id)?;
         if let Some(usage) = value.get("usageMetadata") {
             self.usage = usage_from_gemini(usage, self.route.clone());
         }
@@ -3235,13 +3234,6 @@ impl ProviderStreamState {
                             .entry(output_index)
                             .or_default()
                             .push_str(text);
-                        if let Some(signature) = part
-                            .get("thoughtSignature")
-                            .or_else(|| part.get("thought_signature"))
-                        {
-                            self.gemini_signatures
-                                .insert(output_index, signature.clone());
-                        }
                         self.emit(
                             events,
                             GatewayEvent::ReasoningSummaryDelta {
@@ -3425,16 +3417,7 @@ impl ProviderStreamState {
                         .map(|signature| json!({"thinking":reasoning,"signature":signature}));
                     continue;
                 }
-                *opaque_continuation = self.gemini_signatures.get(&index).map(|signature| {
-                    json!({
-                        "role":"model",
-                        "parts":[{
-                            "text":reasoning,
-                            "thought":true,
-                            "thoughtSignature":signature
-                        }]
-                    })
-                });
+                *opaque_continuation = None;
             }
         }
         let mut output_groups = self
@@ -3979,6 +3962,38 @@ fn parse_anthropic(
     })
 }
 
+fn reject_gemini_signed_parts(
+    value: &Value,
+    request_id: &RequestId,
+    provider: &str,
+) -> Result<(), GatewayError> {
+    let signed = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|candidate| {
+            candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .any(|part| {
+            part.get("thoughtSignature").is_some() || part.get("thought_signature").is_some()
+        });
+    if signed {
+        let mut error = provider_response_error(
+            request_id,
+            provider,
+            "Gemini signed output Parts cannot be preserved by this gateway",
+        );
+        error.code = "gemini_signed_part_unsupported".to_string();
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn parse_gemini(
     value: &Value,
     request_id: &RequestId,
@@ -3986,6 +4001,7 @@ fn parse_gemini(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
+    reject_gemini_signed_parts(value, request_id, &route.backend_id)?;
     let candidates = value
         .get("candidates")
         .and_then(Value::as_array)
@@ -4009,23 +4025,10 @@ fn parse_gemini(
         {
             if let Some(value) = part.get("text").and_then(Value::as_str) {
                 if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                    let signature = part
-                        .get("thoughtSignature")
-                        .or_else(|| part.get("thought_signature"))
-                        .cloned();
                     output.push(fte_types::OutputItem::Reasoning {
                         id: format!("rs_{}", Uuid::new_v4()),
                         summary: vec![value.to_string()],
-                        opaque_continuation: signature.map(|signature| {
-                            json!({
-                                "role":"model",
-                                "parts":[{
-                                    "text":value,
-                                    "thought":true,
-                                    "thoughtSignature":signature
-                                }]
-                            })
-                        }),
+                        opaque_continuation: None,
                     });
                 } else {
                     text.push_str(value);

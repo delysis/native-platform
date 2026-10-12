@@ -2367,3 +2367,686 @@ async fn hosted_anthropic_count_preflight_keeps_generation_tools_and_choice() {
         );
     }
 }
+
+// C-GEMINI-STATE: these are fixed loopback transport fixtures, not model acceptance.
+async fn gemini_signed_state_result(
+    gateway: &Gateway,
+    request: fte_types::GatewayRequest,
+) -> (Vec<GatewayEvent>, Result<GatewayResponse, GatewayError>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut ticket = gateway
+            .execute(request)
+            .await
+            .expect("admitted fixture request");
+        let mut events = Vec::new();
+        while let Some(event) = ticket.events.recv().await {
+            let terminal = event.is_terminal();
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        (events, ticket.final_response().await)
+    })
+    .await
+    .expect("bounded public gateway result; timeout is not a signature witness")
+}
+
+async fn gemini_signed_state_round_trip(sse_response: bool, stream_request: bool) {
+    use fte_types::{InputItem, ModelSelector, ResponseStore};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    let ordinary = json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"ordinary café"}]},"finishReason":"STOP"}]});
+    let calls = json!({"candidates":[{"index":0,"content":{"role":"model","parts":[
+        {"functionCall":{"id":"call-paris","name":"weather","args":{"city":"Paris","index":999}}},
+        {"functionCall":{"id":"call-london","name":"weather","args":{"city":"London","index":7}}}
+    ]},"finishReason":"STOP"}]});
+    let replies = Arc::new(std::sync::Mutex::new(VecDeque::<Vec<Value>>::new()));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("owned fixture listener");
+    let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let provider_replies = Arc::clone(&replies);
+    let provider_capture = Arc::clone(&captured);
+    let fallback = ordinary.clone();
+    let provider =
+        axum::Router::new().fallback(move |uri: axum::http::Uri, Json(body): Json<Value>| {
+            let replies = Arc::clone(&provider_replies);
+            let captured = Arc::clone(&provider_capture);
+            let fallback = fallback.clone();
+            async move {
+                captured
+                    .lock()
+                    .expect("captured requests")
+                    .push((uri.to_string(), body));
+                let frames = replies
+                    .lock()
+                    .expect("fixed responses")
+                    .pop_front()
+                    .unwrap_or_else(|| vec![fallback]);
+                let bytes = if sse_response {
+                    // Separate SSE events remain separate even when TCP coalesces writes.
+                    frames
+                        .iter()
+                        .map(|frame| format!("data: {frame}\r\n\r\n"))
+                        .collect::<String>()
+                        .into_bytes()
+                } else {
+                    assert_eq!(frames.len(), 1, "JSON fixture is one complete response");
+                    frames[0].to_string().into_bytes()
+                };
+                let chunks = async_stream::stream! {
+                    // Deliberately split UTF-8, field names and CRLF in the server body.
+                    // This does not assert reqwest's eventual network chunk boundaries.
+                    for byte in bytes {
+                        tokio::task::yield_now().await;
+                        yield Ok::<_, std::convert::Infallible>(vec![byte]);
+                    }
+                };
+                Response::builder()
+                    .header(
+                        header::CONTENT_TYPE,
+                        if sse_response {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .body(Body::from_stream(chunks))
+                    .expect("fixed fragmented provider body")
+            }
+        });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("owned provider fixture");
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "fte-gemini-signed-state-{}",
+        fte_types::RequestId::new().0
+    ));
+    std::fs::create_dir(&directory).expect("fresh owned fixture directory");
+    let path = directory.join("responses.sqlite");
+    let make_gateway = |store: Arc<SqliteStore>| {
+        let gateway = Gateway::new(fte_router::GatewayDefaults::default());
+        gateway
+            .bind_response_store(store)
+            .expect("one current store owner");
+        let mut config = HostedProviderConfig::gemini(
+            "fixture",
+            "Fixture",
+            "fixture",
+            vec![fixture_model("fixture")],
+        );
+        config.endpoints.messages = Some(url.clone());
+        config.endpoints.count_tokens = None;
+        config.connect_timeout = Duration::from_secs(2);
+        config.request_timeout = Duration::from_secs(3);
+        gateway
+            .register_backend(Arc::new(
+                HostedProviderBackend::new(config, Arc::new(Secrets)).expect("real hosted decoder"),
+            ))
+            .expect("exact fixture route");
+        gateway
+    };
+    let decode = |body: Value| {
+        let wire: fte_protocols::OpenAiResponsesRequest =
+            serde_json::from_value(body).expect("public Responses request decoder");
+        let mut request = wire
+            .into_gateway(fte_protocols::EdgeDefaults {
+                privacy: fte_types::PrivacyPolicy::HostedAllowed,
+                profile: fte_types::RouteProfile::Auto,
+            })
+            .expect("public canonical request");
+        // HTTP model names are ExactModel, not a fabricated backend/model syntax.
+        // The embedding caller explicitly chooses an exact route for this journey.
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "fixture".into(),
+            model_id: "fixture-model".into(),
+        };
+        request.deadline.total_ms = Some(4_000);
+        request
+    };
+    let tools_body = |input: Value| {
+        json!({
+            "model":"fixture-model", "input":input, "store":true, "stream":stream_request,
+            "tools":[{"type":"function","name":"weather","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"weather"}
+        })
+    };
+    let store = Arc::new(SqliteStore::open(&path).expect("current fresh schema"));
+    let gateway = make_gateway(Arc::clone(&store));
+
+    // Ordinary success is an actual prerequisite, not a hand-built canonical oracle.
+    replies
+        .lock()
+        .expect("reply queue")
+        .push_back(vec![ordinary.clone()]);
+    let (events, result) = gemini_signed_state_result(
+        &gateway,
+        decode(json!({
+            "model":"fixture-model","input":"ordinary","store":true,"stream":stream_request
+        })),
+    )
+    .await;
+    let plain = result.expect("ordinary unsigned generation must work first");
+    assert_eq!(
+        fte_protocols::openai_responses_json(&plain)["output"][0]["content"][0]["text"],
+        "ordinary café"
+    );
+    assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+    assert_eq!(
+        store.get(&plain.id).expect("ordinary stored").as_ref(),
+        Some(&plain)
+    );
+
+    // Unsigned tool designation, IDs, argument meaning, order and client authority.
+    replies
+        .lock()
+        .expect("reply queue")
+        .push_back(vec![calls.clone()]);
+    let tool_request = decode(tools_body(json!("tools")));
+    assert_eq!(
+        tool_request.tool_policy.selection,
+        fte_types::ToolSelection::Named {
+            name: "weather".into()
+        }
+    );
+    assert!(matches!(
+        tool_request.tool_policy.execution,
+        fte_types::ToolExecutionPolicy::ClientOnly
+    ));
+    let (_, result) = gemini_signed_state_result(&gateway, tool_request).await;
+    let first = result.expect("ordinary unsigned tools must work before signed cases");
+    assert_eq!(first.output.len(), 2);
+    assert_eq!(first.output_groups.len(), 1);
+    assert_eq!(first.output_groups[0].output_indices, vec![0, 1]);
+    assert_eq!(
+        first.output_groups[0].finish_reason,
+        fte_types::FinishReason::ToolCalls
+    );
+    for (item, (id, city, index)) in first
+        .output
+        .iter()
+        .zip([("call-paris", "Paris", 999), ("call-london", "London", 7)])
+    {
+        match item {
+            fte_types::OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(call_id, id);
+                assert_eq!(name, "weather");
+                assert_eq!(arguments, &json!({"city":city,"index":index}));
+            }
+            _ => panic!("function designation was replaced by another output kind"),
+        }
+    }
+    let canonical = serde_json::to_vec(&first).expect("canonical serialization");
+    let decoded: GatewayResponse =
+        serde_json::from_slice(&canonical).expect("current canonical reader");
+    assert_eq!(decoded, first);
+    assert_eq!(
+        store.get(&first.id).expect("stored tools").as_ref(),
+        Some(&first)
+    );
+    gateway
+        .shutdown()
+        .await
+        .expect("first gateway fully drained");
+    drop(gateway);
+    drop(store);
+
+    // Real close/reopen of the current database: no migration or alternate reader.
+    let store = Arc::new(SqliteStore::open(&path).expect("reopen the same current schema"));
+    let reopened = store
+        .get(&first.id)
+        .expect("reopened lookup")
+        .expect("retained tool response");
+    assert_eq!(
+        serde_json::to_vec(&reopened).expect("reopened canonical bytes"),
+        canonical
+    );
+    assert_eq!(
+        store.get(&plain.id).expect("old ordinary row").as_ref(),
+        Some(&plain)
+    );
+    let gateway = make_gateway(Arc::clone(&store));
+    let public = fte_protocols::openai_responses_json(&reopened);
+    let mut history = vec![json!({"type":"message","role":"user","content":"tools"})];
+    history.extend(
+        public["output"]
+            .as_array()
+            .expect("actual public output")
+            .iter()
+            .cloned(),
+    );
+    history.push(
+        json!({"type":"function_call_output","call_id":"call-paris","output":"Paris result"}),
+    );
+    history.push(
+        json!({"type":"function_call_output","call_id":"call-london","output":"London result"}),
+    );
+    let mut replay = decode(tools_body(json!(history)));
+    replay.model = ModelSelector::ExactRoute {
+        backend_id: reopened.route.backend_id.clone(),
+        model_id: reopened.route.model_id.clone(),
+    };
+    replies
+        .lock()
+        .expect("reply queue")
+        .push_back(vec![ordinary.clone()]);
+    let (_, result) = gemini_signed_state_result(&gateway, replay).await;
+    result.expect("explicit unsigned history replays through public decoder after reopen");
+    {
+        let requests = captured.lock().expect("actual transport requests");
+        assert_eq!(requests.len(), 3);
+        let expected_path = if stream_request {
+            "/models/fixture-model:streamGenerateContent?alt=sse"
+        } else {
+            "/models/fixture-model:generateContent"
+        };
+        assert!(requests.iter().all(|(path, _)| path == expected_path));
+        let request = &requests[2].1;
+        assert_eq!(request["contents"][1]["role"], "model");
+        assert_eq!(
+            request["contents"][1]["parts"],
+            calls["candidates"][0]["content"]["parts"]
+        );
+        assert_eq!(
+            request["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "call-paris"
+        );
+        assert_eq!(
+            request["contents"][3]["parts"][0]["functionResponse"]["id"],
+            "call-london"
+        );
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["weather"])
+        );
+        assert!(request.get("previous_response_id").is_none());
+        assert!(!request.to_string().contains("thoughtSignature"));
+    }
+    let mut previous = decode(json!({"model":"fixture-model","input":"next","store":true,
+        "previous_response_id":first.id}));
+    assert_eq!(
+        gateway
+            .execute(previous.clone())
+            .await
+            .expect_err("Gemini has no provider handle")
+            .code,
+        "previous_response_handle_missing"
+    );
+    previous.storage.previous_response_id = None;
+    previous.routing.privacy = fte_types::PrivacyPolicy::LocalOnly;
+    assert_eq!(
+        gateway
+            .execute(previous)
+            .await
+            .expect_err("privacy still rejects hosted")
+            .class,
+        fte_types::ErrorClass::Privacy
+    );
+    let mut foreign = decode(json!({"model":"fixture-model","input":"foreign","store":false}));
+    foreign.input = fte_types::GenerationInput::Chat {
+        items: vec![InputItem::ProviderOpaque {
+            provider: "anthropic".into(),
+            item: json!({"role":"model","parts":[{"text":"foreign"}]}),
+        }],
+    };
+    assert_eq!(
+        gateway
+            .execute(foreign)
+            .await
+            .expect_err("foreign opaque provider state")
+            .code,
+        "provider_state_incompatible"
+    );
+    assert_eq!(
+        captured
+            .lock()
+            .expect("negative controls never dispatch")
+            .len(),
+        3
+    );
+
+    // The signature-looking string inside args is user data, not Part metadata.
+    let mut arguments_only = calls.clone();
+    arguments_only["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["thoughtSignature"] =
+        json!("argument-data");
+    replies
+        .lock()
+        .expect("reply queue")
+        .push_back(vec![arguments_only]);
+    let (_, result) =
+        gemini_signed_state_result(&gateway, decode(tools_body(json!("arguments")))).await;
+    let argument_response = result.expect("signature-named arguments are ordinary unsigned calls");
+    match &argument_response.output[0] {
+        fte_types::OutputItem::FunctionCall { arguments, .. } => {
+            assert_eq!(arguments["thoughtSignature"], "argument-data")
+        }
+        _ => panic!("argument-data tool must remain a function call"),
+    }
+
+    // Unsigned thought summaries remain ordinary output, not invented signed replay.
+    replies
+        .lock()
+        .expect("reply queue")
+        .push_back(vec![json!({"candidates":[{
+            "index":0,"content":{"role":"model","parts":[
+                {"thought":true,"text":"unsigned summary"},{"text":"ordinary answer"}
+            ]},"finishReason":"STOP"
+        }]})]);
+    let (_, result) =
+        gemini_signed_state_result(&gateway, decode(tools_body(json!("unsigned thought")))).await;
+    let unsigned_thought = result.expect("unsigned thought summaries remain supported");
+    assert!(unsigned_thought.output.iter().any(|item| matches!(item,
+        fte_types::OutputItem::Reasoning { summary, opaque_continuation: None, .. }
+        if summary == &vec!["unsigned summary".to_string()]
+    )));
+
+    // The admission and insertion owners still carry selection, not execution.
+    for (choice, mode) in [
+        (json!("none"), "NONE"),
+        (json!("auto"), "AUTO"),
+        (json!("required"), "ANY"),
+    ] {
+        let mut body = tools_body(json!("selection control"));
+        body["tool_choice"] = choice;
+        replies
+            .lock()
+            .expect("reply queue")
+            .push_back(vec![ordinary.clone()]);
+        let request = decode(body);
+        assert!(matches!(
+            request.tool_policy.execution,
+            fte_types::ToolExecutionPolicy::ClientOnly
+        ));
+        let (_, result) = gemini_signed_state_result(&gateway, request).await;
+        result.expect("ordinary selection mode");
+        let requests = captured.lock().expect("selection captured");
+        let request = &requests.last().expect("selection request").1;
+        assert_eq!(request["toolConfig"]["functionCallingConfig"]["mode"], mode);
+    }
+
+    // Each case exercises the same public decoder, hosted producer and store owner.
+    // Collect failures until after cleanup so Before exposes every signed shape.
+    let mut cases = Vec::<(&str, Vec<Value>)>::new();
+    for (label, part) in [
+        (
+            "signed-call",
+            json!({"functionCall":{"id":"signed-id","name":"weather","args":{"city":"Paris"}},"thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "signed-nonthought-text",
+            json!({"text":"signed text","thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "signed-thought-text",
+            json!({"text":"thought summary","thought":true,"thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "signature-only",
+            json!({"thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "empty-text-signature",
+            json!({"text":"","thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "snake-signature",
+            json!({"functionCall":{"name":"weather","args":{}},"thought_signature":"c2lnbmVkLXNlbnRpbmVs"}),
+        ),
+        (
+            "null-signature",
+            json!({"functionCall":{"name":"weather","args":{}},"thoughtSignature":null}),
+        ),
+        (
+            "empty-signature",
+            json!({"functionCall":{"name":"weather","args":{}},"thoughtSignature":""}),
+        ),
+    ] {
+        cases.push((label, vec![json!({"candidates":[{"index":0,"content":{"role":"model","parts":[part]},"finishReason":"STOP"}]})]));
+    }
+    let mut mixed = calls.clone();
+    mixed["candidates"][0]["content"]["parts"][1]["thoughtSignature"] =
+        json!("c2lnbmVkLXNlbnRpbmVs");
+    cases.push(("unsigned-sibling-before-signed", vec![mixed]));
+    let mut candidates = ordinary.clone();
+    candidates["candidates"].as_array_mut().expect("candidate array").push(json!({
+        "index":7,"content":{"role":"model","parts":[{"text":"alternate","thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}]},"finishReason":"STOP"
+    }));
+    cases.push(("signed-alternate-candidate", vec![candidates]));
+    if sse_response {
+        cases.push(("late-signature", vec![
+            json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"provisional café"}]}}]}),
+            json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"","thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"}]},"finishReason":"STOP"}]})
+        ]));
+        cases.push((
+            "late-call-signature",
+            vec![
+                json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{
+                    "functionCall":{"id":"late-call","name":"weather","args":{"city":"Paris"}}
+                }]}}]}),
+                json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{
+                "functionCall":{"id":"late-call","name":"weather","args":{"city":"Paris"}},
+                "thoughtSignature":"c2lnbmVkLXNlbnRpbmVs"
+            }]},"finishReason":"STOP"}]}),
+            ],
+        ));
+    }
+    let mut violations = Vec::new();
+    for (label, frames) in cases {
+        let before_dispatch = captured.lock().expect("request count").len();
+        let producer_parts = frames[0]["candidates"][0]["content"]["parts"].clone();
+        replies.lock().expect("reply queue").push_back(frames);
+        let request = decode(tools_body(json!(label)));
+        let request_id = request.request_id.clone();
+        let (events, result) = gemini_signed_state_result(&gateway, request).await;
+        let failed = match &result {
+            Err(error) => {
+                error.class == fte_types::ErrorClass::Provider
+                    && error.code == "gemini_signed_part_unsupported"
+                    && error.request_id == request_id
+                    && error.provider.as_deref() == Some("fixture")
+                    && !error.retryable
+                    && error.http_status == 502
+                    && !error.safe_detail.contains("c2lnbmVkLXNlbnRpbmVs")
+            }
+            Ok(_) => false,
+        };
+        if !failed {
+            violations.push(format!(
+                "{label}: signed output was not refused: {result:?}"
+            ));
+        }
+        if events.iter().filter(|event| event.is_terminal()).count() != 1
+            || !matches!(events.last(), Some(GatewayEvent::Failed { error, .. }) if error.code == "gemini_signed_part_unsupported")
+        {
+            violations.push(format!("{label}: expected exactly one failed terminal"));
+        }
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                GatewayEvent::ResponseCreated { response_id, .. } => Some(response_id.as_str()),
+                _ => None,
+            })
+            .expect("public created response identity");
+        if store.get(id).expect("failed response lookup").is_some() {
+            violations.push(format!("{label}: lossy response reached durable history"));
+        }
+        if !label.starts_with("late-")
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    GatewayEvent::OutputItemAdded { .. }
+                        | GatewayEvent::TextDelta { .. }
+                        | GatewayEvent::ReasoningSummaryDelta { .. }
+                        | GatewayEvent::FunctionArgumentsDelta { .. }
+                )
+            })
+        {
+            violations.push(format!(
+                "{label}: frame was partially normalized before refusal"
+            ));
+        }
+        if label == "late-signature"
+            && !events.iter().any(|event| {
+                matches!(event,
+                    GatewayEvent::TextDelta { delta, .. } if delta == "provisional café"
+                )
+            })
+        {
+            violations.push(format!("{label}: missing ordinary provisional progress"));
+        }
+        if events.iter().any(|event| {
+            matches!(
+                event,
+                GatewayEvent::OutputItemCompleted { .. }
+                    | GatewayEvent::ContentPartCompleted { .. }
+                    | GatewayEvent::Completed { .. }
+            )
+        }) {
+            violations.push(format!(
+                "{label}: refused output became authoritative completion"
+            ));
+        }
+        if label == "late-call-signature" {
+            let additions = events.iter().filter(|event| matches!(event,
+                GatewayEvent::OutputItemAdded { item: fte_types::OutputItem::FunctionCall { call_id, .. }, .. }
+                if call_id == "late-call"
+            )).count();
+            let arguments = events
+                .iter()
+                .filter(|event| {
+                    matches!(event,
+                        GatewayEvent::FunctionArgumentsDelta { delta, .. }
+                        if delta == &json!({"city":"Paris"}).to_string()
+                    )
+                })
+                .count();
+            if additions != 1 || arguments != 1 {
+                violations.push(format!(
+                    "{label}: prior call progress missing or signed frame changed it"
+                ));
+            }
+            let mut encoder = fte_protocols::OpenAiResponsesStreamEncoder::default();
+            let wire = events
+                .iter()
+                .filter_map(|event| encoder.encode(event))
+                .collect::<Vec<_>>();
+            if !wire.iter().any(|event| {
+                event.event == "response.output_item.added"
+                    && event.data["item"]["call_id"] == "late-call"
+                    && event.data["item"]["status"] == "in_progress"
+            }) || !wire.last().is_some_and(|event| {
+                event.event == "error" && event.data["code"] == "gemini_signed_part_unsupported"
+            }) || wire.iter().any(|event| {
+                event.event.ends_with(".done")
+                    || matches!(
+                        event.event.as_str(),
+                        "response.completed" | "response.incomplete"
+                    )
+            }) {
+                violations.push(format!(
+                    "{label}: public stream accepted provisional call as done"
+                ));
+            }
+        }
+        if captured.lock().expect("single dispatch").len() != before_dispatch + 1 {
+            violations.push(format!("{label}: unexpected retry or missing dispatch"));
+        }
+        if label == "signed-call"
+            && let Ok(response) = &result
+        {
+            // Preserve a genuine Before diagnostic through the stored public history.
+            // Refused After results never enter this branch or invent a replay Item.
+            let retained = store
+                .get(&response.id)
+                .expect("accepted signed row lookup")
+                .expect("accepted signed response stored by the real publication owner");
+            assert_eq!(&retained, response);
+            let public = fte_protocols::openai_responses_json(&retained);
+            let mut history = vec![json!({"type":"message","role":"user","content":"signed-call"})];
+            history.extend(
+                public["output"]
+                    .as_array()
+                    .expect("produced public history")
+                    .iter()
+                    .cloned(),
+            );
+            history.push(json!({"type":"function_call_output","call_id":"signed-id","output":"Paris result"}));
+            replies
+                .lock()
+                .expect("reply queue")
+                .push_back(vec![ordinary.clone()]);
+            let (_, replayed) =
+                gemini_signed_state_result(&gateway, decode(tools_body(json!(history)))).await;
+            replayed.expect("ordinary local response to accepted history replay");
+            let requests = captured
+                .lock()
+                .expect("actual signed history replay capture");
+            let replay_parts =
+                &requests.last().expect("signed history replay request").1["contents"][1]["parts"];
+            violations.push(format!(
+                "{label}: accepted producer Parts={producer_parts}; stored canonical={retained:?}; replay Parts={replay_parts}; producer equality={}",
+                replay_parts == &producer_parts
+            ));
+        }
+    }
+    // Prior successful rows survive every refusal without rewrite or repair.
+    assert_eq!(
+        store.get(&first.id).expect("retained original").as_ref(),
+        Some(&first)
+    );
+    assert_eq!(
+        store.get(&plain.id).expect("retained ordinary").as_ref(),
+        Some(&plain)
+    );
+    gateway
+        .shutdown()
+        .await
+        .expect("final gateway fully drained");
+    drop(gateway);
+    drop(store);
+    let _ = stop.send(());
+    match tokio::time::timeout(Duration::from_secs(3), &mut server).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => violations.push(format!("provider fixture join failed: {error}")),
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            violations.push("provider fixture did not drain within its cleanup bound".into());
+        }
+    }
+    std::fs::remove_dir_all(directory).expect("remove only the owned synthetic store");
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[tokio::test]
+async fn gemini_signed_state_json_public_history_and_reopen() {
+    gemini_signed_state_round_trip(false, false).await;
+}
+
+#[tokio::test]
+async fn gemini_signed_state_fragmented_sse_public_history_and_reopen() {
+    gemini_signed_state_round_trip(true, true).await;
+}
+
+#[tokio::test]
+async fn gemini_signed_state_json_fallback_public_history_and_reopen() {
+    gemini_signed_state_round_trip(false, true).await;
+}
