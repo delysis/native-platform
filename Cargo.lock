@@ -767,6 +767,7 @@ dependencies = [
  "attachment-native-host",
  "attachment-native-types",
  "clap",
+ "nix",
  "serde",
  "serde_json",
 ]
