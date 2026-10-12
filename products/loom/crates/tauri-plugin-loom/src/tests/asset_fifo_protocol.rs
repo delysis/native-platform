@@ -52,8 +52,11 @@ impl Drop for OwnedChild {
 
 fn record(root: &Path, name: &str, value: &serde_json::Value) {
     let pending = root.join(format!("{name}.pending"));
-    std::fs::write(&pending, serde_json::to_vec_pretty(value).expect("receipt JSON"))
-        .expect("write owned receipt");
+    std::fs::write(
+        &pending,
+        serde_json::to_vec_pretty(value).expect("receipt JSON"),
+    )
+    .expect("write owned receipt");
     std::fs::rename(pending, root.join(format!("{name}.json"))).expect("publish owned receipt");
 }
 
@@ -63,7 +66,9 @@ fn author_snapshot(store: &ProjectStore) -> serde_json::Value {
     let documents: Vec<_> = registry
         .iter()
         .map(|registered| {
-            let loaded = store.read_document(&registered.relative_path).expect("author document");
+            let loaded = store
+                .read_document(&registered.relative_path)
+                .expect("author document");
             serde_json::json!({
                 "registered": registered,
                 "active": loaded,
@@ -85,7 +90,10 @@ fn open_state(store: ProjectStore) -> (PluginState, CommandId) {
         .expect("reserve owned project")
         .finish_without_document_filesystem_watcher(Ok(store))
         .expect("admit owned project without a filesystem observer");
-    let session = snapshot.session_id.parse().expect("current session identifier");
+    let session = snapshot
+        .session_id
+        .parse()
+        .expect("current session identifier");
     (state, session)
 }
 
@@ -113,17 +121,30 @@ fn prepare_fixture(root: &Path) -> Fixture {
         for (path, text) in [
             (
                 "picture.md",
-                format!("# Author\n\nPreserve <3 and λ.\n\n![Image]({})\n", stored.markdown_path),
+                format!(
+                    "# Author\n\nPreserve <3 and λ.\n\n![Image]({})\n",
+                    stored.markdown_path
+                ),
             ),
-            ("unselected.md", "# Other\n\nNo selected image.\n".to_owned()),
+            (
+                "unselected.md",
+                "# Other\n\nNo selected image.\n".to_owned(),
+            ),
         ] {
-            store.create_document_if_absent(path, DocumentContent::Prose(text), "fixture")
+            store
+                .create_document_if_absent(path, DocumentContent::Prose(text), "fixture")
                 .expect("register author document");
         }
         Fixture {
             project_id,
-            selected_document: store.read_document("picture.md").expect("selected document").document_id,
-            unselected_document: store.read_document("unselected.md").expect("unselected document").document_id,
+            selected_document: store
+                .read_document("picture.md")
+                .expect("selected document")
+                .document_id,
+            unselected_document: store
+                .read_document("unselected.md")
+                .expect("unselected document")
+                .document_id,
             relative_asset: stored.relative_path,
             author: author_snapshot(store),
         }
@@ -141,8 +162,15 @@ fn request(uri: &str, method: http::Method, range: Option<&str>) -> http::Reques
 }
 
 fn response_receipt(response: &http::Response<Vec<u8>>) -> serde_json::Value {
-    let headers: std::collections::BTreeMap<_, _> = response.headers().iter()
-        .map(|(name, value)| (name.as_str(), value.to_str().expect("protocol ASCII header")))
+    let headers: std::collections::BTreeMap<_, _> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str(),
+                value.to_str().expect("protocol ASCII header"),
+            )
+        })
         .collect();
     serde_json::json!({ "status": response.status().as_u16(), "headers": headers, "body": response.body() })
 }
@@ -153,19 +181,32 @@ fn ordinary_image_controls(state: &PluginState, uri: &str, png: &[u8], root: &Pa
     assert_eq!(get.status(), http::StatusCode::OK);
     assert_eq!(get.body(), png);
     assert_eq!(get.headers()[http::header::CONTENT_TYPE], "image/png");
-    assert_eq!(get.headers()[http::header::CONTENT_LENGTH], png.len().to_string());
+    assert_eq!(
+        get.headers()[http::header::CONTENT_LENGTH],
+        png.len().to_string()
+    );
     assert_eq!(get.headers()[http::header::CACHE_CONTROL], "no-store");
     assert_eq!(get.headers()["x-content-type-options"], "nosniff");
     let head = loom_asset_protocol_response(state, "main", &request(uri, http::Method::HEAD, None));
     record(root, "ordinary-head", &response_receipt(&head));
     assert_eq!(head.status(), http::StatusCode::OK);
     assert!(head.body().is_empty());
-    assert_eq!(head.headers()[http::header::CONTENT_LENGTH], png.len().to_string());
-    let range = loom_asset_protocol_response(state, "main", &request(uri, http::Method::GET, Some("bytes=0-1")));
+    assert_eq!(
+        head.headers()[http::header::CONTENT_LENGTH],
+        png.len().to_string()
+    );
+    let range = loom_asset_protocol_response(
+        state,
+        "main",
+        &request(uri, http::Method::GET, Some("bytes=0-1")),
+    );
     record(root, "ordinary-range", &response_receipt(&range));
     assert_eq!(range.status(), http::StatusCode::PARTIAL_CONTENT);
     assert_eq!(range.body(), &png[..2]);
-    assert_eq!(range.headers()[http::header::CONTENT_RANGE], format!("bytes 0-1/{}", png.len()));
+    assert_eq!(
+        range.headers()[http::header::CONTENT_RANGE],
+        format!("bytes 0-1/{}", png.len())
+    );
 }
 
 fn ordinary_controls(
@@ -175,7 +216,10 @@ fn ordinary_controls(
     root: &Path,
 ) -> String {
     let asset = root.join("Project").join(&fixture.relative_asset);
-    let file_name = asset.file_name().and_then(std::ffi::OsStr::to_str).expect("canonical image name");
+    let file_name = asset
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("canonical image name");
     let token = |session, document| {
         let token = loom_asset_token(fixture.project_id, session, document, file_name)
             .expect("current canonical v3 token");
@@ -185,11 +229,30 @@ fn ordinary_controls(
     let png = std::fs::read(root.join("ordinary.png")).expect("ordinary PNG");
     ordinary_image_controls(state, &uri, &png, root);
     for (name, view, rejected_uri, status) in [
-        ("wrong-view", "auxiliary", uri.clone(), http::StatusCode::FORBIDDEN),
-        ("wrong-session", "main", token(CommandId::new(), fixture.selected_document), http::StatusCode::NOT_FOUND),
-        ("wrong-document", "main", token(session_id, fixture.unselected_document), http::StatusCode::NOT_FOUND),
+        (
+            "wrong-view",
+            "auxiliary",
+            uri.clone(),
+            http::StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong-session",
+            "main",
+            token(CommandId::new(), fixture.selected_document),
+            http::StatusCode::NOT_FOUND,
+        ),
+        (
+            "wrong-document",
+            "main",
+            token(session_id, fixture.unselected_document),
+            http::StatusCode::NOT_FOUND,
+        ),
     ] {
-        let rejected = loom_asset_protocol_response(state, view, &request(&rejected_uri, http::Method::GET, None));
+        let rejected = loom_asset_protocol_response(
+            state,
+            view,
+            &request(&rejected_uri, http::Method::GET, None),
+        );
         record(root, name, &response_receipt(&rejected));
         assert_eq!(rejected.status(), status);
         assert!(rejected.body().is_empty());
@@ -198,8 +261,10 @@ fn ordinary_controls(
 }
 
 fn run_protocol_child(root: &Path) {
-    let fixture: Fixture = serde_json::from_slice(&std::fs::read(root.join("fixture.json"))
-        .expect("owned fixture configuration")).expect("typed fixture configuration");
+    let fixture: Fixture = serde_json::from_slice(
+        &std::fs::read(root.join("fixture.json")).expect("owned fixture configuration"),
+    )
+    .expect("typed fixture configuration");
     let store = ProjectStore::open(root.join("Project")).expect("reopen owned project");
     assert_eq!(store.manifest().project_id, fixture.project_id);
     let (state, session_id) = open_state(store);
@@ -209,37 +274,58 @@ fn run_protocol_child(root: &Path) {
         author_snapshot(session.store.as_ref().expect("owned store"))
     };
     assert_eq!(author, fixture.author);
-    record(root, "ready", &serde_json::json!({ "uri": uri, "author": author }));
+    record(
+        root,
+        "ready",
+        &serde_json::json!({ "uri": uri, "author": author }),
+    );
     let mut permission = [0];
-    std::io::stdin().read_exact(&mut permission).expect("parent fixture ready signal");
+    std::io::stdin()
+        .read_exact(&mut permission)
+        .expect("parent fixture ready signal");
     assert_eq!(permission, [1]);
     record(root, "entered", &serde_json::json!({ "uri": uri }));
-    let response = loom_asset_protocol_response(&state, "main", &request(&uri, http::Method::GET, None));
+    let response =
+        loom_asset_protocol_response(&state, "main", &request(&uri, http::Method::GET, None));
     record(root, "returned", &response_receipt(&response));
     drop(state);
 }
 
 fn spawn_child(root: &Path) -> OwnedChild {
     let executable = std::env::current_exe().expect("current actual libtest executable");
-    let child = OwnedChild(Command::new(&executable)
-        .args(["--exact", TEST_NAME, "--nocapture"])
-        .env(CHILD_ROOT, root).stdin(Stdio::piped())
-        .stdout(std::fs::File::create(root.join("child.stdout")).expect("owned child stdout"))
-        .stderr(std::fs::File::create(root.join("child.stderr")).expect("owned child stderr"))
-        .spawn().expect("spawn only this protocol owner in a non-native child"));
+    let child = OwnedChild(
+        Command::new(&executable)
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ROOT, root)
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(root.join("child.stdout")).expect("owned child stdout"))
+            .stderr(std::fs::File::create(root.join("child.stderr")).expect("owned child stderr"))
+            .spawn()
+            .expect("spawn only this protocol owner in a non-native child"),
+    );
     let binary = std::fs::metadata(&executable).expect("current binary identity");
-    record(root, "child", &serde_json::json!({
-        "pid": child.0.id(), "executable": executable, "device": binary.dev(),
-        "inode": binary.ino(), "bytes": binary.len(), "root": root,
-        "source_manifest_dir": env!("CARGO_MANIFEST_DIR"), "test_name": TEST_NAME,
-        "native_application": false, "model_invoked": false,
-    }));
+    record(
+        root,
+        "child",
+        &serde_json::json!({
+            "pid": child.0.id(), "executable": executable, "device": binary.dev(),
+            "inode": binary.ino(), "bytes": binary.len(), "root": root,
+            "source_manifest_dir": env!("CARGO_MANIFEST_DIR"), "test_name": TEST_NAME,
+            "native_application": false, "model_invoked": false,
+        }),
+    );
     child
 }
 
 fn replace_with_fifo(asset: &Path) -> std::fs::Metadata {
     std::fs::remove_file(asset).expect("replace only the canonical owned asset");
-    assert!(Command::new("/usr/bin/mkfifo").arg(asset).status().expect("create owned unpaired FIFO").success());
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(asset)
+            .status()
+            .expect("create owned unpaired FIFO")
+            .success()
+    );
     let before = std::fs::symlink_metadata(asset).expect("owned FIFO identity");
     assert!(before.file_type().is_fifo());
     before
@@ -254,22 +340,45 @@ fn assert_reaped_outcome(
 ) {
     let after = std::fs::symlink_metadata(root.join("Project").join(&fixture.relative_asset))
         .expect("preserved owned FIFO");
-    let reopened = ProjectStore::open(root.join("Project")).expect("reopen after unconditional child reap");
+    let reopened =
+        ProjectStore::open(root.join("Project")).expect("reopen after unconditional child reap");
     let author = author_snapshot(&reopened);
     drop(reopened);
     record(root, "author-after", &author);
-    assert_eq!(author, fixture.author, "visible bytes, manifest, registry and active author heads");
+    assert_eq!(
+        author, fixture.author,
+        "visible bytes, manifest, registry and active author heads"
+    );
     assert!(after.file_type().is_fifo());
     assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-    assert_eq!((after.mode(), after.uid(), after.gid()), (before.mode(), before.uid(), before.gid()));
-    assert!(root.join("entered.json").is_file(), "actual current protocol read must be entered");
+    assert_eq!(
+        (after.mode(), after.uid(), after.gid()),
+        (before.mode(), before.uid(), before.gid())
+    );
+    assert!(
+        root.join("entered.json").is_file(),
+        "actual current protocol read must be entered"
+    );
     if !completed {
-        assert!(!root.join("returned.json").exists(), "protocol returned before a cleanup delay; this is not a FIFO-read witness");
+        assert!(
+            !root.join("returned.json").exists(),
+            "protocol returned before a cleanup delay; this is not a FIFO-read witness"
+        );
     }
-    assert!(completed, "authorized DocImage GET waited on an unpaired FIFO; child reaped: {status}; root={}", root.display());
-    assert!(status.success(), "protocol child failed: {status}; root={}", root.display());
-    let returned: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("returned.json"))
-        .expect("actual returned protocol receipt")).expect("returned receipt JSON");
+    assert!(
+        completed,
+        "authorized DocImage GET waited on an unpaired FIFO; child reaped: {status}; root={}",
+        root.display()
+    );
+    assert!(
+        status.success(),
+        "protocol child failed: {status}; root={}",
+        root.display()
+    );
+    let returned: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("returned.json")).expect("actual returned protocol receipt"),
+    )
+    .expect("returned receipt JSON");
     assert_eq!(returned["status"], http::StatusCode::NOT_FOUND.as_u16());
     assert_eq!(returned["body"], serde_json::json!([]));
 }
@@ -279,22 +388,35 @@ fn run_parent(root: &Path, fixture: &Fixture) {
     let ready = child.observe(Some(&root.join("ready.json")), Duration::from_secs(30));
     if !ready {
         let status = child.stop_and_reap();
-        record(root, "cleanup", &serde_json::json!({ "phase": "ordinary", "status": status.to_string() }));
-        panic!("ordinary protocol controls did not finish; child reaped: {status}; root={}", root.display());
+        record(
+            root,
+            "cleanup",
+            &serde_json::json!({ "phase": "ordinary", "status": status.to_string() }),
+        );
+        panic!(
+            "ordinary protocol controls did not finish; child reaped: {status}; root={}",
+            root.display()
+        );
     }
     let before = replace_with_fifo(&root.join("Project").join(&fixture.relative_asset));
     let mut stdin = child.0.stdin.take().expect("owned child ready channel");
-    stdin.write_all(&[1]).expect("allow actual protocol read after FIFO replacement");
+    stdin
+        .write_all(&[1])
+        .expect("allow actual protocol read after FIFO replacement");
     drop(stdin);
     let started = Instant::now();
     let completed = child.observe(None, Duration::from_secs(5));
     let observed = started.elapsed();
     let status = child.stop_and_reap();
-    record(root, "cleanup", &serde_json::json!({
-        "phase": "protocol", "completed_before_deadline": completed,
-        "deadline_ms": 5000, "observed_ms": observed.as_millis(),
-        "status": status.to_string(), "exit_code": status.code(),
-    }));
+    record(
+        root,
+        "cleanup",
+        &serde_json::json!({
+            "phase": "protocol", "completed_before_deadline": completed,
+            "deadline_ms": 5000, "observed_ms": observed.as_millis(),
+            "status": status.to_string(), "exit_code": status.code(),
+        }),
+    );
     assert_reaped_outcome(root, fixture, &before, completed, status);
 }
 
@@ -305,11 +427,17 @@ fn unpaired_fifo_is_refused_without_mutating_registered_documents() {
         return;
     }
     let parent = std::env::var_os(EVIDENCE_ROOT).map_or_else(std::env::temp_dir, PathBuf::from);
-    let root = tempfile::Builder::new().prefix("loom-asset-fifo-")
-        .tempdir_in(parent).expect("parent-owned fixture directory").keep();
+    let root = tempfile::Builder::new()
+        .prefix("loom-asset-fifo-")
+        .tempdir_in(parent)
+        .expect("parent-owned fixture directory")
+        .keep();
     println!("loom_asset_fifo_fixture={}", root.display());
     let fixture = prepare_fixture(&root);
-    std::fs::write(root.join("fixture.json"), serde_json::to_vec_pretty(&fixture)
-        .expect("fixture JSON")).expect("retain fixture configuration");
+    std::fs::write(
+        root.join("fixture.json"),
+        serde_json::to_vec_pretty(&fixture).expect("fixture JSON"),
+    )
+    .expect("retain fixture configuration");
     run_parent(&root, &fixture);
 }
