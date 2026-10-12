@@ -27,10 +27,12 @@ that all reusable view algorithms remain in Rust.
 
 ## Run
 
-Use an isolated synthetic project and the optimized, debuggable profile:
+Use an isolated synthetic project and the root `rust-toolchain.toml` pin (1.95.0).
+The root release profile is optimized; the historical `native-view` profile is no
+longer defined here.
 
 ```sh
-rustup run 1.92.0 cargo run --locked --profile native-view -p loom-easl-interface -- --project /absolute/path/to/scratch-project
+cargo run --locked --release -p loom-easl-interface -- --project /absolute/path/to/scratch-project
 ```
 
 On macOS, `--webview` adds an independent Wry child webview beside the native
@@ -42,8 +44,8 @@ This is a standalone experimental host, not the completed Tauri integration.
 
 New macOS projects use the current store's encrypted private-history policy;
 manuscripts and authored configuration remain readable. Existing plaintext
-projects are not silently converted. Follow `products/loom/AGENTS.md` for stable
-development signing before making a repeated-use application bundle.
+projects are not silently converted. A repeated-use application bundle still
+requires separate signing and native qualification.
 
 ## Responsibility boundary
 
@@ -58,26 +60,28 @@ development signing before making a repeated-use application bundle.
 | Preferred columns, vertical/page and logical line/document navigation | Shared `easl-text/library/navigation.easl`, native line facts |
 | Lossless Markdown/verse source, semantic edits and undo | `loom-markdown` |
 | Project worker, draft/checkpoint operations, settings snapshot, document creation | `loom-text-session` |
-| Exact saved source and UTF-8 boundary capture before completion | `loom-text-session::completion`, used by Tauri and the native worker |
+| Exact saved source and UTF-8 boundary capture before completion | `loom-text-session::completion`, exposed by the native worker; not used by the current Tauri plugin |
 | Authored settings and workspace interpretation | `loom-config` |
 | Files, exact UTF-8 source, immutable revisions and conditional persistence | `loom-store`, `loom-document`, `loom-types` |
 | Protected private payloads | Existing desktop vault and store integration |
 | Generation, models, context, imports and speech | Existing native services; full view adapters remain incomplete |
 
-`loom-text-session::configuration::read` is consumed by both the Tauri adapter
-and native project worker. It retains current `.mine.toml` precedence, existing
-`.loom.md` handling, parse errors and external-edit conflict rules. This
-experiment has no separate preference file or `loom-preferences` authority.
+`loom-text-session::configuration::read` belongs to the native project worker.
+Its `.mine.toml` precedence and registered `.loom.md` fallback remain experimental
+configuration behavior. The current Tauri plugin uses its own
+`workspace_template.rs` (`.loom.md`) and `loom-preferences`; it does not depend on
+`loom-text-session`, `loom-markdown` or `loom-config`. This experiment has no
+separate preference file or `loom-preferences` authority.
 The native view consumes theme mode and configured pane slots, titles and document
 references. Custom themes, settings refresh and visible configuration-error
 handling remain incomplete.
 
-The Tauri adapter and native worker also share `lifecycle::create_untitled`.
-Both persist through the current `loom-store`; their checkpoint/draft adapter
-orchestration still needs consolidation. `Untitled.md` naming, historical reservations and
-no-clobber file creation follow the current application. Both prose and verse
-retain their exact bytes; saving does not normalize line endings or add an undo
-transaction. No synthetic context manuscript is created. An auxiliary editor
+The native worker uses `loom-text-session::lifecycle::create_untitled`; the
+current Tauri plugin uses its own `create_untitled_document`. Both persist
+through `loom-store`, with distinct checkpoint/draft orchestration. `Untitled.md`
+naming, historical reservations and no-clobber creation remain required in each
+adapter. In this experiment, prose and verse saves retain exact bytes without
+normalizing line endings or adding an undo transaction. No synthetic context manuscript is created. An auxiliary editor
 must bind an existing document by its stable identity.
 
 The bounded project worker owns the exclusive project lease. After startup,
@@ -115,12 +119,12 @@ webview focus traversal and the full document lifecycle remain unfinished.
 Do not use this shell as an accepted
 replacement for Loom or infer completion from its titlebar.
 
-Completion source admission is now shared: the Tauri Weave path and the native
-project worker read and validate source through `loom-text-session::completion`.
-The worker exposes acknowledged revision/blob identities and refuses completion
-capture for uncheckpointed drafts or stale visible bytes. The EASL view still has
-no inference/promotion adapter or rendered ghost text; source admission alone
-does not make those controls functional.
+The native project worker exposes `loom-text-session::completion` capture with
+acknowledged revision/blob identities and refuses uncheckpointed drafts or stale
+visible bytes. The current Tauri Weave path does not use that module, and the
+EASL host does not dispatch completion capture. It still has no inference/
+promotion adapter or rendered ghost text; the worker API does not make those
+controls functional.
 
 The host now supports multiple native editor views of the active document, with
 one Markdown source and undo history. Layout, scroll, source/visual mode, stored
@@ -164,10 +168,13 @@ open. See the text crate README for the exact Pretext comparison boundary and
 ## Checks
 
 ```sh
-rustup run 1.92.0 cargo test --locked --profile native-view -p loom-text-session -p loom-markdown -p loom-easl-interface -p easl-native-text
-rustup run 1.92.0 cargo test --locked -p tauri-plugin-loom --lib workspace_template::tests
-rustup run 1.92.0 cargo test --locked -p tauri-plugin-loom --lib new_document_
+cargo test --locked -p loom-text-session -p loom-markdown -p loom-easl-interface
+cargo test --locked -p tauri-plugin-loom --lib workspace_template::tests
+cargo test --locked -p tauri-plugin-loom --lib new_document_
 ```
+
+These are check entry points, not current execution receipts. Canonical
+`easl-native-text` controls belong to the separately pinned EASL workspace.
 
 The manual `render_appearance_review` and `profile_native_view` tests use
 synthetic text. Set `EASL_REVIEW_DIRECTORY` to an isolated output folder for the
