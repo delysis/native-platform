@@ -19,8 +19,9 @@ does not compile, install, or authorize speech by default. See
 [Module and Repository Map](docs/MODULE_MAP.md).
 
 The desktop commands, Rust-only plugin, and optional loopback API now share one
-application-owned `Gateway`. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md)
-records the verified boundary and the live acceptance work still required.
+application-owned `Gateway`. The [historical native handoff](docs/LLAMA_NATIVE_KIT_HANDOFF.md)
+and [historical robustness audit](docs/ROBUSTNESS_AUDIT.md) retain their original
+scope.
 
 ## What works
 
