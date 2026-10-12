@@ -70,22 +70,9 @@ function preserveProseEndSpaces(markdown: string): string {
 }
 
 /**
- * Return the canonical byte surface shared by the visual document and store.
- *
- * Loom's parser encodes a single trailing prose-block space as a character
- * reference before parsing, so ProseMirror preserves the writer's separator
- * and serializes it back to the same byte. The function remains the
- * single normalization boundary for callers, but no longer creates a second,
- * shorter manuscript identity behind the mounted editor.
- */
-export function normalizeVisualMarkdownSource(markdown: string): string {
-  return markdown;
-}
-
-/**
  * Serialize the live ProseMirror document to the one canonical byte sequence
  * that both persistence and completion anchoring consume. Local edits and
- * externally restored Markdown must cross the same normalization boundary.
+ * externally restored Markdown use the same serializer.
  */
 export function serializeVisualMarkdown(document: ProseMirrorNode): string {
   return defaultMarkdownSerializer.serialize(document) + (document.attrs.terminalSuffix ?? '');

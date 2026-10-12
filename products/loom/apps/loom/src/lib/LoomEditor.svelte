@@ -17,7 +17,6 @@
   import { objectNavigation } from './objectNavigation';
   import { shaderCodeBlockView } from './shaderCodeBlock';
   import {
-    normalizeVisualMarkdownSource,
     parseVisualMarkdown,
     serializeVisualMarkdown
   } from './markdownSafety';
@@ -158,9 +157,8 @@
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
-  let lastEmitted = normalizeVisualMarkdownSource(value);
+  let lastEmitted = value;
   let projectionTimer: number | undefined;
-  let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
   let completionMutationAuthorized = false;
   let composing = false;
@@ -512,15 +510,6 @@
   function scheduleProjection(delay = 240): void {
     if (projectionTimer !== undefined) return;
     projectionTimer = window.setTimeout(projectDocument, delay);
-  }
-
-  function scheduleExternalNormalization(original: string, normalized: string): void {
-    if (original === normalized) return;
-    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
-    normalizationTimer = window.setTimeout(() => {
-      normalizationTimer = undefined;
-      if (view && value === original && lastEmitted === normalized) onChange(normalized);
-    }, 0);
   }
 
   export function flushPending(): boolean {
@@ -1188,7 +1177,7 @@
   }
 
   onMount(() => {
-    const initialMarkdown = normalizeVisualMarkdownSource(value);
+    const initialMarkdown = value;
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
@@ -1371,7 +1360,6 @@
     });
     observeVisualBoundary('visual_mount', value, view.state.doc, { focused: view.hasFocus() });
     reportSelection(view.state);
-    scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
     scheduleGhostPresentationSynchronization();
     window.addEventListener('resize', reportGhostVisibility);
@@ -1394,24 +1382,23 @@
   onDestroy(() => referenceDiagnostics.dispose());
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
-    const normalized = normalizeVisualMarkdownSource(value);
+    const incoming = value;
     // The parent replaced the document authority. Neither a captured
     // selection nor a delayed repair from the previous node tree can cross
     // this boundary.
     clearFormattingSelection();
     invalidateSelectionAccessibility();
-    lastEmitted = normalized;
-    const replacement = stateFor(normalized);
+    lastEmitted = incoming;
+    const replacement = stateFor(incoming);
     const next = collaborative ? applyRemoteDocument(view.state, replacement.doc) : replacement;
     observeVisualBoundary('visual_external_value', view.state.doc, next.doc, {
       incoming_utf8_bytes: new TextEncoder().encode(value).byteLength,
-      normalization_exact: value === normalized, focused: view.hasFocus()
+      normalization_exact: value === incoming, focused: view.hasFocus()
     }, value);
     view.updateState(next);
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
-    scheduleExternalNormalization(value, normalized);
   }
 
   $: if (view) {
@@ -1451,7 +1438,6 @@
   onDestroy(() => {
     clearFormattingSelection();
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
-    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (rejectionFrame !== undefined) window.cancelAnimationFrame(rejectionFrame);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (ghostSynchronizationFrame !== undefined) {
