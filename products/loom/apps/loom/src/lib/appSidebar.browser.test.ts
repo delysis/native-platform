@@ -434,3 +434,164 @@ it('teardown settles an actually admitted fixture draft and drains queued sessio
   expect(heldDrafts.size).toBe(0);
   expect((await currentProjectSession()).project_id).toBe(project.project_id);
 });
+
+import type { AudioRecording } from './ipc';
+import type { ContextAttachmentPresentation, DocumentContextSnapshot, SpeechRecordingSnapshot } from './types';
+
+// Current native-shaped audio replies exercise the mounted App, real editors and
+// IPC FIFO. No microphone, native attachment store or durable receipt is executed.
+async function setupAudioRecording() {
+  const fixture = await setup();
+  const nativeInvoke = transport.invoke.getMockImplementation()!;
+  const originalDispose = disposeFixture!;
+  let closed = false, serial = 0, checkpointSerial = 0;
+  let revision = fixture.opened.summary.revision_id!, visibleBlob = fixture.opened.visible_blob_id;
+  let recording: SpeechRecordingSnapshot | null = null;
+  let stopFailure = false, contextFailure = false;
+  const captures: AudioRecording[] = [], attachments: ContextAttachmentPresentation[] = [];
+  const operations: Array<{ command: string; args: Record<string, unknown> }> = [];
+  const scope = (args: Record<string, unknown>): void => {
+    expect(args).toMatchObject({ projectId: fixture.project.project_id, sessionId: fixture.project.session_id });
+    if ('documentId' in args) expect(args.documentId).toBe(fixture.opened.summary.document_id);
+  };
+  const digest = async (text: string): Promise<string> => Array.from(new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  ), byte => byte.toString(16).padStart(2, '0')).join('');
+  transport.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
+    if (!['plugin:loom|audio_record_start', 'plugin:loom|audio_record_stop', 'plugin:loom|speech_input_record_cancel',
+      'plugin:loom|document_context_add_many', 'plugin:loom|document_draft_upsert', 'plugin:loom|document_checkpoint'].includes(command)) {
+      return nativeInvoke(command, args);
+    }
+    fixture.calls.push({ command, args }); operations.push({ command, args: { ...args } });
+    if (closed) throw fixtureDisposed;
+    scope(args);
+    switch (command) {
+      case 'plugin:loom|audio_record_start':
+        expect(recording).toBeNull();
+        recording = { recording_id: `fixture-recording-${++serial}`, project_id: fixture.project.project_id,
+          session_id: fixture.project.session_id, document_id: fixture.opened.summary.document_id, target: 'context', phase: 'recording' };
+        return recording;
+      case 'plugin:loom|audio_record_stop': {
+        expect(args.recordingId).toBe(recording?.recording_id);
+        if (stopFailure) { stopFailure = false; throw { code: 'fixture_capture_refused', message: 'Owned capture was not saved', retryable: true }; }
+        const attachmentId = serial.toString(16).padStart(64, '0'), mediaId = (serial + 256).toString(16).padStart(64, '0');
+        const captured: AudioRecording = { recording_id: recording!.recording_id, document_id: fixture.opened.summary.document_id,
+          attachment: { id: attachmentId, file_name: `Recording ${serial}.wav`, byte_count: 684, detected_format: 'wav',
+            coverage_complete: true, text_bytes: 0, media_kinds: ['audio'], warnings: [], inline_markdown: '', editable_markdown: null,
+            media_markdown: `![Audio: Recording ${serial}.wav](loom-attachment:${attachmentId}/${mediaId})` },
+          activity: { duration_ms: 320, signal_detected: true, limit_reached: false, segments: [{ start_ms: 0, end_ms: 320 }] } };
+        captures.push(captured); recording = null; return captured;
+      }
+      case 'plugin:loom|document_context_add_many': {
+        const captured = captures.at(-1)!;
+        expect(args.attachmentIds).toEqual([captured.attachment.id]);
+        if (contextFailure) { contextFailure = false; throw { code: 'fixture_context_refused', message: 'Owned attachment publication was refused', retryable: true }; }
+        expect(attachments.some(item => item.id === captured.attachment.id)).toBe(false);
+        attachments.push({ id: captured.attachment.id, file_name: captured.attachment.file_name, detected_format: 'wav',
+          coverage_complete: true, text_bytes: 0, source_revision: `fixture-source-${serial}`, excerpt: null, presentation_kind: 'audio', warnings: [],
+          media: [{ id: `fixture-media-${serial}`, kind: 'audio', mime_type: 'audio/wav', sha256: (serial + 256).toString(16).padStart(64, '0'),
+            byte_count: 684, preview_token: null, waveform_peaks: null }] });
+        return { markdown: '', attachments: [...attachments], materials: attachments.map(item => ({ attachment_id: item.id,
+          source_revision: item.source_revision, excerpt: null })), revision: `fixture-context-${serial}` } satisfies DocumentContextSnapshot;
+      }
+      case 'plugin:loom|speech_input_record_cancel':
+        expect(args.recordingId).toBe(recording?.recording_id);
+        { const cancelled = { ...recording!, phase: 'cancelled' as const }; recording = null; return cancelled; }
+      case 'plugin:loom|document_draft_upsert': {
+        expect(args.sourceRevisionId).toBe(revision); expect(args.kind).toBe('prose');
+        const blob = await digest(String(args.text)); if (closed) throw fixtureDisposed;
+        return { document_id: fixture.opened.summary.document_id, source_revision_id: revision, blob_id: blob,
+          version: String(BigInt(String(args.expectedVersion)) + 1n), kind: 'prose', updated_at_unix_ms: Date.now(), replayed: false } satisfies TransientDraftWriteReceipt;
+      }
+      case 'plugin:loom|document_checkpoint': {
+        expect(args.expectedRevisionId).toBe(revision); expect(args.expectedVisibleBlobId).toBe(visibleBlob); expect(args.kind).toBe('prose');
+        const sourceRevision = revision, blob = await digest(String(args.text)); if (closed) throw fixtureDisposed;
+        revision = `fixture-checkpoint-${++checkpointSerial}`; visibleBlob = blob;
+        return { command_id: String(args.commandId), command_kind: 'checkpoint', project_id: fixture.project.project_id, schema_version: 1,
+          source_revision_id: sourceRevision, result_revision_id: revision, result_blob_id: blob, request_fingerprint: null, replayed: false,
+          visible_projection: { status: 'applied' }, artifact_ids: [], completed_at_unix_ms: Date.now() } satisfies CommandReceipt;
+      }
+    }
+  });
+  disposeFixture = async () => {
+    closed = true;
+    // Hash continuations have a definite refusal, then the original fixture
+    // settles any admitted held request and drains the owning FIFO before reset.
+    await originalDispose();
+  };
+  return { ...fixture, captures, attachments, operations,
+    failNextStop: () => { stopFailure = true; }, failNextContext: () => { contextFailure = true; } };
+}
+
+it.each(['visual', 'source'] as const)('actual %s audio insertion retains capture, same-ID retries, mode guard and Escape cancellation', async surface => {
+  const fixture = await setupAudioRecording();
+  await tick(); await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  if (surface === 'source') {
+    expect(key(document.body, 'm', { metaKey: true, shiftKey: true }).defaultPrevented).toBe(true);
+    await expect.element(page.getByRole('textbox', { name: 'Markdown source editor', exact: true })).toBeVisible();
+  }
+  const editor = (): HTMLElement => document.querySelector<HTMLElement>(surface === 'source' ? '.source-editor-shell textarea' : '.ProseMirror')!;
+  const readSurface = (): unknown => surface === 'source' ? (editor() as HTMLTextAreaElement).value : {
+    text: editor().textContent,
+    audio: [...editor().querySelectorAll('audio')].map(media => ({ label: media.getAttribute('aria-label'), source: media.getAttribute('src') }))
+  };
+  const start = async (): Promise<void> => {
+    editor().focus(); await userEvent.keyboard('{End}');
+    await page.getByRole('button', { name: 'Record audio', exact: true }).click();
+    await expect.element(page.getByRole('button', { name: 'Stop recording', exact: true })).toBeVisible();
+  };
+  const assertAttached = async (index: number): Promise<void> => {
+    const captured = fixture.captures[index], markdown = captured.attachment.media_markdown!;
+    if (surface === 'source') await expect.poll(() => (editor() as HTMLTextAreaElement).value).toContain(markdown);
+    else await expect.poll(() => editor().querySelector(`audio[aria-label="Audio: ${captured.attachment.file_name}"]`)?.getAttribute('src')).toBe(
+      `v2-project-1-session-1-document-1-${captured.attachment.id}-${(index + 257).toString(16).padStart(64, '0')}`
+    );
+    expect(key(document.body, 's', { metaKey: true }).defaultPrevented).toBe(true);
+    await expect.poll(() => fixture.operations.filter(item => item.command === 'plugin:loom|document_checkpoint').at(-1)?.args.text).toContain(markdown);
+    const text = String(fixture.operations.filter(item => item.command === 'plugin:loom|document_checkpoint').at(-1)!.args.text);
+    expect(text.startsWith('Original manuscript')).toBe(true); expect(text.split(markdown)).toHaveLength(2);
+    if (surface === 'source' && index === 0) expect(text).toBe('Original manuscript' + markdown);
+    expect(fixture.attachments[index].id).toBe(captured.attachment.id);
+    await currentProjectSession(); await tick();
+  };
+
+  // Ordinary capture and exact attachment Markdown reach the actual editor and
+  // checkpoint transport before either failure/retry or cancellation is tested.
+  await start(); await page.getByRole('button', { name: 'Stop recording', exact: true }).click();
+  await expect.element(page.getByRole('button', { name: 'Record audio', exact: true })).toBeVisible();
+  await assertAttached(0);
+
+  const ordinary = readSurface(); fixture.failNextStop(); await start();
+  await page.getByRole('button', { name: 'Stop recording', exact: true }).click();
+  await expect.element(page.getByRole('button', { name: 'Retry saving recording', exact: true })).toBeVisible();
+  expect(readSurface()).toEqual(ordinary); expect(fixture.captures).toHaveLength(1);
+  await page.getByRole('button', { name: 'Retry saving recording', exact: true }).click();
+  await expect.element(page.getByRole('button', { name: 'Record audio', exact: true })).toBeVisible();
+  const stopAttempts = fixture.operations.filter(item => item.command === 'plugin:loom|audio_record_stop');
+  expect(stopAttempts.map(item => item.args.recordingId)).toEqual(['fixture-recording-1', 'fixture-recording-2', 'fixture-recording-2']);
+  await assertAttached(1);
+
+  const prior = readSurface(); fixture.failNextContext(); await start();
+  await page.getByRole('button', { name: 'Stop recording', exact: true }).click();
+  await expect.element(page.getByRole('button', { name: 'Retry saving recording', exact: true })).toBeVisible();
+  expect(readSurface()).toEqual(prior); expect(fixture.captures).toHaveLength(3); expect(fixture.attachments).toHaveLength(2);
+  const stopCount = fixture.operations.filter(item => item.command === 'plugin:loom|audio_record_stop').length;
+  await page.getByRole('button', { name: 'Retry saving recording', exact: true }).click();
+  await expect.element(page.getByRole('button', { name: 'Record audio', exact: true })).toBeVisible();
+  expect(fixture.operations.filter(item => item.command === 'plugin:loom|audio_record_stop')).toHaveLength(stopCount);
+  expect(fixture.operations.filter(item => item.command === 'plugin:loom|document_context_add_many').slice(-2).map(item => item.args.attachmentIds)).toEqual(
+    [[fixture.captures[2].attachment.id], [fixture.captures[2].attachment.id]]
+  );
+  await assertAttached(2);
+
+  const attached = readSurface(); await start();
+  expect(key(document.body, 'm', { metaKey: true, shiftKey: true }).defaultPrevented).toBe(true);
+  await tick(); expect(editor()).not.toBeNull(); expect(readSurface()).toEqual(attached);
+  expect(key(document.body, 'Escape').defaultPrevented).toBe(true);
+  await expect.element(page.getByRole('button', { name: 'Record audio', exact: true })).toBeVisible();
+  expect(readSurface()).toEqual(attached); expect(fixture.captures).toHaveLength(3); expect(fixture.attachments).toHaveLength(3);
+  expect(fixture.operations.filter(item => item.command === 'plugin:loom|speech_input_record_cancel').map(item => item.args.recordingId)).toEqual(['fixture-recording-4']);
+  expect(fixture.operations.filter(item => item.command === 'plugin:loom|audio_record_start')).toHaveLength(4);
+  expect(fixture.calls.some(item => /speech_input_record_(start|stop)|speech_input_status|speech_input_cancel$/.test(item.command))).toBe(false);
+  await currentProjectSession(); await tick(); expect(fixture.heldDrafts.size).toBe(0);
+});

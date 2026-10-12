@@ -80,7 +80,6 @@ button:disabled { cursor: default; opacity: .45; }
 .suggestions-toggle svg path { fill: currentColor; stroke: none; }
 .shuttle-toggle svg { stroke-width: 1.5; }
 .microphone-toggle.recording { color: var(--danger); background: color-mix(in srgb, var(--danger) 11%, transparent); }
-.microphone-toggle.transcribing { color: var(--warning); background: color-mix(in srgb, #c58a24 10%, transparent); }
 .microphone-toggle.needs-attention { color: var(--danger); }
 .outline-toggle:hover, .outline-toggle[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); }
 .more-button, .icon-button, .bare-button {
@@ -434,8 +433,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .empty-project p { color: var(--muted); line-height: 1.6; }
 .toast { position: fixed; z-index: 20; right: 18px; bottom: 18px; max-width: 420px; display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: 9px; color: white; box-shadow: var(--shadow); }
 .toast.error { background: #743b38; }
-.toast.speech-recovery { background: var(--moss-dark); bottom: 82px; }
-.toast.speech-recovery button { font-size: 13px; text-decoration: underline; }
 .toast button { border: 0; color: white; background: transparent; cursor: pointer; font-size: 18px; }
 
 @media (max-width: 900px) {

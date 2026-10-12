@@ -62,7 +62,6 @@
     applyCoWriter,
     applicationClosePending,
     cancelGeneration,
-    cancelSpeechInput,
     cancelSpeechRecording,
     cancelModelDownload,
     checkpointDocument,
@@ -89,7 +88,6 @@
     getCompletionSnapshot,
     getBuildModelPolicy,
     getModelDownloadStatus,
-    getSpeechInputStatus,
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
@@ -129,10 +127,8 @@
     setFocusMode,
     setDocumentContextSnapshot,
     setSuggestions as setSuggestionsPolicy,
-    startSpeechRecording,
     startWeave,
     startModelDownload,
-    stopSpeechRecording,
     unloadModel,
     normalizeFailure,
     upsertTransientDraft
@@ -383,8 +379,6 @@
     ProjectSnapshot,
     ReconciliationPreview,
     SaveState,
-    SpeechInputSnapshot,
-    SpeechInputTarget,
     SpeechRecordingSnapshot,
     TransientDraftSnapshot,
     DocumentContextSnapshot,
@@ -411,9 +405,8 @@
     end: number;
   };
   type SpeechInsertionAnchor =
-    | { kind: 'visual'; target: SpeechInputTarget; anchor: VisualTextInsertionAnchor }
-    | { kind: 'source'; target: 'manuscript'; anchor: SourceTextInsertionAnchor }
-    | { kind: 'context-source'; target: 'context'; value: string; start: number; end: number };
+    | { kind: 'visual'; anchor: VisualTextInsertionAnchor }
+    | { kind: 'source'; anchor: SourceTextInsertionAnchor };
 
   let desktop = false;
   let buildModelPolicy: BuildModelPolicySummary | null = null;
@@ -755,7 +748,6 @@
     captureMaterialOrigin(); activeMaterial = null; materialsOpen = true; addMenuOpen = false;
   }
 
-  let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
   let contextAttachments: ContextAttachmentPresentation[] = [];
@@ -805,12 +797,9 @@
   let coWriterOperationSerial = 0;
   let coWriterError = '';
   let speechRecording: SpeechRecordingSnapshot | null = null;
-  let speechInput: SpeechInputSnapshot | null = null;
   let speechStarting = false;
   let speechError = '';
-  let speechPollTimer: number | undefined;
   let speechInsertionAnchor: SpeechInsertionAnchor | null = null;
-  let speechRecovery: { transcript: string; target: SpeechInputTarget } | null = null;
   let speechProjectId = '';
   let unlistenNativeAttachmentDrop: (() => void) | undefined;
   let outlineToggle: HTMLButtonElement | undefined;
@@ -1782,7 +1771,6 @@
     contextVisualEditor = null;
     contextSourceTextarea = undefined;
     speechInsertionAnchor = null;
-    speechRecovery = null;
     contextFormatting = {
       block: 'body',
       bold: false,
@@ -1804,17 +1792,12 @@
     coWriterName = '';
     coWriterError = '';
     speechInsertionAnchor = null;
-    speechRecovery = null;
   }
 
   $: if ((project?.project_id ?? '') !== speechProjectId) {
     speechProjectId = project?.project_id ?? '';
-    if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
-    speechPollTimer = undefined;
     speechRecording = null;
-    speechInput = null;
     speechInsertionAnchor = null;
-    speechRecovery = null;
     speechStarting = false;
     speechError = '';
   }
@@ -2002,159 +1985,16 @@
   }
 
   function speechInputActive(): boolean {
-    return Boolean(speechRecording || speechInput);
+    return Boolean(speechRecording);
   }
 
-  function speechTarget(): SpeechInputTarget {
-    return contextPaneOpen ? focusedSpeechTarget : 'manuscript';
-  }
-
-  function rememberSpeechEditor(event: FocusEvent, target: SpeechInputTarget): void {
-    if (event.target instanceof HTMLElement && event.target.closest('[contenteditable="true"], textarea')) {
-      focusedSpeechTarget = target;
-    }
-  }
-
-  function captureSpeechInsertionAnchor(target: SpeechInputTarget): SpeechInsertionAnchor | null {
-    if (target === 'context') {
-      if (mode === 'visual') {
-        const anchor = contextVisualEditor?.captureTextInsertionAnchor() ?? null;
-        return anchor ? { kind: 'visual', target, anchor } : null;
-      }
-      const textarea = contextSourceTextarea;
-      return textarea && !textarea.disabled
-        ? {
-            kind: 'context-source',
-            target,
-            value: textarea.value,
-            start: textarea.selectionStart,
-            end: textarea.selectionEnd
-          }
-        : null;
-    }
+  function captureSpeechInsertionAnchor(): SpeechInsertionAnchor | null {
     if (mode === 'visual') {
       const anchor = visualEditor?.captureTextInsertionAnchor() ?? null;
-      return anchor ? { kind: 'visual', target, anchor } : null;
+      return anchor ? { kind: 'visual', anchor } : null;
     }
     const anchor = sourceEditor?.captureTextInsertionAnchor() ?? null;
-    return anchor ? { kind: 'source', target, anchor } : null;
-  }
-
-  function insertSpeechTranscript(snapshot: SpeechInputSnapshot): boolean {
-    if (!snapshot.transcript) return false;
-    const insertion = speechInsertionAnchor;
-    if (!insertion || insertion.target !== snapshot.target) return false;
-    if (insertion.kind === 'visual') {
-      const editor = insertion.target === 'context' ? contextVisualEditor : visualEditor;
-      return editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript) ?? false;
-    }
-    if (insertion.kind === 'context-source') {
-      if (!contextPaneOpen || mode !== 'source') return false;
-      const textarea = contextSourceTextarea;
-      if (!textarea || textarea.disabled || textarea.value !== insertion.value) return false;
-      textarea.setRangeText(
-        snapshot.transcript,
-        insertion.start,
-        insertion.end,
-        'end'
-      );
-      updateContextText(textarea.value);
-      textarea.focus({ preventScroll: true });
-      return true;
-    }
-    return mode === 'source'
-      ? sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript) ?? false
-      : false;
-  }
-
-  function insertRecoveredSpeech(): void {
-    const recovery = speechRecovery;
-    if (!recovery) return;
-    const inserted = recovery.target === 'context'
-      ? mode === 'visual'
-        ? contextVisualEditor?.insertTextAtSelection(recovery.transcript) ?? false
-        : (() => {
-            const textarea = contextSourceTextarea;
-            if (!textarea || textarea.disabled) return false;
-            textarea.setRangeText(
-              recovery.transcript,
-              textarea.selectionStart,
-              textarea.selectionEnd,
-              'end'
-            );
-            updateContextText(textarea.value);
-            textarea.focus({ preventScroll: true });
-            return true;
-          })()
-      : mode === 'visual'
-        ? visualEditor?.insertTextAtSelection(recovery.transcript) ?? false
-        : sourceEditor?.insertTextAtSelection(recovery.transcript) ?? false;
-    if (inserted) {
-      speechRecovery = null;
-      speechError = '';
-      announce('Recovered dictation inserted at the current caret');
-    }
-  }
-
-  function scheduleSpeechStatusPoll(snapshot: SpeechInputSnapshot): void {
-    if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
-    speechPollTimer = window.setTimeout(() => {
-      speechPollTimer = undefined;
-      void pollSpeechStatus(snapshot);
-    }, 350);
-  }
-
-  async function acceptSpeechSnapshot(snapshot: SpeechInputSnapshot): Promise<void> {
-    if (speechInput?.request_id !== snapshot.request_id) return;
-    speechInput = snapshot;
-    if (snapshot.phase === 'transcribing' || snapshot.phase === 'cancel_requested') {
-      scheduleSpeechStatusPoll(snapshot);
-      return;
-    }
-    if (snapshot.phase === 'completed') {
-      const inScope =
-        project?.project_id === snapshot.project_id &&
-        project.session_id === snapshot.session_id &&
-        document?.summary.document_id === snapshot.document_id;
-      if (!inScope || !insertSpeechTranscript(snapshot)) {
-        speechRecovery = snapshot.transcript
-          ? { transcript: snapshot.transcript, target: snapshot.target }
-          : null;
-        speechError = snapshot.transcript
-          ? 'Dictation finished after its insertion point changed. The transcript is preserved for recovery.'
-          : 'Dictation finished without any text.';
-        announce(speechError);
-      } else {
-        speechRecovery = null;
-        speechError = '';
-        announce('Dictation inserted');
-      }
-    } else if (snapshot.phase === 'failed') {
-      speechError = snapshot.error_message ?? 'Local speech recognition failed.';
-      recordLocalFailure(snapshot.error_code ?? 'speech_input_failed', speechError);
-      announce('Dictation needs attention');
-    } else {
-      announce('Dictation cancelled');
-    }
-    speechInsertionAnchor = null;
-    speechInput = null;
-  }
-
-  async function pollSpeechStatus(expected: SpeechInputSnapshot): Promise<void> {
-    if (speechInput?.request_id !== expected.request_id) return;
-    try {
-      const snapshot = await getSpeechInputStatus(
-        expected.project_id,
-        expected.session_id,
-        expected.request_id
-      );
-      await acceptSpeechSnapshot(snapshot);
-    } catch (error) {
-      if (speechInput?.request_id !== expected.request_id) return;
-      speechError = normalizeFailure(error).message;
-      recordFailure(error);
-      speechInput = null;
-    }
+    return anchor ? { kind: 'source', anchor } : null;
   }
 
   async function beginSpeechRecording(): Promise<void> {
@@ -2162,10 +2002,9 @@
     const captured = {
       projectId: project.project_id,
       sessionId: project.session_id,
-      documentId: document.summary.document_id,
-      target: speechTarget()
+      documentId: document.summary.document_id
     };
-    const insertion = captureSpeechInsertionAnchor('manuscript');
+    const insertion = captureSpeechInsertionAnchor();
     speechStarting = true;
     speechError = '';
     try {
@@ -2187,7 +2026,6 @@
       announce('Recording audio locally');
     } catch (error) {
       speechRecording = null;
-      speechInput = null;
       speechInsertionAnchor = null;
       speechError = normalizeFailure(error).message;
       recordFailure(error);
@@ -2244,13 +2082,6 @@
         );
         speechRecording = null;
         speechInsertionAnchor = null;
-      } else if (speechInput) {
-        const snapshot = await cancelSpeechInput(
-          speechInput.project_id,
-          speechInput.session_id,
-          speechInput.request_id
-        );
-        await acceptSpeechSnapshot(snapshot);
       }
       announce('Dictation cancellation requested');
     } catch (error) {
@@ -2263,7 +2094,6 @@
 
   function toggleSpeechInput(): void {
     if (speechRecording) void finishSpeechRecording();
-    else if (speechInput) void cancelActiveSpeech();
     else void beginSpeechRecording();
   }
 
@@ -2401,7 +2231,7 @@
 
   function closeContextPane(): boolean {
     if (
-      (speechRecording?.target === 'context' || speechInput?.target === 'context') &&
+      speechRecording?.target === 'context' &&
       speechInputActive()
     ) {
       announce('Finish or cancel dictation before closing its context insertion point');
@@ -2933,7 +2763,6 @@
       unlistenNativeAttachmentDrop = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (contextTextSaveTimer !== undefined) window.clearTimeout(contextTextSaveTimer);
-      if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (projectFilesystemRefreshTimer !== undefined) {
         window.clearTimeout(projectFilesystemRefreshTimer);
@@ -10889,28 +10718,23 @@
         {#if document && !activeMaterial && !materialsOpen}
           <button
             class:recording={Boolean(speechRecording) && !speechError}
-            class:transcribing={Boolean(speechInput)}
             class:needs-attention={Boolean(speechError)}
             class="titlebar-button microphone-toggle"
             type="button"
             aria-label={speechRecording
               ? speechError ? 'Retry saving recording' : 'Stop recording'
-              : speechInput
-                ? 'Cancel speech recognition'
-                : 'Record audio'}
+              : 'Record audio'}
             aria-describedby="speech-input-help"
             aria-pressed={Boolean(speechRecording)}
             title={speechError || (speechRecording
               ? 'Stop recording'
-              : speechInput
-                ? 'Recognizing locally — click to cancel'
-                : cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)
-                  ? 'Record audio for this document — shared with your cabal'
-                  : 'Record audio for this document')}
+              : cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)
+                ? 'Record audio for this document — shared with your cabal'
+                : 'Record audio for this document')}
             disabled={!desktop || !document || speechStarting || (editorReadonly && !speechInputActive())}
             on:click={toggleSpeechInput}
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
-          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio is attached to this document. Shared documents also share their recordings.')}</span>
+          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : 'Audio is attached to this document. Shared documents also share their recordings.')}</span>
         {/if}
         {#if !activeMaterial && !materialsOpen}
         <button class="titlebar-button" class:suggestions-toggle={suggestionInteraction === 'ghost'} class:loompad-toggle={suggestionInteraction === 'loompad'}
@@ -11145,7 +10969,6 @@
             class:drop-active={contextDropActive}
             class="completion-context-pane"
             data-attachment-drop="context"
-            on:focusin={(event) => rememberSpeechEditor(event, 'context')}
             aria-label="Completion context"
             role="region"
           >
@@ -11360,7 +11183,7 @@
             </div>
           {/if}
 
-          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={(event) => { materialOriginPane = null; rememberSpeechEditor(event, 'manuscript'); }}>
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={() => { materialOriginPane = null; }}>
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}
@@ -12018,13 +11841,6 @@
       {:else}
         <button type="button" on:click={clearFailure} aria-label="Dismiss error">×</button>
       {/if}
-    </div>
-  {/if}
-  {#if speechRecovery && project}
-    <div class="toast speech-recovery" role="alert">
-      <span>Dictation is preserved because its original insertion point changed.</span>
-      <button type="button" on:click={insertRecoveredSpeech}>Insert at current caret</button>
-      <button type="button" on:click={() => { speechRecovery = null; }} aria-label="Discard preserved dictation">×</button>
     </div>
   {/if}
   <div class="sr-only" aria-live="polite">{liveRegion}</div>
