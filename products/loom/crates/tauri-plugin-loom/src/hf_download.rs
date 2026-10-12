@@ -311,13 +311,15 @@ mod tests {
         fs::hard_link(&paths.blob, &hard_link_peer).expect("owned hard-link identity control");
         assert_eq!(
             blob_identity,
-            same_file::Handle::from_path(&hard_link_peer).expect("owned hard-link identity control")
+            same_file::Handle::from_path(&hard_link_peer)
+                .expect("owned hard-link identity control")
         );
         let independent_copy = root.path().join("independent-copy.gguf");
         fs::write(&independent_copy, bytes).expect("owned equal-byte identity control");
         assert_ne!(
             blob_identity,
-            same_file::Handle::from_path(&independent_copy).expect("owned equal-byte identity control")
+            same_file::Handle::from_path(&independent_copy)
+                .expect("owned equal-byte identity control")
         );
         let request = GgufDownloadRequest::new(&url, &paths.snapshot, sha, 1024);
         for _ in 0..2 {
@@ -330,7 +332,10 @@ mod tests {
             .await
             .expect("shared HF fixture");
             assert_eq!(result.target_path, paths.snapshot);
-            assert_eq!(result.bytes, u64::try_from(bytes.len()).expect("owned fixture length"));
+            assert_eq!(
+                result.bytes,
+                u64::try_from(bytes.len()).expect("owned fixture length")
+            );
             assert_eq!(result.sha256, sha);
             assert_eq!(
                 same_file::Handle::from_path(&paths.snapshot).expect("shared HF fixture"),
