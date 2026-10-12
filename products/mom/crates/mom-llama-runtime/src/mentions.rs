@@ -18,9 +18,8 @@ use crate::kv_cache::ensure_persona_prefix;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::mcp::mcp_platform_blocker;
 use crate::mcp::{
-    McpCallToolOutput, McpServerConfig, McpTool, cached_persona_mcp_tool_contract,
-    exact_mcp_server_config_sha256, load_mcp_db, mcp_call_tool_supervised_with_config,
-    validate_frozen_mcp_server,
+    McpCallToolOutput, McpServerConfig, exact_mcp_server_config_sha256, load_mcp_db,
+    mcp_call_tool_supervised_with_config, validate_frozen_mcp_server,
 };
 use crate::native_runtime::{
     model_configuration_for_profile, resident_model_for_configuration,
@@ -30,9 +29,7 @@ use crate::now_ms;
 use crate::operation_scope::{
     MentionCancelControl, MentionCancelKey, MentionCancelRegistry, OperationScope,
 };
-use crate::personas::{
-    MAX_PERSONA_TOOL_BINDINGS, conversation_and_group_handles, persona_instantiate,
-};
+use crate::personas::{conversation_and_group_handles, persona_instantiate};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use crate::tool_loop::{ToolPermissionPolicy, tool_permission_policy, validate_tool_arguments};
@@ -40,14 +37,11 @@ use anyhow::{Result, anyhow};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use fs2::FileExt;
 use handoff::handoff_messages;
-use llama_native_engine::{ControlledGenerationSubmission, NativeModelHandle};
+use llama_native_engine::NativeModelHandle;
 use llama_native_types::{
-    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, ConstraintArtifactReference,
-    ControlProgram, ControlledGenerationBatchRequest, ControlledGenerationCase,
-    DistributionObservationPolicy, ExactTokenPrompt, ExtendedSamplerProgram, GenerationEventKind,
-    GenerationInput, GenerationMetrics, GenerationOutput, GenerationRequest, GenerationState,
-    ModelFingerprint, NativeModelConfig, SamplingConfig, SharedPrefixBatchRequest,
-    StructuredConstraint, TerminalSelector,
+    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
+    GenerationMetrics, GenerationOutput, GenerationRequest, GenerationState, ModelFingerprint,
+    NativeModelConfig, SamplingConfig, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -66,13 +60,10 @@ use uuid::Uuid;
 const INVOCATIONS_NAMESPACE: &str = "mention-invocations.v1";
 const ACTIVE_APPROVALS_NAMESPACE: &str = "mention-active-approvals.v1";
 const MAX_TARGETS: usize = 4;
-const PERSONA_TOOL_DECISION_MAX_TOKENS: u32 = 512;
 const PERSONA_TOOL_APPROVAL_TTL_MS: u128 = 5 * 60 * 1000;
 const PERSONA_TOOL_CLOCK_ANCHOR_TOLERANCE_MS: u128 = 2_000;
 const MAX_ACTIVE_APPROVAL_INVOCATIONS: usize = 64;
 const MAX_VISIBLE_TOOL_APPROVALS: usize = 16;
-const MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
-const MAX_PERSONA_TOOL_MANIFEST_BYTES: usize = 128 * 1024;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionTargetKind {
@@ -2357,14 +2348,6 @@ fn platform_monotonic_ms() -> Result<u128> {
     anyhow::bail!("durable monotonic Persona approval deadlines are unsupported on this platform")
 }
 
-fn capture_persona_tool_deadline_clock(wall_now_ms: u128) -> Result<PersonaToolDeadlineClock> {
-    let monotonic_created_ms = platform_monotonic_ms()?;
-    Ok(PersonaToolDeadlineClock {
-        monotonic_created_ms,
-        boot_wall_anchor_ms: wall_now_ms.saturating_sub(monotonic_created_ms),
-    })
-}
-
 #[derive(Clone)]
 pub struct PersonaToolApprovalRecovery {
     store: RuntimeStore,
@@ -3306,17 +3289,6 @@ where
                 continue;
             }
         };
-        let tools = match resolve_mention_tools(&[]) {
-            Ok(tools) => tools,
-            Err(blocker) => {
-                invocation.results.push(blocked_target_result(
-                    snapshot,
-                    GenerationState::Failed,
-                    &blocker.message,
-                ));
-                continue;
-            }
-        };
         let handoff = match handoff_messages(
             &handle,
             &settings,
@@ -3327,7 +3299,6 @@ where
             &user_message_id,
             &addressed,
             &participant_names,
-            &tools,
         ) {
             Ok(handoff) => handoff,
             Err(blocker) => {
@@ -3365,7 +3336,6 @@ where
         selected_sources.extend(handoff.receipt.attachment_sources.iter().cloned());
         planned.push(PlannedTarget {
             snapshot: snapshot.clone(),
-            model_path: model_path.to_path_buf(),
             model_config,
             handle,
             messages: handoff.messages,
@@ -3374,11 +3344,9 @@ where
             model_fingerprint: handoff.receipt.model_fingerprint,
             text_prompt_tokens: handoff.text_prompt_tokens,
             cached_prefix: cache_use.map(|cache| cache.sequence),
-            tools,
         });
     }
 
-    let mut pending_continuations = Vec::new();
     let completions =
         execution::execute_groups(scope, &invocation_id, planned, &settings, options, on_event)?;
     for (outcome, targets) in completions {
@@ -3389,54 +3357,6 @@ where
                         .iter()
                         .find(|target| target.snapshot.target_id == output.branch_id)
                     {
-                        let (output, tool_receipt_ids) = if output.state
-                            == GenerationState::Completed
-                            && !target.tools.is_empty()
-                        {
-                            match finish_tool_bound_mention(
-                                scope,
-                                target,
-                                output,
-                                &invocation_id,
-                                &invocation.host_conversation_id,
-                                &invocation.user_message_id,
-                                &settings,
-                            ) {
-                                Ok(ToolBoundMentionFinish::Final {
-                                    output,
-                                    tool_receipt_ids,
-                                }) => (output, tool_receipt_ids),
-                                Ok(ToolBoundMentionFinish::Pending {
-                                    approval,
-                                    continuation,
-                                }) => {
-                                    invocation.tool_approvals.push(approval);
-                                    pending_continuations.push(*continuation);
-                                    continue;
-                                }
-                                Err(blocker) => {
-                                    let state = if mention_cancellation_requested(
-                                        scope,
-                                        &invocation_id,
-                                        &target.snapshot.target_id,
-                                    ) {
-                                        GenerationState::Cancelled
-                                    } else {
-                                        GenerationState::Failed
-                                    };
-                                    let mut blocked = blocked_target_result(
-                                        &target.snapshot,
-                                        state,
-                                        &blocker.message,
-                                    );
-                                    blocked.real_engine_invoked = true;
-                                    invocation.results.push(blocked);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            (output, Vec::new())
-                        };
                         let cancelled = execution::terminal_cancelled(
                             scope,
                             &invocation_id,
@@ -3464,7 +3384,7 @@ where
                             metrics: output.metrics,
                             cache_id: target.cache_id.clone(),
                             cache_reused,
-                            tool_receipt_ids,
+                            tool_receipt_ids: Vec::new(),
                             real_engine_invoked: output.real_engine_invoked,
                             fake_fixture: output.fake_fixture,
                         });
@@ -3492,34 +3412,18 @@ where
             .position(|target| target.target_id == result.target_id)
             .unwrap_or(usize::MAX)
     });
-    invocation.state = if invocation
-        .tool_approvals
-        .iter()
-        .any(|approval| approval.state == MentionToolApprovalState::Pending)
-    {
-        MentionInvocationState::AwaitingApproval
-    } else {
-        invocation_state(&invocation.results)
-    };
+    invocation.state = invocation_state(&invocation.results);
     invocation.updated_at = now_ms().to_string();
     let has_completed_response = invocation.results.iter().any(|result| {
         result.real_engine_invoked
             && !result.fake_fixture
             && result.state == GenerationState::Completed
             && !result.text.trim().is_empty()
-    }) || pending_continuations.iter().any(|continuation| {
-        continuation.provisional_output.real_engine_invoked
-            && !continuation.provisional_output.fake_fixture
-            && continuation.provisional_output.state == GenerationState::Completed
     });
     let real_engine_invoked = invocation
         .results
         .iter()
-        .any(|result| result.real_engine_invoked && !result.fake_fixture)
-        || pending_continuations.iter().any(|continuation| {
-            continuation.provisional_output.real_engine_invoked
-                && !continuation.provisional_output.fake_fixture
-        });
+        .any(|result| result.real_engine_invoked && !result.fake_fixture);
     if !has_completed_response {
         save_invocation(&invocation)?;
         return Ok(CommandResult::blocked_with_evidence(
@@ -3555,9 +3459,7 @@ where
     host.messages.push(user_message);
     host.active_leaf_message_id = Some(user_message_id.clone());
     host.updated_at = now_ms().to_string();
-    if pending_continuations.is_empty() {
-        append_attributed_results(host, &mut invocation);
-    }
+    append_attributed_results(host, &mut invocation);
     let generated_message_ids = std::iter::once(user_message_id.clone())
         .chain(
             invocation
@@ -3578,9 +3480,7 @@ where
         &selected_sources,
         INVOCATIONS_NAMESPACE,
         MentionInvocationDb::default,
-        |invocations| {
-            upsert_invocation_with_continuations(invocations, &invocation, pending_continuations)
-        },
+        |invocations| upsert_invocation_with_continuations(invocations, &invocation, Vec::new()),
         write_active_approval_index,
     ) {
         Ok(committed) => committed,
@@ -3645,7 +3545,6 @@ fn ambiguous_resolution_blocker(resolution: &TargetResolution) -> Option<Blocker
 
 struct PlannedTarget {
     snapshot: MentionTargetSnapshot,
-    model_path: PathBuf,
     model_config: NativeModelConfig,
     handle: NativeModelHandle,
     messages: Vec<ChatMessage>,
@@ -3654,18 +3553,6 @@ struct PlannedTarget {
     model_fingerprint: ModelFingerprint,
     text_prompt_tokens: usize,
     cached_prefix: Option<llama_native_types::SequenceStateBlob>,
-    tools: Vec<BoundMentionTool>,
-}
-
-enum ToolBoundMentionFinish {
-    Final {
-        output: GenerationOutput,
-        tool_receipt_ids: Vec<String>,
-    },
-    Pending {
-        approval: MentionToolApproval,
-        continuation: Box<FrozenMentionToolContinuation>,
-    },
 }
 
 struct MentionCancelLifecycle {
@@ -3804,17 +3691,6 @@ fn mention_cancellation_requested(
         .is_some_and(|control| control.cancellation_requested())
 }
 
-#[derive(Debug, Clone)]
-struct BoundMentionTool {
-    contract: McpTool,
-    server: String,
-    server_config: McpServerConfig,
-    policy: ToolPermissionPolicy,
-    server_config_sha256: String,
-    frozen_server_config_sha256: String,
-    tool_schema_sha256: String,
-}
-
 fn resolve_recipient_targets(
     ids: &[String],
     contacts: &[Conversation],
@@ -3888,614 +3764,6 @@ fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
     })
 }
 
-fn resolve_mention_tools(
-    bindings: &[crate::conversation_store::ToolBinding],
-) -> std::result::Result<Vec<BoundMentionTool>, Blocker> {
-    if bindings.len() > MAX_PERSONA_TOOL_BINDINGS {
-        return Err(Blocker::new(
-            "persona_tool_binding_limit_exceeded",
-            format!("A Persona may attach at most {MAX_PERSONA_TOOL_BINDINGS} external tools."),
-            vec!["Remove tool bindings before running this Persona.".to_string()],
-        ));
-    }
-    let mut tools = Vec::with_capacity(bindings.len());
-    let mut seen = BTreeSet::new();
-    for binding in bindings {
-        if !seen.insert((binding.server.as_str(), binding.tool.as_str())) {
-            return Err(Blocker::new(
-                "mention_tool_binding_duplicate",
-                format!(
-                    "The Persona attaches `{}/{}` more than once.",
-                    binding.server, binding.tool
-                ),
-                vec!["Remove the duplicate tool binding in Settings.".to_string()],
-            ));
-        }
-        let reviewed = cached_persona_mcp_tool_contract(&binding.server, &binding.tool)
-            .map_err(|error| {
-                Blocker::new(
-                    "mention_tool_contract_failed",
-                    error.to_string(),
-                    vec!["Check this Persona's attached tools in Settings.".to_string()],
-                )
-            })?
-            .map_err(|(_, blocker)| blocker)?;
-        let contract = reviewed.tool;
-        let policy = effective_persona_tool_policy(
-            tool_permission_policy(&binding.server, &binding.tool).map_err(|error| {
-                Blocker::new(
-                    "mention_tool_permission_failed",
-                    error.to_string(),
-                    vec![
-                        "Review configured external-process tool permissions in Settings."
-                            .to_string(),
-                    ],
-                )
-            })?,
-        );
-        let tool_schema_sha256 = sha256_json_value(&contract.input_schema).map_err(|error| {
-            Blocker::new(
-                "mention_tool_schema_identity_failed",
-                error.to_string(),
-                vec!["Review the attached MCP tool schema.".to_string()],
-            )
-        })?;
-        tools.push(BoundMentionTool {
-            contract,
-            server: binding.server.clone(),
-            server_config: reviewed.frozen_server_config,
-            policy,
-            server_config_sha256: reviewed.server_config_sha256,
-            frozen_server_config_sha256: reviewed.frozen_server_config_sha256,
-            tool_schema_sha256,
-        });
-    }
-    validate_resolved_mention_tools(&tools)?;
-    Ok(tools)
-}
-
-fn validate_resolved_mention_tools(tools: &[BoundMentionTool]) -> std::result::Result<(), Blocker> {
-    if tools.len() > MAX_PERSONA_TOOL_BINDINGS {
-        return Err(Blocker::new(
-            "persona_tool_binding_limit_exceeded",
-            format!("A Persona may attach at most {MAX_PERSONA_TOOL_BINDINGS} external tools."),
-            vec!["Remove tool bindings before running this Persona.".to_string()],
-        ));
-    }
-    let mut aggregate_schema_bytes = 0usize;
-    for tool in tools {
-        let schema_bytes = serde_json::to_vec(&tool.contract.input_schema).map_err(|error| {
-            Blocker::new(
-                "mention_tool_schema_invalid",
-                error.to_string(),
-                vec!["Review the attached MCP tool input schema.".to_string()],
-            )
-        })?;
-        if schema_bytes.len() > MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES {
-            return Err(Blocker::new(
-                "mention_tool_schema_too_large",
-                format!(
-                    "Tool `{}/{}` exceeds the {} byte input-schema limit.",
-                    tool.server, tool.contract.name, MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES
-                ),
-                vec!["Attach a smaller, bounded tool schema.".to_string()],
-            ));
-        }
-        aggregate_schema_bytes = aggregate_schema_bytes
-            .checked_add(schema_bytes.len())
-            .ok_or_else(|| {
-                Blocker::new(
-                    "mention_tool_manifest_too_large",
-                    "The attached tool input-schema byte count overflowed.",
-                    vec!["Remove tool bindings before running this Persona.".to_string()],
-                )
-            })?;
-        if aggregate_schema_bytes > MAX_PERSONA_TOOL_MANIFEST_BYTES {
-            return Err(Blocker::new(
-                "mention_tool_manifest_too_large",
-                format!(
-                    "Attached tool input schemas exceed the {} byte aggregate limit.",
-                    MAX_PERSONA_TOOL_MANIFEST_BYTES
-                ),
-                vec!["Remove or reduce attached tool schemas.".to_string()],
-            ));
-        }
-    }
-    for (label, value) in [
-        ("manifest", json!(mention_tool_manifest(tools))),
-        ("decision schema", persona_tool_decision_schema(tools)),
-    ] {
-        let bytes = serde_json::to_vec(&value).map_err(|error| {
-            Blocker::new(
-                "mention_tool_manifest_invalid",
-                error.to_string(),
-                vec!["Review the attached MCP tool contracts.".to_string()],
-            )
-        })?;
-        if bytes.len() > MAX_PERSONA_TOOL_MANIFEST_BYTES {
-            return Err(Blocker::new(
-                "mention_tool_manifest_too_large",
-                format!(
-                    "The Persona tool {label} exceeds the {} byte limit.",
-                    MAX_PERSONA_TOOL_MANIFEST_BYTES
-                ),
-                vec!["Remove or reduce attached tool schemas.".to_string()],
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn mention_tool_instructions(tools: &[BoundMentionTool]) -> String {
-    if tools.is_empty() {
-        return String::new();
-    }
-    format!(
-        " Attached configured external-process tools are restricted to this manifest: {}. A denied tool is unavailable. Draft the answer as ordinary prose. Do not encode or imitate a tool call in the answer; a separate constrained decision phase decides whether one exact attached call is necessary.",
-        serde_json::to_string(&mention_tool_manifest(tools)).unwrap_or_else(|_| "[]".to_string())
-    )
-}
-
-fn mention_tool_manifest(tools: &[BoundMentionTool]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "server": tool.server,
-                "tool": tool.contract.name,
-                "description": tool.contract.description,
-                "input_schema": tool.contract.input_schema,
-                "permission": match effective_persona_tool_policy(tool.policy) {
-                    ToolPermissionPolicy::Ask => "ask",
-                    ToolPermissionPolicy::AlwaysAllow => unreachable!("Persona policy is normalized"),
-                    ToolPermissionPolicy::Deny => "deny",
-                }
-            })
-        })
-        .collect()
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum PersonaToolDecision {
-    Call {
-        server: String,
-        tool: String,
-        arguments: Value,
-    },
-    Final {},
-}
-
-fn persona_tool_decision_schema(tools: &[BoundMentionTool]) -> Value {
-    let mut variants = vec![json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["action"],
-        "properties": {
-            "action": {"const": "final"}
-        }
-    })];
-    variants.extend(tools.iter().map(|binding| {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["action", "server", "tool", "arguments"],
-            "properties": {
-                "action": {"const": "call"},
-                "server": {"const": binding.server},
-                "tool": {"const": binding.contract.name},
-                "arguments": binding.contract.input_schema
-            }
-        })
-    }));
-    json!({
-        "title": "PersonaToolDecisionV1",
-        "oneOf": variants
-    })
-}
-
-fn run_persona_tool_decision(
-    scope: &OperationScope,
-    target: &PlannedTarget,
-    invocation_id: &str,
-    settings: &Settings,
-) -> std::result::Result<PersonaToolDecision, Blocker> {
-    if mention_cancellation_requested(scope, invocation_id, &target.snapshot.target_id) {
-        return Err(Blocker::new(
-            "mention_tool_decision_cancelled",
-            "The Persona tool decision was cancelled before admission.",
-            vec!["Retry the Persona response if the call is still needed.".to_string()],
-        ));
-    }
-    let schema =
-        serde_json::to_string(&persona_tool_decision_schema(&target.tools)).map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_schema_failed",
-                format!("The exact Persona tool decision schema could not be encoded: {error}"),
-                vec!["Review the Persona's attached tool schemas.".to_string()],
-            )
-        })?;
-    let schema_sha256 = format!("{:x}", Sha256::digest(schema.as_bytes()));
-    let schema_len = u32::try_from(schema.len()).map_err(|_| {
-        Blocker::new(
-            "mention_tool_decision_schema_too_large",
-            "The exact Persona tool decision schema exceeds the Native artifact bound.",
-            vec!["Remove or simplify attached tool schemas.".to_string()],
-        )
-    })?;
-    let reference = ConstraintArtifactReference::new(
-        format!("persona-tool-decision-v1-{}", &schema_sha256[..16]),
-        schema_sha256,
-        schema_len,
-    )
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_decision_schema_invalid",
-            error.message,
-            vec!["Review the Persona's attached tool schemas.".to_string()],
-        )
-    })?;
-    let manifest =
-        serde_json::to_string(&mention_tool_manifest(&target.tools)).map_err(|error| {
-            Blocker::new(
-                "mention_tool_manifest_failed",
-                format!("The attached tool manifest could not be encoded: {error}"),
-                vec!["Review the Persona's attached tools.".to_string()],
-            )
-        })?;
-    let decision_input = serde_json::to_string(&json!({
-        "addressed_message": target
-            .messages
-            .last()
-            .map(|message| message.content.as_str())
-            .unwrap_or_default(),
-    }))
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_decision_input_failed",
-            format!("The Persona tool decision input could not be encoded: {error}"),
-            vec!["Retry the Persona response.".to_string()],
-        )
-    })?;
-    let messages = vec![
-        ChatMessage {
-            role: ChatRole::System,
-            content: format!(
-                "You are a constrained control phase, not the Persona answer. Return exactly one schema-valid decision object. You never receive or inspect the Persona's answer prose. Choose final unless one exact attached configured external-process tool call is necessary to answer the addressed message. At most one call is permitted. Attached manifest: {manifest}"
-            ),
-        },
-        ChatMessage {
-            role: ChatRole::User,
-            content: decision_input,
-        },
-    ];
-    let template = profile_chat_template(&target.snapshot.profile);
-    let mut prepared = target
-        .handle
-        .prepare_input(GenerationInput::Chat { messages, template })
-        .map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_prompt_failed",
-                error.message,
-                vec!["Check the target model's chat template.".to_string()],
-            )
-        })?;
-    if prepared.len() != 1 {
-        return Err(Blocker::new(
-            "mention_tool_decision_prompt_ambiguous",
-            "Native prompt preparation did not return exactly one Persona tool decision prompt.",
-            vec!["Check the target model's chat template.".to_string()],
-        ));
-    }
-    let prepared = prepared.pop().expect("length checked");
-    let writer = target
-        .handle
-        .controlled_model_identity("persona-tool-decision")
-        .map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_identity_failed",
-                error.message,
-                vec!["Retry after reloading the target model.".to_string()],
-            )
-        })?;
-    let control = ControlProgram::new(
-        writer,
-        Vec::new(),
-        Some(StructuredConstraint::JsonSchema { reference }),
-        Vec::new(),
-        ExtendedSamplerProgram::default(),
-        TerminalSelector::Distribution,
-        DistributionObservationPolicy::default(),
-        Vec::new(),
-    )
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_decision_control_failed",
-            error.message,
-            vec!["Review the target model and attached tool schemas.".to_string()],
-        )
-    })?;
-    let mut sampling = settings
-        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
-        .map_err(|validation| validation.blocker)?;
-    sampling.max_tokens = sampling
-        .max_tokens
-        .clamp(64, PERSONA_TOOL_DECISION_MAX_TOKENS);
-    sampling.temperature = sampling.temperature.min(0.2);
-    sampling.dynamic_temperature_range = 0.0;
-    sampling.stop.clear();
-    let case = ControlledGenerationCase::new(
-        target.snapshot.target_id.clone(),
-        ExactTokenPrompt::new(prepared.token_ids).map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_prompt_invalid",
-                error.message,
-                vec!["Reduce the addressed message or Persona context.".to_string()],
-            )
-        })?,
-        None,
-        sampling,
-    )
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_decision_case_invalid",
-            error.message,
-            vec!["Review the target model and Persona settings.".to_string()],
-        )
-    })?;
-    let request =
-        ControlledGenerationBatchRequest::new(invocation_id.to_string(), vec![case], control)
-            .map_err(|error| {
-                Blocker::new(
-                    "mention_tool_decision_request_invalid",
-                    error.message,
-                    vec!["Reduce the addressed message or Persona context.".to_string()],
-                )
-            })?;
-    let submission =
-        ControlledGenerationSubmission::new(request, Some(schema)).map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_constraint_invalid",
-                error.message,
-                vec!["Review the Persona's attached tool schemas.".to_string()],
-            )
-        })?;
-    let verified = target
-        .handle
-        .generate_controlled(submission)
-        .map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_admission_failed",
-                error.message,
-                vec!["Retry the Persona response.".to_string()],
-            )
-        })?
-        .wait_verified()
-        .map_err(|error| {
-            Blocker::new(
-                "mention_tool_decision_failed",
-                error.message,
-                vec!["Retry the Persona response.".to_string()],
-            )
-        })?;
-    let cases = verified.output().cases();
-    if cases.len() != 1 || cases[0].case_id() != target.snapshot.target_id {
-        return Err(Blocker::new(
-            "mention_tool_decision_output_ambiguous",
-            "Native returned a Persona tool decision for the wrong target.",
-            vec!["Retry after reloading the target model.".to_string()],
-        ));
-    }
-    let generation = cases[0].generation();
-    if !generation.real_engine_invoked || generation.fake_fixture {
-        return Err(Blocker::new(
-            "mention_tool_decision_not_real",
-            "The Persona tool decision lacks real Native execution evidence.",
-            vec!["Run with the configured local model.".to_string()],
-        ));
-    }
-    serde_json::from_str(generation.text.trim()).map_err(|error| {
-        Blocker::new(
-            "mention_tool_decision_invalid",
-            format!("The constrained Persona tool decision was not complete: {error}"),
-            vec!["Retry the Persona response.".to_string()],
-        )
-    })
-}
-
-fn finish_tool_bound_mention(
-    scope: &OperationScope,
-    target: &PlannedTarget,
-    output: GenerationOutput,
-    invocation_id: &str,
-    host_conversation_id: &str,
-    user_message_id: &str,
-    settings: &Settings,
-) -> std::result::Result<ToolBoundMentionFinish, Blocker> {
-    let decision = run_persona_tool_decision(scope, target, invocation_id, settings)?;
-    let PersonaToolDecision::Call {
-        server,
-        tool,
-        arguments,
-    } = decision
-    else {
-        return Ok(ToolBoundMentionFinish::Final {
-            output,
-            tool_receipt_ids: Vec::new(),
-        });
-    };
-    let binding = validate_bound_tool(
-        &target.tools,
-        &server,
-        &tool,
-        &arguments,
-        &target.snapshot.handle,
-    )?;
-    match effective_persona_tool_policy(binding.policy) {
-        ToolPermissionPolicy::Deny => Err(Blocker::new(
-            "tool_permission_denied",
-            format!("Tool `{server}/{tool}` is denied by local policy."),
-            vec!["Change or remove the tool permission in Settings.".to_string()],
-        )),
-        ToolPermissionPolicy::Ask | ToolPermissionPolicy::AlwaysAllow => {
-            if target.snapshot.kind != MentionTargetKind::Persona {
-                return Err(Blocker::new(
-                    "mention_tool_approval_persona_required",
-                    "Exact resumable approval is available only for a frozen Persona invocation.",
-                    vec!["Use a Persona target or change the binding policy.".to_string()],
-                ));
-            }
-            prepare_persona_tool_approval(
-                target,
-                output,
-                binding,
-                invocation_id,
-                host_conversation_id,
-                user_message_id,
-                server,
-                tool,
-                arguments,
-                settings,
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_persona_tool_approval(
-    target: &PlannedTarget,
-    provisional_output: GenerationOutput,
-    binding: &BoundMentionTool,
-    invocation_id: &str,
-    host_conversation_id: &str,
-    user_message_id: &str,
-    server: String,
-    tool: String,
-    arguments: Value,
-    settings: &Settings,
-) -> std::result::Result<ToolBoundMentionFinish, Blocker> {
-    let status = target.handle.status();
-    let Some(model_fingerprint) = status.fingerprint else {
-        return Err(Blocker::new(
-            "mention_tool_approval_model_identity_missing",
-            "The frozen Persona invocation has no exact model fingerprint.",
-            vec!["Reload the local model and retry the Persona response.".to_string()],
-        ));
-    };
-    let mut frozen_model_config = target.model_config.clone();
-    frozen_model_config.expected_model_sha256 = Some(model_fingerprint.model_sha256.clone());
-    frozen_model_config.expected_mmproj_sha256 =
-        model_fingerprint.multimodal_projector_sha256.clone();
-    let model_config_sha256 = sha256_json(&frozen_model_config).map_err(|error| {
-        Blocker::new(
-            "mention_tool_approval_model_config_invalid",
-            error.to_string(),
-            vec!["Reload the local model and retry the Persona response.".to_string()],
-        )
-    })?;
-    let arguments_sha256 = sha256_json_value(&arguments).map_err(|error| {
-        Blocker::new(
-            "mention_tool_approval_arguments_invalid",
-            error.to_string(),
-            vec!["Review the exact tool arguments.".to_string()],
-        )
-    })?;
-    let now = now_ms();
-    let deadline_clock = capture_persona_tool_deadline_clock(now).map_err(|error| {
-        Blocker::new(
-            "mention_tool_approval_deadline_unavailable",
-            error.to_string(),
-            vec!["Persona tool approvals are unavailable on this platform.".to_string()],
-        )
-    })?;
-    validate_frozen_mcp_server(
-        &binding.server_config,
-        &settings.data_dir,
-        &binding.frozen_server_config_sha256,
-    )
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_approval_executable_not_frozen",
-            error.to_string(),
-            vec!["Refresh the reviewed MCP tool catalog.".to_string()],
-        )
-    })?;
-    let frozen_mcp_server_config = binding.server_config.clone();
-    let frozen_mcp_server_config_sha256 = binding.frozen_server_config_sha256.clone();
-    let approval_id = Uuid::new_v4().to_string();
-    let call_sha256 = persona_tool_call_sha256(PersonaToolCallIdentity {
-        invocation_id,
-        host_conversation_id,
-        user_message_id,
-        target_id: &target.snapshot.target_id,
-        persona_version: target.snapshot.version,
-        snapshot_sha256: &target.snapshot.snapshot_sha256,
-        server: &server,
-        tool: &tool,
-        arguments_sha256: &arguments_sha256,
-        server_config_sha256: &binding.server_config_sha256,
-        frozen_server_config_sha256: &frozen_mcp_server_config_sha256,
-        tool_schema_sha256: &binding.tool_schema_sha256,
-        model_config_sha256: &model_config_sha256,
-        model_fingerprint: &model_fingerprint,
-    })
-    .map_err(|error| {
-        Blocker::new(
-            "mention_tool_approval_hash_failed",
-            error.to_string(),
-            vec!["Retry the Persona response.".to_string()],
-        )
-    })?;
-    let approval = MentionToolApproval {
-        id: approval_id.clone(),
-        invocation_id: invocation_id.to_string(),
-        host_conversation_id: host_conversation_id.to_string(),
-        user_message_id: user_message_id.to_string(),
-        target_id: target.snapshot.target_id.clone(),
-        handle: target.snapshot.handle.clone(),
-        label: target.snapshot.label.clone(),
-        persona_version: target.snapshot.version,
-        snapshot_sha256: target.snapshot.snapshot_sha256.clone(),
-        server,
-        tool,
-        arguments,
-        arguments_sha256,
-        server_config_sha256: binding.server_config_sha256.clone(),
-        tool_schema_sha256: binding.tool_schema_sha256.clone(),
-        model_config_sha256,
-        call_sha256,
-        effect_receipt_id: None,
-        effect_outcome: None,
-        created_at_ms: now,
-        expires_at_ms: now.saturating_add(PERSONA_TOOL_APPROVAL_TTL_MS),
-        consumed_at_ms: None,
-        decision: None,
-        state: MentionToolApprovalState::Pending,
-    };
-    let continuation = FrozenMentionToolContinuation {
-        approval_id,
-        model_path: target.model_path.clone(),
-        mmproj_path: target.snapshot.profile.mmproj_path.clone(),
-        model_config: Some(frozen_model_config),
-        model_fingerprint,
-        chat_template: profile_chat_template(&target.snapshot.profile),
-        sampling: settings
-            .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
-            .map_err(|validation| validation.blocker)?,
-        messages: target.messages.clone(),
-        provisional_output,
-        input_schema: binding.contract.input_schema.clone(),
-        mcp_server_config: Some(frozen_mcp_server_config),
-        mcp_server_config_sha256: frozen_mcp_server_config_sha256,
-        deadline_clock: Some(deadline_clock),
-        resume_lease_id: None,
-    };
-    Ok(ToolBoundMentionFinish::Pending {
-        approval,
-        continuation: Box::new(continuation),
-    })
-}
-
 struct PersonaToolCallIdentity<'a> {
     invocation_id: &'a str,
     host_conversation_id: &'a str,
@@ -4544,65 +3812,6 @@ fn sha256_json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
 
 fn persona_tool_effect_receipt_id() -> String {
     format!("mom_llama.persona_tool_effect:{}", Uuid::new_v4())
-}
-
-fn validate_bound_tool<'a>(
-    tools: &'a [BoundMentionTool],
-    server: &str,
-    tool: &str,
-    arguments: &Value,
-    handle: &str,
-) -> std::result::Result<&'a BoundMentionTool, Blocker> {
-    let Some(binding) = tools
-        .iter()
-        .find(|candidate| candidate.server == server && candidate.contract.name == tool)
-    else {
-        return Err(Blocker::new(
-            "mention_tool_not_attached",
-            format!("@{handle} requested a tool that is not attached to this Persona."),
-            vec!["Review the Persona's attached tools in Settings.".to_string()],
-        ));
-    };
-    if let Some(blocker) = validate_tool_arguments(&binding.contract.input_schema, arguments) {
-        return Err(blocker);
-    }
-    Ok(binding)
-}
-
-fn effective_persona_tool_policy(policy: ToolPermissionPolicy) -> ToolPermissionPolicy {
-    // Persona calls carry frozen model and conversation authority across a user-visible
-    // decision boundary. Until an automatic durable intent/claim path exists, the generic
-    // tool-loop AlwaysAllow setting cannot bypass that boundary.
-    match policy {
-        ToolPermissionPolicy::AlwaysAllow => ToolPermissionPolicy::Ask,
-        policy => policy,
-    }
-}
-
-#[cfg(test)]
-fn authorize_bound_tool<'a>(
-    tools: &'a [BoundMentionTool],
-    server: &str,
-    tool: &str,
-    arguments: &Value,
-    handle: &str,
-) -> std::result::Result<&'a BoundMentionTool, Blocker> {
-    let binding = validate_bound_tool(tools, server, tool, arguments, handle)?;
-    match effective_persona_tool_policy(binding.policy) {
-        ToolPermissionPolicy::Deny => Err(Blocker::new(
-            "tool_permission_denied",
-            format!("Tool `{server}/{tool}` is denied by local policy."),
-            vec!["Change or remove the tool permission in Settings.".to_string()],
-        )),
-        ToolPermissionPolicy::Ask => Err(Blocker::new(
-            "mention_tool_approval_required",
-            format!(
-                "Tool `{server}/{tool}` needs explicit approval before this Persona can continue."
-            ),
-            vec!["Approve or deny this exact Persona tool call.".to_string()],
-        )),
-        ToolPermissionPolicy::AlwaysAllow => unreachable!("Persona policy is normalized"),
-    }
 }
 
 fn profile_chat_template(profile: &ConversationExecutionProfile) -> ChatTemplateChoice {
@@ -4931,17 +4140,14 @@ mod tests {
         upsert_invocation_with_continuations, write_active_approval_index,
     };
     use super::{
-        ApprovalDeadlineTracker, BoundMentionTool, FrozenMentionToolContinuation,
-        MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES, MAX_PERSONA_TOOL_MANIFEST_BYTES, MentionCancelControl,
+        ApprovalDeadlineTracker, FrozenMentionToolContinuation, MentionCancelControl,
         MentionInvocation, MentionInvocationState, MentionTargetKind, MentionTargetSnapshot,
         MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
-        MentionToolApprovalState, PersonaToolCallIdentity, PersonaToolDecision,
-        StoredMentionInvocation, active_approval_index, ambiguous_resolution_blocker,
-        authorize_bound_tool, finish_stored_mention_invocation, mention_tool_instructions,
-        mention_tool_manifest, parse_handles, persona_tool_call_sha256,
-        persona_tool_decision_schema, reconcile_stored_persona_tool_approvals,
+        MentionToolApprovalState, PersonaToolCallIdentity, StoredMentionInvocation,
+        active_approval_index, ambiguous_resolution_blocker, finish_stored_mention_invocation,
+        parse_handles, persona_tool_call_sha256, reconcile_stored_persona_tool_approvals,
         resolve_targets_from_registry, sha256_json_value, unknown_persona_tool_effect_receipt,
-        unregister_exact_mentions, validate_resolved_mention_tools,
+        unregister_exact_mentions,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{
@@ -4953,11 +4159,10 @@ mod tests {
     use crate::conversation_store::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind,
     };
+    use crate::mcp::McpServerConfig;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::mcp::exact_mcp_server_config_sha256;
-    use crate::mcp::{McpServerConfig, McpTool};
     use crate::store::RuntimeStore;
-    use crate::tool_loop::ToolPermissionPolicy;
     use llama_native_types::{
         ChatTemplateChoice, GenerationMetrics, GenerationOutput, GenerationState, ModelFingerprint,
         NativeModelConfig, NativeTransport, SamplingConfig,
@@ -6308,233 +5513,6 @@ mod tests {
                 .expect("ambiguous registry must produce a blocker")
                 .code,
             "mention_target_ambiguous"
-        );
-    }
-
-    #[test]
-    fn mention_tool_calls_must_match_an_attached_allowlisted_binding_and_schema() {
-        let tool = |policy| BoundMentionTool {
-            server: "local".to_string(),
-            server_config: McpServerConfig {
-                executable_sha256: None,
-                name: "local".to_string(),
-                command: std::env::current_exe().expect("test executable path"),
-                args: Vec::new(),
-                enabled: true,
-            },
-            policy,
-            server_config_sha256: "server-config".to_string(),
-            frozen_server_config_sha256: "frozen-server-config".to_string(),
-            tool_schema_sha256: "tool-schema".to_string(),
-            contract: McpTool {
-                name: "lookup".to_string(),
-                description: None,
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {"query": {"type": "string"}}
-                }),
-            },
-        };
-        assert_eq!(
-            authorize_bound_tool(
-                &[tool(ToolPermissionPolicy::AlwaysAllow)],
-                "local",
-                "lookup",
-                &json!({"query": "exact"}),
-                "researcher",
-            )
-            .expect_err("Persona AlwaysAllow must fail closed to exact approval")
-            .code,
-            "mention_tool_approval_required"
-        );
-        assert_eq!(
-            authorize_bound_tool(
-                &[tool(ToolPermissionPolicy::Ask)],
-                "local",
-                "lookup",
-                &json!({"query": "exact"}),
-                "researcher",
-            )
-            .expect_err("ask policy must require explicit approval")
-            .code,
-            "mention_tool_approval_required"
-        );
-        assert_eq!(
-            authorize_bound_tool(
-                &[tool(ToolPermissionPolicy::Deny)],
-                "local",
-                "lookup",
-                &json!({"query": "exact"}),
-                "researcher",
-            )
-            .expect_err("deny policy must reject the tool call")
-            .code,
-            "tool_permission_denied"
-        );
-        assert_eq!(
-            authorize_bound_tool(
-                &[tool(ToolPermissionPolicy::AlwaysAllow)],
-                "other",
-                "lookup",
-                &json!({"query": "exact"}),
-                "researcher",
-            )
-            .expect_err("an unattached tool binding must be rejected")
-            .code,
-            "mention_tool_not_attached"
-        );
-        assert_eq!(
-            authorize_bound_tool(
-                &[tool(ToolPermissionPolicy::AlwaysAllow)],
-                "local",
-                "lookup",
-                &json!({}),
-                "researcher",
-            )
-            .expect_err("missing required tool arguments must be rejected")
-            .code,
-            "tool_loop_required_argument_missing"
-        );
-    }
-
-    #[test]
-    fn persona_tool_decision_requires_one_complete_strict_control_object() {
-        assert!(
-            serde_json::from_str::<PersonaToolDecision>("Please call local/lookup now").is_err()
-        );
-        assert_eq!(
-            serde_json::from_str::<PersonaToolDecision>(
-                r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#
-            )
-            .expect("complete call decision"),
-            PersonaToolDecision::Call {
-                server: "local".to_string(),
-                tool: "lookup".to_string(),
-                arguments: json!({"query": "x"}),
-            }
-        );
-        assert_eq!(
-            serde_json::from_str::<PersonaToolDecision>(r#"{"action":"final"}"#)
-                .expect("complete final decision"),
-            PersonaToolDecision::Final {}
-        );
-        let call =
-            r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#;
-        let prose = format!("Here is an example, not a request: {call} Please explain it.");
-        let fenced = format!("A configuration example:\n```json\n{call}\n```");
-
-        assert!(
-            serde_json::from_str::<PersonaToolDecision>(&prose).is_err(),
-            "answer prose must never be scanned for an embedded control object"
-        );
-        assert!(
-            serde_json::from_str::<PersonaToolDecision>(&fenced).is_err(),
-            "fenced display JSON must remain inert answer prose"
-        );
-        assert!(
-            serde_json::from_str::<PersonaToolDecision>(
-                r#"{"action":"final","unexpected":"field"}"#
-            )
-            .is_err(),
-            "unknown fields must invalidate the complete decision"
-        );
-    }
-
-    #[test]
-    fn persona_tool_decision_schema_binds_each_call_to_one_attached_contract() {
-        let tools = vec![BoundMentionTool {
-            server: "local".to_string(),
-            server_config: McpServerConfig {
-                executable_sha256: None,
-                name: "local".to_string(),
-                command: std::env::current_exe().expect("test executable path"),
-                args: Vec::new(),
-                enabled: true,
-            },
-            policy: ToolPermissionPolicy::AlwaysAllow,
-            server_config_sha256: "server-config".to_string(),
-            frozen_server_config_sha256: "frozen-server-config".to_string(),
-            tool_schema_sha256: "tool-schema".to_string(),
-            contract: McpTool {
-                name: "lookup".to_string(),
-                description: Some("Look up one exact query".to_string()),
-                input_schema: json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["query"],
-                    "properties": {"query": {"type": "string"}}
-                }),
-            },
-        }];
-        let schema = persona_tool_decision_schema(&tools);
-        let variants = schema["oneOf"].as_array().expect("oneOf variants");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[0]["properties"]["action"]["const"], "final");
-        assert_eq!(variants[1]["properties"]["action"]["const"], "call");
-        assert_eq!(variants[1]["properties"]["server"]["const"], "local");
-        assert_eq!(variants[1]["properties"]["tool"]["const"], "lookup");
-        assert_eq!(
-            variants[1]["properties"]["arguments"],
-            tools[0].contract.input_schema
-        );
-        assert_eq!(variants[1]["additionalProperties"], false);
-        assert!(mention_tool_instructions(&tools).contains("Draft the answer as ordinary prose"));
-        assert!(!mention_tool_instructions(&tools).contains("return only"));
-        assert_eq!(mention_tool_manifest(&tools)[0]["permission"], "ask");
-    }
-
-    #[test]
-    fn persona_tool_contracts_are_count_and_byte_bounded_before_prompt_construction() {
-        let tool = |index: usize, payload_bytes: usize| BoundMentionTool {
-            server: format!("server-{index}"),
-            server_config: McpServerConfig {
-                executable_sha256: None,
-                name: format!("server-{index}"),
-                command: std::env::current_exe().expect("test executable path"),
-                args: Vec::new(),
-                enabled: true,
-            },
-            policy: ToolPermissionPolicy::Ask,
-            server_config_sha256: "server-config".to_string(),
-            frozen_server_config_sha256: "frozen-server-config".to_string(),
-            tool_schema_sha256: "tool-schema".to_string(),
-            contract: McpTool {
-                name: format!("tool-{index}"),
-                description: None,
-                input_schema: json!({
-                    "type": "object",
-                    "description": "x".repeat(payload_bytes),
-                }),
-            },
-        };
-
-        let too_many = (0..=crate::personas::MAX_PERSONA_TOOL_BINDINGS)
-            .map(|index| tool(index, 0))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            validate_resolved_mention_tools(&too_many)
-                .expect_err("over-limit tool count must fail")
-                .code,
-            "persona_tool_binding_limit_exceeded"
-        );
-
-        let oversized = vec![tool(0, MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES)];
-        assert_eq!(
-            validate_resolved_mention_tools(&oversized)
-                .expect_err("oversized input schema must fail")
-                .code,
-            "mention_tool_schema_too_large"
-        );
-
-        let aggregate = (0..3)
-            .map(|index| tool(index, MAX_PERSONA_TOOL_MANIFEST_BYTES / 3))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            validate_resolved_mention_tools(&aggregate)
-                .expect_err("oversized aggregate manifest must fail")
-                .code,
-            "mention_tool_manifest_too_large"
         );
     }
 }

@@ -6247,6 +6247,8 @@ dependencies = [
  "clap",
  "llama-native-types",
  "mom-llama-runtime",
+ "nix",
+ "rusqlite",
  "serde",
  "serde_json",
  "uuid",
