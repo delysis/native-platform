@@ -13,6 +13,7 @@
   --success: #3fc66b;
   --danger: #ff6257;
   --focus: #8fb8ff;
+  --mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
   --sidebar-width: 256px;
   --settings-width: clamp(320px, 30vw, 400px);
   --content-width: 780px;
@@ -472,7 +473,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .mention-candidate > svg { width: 17px; height: 17px; color: var(--muted); }
 .mention-candidate-copy { display: grid; min-width: 0; gap: 2px; }
 .mention-candidate-copy > span { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.mention-candidate.active, .mention-candidate:hover { background: var(--hover); }
+.mention-candidate.active, .mention-candidate:hover { background: var(--surface-active); }
 
 .persona-list, .persona-group-list { display: grid; gap: 5px; }
 .persona-row, .persona-group-row { display: flex; align-items: center; gap: 6px; }
@@ -1019,7 +1020,8 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #0e0e0e;
+  color: var(--text);
+  background: var(--surface-raised);
   box-shadow: 0 30px 100px rgba(0, 0, 0, .62);
 }
 .tool-approval-dialog h2 { margin: 6px 0 8px; }
@@ -1049,9 +1051,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
   display: grid;
   gap: 6px;
   padding: 10px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--panel);
+  background: var(--surface-raised);
 }
 .tool-loop-live-event pre {
   max-height: 160px;

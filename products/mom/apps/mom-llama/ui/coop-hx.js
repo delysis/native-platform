@@ -927,7 +927,9 @@
     shell()?.classList.remove("settings-open");
     const toggle = document.querySelector('[data-action="settings-open"]');
     toggle?.setAttribute("aria-expanded", "false");
-    if (hadFocus) toggle?.focus();
+    if (hadFocus) {
+      (toggle || document.querySelector("#chat-form textarea[name='message']"))?.focus();
+    }
     sizeComposer();
   };
 

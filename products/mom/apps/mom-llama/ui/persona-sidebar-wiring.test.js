@@ -84,3 +84,51 @@ test("Persona updates use Rust's tagged template policy and exclude retired cont
     }
   }
 });
+
+// Execute actual Settings open/close owners and the existing close action.
+// Synthetic focus objects do not qualify native menu/WebView focus behavior.
+const settingsFocusVm = require("node:vm");
+const settingsFocusHarness = (withToggle) => {
+  const focusEvents = [];
+  const classList = { add() {}, remove() {} };
+  const composer = { selectionStart: 2, selectionEnd: 5, focus() { focusEvents.push("composer"); } };
+  const toggle = withToggle ? { setAttribute() {}, focus() { focusEvents.push("toggle"); } } : null;
+  const tab = { focus() { context.document.activeElement = tab; } };
+  const outside = {};
+  const sidebar = { hidden: true, classList, setAttribute() {},
+    contains: (node) => node === tab, querySelector: () => tab };
+  const calls = [];
+  const context = {
+    document: { activeElement: outside, getElementById: () => sidebar,
+      querySelector(selector) { return selector === '[data-action="settings-open"]' ? toggle : composer; } },
+    shell: () => ({ classList }), sizeComposer() {}, switchSettingsSection() {},
+    invoke: async (command) => { calls.push(command); return { status: "passed" }; },
+  };
+  settingsFocusVm.runInNewContext(
+    between(client, "  const openSettings =", "  const setModalVisibility =")
+    + "\nconst actions = {" + between(client, '    "settings-open": async', '    "settings-section": async') + "};"
+    + "\nglobalThis.api = { openSettings, close: actions['settings-close'] };",
+    context,
+  );
+  return { ...context.api, composer, sidebar, focusEvents, calls, focusOutside() { context.document.activeElement = outside; } };
+};
+
+test("Settings native-menu open then actual Close returns focus to current composer", async () => {
+  const h = settingsFocusHarness(false); h.openSettings();
+  assert.equal(h.sidebar.hidden, false);
+  await h.close();
+  assert.equal(h.sidebar.hidden, true);
+  assert.deepEqual(h.calls, ["mom_llama_settings_get"]);
+  assert.deepEqual(h.focusEvents, ["composer"]);
+  assert.deepEqual([h.composer.selectionStart, h.composer.selectionEnd], [2, 5]);
+});
+
+test("Settings Close preserves its DOM invoker when one exists", async () => {
+  const h = settingsFocusHarness(true); h.openSettings(); await h.close();
+  assert.deepEqual(h.focusEvents, ["toggle"]);
+});
+
+test("Settings Close does not move unrelated current focus", async () => {
+  const h = settingsFocusHarness(false); h.openSettings(); h.focusOutside(); await h.close();
+  assert.deepEqual(h.focusEvents, []);
+});
