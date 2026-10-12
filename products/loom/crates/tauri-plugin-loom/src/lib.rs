@@ -11452,6 +11452,9 @@ mod tests {
     };
     use loom_types::ModelEnvironmentId;
 
+    #[cfg(unix)]
+    mod asset_fifo_protocol;
+
     fn png_attachment_fixture(seed: u8) -> Vec<u8> {
         let image = image::RgbaImage::from_fn(2, 2, |x, y| {
             image::Rgba([
