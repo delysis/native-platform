@@ -894,6 +894,7 @@ impl SpeechHost {
             tokio::pin!(backend_final);
             let mut backend_events_open = true;
             let mut backend_terminal = None;
+            let mut essential_audio_lost = false;
             let outcome = loop {
                 let deadline = monitor_budget.next_deadline();
                 let timeout = wait_for_deadline(Arc::clone(&monitor_clock), deadline);
@@ -917,7 +918,7 @@ impl SpeechHost {
                             ) {
                                 break FinalOutcome::TimedOut(kind);
                             }
-                            forward_synthesis_event(
+                            essential_audio_lost |= forward_synthesis_event(
                                 &event_sender,
                                 event,
                                 &mut backend_terminal,
@@ -934,7 +935,27 @@ impl SpeechHost {
                         &event_sender,
                         &mut backend_events,
                         &mut backend_terminal,
+                        &mut essential_audio_lost,
                     );
+                    let result = match result {
+                        Ok(response)
+                            if essential_audio_lost
+                                && matches!(
+                                    &response.output,
+                                    speech_native_types::SynthesisOutput::Streamed { .. }
+                                ) =>
+                        {
+                            Err(SpeechError {
+                                code: "speech_stream_delivery_incomplete".to_owned(),
+                                class: SpeechErrorClass::Internal,
+                                retryable: false,
+                                request_id: monitor_request_id.clone(),
+                                backend_id: Some(monitor_backend_id.clone()),
+                                safe_detail: "speech streamed audio could not be delivered through the public event channel".to_owned(),
+                            })
+                        }
+                        result => result,
+                    };
                     let finalized = executor.terminalize(terminal_for_result(&result), true);
                     let delivered = match &finalized {
                         Ok(finished) if finished.cancellation_requested => {
@@ -1324,6 +1345,15 @@ impl SpeechHost {
                 permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
             },
         }?;
+        if let Some(kind) = elapsed_deadline(budget.queue_cutoff(), self.clock.now(), false) {
+            return Err(deadline_timeout_error(
+                request_id,
+                &plan.selected.route.backend_id,
+                kind,
+                DeadlineStage::Dispatch,
+            )
+            .into());
+        }
         Ok(acquired)
     }
 
@@ -1673,13 +1703,17 @@ fn forward_synthesis_event(
     public: &mpsc::Sender<SynthesisEvent>,
     event: SynthesisEvent,
     backend_terminal: &mut Option<SynthesisEvent>,
-) {
+) -> bool {
     if event.is_terminal() {
         if backend_terminal.is_none() {
             *backend_terminal = Some(event);
         }
-    } else if public.capacity() > 1 {
-        let _bounded_progress = public.try_send(event);
+        false
+    } else {
+        let essential_audio =
+            matches!(&event, SynthesisEvent::Audio { chunk, .. } if !chunk.data.is_empty());
+        let not_forwarded = public.capacity() <= 1 || public.try_send(event).is_err();
+        essential_audio && not_forwarded
     }
 }
 
@@ -1695,9 +1729,10 @@ fn drain_synthesis_events(
     public: &mpsc::Sender<SynthesisEvent>,
     backend: &mut mpsc::Receiver<SynthesisEvent>,
     backend_terminal: &mut Option<SynthesisEvent>,
+    essential_audio_lost: &mut bool,
 ) {
     while let Ok(event) = backend.try_recv() {
-        forward_synthesis_event(public, event, backend_terminal);
+        *essential_audio_lost |= forward_synthesis_event(public, event, backend_terminal);
     }
 }
 
@@ -3055,6 +3090,7 @@ mod tests {
 
     struct DeferredBackend {
         descriptor: SpeechBackendDescriptor,
+        calls: AtomicUsize,
         finals: Mutex<BTreeMap<SpeechRequestId, oneshot::Sender<SynthesisResponse>>>,
         events: Mutex<BTreeMap<SpeechRequestId, mpsc::Sender<SynthesisEvent>>>,
         cancel_calls: Arc<AtomicUsize>,
@@ -3227,6 +3263,7 @@ mod tests {
             &self,
             request: SynthesisRequest,
         ) -> Result<SynthesisTicket, SpeechError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
             let request_id = request.context.request_id;
             let (event_sender, event_receiver) = mpsc::channel(8);
             let (backend_final_sender, backend_final_receiver) = oneshot::channel();
@@ -3754,6 +3791,7 @@ mod tests {
         descriptor.capabilities[0].limits.max_concurrent_requests = max_concurrent_requests;
         Arc::new(DeferredBackend {
             descriptor,
+            calls: AtomicUsize::new(0),
             finals: Mutex::new(BTreeMap::new()),
             events: Mutex::new(BTreeMap::new()),
             cancel_calls: Arc::new(AtomicUsize::new(0)),
@@ -5863,5 +5901,420 @@ mod tests {
         host.lifecycle
             .release_route(&request_id, &current.operation.identity())
             .expect("clean current route");
+    }
+
+    #[derive(Default)]
+    struct AdmissionWakeProbe {
+        wakes: AtomicUsize,
+        changed: Notify,
+    }
+
+    impl std::task::Wake for AdmissionWakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_waiters();
+        }
+    }
+
+    impl AdmissionWakeProbe {
+        async fn wait_after(&self, previous: usize) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.wakes.load(Ordering::Acquire) > previous {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    async fn assert_ready_permit_cutoff(
+        deadline: SpeechDeadlinePolicy,
+        elapsed_ms: u64,
+        expected_code: &str,
+    ) {
+        let (host, clock) = host_with_manual_clock();
+        let backend_id = "ready-cutoff.tts";
+        let backend = deferred_backend_with_capacity(backend_id, Some(1));
+        host.register_backend(backend.clone())
+            .expect("register fixture");
+        let holder_id = SpeechRequestId("ready-cutoff-holder".to_owned());
+        let queued_id = SpeechRequestId("ready-cutoff-queued".to_owned());
+        let holder = host
+            .synthesize(exact_request(&holder_id.0, backend_id))
+            .await
+            .expect("ordinary admission");
+        backend.wait_until_active(&holder_id).await;
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+
+        let mut queued_request = exact_request(&queued_id.0, backend_id);
+        queued_request.context.deadline = deadline;
+        let cutoff = clock
+            .now()
+            .checked_add(Duration::from_millis(10))
+            .expect("bounded cutoff");
+        let mut queued = Box::pin(host.synthesize(queued_request));
+        let observer = Arc::new(AdmissionWakeProbe::default());
+        {
+            let waker = std::task::Waker::from(Arc::clone(&observer));
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(std::future::Future::poll(queued.as_mut(), &mut context).is_pending());
+        }
+        wait_for_operation_phase(
+            &host,
+            &queued_id,
+            operation_lifecycle::OperationPhase::Queued,
+        )
+        .await;
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("active owners"),
+            2
+        );
+
+        clock.advance(Duration::from_millis(elapsed_ms));
+        assert!(clock.now() >= cutoff);
+        let clock_wakes = observer.wakes.load(Ordering::Acquire);
+        assert!(
+            clock_wakes > 0,
+            "elapsed clock notified the retained admission"
+        );
+        backend.complete(&holder_id);
+        holder
+            .final_response()
+            .await
+            .expect("ordinary holder final");
+        // No further clock advance or cancellation: this is the assigned permit's wake.
+        observer.wait_after(clock_wakes).await;
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+
+        let queued_result = queued.await;
+        let admitted_calls = backend.calls.load(Ordering::Acquire);
+        let refused_at_queue = matches!(
+            &queued_result,
+            Err(SpeechHostError::Backend { error })
+                if error.code == expected_code && error.class == SpeechErrorClass::Timeout
+        );
+        let observed = match &queued_result {
+            Ok(_) => "Ok(SynthesisTicket)".to_owned(),
+            Err(error) => format!("{error:?}"),
+        };
+        let late_admitted = backend
+            .finals
+            .lock()
+            .expect("fixture finals")
+            .contains_key(&queued_id);
+        if late_admitted {
+            backend.complete(&queued_id);
+        }
+        if let Ok(ticket) = queued_result {
+            ticket
+                .final_response()
+                .await
+                .expect("settle before-admitted late ticket");
+        }
+        wait_for_active_count(&host, 0).await;
+        let successor_id = SpeechRequestId("ready-cutoff-successor".to_owned());
+        let successor = host
+            .synthesize(exact_request(&successor_id.0, backend_id))
+            .await
+            .expect("capacity recovery");
+        assert_eq!(backend.calls.load(Ordering::Acquire), admitted_calls + 1);
+        backend.complete(&successor_id);
+        let successor_response = successor.final_response().await.expect("successor final");
+        assert_eq!(successor_response.request_id, successor_id);
+        wait_for_active_count(&host, 0).await;
+        host.shutdown().await.expect("join all host owners");
+        assert_eq!(backend.shutdown_calls.load(Ordering::Acquire), 1);
+        assert!(
+            refused_at_queue && admitted_calls == 1,
+            "expired {expected_code} must refuse before backend admission: elapsed_ms={elapsed_ms}, returned={observed}, backend_calls={admitted_calls}, capacity_recovered=true, host_joined=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_permit_at_queue_cutoff_refuses_before_backend_admission() {
+        let deadline = SpeechDeadlinePolicy {
+            queue_ms: Some(10),
+            ..SpeechDeadlinePolicy::default()
+        };
+        assert_ready_permit_cutoff(deadline, 10, "speech_queue_timeout").await;
+    }
+
+    #[tokio::test]
+    async fn ready_permit_after_queue_cutoff_refuses_before_backend_admission() {
+        let deadline = SpeechDeadlinePolicy {
+            queue_ms: Some(10),
+            total_ms: Some(20),
+            ..SpeechDeadlinePolicy::default()
+        };
+        assert_ready_permit_cutoff(deadline, 11, "speech_queue_timeout").await;
+    }
+
+    #[tokio::test]
+    async fn ready_permit_at_total_cutoff_refuses_before_backend_admission() {
+        let deadline = SpeechDeadlinePolicy {
+            queue_ms: Some(20),
+            total_ms: Some(10),
+            ..SpeechDeadlinePolicy::default()
+        };
+        assert_ready_permit_cutoff(deadline, 10, "speech_total_timeout").await;
+    }
+
+    #[tokio::test]
+    async fn ready_permit_after_tied_cutoffs_reports_total_without_backend_admission() {
+        let deadline = SpeechDeadlinePolicy {
+            queue_ms: Some(10),
+            total_ms: Some(10),
+            ..SpeechDeadlinePolicy::default()
+        };
+        assert_ready_permit_cutoff(deadline, 11, "speech_total_timeout").await;
+    }
+
+    impl DeferredBackend {
+        fn complete_with_output(&self, request_id: &SpeechRequestId, output: SynthesisOutput) {
+            let mut response = deferred_response(request_id, &self.descriptor.id);
+            response.output = output;
+            response.duration_ms = None;
+            let sender = self
+                .finals
+                .lock()
+                .expect("lock deferred finals")
+                .remove(request_id)
+                .expect("deferred request must exist");
+            self.events
+                .lock()
+                .expect("lock deferred events")
+                .remove(request_id);
+            let _ = sender.send(response);
+            self.changed.notify_waiters();
+        }
+    }
+
+    struct AudioDeliveryObservation {
+        result: Result<SynthesisResponse, SpeechError>,
+        events: Vec<SynthesisEvent>,
+        submitted: Vec<u8>,
+        request_id: SpeechRequestId,
+    }
+
+    async fn observe_audio_delivery(chunks: u16, streamed: bool) -> AudioDeliveryObservation {
+        let host = SpeechHost::default();
+        let backend_id = "observed-audio.tts";
+        let mut backend = deferred_streaming_backend(backend_id);
+        {
+            let backend = Arc::get_mut(&mut backend).expect("new fixture has one owner");
+            let SpeechOperationCapability::Synthesis(capability) =
+                &mut backend.descriptor.capabilities[0].operation
+            else {
+                panic!("fixture supports synthesis");
+            };
+            capability.returned_audio.push(AudioOutputKind::Pcm);
+        }
+        host.register_backend(backend.clone())
+            .expect("register fixture");
+        let request_id = SpeechRequestId("observed-audio-request".to_owned());
+        let format = PcmFormat {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            sample_format: PcmSampleFormat::I16Le,
+            interleaved: true,
+        };
+        let mut request = exact_request(&request_id.0, backend_id);
+        request.output = AudioOutputFormat::Pcm { format };
+        request.stream = streamed;
+        let mut ticket = host.synthesize(request).await.expect("public admission");
+        backend.wait_until_active(&request_id).await;
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+        let mut public_events = std::mem::replace(&mut ticket.events, mpsc::channel(1).1);
+        let sender = backend
+            .events
+            .lock()
+            .expect("fixture event senders")
+            .get(&request_id)
+            .expect("admitted backend sender")
+            .clone();
+        let mut submitted = Vec::new();
+        for sequence in 0..chunks {
+            let data = sequence.to_le_bytes().to_vec();
+            submitted.extend_from_slice(&data);
+            let chunk = speech_native_types::AudioChunk {
+                sequence: u64::from(sequence),
+                sample_offset: u64::from(sequence),
+                format,
+                data,
+                end_of_stream: sequence + 1 == chunks,
+            };
+            chunk.validate(&request_id).expect("valid owned PCM chunk");
+            sender
+                .send(SynthesisEvent::Audio {
+                    request_id: request_id.clone(),
+                    chunk,
+                })
+                .await
+                .expect("real backend channel accepts chunk");
+        }
+        drop(sender);
+        let output = if streamed {
+            SynthesisOutput::Streamed {
+                format: AudioOutputFormat::Pcm { format },
+                emitted_bytes: u64::try_from(submitted.len()).expect("bounded fixture bytes"),
+            }
+        } else {
+            SynthesisOutput::Complete {
+                audio: submitted.clone(),
+                format: AudioOutputFormat::Pcm { format },
+            }
+        };
+        backend.complete_with_output(&request_id, output);
+        // Retain the public receiver without draining it until the actual final.
+        let result = ticket.final_response().await;
+        let mut events = Vec::new();
+        while let Some(event) = public_events.recv().await {
+            events.push(event);
+        }
+        wait_for_active_count(&host, 0).await;
+        host.shutdown().await.expect("join all actual host owners");
+        assert_eq!(backend.shutdown_calls.load(Ordering::Acquire), 1);
+        AudioDeliveryObservation {
+            result,
+            events,
+            submitted,
+            request_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_audio_pressure_reports_delivery_failure_after_ordinary_delivery() {
+        let ordinary = observe_audio_delivery(3, true).await;
+        let response = ordinary.result.as_ref().expect("ordinary streamed final");
+        assert!(matches!(
+            &response.output,
+            SynthesisOutput::Streamed {
+                emitted_bytes: 6,
+                ..
+            }
+        ));
+        let ordinary_audio: Vec<_> = ordinary
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SynthesisEvent::Audio { chunk, .. } => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ordinary_audio.len(), 3);
+        assert_eq!(
+            ordinary_audio
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            ordinary.submitted
+        );
+        assert_eq!(
+            ordinary
+                .events
+                .iter()
+                .filter(|event| event.is_terminal())
+                .count(),
+            1
+        );
+        assert!(ordinary.events.iter().any(|event| matches!(
+            event, SynthesisEvent::Completed { response: completed, .. } if completed == response
+        )));
+
+        let overflow = observe_audio_delivery(64, true).await;
+        let observed_audio: Vec<_> = overflow
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SynthesisEvent::Audio { chunk, .. } => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        let delivered_bytes: usize = observed_audio.iter().map(|chunk| chunk.data.len()).sum();
+        assert!(
+            matches!(
+                &overflow.result,
+                Err(error) if error.code == "speech_stream_delivery_incomplete"
+                    && error.class == SpeechErrorClass::Internal && !error.retryable
+            ),
+            "essential streamed audio loss must return failure: submitted_bytes={}, delivered_bytes={delivered_bytes}, returned={:?}, host_joined=true",
+            overflow.submitted.len(),
+            overflow.result
+        );
+        let error = overflow
+            .result
+            .as_ref()
+            .expect_err("typed delivery failure");
+        assert_eq!(error.request_id, overflow.request_id);
+        assert_eq!(error.backend_id.as_deref(), Some("observed-audio.tts"));
+        assert_eq!(observed_audio.len(), 63);
+        for (sequence, chunk) in observed_audio.iter().enumerate() {
+            assert_eq!(
+                chunk.sequence,
+                u64::try_from(sequence).expect("bounded sequence")
+            );
+            assert_eq!(chunk.sample_offset, chunk.sequence);
+        }
+        assert_eq!(
+            observed_audio
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            overflow.submitted[..delivered_bytes]
+        );
+        assert_eq!(
+            overflow
+                .events
+                .iter()
+                .filter(|event| event.is_terminal())
+                .count(),
+            1
+        );
+        assert!(overflow.events.iter().any(|event| matches!(
+            event, SynthesisEvent::Failed { error: terminal_error, .. } if terminal_error == error
+        )));
+        assert!(
+            !overflow
+                .events
+                .iter()
+                .any(|event| matches!(event, SynthesisEvent::Completed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_audio_remains_authoritative_when_event_copies_exceed_relay_capacity() {
+        let complete = observe_audio_delivery(64, false).await;
+        let response = complete
+            .result
+            .as_ref()
+            .expect("complete final remains authoritative");
+        assert!(matches!(
+            &response.output,
+            SynthesisOutput::Complete { audio, .. } if audio == &complete.submitted
+        ));
+        let copied_audio = complete
+            .events
+            .iter()
+            .filter(|event| matches!(event, SynthesisEvent::Audio { .. }))
+            .count();
+        assert_eq!(copied_audio, 63);
+        assert_eq!(
+            complete
+                .events
+                .iter()
+                .filter(|event| event.is_terminal())
+                .count(),
+            1
+        );
+        assert!(complete.events.iter().any(|event| matches!(
+            event, SynthesisEvent::Completed { response: completed, .. } if completed == response
+        )));
     }
 }

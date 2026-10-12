@@ -1822,9 +1822,9 @@ impl StreamingNormalizer {
             self.position += step;
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let consumed = self.position.floor() as usize;
+        let consumed = (self.position.floor() as usize).min(self.source.len());
         if consumed > 0 {
-            self.source.drain(..consumed.min(self.source.len()));
+            self.source.drain(..consumed);
             self.position -= consumed as f64;
         }
         Ok(output)
@@ -2265,6 +2265,74 @@ mod tests {
         assert_eq!(resampled.len(), 6);
         assert_eq!(resampled[0], 0.0);
         assert_eq!(resampled[2], 1.0);
+    }
+
+    #[test]
+    fn streaming_downsampling_matches_full_buffer_across_short_chunks() {
+        let request_id = SpeechRequestId("streaming-downsample-phase".to_owned());
+        let format = PcmFormat {
+            sample_rate_hz: 48_000,
+            ..fixture_pcm_format()
+        };
+        let bytes = [0_i16, 4_096, 8_192, 12_288, 16_384, 20_480]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        let complete = decode_complete(
+            &AudioInput::Pcm {
+                format,
+                data: bytes.clone(),
+            },
+            &request_id,
+        )
+        .expect("complete PCM decoding");
+        assert_eq!(complete, vec![0.0, 0.375]);
+        let mut whole = StreamingNormalizer::new(format);
+        let mut full_stream = whole.push(&bytes, &request_id).expect("whole stream input");
+        full_stream.extend(whole.finish());
+        assert_eq!(full_stream, complete);
+
+        for chunk_frames in [2, 1, 3, 4, 5] {
+            let mut split = StreamingNormalizer::new(format);
+            let mut output = Vec::new();
+            for chunk in bytes.chunks(chunk_frames * format.bytes_per_frame()) {
+                output.extend(split.push(chunk, &request_id).expect("split stream input"));
+            }
+            output.extend(split.finish());
+            assert_eq!(output, complete, "chunk_frames={chunk_frames}");
+        }
+    }
+
+    #[test]
+    fn streaming_identity_rate_matches_complete_audio_across_short_chunks() {
+        let request_id = SpeechRequestId("streaming-identity-rate".to_owned());
+        let format = fixture_pcm_format();
+        let bytes = [0_i16, 4_096, 8_192, 12_288, 16_384, 20_480]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        let complete = decode_complete(
+            &AudioInput::Pcm {
+                format,
+                data: bytes.clone(),
+            },
+            &request_id,
+        )
+        .expect("complete identity-rate PCM decoding");
+        assert_eq!(complete, vec![0.0, 0.125, 0.25, 0.375, 0.5, 0.625]);
+        for chunk_frames in [1, 2, 4, 6] {
+            let mut split = StreamingNormalizer::new(format);
+            let mut output = Vec::new();
+            for chunk in bytes.chunks(chunk_frames * format.bytes_per_frame()) {
+                output.extend(
+                    split
+                        .push(chunk, &request_id)
+                        .expect("identity stream input"),
+                );
+            }
+            output.extend(split.finish());
+            assert_eq!(output, complete, "chunk_frames={chunk_frames}");
+        }
     }
 
     #[test]
