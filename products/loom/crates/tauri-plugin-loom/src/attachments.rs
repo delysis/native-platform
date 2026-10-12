@@ -743,7 +743,7 @@ impl BoundedAssetFile {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         #[cfg(windows)]
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 
@@ -785,6 +785,9 @@ impl BoundedAssetFile {
 
     fn ensure_path_binding(&self) -> Result<(), AttachmentStoreError> {
         validate_asset_metadata(&fs::symlink_metadata(&self.path)?, self.max_bytes)?;
+        #[cfg(unix)]
+        let visible = Self::open(&self.path, self.max_bytes)?.identity;
+        #[cfg(not(unix))]
         let visible = FileIdentityHandle::from_path(&self.path)?;
         validate_asset_metadata(&fs::symlink_metadata(&self.path)?, self.max_bytes)?;
         if visible != self.identity {

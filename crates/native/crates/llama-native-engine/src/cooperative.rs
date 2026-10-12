@@ -490,7 +490,6 @@ impl Sequence {
         ) {
             return Err((Box::new(job), error));
         }
-        let _ = job.lease.progress(0);
         let authority_error = if is_statically_sealable_generation_batch(
             &job.request,
             GenerationBatchAdmission::Cooperative,
@@ -591,7 +590,6 @@ impl Sequence {
         } else {
             self.pending_token = Some(token);
         }
-        let _ = self.job.lease.progress(self.token_ids.len() as u64);
         Ok(())
     }
 
@@ -1122,7 +1120,6 @@ mod tests {
                 .expect("bounded checkpoint text");
             sequence.emit(GenerationEventKind::Delta { text });
         }
-        sequence.job.lease.progress(2).expect("running progress");
         (handle, sequence, ticket)
     }
 

@@ -11292,24 +11292,38 @@
 
           {#if uncertainPromotion}
             <div class="attention-action">
-              <button class="secondary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
-                {promotionInFlight ? 'Checking suggestion…' : 'Check suggestion result'}
+              <button class="secondary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight} aria-label={promotionInFlight ? 'Checking suggestion…' : 'Check suggestion result'} title="Check the authoritative suggestion result">
+                <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 2h5l3 3v9H4Z M9 2v4h3"/></svg>
+                {promotionInFlight ? 'Checking' : 'Check'}
               </button>
             </div>
           {/if}
         {:else}
           <section class="empty-project">
             {#if transition === 'navigation'}
-              <h1>Opening your writing…</h1>
-              <p>The document controls will appear when the writing surface is ready.</p>
+              <h1 aria-label="Opening your writing…" aria-describedby="opening-surface-help" title="Opening your writing…">
+                <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg>
+                Opening
+              </h1>
+              <span id="opening-surface-help" class="sr-only">The document controls will appear when the writing surface is ready.</span>
             {:else if uncertainPromotion}
-              <h1>Promotion needs confirmation.</h1>
-              <p>The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
-              <button class="primary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
-                {promotionInFlight ? 'Checking authoritative state…' : 'Check promotion result'}
+              <h1 aria-label="Promotion needs confirmation." aria-describedby="promotion-confirmation-help" title="Promotion needs confirmation.">
+                <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 2h5l3 3v9H4Z M9 2v4h3"/></svg>
+                Uncertain
+              </h1>
+              <details>
+                <summary title="Why the writing surface is locked">Details</summary>
+                <p id="promotion-confirmation-help">The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
+              </details>
+              <button class="primary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight} aria-label={promotionInFlight ? 'Checking authoritative state…' : 'Check promotion result'} aria-describedby="promotion-confirmation-help" title="Check the authoritative promotion result">
+                <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 2h5l3 3v9H4Z M9 2v4h3"/></svg>
+                {promotionInFlight ? 'Checking' : 'Check'}
               </button>
             {:else}
-              <h1>{project.documents.length > 0 ? 'Choose a note.' : 'No notes.'}</h1>
+              <h1 aria-label={project.documents.length > 0 ? 'Choose a note.' : 'No notes.'} title={project.documents.length > 0 ? 'Choose a note.' : 'No notes.'}>
+                <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M4 2h5l3 3v9H4Z M9 2v4h3"/></svg>
+                {project.documents.length > 0 ? 'Notes' : 'Empty'}
+              </h1>
             {/if}
           </section>
         {/if}
@@ -11399,11 +11413,15 @@
       </TerminalPane>
       </div>
   {:else}
+    {@const welcomeDescription = errorMessage ? 'Your writing did not open.' : desktop ? 'Opening your writing…' : 'Desktop app required.'}
     <main class="welcome" id="manuscript">
-      <section class="welcome-note" aria-labelledby="welcome-title">
-        <h1 id="welcome-title">{errorMessage ? 'Your writing did not open.' : desktop ? 'Opening your writing…' : 'Desktop app required.'}</h1>
+      <section class="welcome-note" aria-labelledby="welcome-title" aria-describedby={!desktop ? 'welcome-runtime-help' : undefined}>
+        <h1 id="welcome-title" aria-label={welcomeDescription} title={welcomeDescription}>
+          <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg>
+          {errorMessage ? 'Unavailable' : desktop ? 'Opening' : 'Desktop'}
+        </h1>
         {#if !desktop}
-          <div class="runtime-note" role="note">Writing and local models are available in the desktop app.</div>
+          <span id="welcome-runtime-help" class="sr-only" role="note">Writing and local models are available in the desktop app.</span>
         {/if}
         {#if errorMessage}
           <div class="error-banner" role="alert">
@@ -11416,8 +11434,9 @@
               Retry
             </button>
           {/if}
-          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening}>
-            {opening ? 'Opening…' : 'Open folder…'}
+          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening} aria-label={opening ? 'Opening…' : 'Open folder…'} title="Open a writing folder">
+            <svg class="surface-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg>
+            {opening ? 'Opening' : 'Open'}
           </button>
         </div>
       </section>
@@ -11846,4 +11865,5 @@
 
 <style>
   .workspace-root.unavailable { opacity: 0.55; }
+  .surface-icon { width: 1em; height: 1em; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
 </style>
