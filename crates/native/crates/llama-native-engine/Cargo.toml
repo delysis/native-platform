@@ -23,7 +23,6 @@ llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cp
 
 [dev-dependencies]
 serde.workspace = true
-serde_json.workspace = true
 
 [build-dependencies]
 sha2.workspace = true
