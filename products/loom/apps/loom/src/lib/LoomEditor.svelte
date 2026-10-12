@@ -602,6 +602,8 @@
     markdown: string;
     from: number;
     to: number;
+    view: EditorView;
+    document: ProseMirrorNode;
   } | null {
     if (!view || readonly || composing) return null;
     // Clicking a source places the browser caret inside its label. Derivations
@@ -612,6 +614,8 @@
     return {
       surfaceKey,
       markdown: lastEmitted,
+      view,
+      document: view.state.doc,
       from: afterReference ?? view.state.selection.from,
       to: afterReference ?? view.state.selection.to
     };
@@ -621,15 +625,19 @@
     if (!view || readonly || composing) return null;
     const position = view.posAtCoords({ left: clientX, top: clientY });
     const selection = position ? Selection.near(view.state.doc.resolve(position.pos)) : view.state.selection;
-    return { surfaceKey, markdown: lastEmitted, from: selection.from, to: selection.to };
+    return {
+      surfaceKey, markdown: lastEmitted, from: selection.from, to: selection.to,
+      view, document: view.state.doc
+    };
   }
 
   export function insertMarkdownAtAnchor(
-    anchor: { surfaceKey: string; markdown: string; from: number; to: number }, markdown: string
+    anchor: NonNullable<ReturnType<typeof captureTextInsertionAnchor>>, markdown: string
   ): boolean {
     if (!view || readonly || composing || anchor.surfaceKey !== surfaceKey ||
         anchor.markdown !== lastEmitted || anchor.from < 0 || anchor.to < anchor.from ||
-        anchor.to > view.state.doc.content.size) return false;
+        anchor.to > view.state.doc.content.size || view !== anchor.view ||
+        view.isDestroyed || !view.state.doc.eq(anchor.document)) return false;
     const imported = parse(markdown);
     view.dispatch(view.state.tr.replaceRange(anchor.from, anchor.to, imported.slice(0, imported.content.size)));
     projectDocument();
@@ -638,7 +646,7 @@
   }
 
   export function insertTextAtAnchor(
-    anchor: { surfaceKey: string; markdown: string; from: number; to: number },
+    anchor: NonNullable<ReturnType<typeof captureTextInsertionAnchor>>,
     text: string
   ): boolean {
     if (
@@ -650,7 +658,10 @@
       anchor.markdown !== lastEmitted ||
       anchor.from < 0 ||
       anchor.to < anchor.from ||
-      anchor.to > view.state.doc.content.size
+      anchor.to > view.state.doc.content.size ||
+      view !== anchor.view ||
+      view.isDestroyed ||
+      !view.state.doc.eq(anchor.document)
     ) return false;
     view.dispatch(view.state.tr.insertText(text, anchor.from, anchor.to));
     projectDocument();

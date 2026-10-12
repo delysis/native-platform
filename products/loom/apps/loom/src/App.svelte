@@ -392,12 +392,7 @@
     type BoundaryObservation
   } from './lib/completionBoundaryDiagnostics';
 
-  type VisualTextInsertionAnchor = {
-    surfaceKey: string;
-    markdown: string;
-    from: number;
-    to: number;
-  };
+  type VisualTextInsertionAnchor = NonNullable<ReturnType<LoomEditor['captureTextInsertionAnchor']>>;
   type SourceTextInsertionAnchor = {
     surfaceKey: string;
     value: string;
