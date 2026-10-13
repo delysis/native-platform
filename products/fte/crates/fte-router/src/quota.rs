@@ -4,8 +4,10 @@
 //! account for reported input/output usage and reserve the caller's output
 //! ceiling across concurrent calls. Unknown input tokenization is not guessed;
 //! a remote provider remains authoritative about its own token limits. Missing
-//! final accounting closes a token-limited window rather than refunding an
-//! unknowable charge. No counter survives beyond its minute/day window.
+//! generation accounting closes a token-limited window rather than refunding an
+//! unknowable charge. Router rejection before backend execution releases token
+//! reservation only; the admitted request still counts. Token-count preflight
+//! is not generation execution. No counter survives its minute/day window.
 
 use fte_types::{
     ErrorClass, GatewayError, GatewayResponse, QuotaLimits, RequestId, UsageProvenance,
@@ -155,6 +157,7 @@ impl Quota {
             quota: Arc::clone(self),
             starts: [state.minute.start, state.day.start],
             reserved,
+            execution_started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         })
     }
@@ -164,10 +167,17 @@ pub(crate) struct Reservation {
     quota: Arc<Quota>,
     starts: [Instant; 2],
     reserved: u64,
+    execution_started: AtomicBool,
     finished: AtomicBool,
 }
 
 impl Reservation {
+    // Set immediately before entering GatewayBackend::execute, never inferred
+    // from an error code: an execute error may follow real provider work.
+    pub(crate) fn start_execution(&self) {
+        self.execution_started.store(true, Ordering::Release);
+    }
+
     pub(crate) fn finish(&self, result: &Result<GatewayResponse, GatewayError>) {
         let tokens = result.as_ref().ok().and_then(|response| {
             (response.usage.provenance == UsageProvenance::Exact)
@@ -206,7 +216,8 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.settle(None);
+        let tokens = (!self.execution_started.load(Ordering::Acquire)).then_some(0);
+        self.settle(tokens);
     }
 }
 
@@ -297,6 +308,7 @@ mod tests {
             ..Default::default()
         });
         let reservation = quota.reserve(&RequestId::new(), Some(1)).expect("first");
+        reservation.start_execution();
         drop(reservation);
         assert_eq!(quota.headroom(), Some(0.0));
     }

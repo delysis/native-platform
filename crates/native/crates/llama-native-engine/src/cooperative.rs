@@ -11,7 +11,7 @@ use std::sync::{Weak, atomic::AtomicU64};
 
 const MAX_LIVE: usize = 8;
 const PREFILL_QUANTUM: usize = 64;
-const MAX_PROMPT_BYTES: usize = 64 * 1024;
+const MAX_PROMPT_TOKENS: usize = 64 * 1024;
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 const MAX_OBSERVERS: usize = 2;
 const OBSERVATION_CAPACITY: usize = 4096;
@@ -195,7 +195,7 @@ impl DecodeHub {
 }
 
 impl NativeModelHandle {
-    /// Submit one independently owned, uncached case to the cooperative lane.
+    /// Submit one independently owned, uncached exact-token case to the cooperative lane.
     /// Later cooperative requests may join while this request is decoding.
     /// Media, caller caches and out-of-band reasoning intervention are not
     /// supported on this lane. The resident must be loaded with `kv_unified`
@@ -247,27 +247,15 @@ fn validate_request(request: &GenerationBatchRequest) -> NativeResult<()> {
     let bounded_input = match &case.input {
         GenerationInput::Completion { prompts } => match prompts.as_slice() {
             [CompletionPrompt::Tokens { token_ids }] => {
-                !token_ids.is_empty() && token_ids.len() <= MAX_PROMPT_BYTES
-            }
-            [CompletionPrompt::Text { text, .. }] => {
-                !text.is_empty() && text.len() <= MAX_PROMPT_BYTES
+                !token_ids.is_empty() && token_ids.len() <= MAX_PROMPT_TOKENS
             }
             _ => false,
         },
-        GenerationInput::Chat { messages, .. } => {
-            !messages.is_empty()
-                && messages
-                    .iter()
-                    .try_fold(0_usize, |total, message| {
-                        total.checked_add(message.content.len())
-                    })
-                    .is_some_and(|bytes| bytes <= MAX_PROMPT_BYTES)
-        }
-        GenerationInput::FillInMiddle { .. } => false,
+        GenerationInput::Chat { .. } | GenerationInput::FillInMiddle { .. } => false,
     };
     if !bounded_input {
         return Err(unsupported(
-            "cooperative prompt exceeds its bounded text/token contract",
+            "cooperative generation requires one nonempty exact-token prompt of at most 65536 tokens",
         ));
     }
     Ok(())
@@ -1641,5 +1629,68 @@ mod tests {
             1
         );
         Ok(())
+    }
+    #[test]
+    fn public_cooperative_admission_rejects_text_and_chat_without_queuing() {
+        let (mut handle, commands, _speculative) =
+            crate::tests::test_admission_handle(crate::tests::admission_test_status(), 2);
+        let inner = Arc::get_mut(&mut handle.inner).expect("unique fixture handle");
+        Arc::get_mut(&mut inner.worker_identity)
+            .expect("unique fixture worker")
+            .kv_unified = false;
+        let mut request = GenerationBatchRequest {
+            request_id: "same-admission".into(),
+            model_id: "model".into(),
+            first_word_choices: None,
+            media: Vec::new(),
+            cases: vec![GenerationCase {
+                case_id: "case".into(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Tokens {
+                        token_ids: vec![1, 2],
+                    }],
+                },
+                sampling: SamplingConfig {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+                cached_prefix: None,
+            }],
+        };
+        let exact = request.cases[0].input.clone();
+        for input in [
+            GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Text {
+                    text: "hello".into(),
+                    special_tokens: Default::default(),
+                }],
+            },
+            GenerationInput::Chat {
+                messages: vec![llama_native_types::ChatMessage {
+                    role: llama_native_types::ChatRole::User,
+                    content: "hello".into(),
+                }],
+                template: Default::default(),
+            },
+        ] {
+            request.cases[0].input = input;
+            let error = match handle.generate_cooperative(request.clone()) {
+                Ok(_) => panic!("independent streams require exact tokens"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, NativeErrorCode::UnsupportedParameter);
+            assert!(
+                commands.try_recv().is_err(),
+                "unsupported input cannot queue native work"
+            );
+        }
+        request.cases[0].input = exact;
+        let ticket = handle
+            .generate_cooperative(request)
+            .expect("ordinary exact-token admission");
+        let job = Job::from_command(commands.recv().expect("exact-token command"))
+            .expect("actual cooperative job");
+        drop(job);
+        drop(ticket);
     }
 }

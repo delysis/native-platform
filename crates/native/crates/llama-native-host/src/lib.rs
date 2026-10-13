@@ -136,6 +136,7 @@ impl PrefixCachePromotionLease for UnrestrictedPrefixCachePromotionLease {
 pub struct NativeHostConfig {
     pub memory_budget_bytes: u64,
     pub max_slots: usize,
+    /// Resident cache allocation charge; see `MemoryPrefixCache` for its scope.
     pub memory_cache_bytes: usize,
     pub cache_namespace: String,
     pub cache_policy: HostCachePolicy,
@@ -1029,6 +1030,7 @@ impl NativeHost {
         let Some(validated) = ValidatedPrefixCacheValue::new(value.clone()) else {
             return Ok(CacheInsertOutcome::InvalidRejected);
         };
+        let fits_memory = validated.memory_bytes() <= self.config.memory_cache_bytes;
         let _cache_guard = self.cache_gate.lock().map_err(host_poisoned)?;
         let owner_generation = value.metadata.owner_id.as_deref().map(|owner_id| {
             self.state
@@ -1053,7 +1055,7 @@ impl NativeHost {
         };
         let persistent =
             self.config.cache_policy.allows_persistent() && self.persistent_cache.is_some();
-        if value.metadata.state_bytes > self.config.memory_cache_bytes && !persistent {
+        if !fits_memory && !persistent {
             return Ok(CacheInsertOutcome::InvalidRejected);
         }
         if let Some(store) = self.persistent_cache.as_ref().filter(|_| persistent) {
@@ -1070,7 +1072,7 @@ impl NativeHost {
         {
             return Ok(CacheInsertOutcome::OwnerRejected);
         }
-        if value.metadata.state_bytes > self.config.memory_cache_bytes {
+        if !fits_memory {
             let evicted = state
                 .cache
                 .invalidate(&id)
@@ -2282,7 +2284,9 @@ mod tests {
         let store = Arc::new(TestPrefixStore::default());
         let host = NativeHost::with_dependencies(
             NativeHostConfig {
-                memory_cache_bytes: 8,
+                memory_cache_bytes: ValidatedPrefixCacheValue::new(cache_value("same", 1))
+                    .expect("valid fixture")
+                    .memory_bytes(),
                 ..NativeHostConfig::default()
             },
             Arc::new(SystemClock),
@@ -2321,7 +2325,9 @@ mod tests {
             .expect("seed");
         let host = NativeHost::with_dependencies(
             NativeHostConfig {
-                memory_cache_bytes: 8,
+                memory_cache_bytes: ValidatedPrefixCacheValue::new(cache_value("a", 1))
+                    .expect("valid fixture")
+                    .memory_bytes(),
                 ..NativeHostConfig::default()
             },
             Arc::new(SystemClock),
@@ -2377,7 +2383,9 @@ mod tests {
         let store = Arc::new(TestPrefixStore::default());
         let host = NativeHost::with_dependencies(
             NativeHostConfig {
-                memory_cache_bytes: 8,
+                memory_cache_bytes: ValidatedPrefixCacheValue::new(cache_value("second", 2))
+                    .expect("valid fixture")
+                    .memory_bytes(),
                 ..NativeHostConfig::default()
             },
             Arc::new(SystemClock),
@@ -2406,7 +2414,7 @@ mod tests {
     fn host_cache_lookup_requires_an_exact_owner_scope() {
         let host = NativeHost::new(NativeHostConfig {
             cache_policy: HostCachePolicy::MemoryOnly,
-            memory_cache_bytes: 64,
+            memory_cache_bytes: 64 * 1024,
             ..NativeHostConfig::default()
         });
         let unowned = cache_value("unowned", 1);
@@ -2721,6 +2729,59 @@ mod tests {
             )
             .is_none(),
             "a same-ID owner replacement must not inherit the captured owner's lease"
+        );
+    }
+    #[test]
+    fn token_heavy_persistent_value_reports_disk_only_and_is_not_restored_to_memory() {
+        let store = Arc::new(TestPrefixStore::default());
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                memory_cache_bytes: 4096,
+                ..NativeHostConfig::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        let original = cache_value("same", 1);
+        assert!(matches!(
+            host.cache_insert(original.clone())
+                .expect("ordinary insert"),
+            CacheInsertOutcome::Stored {
+                memory_resident: true,
+                persistent_resident: true,
+                ..
+            }
+        ));
+        let mut large = cache_value("same", 2);
+        large.metadata.token_ids = vec![2; 16 * 1024];
+        large.metadata.token_sha256 = llama_native_cache::token_sha256(&large.metadata.token_ids);
+        large.sequence.token_ids = large.metadata.token_ids.clone();
+        large.sequence.token_count = large.sequence.token_ids.len();
+        assert_eq!(large.metadata.state_bytes, original.metadata.state_bytes);
+        assert_eq!(
+            host.cache_insert(large.clone())
+                .expect("persistent publication"),
+            CacheInsertOutcome::Stored {
+                memory_resident: false,
+                persistent_resident: true,
+                evicted: vec!["same".to_string()],
+            }
+        );
+        assert!(
+            host.cache_lookup(&original.metadata.fingerprint, &[1, 3])
+                .is_none()
+        );
+        large.bind_reconstruction();
+        assert_eq!(
+            store
+                .load("llama-native-host")
+                .expect("persistent evidence"),
+            vec![large]
+        );
+        assert_eq!(
+            host.restore_persistent_cache()
+                .expect("bounded restoration"),
+            0
         );
     }
 }

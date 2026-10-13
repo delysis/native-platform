@@ -1,5 +1,5 @@
 use llama_native_types::{NativeError, NativeErrorCode};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,8 +243,9 @@ pub(crate) struct RequestSnapshot {
 struct RegistryState {
     phase: RegistryPhase,
     next_nonce: u64,
+    // One executor-owned attempt per request ID, retained through final delivery.
+    // The entry's nonce and Arc identity distinguish later reuse of the same ID.
     active: HashMap<String, Arc<ActiveRequest>>,
-    attempts: BTreeMap<u64, Arc<ActiveRequest>>,
     expected_worker_ids: Vec<String>,
     joined_worker_ids: Vec<String>,
     shutdown: Option<RegistryShutdownOutcome>,
@@ -282,7 +283,6 @@ impl RequestRegistry {
                 phase: RegistryPhase::Running,
                 next_nonce: 0,
                 active: HashMap::new(),
-                attempts: BTreeMap::new(),
                 expected_worker_ids: Vec::new(),
                 joined_worker_ids: Vec::new(),
                 shutdown: None,
@@ -350,7 +350,6 @@ impl RequestRegistry {
             }),
         });
         state.active.insert(request_id, Arc::clone(&entry));
-        state.attempts.insert(reservation_nonce, Arc::clone(&entry));
         Ok((
             Arc::clone(&entry),
             RequestLease {
@@ -420,7 +419,7 @@ impl RequestRegistry {
 
     #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
-        self.lock_recovering_poison().attempts.len()
+        self.lock_recovering_poison().active.len()
     }
 
     #[cfg(test)]
@@ -435,7 +434,7 @@ impl RequestRegistry {
                 return;
             }
             state.phase = RegistryPhase::Quiescing;
-            state.attempts.values().cloned().collect::<Vec<_>>()
+            state.active.values().cloned().collect::<Vec<_>>()
         };
         for entry in active {
             entry.cancel_all();
@@ -452,7 +451,7 @@ impl RequestRegistry {
             }
         }
         let mut state = self.lock_recovering_poison();
-        while !state.attempts.is_empty() {
+        while !state.active.is_empty() {
             state = self
                 .drained
                 .wait(state)
@@ -464,7 +463,7 @@ impl RequestRegistry {
         let outcome = RegistryShutdownOutcome {
             phase: RequestRegistryPhase::Closed,
             state_poisoned: self.state.is_poisoned(),
-            active_operations: state.attempts.len(),
+            active_operations: state.active.len(),
             retained_tasks: 0,
             expected_workers: expected_worker_ids.len(),
             joined_workers: joined_worker_ids.len(),
@@ -490,12 +489,12 @@ impl RequestRegistry {
 
     pub(crate) fn mark_closed(&self) -> NativeResult<()> {
         let mut state = self.lock_recovering_poison();
-        if !state.attempts.is_empty() {
+        if !state.active.is_empty() {
             return Err(NativeError::new(
                 NativeErrorCode::Internal,
                 format!(
                     "native worker joined with {} active request reservation(s)",
-                    state.attempts.len()
+                    state.active.len()
                 ),
             ));
         }
@@ -513,7 +512,7 @@ impl RequestRegistry {
     #[cfg(test)]
     pub(crate) fn wait_until_drained(&self) {
         let mut state = self.lock_recovering_poison();
-        while !state.attempts.is_empty() {
+        while !state.active.is_empty() {
             state = self
                 .drained
                 .wait(state)
@@ -536,31 +535,24 @@ impl RequestRegistry {
     #[cfg(test)]
     fn release_if_current(&self, entry: &Arc<ActiveRequest>) {
         let mut state = self.lock_recovering_poison();
-        let current_matches = state
-            .attempts
-            .get(&entry.reservation_nonce)
-            .is_some_and(|current| Arc::ptr_eq(current, entry));
+        let current_matches = state.active.get(entry.request_id()).is_some_and(|current| {
+            Arc::ptr_eq(current, entry) && current.reservation_nonce == entry.reservation_nonce
+        });
         if current_matches {
-            if state.active.get(entry.request_id()).is_some_and(|current| {
-                Arc::ptr_eq(current, entry) && current.reservation_nonce == entry.reservation_nonce
-            }) {
-                state.active.remove(entry.request_id());
-            }
-            state.attempts.remove(&entry.reservation_nonce);
+            state.active.remove(entry.request_id());
             #[cfg(test)]
             self.releases.fetch_add(1, Ordering::AcqRel);
         }
-        if state.attempts.is_empty() {
+        if state.active.is_empty() {
             self.drained.notify_all();
         }
     }
 
     fn abandon_if_current(&self, entry: &Arc<ActiveRequest>) {
         let mut state = self.lock_recovering_poison();
-        let current_matches = state
-            .attempts
-            .get(&entry.reservation_nonce)
-            .is_some_and(|current| Arc::ptr_eq(current, entry));
+        let current_matches = state.active.get(entry.request_id()).is_some_and(|current| {
+            Arc::ptr_eq(current, entry) && current.reservation_nonce == entry.reservation_nonce
+        });
         if !current_matches {
             return;
         }
@@ -578,12 +570,7 @@ impl RequestRegistry {
                 sequence: entry.reservation_nonce,
             });
         }
-        state.attempts.remove(&entry.reservation_nonce);
-        if state.active.get(entry.request_id()).is_some_and(|current| {
-            Arc::ptr_eq(current, entry) && current.reservation_nonce == entry.reservation_nonce
-        }) {
-            state.active.remove(entry.request_id());
-        }
+        state.active.remove(entry.request_id());
         lifecycle.phase = RequestPhase::Released;
         #[cfg(test)]
         self.releases.fetch_add(1, Ordering::AcqRel);
@@ -595,9 +582,12 @@ impl RequestRegistry {
     fn require_current(&self, lease: &RequestLease) -> NativeResult<()> {
         let state = self.lock_recovering_poison();
         let current = state
-            .attempts
-            .get(&lease.entry.reservation_nonce)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &lease.entry));
+            .active
+            .get(lease.entry.request_id())
+            .is_some_and(|entry| {
+                Arc::ptr_eq(entry, &lease.entry)
+                    && entry.reservation_nonce == lease.entry.reservation_nonce
+            });
         if current { Ok(()) } else { Err(stale_lease()) }
     }
 
