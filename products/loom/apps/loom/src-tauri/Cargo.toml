@@ -28,6 +28,7 @@ loom-types = { path = "../../../crates/loom-types" }
 sha2.workspace = true
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
+tauri-plugin-global-shortcut = "2.3.1"
 tauri-plugin-loom = { path = "../../../crates/tauri-plugin-loom" }
 
 # Keep the existing mobile library independent of the desktop Mom shell.

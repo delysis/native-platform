@@ -9,7 +9,8 @@ use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
 use tauri::utils::config::WindowConfig;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod application;
@@ -23,7 +24,6 @@ const FILE_NEW_DOCUMENT_ACCELERATOR: &str = "CmdOrCtrl+N";
 const FILE_OPEN_PROJECT_ACCELERATOR: &str = "CmdOrCtrl+O";
 const FILE_SAVE_ACCELERATOR: &str = "CmdOrCtrl+S";
 const FILE_EXPORT_COPY_ACCELERATOR: &str = "CmdOrCtrl+Shift+S";
-const REVERSE_COMPLETION_ACCELERATOR: &str = "Alt+Left";
 const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,6 +71,17 @@ pub fn run() {
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if *shortcut == reverse_completion_shortcut() &&
+                        event.state == ShortcutState::Pressed
+                    {
+                        let _ = app.emit(tauri_plugin_loom::REVERSE_COMPLETION_EVENT, ());
+                    }
+                })
+                .build(),
+        )
         .plugin(loom_plugin.build())
         .setup(move |app| {
             if let Some(identifier) = acceptance_data_store {
@@ -82,10 +93,35 @@ pub fn run() {
                         .build()?;
                 }
             }
+            for window in app.webview_windows().into_values() {
+                let handle = app.handle().clone();
+                if window.is_focused().unwrap_or(false) {
+                    set_reverse_completion_shortcut(&handle, true);
+                }
+                window.on_window_event(move |event| {
+                    if let WindowEvent::Focused(focused) = event {
+                        set_reverse_completion_shortcut(&handle, *focused);
+                    }
+                });
+            }
             Ok(())
         })
         .run(context)
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
+}
+
+fn reverse_completion_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::ALT), Code::ArrowLeft)
+}
+
+fn set_reverse_completion_shortcut<R: Runtime>(app: &AppHandle<R>, enabled: bool) {
+    let manager = app.global_shortcut();
+    let shortcut = reverse_completion_shortcut();
+    if enabled && !manager.is_registered(shortcut) {
+        let _ = manager.register(shortcut);
+    } else if !enabled && manager.is_registered(shortcut) {
+        let _ = manager.unregister(shortcut);
+    }
 }
 
 // Native project storage and renderer storage are independent. Acceptance
@@ -260,7 +296,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                         tauri_plugin_loom::REVERSE_COMPLETION_MENU_ID,
                         "Reverse Completion",
                         true,
-                        Some(REVERSE_COMPLETION_ACCELERATOR),
+                        None::<&str>,
                     )?,
                 ],
             )?,
