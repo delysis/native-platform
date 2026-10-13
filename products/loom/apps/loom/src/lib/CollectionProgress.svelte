@@ -123,30 +123,28 @@
       {:else if status.refresh_authorized}
         <button disabled={busy} on:click={() => void act(status?.resumable ? 'resume' : 'fresh')}>{status.resumable ? 'Resume' : 'Refresh'}</button>
         {#if status.resumable}
-          <button disabled={busy} on:click={() => void act('fresh')}>Start again</button>
+          <button disabled={busy} aria-label="Start again" title="Start a fresh collection refresh" on:click={() => void act('fresh')}>Restart</button>
         {/if}
       {/if}
     </div>
     {#if !status.refresh_authorized}
-      <p class="muted">{status.local_readable && status.retained_count > 0 ? 'Retained sources are available. Reconnect to refresh.' : 'Reconnect to add sources.'}</p>
       {#if choosingAccount}
         <p class="muted">{status.scope.kind === 'drive_folder' ? `Drive folder: ${status.scope.id}` : `Mail: ${status.scope.query}`}</p>
         {#if accounts.length}
           <label>Account <select bind:value={accountEmail} disabled={busy}>
-            <option value="">Choose an account</option>
+            <option value="">Account</option>
             {#each accounts as account}<option value={account.email ?? ''}>{account.email}</option>{/each}
           </select></label>
           <button disabled={busy || !accountEmail} on:click={() => void connect()}>Connect</button>
         {:else}
-          <p class="muted">Connect an account in Add sources, then return here.</p>
-          <button disabled={busy} on:click={() => void chooseAccount()}>Check connections</button>
+          <button disabled={busy} aria-label="Check connections" title="Connect an account in Add sources, then check connections here" on:click={() => void chooseAccount()}>Check</button>
         {/if}
       {:else}
-        <button disabled={busy} on:click={() => void chooseAccount()}>Reconnect</button>
+        <button disabled={busy} title={status.local_readable && status.retained_count > 0 ? 'Retained sources are available. Reconnect to refresh.' : 'Reconnect to add sources.'} on:click={() => void chooseAccount()}>Reconnect</button>
       {/if}
     {/if}
     {#if status.failures.length}
-      <details><summary>{status.failures.length} {status.failures.length === 1 ? 'source needs attention' : 'sources need attention'}</summary>
+      <details><summary aria-label={`${status.failures.length} sources need attention`} title="Inspect source failures"><span aria-hidden="true">⚠</span> {status.failures.length}</summary>
         {#each status.failures as failure}<p>{failure.name}: {failure.message}</p>{/each}
       </details>
     {/if}

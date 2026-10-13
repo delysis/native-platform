@@ -57,8 +57,8 @@
     <button class="member" on:click={() => onOpenMember(member)}>{member.name}</button>
   {/each}
   {#if error}<p role="alert">{error} <button disabled={busy} on:click={() => void load(nextOffset ?? 0)}>Retry</button></p>
-  {:else if !busy && !members.length}<p class="empty">No retained sources yet.</p>{/if}
-  {#if nextOffset !== null}<button disabled={busy} on:click={() => void load(nextOffset!)}>More sources</button>{/if}
+  {/if}
+  {#if nextOffset !== null}<button disabled={busy} aria-label="More sources" title="More sources" on:click={() => void load(nextOffset!)}>More</button>{/if}
 </div>
 
 <style>
@@ -68,6 +68,5 @@
   button:hover { background: var(--chrome-hover); }
   button:disabled { opacity: .5; }
   p { margin: 6px 0; }
-  .empty { color: var(--muted); }
   [role=alert] { color: var(--danger); }
 </style>

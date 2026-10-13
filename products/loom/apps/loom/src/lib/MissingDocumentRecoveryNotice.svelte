@@ -12,8 +12,12 @@
 
 <section class="missing-document-recovery" role="alert" aria-labelledby="missing-document-title">
   <div>
-    <span class="eyebrow">File deleted outside Loom</span>
-    <h2 id="missing-document-title">“{title}” is preserved for recovery.</h2>
+    <span role="img" aria-label="File deleted outside Loom" title={hadUnsavedText && !journalDurable ? 'Draft durability could not be confirmed. Keep Loom open and copy the preserved text.' : 'File deleted outside Loom; preserved text is available for recovery.'}>⚠</span>
+    <h2 id="missing-document-title">{title}</h2>
+    <code>{relativePath}</code>
+  </div>
+  <details>
+    <summary aria-label="Inspect preserved text" title="Inspect preserved text and recovery evidence">Recovery</summary>
     <p>
       {#if hadUnsavedText}
         The editor text was captured before Loom left the missing file.
@@ -37,15 +41,12 @@
       </p>
     {/if}
     <p class="missing-document-path">Restore <code>{relativePath}</code> and refocus Loom to reopen it.</p>
-  </div>
-  <details>
-    <summary>Inspect preserved text</summary>
     <textarea readonly aria-label={`Preserved text for ${title}`} value={text}></textarea>
   </details>
   <div class="missing-document-actions">
-    <button class="secondary-button" type="button" on:click={onCopy}>Copy preserved text</button>
-    <span role="status" aria-live="polite">
-      {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed; select the text above' : ''}
+    <button class="secondary-button" type="button" aria-label="Copy preserved text" title="Copy preserved text" on:click={onCopy}>Copy</button>
+    <span role="status" aria-live="polite" title={copyState === 'failed' ? 'Copy failed; open Recovery and select the preserved text' : undefined}>
+      {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Failed' : ''}
     </span>
   </div>
 </section>

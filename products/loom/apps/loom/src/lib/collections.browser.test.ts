@@ -115,7 +115,7 @@ describe('named connected collections', () => {
       await unmount(component);
       status = { ...status, phase: 'interrupted', refresh_authorized: false };
       component = mount(CollectionProgress, { target: runtime.target, props });
-      await expect.element(page.getByText('Retained sources are available. Reconnect to refresh.', { exact: true })).toBeVisible();
+      await expect.element(page.getByRole('button', { name: 'Reconnect', exact: true })).toHaveAttribute('title', 'Retained sources are available. Reconnect to refresh.');
       expect(page.getByRole('button', { name: /Refresh|Resume|Stop/ }).query()).toBeNull();
     } finally { await unmount(component); runtime.cleanup(); }
   });

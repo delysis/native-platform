@@ -59,7 +59,7 @@ describe('source import cancellation', () => {
         projectId: 'project-a', sessionId: 'session-a', operationId
       }));
       // The import has not resolved: cancel must bypass its pending ordering lane.
-      await expect.element(page.getByRole('status')).toHaveTextContent('Stopping…');
+      await expect.element(page.getByRole('status')).toHaveTextContent('Stopping');
       batch.resolve({ workspace_id: 'project-a', workspace_session_id: 'session-a', operation_id: operationId,
         imported: [{ attachment: retained, material: { id: 'material-source', name: 'Retained source', reference: '@source', kind: 'attachment', pinned: false, available: true, source_path: null, attachment_id: retained.id } }],
         failures: [{ name: 'Next source.pdf', message: 'Import stopped.' }], cancelled: true });
@@ -83,7 +83,7 @@ describe('source import cancellation', () => {
       }));
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
       disconnect.resolve();
-      await expect.element(page.getByRole('status')).toHaveTextContent('Connection removed');
+      await expect.element(page.getByRole('status')).toHaveTextContent('Disconnected');
       expect(native.invoke.mock.calls.filter(([command]) => command === 'plugin:loom|workspace_source_import_cancel')).toHaveLength(1);
     } finally {
       batch.resolve({ workspace_id: 'project-a', workspace_session_id: 'session-a', operation_id: '', imported: [], failures: [], cancelled: true });
