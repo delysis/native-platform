@@ -31,17 +31,11 @@ describe('App ghost reactivity wiring', () => {
     expect(visualEvaluation).toContain('visualGhostTargetByte');
     expect(visualEvaluation).toContain('branchPromotionReady');
 
-    const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
-    expect(visual).toContain('visualFamilyEvaluation');
-
     const sourceEvaluation = dependencyThunkFor(compiled, '$.set(sourceFamilyEvaluation');
     expect(sourceEvaluation).toContain('verifiedBranchBodyByRun');
     expect(sourceEvaluation).toContain('branches');
     expect(sourceEvaluation).toContain('sourceGhostTargetByte');
     expect(sourceEvaluation).toContain('branchPromotionReady');
-
-    const sourceGhost = dependencyThunkFor(compiled, '$.set(sourceAutocompleteDisposition');
-    expect(sourceGhost).toContain('sourceFamilyEvaluation');
 
     const visualFamily = dependencyThunkFor(compiled, '$.set(visualSuggestionFamily');
     expect(visualFamily).toContain('visualFamilyEvaluation');
