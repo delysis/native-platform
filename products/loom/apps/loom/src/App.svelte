@@ -8467,14 +8467,25 @@
     presentationKey: string,
     text: string
   ): boolean {
+    const projected = eligibleGhostForCurrentMode();
     const authorization = authorizeCompletionUnconsume(completionController, {
       contextKey: completionContextKey,
-      eligible: eligibleGhostForCurrentMode(),
+      eligible: projected,
       candidateId,
       presentationKey,
       text,
       manuscriptText: documentText
     });
+    observeCompletionBoundary({ kind: 'controller_unconsume', facts: {
+      authorized: authorization.authorized,
+      context_matches: completionController.session?.contextKey === completionContextKey,
+      candidate_matches: projected?.candidateId === candidateId,
+      presentation_matches: projected?.presentationKey === presentationKey,
+      pending_text: completionController.pendingText !== null,
+      session_present: Boolean(completionController.session),
+      accepted_chunk_count: completionController.session?.acceptedChunks.length ?? 0,
+      requested_utf8_bytes: new TextEncoder().encode(text).byteLength
+    } });
     completionController = authorization.state;
     return authorization.authorized;
   }

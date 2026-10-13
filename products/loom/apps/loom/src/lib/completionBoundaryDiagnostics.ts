@@ -43,6 +43,7 @@ export type BoundaryObservationKind =
   | 'source_input'
   | 'app_update_text'
   | 'controller_insertion'
+  | 'controller_unconsume'
   | 'shuttle_schedule'
   | 'shuttle_fire'
   | 'visual_shuttle_attempt'
