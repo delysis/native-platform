@@ -1,12 +1,11 @@
 use crate::config::{KvCachePolicy, resolve_settings};
-use crate::conversation_store::{Conversation, load_db, save_db};
+use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Conversation, ConversationDb};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 use uuid::Uuid;
 
 pub(crate) const SKILLS_NAMESPACE: &str = "skills.v2";
@@ -158,66 +157,70 @@ pub fn skill_apply(
     conversation_id: &str,
     skill_id_or_name: &str,
 ) -> Result<CommandResult<Conversation>> {
-    let skill_db = load_skill_db()?;
-    let Some(skill) = skill_db
-        .skills
-        .iter()
-        .find(|skill| skill.id == skill_id_or_name || skill.name == skill_id_or_name)
-    else {
-        return Ok(CommandResult::blocked(
-            "mom_llama.skill_apply",
-            "stub_blocked",
-            Blocker::new(
-                "skill_not_found",
-                format!("Skill {skill_id_or_name} was not found."),
-                vec!["Run `mom-llama skill list --json`.".to_string()],
-            ),
-        ));
-    };
-    let mut conversation_db = load_db()?;
-    let Some(conversation) = conversation_db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(CommandResult::blocked(
-            "mom_llama.skill_apply",
-            "stub_blocked",
-            Blocker::new(
-                "conversation_not_found",
-                format!("Conversation {conversation_id} was not found."),
-                vec!["Run `mom-llama conversation list --json`.".to_string()],
-            ),
-        ));
-    };
-    if !conversation.current_skill_ids.contains(&skill.id) {
-        conversation.current_skill_ids.push(skill.id.clone());
-    }
-    conversation.updated_at = now_ms().to_string();
-    let result = conversation.clone();
-    let path = save_db(&conversation_db)?;
-    Ok(CommandResult::passed(
-        "mom_llama.skill_apply",
-        "contracted",
-        result,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |conversations, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                conversation_id,
+                documents,
+            )?;
+            let skill_db = documents
+                .get::<SkillDb>(SKILLS_NAMESPACE)?
+                .unwrap_or_default();
+            let Some(skill) = skill_db
+                .skills
+                .iter()
+                .find(|skill| skill.id == skill_id_or_name || skill.name == skill_id_or_name)
+            else {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.skill_apply",
+                    "stub_blocked",
+                    Blocker::new(
+                        "skill_not_found",
+                        format!("Skill {skill_id_or_name} was not found."),
+                        vec!["Run `mom-llama skill list --json`.".to_string()],
+                    ),
+                ));
+            };
+            let Some(conversation) = conversations
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            else {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.skill_apply",
+                    "stub_blocked",
+                    Blocker::new(
+                        "conversation_not_found",
+                        format!("Conversation {conversation_id} was not found."),
+                        vec!["Run `mom-llama conversation list --json`.".to_string()],
+                    ),
+                ));
+            };
+            if !conversation.current_skill_ids.contains(&skill.id) {
+                conversation.current_skill_ids.push(skill.id.clone());
+            }
+            conversation.updated_at = now_ms().to_string();
+            let result = conversation.clone();
+            Ok(CommandResult::passed(
+                "mom_llama.skill_apply",
+                "contracted",
+                result,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn load_skill_db() -> Result<SkillDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     Ok(store.get(SKILLS_NAMESPACE)?.unwrap_or_default())
-}
-
-pub fn save_skill_db(db: &SkillDb) -> Result<PathBuf> {
-    let settings = resolve_settings()?;
-    let store = RuntimeStore::open(&settings.data_dir)?;
-    store.put(SKILLS_NAMESPACE, db)?;
-    Ok(store.path().to_path_buf())
 }
 
 pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> {

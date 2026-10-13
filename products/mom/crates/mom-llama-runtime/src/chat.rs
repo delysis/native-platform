@@ -591,8 +591,15 @@ where
     );
     let request_id = Uuid::new_v4().to_string();
     let operation = scope.register_chat(&request_id, &conversation.id)?;
-    emit(
+    let mut stream = ChatStreamLifecycle::new(
+        &request_id,
+        &conversation.id,
+        options,
         &mut on_event,
+        operation,
+    );
+    emit(
+        stream.callback(),
         stream_event(
             &request_id,
             &conversation.id,
@@ -606,13 +613,6 @@ where
             options,
         ),
     )?;
-    let mut stream = ChatStreamLifecycle::new(
-        &request_id,
-        &conversation.id,
-        options,
-        &mut on_event,
-        operation,
-    );
     if stream.cancellation_requested() {
         return stream.finish_cancelled();
     }
@@ -1252,22 +1252,9 @@ where
                         .map_err(ChatTicketError::Callback)?;
                     }
                 }
-                GenerationEventKind::State { state } => {
-                    if state == GenerationState::Cancelled {
-                        emit(
-                            on_event,
-                            stream_event(
-                                request_id,
-                                conversation_id,
-                                "cancelled",
-                                None,
-                                Some("Generation cancelled.".to_string()),
-                                options,
-                            ),
-                        )
-                        .map_err(ChatTicketError::Callback)?;
-                    }
-                }
+                // Native state is not a product terminal. The lifecycle owner emits
+                // exactly one terminal after the generation ticket has been joined.
+                GenerationEventKind::State { .. } => {}
                 GenerationEventKind::Warning { code, message } => emit(
                     on_event,
                     stream_event(

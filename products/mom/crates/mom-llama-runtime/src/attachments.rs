@@ -1342,26 +1342,6 @@ fn consume_exact_draft(
     });
 }
 
-pub(crate) fn snapshot_message_attachments(
-    target_conversation_id: &str,
-    messages: &mut [Message],
-) -> Result<()> {
-    let _lifecycle = lock_attachment_lifecycle()?;
-    let snapshot = load_attachment_db()?;
-    RuntimeStore::current()?.mutate_documents(
-        ATTACHMENTS_NAMESPACE,
-        || snapshot,
-        |db, documents| {
-            snapshot_message_attachments_in_documents(
-                target_conversation_id,
-                messages,
-                db,
-                documents,
-            )
-        },
-    )
-}
-
 /// Move only the submitted new-chat draft's staged occurrences. Caller holds
 /// the attachment lifecycle lock and the encrypted store transaction.
 pub(crate) fn transfer_new_draft_attachments(
@@ -1810,6 +1790,25 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
             if let Some(conversations) = conversations_to_write.clone() {
                 crate::personas::reject_removed_conversation_writes_from_documents(
                     &conversations,
+                    documents,
+                )?;
+                let changed_personas = conversations
+                    .conversations
+                    .iter()
+                    .filter(|conversation| {
+                        conversation.kind
+                            == crate::conversation_store::ConversationKind::PersonaTemplate
+                            && state.expected_conversations.is_some_and(|expected| {
+                                expected.conversations.iter().any(|previous| {
+                                    previous.id == conversation.id
+                                        && previous.execution_profile.version
+                                            != conversation.execution_profile.version
+                                })
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                crate::personas::record_persona_versions_from_documents(
+                    &changed_personas,
                     documents,
                 )?;
                 documents.put_bytes(
@@ -2758,8 +2757,13 @@ fn load_verified_object(
 
 fn verify_content(expected_sha256: &str, expected_bytes: u64, bytes: Vec<u8>) -> Result<Vec<u8>> {
     let actual_bytes = u64::try_from(bytes.len()).context("attachment byte length overflow")?;
+    if actual_bytes != expected_bytes {
+        return Err(anyhow!(
+            "attachment content mismatch: expected {expected_bytes} bytes, got {actual_bytes}"
+        ));
+    }
     let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
-    if actual_bytes != expected_bytes || actual_sha256 != expected_sha256 {
+    if actual_sha256 != expected_sha256 {
         return Err(anyhow!(
             "attachment content mismatch: expected {expected_bytes} bytes and {expected_sha256}, got {actual_bytes} bytes and {actual_sha256}"
         ));
@@ -3752,32 +3756,31 @@ mod tests {
 
     #[test]
     fn forked_persona_attachment_snapshot_is_independent_and_content_addressed() {
-        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("attachment-snapshot");
-        let source =
-            attachment_import_pasted_text(&scope, "source", "stable source notes".to_string())
-                .expect("stage source")
-                .result
-                .expect("source result")
-                .attachment;
-        let mut db = load_attachment_db().expect("load source attachment");
-        let source_record = db
-            .attachments
-            .iter_mut()
-            .find(|record| record.id == source.id)
-            .expect("source record");
-        source_record.state = AttachmentState::Committed;
-        source_record.message_id = "source-message".to_string();
-        RuntimeStore::current()
-            .expect("store")
-            .put(ATTACHMENTS_NAMESPACE, &db)
-            .expect("commit source fixture");
-
-        let mut messages = vec![message("snapshot-message", vec![source.id.clone()])];
-        // Production forks remap message ownership before snapshotting.
-        messages[0].conversation_id = "persona".to_string();
-        snapshot_message_attachments("persona", &mut messages).expect("snapshot attachment");
-        let snapshot_id = messages[0].attachment_ids[0].clone();
+        let source_conversation = new_conversation("Snapshot source");
+        let source = stage_text(&source_conversation.id, "stable source notes");
+        let committed = send_staged_attachment(&source_conversation.id);
+        let source_message = committed
+            .messages
+            .iter()
+            .find(|message| message.attachment_ids.contains(&source.id))
+            .expect("committed source attachment message");
+        let persona = crate::personas::persona_freeze(crate::personas::PersonaFreezeInput {
+            conversation_id: source_conversation.id.clone(),
+            message_id: source_message.id.clone(),
+            name: "Attachment snapshot".to_string(),
+            mention_handle: "attachment-snapshot".to_string(),
+            history_mode: crate::personas::PersonaHistoryMode::Full,
+        })
+        .expect("public Persona freeze")
+        .result
+        .expect("snapshot Persona");
+        let messages = persona.messages;
+        let snapshot_message = messages
+            .iter()
+            .find(|message| !message.attachment_ids.is_empty())
+            .expect("snapshot attachment message");
+        let snapshot_id = snapshot_message.attachment_ids[0].clone();
         assert_ne!(snapshot_id, source.id);
 
         let db = load_attachment_db().expect("load snapshots");
@@ -3791,9 +3794,9 @@ mod tests {
             .iter()
             .find(|record| record.id == snapshot_id)
             .expect("snapshot record");
-        assert_eq!(preserved.conversation_id, "source");
-        assert_eq!(snapshot.conversation_id, "persona");
-        assert_eq!(snapshot.message_id, "snapshot-message");
+        assert_eq!(preserved.conversation_id, source_conversation.id);
+        assert_eq!(snapshot.conversation_id, persona.id);
+        assert_eq!(snapshot.message_id, snapshot_message.id);
         assert_eq!(snapshot.state, AttachmentState::Committed);
         assert_eq!(snapshot.root_object_id, preserved.root_object_id);
         assert_eq!(
@@ -3801,19 +3804,21 @@ mod tests {
             attachment_bytes(&source.id).expect("source bytes")
         );
 
-        let context = prepare_chat_attachments("persona", &messages, Some("__snapshot__"))
+        let context = prepare_chat_attachments(&persona.id, &messages, Some("__snapshot__"))
             .expect("prepare snapshot")
             .expect("snapshot context");
         assert!(
             context
                 .text_by_message_id
-                .get("snapshot-message")
+                .get(&snapshot_message.id)
                 .is_some_and(|text| text.contains("stable source notes"))
         );
 
         let mut foreign = messages.clone();
-        foreign[0].conversation_id = "source".to_string();
-        let blocked = prepare_chat_attachments("persona", &foreign, Some("__snapshot__"))
+        for message in &mut foreign {
+            message.conversation_id = source_conversation.id.clone();
+        }
+        let blocked = prepare_chat_attachments(&persona.id, &foreign, Some("__snapshot__"))
             .expect("ownership check")
             .expect_err("a foreign message cannot borrow the snapshot");
         assert_eq!(

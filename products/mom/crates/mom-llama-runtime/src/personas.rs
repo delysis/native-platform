@@ -2,7 +2,7 @@ use crate::config::{resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb,
     ConversationExecutionProfile, ConversationKind, DRAFTS_NAMESPACE, DraftDb, Message,
-    MessageRole, ToolBinding, active_path_messages, load_db, save_db,
+    MessageRole, ToolBinding, active_path_messages, load_db,
 };
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
@@ -245,109 +245,124 @@ enum PersonaRemovalAttempt {
 
 pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Conversation>> {
     ensure_builtin_catalog()?;
-    let mut db = load_db()?;
-    let Some(source) = db
-        .conversations
-        .iter()
-        .find(|conversation| conversation.id == input.conversation_id)
-        .cloned()
-    else {
-        return Ok(blocked_persona(
-            "mom_llama.persona_freeze",
-            "persona_source_not_found",
-            "The source chat no longer exists.",
-        ));
-    };
-    let active = active_path_messages(&source)?;
-    let Some(index) = active
-        .iter()
-        .position(|message| message.id == input.message_id)
-    else {
-        return Ok(blocked_persona(
-            "mom_llama.persona_freeze",
-            "persona_source_not_on_active_branch",
-            "Choose a message on the chat's active branch.",
-        ));
-    };
-    let mut profile = source.execution_profile.clone();
-    profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
-        Ok(tools) => tools,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.persona_freeze",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
-    let handle = match validate_available_handle(
-        &db,
-        None,
-        None,
-        &input.mention_handle,
-        &load_group_db()?.groups,
-    ) {
-        Ok(handle) => handle,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.persona_freeze",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
     let settings = resolve_settings()?;
-    let persona_id = Uuid::new_v4().to_string();
-    let selected = match input.history_mode {
-        PersonaHistoryMode::Full => active[..=index].to_vec(),
-        PersonaHistoryMode::SystemOnly => active[..=index]
-            .iter()
-            .filter(|message| message.role == MessageRole::System)
-            .cloned()
-            .collect(),
-        PersonaHistoryMode::Empty => Vec::new(),
-    };
-    let mut messages = remap_messages(&persona_id, selected);
-    crate::attachments::snapshot_message_attachments(&persona_id, &mut messages)?;
-    profile.mention_handle = handle;
-    profile.model_path = profile
-        .model_path
-        .or_else(|| source.selected_model_path.clone())
-        .or_else(|| settings.model_path.clone());
-    profile.mmproj_path = profile.mmproj_path.or(settings.mmproj_path.clone());
-    if profile.system_message.is_none() {
-        profile.system_message = upstream_setting_string(&settings, "systemMessage")
-            .filter(|message| !message.trim().is_empty());
-    }
-    profile.version = 1;
-    let now = now_ms().to_string();
-    let persona = Conversation {
-        id: persona_id.clone(),
-        title: clean_name(&input.name, "New persona"),
-        created_at: now.clone(),
-        updated_at: now,
-        kind: ConversationKind::PersonaTemplate,
-        execution_profile: profile.clone(),
-        selected_model_path: profile.model_path.clone(),
-        source_conversation_id: Some(source.id),
-        source_message_id: Some(input.message_id.clone()),
-        branch_root_message_id: Some(input.message_id),
-        active_leaf_message_id: messages.last().map(|message| message.id.clone()),
-        recipient_ids: Vec::new(),
-        current_skill_ids: source.current_skill_ids,
-        messages,
-    };
-    db.conversations.insert(0, persona.clone());
-    let path = save_persona_with_version(&db, &persona)?;
-    Ok(CommandResult::passed(
-        "mom_llama.persona_freeze",
-        "contracted",
-        persona,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let _attachments = crate::attachments::lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let Some(source) = db
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == input.conversation_id)
+                .cloned()
+            else {
+                return Ok(blocked_persona(
+                    "mom_llama.persona_freeze",
+                    "persona_source_not_found",
+                    "The source chat no longer exists.",
+                ));
+            };
+            let active = active_path_messages(&source)?;
+            let Some(index) = active
+                .iter()
+                .position(|message| message.id == input.message_id)
+            else {
+                return Ok(blocked_persona(
+                    "mom_llama.persona_freeze",
+                    "persona_source_not_on_active_branch",
+                    "Choose a message on the chat's active branch.",
+                ));
+            };
+            let mut profile = source.execution_profile.clone();
+            profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
+                Ok(tools) => tools,
+                Err(blocker) => {
+                    return Ok(CommandResult::blocked(
+                        "mom_llama.persona_freeze",
+                        "stub_blocked",
+                        blocker,
+                    ));
+                }
+            };
+            let handle = match validate_available_handle(
+                &db,
+                None,
+                None,
+                &input.mention_handle,
+                &documents
+                    .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+                    .unwrap_or_default()
+                    .groups,
+            ) {
+                Ok(handle) => handle,
+                Err(blocker) => {
+                    return Ok(CommandResult::blocked(
+                        "mom_llama.persona_freeze",
+                        "stub_blocked",
+                        blocker,
+                    ));
+                }
+            };
+            let persona_id = Uuid::new_v4().to_string();
+            let selected = match input.history_mode {
+                PersonaHistoryMode::Full => active[..=index].to_vec(),
+                PersonaHistoryMode::SystemOnly => active[..=index]
+                    .iter()
+                    .filter(|message| message.role == MessageRole::System)
+                    .cloned()
+                    .collect(),
+                PersonaHistoryMode::Empty => Vec::new(),
+            };
+            let mut messages = remap_messages(&persona_id, selected);
+            crate::attachments::snapshot_message_attachments_from_documents(
+                &persona_id,
+                &mut messages,
+                documents,
+            )?;
+            profile.mention_handle = handle;
+            profile.model_path = profile
+                .model_path
+                .or_else(|| source.selected_model_path.clone())
+                .or_else(|| settings.model_path.clone());
+            profile.mmproj_path = profile.mmproj_path.or(settings.mmproj_path.clone());
+            if profile.system_message.is_none() {
+                profile.system_message = upstream_setting_string(&settings, "systemMessage")
+                    .filter(|message| !message.trim().is_empty());
+            }
+            profile.version = 1;
+            let now = now_ms().to_string();
+            let persona = Conversation {
+                id: persona_id.clone(),
+                title: clean_name(&input.name, "New persona"),
+                created_at: now.clone(),
+                updated_at: now,
+                kind: ConversationKind::PersonaTemplate,
+                execution_profile: profile.clone(),
+                selected_model_path: profile.model_path.clone(),
+                source_conversation_id: Some(source.id),
+                source_message_id: Some(input.message_id.clone()),
+                branch_root_message_id: Some(input.message_id),
+                active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+                recipient_ids: Vec::new(),
+                current_skill_ids: source.current_skill_ids,
+                messages,
+            };
+            db.conversations.insert(0, persona.clone());
+            reject_removed_conversation_writes_from_documents(db, documents)?;
+            record_persona_versions_from_documents(&[&persona], documents)?;
+            Ok(CommandResult::passed(
+                "mom_llama.persona_freeze",
+                "contracted",
+                persona,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn persona_list() -> Result<CommandResult<Vec<Conversation>>> {
@@ -555,20 +570,20 @@ pub fn persona_update(
                 tool_bindings: Vec::new(),
                 source_history_tokens: 0,
                 host_context_tokens: 0,
-                version: persona.execution_profile.version.saturating_add(1),
+                version: persona
+                    .execution_profile
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Persona version exhausted; the retained version cannot be overwritten"
+                        )
+                    })?,
             };
             persona.selected_model_path = model_path.clone();
             persona.updated_at = now_ms().to_string();
             let output = persona.clone();
-            let version = build_persona_version(&output)?;
-            let mut versions = documents
-                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
-                .unwrap_or_default();
-            versions.versions.retain(|candidate| {
-                candidate.persona_id != version.persona_id || candidate.version != version.version
-            });
-            versions.versions.push(version);
-            documents.put_bytes(PERSONA_VERSIONS_NAMESPACE, &serde_json::to_vec(&versions)?)?;
+            record_persona_versions_from_documents(&[&output], documents)?;
             Ok(Ok(output))
         },
     )?;
@@ -593,54 +608,32 @@ pub fn persona_update(
     ))
 }
 
-pub(crate) fn record_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
-    let version = build_persona_version(persona)?;
-    RuntimeStore::current()?.mutate(
-        PERSONA_VERSIONS_NAMESPACE,
-        PersonaVersionDb::default,
-        |db| {
-            db.versions.retain(|candidate| {
-                candidate.persona_id != version.persona_id || candidate.version != version.version
-            });
-            db.versions.push(version.clone());
-            Ok(())
-        },
-    )?;
-    Ok(version)
-}
-
-pub(crate) fn save_persona_with_version(
-    conversations: &ConversationDb,
-    persona: &Conversation,
-) -> Result<PathBuf> {
-    let version = build_persona_version(persona)?;
-    let store = RuntimeStore::current()?;
-    store.mutate_documents(
-        CONVERSATIONS_NAMESPACE,
-        ConversationDb::default,
-        |stored, documents| {
-            let next = conversations.clone();
-            reject_removed_conversation_writes_from_documents(&next, documents)?;
-            if !next.conversations.iter().any(|conversation| {
-                conversation.id == persona.id
-                    && conversation.kind == ConversationKind::PersonaTemplate
-                    && conversation.execution_profile.version == version.version
-            }) {
-                anyhow::bail!("Persona changed or was removed before its version could commit");
+pub(crate) fn record_persona_versions_from_documents(
+    personas: &[&Conversation],
+    documents: &mut DocumentMutations<'_, '_, '_>,
+) -> Result<()> {
+    if personas.is_empty() {
+        return Ok(());
+    }
+    let mut versions = documents
+        .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+        .unwrap_or_default();
+    for persona in personas {
+        let version = build_persona_version(persona)?;
+        if let Some(existing) = versions.versions.iter().find(|candidate| {
+            candidate.persona_id == version.persona_id && candidate.version == version.version
+        }) {
+            if existing.profile_sha256 != version.profile_sha256
+                || existing.conversation_sha256 != version.conversation_sha256
+            {
+                anyhow::bail!("Persona version identity is already bound to different content");
             }
-            *stored = next;
-            let mut versions = documents
-                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
-                .unwrap_or_default();
-            versions.versions.retain(|candidate| {
-                candidate.persona_id != version.persona_id || candidate.version != version.version
-            });
-            versions.versions.push(version.clone());
-            documents.put_bytes(PERSONA_VERSIONS_NAMESPACE, &serde_json::to_vec(&versions)?)?;
-            Ok(())
-        },
-    )?;
-    Ok(store.path().to_path_buf())
+            // Idempotence preserves the original version timestamp and exact record.
+            continue;
+        }
+        versions.versions.push(version);
+    }
+    documents.put_bytes(PERSONA_VERSIONS_NAMESPACE, &serde_json::to_vec(&versions)?)
 }
 
 fn build_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
@@ -1587,27 +1580,39 @@ fn write_group(
 }
 
 pub(crate) fn ensure_builtin_catalog() -> Result<()> {
-    let mut groups = load_group_db()?;
-    if groups.catalog_revision.as_deref() == Some(LIBRARY_REVISION) {
+    if load_group_db()?.catalog_revision.as_deref() == Some(LIBRARY_REVISION) {
         return Ok(());
     }
-    let mut conversations = load_db()?;
     let settings = resolve_settings()?;
-    let versions = reconcile_builtin_personas(
-        &mut conversations,
-        &mut groups,
-        builtin_personas(),
-        LIBRARY_REVISION,
-        settings.model_path,
-        settings.mmproj_path,
-    )?;
-    save_db(&conversations)?;
-    for persona in versions {
-        record_persona_version(&persona)?;
-    }
-    groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
-    RuntimeStore::current()?.put(GROUPS_NAMESPACE, &groups)?;
-    Ok(())
+    RuntimeStore::current()?.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |conversations, documents| {
+            let mut groups = documents
+                .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+                .unwrap_or_default();
+            // Another initializer may have completed before this transaction began.
+            if groups.catalog_revision.as_deref() == Some(LIBRARY_REVISION) {
+                return Ok(());
+            }
+            let personas = reconcile_builtin_personas(
+                conversations,
+                &mut groups,
+                builtin_personas(),
+                LIBRARY_REVISION,
+                settings.model_path,
+                settings.mmproj_path,
+            )?;
+            reject_removed_conversation_writes_from_documents(conversations, documents)?;
+            record_persona_versions_from_documents(
+                &personas.iter().collect::<Vec<_>>(),
+                documents,
+            )?;
+            groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
+            documents.put_bytes(GROUPS_NAMESPACE, &serde_json::to_vec(&groups)?)?;
+            Ok(())
+        },
+    )
 }
 
 fn reconcile_builtin_personas(
@@ -1708,8 +1713,11 @@ fn reconcile_builtin_personas(
                         persona.kind = ConversationKind::PersonaTemplate;
                         persona.execution_profile.system_message =
                             Some(source.perspective_prompt.clone());
-                        persona.execution_profile.version =
-                            persona.execution_profile.version.saturating_add(1);
+                        persona.execution_profile.version = persona
+                            .execution_profile
+                            .version
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("Persona version exhausted"))?;
                         persona.updated_at = now_ms().to_string();
                         versioned_ids.insert(id.clone());
                     }
@@ -1867,8 +1875,11 @@ pub(crate) fn validate_imported_conversation_handle(
     conversations: &ConversationDb,
     value: &str,
     title: &str,
+    documents: &DocumentMutations<'_, '_, '_>,
 ) -> Result<std::result::Result<String, Blocker>> {
-    let groups = load_group_db()?;
+    let groups = documents
+        .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+        .unwrap_or_default();
     if value.trim().is_empty() {
         return Ok(Ok(unique_handle(conversations, &groups.groups, title)));
     }
@@ -3157,18 +3168,23 @@ mod tests {
         });
 
         before_admission.wait();
-        persona_remove_from_library_in_scope(
+        let removal = persona_remove_from_library_in_scope(
             &scope,
             PersonaRemovalCommitInput {
                 persona_id: persona.id.clone(),
                 persona_version: impact.persona_version,
                 impact_sha256: impact.impact_sha256,
             },
-        )
-        .expect("commit removal while instantiation is pre-admission")
-        .result
-        .expect("removal output");
+        );
+        // Always release and join the owned worker before reporting a fixture
+        // failure; otherwise one failed assertion strands the global attachment
+        // lifecycle lock and masks every later test as a hang.
         release_admission.wait();
+        let removal = removal
+            .expect("commit removal while instantiation is pre-admission")
+            .result
+            .expect("removal output");
+        assert_eq!(removal.impact.persona_id, persona.id);
 
         let blocked = worker
             .join()
@@ -3296,5 +3312,257 @@ mod tests {
                 .expect("read ledger")
                 .is_none()
         );
+    }
+    #[test]
+    fn catalog_failure_keeps_conversations_versions_and_provenance_together() -> anyhow::Result<()>
+    {
+        let _dir = TestDataDir::new("catalog-joint-publication");
+        let ordinary = super::persona_list()?
+            .result
+            .expect("ordinary public catalog");
+        assert!(!ordinary.is_empty());
+        let store = RuntimeStore::current()?;
+        let missing = &ordinary[0].id;
+        let mut conversations = load_db()?;
+        conversations
+            .conversations
+            .retain(|conversation| &conversation.id != missing);
+        let mut groups = store
+            .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+            .expect("catalog provenance");
+        groups.catalog_revision = Some("owned-earlier-catalog".to_string());
+        groups
+            .builtin_persona_provenance
+            .retain(|entry| &entry.persona_id != missing);
+        // This represents an earlier catalog that has never seen the selected built-in.
+        store.put(CONVERSATIONS_NAMESPACE, &conversations)?;
+        store.put(GROUPS_NAMESPACE, &groups)?;
+        store.put(
+            PERSONA_VERSIONS_NAMESPACE,
+            &serde_json::json!({"versions":"invalid retained shape"}),
+        )?;
+        let before = [
+            CONVERSATIONS_NAMESPACE,
+            PERSONA_VERSIONS_NAMESPACE,
+            GROUPS_NAMESPACE,
+        ]
+        .map(|namespace| {
+            store
+                .get_bytes(namespace)
+                .expect("snapshot exact retained bytes")
+        });
+        assert!(
+            super::persona_list().is_err(),
+            "malformed current version document must still be rejected"
+        );
+        let after = [
+            CONVERSATIONS_NAMESPACE,
+            PERSONA_VERSIONS_NAMESPACE,
+            GROUPS_NAMESPACE,
+        ]
+        .map(|namespace| {
+            store
+                .get_bytes(namespace)
+                .expect("read after refused publication")
+        });
+        assert_eq!(
+            after, before,
+            "a refused seed must not publish its conversations separately"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_freeze_failure_does_not_leave_attachment_snapshots_or_author_changes()
+    -> anyhow::Result<()> {
+        let _dir = TestDataDir::new("freeze-joint-publication");
+        let scope = crate::OperationScope::detached();
+        let source = crate::conversation_new(Some("Source with attachment".into()))?
+            .result
+            .expect("source");
+        let attachment = crate::attachment_import_pasted_text(
+            &scope,
+            &source.id,
+            "Exact source material.".into(),
+        )?
+        .result
+        .expect("staged source")
+        .attachment;
+        crate::draft_update(
+            Some(&source.id),
+            "Use the source.".into(),
+            vec![attachment.id.clone()],
+        )?;
+        let sent = crate::chat_send_in_scope(
+            &scope,
+            crate::ChatSendInput {
+                conversation_id: source.id.clone(),
+                message: "Use the source.".into(),
+            },
+            crate::ChatSendOptions {
+                fake_fixture: true,
+                ..Default::default()
+            },
+        )?;
+        assert!(sent.receipt.fake_fixture);
+        assert!(!sent.receipt.real_engine_invoked);
+        let source = crate::conversation_select(&source.id)?
+            .result
+            .expect("committed source");
+        let message = source
+            .messages
+            .iter()
+            .find(|message| message.attachment_ids.contains(&attachment.id))
+            .expect("source attachment message");
+        let input = |handle: &str| super::PersonaFreezeInput {
+            conversation_id: source.id.clone(),
+            message_id: message.id.clone(),
+            name: "Snapshot Persona".into(),
+            mention_handle: handle.to_string(),
+            history_mode: super::PersonaHistoryMode::Full,
+        };
+        let ordinary = super::persona_freeze(input("ordinary-snapshot"))?
+            .result
+            .expect("ordinary freeze");
+        let ordinary_attachment = ordinary
+            .messages
+            .iter()
+            .flat_map(|message| message.attachment_ids.iter())
+            .next()
+            .expect("ordinary snapshot attachment");
+        assert_ne!(ordinary_attachment, &attachment.id);
+        assert_eq!(super::persona_versions(&ordinary.id)?.len(), 1);
+        let store = RuntimeStore::current()?;
+        store.put(
+            PERSONA_VERSIONS_NAMESPACE,
+            &serde_json::json!({"versions":false}),
+        )?;
+        let snapshot = || -> anyhow::Result<Vec<(String, Vec<u8>, Vec<u8>, i64)>> {
+            let connection = rusqlite::Connection::open(store.path())?;
+            let mut statement = connection.prepare("SELECT namespace, nonce, ciphertext, updated_at FROM encrypted_documents ORDER BY namespace")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+        let before = snapshot()?;
+        let source_before = load_db()?
+            .conversations
+            .into_iter()
+            .find(|conversation| conversation.id == source.id)
+            .expect("raw source before failure");
+        assert!(super::persona_freeze(input("rejected-snapshot")).is_err());
+        assert_eq!(
+            snapshot()?,
+            before,
+            "no detached attachment index/manifest may survive a failed freeze"
+        );
+        assert_eq!(
+            load_db()?
+                .conversations
+                .into_iter()
+                .find(|conversation| conversation.id == source.id),
+            Some(source_before)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_maximum_persona_version_refuses_writers_without_replacing_history()
+    -> anyhow::Result<()> {
+        let _dir = TestDataDir::new("checked-persona-exhaustion");
+        let scope = crate::OperationScope::detached();
+        super::persona_list()?;
+        let mut ordinary = removal_persona("ordinary-import");
+        ordinary.execution_profile.mention_handle = "ordinary-import".into();
+        ordinary.execution_profile.version = 1;
+        crate::conversation_import_json(&serde_json::to_string(&ordinary)?)?;
+        let ordinary = super::persona_update(
+            &scope,
+            super::PersonaUpdateInput {
+                persona_id: ordinary.id.clone(),
+                name: ordinary.title.clone(),
+                mention_handle: ordinary.execution_profile.mention_handle.clone(),
+                model_path: None,
+                mmproj_path: None,
+                auto_discover_mmproj: false,
+                system_message: Some("Ordinary instructions".into()),
+                sampling: None,
+                chat_template: crate::ChatTemplatePolicy::ModelDefault,
+            },
+        )?
+        .result
+        .expect("ordinary update");
+        assert_eq!(ordinary.execution_profile.version, 2);
+        assert_eq!(
+            super::persona_versions(&ordinary.id)?
+                .last()
+                .expect("new exact version")
+                .version,
+            2
+        );
+
+        let mut exhausted = removal_persona("maximum-import");
+        exhausted.execution_profile.mention_handle = "maximum-import".into();
+        exhausted.execution_profile.version = u64::MAX;
+        let exhausted = crate::conversation_import_json(&serde_json::to_string(&exhausted)?)?
+            .result
+            .expect("maximum accepted import");
+        let store = RuntimeStore::current()?;
+        let before = load_db()?;
+        let versions = store.get_bytes(PERSONA_VERSIONS_NAMESPACE)?;
+        let source_id = &exhausted.messages[0].id;
+        let unchanged_after = |result: anyhow::Result<()>| -> anyhow::Result<()> {
+            assert!(
+                result
+                    .expect_err("checked exhaustion")
+                    .to_string()
+                    .contains("exhausted")
+            );
+            assert_eq!(load_db()?, before);
+            assert_eq!(store.get_bytes(PERSONA_VERSIONS_NAMESPACE)?, versions);
+            Ok(())
+        };
+        unchanged_after(
+            crate::conversation_system_message_update(
+                &exhausted.id,
+                Some("Must not replace".into()),
+            )
+            .map(|_| ()),
+        )?;
+        unchanged_after(
+            crate::message_edit(&exhausted.id, source_id, "Must not replace".into()).map(|_| ()),
+        )?;
+        unchanged_after(crate::message_delete(&exhausted.id, source_id).map(|_| ()))?;
+        unchanged_after(
+            super::persona_update(
+                &scope,
+                super::PersonaUpdateInput {
+                    persona_id: exhausted.id.clone(),
+                    name: "Must not replace".into(),
+                    mention_handle: exhausted.execution_profile.mention_handle.clone(),
+                    model_path: None,
+                    mmproj_path: None,
+                    auto_discover_mmproj: false,
+                    system_message: Some("Must not replace".into()),
+                    sampling: None,
+                    chat_template: crate::ChatTemplatePolicy::ModelDefault,
+                },
+            )
+            .map(|_| ()),
+        )?;
+        assert!(
+            super::persona_versions(&exhausted.id)?.is_empty(),
+            "do not invent a record for imported history"
+        );
+        let unavailable = super::persona_instantiate(&exhausted.id, None)?;
+        assert_eq!(
+            unavailable
+                .blocker
+                .expect("exact missing version remains refused")
+                .code,
+            "persona_version_unavailable"
+        );
+        Ok(())
     }
 }

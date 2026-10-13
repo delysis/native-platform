@@ -1561,6 +1561,7 @@ fn live_chat_controls_select_latest_owned_request_and_preserve_author_state() ->
             "no_active_chat_request"
         );
     }
+    let mut interrupted_events = Vec::new();
     let interrupted = mom_llama_runtime::chat_send_stream_in_scope(
         &scope,
         ChatSendInput {
@@ -1569,13 +1570,30 @@ fn live_chat_controls_select_latest_owned_request_and_preserve_author_state() ->
         },
         options,
         |event| {
-            assert_eq!(event.event, "started");
-            Err(anyhow!("owned callback rejection"))
+            let is_started = event.event == "started";
+            interrupted_events.push(event);
+            if is_started {
+                Err(anyhow!("owned callback rejection"))
+            } else {
+                Ok(())
+            }
         },
     );
     assert_eq!(
         interrupted.expect_err("callback rejection").to_string(),
         "owned callback rejection"
+    );
+    assert_eq!(interrupted_events.len(), 2);
+    assert_eq!(interrupted_events[0].event, "started");
+    assert_eq!(interrupted_events[1].event, "failed");
+    assert_eq!(
+        interrupted_events[0].request_id,
+        interrupted_events[1].request_id
+    );
+    assert!(
+        interrupted_events
+            .iter()
+            .all(|event| !event.real_engine_invoked)
     );
     assert_eq!(scope.active_operation_count(), 0);
     assert_eq!(
@@ -2364,6 +2382,346 @@ fn configure_mcp_fixture(session: &TestSession) -> Result<()> {
         ..SettingsUpdate::default()
     })?;
     mom_llama_runtime::mcp_configure("fixture".to_string(), executable, Vec::new(), true)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn mcp_public_methods_negotiate_only_their_own_capability() -> Result<()> {
+    let _session = TestSession::new("mcp-independent-capabilities")?;
+    let scope = mom_llama_runtime::OperationScope::detached();
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        upstream_settings: Some(BTreeMap::from([(
+            "mcpNativeEnabled".to_string(),
+            json!(true),
+        )])),
+        ..SettingsUpdate::default()
+    })?;
+    let configure = |name: &str,
+                     capability: serde_json::Value,
+                     method: &str,
+                     result: serde_json::Value|
+     -> Result<()> {
+        let initialize = json!({"jsonrpc":"2.0","id":1,"result":{
+            "protocolVersion":"2024-11-05", "capabilities":capability,
+            "serverInfo":{"name":"owned-capability-fixture","version":"1"}
+        }});
+        let response = json!({"jsonrpc":"2.0","id":2,"result":result});
+        // Each owned process accepts exactly the public method under test, after initialization.
+        let script = format!(
+            "IFS= read -r initialize || exit 2; printf '%s\\n' '{initialize}'; \
+             IFS= read -r initialized || exit 3; IFS= read -r request || exit 4; \
+             case \"$request\" in *'\"method\":\"{method}\"'*) printf '%s\\n' '{response}';; *) exit 5;; esac"
+        );
+        mom_llama_runtime::mcp_configure(
+            name.to_string(),
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), script],
+            true,
+        )?;
+        Ok(())
+    };
+    // Ordinary tools-only control first; resources/prompts remain independent, not optional tools.
+    configure(
+        "tools",
+        json!({"tools":{}}),
+        "tools/list",
+        json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
+    )?;
+    let tools = mom_llama_runtime::mcp_list_tools_in_scope(&scope, "tools")?;
+    assert_eq!(tools.status, "host_integrated");
+    assert_eq!(tools.result.context("ordinary tool list")?[0].name, "echo");
+    assert_eq!(scope.active_operation_count(), 0);
+
+    configure(
+        "resources-list",
+        json!({"resources":{}}),
+        "resources/list",
+        json!({"resources":[{"uri":"fixture://note","name":"note"}]}),
+    )?;
+    let resources = mom_llama_runtime::mcp_list_resources_in_scope(&scope, "resources-list")?;
+    assert_eq!(resources.status, "host_integrated");
+    assert_eq!(
+        resources.result.context("resource list")?[0].uri,
+        "fixture://note"
+    );
+    configure(
+        "resources-read",
+        json!({"resources":{}}),
+        "resources/read",
+        json!({"contents":[{"uri":"fixture://note","text":"owned note"}]}),
+    )?;
+    let resource =
+        mom_llama_runtime::mcp_read_resource_in_scope(&scope, "resources-read", "fixture://note")?;
+    assert_eq!(resource.status, "host_integrated");
+    assert!(serde_json::to_string(&resource.result)?.contains("owned note"));
+
+    configure(
+        "prompts-list",
+        json!({"prompts":{}}),
+        "prompts/list",
+        json!({"prompts":[{"name":"review","arguments":[]}]}),
+    )?;
+    let prompts = mom_llama_runtime::mcp_list_prompts_in_scope(&scope, "prompts-list")?;
+    assert_eq!(prompts.status, "host_integrated");
+    assert_eq!(prompts.result.context("prompt list")?[0].name, "review");
+    configure(
+        "prompts-get",
+        json!({"prompts":{}}),
+        "prompts/get",
+        json!({"messages":[{"role":"user","content":{"type":"text","text":"owned prompt"}}]}),
+    )?;
+    let prompt =
+        mom_llama_runtime::mcp_get_prompt_in_scope(&scope, "prompts-get", "review", json!({}))?;
+    assert_eq!(prompt.status, "host_integrated");
+    assert!(serde_json::to_string(&prompt.result)?.contains("owned prompt"));
+
+    for (name, capabilities) in [
+        ("absent", json!({})),
+        ("wrong", json!({"tools":{}})),
+        ("malformed", json!({"resources":true})),
+    ] {
+        configure(
+            name,
+            capabilities,
+            "resources/list",
+            json!({"resources":[]}),
+        )?;
+        let error = mom_llama_runtime::mcp_list_resources_in_scope(&scope, name)
+            .expect_err("resource capability is mandatory");
+        assert!(error.to_string().contains("resources capability"));
+        assert_eq!(scope.active_operation_count(), 0);
+    }
+    let error = mom_llama_runtime::mcp_list_tools_in_scope(&scope, "resources-list")
+        .expect_err("resource-only server must not admit a tool call");
+    assert!(error.to_string().contains("tools capability"));
+    let error = mom_llama_runtime::mcp_get_prompt_in_scope(&scope, "tools", "review", json!({}))
+        .expect_err("tools-only server must not admit a prompt call");
+    assert!(error.to_string().contains("prompts capability"));
+    assert_eq!(scope.active_operation_count(), 0);
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn tool_started_callback_rejection_finishes_the_exact_durable_row() -> Result<()> {
+    let session = TestSession::new("tool-started-rejection")?;
+    let scope = mom_llama_runtime::OperationScope::detached();
+    configure_mcp_fixture(&session)?;
+    let conversation_id = "started-rejection";
+    for reject_started in [false, true] {
+        let prompt = format!("Owned callback control {reject_started}");
+        let arguments = json!({"value":"ready"});
+        let approval = mom_llama_runtime::tool_loop_prepare_in_scope(
+            &scope,
+            conversation_id,
+            prompt.clone(),
+            "fixture".to_string(),
+            "echo".to_string(),
+            arguments.clone(),
+            1,
+        )?
+        .result
+        .context("prepared approval")?;
+        let mut events = Vec::new();
+        let result = mom_llama_runtime::tool_loop_run_stream_in_scope(
+            &scope,
+            mom_llama_runtime::ToolLoopRunInput {
+                conversation_id: conversation_id.to_string(),
+                prompt,
+                server: "fixture".to_string(),
+                tool: "echo".to_string(),
+                arguments,
+                max_turns: 1,
+                approval_id: Some(approval.id),
+            },
+            |event| {
+                let reject = reject_started && event.event == "started";
+                events.push(event);
+                if reject {
+                    Err(anyhow!("owned tool started rejection"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if reject_started {
+            assert_eq!(
+                result.expect_err("started rejection").to_string(),
+                "owned tool started rejection"
+            );
+        } else {
+            // No GGUF is admitted: this exercises the ordinary existing typed no-model terminal.
+            let result = result?;
+            assert_eq!(result.readiness, "blocked_missing_model");
+            assert!(!result.receipt.real_engine_invoked);
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "started");
+        assert_eq!(scope.active_operation_count(), 0);
+        let rows = mom_llama_runtime::tool_loop_status(Some(conversation_id))?
+            .result
+            .context("durable loops")?;
+        let row = rows
+            .iter()
+            .find(|row| row.request_id == events[0].request_id)
+            .context("exact registered row")?;
+        assert_eq!(row.state, mom_llama_runtime::ToolLoopState::Failed);
+        assert!(row.current_model_request_id.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrent_public_conversation_creates_preserve_every_committed_author() -> Result<()> {
+    let session = TestSession::new("current-conversation-transactions")?;
+    let ordinary =
+        mom_llama_runtime::conversation_new(Some("Ordinary preserved author".to_string()))?
+            .result
+            .context("ordinary public create")?;
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let workers = (0..8)
+        .map(|worker| {
+            let directory = session.path().to_path_buf();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                set_data_dir_override_for_tests(Some(directory));
+                start.wait();
+                let result = (|| -> Result<Vec<Conversation>> {
+                    (0..8)
+                        .map(|index| {
+                            mom_llama_runtime::conversation_new(Some(format!(
+                                "Author {worker}/{index}"
+                            )))?
+                            .result
+                            .context("committed public create")
+                        })
+                        .collect()
+                })();
+                set_data_dir_override_for_tests(None);
+                result
+            })
+        })
+        .collect::<Vec<_>>();
+    // Join all owned threads before propagating a failure or asserting preservation.
+    let joined = workers
+        .into_iter()
+        .map(|worker| worker.join())
+        .collect::<Vec<_>>();
+    let mut committed = vec![ordinary];
+    for result in joined {
+        committed.extend(result.map_err(|_| anyhow!("owned conversation writer panicked"))??);
+    }
+    let retained = mom_llama_runtime::conversation_store::load_db()?;
+    assert_eq!(retained.conversations.len(), committed.len());
+    for conversation in &committed {
+        assert!(
+            retained.conversations.contains(conversation),
+            "lost committed author {}",
+            conversation.id
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn conversation_file_import_binds_regular_descriptor_and_encoded_byte_limit() -> Result<()> {
+    let session = TestSession::new("conversation-file-admission")?;
+    let source = attributed_history_fixture("file-import-source");
+    let path = session.path().join("owned.json");
+    fs::write(&path, serde_json::to_vec(&source)?)?;
+    let ordinary = mom_llama_runtime::conversation_import_file(&path)?;
+    assert_eq!(ordinary.status, "contracted");
+    let imported = ordinary.result.context("ordinary JSON import")?;
+    assert_eq!(imported.messages, source.messages);
+    let rows = encrypted_document_snapshot(session.path())?;
+
+    let oversized = session.path().join("oversized.json");
+    fs::File::create(&oversized)?.set_len(128 * 1024 * 1024 + 1)?;
+    let error =
+        mom_llama_runtime::conversation_import_file(&oversized).expect_err("oversized descriptor");
+    assert!(error.to_string().contains("byte limit"));
+    assert_eq!(encrypted_document_snapshot(session.path())?, rows);
+    let error = mom_llama_runtime::conversation_import_file(session.path())
+        .expect_err("directory descriptor");
+    #[cfg(unix)]
+    assert!(error.to_string().contains("regular file"));
+    #[cfg(not(unix))]
+    let _ = error;
+    assert_eq!(encrypted_document_snapshot(session.path())?, rows);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let fifo = session.path().join("owned-fifo.json");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let error =
+            mom_llama_runtime::conversation_import_file(&fifo).expect_err("FIFO descriptor");
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(encrypted_document_snapshot(session.path())?, rows);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_chat_cancellation_emits_one_terminal_after_native_join() -> Result<()> {
+    let _session = configured_real_session("single-chat-cancel-terminal")?;
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+    product_chat_cache_request(
+        &scope,
+        "ordinary-before-cancel",
+        "Answer with a short greeting.",
+    )?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        max_tokens: Some(4096),
+        ..SettingsUpdate::default()
+    })?;
+    let mut events = Vec::new();
+    let mut cancellation_observed = false;
+    let result = mom_llama_runtime::chat_send_stream_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: "cancel-one-terminal".to_string(),
+            message: "Write an extensive numbered account of integers starting at one.".to_string(),
+        },
+        ChatSendOptions::default(),
+        |event| {
+            if !cancellation_observed
+                && matches!(event.event.as_str(), "delta" | "reasoning_delta")
+                && mom_llama_runtime::resident_status(&scope)
+                    .is_some_and(|status| status.active_sequences > 0)
+            {
+                let cancel =
+                    mom_llama_runtime::chat_cancel_in_scope(&scope, "cancel-one-terminal")?;
+                anyhow::ensure!(cancel.blocker.is_none(), "public cancellation was refused");
+                cancellation_observed = true;
+            }
+            events.push(event);
+            Ok(())
+        },
+    )?;
+    assert!(
+        cancellation_observed,
+        "no active native request was observed; this is not a cancellation pass"
+    );
+    assert!(result.has_authoritative_cancellation_evidence());
+    assert!(result.receipt.real_engine_invoked);
+    assert!(!result.receipt.fake_fixture);
+    let terminals = events
+        .iter()
+        .filter(|event| matches!(event.event.as_str(), "completed" | "cancelled" | "failed"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].event, "cancelled");
+    assert_eq!(terminals[0].request_id, events[0].request_id);
+    assert_eq!(scope.active_operation_count(), 0);
+    assert!(
+        mom_llama_runtime::resident_status(&scope)
+            .is_none_or(|status| status.active_sequences == 0)
+    );
     Ok(())
 }
 
@@ -3292,6 +3650,17 @@ fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()>
             .iter()
             .any(|event| event.event == "model_delta" && event.delta.is_some())
     );
+    assert!(
+        stream_events
+            .iter()
+            .any(|event| event.event == "model_started")
+    );
+    assert!(
+        stream_events
+            .iter()
+            .filter(|event| event.event == "model_started")
+            .all(|event| !event.real_engine_invoked)
+    );
     let conversation = mom_llama_runtime::conversation_select("real-tool-loop")?
         .result
         .ok_or_else(|| anyhow!("tool loop conversation missing"))?;
@@ -3300,6 +3669,13 @@ fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()>
             .messages
             .iter()
             .any(|message| message.role == mom_llama_runtime::MessageRole::Tool)
+    );
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .all(|message| message.prompt_tokens.is_some() && message.completion_tokens.is_some())
     );
     Ok(())
 }
@@ -3337,8 +3713,10 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
     let prompt_for_worker = prompt.clone();
     let arguments_for_worker = arguments.clone();
     let worker_scope = operation_scope.clone();
+    let worker_data_dir = session.path().to_path_buf();
     let worker = std::thread::spawn(move || {
-        mom_llama_runtime::tool_loop_run_in_scope(
+        set_data_dir_override_for_tests(Some(worker_data_dir));
+        let result = mom_llama_runtime::tool_loop_run_in_scope(
             &worker_scope,
             conversation_id,
             prompt_for_worker,
@@ -3347,39 +3725,57 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
             arguments_for_worker,
             2,
             Some(approval_id),
-        )
+        );
+        set_data_dir_override_for_tests(None);
+        result
     });
 
-    let deadline = Instant::now() + Duration::from_mins(2);
-    let active = loop {
-        let status = mom_llama_runtime::tool_loop_status(Some(conversation_id))?;
-        if let Some(active) = status
-            .result
-            .unwrap_or_default()
-            .into_iter()
-            .find(|active| {
-                active.current_model_request_id.is_some()
-                    && active.state == mom_llama_runtime::ToolLoopState::Running
-            })
-        {
-            break active;
-        }
-        if worker.is_finished() {
-            return Err(anyhow!(
-                "tool loop finished before exposing an active native request"
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "tool loop did not expose an active native request before timeout"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // No observation, timeout, or cancellation error may abandon the owned worker.
+    let observation = (|| -> Result<_> {
+        let deadline = Instant::now() + Duration::from_mins(2);
+        let active = loop {
+            let status = mom_llama_runtime::tool_loop_status(Some(conversation_id))?;
+            if let Some(active) = status
+                .result
+                .unwrap_or_default()
+                .into_iter()
+                .find(|active| {
+                    active.current_model_request_id.is_some()
+                        && active.state == mom_llama_runtime::ToolLoopState::Running
+                })
+            {
+                // The durable model ID is admission intent. Require live native work too.
+                if mom_llama_runtime::resident_status(&operation_scope)
+                    .is_some_and(|status| status.active_sequences > 0)
+                {
+                    break active;
+                }
+            }
+            if worker.is_finished() {
+                return Err(anyhow!(
+                    "tool loop finished before exposing an active native request"
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "tool loop did not expose an active native request before timeout"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let cancelled =
+            mom_llama_runtime::tool_loop_cancel_in_scope(&operation_scope, conversation_id)?;
+        Ok((active, cancelled))
+    })();
+    if observation.is_err() {
+        operation_scope.request_cancellation();
+    }
+    let joined = worker
+        .join()
+        .map_err(|_| anyhow!("tool-loop worker panicked"));
+    let (active, cancelled) = observation?;
+    let result = joined??;
     assert!(active.current_model_request_id.is_some());
-
-    let cancelled =
-        mom_llama_runtime::tool_loop_cancel_in_scope(&operation_scope, conversation_id)?;
     assert_eq!(cancelled.status, "contracted");
     assert_eq!(
         cancelled
@@ -3388,9 +3784,6 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
             .and_then(|output| output.current_model_request_id.as_ref()),
         active.current_model_request_id.as_ref()
     );
-    let result = worker
-        .join()
-        .map_err(|_| anyhow!("tool-loop worker panicked"))??;
     assert_eq!(result.readiness, "cancelled");
     assert_eq!(
         result.blocker.as_ref().map(|blocker| blocker.code.as_str()),

@@ -1161,9 +1161,9 @@ pub fn mom_llama_conversation_import(
     path: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_conversation_import"))?;
-    let content = std::fs::read_to_string(&path)
-        .map_err(|error| format!("could not read conversation import {path}: {error}"))?;
-    command_value(mom_llama_runtime::conversation_import_json(&content))
+    command_value(mom_llama_runtime::conversation_import_file(
+        PathBuf::from(path).as_path(),
+    ))
 }
 
 #[tauri::command]
