@@ -24,6 +24,7 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
+    ghostRollbackTextIsExactAtSelection,
     setGhostFanPinned,
     setGhostText,
     visualCaretBoundaryProof,
@@ -454,7 +455,32 @@
       fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
       fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
-    setGhostText(editorView, presentation, forceRender);
+    const currentPlan = currentGhostTextPlan(editorView.state);
+    const retainExactRollback = !presentation &&
+      !snapshot.readonly &&
+      !snapshot.composing &&
+      snapshot.text === '' &&
+      snapshot.unconsumeText !== '' &&
+      currentPlan?.text === '' &&
+      currentPlan.hidden &&
+      currentPlan.candidateId === snapshot.candidateId &&
+      currentPlan.presentationKey === snapshot.presentationKey &&
+      currentPlan.surfaceKey === snapshot.surfaceKey &&
+      currentPlan.unconsumeText === snapshot.unconsumeText &&
+      selectionBoundary(editorView.state) === currentPlan.anchorByteOffset &&
+      ghostRollbackTextIsExactAtSelection(editorView.state, currentPlan);
+    // Option-down is observed in the window capture phase. During native AX
+    // reconciliation the parent caret projection can briefly be unavailable,
+    // even though the editor still proves the same scoped rollback bytes at
+    // the same caret. Do not erase that one-use authority between Option and
+    // ArrowLeft; every identity, byte, and live-selection check above must
+    // continue to match. A real caret move, edit, scope change, or revocation
+    // still clears the plan synchronously.
+    if (!retainExactRollback) setGhostText(editorView, presentation, forceRender);
+    else if (forceRender && currentPlan) setGhostText(editorView, {
+      ...currentPlan,
+      active: true
+    }, true);
     reportCompletionAccessibility();
     scheduleGhostVisibilityReport();
   }

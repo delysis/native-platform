@@ -9,6 +9,7 @@ import {
   exactMarkdownByteOffsetAtSelection,
   visualCaretBoundaryProof,
   ghostTextPluginKey,
+  ghostRollbackTextIsExactAtSelection,
   planGhostText,
   renderedGhostPresentationKey,
   setCompletionOptionAccessibility,
@@ -321,6 +322,25 @@ describe('visual ghost widget', () => {
       key: 'Alt', altKey: false
     } as KeyboardEvent);
     expect(modifierStates).toEqual([true, false]);
+  });
+
+  it('proves rollback bytes only at the live collapsed caret', () => {
+    const doc = defaultMarkdownParser.parse('A one waits');
+    const exact = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, 6)
+    });
+    const plan = { unconsumeText: ' one' };
+
+    expect(ghostRollbackTextIsExactAtSelection(exact, plan)).toBe(true);
+    expect(ghostRollbackTextIsExactAtSelection(
+      exact.apply(exact.tr.setSelection(TextSelection.create(doc, 5))),
+      plan
+    )).toBe(false);
+    expect(ghostRollbackTextIsExactAtSelection(
+      exact.apply(exact.tr.setSelection(TextSelection.create(doc, 2, 6))),
+      plan
+    )).toBe(false);
   });
 
   it('keeps Option held while an exact hidden rollback restores the fan family', () => {

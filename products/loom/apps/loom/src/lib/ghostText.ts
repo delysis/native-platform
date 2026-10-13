@@ -165,6 +165,25 @@ export function planGhostText(
   };
 }
 
+/**
+ * Prove that the hidden rollback bytes still end at the live visual caret.
+ * This proof is deliberately independent of the decoration DOM: exhausted
+ * completion authority has no visible widget, and WebKit may reconcile its
+ * accessibility projection between the Option and ArrowLeft key events.
+ */
+export function ghostRollbackTextIsExactAtSelection(
+  state: EditorState,
+  plan: Pick<GhostTextPlan, 'unconsumeText'> | null
+): boolean {
+  if (!plan?.unconsumeText || !state.selection.empty || !(state.selection instanceof TextSelection)) {
+    return false;
+  }
+  const rollbackEnd = state.selection.from;
+  const rollbackStart = rollbackEnd - plan.unconsumeText.length;
+  return rollbackStart >= 0 &&
+    state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') === plan.unconsumeText;
+}
+
 interface FlattenedTextCaret {
   text: string;
   offset: number;
@@ -822,16 +841,7 @@ export function createGhostTextPlugin(
                 plan.anchorByteOffset
               )
         ));
-        const rollbackEnd = view.state.selection.from;
-        const rollbackStart = plan?.unconsumeText
-          ? rollbackEnd - plan.unconsumeText.length
-          : -1;
-        const exactRollbackAvailable = Boolean(
-          plan?.unconsumeText &&
-          rollbackStart >= 0 &&
-          view.state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') ===
-            plan.unconsumeText
-        );
+        const exactRollbackAvailable = ghostRollbackTextIsExactAtSelection(view.state, plan);
         // Keep reporting the physical modifier when there is no completion.
         // When a plan does exist, however, only its live viewport witness may
         // project Option-held fan state back through the Svelte owner. The one
@@ -888,6 +898,8 @@ export function createGhostTextPlugin(
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
+            const rollbackEnd = view.state.selection.from;
+            const rollbackStart = rollbackEnd - plan.unconsumeText.length;
             const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
             const anchorByteOffset = plan.anchorByteOffset - removedBytes;
             if (anchorByteOffset < 0) return false;
