@@ -880,7 +880,11 @@ guard let shuttleEnabled = waitForWitness(timeout: 10, { witness in
 }) else {
     releaseOptionAndFail("Shuttle did not hide the inline presentation while retaining the exact cached family")
 }
-guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
+// The system-level Command-Shift-J event can briefly move native focus while
+// WebKit processes the shortcut. Re-establish the explicit writing-surface
+// prerequisite before judging whether the foreground-only Shuttle fires.
+guard focusWritingSurface(expected: original, timeout: 5) != nil,
+      let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let shuttleAccepted = waitForWitness(timeout: 10, { witness in
           let action = lastAction(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&

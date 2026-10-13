@@ -1411,6 +1411,10 @@
     setOptionHeld(false);
   }
 
+  function releaseOptionStateUnlessRollbackLease(): void {
+    if (!rollbackOptionLease) releaseOptionState();
+  }
+
   function handleWindowFocus(): void {
     scheduleGhostPresentationSynchronization(true);
   }
@@ -1585,7 +1589,11 @@
           return false;
         },
         blur() {
-          releaseOptionState();
+          // The native Option-Left shortcut can briefly move first-responder
+          // status while its exact rollback event crosses into WebKit. Keep
+          // that bounded lease until the physical Option-up, page hide, or a
+          // pointer interaction ends it.
+          releaseOptionStateUnlessRollbackLease();
           scheduleGhostVisibilityReport();
           return false;
         },
@@ -1617,7 +1625,7 @@
     window.addEventListener('focus', handleWindowFocus);
     window.addEventListener('keydown', handleWindowKeyDown, true);
     window.addEventListener('keyup', handleWindowKeyUp, true);
-    window.addEventListener('blur', releaseOptionState);
+    window.addEventListener('blur', releaseOptionStateUnlessRollbackLease);
     window.addEventListener('pagehide', releaseOptionState);
     window.addEventListener('pointerdown', releaseOptionState, true);
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -1705,7 +1713,7 @@
     window.removeEventListener('focus', handleWindowFocus);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);
-    window.removeEventListener('blur', releaseOptionState);
+    window.removeEventListener('blur', releaseOptionStateUnlessRollbackLease);
     window.removeEventListener('pagehide', releaseOptionState);
     window.removeEventListener('pointerdown', releaseOptionState, true);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
