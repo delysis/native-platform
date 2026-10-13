@@ -54,6 +54,7 @@ members = [
     "products/loom/crates/loom-cli",
     "products/loom/crates/loom-document",
     "products/loom/crates/loom-host",
+    "products/loom/crates/loom-macos-shortcut",
     "products/loom/crates/loom-store",
     "products/loom/crates/loom-signal-protocol",
     "products/loom/crates/loom-types",

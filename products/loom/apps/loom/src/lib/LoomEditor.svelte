@@ -195,6 +195,7 @@
   let retainedRollbackPlan: GhostTextPlan | null = null;
   let rollbackOptionLease = false;
   let rollbackKeyDownHandled = false;
+  let lastExactRollbackAt = Number.NEGATIVE_INFINITY;
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
@@ -1341,6 +1342,7 @@
       ) {
         event.preventDefault();
         event.stopImmediatePropagation();
+        lastExactRollbackAt = performance.now();
         retainedRollbackPlan = null;
         dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
         return true;
@@ -1350,6 +1352,7 @@
   }
 
   export function reverseCompletion(): boolean {
+    if (performance.now() - lastExactRollbackAt < 100) return true;
     return handleExactRollbackChord(new KeyboardEvent('keydown', {
       key: 'ArrowLeft',
       altKey: true,

@@ -9,8 +9,7 @@ use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
 use tauri::utils::config::WindowConfig;
-use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri::{AppHandle, Emitter, Runtime};
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod application;
@@ -71,17 +70,6 @@ pub fn run() {
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
-                    if *shortcut == reverse_completion_shortcut() &&
-                        event.state == ShortcutState::Pressed
-                    {
-                        let _ = app.emit(tauri_plugin_loom::REVERSE_COMPLETION_EVENT, ());
-                    }
-                })
-                .build(),
-        )
         .plugin(loom_plugin.build())
         .setup(move |app| {
             if let Some(identifier) = acceptance_data_store {
@@ -93,41 +81,17 @@ pub fn run() {
                         .build()?;
                 }
             }
-            for window in app.webview_windows().into_values() {
+            #[cfg(target_os = "macos")]
+            {
                 let handle = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::Focused(focused) = event {
-                        set_reverse_completion_shortcut(&handle, *focused);
-                    }
+                loom_macos_shortcut::install(move || {
+                    let _ = handle.emit(tauri_plugin_loom::REVERSE_COMPLETION_EVENT, ());
                 });
             }
-            // Acceptance windows are created above during setup. AppKit can
-            // focus that first window before its observer is attached, so
-            // establish the foreground registration once here; later focus
-            // events keep it scoped to Loom.
-            set_reverse_completion_shortcut(app.handle(), true);
             Ok(())
         })
         .run(context)
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
-}
-
-fn reverse_completion_shortcut() -> Shortcut {
-    Shortcut::new(Some(Modifiers::ALT), Code::ArrowLeft)
-}
-
-fn set_reverse_completion_shortcut<R: Runtime>(app: &AppHandle<R>, enabled: bool) {
-    let manager = app.global_shortcut();
-    let shortcut = reverse_completion_shortcut();
-    if enabled && !manager.is_registered(shortcut) {
-        if let Err(error) = manager.register(shortcut) {
-            eprintln!("Loom could not register completion reversal: {error}");
-        }
-    } else if !enabled && manager.is_registered(shortcut) {
-        if let Err(error) = manager.unregister(shortcut) {
-            eprintln!("Loom could not release completion reversal: {error}");
-        }
-    }
 }
 
 // Native project storage and renderer storage are independent. Acceptance

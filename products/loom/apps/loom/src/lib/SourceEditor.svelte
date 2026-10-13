@@ -46,6 +46,8 @@
     transferMayContainImageFile
   } from './attachments';
 
+  let lastExactRollbackAt = Number.NEGATIVE_INFINITY;
+
   const ownedCompletionInputAttributes: Record<string, string> = {
     autocorrect: 'off',
     autocomplete: 'off'
@@ -588,6 +590,7 @@
     ) {
       event.preventDefault();
       event.stopPropagation();
+      lastExactRollbackAt = performance.now();
       const end = element.selectionStart;
       const start = end - ghostUnconsumeText.length;
       applyCompletionTextEdit(element.value.slice(0, start) + element.value.slice(end), start);
@@ -761,6 +764,7 @@
   }
 
   export function reverseCompletion(): boolean {
+    if (performance.now() - lastExactRollbackAt < 100) return true;
     const before = element?.value;
     if (before === undefined) return false;
     handleKeydown(new KeyboardEvent('keydown', {
