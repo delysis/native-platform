@@ -1303,6 +1303,7 @@
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
+    if (handleExactRollbackChord(event)) return;
     if (!hasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
 
