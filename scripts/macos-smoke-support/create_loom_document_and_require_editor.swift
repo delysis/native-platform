@@ -73,9 +73,9 @@ func postKey(_ key: CGKeyCode) -> Bool {
           let up = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) else {
         return false
     }
-    down.postToPid(pid)
+    down.post(tap: .cghidEventTap)
     Thread.sleep(forTimeInterval: 0.03)
-    up.postToPid(pid)
+    up.post(tap: .cghidEventTap)
     return true
 }
 
