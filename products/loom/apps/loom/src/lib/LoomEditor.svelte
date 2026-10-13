@@ -1238,18 +1238,7 @@
     return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
-  function handleWindowKeyDown(event: KeyboardEvent): void {
-    if (!hasExactFocus()) {
-      setOptionHeld(false);
-      return;
-    }
-    // Every keydown is a fresh physical-state witness. This recovers from a
-    // swallowed Option-up without guessing from the previous event sequence.
-    setOptionHeld(
-      (event.key === 'Alt' || event.altKey) &&
-      !event.metaKey &&
-      !event.ctrlKey
-    );
+  function handleExactRollbackChord(event: KeyboardEvent): boolean {
     if (
       event.key === 'ArrowLeft' &&
       event.altKey &&
@@ -1257,6 +1246,10 @@
       !event.ctrlKey &&
       view
     ) {
+      const target = event.target;
+      const targetsEditor = target === window || target === document || target === document.body ||
+        (target instanceof Node && (target === view.dom || view.dom.contains(target)));
+      if (!targetsEditor) return false;
       const livePlan = currentGhostTextPlan(view.state);
       const plan = livePlan ?? retainedRollbackPlan;
       const rollbackEnd = view.state.selection.from;
@@ -1283,8 +1276,25 @@
         event.stopImmediatePropagation();
         retainedRollbackPlan = null;
         dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
+        return true;
       }
     }
+    return false;
+  }
+
+  function handleWindowKeyDown(event: KeyboardEvent): void {
+    if (handleExactRollbackChord(event)) return;
+    if (!hasExactFocus()) {
+      setOptionHeld(false);
+      return;
+    }
+    // Every keydown is a fresh physical-state witness. This recovers from a
+    // swallowed Option-up without guessing from the previous event sequence.
+    setOptionHeld(
+      (event.key === 'Alt' || event.altKey) &&
+      !event.metaKey &&
+      !event.ctrlKey
+    );
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
