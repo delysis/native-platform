@@ -94,6 +94,10 @@ func fail(_ reason: String) -> Never {
 func guardsHold() -> Bool {
     !application.isTerminated && !guardPaths.contains { manager.fileExists(atPath: $0) }
 }
+func loomIsBackgrounded() -> Bool {
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
+    return frontmost.processIdentifier != pid
+}
 func rows(_ sql: String, offset: Bool = false) -> [[String]]? {
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
@@ -216,14 +220,12 @@ let started = ProcessInfo.processInfo.systemUptime
 var polls = 0
 while ProcessInfo.processInfo.systemUptime - started < 75 {
     polls += 1
-    guard guardsHold(), application.isHidden,
-          NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+    guard guardsHold(), application.isHidden, loomIsBackgrounded(),
           storeIdentity() == stableStore else { fail("focus_process_generation_or_terminal_identity_changed") }
     serviceMainRunLoop()
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
-guard guardsHold(), application.isHidden,
-      NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+guard guardsHold(), application.isHidden, loomIsBackgrounded(),
       storeIdentity() == stableStore else { fail("final_idle_invariant_changed") }
 stage = "after_resume"
 showExactApplication()
@@ -243,6 +245,7 @@ guard waitFor({
 after = resumed
 let result: [String: Any] = ["schema": "delysis.loom-idle-resume-ghost-witness.v1", "pid": pid, "database": dbPath,
     "background_pid": finder.processIdentifier, "application_hidden_during_idle": true, "loom_frontmost_during_idle": false,
+    "background_focus_may_change": true,
     "minimum_idle_seconds": 75, "actual_idle_seconds": elapsed, "idle_polls": polls, "explicit_resume": true,
     "editor_focused_after_resume": true, "caret_utf16_after_resume": manuscript.utf16.count,
     "generation_runs_before_idle": baseline + 4, "generation_runs_after_resume": baseline + 4,
