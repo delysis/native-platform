@@ -942,6 +942,10 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Return did not apply the selected cached remainder")
 }
 let returnAction = lastAction(returnAccepted)
+// The app witness and WebKit's key-dispatch target settle on adjacent render
+// turns. Match the browser contract's two-paint handoff without approaching
+// the 1.8-second candidate-exhaustion schedule.
+Thread.sleep(forTimeInterval: 0.25)
 guard let returnCandidate = expectedCandidates[returnRunId],
       let returnAcceptedBytes = waitForExactEditorInsertion(
           original: original,
@@ -1020,6 +1024,7 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Tab did not apply the selected cached remainder")
 }
 let tabAction = lastAction(tabAccepted)
+Thread.sleep(forTimeInterval: 0.25)
 guard let tabCandidate = expectedCandidates[tabRunId],
       let tabAcceptedBytes = waitForExactEditorInsertion(
           original: original,
