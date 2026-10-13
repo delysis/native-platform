@@ -895,40 +895,6 @@ NODE
   return 1
 }
 
-wait_for_loom_manuscript_extension() {
-  manuscript=$1
-  prefix=$2
-  attempt=0
-  while [ "$attempt" -lt 1800 ]; do
-    if [ -n "${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" ] && [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; then
-      echo "Loom exposed project_busy before Shuttle persisted its cached word" >&2
-      return 1
-    fi
-    if node - "$manuscript" "$prefix" <<'NODE'
-const fs = require('fs');
-const [path, prefix] = process.argv.slice(2);
-try {
-  const observed = fs.readFileSync(path, 'utf8');
-  process.exit(observed.startsWith(prefix) && observed.length > prefix.length && /\S/u.test(observed.slice(prefix.length)) ? 0 : 1);
-} catch (error) {
-  if (error?.code === 'ENOENT') process.exit(1);
-  throw error;
-}
-NODE
-    then
-      node - "$manuscript" <<'NODE'
-const fs = require('fs');
-process.stdout.write(JSON.stringify(fs.readFileSync(process.argv[2], 'utf8')));
-NODE
-      return 0
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.1
-  done
-  echo "Shuttle never persisted a completion word after a real four-way batch" >&2
-  return 1
-}
-
 exercise_loom_completion_word_reversal() {
   target_pid=$1
   manuscript=$2

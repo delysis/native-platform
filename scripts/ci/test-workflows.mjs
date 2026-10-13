@@ -647,6 +647,8 @@ test("the macOS builder rejects the same common model-weight formats as the arch
     assert.ok(scannerSource.includes(`".${extension}"`));
   }
   assert.match(scannerSource, /Buffer\.from\("GGUF"\)/);
+  assert.match(scannerSource, /O_NONBLOCK/);
+  assert.match(scannerSource, /fstatSync\(descriptor\)\.isFile\(\)/);
 });
 
 test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {

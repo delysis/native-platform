@@ -228,7 +228,6 @@
     attachWorkspaceProjectReply,
     restoreBeforeBackgroundWork,
     runCurrentWorkspaceStep,
-    shouldDiscoverModelsOnStartup,
     workspaceResumeAction
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
@@ -6721,7 +6720,8 @@
     if (!workspaceRestoreIsCurrent(captured)) return;
     await recoverModelDownloads();
     if (!workspaceRestoreIsCurrent(captured)) return;
-    if (!shouldDiscoverModelsOnStartup(completionAutomationActive)) return;
+    // Loading the verified local writer is preparation, independent of the
+    // per-project suggestion preference.
     recordStartupTiming('writer_preload_queued', { suggestions_enabled: suggestionsEnabled });
     requestPreferredWriterEnsure(captured);
   }
@@ -10958,6 +10958,7 @@
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
             {#if materialOwnerScope}{#key materialOwnerScope.sessionId}<ImportSources projectId={materialOwnerScope.projectId} sessionId={materialOwnerScope.sessionId} onOpen={openImportedSource} onImported={addImportedSources} onOpenFolder={openAnotherProject}
               onCollectionAdded={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) { ownerMaterialChanged(item, scope); void refreshMaterials(); } }}
+              onCollectionRetained={async (_id, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) await refreshMaterials(); }}
               onOpenCollection={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) openMaterial(item, undefined, scope); }} />{/key}{/if}
           </section>
         {/if}

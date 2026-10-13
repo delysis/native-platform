@@ -3732,16 +3732,7 @@ fn resolve_targets(handles: &[String], host_id: &str) -> Result<TargetResolution
     ))
 }
 
-use target_resolution::checked_resolve_targets_from_registry;
-
-fn resolve_targets_from_registry(
-    handles: &[String],
-    host_id: &str,
-    conversations: &[Conversation],
-    groups: &[crate::personas::PersonaGroup],
-) -> TargetResolution {
-    checked_resolve_targets_from_registry(handles, host_id, conversations, groups)
-}
+use target_resolution::checked_resolve_targets_from_registry as resolve_targets_from_registry;
 
 fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
     let source_messages = crate::document::checked_active_messages(&target.conversation)?;

@@ -718,28 +718,21 @@ where
             total_bytes: Some(completed.bytes),
             resumed_from_bytes: disposition_resume(completed.disposition),
         })?;
-        let disposition = match std::fs::hard_link(partial_path, &self.request.target_path) {
-            Ok(()) => {
-                // `hard_link` committed the exact inode represented by the
-                // verified, locked handle. Compare file identities instead of
-                // reading through the target path: Windows byte-range locks
-                // intentionally reject that second read even though both names
-                // address the same file.
-                self.validate_linked_target(partial).await?;
-                completed.disposition
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                self.validate_install_race(completed).await?;
-                DownloadDisposition::ReusedExisting
-            }
-            Err(source) => {
-                return Err(io_error(
-                    "atomically install completed model",
-                    &self.request.target_path,
-                    source,
-                ));
-            }
-        };
+        let disposition =
+            match publish_verified_partial(partial, partial_path, &self.request.target_path) {
+                Ok(()) => completed.disposition,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    self.validate_install_race(completed).await?;
+                    DownloadDisposition::ReusedExisting
+                }
+                Err(source) => {
+                    return Err(io_error(
+                        "atomically install completed model",
+                        &self.request.target_path,
+                        source,
+                    ));
+                }
+            };
         let partial_removed = std::fs::remove_file(partial_path).is_ok();
         self.emit_complete(completed.bytes, disposition_resume(disposition));
         Ok(GgufDownloadResult {
@@ -749,40 +742,6 @@ where
             disposition,
             partial_removed,
         })
-    }
-
-    async fn validate_linked_target(&self, partial: &tokio::fs::File) -> Result<(), DownloadError> {
-        let partial_clone = partial
-            .try_clone()
-            .await
-            .map_err(|source| {
-                io_error(
-                    "clone verified partial file",
-                    &self.request.target_path,
-                    source,
-                )
-            })?
-            .into_std()
-            .await;
-        let partial_identity = same_file::Handle::from_file(partial_clone).map_err(|source| {
-            io_error(
-                "identify verified partial file",
-                &self.request.target_path,
-                source,
-            )
-        })?;
-        let target_identity =
-            same_file::Handle::from_path(&self.request.target_path).map_err(|source| {
-                io_error(
-                    "identify installed model",
-                    &self.request.target_path,
-                    source,
-                )
-            })?;
-        if partial_identity != target_identity {
-            return Err(DownloadError::TargetRaceMismatch);
-        }
-        Ok(())
     }
 
     async fn validate_install_race(
@@ -1204,12 +1163,8 @@ fn open_locked_partial(path: &Path) -> Result<File, DownloadError> {
             open_existing_partial(path)?
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
+            let mut options = partial_open_options();
+            match options.create_new(true).open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let metadata = std::fs::symlink_metadata(path)
@@ -1248,11 +1203,93 @@ fn open_locked_partial(path: &Path) -> Result<File, DownloadError> {
 }
 
 fn open_existing_partial(path: &Path) -> Result<File, DownloadError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
+    partial_open_options()
         .open(path)
         .map_err(|source| io_error("open partial file", path, source))
+}
+
+fn partial_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        // Withhold FILE_SHARE_DELETE so the verified pathname cannot be
+        // renamed or replaced while Windows publishes its hard link.
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options
+}
+
+#[cfg(target_vendor = "apple")]
+fn publish_verified_partial(
+    partial: &tokio::fs::File,
+    _partial_path: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{CloneFlags, Mode, OFlags, fclonefileat, open};
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing target parent"))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing target name"))?;
+    let directory = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    fclonefileat(partial, directory, name, CloneFlags::NOFOLLOW).map_err(io::Error::from)
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn publish_verified_partial(
+    partial: &tokio::fs::File,
+    _partial_path: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, open};
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing target parent"))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing target name"))?;
+    let directory = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let descriptor = partial.as_raw_fd().to_string();
+    let mut last = None;
+    for root in ["/proc/self/fd", "/dev/fd"] {
+        let source = Path::new(root).join(&descriptor);
+        match linkat(CWD, &source, &directory, name, AtFlags::SYMLINK_FOLLOW) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(io::Error::from(
+        last.expect("descriptor publication attempted"),
+    ))
+}
+
+#[cfg(not(unix))]
+fn publish_verified_partial(
+    _partial: &tokio::fs::File,
+    partial_path: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    // Windows holds the partial without FILE_SHARE_DELETE until this returns.
+    std::fs::hard_link(partial_path, target)
 }
 
 async fn validate_open_path(
@@ -1579,6 +1616,37 @@ mod tests {
             }
         );
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(!partial.exists());
+        assert!(result.partial_removed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_publishes_the_verified_handle_after_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("model.gguf");
+        let partial = directory.path().join("model.gguf.part");
+        let displaced = directory.path().join("verified-displaced.gguf");
+        let bytes = model_bytes();
+        std::fs::write(&partial, &bytes).unwrap();
+        let mut replaced = false;
+        let result = download_gguf(
+            &request(target.clone(), &bytes),
+            &DownloadCancellation::default(),
+            |event| {
+                if event.phase == DownloadPhase::Installing && !replaced {
+                    std::fs::rename(&partial, &displaced).unwrap();
+                    std::fs::write(&partial, b"GGUFpath-replacement").unwrap();
+                    replaced = true;
+                }
+                DownloadControl::Continue
+            },
+        )
+        .await
+        .unwrap();
+        assert!(replaced);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(std::fs::read(&displaced).unwrap(), bytes);
         assert!(!partial.exists());
         assert!(result.partial_removed);
     }

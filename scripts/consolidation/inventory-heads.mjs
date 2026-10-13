@@ -19,7 +19,7 @@ function main() {
       '+refs/heads/*:refs/remotes/origin/*', '+refs/pull/*/head:refs/review/github-pr/*']);
   }
   check(git(repo, ['rev-parse', `${BASE}^{commit}`]).trim() === BASE, 'base commit missing');
-  exclusiveDirectory(out);
+  exclusiveDirectory(out, repo);
   const refs = git(repo, ['for-each-ref', '--format=%(refname)%00%(objectname)%00%(objecttype)',
     'refs/heads', 'refs/remotes', 'refs/pull', 'refs/review']).trim().split('\n').filter(Boolean);
   const cache = new Map();

@@ -220,17 +220,17 @@ describe('missing current-document boundary', () => {
       copied: false
     };
 
-    expect(missingDocumentRecoveryBlocksReplacement(existing, 'second-missing')).toBe(true);
-    expect(missingDocumentRecoveryBlocksReplacement(existing, 'first-missing')).toBe(true);
+    expect(missingDocumentRecoveryBlocksReplacement(existing)).toBe(true);
+    expect(missingDocumentRecoveryBlocksReplacement(existing)).toBe(true);
     expect(missingDocumentRecoveryBlocksReplacement({
       ...existing,
       journalDurable: true
-    }, 'second-missing')).toBe(false);
+    })).toBe(false);
     expect(missingDocumentRecoveryBlocksReplacement({
       ...existing,
       copied: true
-    }, 'second-missing')).toBe(false);
-    expect(missingDocumentRecoveryBlocksReplacement(null, 'second-missing')).toBe(false);
+    })).toBe(false);
+    expect(missingDocumentRecoveryBlocksReplacement(null)).toBe(false);
   });
 
   it('does not clear or overwrite unsafe recovery when the same document ID reappears', () => {

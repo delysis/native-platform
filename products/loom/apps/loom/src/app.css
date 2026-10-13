@@ -66,7 +66,7 @@ button:disabled { cursor: default; opacity: .45; }
 .canvas-controls-right { position: relative; }
 .titlebar-drag-surface { position: relative; min-width: 28px; height: 100%; flex: 1; }
 .titlebar-document-title { position: absolute; top: 50%; left: 50%; overflow: hidden; max-width: min(52vw, 420px); transform: translate(-50%, -50%); color: color-mix(in srgb, var(--ink) 68%, transparent); font-size: 12px; font-weight: 600; line-height: 1; pointer-events: none; text-overflow: ellipsis; white-space: nowrap; }
-.topbar-caption, .muted { color: var(--muted); font-size: 13px; }
+.muted { color: var(--muted); font-size: 13px; }
 .titlebar-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; line-height: 1; }
 .titlebar-button svg { width: 15px; height: 15px; display: block; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
 .mode-toggle { width: 27px; }
@@ -418,12 +418,7 @@ button.document-row:hover { background: var(--chrome-hover); }
 .welcome-note h1 { margin: 12px 0 24px; font: 500 clamp(34px, 6vw, 48px)/1.1 Iowan Old Style, Palatino, Georgia, serif; letter-spacing: -.035em; }
 .welcome-actions { display: flex; align-items: center; justify-content: center; gap: 14px; }
 .welcome-open { padding: 7px 9px; color: var(--muted); font-size: 12px; }
-.project-card { padding: 28px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); box-shadow: var(--shadow); backdrop-filter: blur(12px); }
-.project-card h2 { margin: 7px 0 22px; font: 500 28px/1.2 Georgia, serif; }
-.project-card label { display: grid; gap: 6px; margin: 13px 0; color: var(--muted); font-size: 12px; font-weight: 650; }
-.project-card input { width: 100%; padding: 10px 11px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); }
 .project-actions { display: flex; justify-content: flex-end; gap: 9px; margin: 20px 0 14px; }
-.project-card > small { display: block; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .runtime-note, .error-banner { margin: 0 0 16px; padding: 10px 11px; border-radius: 8px; font-size: 12px; line-height: 1.45; }
 .runtime-note { color: var(--warning); background: var(--warning-soft); }
 .runtime-note pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; color: var(--ink); }
@@ -438,7 +433,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 @media (max-width: 900px) {
   .button-label { display: none; }
   .welcome { overflow: auto; padding: 40px 24px 70px; }
-  .project-card { width: min(100%, 600px); }
   .reconciliation-columns { grid-template-columns: 1fr; }
 }
 @media (max-width: 620px) {

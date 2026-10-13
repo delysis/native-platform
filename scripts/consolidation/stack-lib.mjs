@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 export const BASE = '637e60b6b044230ed24ed3118615a2e5538cae83';
@@ -22,9 +23,17 @@ export function run(command, args, options = {}) {
 export function git(repo, args, options = {}) {
   return run('git', ['-c', 'core.hooksPath=/dev/null', '-C', repo, ...args], options);
 }
-export function exclusiveDirectory(directory) {
+export function exclusiveDirectory(directory, source) {
   // mkdir without recursive/exist_ok: never erase or reuse a user's output.
+  const canonicalSource = fs.realpathSync(source);
+  const canonicalParent = fs.realpathSync(path.dirname(directory));
+  const materialized = path.join(canonicalParent, path.basename(directory));
+  check(
+    materialized !== canonicalSource && !materialized.startsWith(canonicalSource + path.sep),
+    'output must materialize outside source',
+  );
   fs.mkdirSync(directory, { mode: 0o700 });
+  check(fs.realpathSync(directory) === materialized, 'created output identity changed');
 }
 export function parseOptions(argv, allowed, switches = []) {
   const result = {};

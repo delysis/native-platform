@@ -4967,6 +4967,7 @@ dependencies = [
  "llama-native-types",
  "loom-types",
  "reqwest 0.13.4",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",
@@ -11054,6 +11055,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "glib",
+ "libc",
+ "nix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

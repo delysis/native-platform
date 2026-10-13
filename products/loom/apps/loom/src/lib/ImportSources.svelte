@@ -15,6 +15,7 @@
   export let onOpenFolder: () => Promise<void> = async () => {};
   export let onImported: (items: ContextAttachment[], projectId: string, sessionId: string) => Promise<void>;
   export let onCollectionAdded: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
+  export let onCollectionRetained: (id: string, projectId: string, sessionId: string) => Promise<void> = async () => {};
   export let onOpenCollection: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
   let collection: MaterialEntry | null = null;
   async function publishImported(): Promise<void> {
@@ -51,6 +52,14 @@
     }
     return String(error);
   }
+  function retainedCollectionId(error: unknown): string | null {
+    if (!error || typeof error !== 'object') return null;
+    const value = error as Record<string, unknown>;
+    return typeof value.retained_collection_id === 'string' &&
+      typeof value.retained_collection_state === 'string'
+      ? value.retained_collection_id
+      : null;
+  }
   async function refresh(): Promise<void> {
     try { accounts = await importAccounts(projectId, sessionId); }
     catch (error) { message = errorText(error); }
@@ -86,7 +95,14 @@
       added = await addCollection(scope.projectId, scope.sessionId, collectionName.trim(), selectedScope, account);
       await refreshCollection(scope.projectId, scope.sessionId, added.id, 'fresh');
       message = '';
-    } catch (error) { message = errorText(error); }
+    } catch (error) {
+      message = errorText(error);
+      const retained = retainedCollectionId(error);
+      if (retained) {
+        collectionName = '';
+        await onCollectionRetained(retained, scope.projectId, scope.sessionId);
+      }
+    }
     finally {
       if (added) {
         collection = added;

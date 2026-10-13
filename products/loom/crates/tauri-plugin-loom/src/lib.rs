@@ -2420,6 +2420,10 @@ pub struct IpcFailure {
     message: String,
     retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    retained_collection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_collection_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     speculation_recovery: Option<Box<LoompadRecovery>>,
 }
 
@@ -2429,8 +2433,16 @@ impl IpcFailure {
             code,
             message: message.into(),
             retryable,
+            retained_collection_id: None,
+            retained_collection_state: None,
             speculation_recovery: None,
         }
+    }
+
+    fn with_retained_collection(mut self, id: &str, state: &'static str) -> Self {
+        self.retained_collection_id = Some(id.to_string());
+        self.retained_collection_state = Some(state);
+        self
     }
 
     fn attachment(error: &AttachmentStoreError) -> Self {
