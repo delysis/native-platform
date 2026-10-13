@@ -331,7 +331,7 @@ func cumulativeText(_ run: String, through sequence: Int64?) -> String? {
 }
 func sha256(_ text: String) -> String { SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined() }
 // Service AppKit state notifications without changing any observation gate.
-func reject(_ reason: String) { rejected[reason, default: 0] += 1; RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05)) }
+func reject(_ reason: String) { rejected[reason, default: 0] += 1; RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.005)) }
 func fail(_ reason: String) -> Never {
     let evidence: [String: Any] = ["schema": "delysis.loom-live-stream-failure.v1", "pid": pid, "reason": reason,
         "polls": polls, "generation_run_count": count() ?? -1, "family_run_ids": familyIds() ?? [],
