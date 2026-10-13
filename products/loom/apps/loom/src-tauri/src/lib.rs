@@ -95,15 +95,17 @@ pub fn run() {
             }
             for window in app.webview_windows().into_values() {
                 let handle = app.handle().clone();
-                if window.is_focused().unwrap_or(false) {
-                    set_reverse_completion_shortcut(&handle, true);
-                }
                 window.on_window_event(move |event| {
                     if let WindowEvent::Focused(focused) = event {
                         set_reverse_completion_shortcut(&handle, *focused);
                     }
                 });
             }
+            // Acceptance windows are created above during setup. AppKit can
+            // focus that first window before its observer is attached, so
+            // establish the foreground registration once here; later focus
+            // events keep it scoped to Loom.
+            set_reverse_completion_shortcut(app.handle(), true);
             Ok(())
         })
         .run(context)
@@ -118,9 +120,13 @@ fn set_reverse_completion_shortcut<R: Runtime>(app: &AppHandle<R>, enabled: bool
     let manager = app.global_shortcut();
     let shortcut = reverse_completion_shortcut();
     if enabled && !manager.is_registered(shortcut) {
-        let _ = manager.register(shortcut);
+        if let Err(error) = manager.register(shortcut) {
+            eprintln!("Loom could not register completion reversal: {error}");
+        }
     } else if !enabled && manager.is_registered(shortcut) {
-        let _ = manager.unregister(shortcut);
+        if let Err(error) = manager.unregister(shortcut) {
+            eprintln!("Loom could not release completion reversal: {error}");
+        }
     }
 }
 
