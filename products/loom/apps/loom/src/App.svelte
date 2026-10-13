@@ -7420,6 +7420,13 @@
             projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
             document?.summary.document_id === target.documentId
           ) {
+            // A native menu action can leave the NSWindow active while WebKit
+            // still refuses DOM focus. Reassert the native window before
+            // handing focus to the newly mounted editor.
+            if (desktop) {
+              try { await getCurrentWindow().setFocus(); }
+              catch (error) { recordFailure(error); }
+            }
             focusCurrentWritingSurfaceAtEnd();
             // A document identity swap can remount the active editor after
             // the first painted frame. Restore the caret once more after that
