@@ -95,7 +95,7 @@
     },
     {
       "effect_id": "mom_llama.effects.information_managed_read.v1",
-      "reads": ["bounded_active_receipt_projection", "exact_verified_attachment_bridge_manifest", "exact_managed_database", "exact_managed_citation"],
+      "reads": ["bounded_active_receipt_projection", "bounded_retained_removal_projection", "exact_verified_attachment_bridge_manifest", "exact_managed_database", "exact_managed_citation"],
       "writes": [],
       "network": [],
       "process": [],
@@ -108,8 +108,8 @@
     },
     {
       "effect_id": "mom_llama.effects.information_managed_removal.v1",
-      "reads": ["server_held_exact_removal_preview", "verified_attachment_bridge_manifest", "exact_managed_content_and_database_sha256"],
-      "writes": ["remove_exact_information_managed_representation", "cached_idempotent_removal_result"],
+      "reads": ["server_held_fresh_nonce_and_exact_removal_preview", "verified_attachment_bridge_manifest_or_retained_qualification_evidence", "exact_original_removal_operation_and_generation", "exact_managed_content_and_database_sha256"],
+      "writes": ["remove_exact_information_managed_representation", "retained_exact_removal_terminal"],
       "network": [],
       "process": [],
       "secrets": [],

@@ -362,6 +362,12 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
                 "refusing an invalid persistent prefix",
             ));
         }
+        if value.metadata.state_bytes > PERSISTENT_PREFIX_CACHE_MAX_BYTES {
+            return Err(NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                "persistent prefix exceeds the encrypted cache capacity",
+            ));
+        }
         self.store.mutate_documents(&Self::document(namespace), Vec::<PrefixCacheMetadata>::new, |entries, documents| {
             if let Some(owner_id) = value.metadata.owner_id.as_deref()
                 && crate::personas::persona_cache_owner_is_removed_from_documents(documents, owner_id)?
@@ -377,6 +383,8 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
             }
             if entries.iter().any(|entry| entry.id == value.metadata.id) {
                 documents.put_bytes(&Self::entry(namespace, &value.metadata.id), &serde_json::to_vec(value)?)?;
+            } else {
+                anyhow::bail!("persistent prefix was evicted before admission");
             }
             Ok(())
         }).map_err(prefix_store_error)
@@ -741,11 +749,14 @@ fn native_blocker(code: &str, message: &str) -> ValidationBlocker {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostCachePolicy, PrefixCacheStore, ProductHostKey, ProductPrefixCacheStore,
-        ProductRuntimeOwner, create_product_host, host_cache_policy,
+        HostCachePolicy, NativeHost, NativeHostConfig, PrefixCacheStore, ProductHostKey,
+        ProductPrefixCacheStore, ProductRuntimeOwner, SystemClock, create_product_host,
+        host_cache_policy,
     };
     use crate::config::KvCachePolicy;
-    use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata, PrefixCacheValue};
+    use llama_native_cache::{
+        CacheFingerprint, CacheInsertOutcome, CacheTier, PrefixCacheMetadata, PrefixCacheValue,
+    };
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
 
     #[test]
@@ -809,6 +820,169 @@ mod tests {
         };
         value.bind_reconstruction();
         value
+    }
+
+    #[test]
+    fn product_prefix_admission_preserves_storage_when_incoming_is_evicted() {
+        for memory_cache_bytes in [0, 3] {
+            let directory = tempfile::tempdir().expect("isolated cache admission fixture");
+            let store = crate::store::RuntimeStore::open_with_key(directory.path(), [31; 32])
+                .expect("encrypted store");
+            let store_path = store.path().to_path_buf();
+            let cache = std::sync::Arc::new(ProductPrefixCacheStore { store });
+            let namespace = "admission";
+            let mut incumbents = Vec::new();
+            for index in 0..super::PERSISTENT_PREFIX_CACHE_MAX_ENTRIES {
+                let mut value = cache_value();
+                value.metadata.id = format!("incumbent-{index}");
+                value.metadata.last_used_at_ms = index as u128 + 1;
+                cache.save(namespace, &value).expect("admit incumbent");
+                incumbents.push(value);
+            }
+            let incumbent = incumbents[0].clone();
+            let host = NativeHost::with_dependencies(
+                NativeHostConfig {
+                    memory_cache_bytes,
+                    cache_namespace: namespace.to_string(),
+                    cache_policy: HostCachePolicy::MemoryAndPersistent,
+                    ..NativeHostConfig::default()
+                },
+                std::sync::Arc::new(SystemClock),
+                Some(cache.clone()),
+            );
+            assert_eq!(
+                host.cache_insert(incumbent.clone())
+                    .expect("ordinary public admission"),
+                CacheInsertOutcome::Stored {
+                    memory_resident: memory_cache_bytes != 0,
+                    persistent_resident: true,
+                    evicted: Vec::new(),
+                }
+            );
+            let snapshot = || {
+                let connection =
+                    rusqlite::Connection::open(&store_path).expect("read encrypted rows");
+                let mut query = connection
+                    .prepare("SELECT namespace, nonce, ciphertext FROM encrypted_documents ORDER BY namespace")
+                    .expect("encrypted row query");
+                query
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    })
+                    .expect("encrypted rows")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("encrypted row snapshot")
+            };
+            let before = snapshot();
+            assert_eq!(before.len(), super::PERSISTENT_PREFIX_CACHE_MAX_ENTRIES + 1);
+            let mut incoming = cache_value();
+            incoming.metadata.id = "incoming".to_string();
+            incoming.metadata.fingerprint.model_sha256 = "incoming-fixture".to_string();
+            incoming.metadata.last_used_at_ms = 0;
+            assert!(incoming.is_valid(), "ordinary structural cache fixture");
+            let prompt = [1, 2, 3, 99];
+            assert_eq!(
+                host.cache_lookup(&incumbent.metadata.fingerprint, &prompt)
+                    .map(|value| value.metadata.id),
+                (memory_cache_bytes != 0).then(|| incumbent.metadata.id.clone())
+            );
+
+            let error = host
+                .cache_insert(incoming.clone())
+                .expect_err("an evicted incoming entry must not report public admission");
+            assert_eq!(error.code, super::NativeErrorCode::Internal);
+            assert_eq!(
+                snapshot(),
+                before,
+                "refusal preserves index and every encrypted blob"
+            );
+            assert_eq!(
+                cache.load(namespace).expect("unchanged incumbents"),
+                incumbents
+            );
+            assert!(
+                cache
+                    .load_entry(namespace, &incoming.metadata.id)
+                    .expect("incoming absence")
+                    .is_none()
+            );
+            assert!(
+                host.cache_lookup(&incoming.metadata.fingerprint, &prompt)
+                    .is_none()
+            );
+            assert_eq!(
+                host.cache_lookup(&incumbent.metadata.fingerprint, &prompt)
+                    .map(|value| value.metadata.id),
+                (memory_cache_bytes != 0).then(|| incumbent.metadata.id.clone()),
+                "refusal does not displace the live incumbent"
+            );
+            let reopened = ProductPrefixCacheStore {
+                store: crate::store::RuntimeStore::open_with_key(directory.path(), [31; 32])
+                    .expect("reopen refused store"),
+            };
+            assert_eq!(
+                reopened.load(namespace).expect("durable incumbents"),
+                incumbents
+            );
+            drop(reopened);
+
+            incoming.metadata.last_used_at_ms =
+                super::PERSISTENT_PREFIX_CACHE_MAX_ENTRIES as u128 + 1;
+            assert_eq!(
+                host.cache_insert(incoming.clone())
+                    .expect("newer entry is admitted"),
+                CacheInsertOutcome::Stored {
+                    memory_resident: memory_cache_bytes != 0,
+                    persistent_resident: true,
+                    evicted: if memory_cache_bytes == 0 {
+                        Vec::new()
+                    } else {
+                        vec![incumbent.metadata.id.clone()]
+                    },
+                }
+            );
+            assert!(
+                cache
+                    .load_entry(namespace, &incumbent.metadata.id)
+                    .expect("oldest incumbent evicted")
+                    .is_none()
+            );
+            assert_eq!(
+                cache
+                    .load_entry(namespace, &incoming.metadata.id)
+                    .expect("admitted encrypted blob"),
+                Some(incoming.clone())
+            );
+            assert_eq!(
+                host.cache_lookup(&incoming.metadata.fingerprint, &prompt)
+                    .map(|value| value.metadata.id),
+                (memory_cache_bytes != 0).then(|| incoming.metadata.id.clone())
+            );
+            assert!(
+                host.cache_lookup(&incumbent.metadata.fingerprint, &prompt)
+                    .is_none()
+            );
+            incumbents.remove(0);
+            incumbents.push(incoming);
+            assert_eq!(
+                cache.load(namespace).expect("actual LRU admission"),
+                incumbents
+            );
+            drop(host);
+            drop(cache);
+            let reopened = ProductPrefixCacheStore {
+                store: crate::store::RuntimeStore::open_with_key(directory.path(), [31; 32])
+                    .expect("reopen admitted store"),
+            };
+            assert_eq!(
+                reopened.load(namespace).expect("durable admission"),
+                incumbents
+            );
+        }
     }
 
     #[test]

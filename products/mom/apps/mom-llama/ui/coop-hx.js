@@ -1095,12 +1095,6 @@
     const container = document.getElementById("information-managed-list");
     if (!container) return records;
     container.replaceChildren();
-    if (!records.length) {
-      const empty = document.createElement("p");
-      empty.textContent = "No active Attachment library representations.";
-      container.append(empty);
-      return records;
-    }
     records.forEach((record) => {
       const article = document.createElement("article");
       article.className = "information-managed-item";
@@ -1133,7 +1127,7 @@
       remove.type = "button";
       remove.className = "small-button danger";
       remove.dataset.action = "information-managed-remove-preview";
-      remove.textContent = "Review removal";
+      setInformationRemovalControl(remove, "review", "Review", `Review removal of ${record.title}`);
       const results = document.createElement("div");
       results.className = "information-managed-results";
       results.setAttribute("aria-live", "polite");
@@ -1141,7 +1135,42 @@
       article.append(title, lineage, query, controls, results);
       container.append(article);
     });
+    const retained = await invoke("mom_llama_information_managed_removals");
+    const removals = document.getElementById("information-removal-list");
+    if (removals) {
+      removals.replaceChildren();
+      retained.forEach((record) => {
+        const article = document.createElement("article");
+        article.className = "information-managed-item";
+        article.dataset.materialization = record.preview.materialization_id;
+        article.dataset.retainedOperation = record.preview.preview_id;
+        const title = document.createElement("strong");
+        title.textContent = record.attachment?.title || record.preview.preview_id;
+        const review = createCommandElement("button", DYNAMIC_CONTROL_SPECS.informationManagedRemovalPreview);
+        review.type = "button";
+        review.className = "small-button danger";
+        review.dataset.action = "information-managed-remove-preview";
+        review.disabled = !record.attachment;
+        const description = record.attachment
+          ? `Review the exact retained removal ${record.preview.preview_id}`
+          : "Fresh removal consent is unavailable without retained Attachment qualification evidence.";
+        setInformationRemovalControl(review, "review", "Review", description);
+        const results = document.createElement("div");
+        results.className = "information-managed-results";
+        results.setAttribute("aria-live", "polite");
+        article.append(title, review, results);
+        removals.append(article);
+      });
+    }
     return records;
+  };
+
+  const setInformationRemovalControl = (button, kind, label, description) => {
+    const icon = document.getElementById("information-managed-icons")?.content
+      ?.querySelector(`[data-information-icon="${kind}"] svg`)?.cloneNode(true);
+    button.replaceChildren(...(icon ? [icon] : []), document.createTextNode(label));
+    button.title = description;
+    button.setAttribute("aria-label", description);
   };
 
   const slugHandle = (value) => String(value || "")
@@ -3085,9 +3114,11 @@
     },
     "information-managed-remove-preview": async (button) => {
       const article = button.closest(".information-managed-item");
-      const preview = await invoke("mom_llama_information_managed_removal_preview", {
-        materializationId: article?.dataset.materialization || "",
-      });
+      const selection = article?.dataset.retainedOperation
+        ? { kind: "retained", operation_id: article.dataset.retainedOperation }
+        : { kind: "active", materialization_id: article?.dataset.materialization || "" };
+      const confirmation = await invoke("mom_llama_information_managed_removal_preview", { selection });
+      const preview = confirmation.preview;
       const output = article.querySelector(".information-managed-results");
       output.replaceChildren();
       const impact = document.createElement("p");
@@ -3099,13 +3130,13 @@
       commit.type = "button";
       commit.className = "primary-button danger-button";
       commit.dataset.action = "information-managed-remove-commit";
-      commit.dataset.preview = JSON.stringify(preview);
-      commit.textContent = "Remove exact managed representation";
+      commit.dataset.confirmation = JSON.stringify(confirmation);
+      setInformationRemovalControl(commit, "commit", "Remove", "Confirm this exact removal; original source bytes are preserved.");
       output.append(impact, commit);
     },
     "information-managed-remove-commit": async (button) => {
       const result = await invoke("mom_llama_information_managed_removal_commit", {
-        preview: JSON.parse(button.dataset.preview || "{}"),
+        confirmation: JSON.parse(button.dataset.confirmation || "{}"),
       });
       if (result.external_source_bytes_removed) {
         throw new Error("Information reported an invalid external-source removal.");

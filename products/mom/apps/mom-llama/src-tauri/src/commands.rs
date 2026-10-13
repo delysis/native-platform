@@ -15,7 +15,8 @@ use tauri::{Emitter, State, Window};
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
 use crate::command_registry::command_spec;
 use crate::information::{
-    AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalPreview,
+    AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
+    ManagedRemovalSelection,
 };
 
 #[tauri::command]
@@ -273,6 +274,14 @@ pub fn mom_llama_information_managed_attachments(
 }
 
 #[tauri::command]
+pub fn mom_llama_information_managed_removals(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_managed_removals"))?;
+    to_value(runtime.information().managed_removals()?).map_err(to_error)
+}
+
+#[tauri::command]
 pub async fn mom_llama_information_search_managed_attachment(
     runtime: State<'_, AppRuntimeHandle>,
     materialization_id: String,
@@ -301,14 +310,14 @@ pub async fn mom_llama_information_open_managed_citation(
 #[tauri::command]
 pub async fn mom_llama_information_managed_removal_preview(
     runtime: State<'_, AppRuntimeHandle>,
-    materialization_id: String,
+    selection: ManagedRemovalSelection,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec(
         "mom_llama_information_managed_removal_preview",
     ))?;
     let information = runtime.information();
     blocking_value(lease, move || {
-        information.preview_managed_removal(&materialization_id)
+        information.preview_managed_removal(selection)
     })
     .await
 }
@@ -316,11 +325,14 @@ pub async fn mom_llama_information_managed_removal_preview(
 #[tauri::command]
 pub async fn mom_llama_information_managed_removal_commit(
     runtime: State<'_, AppRuntimeHandle>,
-    preview: ManagedRemovalPreview,
+    confirmation: ManagedRemovalConfirmation,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_information_managed_removal_commit"))?;
     let information = runtime.information();
-    blocking_value(lease, move || information.commit_managed_removal(&preview)).await
+    blocking_value(lease, move || {
+        information.commit_managed_removal(&confirmation)
+    })
+    .await
 }
 
 #[tauri::command]

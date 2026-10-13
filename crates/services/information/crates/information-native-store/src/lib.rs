@@ -14,7 +14,8 @@
 
 mod managed_documents;
 pub use managed_documents::{
-    ActiveManagedDocument, ActiveManagedMaterialization, ActiveManagedReceipt, ActiveManagedSegment,
+    ActiveManagedDocument, ActiveManagedMaterialization, ActiveManagedReceipt,
+    ActiveManagedSegment, ManagedRemovalProjection, ManagedRemovalSourceEvidence,
 };
 
 use chrono::{DateTime, Utc};
@@ -143,6 +144,8 @@ pub enum StoreError {
     InstallationNotFound(InstallationId),
     #[error("managed document materialization was not found: {0}")]
     ManagedDocumentsNotFound(ManagedMaterializationId),
+    #[error("retained managed document removal was not found: {0}")]
+    ManagedDocumentsRemovalNotFound(information_native_types::ManagedRemovalId),
     #[error("managed document materialization {0} conflicts with existing immutable content")]
     ManagedDocumentsConflict(ManagedMaterializationId),
     #[error("managed document materialization identity does not match exact confirmation")]

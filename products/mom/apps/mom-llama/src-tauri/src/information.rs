@@ -9,7 +9,8 @@ use information_native_backend_sqlite::{AlexandriaBackend, AlexandriaBackendConf
 use information_native_host::{HostError, InformationHost};
 use information_native_retrieval::{BackendReadResult, ReadRequest};
 use information_native_store::{
-    ActiveManagedMaterialization, ExternalRegistrationRequest, StoreError,
+    ActiveManagedMaterialization, ExternalRegistrationRequest, ManagedRemovalSourceEvidence,
+    StoreError,
 };
 use information_native_types::{
     CATALOG_SCHEMA, CatalogTrust, EvidenceHit, EvidenceLocator, ExternalAccessMode,
@@ -77,8 +78,15 @@ struct PendingAttachmentPreview {
 struct PendingRemovalPreview {
     preview: ManagedRemovalPreview,
     request: ManagedDocumentsRemovalRequest,
+    origin: RemovalPreviewOrigin,
     accepted: bool,
     expires_at_unix_ms: u64,
+}
+
+#[derive(Clone)]
+enum RemovalPreviewOrigin {
+    Active,
+    Retained { evidence_sha256: String },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -219,6 +227,28 @@ pub struct ManagedRemovalPreview {
     pub observed_managed_bytes: u64,
     pub external_source_bytes_removed: bool,
     pub impact_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedRemovalSelection {
+    Active { materialization_id: String },
+    Retained { operation_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRemovalConfirmation {
+    pub preview: ManagedRemovalPreview,
+    pub confirmation_nonce: String,
+}
+
+/// An operation identity is discoverability, never a renewed permission.
+/// Missing qualification is visible only as blocked diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedRemovalRecord {
+    pub preview: ManagedRemovalPreview,
+    pub attachment: Option<ManagedAttachmentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -733,31 +763,37 @@ impl MomInformation {
 
     pub fn preview_managed_removal(
         &self,
-        materialization_id: &str,
-    ) -> Result<ManagedRemovalPreview, String> {
-        let record = self.managed_record(materialization_id)?;
-        let id =
-            ManagedMaterializationId::parse(record.materialization_id).map_err(display_error)?;
-        let plan = self
-            .host
-            .plan_managed_documents_removal(&id)
-            .map_err(display_error)?;
-        let mut preview = ManagedRemovalPreview {
-            preview_id: ManagedRemovalId::new().to_string(),
-            activation_id: plan.activation_id.clone(),
-            activated_at: plan.activated_at,
-            manifest_sha256: plan.manifest_sha256.clone(),
-            materialization_id: plan.materialization_id.to_string(),
-            content_sha256: plan.content_sha256.clone(),
-            database_sha256: plan.database_sha256.clone(),
-            observed_managed_bytes: plan.observed_managed_bytes,
-            external_source_bytes_removed: plan.external_source_bytes_removed,
-            impact_sha256: String::new(),
+        selection: ManagedRemovalSelection,
+    ) -> Result<ManagedRemovalConfirmation, String> {
+        let (request, origin, accepted) = match selection {
+            ManagedRemovalSelection::Active { materialization_id } => {
+                let record = self.managed_record(&materialization_id)?;
+                let id = ManagedMaterializationId::parse(record.materialization_id)
+                    .map_err(display_error)?;
+                let plan = self
+                    .host
+                    .plan_managed_documents_removal(&id)
+                    .map_err(display_error)?;
+                (
+                    plan.confirmed_request(ManagedRemovalId::new()),
+                    RemovalPreviewOrigin::Active,
+                    false,
+                )
+            }
+            ManagedRemovalSelection::Retained { operation_id } => {
+                let id = ManagedRemovalId::parse(operation_id).map_err(display_error)?;
+                let (request, evidence_sha256) = self.qualified_retained_removal(&id)?;
+                (
+                    request,
+                    RemovalPreviewOrigin::Retained { evidence_sha256 },
+                    true,
+                )
+            }
         };
-        preview.impact_sha256 = removal_sha256(&preview)?;
-        let request = plan.confirmed_request(
-            ManagedRemovalId::parse(preview.preview_id.clone()).map_err(display_error)?,
-        );
+        let preview = removal_preview_from_request(&request)?;
+        // This fresh key is deliberately separate from the original operation
+        // identity and impact hash. A cached old confirmation never revives.
+        let confirmation_nonce = InstallationId::new().to_string();
         let now = now_unix_ms();
         let mut grants = self
             .grants
@@ -768,21 +804,73 @@ impl MomInformation {
             return Err("Too many managed removal previews are pending.".to_string());
         }
         grants.removals.insert(
-            preview.preview_id.clone(),
+            confirmation_nonce.clone(),
             PendingRemovalPreview {
                 preview: preview.clone(),
                 request,
-                accepted: false,
+                origin,
+                accepted,
                 expires_at_unix_ms: now.saturating_add(PREVIEW_TTL_MS),
             },
         );
-        Ok(preview)
+        Ok(ManagedRemovalConfirmation {
+            preview,
+            confirmation_nonce,
+        })
+    }
+
+    pub fn managed_removals(&self) -> Result<Vec<ManagedRemovalRecord>, String> {
+        self.host
+            .list_retained_managed_removals(MAX_ACTIVE_MANAGED_PROJECTION)
+            .map_err(display_error)?
+            .into_iter()
+            // A prefix only limits diagnostics; it never qualifies a removal.
+            .filter(|record| {
+                record
+                    .request
+                    .materialization_id
+                    .as_str()
+                    .starts_with("attachment-text:")
+            })
+            .map(|record| {
+                let attachment = match record.source_evidence {
+                    ManagedRemovalSourceEvidence::Retained(source) => {
+                        project_attachment_materialization(*source)?
+                    }
+                    ManagedRemovalSourceEvidence::Unavailable => None,
+                };
+                Ok(ManagedRemovalRecord {
+                    preview: removal_preview_from_request(&record.request)?,
+                    attachment,
+                })
+            })
+            .collect()
+    }
+
+    fn qualified_retained_removal(
+        &self,
+        operation_id: &ManagedRemovalId,
+    ) -> Result<(ManagedDocumentsRemovalRequest, String), String> {
+        let record = self
+            .host
+            .retained_managed_removal(operation_id)
+            .map_err(display_error)?;
+        let ManagedRemovalSourceEvidence::Retained(source) = &record.source_evidence else {
+            return Err("Retained qualification evidence is unavailable; fresh removal consent cannot be issued.".to_string());
+        };
+        project_attachment_materialization((**source).clone())?.ok_or_else(|| {
+            "The retained managed representation is not an Attachment library item.".to_string()
+        })?;
+        let evidence_sha256 =
+            sha256(&serde_json::to_vec(&record.source_evidence).map_err(display_error)?);
+        Ok((record.request, evidence_sha256))
     }
 
     pub fn commit_managed_removal(
         &self,
-        preview: &ManagedRemovalPreview,
+        confirmation: &ManagedRemovalConfirmation,
     ) -> Result<ManagedRemovalOutput, String> {
+        let preview = &confirmation.preview;
         if preview.external_source_bytes_removed
             || removal_sha256(preview)? != preview.impact_sha256
         {
@@ -800,7 +888,7 @@ impl MomInformation {
         grants.prune(now);
         let capability = grants
             .removals
-            .get_mut(&preview.preview_id)
+            .get_mut(&confirmation.confirmation_nonce)
             .ok_or_else(|| {
                 "No live server-side preview authorizes this managed removal.".to_string()
             })?;
@@ -811,10 +899,16 @@ impl MomInformation {
         }
         let id = ManagedMaterializationId::parse(preview.materialization_id.clone())
             .map_err(display_error)?;
-        // Fresh consent is checked against the active Attachment producer.
-        // An accepted continuation uses the exact stored request; deliberately
-        // hidden bytes are not required to become discoverable again.
-        if !capability.accepted {
+        // Fresh retained consent requalifies durable evidence. An already
+        // qualified Active-origin live retry preserves its current authority
+        // even when the intent could not retain a wide recovery projection.
+        if let RemovalPreviewOrigin::Retained { evidence_sha256 } = &capability.origin {
+            let (request, observed) =
+                self.qualified_retained_removal(&capability.request.operation_id)?;
+            if request != capability.request || observed != *evidence_sha256 {
+                return Err("The retained removal evidence changed after preview.".to_string());
+            }
+        } else if !capability.accepted {
             let active = self
                 .host
                 .active_managed_document(&id)
@@ -1319,6 +1413,25 @@ fn removal_sha256(preview: &ManagedRemovalPreview) -> Result<String, String> {
         .map_err(display_error)
 }
 
+fn removal_preview_from_request(
+    request: &ManagedDocumentsRemovalRequest,
+) -> Result<ManagedRemovalPreview, String> {
+    let mut preview = ManagedRemovalPreview {
+        preview_id: request.operation_id.to_string(),
+        activation_id: request.activation_id.clone(),
+        activated_at: request.activated_at,
+        manifest_sha256: request.manifest_sha256.clone(),
+        materialization_id: request.materialization_id.to_string(),
+        content_sha256: request.content_sha256.clone(),
+        database_sha256: request.database_sha256.clone(),
+        observed_managed_bytes: request.observed_managed_bytes,
+        external_source_bytes_removed: false,
+        impact_sha256: String::new(),
+    };
+    preview.impact_sha256 = removal_sha256(&preview)?;
+    Ok(preview)
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1781,6 +1894,18 @@ mod tests {
         information: &MomInformation,
         source_bytes: &[u8],
     ) -> information_native_types::ManagedDocumentsV1 {
+        let documents = removal_fixture_documents(source_bytes);
+        information
+            .host
+            .materialize_documents(&documents)
+            .expect("public materialization");
+        documents
+    }
+
+    #[cfg(unix)]
+    fn removal_fixture_documents(
+        source_bytes: &[u8],
+    ) -> information_native_types::ManagedDocumentsV1 {
         use information_native_types::{
             ArtifactId, MANAGED_DOCUMENTS_SCHEMA, ManagedDocument, ManagedDocumentId,
             ManagedDocumentLineage, ManagedDocumentsV1, ManagedSegmentId, ManagedSourceArtifact,
@@ -1874,10 +1999,6 @@ mod tests {
             content_sha256: String::new(),
         };
         documents.refresh_content_sha256().expect("content hash");
-        information
-            .host
-            .materialize_documents(&documents)
-            .expect("public materialization");
         documents
     }
 
@@ -1892,7 +2013,9 @@ mod tests {
         let information = MomInformation::open(&data_dir).expect("Information owner");
         let documents = materialize_removal_fixture(&information, source_bytes);
         let preview = information
-            .preview_managed_removal(documents.materialization_id.as_str())
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
             .expect("actual public removal preview");
         assert_eq!(information.managed_attachments().expect("before").len(), 1);
         REMOVAL_DELIVERY_FAULT.with(|fault| fault.set(true));
@@ -1909,7 +2032,10 @@ mod tests {
         let output = information
             .commit_managed_removal(&preview)
             .expect("same authorized retry");
-        assert_eq!(output.removed_managed_bytes, preview.observed_managed_bytes);
+        assert_eq!(
+            output.removed_managed_bytes,
+            preview.preview.observed_managed_bytes
+        );
         assert!(!output.external_source_bytes_removed);
         assert!(!output.already_absent);
         assert_eq!(
@@ -1943,9 +2069,11 @@ mod tests {
                 .contains("No live server-side preview")
         );
         let fresh = reopened
-            .preview_managed_removal(documents.materialization_id.as_str())
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
             .expect("fresh explicit preview");
-        assert_ne!(fresh.activation_id, preview.activation_id);
+        assert_ne!(fresh.preview.activation_id, preview.preview.activation_id);
         reopened
             .commit_managed_removal(&fresh)
             .expect("fresh consent removes replacement");
@@ -1963,11 +2091,14 @@ mod tests {
             MomInformation::open(&temporary.path().join("mom")).expect("Information owner");
         let documents = materialize_removal_fixture(&information, b"bounded private source text");
         let preview = information
-            .preview_managed_removal(documents.materialization_id.as_str())
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
             .expect("public preview");
         let mut forged = preview.clone();
-        forged.preview_id = ManagedRemovalId::new().to_string();
-        forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
+        forged.confirmation_nonce = InstallationId::new().to_string();
+        forged.preview.preview_id = ManagedRemovalId::new().to_string();
+        forged.preview.impact_sha256 = removal_sha256(&forged.preview).expect("forged hash");
         assert!(
             information
                 .commit_managed_removal(&forged)
@@ -1975,8 +2106,8 @@ mod tests {
                 .contains("No live server-side preview")
         );
         forged = preview.clone();
-        forged.materialization_id = "attachment-text:other".to_string();
-        forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
+        forged.preview.materialization_id = "attachment-text:other".to_string();
+        forged.preview.impact_sha256 = removal_sha256(&forged.preview).expect("forged hash");
         assert!(
             information
                 .commit_managed_removal(&forged)
@@ -1984,15 +2115,15 @@ mod tests {
                 .contains("does not match")
         );
         forged = preview.clone();
-        forged.activation_id = ManagedActivationId::new();
-        forged.impact_sha256 = removal_sha256(&forged).expect("forged hash");
+        forged.preview.activation_id = ManagedActivationId::new();
+        forged.preview.impact_sha256 = removal_sha256(&forged.preview).expect("forged hash");
         assert!(information.commit_managed_removal(&forged).is_err());
         information
             .grants
             .lock()
             .expect("grants")
             .removals
-            .get_mut(&preview.preview_id)
+            .get_mut(&preview.confirmation_nonce)
             .expect("pending preview")
             .expires_at_unix_ms = 0;
         assert!(
@@ -2009,11 +2140,656 @@ mod tests {
             1
         );
         let fresh = information
-            .preview_managed_removal(documents.materialization_id.as_str())
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
             .expect("fresh preview");
         information
             .commit_managed_removal(&fresh)
             .expect("authorized neighboring control");
         assert!(information.managed_attachments().expect("after").is_empty());
+    }
+
+    // These controls contain only values returned by the actual public Mom
+    // surface. Version-specific adapters below never create consent or receipts.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct RemovalRecoveryControl {
+        preview: ManagedRemovalPreview,
+        wire: serde_json::Value,
+        server_key: String,
+    }
+
+    #[cfg(unix)]
+    fn removal_product_fixture_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt;
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, (u32, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).expect("owned fixture metadata");
+            let bytes = if metadata.file_type().is_symlink() {
+                std::fs::read_link(path)
+                    .expect("owned fixture link")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else if metadata.is_file() {
+                std::fs::read(path).expect("owned fixture file")
+            } else {
+                Vec::new()
+            };
+            entries.insert(
+                path.strip_prefix(root)
+                    .expect("owned fixture path")
+                    .to_path_buf(),
+                (metadata.permissions().mode(), bytes),
+            );
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).expect("owned fixture directory") {
+                    visit(root, &entry.expect("owned fixture entry").path(), entries);
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restart_requires_fresh_explicit_consent_for_one_retained_removal() {
+        let temporary = tempfile::tempdir().expect("temporary product data");
+        let source = temporary.path().join("original-source.txt");
+        let source_bytes = b"original source survives product restart";
+        std::fs::write(&source, source_bytes).expect("source fixture");
+        let data_dir = temporary.path().join("mom");
+        let information = MomInformation::open(&data_dir).expect("Information owner");
+        let documents = materialize_removal_fixture(&information, source_bytes);
+        let original =
+            removal_recovery_active_preview(&information, documents.materialization_id.as_str())
+                .expect("actual active preview");
+        let request = information
+            .grants
+            .lock()
+            .expect("grants")
+            .removals
+            .get(&original.server_key)
+            .expect("actual admitted request")
+            .request
+            .clone();
+        REMOVAL_DELIVERY_FAULT.with(|fault| fault.set(true));
+        assert!(
+            removal_recovery_commit(&information, &original)
+                .expect_err("actual lost response")
+                .contains("lost managed removal response")
+        );
+        assert!(
+            information
+                .managed_attachments()
+                .expect("active discovery")
+                .is_empty()
+        );
+        let before = removal_product_fixture_snapshot(&data_dir);
+        drop(information);
+        let reopened = MomInformation::open(&data_dir).expect("reopened actual product owner");
+        assert!(
+            reopened.grants.lock().expect("grants").removals.is_empty(),
+            "startup must not restore destructive grants"
+        );
+        assert!(
+            removal_recovery_commit(&reopened, &original)
+                .expect_err("old nonce")
+                .contains("No live server-side preview")
+        );
+        let discovery = removal_recovery_discovery(&reopened).expect("actual bounded discovery");
+        let fresh = removal_recovery_retained_preview(&reopened, &original)
+            .expect("fresh explicit retained-operation preview");
+        assert!(discovery.contains(&(
+            Some(request.operation_id.to_string()),
+            documents.materialization_id.to_string()
+        )));
+        assert_eq!(
+            fresh.preview, original.preview,
+            "original operation, generation, impact and accounting stay immutable"
+        );
+        assert_ne!(
+            fresh.server_key, original.server_key,
+            "a new live nonce is required"
+        );
+        assert_ne!(
+            fresh.server_key, fresh.preview.preview_id,
+            "fresh nonce is separate from the original operation"
+        );
+        assert!(
+            removal_recovery_commit(&reopened, &original).is_err(),
+            "new consent cannot revive an old wire confirmation"
+        );
+        assert_eq!(
+            reopened
+                .grants
+                .lock()
+                .expect("grants")
+                .removals
+                .get(&fresh.server_key)
+                .expect("fresh live grant")
+                .request,
+            request
+        );
+        assert_eq!(
+            removal_product_fixture_snapshot(&data_dir),
+            before,
+            "discovery and preview never settle or sanitize the journal"
+        );
+        let output = removal_recovery_commit(&reopened, &fresh).expect("fresh explicit commit");
+        assert_eq!(
+            output.removed_managed_bytes,
+            original.preview.observed_managed_bytes
+        );
+        assert!(!output.external_source_bytes_removed);
+        assert!(!output.already_absent);
+        assert_eq!(
+            removal_recovery_commit(&reopened, &fresh).expect("same live replay"),
+            output
+        );
+        assert_eq!(
+            removal_product_fixture_snapshot(&data_dir),
+            before,
+            "already-published terminal identity/time/bytes stay unchanged"
+        );
+        assert_eq!(
+            std::fs::read(source).expect("original source"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn expiry_requires_fresh_explicit_consent_for_one_retained_removal() {
+        let temporary = tempfile::tempdir().expect("temporary product data");
+        let source = temporary.path().join("original-source.txt");
+        let source_bytes = b"original source survives consent expiry";
+        std::fs::write(&source, source_bytes).expect("source fixture");
+        let data_dir = temporary.path().join("mom");
+        let information = MomInformation::open(&data_dir).expect("Information owner");
+        let documents = materialize_removal_fixture(&information, source_bytes);
+        let original =
+            removal_recovery_active_preview(&information, documents.materialization_id.as_str())
+                .expect("actual active preview");
+        let request = information
+            .grants
+            .lock()
+            .expect("grants")
+            .removals
+            .get(&original.server_key)
+            .expect("actual admitted request")
+            .request
+            .clone();
+        REMOVAL_DELIVERY_FAULT.with(|fault| fault.set(true));
+        assert!(
+            removal_recovery_commit(&information, &original)
+                .expect_err("actual lost response")
+                .contains("lost managed removal response")
+        );
+        assert!(
+            information
+                .managed_attachments()
+                .expect("active discovery")
+                .is_empty()
+        );
+        information
+            .grants
+            .lock()
+            .expect("grants")
+            .removals
+            .get_mut(&original.server_key)
+            .expect("live preview")
+            .expires_at_unix_ms = 0;
+        let before = removal_product_fixture_snapshot(&data_dir);
+        assert!(
+            removal_recovery_commit(&information, &original)
+                .expect_err("expired nonce")
+                .contains("No live server-side preview")
+        );
+        assert!(
+            information
+                .grants
+                .lock()
+                .expect("grants")
+                .removals
+                .is_empty()
+        );
+        let discovery = removal_recovery_discovery(&information).expect("actual bounded discovery");
+        let fresh = removal_recovery_retained_preview(&information, &original)
+            .expect("fresh explicit retained-operation preview");
+        assert!(discovery.contains(&(
+            Some(request.operation_id.to_string()),
+            documents.materialization_id.to_string()
+        )));
+        assert_eq!(fresh.preview, original.preview);
+        assert_ne!(fresh.server_key, original.server_key);
+        assert_ne!(fresh.server_key, fresh.preview.preview_id);
+        assert!(
+            removal_recovery_commit(&information, &original).is_err(),
+            "fresh preview cannot revive the expired nonce"
+        );
+        assert_eq!(
+            information
+                .grants
+                .lock()
+                .expect("grants")
+                .removals
+                .get(&fresh.server_key)
+                .expect("fresh live grant")
+                .request,
+            request
+        );
+        assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        let output = removal_recovery_commit(&information, &fresh).expect("fresh explicit commit");
+        assert_eq!(
+            output.removed_managed_bytes,
+            original.preview.observed_managed_bytes
+        );
+        assert!(!output.external_source_bytes_removed);
+        assert_eq!(
+            removal_recovery_commit(&information, &fresh).expect("same live replay"),
+            output
+        );
+        assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        assert_eq!(
+            std::fs::read(source).expect("original source"),
+            source_bytes
+        );
+    }
+
+    // After adapters preserve the actual mandatory nonce envelope and select the
+    // exact operation returned by the original public preview.
+    #[cfg(unix)]
+    fn removal_recovery_active_preview(
+        information: &MomInformation,
+        materialization_id: &str,
+    ) -> Result<RemovalRecoveryControl, String> {
+        let confirmation =
+            information.preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: materialization_id.to_string(),
+            })?;
+        Ok(RemovalRecoveryControl {
+            server_key: confirmation.confirmation_nonce.clone(),
+            wire: serde_json::to_value(&confirmation).expect("actual public confirmation wire"),
+            preview: confirmation.preview,
+        })
+    }
+
+    #[cfg(unix)]
+    fn removal_recovery_retained_preview(
+        information: &MomInformation,
+        original: &RemovalRecoveryControl,
+    ) -> Result<RemovalRecoveryControl, String> {
+        let confirmation =
+            information.preview_managed_removal(ManagedRemovalSelection::Retained {
+                operation_id: original.preview.preview_id.clone(),
+            })?;
+        Ok(RemovalRecoveryControl {
+            server_key: confirmation.confirmation_nonce.clone(),
+            wire: serde_json::to_value(&confirmation).expect("actual public confirmation wire"),
+            preview: confirmation.preview,
+        })
+    }
+
+    #[cfg(unix)]
+    fn removal_recovery_commit(
+        information: &MomInformation,
+        control: &RemovalRecoveryControl,
+    ) -> Result<ManagedRemovalOutput, String> {
+        let confirmation: ManagedRemovalConfirmation =
+            serde_json::from_value(control.wire.clone()).expect("actual nonce confirmation wire");
+        information.commit_managed_removal(&confirmation)
+    }
+
+    #[cfg(unix)]
+    fn removal_recovery_discovery(
+        information: &MomInformation,
+    ) -> Result<Vec<(Option<String>, String)>, String> {
+        Ok(information
+            .managed_removals()?
+            .into_iter()
+            .filter(|record| record.attachment.is_some())
+            .map(|record| {
+                (
+                    Some(record.preview.preview_id),
+                    record.preview.materialization_id,
+                )
+            })
+            .collect())
+    }
+
+    #[cfg(unix)]
+    fn removal_fixture_intent(data_dir: &Path) -> PathBuf {
+        let intents = removal_product_fixture_snapshot(data_dir)
+            .into_keys()
+            .filter(|path| path.file_name().is_some_and(|name| name == "intent.json"))
+            .collect::<Vec<_>>();
+        assert_eq!(intents.len(), 1, "one actual public fixture operation");
+        data_dir.join(&intents[0])
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_consent_refuses_unrelated_operations_wrong_preview_and_new_generation() {
+        let temporary = tempfile::tempdir().expect("temporary product data");
+        let source = temporary.path().join("original-source.txt");
+        let source_bytes = b"original source survives authority refusals";
+        std::fs::write(&source, source_bytes).expect("source fixture");
+        let data_dir = temporary.path().join("mom");
+        let information = MomInformation::open(&data_dir).expect("Information owner");
+        let documents = materialize_removal_fixture(&information, source_bytes);
+        let original = information
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
+            .expect("public active preview");
+        information
+            .commit_managed_removal(&original)
+            .expect("actual terminal removal");
+        let before = removal_product_fixture_snapshot(&data_dir);
+        assert!(
+            information
+                .preview_managed_removal(ManagedRemovalSelection::Retained {
+                    operation_id: ManagedRemovalId::new().to_string()
+                })
+                .is_err()
+        );
+        assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        let fresh = information
+            .preview_managed_removal(ManagedRemovalSelection::Retained {
+                operation_id: original.preview.preview_id.clone(),
+            })
+            .expect("exact fresh consent");
+        assert_eq!(fresh.preview, original.preview);
+        for changed in 0..3 {
+            let mut forged = fresh.clone();
+            match changed {
+                0 => forged.confirmation_nonce = InstallationId::new().to_string(),
+                1 => forged.preview.preview_id = ManagedRemovalId::new().to_string(),
+                _ => forged.preview.activation_id = ManagedActivationId::new(),
+            }
+            forged.preview.impact_sha256 =
+                removal_sha256(&forged.preview).expect("self-consistent submitted hash");
+            assert!(information.commit_managed_removal(&forged).is_err());
+            assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        }
+        let flat = serde_json::to_value(&fresh.preview).expect("old flat wire");
+        assert!(
+            serde_json::from_value::<ManagedRemovalConfirmation>(flat).is_err(),
+            "flat old input cannot imply fresh nonce authority"
+        );
+        let mut missing = serde_json::to_value(&fresh).expect("current envelope");
+        missing
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("confirmation_nonce");
+        assert!(serde_json::from_value::<ManagedRemovalConfirmation>(missing).is_err());
+        for selection in [
+            serde_json::json!({"kind":"retained","materialization_id":documents.materialization_id.to_string()}),
+            serde_json::json!({"kind":"retained","operation_id":original.preview.preview_id,"materialization_id":documents.materialization_id.to_string()}),
+            serde_json::json!({"kind":"active","operation_id":ManagedRemovalId::new().to_string()}),
+        ] {
+            assert!(serde_json::from_value::<ManagedRemovalSelection>(selection).is_err());
+        }
+        information
+            .host
+            .materialize_documents(&documents)
+            .expect("new actual generation");
+        let replacement = information
+            .host
+            .active_managed_document(&documents.materialization_id)
+            .expect("current activation");
+        assert_ne!(replacement.activation_id, original.preview.activation_id);
+        let before = removal_product_fixture_snapshot(&data_dir);
+        assert!(
+            information.commit_managed_removal(&fresh).is_err(),
+            "retained nonce cannot replay into a new activation"
+        );
+        assert!(
+            information
+                .preview_managed_removal(ManagedRemovalSelection::Retained {
+                    operation_id: fresh.preview.preview_id.clone()
+                })
+                .is_err()
+        );
+        assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        let current = information
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
+            .expect("ordinary current active preview still works");
+        information
+            .commit_managed_removal(&current)
+            .expect("fresh explicit current generation consent");
+        assert_eq!(
+            std::fs::read(source).expect("original source"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_consent_requalifies_producer_rights_and_post_preview_fingerprint() {
+        for changed in 0..3 {
+            let temporary = tempfile::tempdir().expect("temporary product data");
+            let source = temporary.path().join("original-source.txt");
+            let source_bytes = b"original source survives retained evidence refusals";
+            std::fs::write(&source, source_bytes).expect("source fixture");
+            let data_dir = temporary.path().join("mom");
+            let information = MomInformation::open(&data_dir).expect("Information owner");
+            let documents = materialize_removal_fixture(&information, source_bytes);
+            let original = information
+                .preview_managed_removal(ManagedRemovalSelection::Active {
+                    materialization_id: documents.materialization_id.to_string(),
+                })
+                .expect("public active preview");
+            information
+                .commit_managed_removal(&original)
+                .expect("actual terminal removal");
+            let intent = removal_fixture_intent(&data_dir);
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&intent).expect("native intent bytes"))
+                    .expect("native intent");
+            let fresh = if changed == 2 {
+                Some(
+                    information
+                        .preview_managed_removal(ManagedRemovalSelection::Retained {
+                            operation_id: original.preview.preview_id.clone(),
+                        })
+                        .expect("untampered fresh explicit preview"),
+                )
+            } else {
+                None
+            };
+            let projection = &mut journal["source_evidence"]["projection"];
+            match changed {
+                0 => {
+                    projection["provenance"]["publisher"] = "other producer".into();
+                    projection["provenance"]["transformation"] = serde_json::Value::Null;
+                }
+                1 => {
+                    projection["documents"][0]["rights"][0]["redistribution"] =
+                        serde_json::to_value(RedistributionPolicy::Unknown).expect("rights enum")
+                }
+                _ => projection["documents"][0]["title"] = "changed after preview".into(),
+            }
+            // The original manifest is already gone. This intentionally probes
+            // private journal trust and Mom qualification, not crypto origin.
+            std::fs::write(
+                &intent,
+                serde_json::to_vec_pretty(&journal).expect("changed owned evidence"),
+            )
+            .expect("owned evidence mutation");
+            let before = removal_product_fixture_snapshot(&data_dir);
+            if let Some(fresh) = fresh {
+                assert!(
+                    information
+                        .commit_managed_removal(&fresh)
+                        .expect_err("post-preview mutation")
+                        .contains("changed after preview")
+                );
+            } else {
+                let grant_count = information.grants.lock().expect("grants").removals.len();
+                assert!(
+                    information
+                        .preview_managed_removal(ManagedRemovalSelection::Retained {
+                            operation_id: original.preview.preview_id.clone()
+                        })
+                        .is_err()
+                );
+                assert_eq!(
+                    information.grants.lock().expect("grants").removals.len(),
+                    grant_count,
+                    "refusal never creates a grant"
+                );
+                if changed == 0 {
+                    let records = information
+                        .managed_removals()
+                        .expect("generic prefixed evidence is diagnostic only");
+                    assert_eq!(records.len(), 1);
+                    assert!(records[0].attachment.is_none());
+                }
+            }
+            assert_eq!(
+                removal_product_fixture_snapshot(&data_dir),
+                before,
+                "unfamiliar evidence and original receipts are preserved"
+            );
+            assert_eq!(
+                std::fs::read(source).expect("original source"),
+                source_bytes
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wide_qualified_metadata_preserves_live_retry_and_refuses_fresh_retained_consent() {
+        let temporary = tempfile::tempdir().expect("temporary product data");
+        let source = temporary.path().join("original-source.txt");
+        let source_bytes = b"original source survives bounded metadata fallback";
+        std::fs::write(&source, source_bytes).expect("source fixture");
+        let data_dir = temporary.path().join("mom");
+        let information = MomInformation::open(&data_dir).expect("Information owner");
+        let mut documents = removal_fixture_documents(source_bytes);
+        documents.documents[0].rights[0].expression = "x".repeat(70_000);
+        documents
+            .refresh_content_sha256()
+            .expect("current complete content hash");
+        documents
+            .validate_manifest_projection_bytes(MAX_MANAGED_MANIFEST_PROJECTION_BYTES)
+            .expect("inside current source projection admission");
+        information
+            .host
+            .materialize_documents(&documents)
+            .expect("actual public materialization");
+        assert_eq!(
+            information
+                .managed_attachments()
+                .expect("unchanged Mom Attachment predicate")
+                .len(),
+            1
+        );
+        let original = information
+            .preview_managed_removal(ManagedRemovalSelection::Active {
+                materialization_id: documents.materialization_id.to_string(),
+            })
+            .expect("actual qualified active preview");
+        REMOVAL_DELIVERY_FAULT.with(|fault| fault.set(true));
+        assert!(
+            information
+                .commit_managed_removal(&original)
+                .expect_err("actual lost response")
+                .contains("lost managed removal response")
+        );
+        let intent = removal_fixture_intent(&data_dir);
+        let bytes = std::fs::read(&intent).expect("bounded native intent");
+        assert!(bytes.len() <= 64 * 1024);
+        let record = information
+            .host
+            .retained_managed_removal(
+                &ManagedRemovalId::parse(original.preview.preview_id.clone())
+                    .expect("operation id"),
+            )
+            .expect("exact native evidence");
+        assert_eq!(
+            record.source_evidence,
+            ManagedRemovalSourceEvidence::Unavailable
+        );
+        assert_eq!(
+            information
+                .managed_removals()
+                .expect("bounded diagnostics")
+                .len(),
+            1
+        );
+        assert!(
+            information.managed_removals().expect("bounded diagnostics")[0]
+                .attachment
+                .is_none()
+        );
+        let before = removal_product_fixture_snapshot(&data_dir);
+        let output = information
+            .commit_managed_removal(&original)
+            .expect("already qualified Active-origin live retry survives Unavailable");
+        assert_eq!(
+            output.removed_managed_bytes,
+            original.preview.observed_managed_bytes
+        );
+        assert_eq!(
+            information
+                .commit_managed_removal(&original)
+                .expect("same live replay"),
+            output
+        );
+        information
+            .grants
+            .lock()
+            .expect("grants")
+            .removals
+            .get_mut(&original.confirmation_nonce)
+            .expect("live consent")
+            .expires_at_unix_ms = 0;
+        assert!(
+            information
+                .commit_managed_removal(&original)
+                .expect_err("expired consent")
+                .contains("No live server-side preview")
+        );
+        assert!(
+            information
+                .preview_managed_removal(ManagedRemovalSelection::Retained {
+                    operation_id: original.preview.preview_id.clone()
+                })
+                .expect_err("bounded remaining recovery gap")
+                .contains("unavailable")
+        );
+        assert!(
+            information
+                .grants
+                .lock()
+                .expect("grants")
+                .removals
+                .is_empty()
+        );
+        drop(information);
+        let reopened = MomInformation::open(&data_dir).expect("actual reopened product");
+        assert!(
+            reopened
+                .preview_managed_removal(ManagedRemovalSelection::Retained {
+                    operation_id: original.preview.preview_id
+                })
+                .expect_err("restart cannot reconstruct wide qualification")
+                .contains("unavailable")
+        );
+        assert!(reopened.grants.lock().expect("grants").removals.is_empty());
+        assert_eq!(removal_product_fixture_snapshot(&data_dir), before);
+        assert_eq!(std::fs::read(&intent).expect("preserved intent"), bytes);
+        assert_eq!(
+            std::fs::read(source).expect("original source"),
+            source_bytes
+        );
     }
 }

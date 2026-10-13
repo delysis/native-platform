@@ -30,9 +30,9 @@ use information_native_retrieval::{
     ResourceBackend, RetrievalRouter,
 };
 use information_native_store::{
-    ActiveManagedMaterialization, ActiveManagedReceipt, ExternalRegistrationRequest, ManagedStore,
-    PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
-    TransferSummary,
+    ActiveManagedMaterialization, ActiveManagedReceipt, ExternalRegistrationRequest,
+    ManagedRemovalProjection, ManagedStore, PreparedInstall, RegisteredInstallation, RemovalPlan,
+    StoreError, StoreSnapshot, TransferSummary,
 };
 use information_native_types::{
     AcquisitionAttempt, AcquisitionRedirect, AcquisitionTransport, AgentToolDefinition,
@@ -879,6 +879,20 @@ impl InformationHost {
             .project_active_managed_document(materialization_id, max_manifest_bytes)?)
     }
 
+    pub fn list_retained_managed_removals(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<ManagedRemovalProjection>, HostError> {
+        Ok(self.store.list_retained_managed_removals(max_entries)?)
+    }
+
+    pub fn retained_managed_removal(
+        &self,
+        operation_id: &information_native_types::ManagedRemovalId,
+    ) -> Result<ManagedRemovalProjection, HostError> {
+        Ok(self.store.retained_managed_removal(operation_id)?)
+    }
+
     pub fn plan_managed_documents_removal(
         &self,
         materialization_id: &ManagedMaterializationId,
@@ -1248,6 +1262,7 @@ fn store_information_error(error: &StoreError) -> InformationError {
         ),
         StoreError::InstallationNotFound(_)
         | StoreError::StageNotFound(_)
+        | StoreError::ManagedDocumentsRemovalNotFound(_)
         | StoreError::ManagedDocumentsNotFound(_) => {
             (ErrorClass::NotFound, "information_store_not_found", false)
         }

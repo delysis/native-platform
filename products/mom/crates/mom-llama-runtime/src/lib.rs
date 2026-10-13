@@ -21,7 +21,6 @@ pub mod server;
 pub mod skill_store;
 mod store;
 pub mod tool_loop;
-pub mod upstream_status;
 
 pub use attachments::{
     AttachmentImportOutput, AttachmentKind, AttachmentLibraryInput, AttachmentPreviewAnchor,
@@ -100,10 +99,7 @@ pub use personas::{
     persona_remove_from_library_in_scope, persona_update, persona_versions,
 };
 pub use receipts::{Blocker, CommandReceipt, CommandResult, persist_command_receipt};
-pub use server::{
-    ModelSlot, ServerConfig, ServerStatus, model_slot_list, model_slot_load, model_slot_unload,
-    server_configure, server_start, server_status, server_stop,
-};
+pub use server::{ModelSlot, model_slot_list, model_slot_load, model_slot_unload};
 pub use tool_loop::{
     ActiveToolLoop, ToolLoopApproval, ToolLoopCancelOutput, ToolLoopOutput, ToolLoopRunInput,
     ToolLoopState, ToolLoopStep, ToolLoopStreamEvent, ToolPermission, ToolPermissionPolicy,

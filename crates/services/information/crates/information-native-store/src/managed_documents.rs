@@ -7,14 +7,15 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use information_native_types::{
-    EvidenceLocator, MANAGED_DOCUMENTS_RECEIPT_SCHEMA, MANAGED_DOCUMENTS_REMOVAL_SCHEMA,
-    MANAGED_DOCUMENTS_SEARCH_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES, ManagedActivationId,
-    ManagedDocumentId, ManagedDocumentLineage, ManagedDocumentsReceipt,
-    ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest,
-    ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
-    ManagedDocumentsV1, ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId,
-    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RetrievalPurpose,
-    RightsStatement, UsePermission, UsePolicy,
+    ContractError, EvidenceLocator, MANAGED_DOCUMENTS_RECEIPT_SCHEMA,
+    MANAGED_DOCUMENTS_REMOVAL_SCHEMA, MANAGED_DOCUMENTS_SEARCH_SCHEMA,
+    MAX_MANAGED_MANIFEST_PROJECTION_BYTES, ManagedActivationId, ManagedDocumentId,
+    ManagedDocumentLineage, ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan,
+    ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest, ManagedDocumentsSearchHit,
+    ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult, ManagedDocumentsV1,
+    ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId, ManagedSourceArtifact,
+    Provenance, ReleaseId, RepresentationId, ResourceId, RetrievalPurpose, RightsStatement,
+    UsePermission, UsePolicy,
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const MANAGED_DOCUMENTS_DIRECTORY: &str = "managed-documents-v1";
@@ -102,6 +103,32 @@ pub struct ActiveManagedReceipt {
     pub activated_at: DateTime<Utc>,
 }
 
+/// Retained native evidence, never a product consent grant. Wide generic
+/// materializations remain removable without retaining a recovery projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "kind",
+    content = "projection",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ManagedRemovalSourceEvidence {
+    Retained(Box<ActiveManagedMaterialization>),
+    Unavailable,
+}
+
+/// Exact, text-free native operation projection. Products must independently
+/// qualify its evidence and require fresh consent before continuing a removal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRemovalProjection {
+    pub request: ManagedDocumentsRemovalRequest,
+    pub source_evidence: ManagedRemovalSourceEvidence,
+    /// Saved receipt evidence, including a still-pending terminal file. This
+    /// does not assert settled publication, staging cleanup or acknowledgement.
+    pub terminal_receipt: Option<ManagedDocumentsRemovalReceipt>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishBoundary {
     DatabaseSynced,
@@ -137,12 +164,13 @@ fn observe_publish_boundary(_boundary: PublishBoundary) {}
 /// exact request admitted by a caller, never a product permission grant.
 /// Terminal records remain in the private store until explicit owner cleanup;
 /// opening a store does not resume operations or erase their failed evidence.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct RemovalJournal {
     schema: String,
     request: ManagedDocumentsRemovalRequest,
     source_receipt: ManagedDocumentsReceipt,
+    source_evidence: ManagedRemovalSourceEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +300,65 @@ impl ManagedStore {
             ));
         }
         active_projection_without_database(self, &active, max_manifest_bytes)
+    }
+
+    /// Enumerate retained operation identities under an explicit caller cap.
+    /// This never resumes work, repairs permissions or discards terminal history.
+    /// An over-cap history refuses rather than silently choosing a subset.
+    pub fn list_retained_managed_removals(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<ManagedRemovalProjection>, StoreError> {
+        if max_entries == 0 || max_entries > MAX_ACTIVE_PROJECTION_ENTRIES {
+            return Err(StoreError::RegistryCorrupt(format!(
+                "managed removal projection cap must be between 1 and {MAX_ACTIVE_PROJECTION_ENTRIES}"
+            )));
+        }
+        let _lock = self.try_lock()?;
+        if !path_exists(&documents_root(self))? {
+            return Ok(Vec::new());
+        }
+        inspect_removal_layout(self)?;
+        let root = removals_root(self);
+        let mut paths = Vec::with_capacity(max_entries.saturating_add(1));
+        for entry in fs::read_dir(&root)
+            .map_err(|source| StoreError::io("list retained managed removals", &root, source))?
+            .take(max_entries.saturating_add(1))
+        {
+            paths.push(
+                entry
+                    .map_err(|source| StoreError::io("read retained removal entry", &root, source))?
+                    .path(),
+            );
+        }
+        if paths.len() > max_entries {
+            return Err(StoreError::RegistryCorrupt(format!(
+                "retained managed removal count exceeds product projection cap {max_entries}"
+            )));
+        }
+        paths.sort();
+        paths
+            .iter()
+            .map(|path| project_removal_operation(self, path))
+            .collect()
+    }
+
+    /// Inspect one exact operation without changing any journal, stage,
+    /// representation or source bytes. The ordinary administrative store lock
+    /// is still acquired; this lookup never constitutes product permission.
+    pub fn retained_managed_removal(
+        &self,
+        operation_id: &ManagedRemovalId,
+    ) -> Result<ManagedRemovalProjection, StoreError> {
+        let _lock = self.try_lock()?;
+        let operation = removal_operation_path(self, operation_id);
+        if !path_exists(&operation)? {
+            return Err(StoreError::ManagedDocumentsRemovalNotFound(
+                operation_id.clone(),
+            ));
+        }
+        inspect_removal_layout(self)?;
+        project_removal_operation(self, &operation)
     }
 
     /// Materialize one complete `managed.documents.v1` value into a private
@@ -418,13 +505,9 @@ impl ManagedStore {
                     request.materialization_id.clone(),
                 ));
             }
-            let receipt = validate_active_materialization(self, &active)?;
+            let (receipt, manifest) = read_verified_active_materialization(self, &active)?;
             require_exact_removal_source(&active, &receipt, request)?;
-            let journal = RemovalJournal {
-                schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-                request: request.clone(),
-                source_receipt: receipt,
-            };
+            let journal = removal_journal_with_evidence(receipt, manifest, request)?;
             create_private_dir(&operation)?;
             write_new_json(
                 &operation.join(REMOVAL_INTENT_FILE),
@@ -451,10 +534,93 @@ fn active_projection(
     store: &ManagedStore,
     active: &Path,
 ) -> Result<ActiveManagedMaterialization, StoreError> {
-    let receipt = validate_active_materialization(store, active)?;
-    let manifest: ManagedDocumentsV1 =
-        read_json(&active.join(MANIFEST_FILE), "managed documents manifest")?;
+    let (receipt, manifest) = read_verified_active_materialization(store, active)?;
     projection_from_parts(receipt_projection_from_receipt(receipt), manifest)
+}
+
+fn removal_journal_with_evidence(
+    receipt: ManagedDocumentsReceipt,
+    manifest: ManagedDocumentsV1,
+    request: &ManagedDocumentsRemovalRequest,
+) -> Result<RemovalJournal, StoreError> {
+    let mut journal = RemovalJournal {
+        schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+        request: request.clone(),
+        source_receipt: receipt,
+        source_evidence: ManagedRemovalSourceEvidence::Unavailable,
+    };
+    match manifest.validate_manifest_projection_bytes(MAX_MANAGED_MANIFEST_PROJECTION_BYTES) {
+        Ok(()) => {
+            let projection = projection_from_parts(
+                receipt_projection_from_receipt(journal.source_receipt.clone()),
+                manifest,
+            )?;
+            journal.source_evidence = ManagedRemovalSourceEvidence::Retained(Box::new(projection));
+            if !removal_intent_fits(&journal)? {
+                journal.source_evidence = ManagedRemovalSourceEvidence::Unavailable;
+            }
+        }
+        Err(ContractError::LimitExceeded(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // The unavailable envelope contains only the existing bounded identities.
+    // Never publish an intent that the unchanged reader cannot reopen.
+    if !removal_intent_fits(&journal)? {
+        return Err(StoreError::RegistryCorrupt(
+            "managed removal identities exceed the current intent byte limit".to_string(),
+        ));
+    }
+    Ok(journal)
+}
+
+fn removal_intent_fits(journal: &RemovalJournal) -> Result<bool, StoreError> {
+    let mut counter = RemovalIntentByteCounter {
+        written: 0,
+        exceeded: false,
+    };
+    let encoded = serde_json::to_writer_pretty(&mut counter, journal);
+    if counter.exceeded {
+        return Ok(false);
+    }
+    encoded.map_err(|source| StoreError::Json {
+        context: "managed removal intent",
+        source,
+    })?;
+    match counter.write_all(b"\n") {
+        Ok(()) => Ok(true),
+        Err(_) if counter.exceeded => Ok(false),
+        Err(source) => Err(StoreError::io(
+            "count managed removal intent",
+            Path::new(REMOVAL_INTENT_FILE),
+            source,
+        )),
+    }
+}
+
+struct RemovalIntentByteCounter {
+    written: u64,
+    exceeded: bool,
+}
+
+impl Write for RemovalIntentByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| std::io::Error::other("removal intent byte count overflow"))?;
+        let Some(written) = self
+            .written
+            .checked_add(length)
+            .filter(|count| *count <= MAX_RECEIPT_PROJECTION_BYTES)
+        else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("removal intent byte limit exceeded"));
+        };
+        self.written = written;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn projection_from_parts(
@@ -1019,6 +1185,13 @@ fn validate_active_materialization(
     store: &ManagedStore,
     active: &Path,
 ) -> Result<ManagedDocumentsReceipt, StoreError> {
+    read_verified_active_materialization(store, active).map(|(receipt, _)| receipt)
+}
+
+fn read_verified_active_materialization(
+    store: &ManagedStore,
+    active: &Path,
+) -> Result<(ManagedDocumentsReceipt, ManagedDocumentsV1), StoreError> {
     validate_materialization_directory(active, true)?;
     let receipt: ManagedDocumentsReceipt =
         read_json(&active.join(RECEIPT_FILE), "managed documents receipt")?;
@@ -1043,7 +1216,7 @@ fn validate_active_materialization(
             "managed documents database digest disagrees with its receipt".to_string(),
         ));
     }
-    Ok(receipt)
+    Ok((receipt, manifest))
 }
 
 fn validate_materialization_directory(path: &Path, require_all: bool) -> Result<(), StoreError> {
@@ -1114,6 +1287,13 @@ fn read_removal_journal(
     operation: &Path,
 ) -> Result<RemovalJournal, StoreError> {
     validate_removal_operation_directory(operation)?;
+    decode_removal_journal(store, operation)
+}
+
+fn decode_removal_journal(
+    store: &ManagedStore,
+    operation: &Path,
+) -> Result<RemovalJournal, StoreError> {
     let journal: RemovalJournal = read_json_bounded(
         &operation.join(REMOVAL_INTENT_FILE),
         "managed removal intent",
@@ -1137,6 +1317,23 @@ fn read_removal_journal(
     {
         return Err(StoreError::ManagedDocumentsIdentityMismatch);
     }
+    if let ManagedRemovalSourceEvidence::Retained(projection) = &journal.source_evidence {
+        let receipt = &journal.source_receipt;
+        if projection.activation_id != receipt.activation_id
+            || projection.activated_at != receipt.activated_at
+            || projection.materialization_id != receipt.materialization_id
+            || projection.resource_id != receipt.resource_id
+            || projection.release_id != receipt.release_id
+            || projection.representation_id != receipt.representation_id
+            || projection.content_sha256 != receipt.content_sha256
+            || projection.database_sha256 != receipt.database_sha256
+            || projection.document_count != receipt.document_count
+            || projection.segment_count != receipt.segment_count
+            || projection.text_bytes != receipt.text_bytes
+        {
+            return Err(StoreError::ManagedDocumentsIdentityMismatch);
+        }
+    }
     Ok(journal)
 }
 
@@ -1149,33 +1346,186 @@ fn validate_removal_operation_directory(path: &Path) -> Result<(), StoreError> {
         let entry = entry.map_err(|source| {
             StoreError::io("read managed removal operation entry", path, source)
         })?;
-        let name = entry.file_name();
-        if ![
-            REMOVAL_INTENT_FILE,
-            REMOVAL_TERMINAL_FILE,
-            REMOVAL_TERMINAL_PENDING_FILE,
-        ]
-        .iter()
-        .any(|expected| name == *expected)
-            || !entry
-                .file_type()
-                .map_err(|source| {
-                    StoreError::io(
-                        "inspect managed removal operation entry",
-                        &entry.path(),
-                        source,
-                    )
-                })?
-                .is_file()
-        {
-            return Err(StoreError::UnsafePath {
-                path: entry.path(),
-                reason: "unexpected or nonregular managed removal operation entry",
-            });
-        }
+        validate_removal_operation_entry(&entry)?;
         enforce_private_file(&entry.path())?;
     }
     Ok(())
+}
+
+fn validate_removal_operation_entry(entry: &fs::DirEntry) -> Result<(), StoreError> {
+    let name = entry.file_name();
+    if ![
+        REMOVAL_INTENT_FILE,
+        REMOVAL_TERMINAL_FILE,
+        REMOVAL_TERMINAL_PENDING_FILE,
+    ]
+    .iter()
+    .any(|expected| name == *expected)
+        || !entry
+            .file_type()
+            .map_err(|source| {
+                StoreError::io(
+                    "inspect managed removal operation entry",
+                    &entry.path(),
+                    source,
+                )
+            })?
+            .is_file()
+    {
+        return Err(StoreError::UnsafePath {
+            path: entry.path(),
+            reason: "unexpected or nonregular managed removal operation entry",
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RemovalPrivateMode {
+    Directory,
+    File,
+    RepresentationDirectory,
+    RepresentationFile,
+}
+
+#[cfg(unix)]
+fn inspect_private_mode(path: &Path, expected: RemovalPrivateMode) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect retained removal permissions", path, source))?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    let valid = match expected {
+        RemovalPrivateMode::Directory => metadata.is_dir() && mode == 0o700,
+        RemovalPrivateMode::File => metadata.is_file() && mode == 0o600,
+        RemovalPrivateMode::RepresentationDirectory => {
+            metadata.is_dir() && matches!(mode, 0o500 | 0o700)
+        }
+        RemovalPrivateMode::RepresentationFile => {
+            metadata.is_file() && matches!(mode, 0o400 | 0o600)
+        }
+    };
+    if metadata.file_type().is_symlink() || !valid {
+        return Err(StoreError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "retained removal path has unexpected type or private permissions",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn inspect_private_mode(_path: &Path, _expected: RemovalPrivateMode) -> Result<(), StoreError> {
+    Err(StoreError::UnsupportedPlatform)
+}
+
+fn inspect_removal_layout(store: &ManagedStore) -> Result<(), StoreError> {
+    for path in [
+        documents_root(store),
+        active_root(store),
+        staging_root(store),
+        removals_root(store),
+    ] {
+        inspect_private_mode(&path, RemovalPrivateMode::Directory)?;
+    }
+    Ok(())
+}
+
+fn inspect_removal_operation_directory(path: &Path) -> Result<(), StoreError> {
+    inspect_private_mode(path, RemovalPrivateMode::Directory)?;
+    for entry in fs::read_dir(path)
+        .map_err(|source| StoreError::io("read managed removal operation", path, source))?
+    {
+        let entry = entry.map_err(|source| {
+            StoreError::io("read managed removal operation entry", path, source)
+        })?;
+        validate_removal_operation_entry(&entry)?;
+        inspect_private_mode(&entry.path(), RemovalPrivateMode::File)?;
+    }
+    Ok(())
+}
+
+fn project_removal_operation(
+    store: &ManagedStore,
+    operation: &Path,
+) -> Result<ManagedRemovalProjection, StoreError> {
+    inspect_removal_operation_directory(operation)?;
+    let journal = decode_removal_journal(store, operation)?;
+    let request = &journal.request;
+    let active = active_path(store, &request.materialization_id);
+    let removing = removing_path(store, &request.materialization_id);
+    let representation = removing.join(REMOVAL_REPRESENTATION_DIRECTORY);
+    let terminal = operation.join(REMOVAL_TERMINAL_FILE);
+    let pending = operation.join(REMOVAL_TERMINAL_PENDING_FILE);
+    let terminal_exists = path_exists(&terminal)?;
+    let pending_exists = path_exists(&pending)?;
+    if terminal_exists && pending_exists {
+        return Err(StoreError::RegistryCorrupt(
+            "managed removal has both terminal and pending terminal records".to_string(),
+        ));
+    }
+    let terminal_receipt = if terminal_exists || pending_exists {
+        if path_exists(&active)? {
+            return Err(StoreError::ManagedDocumentsConflict(
+                request.materialization_id.clone(),
+            ));
+        }
+        if path_exists(&representation)? {
+            return Err(StoreError::RegistryCorrupt(
+                "terminal removal still has representation bytes".to_string(),
+            ));
+        }
+        if path_exists(&removing)? {
+            inspect_removal_stage(&removing, &request.operation_id, true)?;
+        }
+        Some(read_removal_terminal(
+            if terminal_exists { &terminal } else { &pending },
+            request,
+        )?)
+    } else {
+        let stage_exists = path_exists(&removing)?;
+        let active_exists = path_exists(&active)?;
+        if stage_exists {
+            inspect_removal_stage(&removing, &request.operation_id, false)?;
+            if path_exists(&representation)? {
+                inspect_private_mode(&representation, RemovalPrivateMode::RepresentationDirectory)?;
+                for name in EXPECTED_ACTIVE_FILES {
+                    let path = representation.join(name);
+                    if path_exists(&path)? {
+                        inspect_private_mode(&path, RemovalPrivateMode::RepresentationFile)?;
+                    }
+                }
+                validate_removal_survivors(&representation, &journal)?;
+                validate_surviving_removal_evidence(&representation, &journal)?;
+            }
+        }
+        if active_exists {
+            if path_exists(&representation)? {
+                return Err(StoreError::ManagedDocumentsConflict(
+                    request.materialization_id.clone(),
+                ));
+            }
+            inspect_private_mode(&active, RemovalPrivateMode::RepresentationDirectory)?;
+            for name in EXPECTED_ACTIVE_FILES {
+                inspect_private_mode(&active.join(name), RemovalPrivateMode::RepresentationFile)?;
+            }
+            let (receipt, manifest) = read_verified_active_materialization(store, &active)?;
+            require_exact_removal_source(&active, &receipt, request)?;
+            if receipt != journal.source_receipt {
+                return Err(StoreError::ManagedDocumentsIdentityMismatch);
+            }
+            require_exact_retained_projection(manifest, &journal)?;
+        } else if !stage_exists {
+            return Err(StoreError::ManagedDocumentsNotFound(
+                request.materialization_id.clone(),
+            ));
+        }
+        None
+    };
+    Ok(ManagedRemovalProjection {
+        request: journal.request,
+        source_evidence: journal.source_evidence,
+        terminal_receipt,
+    })
 }
 
 fn require_exact_removal_source(
@@ -1228,11 +1578,12 @@ fn finish_removal_operation(
                     request.materialization_id.clone(),
                 ));
             }
-            let receipt = validate_active_materialization(store, active)?;
+            let (receipt, manifest) = read_verified_active_materialization(store, active)?;
             require_exact_removal_source(active, &receipt, request)?;
             if receipt != journal.source_receipt {
                 return Err(StoreError::ManagedDocumentsIdentityMismatch);
             }
+            require_exact_retained_projection(manifest, journal)?;
             create_private_dir(removing)?;
             write_new_json(
                 &removing.join(REMOVAL_OWNER_FILE),
@@ -1250,11 +1601,12 @@ fn finish_removal_operation(
                     request.materialization_id.clone(),
                 ));
             }
-            let receipt = validate_active_materialization(store, active)?;
+            let (receipt, manifest) = read_verified_active_materialization(store, active)?;
             require_exact_removal_source(active, &receipt, request)?;
             if receipt != journal.source_receipt {
                 return Err(StoreError::ManagedDocumentsIdentityMismatch);
             }
+            require_exact_retained_projection(manifest, journal)?;
             make_materialization_directory_writable(active)?;
             if let Err(source) = fs::rename(active, &representation) {
                 let _ = make_materialization_directory_immutable(active);
@@ -1380,19 +1732,31 @@ fn validate_removal_stage(
     {
         let entry = entry
             .map_err(|source| StoreError::io("read managed removal stage entry", path, source))?;
-        let kind = entry.file_type().map_err(|source| {
-            StoreError::io("inspect managed removal stage entry", &entry.path(), source)
-        })?;
-        if (entry.file_name() == REMOVAL_OWNER_FILE && kind.is_file())
-            || (!terminal && entry.file_name() == REMOVAL_REPRESENTATION_DIRECTORY && kind.is_dir())
-        {
-            continue;
-        }
-        return Err(StoreError::UnsafePath {
-            path: entry.path(),
-            reason: "unexpected or nonregular managed removal stage entry",
-        });
+        validate_removal_stage_entry(&entry, terminal)?;
     }
+    validate_removal_stage_owner(path, operation_id, terminal)
+}
+
+fn validate_removal_stage_entry(entry: &fs::DirEntry, terminal: bool) -> Result<(), StoreError> {
+    let kind = entry.file_type().map_err(|source| {
+        StoreError::io("inspect managed removal stage entry", &entry.path(), source)
+    })?;
+    if (entry.file_name() == REMOVAL_OWNER_FILE && kind.is_file())
+        || (!terminal && entry.file_name() == REMOVAL_REPRESENTATION_DIRECTORY && kind.is_dir())
+    {
+        return Ok(());
+    }
+    Err(StoreError::UnsafePath {
+        path: entry.path(),
+        reason: "unexpected or nonregular managed removal stage entry",
+    })
+}
+
+fn validate_removal_stage_owner(
+    path: &Path,
+    operation_id: &ManagedRemovalId,
+    terminal: bool,
+) -> Result<(), StoreError> {
     let owner_path = path.join(REMOVAL_OWNER_FILE);
     if path_exists(&owner_path)? {
         let owner: ManagedRemovalId =
@@ -1408,7 +1772,26 @@ fn validate_removal_stage(
     Ok(())
 }
 
-fn finish_removal(path: &Path, journal: &RemovalJournal) -> Result<(), StoreError> {
+fn inspect_removal_stage(
+    path: &Path,
+    operation_id: &ManagedRemovalId,
+    terminal: bool,
+) -> Result<(), StoreError> {
+    inspect_private_mode(path, RemovalPrivateMode::Directory)?;
+    for entry in fs::read_dir(path)
+        .map_err(|source| StoreError::io("read managed removal stage", path, source))?
+    {
+        let entry = entry
+            .map_err(|source| StoreError::io("read managed removal stage entry", path, source))?;
+        validate_removal_stage_entry(&entry, terminal)?;
+        if entry.file_name() == REMOVAL_OWNER_FILE {
+            inspect_private_mode(&entry.path(), RemovalPrivateMode::File)?;
+        }
+    }
+    validate_removal_stage_owner(path, operation_id, terminal)
+}
+
+fn validate_removal_survivors(path: &Path, journal: &RemovalJournal) -> Result<(), StoreError> {
     validate_materialization_directory(path, false)?;
     // Revalidate every surviving owned object before mutating any of it. Missing
     // objects are legitimate only under this exact retained removal operation.
@@ -1435,6 +1818,12 @@ fn finish_removal(path: &Path, journal: &RemovalJournal) -> Result<(), StoreErro
             }
         }
     }
+    Ok(())
+}
+
+fn finish_removal(path: &Path, journal: &RemovalJournal) -> Result<(), StoreError> {
+    validate_removal_survivors(path, journal)?;
+    validate_surviving_removal_evidence(path, journal)?;
     make_materialization_writable(path)?;
     for (name, boundary) in [
         (DATABASE_FILE, RemovalBoundary::DatabaseUnlinked),
@@ -1452,6 +1841,46 @@ fn finish_removal(path: &Path, journal: &RemovalJournal) -> Result<(), StoreErro
     }
     fs::remove_dir(path)
         .map_err(|source| StoreError::io("remove empty managed representation", path, source))
+}
+
+fn validate_surviving_removal_evidence(
+    path: &Path,
+    journal: &RemovalJournal,
+) -> Result<(), StoreError> {
+    // Called only after the unchanged survivor checks bind this manifest's
+    // bytes to the original request. Once it is gone, retained metadata is
+    // private native journal evidence, not independently authenticated data.
+    let manifest_path = path.join(MANIFEST_FILE);
+    if matches!(
+        &journal.source_evidence,
+        ManagedRemovalSourceEvidence::Retained(_)
+    ) && path_exists(&manifest_path)?
+    {
+        let manifest: ManagedDocumentsV1 = read_json_bounded(
+            &manifest_path,
+            "managed removal surviving manifest",
+            MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
+        )?;
+        manifest.validate()?;
+        require_exact_retained_projection(manifest, journal)?;
+    }
+    Ok(())
+}
+
+fn require_exact_retained_projection(
+    manifest: ManagedDocumentsV1,
+    journal: &RemovalJournal,
+) -> Result<(), StoreError> {
+    if let ManagedRemovalSourceEvidence::Retained(retained) = &journal.source_evidence {
+        let observed = projection_from_parts(
+            receipt_projection_from_receipt(journal.source_receipt.clone()),
+            manifest,
+        )?;
+        if observed != **retained {
+            return Err(StoreError::ManagedDocumentsIdentityMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn remove_build_stage(path: &Path) -> Result<(), StoreError> {
@@ -1895,6 +2324,19 @@ mod tests {
             );
             let operation = removal_operation_path(&store, &request.operation_id);
             let intent_before = fs::read(operation.join(REMOVAL_INTENT_FILE))?;
+            let state_before_projection = removal_fixture_snapshot(&root)?;
+            let projection = store.retained_managed_removal(&request.operation_id)?;
+            assert_eq!(projection.request, request);
+            assert!(
+                matches!(&projection.source_evidence, ManagedRemovalSourceEvidence::Retained(source)
+                if source.activation_id == original.activation_id
+                    && source.content_sha256 == original.content_sha256)
+            );
+            assert_eq!(
+                store.list_retained_managed_removals(1)?,
+                vec![projection.clone()]
+            );
+            assert_eq!(removal_fixture_snapshot(&root)?, state_before_projection);
             let original_terminal = if path_exists(&operation.join(REMOVAL_TERMINAL_FILE))? {
                 Some(read_removal_terminal(
                     &operation.join(REMOVAL_TERMINAL_FILE),
@@ -1909,6 +2351,41 @@ mod tests {
                 None
             };
             let pending = removing_path(&store, &request.materialization_id);
+            let saved_receipt = matches!(
+                boundary,
+                RemovalBoundary::TerminalFileSynced
+                    | RemovalBoundary::TerminalRenamed
+                    | RemovalBoundary::TerminalSynced
+                    | RemovalBoundary::OwnerUnlinked
+                    | RemovalBoundary::DirectoryRemoved
+                    | RemovalBoundary::ParentSynced
+            );
+            assert_eq!(projection.terminal_receipt, original_terminal);
+            assert_eq!(projection.terminal_receipt.is_some(), saved_receipt);
+            assert_eq!(
+                path_exists(&operation.join(REMOVAL_TERMINAL_PENDING_FILE))?,
+                boundary == RemovalBoundary::TerminalFileSynced
+            );
+            assert_eq!(
+                path_exists(&operation.join(REMOVAL_TERMINAL_FILE))?,
+                saved_receipt && boundary != RemovalBoundary::TerminalFileSynced
+            );
+            assert_eq!(
+                path_exists(&pending)?,
+                !matches!(
+                    boundary,
+                    RemovalBoundary::DirectoryRemoved | RemovalBoundary::ParentSynced
+                )
+            );
+            assert_eq!(
+                path_exists(&pending.join(REMOVAL_OWNER_FILE))?,
+                !matches!(
+                    boundary,
+                    RemovalBoundary::OwnerUnlinked
+                        | RemovalBoundary::DirectoryRemoved
+                        | RemovalBoundary::ParentSynced
+                )
+            );
             if path_exists(&pending)? {
                 assert!(matches!(
                     store.materialize_documents(&materialization),
@@ -1923,6 +2400,10 @@ mod tests {
             }
             drop(store);
             let reopened = ManagedStore::open(&root)?;
+            assert_eq!(
+                reopened.retained_managed_removal(&request.operation_id)?,
+                projection
+            );
             let completed = reopened.remove_managed_documents(&request)?;
             assert_eq!(completed.operation_id, request.operation_id);
             assert_eq!(completed.activation_id, original.activation_id);
@@ -1945,6 +2426,12 @@ mod tests {
                 fs::read(operation.join(REMOVAL_INTENT_FILE))?,
                 intent_before
             );
+            assert_eq!(
+                reopened
+                    .retained_managed_removal(&request.operation_id)?
+                    .terminal_receipt,
+                Some(completed.clone())
+            );
             assert!(!path_exists(&pending)?);
             assert_eq!(fs::read(&source)?, source_bytes);
             assert!(reopened.list_active_managed_documents(1)?.is_empty());
@@ -1965,6 +2452,11 @@ mod tests {
             .confirmed_request(ManagedRemovalId::new());
         let active = active_path(&store, &request.materialization_id);
         let before = fs::read(active.join(DATABASE_FILE))?;
+        let unknown = ManagedRemovalId::new();
+        let before_unknown = removal_fixture_snapshot(store.root())?;
+        assert!(matches!(store.retained_managed_removal(&unknown),
+            Err(StoreError::ManagedDocumentsRemovalNotFound(id)) if id == unknown));
+        assert_eq!(removal_fixture_snapshot(store.root())?, before_unknown);
         for field in 0..5 {
             let mut wrong = request.clone();
             match field {
@@ -2072,12 +2564,197 @@ mod tests {
                 }
             }
             assert!(store.remove_managed_documents(&request).is_err());
+            assert!(
+                store
+                    .retained_managed_removal(&request.operation_id)
+                    .is_err()
+            );
             assert_eq!(fs::read(hidden.join(DATABASE_FILE))?, database_before);
             assert_eq!(fs::read(&source)?, b"preserved external source");
             if obstruction == 0 {
                 assert_eq!(fs::read(hidden.join("unexpected.txt"))?, b"preserve me");
             } else if obstruction == 1 {
                 assert_eq!(fs::read_link(hidden.join("unexpected-link"))?, source);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    type RemovalFixtureSnapshot = BTreeMap<PathBuf, (u32, Vec<u8>)>;
+
+    #[cfg(unix)]
+    fn removal_fixture_snapshot(root: &Path) -> Result<RemovalFixtureSnapshot, Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        fn visit(
+            root: &Path,
+            path: &Path,
+            entries: &mut RemovalFixtureSnapshot,
+        ) -> Result<(), Box<dyn Error>> {
+            let metadata = fs::symlink_metadata(path)?;
+            let bytes = if metadata.file_type().is_symlink() {
+                fs::read_link(path)?.as_os_str().as_encoded_bytes().to_vec()
+            } else if metadata.is_file() {
+                fs::read(path)?
+            } else {
+                Vec::new()
+            };
+            entries.insert(
+                path.strip_prefix(root)?.to_path_buf(),
+                (metadata.permissions().mode(), bytes),
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path)? {
+                    visit(root, &entry?.path(), entries)?;
+                }
+            }
+            Ok(())
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries)?;
+        Ok(entries)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_projection_never_repairs_permissions_or_old_intent_fieldsets()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempdir()?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        let materialization = fixture_materialization()?;
+        let receipt = store.materialize_documents(&materialization)?;
+        let request = store
+            .plan_managed_documents_removal(&receipt.materialization_id)?
+            .confirmed_request(ManagedRemovalId::new());
+        REMOVAL_FAULT.with(|fault| fault.set(Some(RemovalBoundary::Hidden)));
+        assert!(matches!(
+            store.remove_managed_documents(&request),
+            Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
+        ));
+        let intent =
+            removal_operation_path(&store, &request.operation_id).join(REMOVAL_INTENT_FILE);
+        fs::set_permissions(&intent, fs::Permissions::from_mode(0o644))?;
+        let before = removal_fixture_snapshot(store.root())?;
+        assert!(
+            store
+                .retained_managed_removal(&request.operation_id)
+                .is_err()
+        );
+        assert!(store.list_retained_managed_removals(1).is_err());
+        assert_eq!(removal_fixture_snapshot(store.root())?, before);
+        fs::set_permissions(&intent, fs::Permissions::from_mode(0o600))?;
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&intent)?)?;
+        old.as_object_mut()
+            .ok_or("intent object")?
+            .remove("source_evidence");
+        fs::write(&intent, serde_json::to_vec_pretty(&old)?)?;
+        let before = removal_fixture_snapshot(store.root())?;
+        assert!(
+            store
+                .retained_managed_removal(&request.operation_id)
+                .is_err()
+        );
+        assert!(store.remove_managed_documents(&request).is_err());
+        assert_eq!(removal_fixture_snapshot(store.root())?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wide_generic_metadata_remains_removable_with_bounded_unavailable_evidence()
+    -> Result<(), Box<dyn Error>> {
+        for bytes in [
+            70_000,
+            usize::try_from(MAX_MANAGED_MANIFEST_PROJECTION_BYTES)? + 1,
+        ] {
+            let temporary = tempdir()?;
+            let source = temporary.path().join("original-source.txt");
+            fs::write(&source, b"preserve original source")?;
+            let store = ManagedStore::open(temporary.path().join("managed"))?;
+            let mut materialization = fixture_materialization()?;
+            materialization.documents[0].rights[0].expression = "x".repeat(bytes);
+            materialization.refresh_content_sha256()?;
+            let receipt = store.materialize_documents(&materialization)?;
+            let request = store
+                .plan_managed_documents_removal(&receipt.materialization_id)?
+                .confirmed_request(ManagedRemovalId::new());
+            REMOVAL_FAULT.with(|fault| fault.set(Some(RemovalBoundary::Hidden)));
+            assert!(matches!(
+                store.remove_managed_documents(&request),
+                Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
+            ));
+            let intent =
+                removal_operation_path(&store, &request.operation_id).join(REMOVAL_INTENT_FILE);
+            let original_intent = fs::read(&intent)?;
+            assert!(u64::try_from(original_intent.len())? <= MAX_RECEIPT_PROJECTION_BYTES);
+            let projection = store.retained_managed_removal(&request.operation_id)?;
+            assert_eq!(projection.request, request);
+            assert_eq!(
+                projection.source_evidence,
+                ManagedRemovalSourceEvidence::Unavailable
+            );
+            let terminal = store.remove_managed_documents(&request)?;
+            assert_eq!(
+                terminal.removed_managed_bytes,
+                request.observed_managed_bytes
+            );
+            assert_eq!(store.remove_managed_documents(&request)?, terminal);
+            assert_eq!(fs::read(&intent)?, original_intent);
+            assert_eq!(fs::read(source)?, b"preserve original source");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surviving_original_manifest_rejects_changed_retained_producer_and_rights()
+    -> Result<(), Box<dyn Error>> {
+        for boundary in [
+            RemovalBoundary::IntentSynced,
+            RemovalBoundary::Hidden,
+            RemovalBoundary::DatabaseUnlinked,
+        ] {
+            for changed_producer in [true, false] {
+                let temporary = tempdir()?;
+                let source = temporary.path().join("original-source.txt");
+                fs::write(&source, b"preserve original source")?;
+                let store = ManagedStore::open(temporary.path().join("managed"))?;
+                let materialization = fixture_materialization()?;
+                let receipt = store.materialize_documents(&materialization)?;
+                let request = store
+                    .plan_managed_documents_removal(&receipt.materialization_id)?
+                    .confirmed_request(ManagedRemovalId::new());
+                REMOVAL_FAULT.with(|fault| fault.set(Some(boundary)));
+                assert!(matches!(
+                    store.remove_managed_documents(&request),
+                    Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
+                ));
+                let intent =
+                    removal_operation_path(&store, &request.operation_id).join(REMOVAL_INTENT_FILE);
+                let mut journal: RemovalJournal = serde_json::from_slice(&fs::read(&intent)?)?;
+                let ManagedRemovalSourceEvidence::Retained(retained) = &mut journal.source_evidence
+                else {
+                    return Err("fixture lacks retained evidence".into());
+                };
+                if changed_producer {
+                    retained.provenance.publisher = "changed producer".to_string();
+                } else {
+                    retained.documents[0].rights[0].expression = "changed rights".to_string();
+                }
+                fs::write(&intent, serde_json::to_vec_pretty(&journal)?)?;
+                let before = removal_fixture_snapshot(store.root())?;
+                assert!(matches!(
+                    store.retained_managed_removal(&request.operation_id),
+                    Err(StoreError::ManagedDocumentsIdentityMismatch)
+                ));
+                assert!(store.list_retained_managed_removals(1).is_err());
+                assert_eq!(removal_fixture_snapshot(store.root())?, before);
+                assert!(matches!(store.remove_managed_documents(&request),
+                    Err(StoreError::ManagedDocumentsRemovalIncomplete { source, .. })
+                        if matches!(*source, StoreError::ManagedDocumentsIdentityMismatch)));
+                assert_eq!(removal_fixture_snapshot(store.root())?, before);
+                assert_eq!(fs::read(&source)?, b"preserve original source");
             }
         }
         Ok(())
