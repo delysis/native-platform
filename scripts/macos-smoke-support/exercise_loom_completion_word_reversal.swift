@@ -431,7 +431,8 @@ func waitForAccessibleFan(
 
 @discardableResult
 func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
-    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else {
         return false
     }
     event.flags = flags
