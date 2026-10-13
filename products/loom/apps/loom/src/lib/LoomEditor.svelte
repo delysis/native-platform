@@ -1247,8 +1247,13 @@
       view
     ) {
       const target = event.target;
-      const targetsEditor = target === window || target === document || target === document.body ||
-        (target instanceof Node && (target === view.dom || view.dom.contains(target)));
+      const targetElement = target instanceof Element ? target : null;
+      const interactiveTarget = targetElement?.closest(
+        'button, input, textarea, select, a[href], [contenteditable="true"]'
+      );
+      const targetsEditor = target === window || target === document ||
+        (target instanceof Node && view.dom.contains(target)) ||
+        !interactiveTarget;
       if (!targetsEditor) return false;
       const livePlan = currentGhostTextPlan(view.state);
       const plan = livePlan ?? retainedRollbackPlan;
