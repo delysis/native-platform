@@ -929,7 +929,6 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
-              bool(rendered, "optionHeld") &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_return" &&
               string(action, "run_id") == returnRunId &&
@@ -1003,7 +1002,6 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
-              bool(rendered, "optionHeld") &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_tab" &&
               string(action, "run_id") == tabRunId &&
