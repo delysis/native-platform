@@ -149,27 +149,42 @@ impl NativeMicrophoneCapture {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), MicrophoneCaptureError> {
-        let owner = self
-            .owner
-            .lock()
-            .map_err(|_| controller("owner lock poisoned"))?
-            .take();
-        let Some(owner) = owner else {
-            return Ok(());
+        let mut failure = None;
+        let mut owners = self.owner.lock().unwrap_or_else(|poisoned| {
+            failure = Some(controller("owner lock poisoned"));
+            poisoned.into_inner()
+        });
+        let Some(owner) = owners.take() else {
+            return failure.map_or(Ok(()), Err);
         };
         let (tx, rx) = bounded(1);
-        self.command_tx
+        if self
+            .command_tx
             .send(Command::Shutdown { reply: tx })
-            .map_err(|_| MicrophoneCaptureError::OwnerStopped)?;
-        rx.recv()
-            .map_err(|_| MicrophoneCaptureError::OwnerStopped)?;
-        owner.join().map_err(|_| MicrophoneCaptureError::OwnerJoin)
+            .is_err()
+            || rx.recv().is_err()
+        {
+            failure.get_or_insert(MicrophoneCaptureError::OwnerStopped);
+        }
+        // A missing acknowledgement is not a join. Keep the owner lock until
+        // this handle is joined, including on errors and concurrent shutdowns.
+        if owner.join().is_err() {
+            failure = Some(MicrophoneCaptureError::OwnerJoin);
+        }
+        drop(owners);
+        failure.map_or(Ok(()), Err)
     }
 
     fn ensure_initialized(&self) -> Result<(), MicrophoneCaptureError> {
         self.initialization_error
             .as_ref()
             .map_or(Ok(()), |error| Err(controller(error.clone())))
+    }
+}
+
+impl Drop for NativeMicrophoneCapture {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -540,5 +555,81 @@ mod tests {
         assert_eq!(rx.recv().expect("chunk").0, vec![0.0, 0.5]);
         capture_callback(&[0.25_f32, 0.75], 2, &tx, &free_rx, &overflow);
         assert!(overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn microphone_shutdown_keeps_join_ownership_through_an_unacknowledged_reply() {
+        use std::sync::{Arc, Weak};
+
+        // No stream or audio hardware: the actual command channel and owner
+        // handle are exercised, with an actor that deliberately loses its reply.
+        for acknowledge in [true, false] {
+            let (command_tx, command_rx) = bounded(8);
+            let (bootstrap, initialized) = bounded::<Weak<NativeMicrophoneCapture>>(1);
+            let (observed, observation) = bounded(1);
+            let owner = std::thread::spawn(move || {
+                let capture = initialized
+                    .recv()
+                    .expect("capture identity")
+                    .upgrade()
+                    .expect("owner");
+                let Command::Shutdown { reply } = command_rx.recv().expect("real shutdown command")
+                else {
+                    panic!("unexpected command");
+                };
+                // The command is sent after shutdown has taken the handle.
+                // A second shutdown must still be excluded until this actor is joined.
+                observed
+                    .send(capture.owner.try_lock().is_err())
+                    .expect("ownership observer");
+                if acknowledge {
+                    reply.send(()).expect("shutdown acknowledgement");
+                } else {
+                    drop(reply);
+                }
+            });
+            let capture = Arc::new(NativeMicrophoneCapture {
+                command_tx,
+                owner: Mutex::new(Some(owner)),
+                initialization_error: None,
+            });
+            bootstrap
+                .send(Arc::downgrade(&capture))
+                .expect("bind actor");
+            let outcome = capture.shutdown();
+            assert!(
+                observation.recv().expect("actor observed join owner"),
+                "shutdown exposed an empty owner slot before its physical join"
+            );
+            if acknowledge {
+                outcome.expect("ordinary shutdown");
+            } else {
+                assert!(matches!(outcome, Err(MicrophoneCaptureError::OwnerStopped)));
+            }
+            assert!(capture.owner.lock().expect("owner lock").is_none());
+            capture.shutdown().expect("joined shutdown is idempotent");
+        }
+    }
+
+    #[test]
+    fn microphone_shutdown_joins_a_panicked_owner_even_when_command_send_fails() {
+        let (command_tx, command_rx) = bounded(8);
+        let owner = std::thread::spawn(move || {
+            drop(command_rx);
+            panic!("controlled microphone actor failure");
+        });
+        while !owner.is_finished() {
+            std::thread::yield_now();
+        }
+        let capture = NativeMicrophoneCapture {
+            command_tx,
+            owner: Mutex::new(Some(owner)),
+            initialization_error: None,
+        };
+        assert!(
+            matches!(capture.shutdown(), Err(MicrophoneCaptureError::OwnerJoin)),
+            "the join failure must be observed rather than detaching the taken handle"
+        );
+        assert!(capture.owner.lock().expect("owner lock").is_none());
     }
 }

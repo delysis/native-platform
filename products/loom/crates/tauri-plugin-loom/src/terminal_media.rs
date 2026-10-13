@@ -109,7 +109,6 @@ pub(super) fn resolve(
     store: &ProjectStore,
     source: &LoadedDocument,
     references: &[ResolvedDocument],
-    _context_tokens: u32,
 ) -> Result<Vec<MediaInput>, IpcFailure> {
     if references.len() > 32 {
         return Err(limit());
@@ -439,7 +438,7 @@ mod tests {
             &[private.id],
         )
         .expect("private referenced context");
-        let media = resolve(&store, &source, &references, 32_768).expect("native media");
+        let media = resolve(&store, &source, &references).expect("native media");
         assert_eq!(media.len(), 2);
         assert_eq!(media[0].bytes, first_bytes);
         assert_eq!(media[1].bytes, second_bytes);
@@ -448,11 +447,6 @@ mod tests {
         assert_eq!(referenced_media.len(), 2);
         assert_eq!(referenced_media[0].bytes, second_bytes);
         assert_eq!(referenced_media[1].bytes, first_bytes);
-        assert_eq!(
-            resolve(&store, &source, &[], 32_768)
-                .expect("source only")
-                .len(),
-            1
-        );
+        assert_eq!(resolve(&store, &source, &[]).expect("source only").len(), 1);
     }
 }

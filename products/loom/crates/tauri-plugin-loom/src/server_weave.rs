@@ -613,21 +613,22 @@ mod tests {
         let command = CommandId::new();
         // Focus blocks even explicitly configured servers before durable work.
         state.session.lock().unwrap().agency.set_focus_mode(true);
-        let start = || {
+        let start_with = |requested_command: CommandId, requested_policy: WeavePolicySnapshot| {
             tauri::async_runtime::block_on(weave_start(
                 project.to_string(),
                 session_id.to_string(),
-                command.to_string(),
+                requested_command.to_string(),
                 source.document_id.to_string(),
                 INITIAL_DOCUMENT.into(),
                 source.revision_id.to_string(),
                 source.blob_id.to_string(),
                 5,
-                policy,
+                requested_policy,
                 app.handle().clone(),
                 app.state::<PluginState>(),
             ))
         };
+        let start = || start_with(command, policy);
         if matches!(
             policy,
             WeavePolicySnapshot::AutomaticV3 {}
@@ -717,6 +718,30 @@ mod tests {
         }
         assert_eq!(&calls.lock().unwrap()[..2], &["offline", "writer"]);
         let before_replay = calls.lock().unwrap().len();
+        if matches!(policy, WeavePolicySnapshot::AutomaticV2 {}) && !cancel {
+            for changed in [
+                WeavePolicySnapshot::AutomaticV3 {},
+                WeavePolicySnapshot::AutomaticVisualV4 {},
+            ] {
+                assert_eq!(
+                    start_with(command, changed)
+                        .expect_err("changed semantic retry")
+                        .code,
+                    "idempotency_conflict"
+                );
+                assert_eq!(
+                    start_with(CommandId::new(), changed)
+                        .expect_err("fresh hosted first-word admission remains unsupported")
+                        .code,
+                    "distinct_words_unavailable"
+                );
+                assert_eq!(calls.lock().unwrap().len(), before_replay);
+            }
+            assert_eq!(
+                std::fs::read(temporary.path().join("Writing").join(INITIAL_DOCUMENT)).unwrap(),
+                b"Once "
+            );
+        }
         // Exact replay must recover durable evidence before model/agency or
         // archive preparation. A newly invalid opt-in file cannot break it.
         {

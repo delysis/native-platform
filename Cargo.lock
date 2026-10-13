@@ -8996,6 +8996,7 @@ dependencies = [
  "loom-store",
  "loom-types",
  "naga",
+ "nix",
  "notify",
  "rusqlite",
  "rustix",

@@ -140,7 +140,7 @@ async fn reviewed_context_crosses_quic_as_editable_markdown_with_only_selected_m
         std::slice::from_ref(&published.path),
     )
     .unwrap();
-    let media = crate::terminal_media::resolve(&destination, &page, &references, 32_768).unwrap();
+    let media = crate::terminal_media::resolve(&destination, &page, &references).unwrap();
     assert_eq!(media.len(), 1);
     assert_eq!(media[0].bytes, audio_bytes);
     let mut completion = context_attachments::resolve_for_generation_with_budget(

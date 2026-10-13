@@ -82,7 +82,7 @@ fn native_capture_projects_exact_audio_and_inspects_it_only_when_a_prompt_needs_
         !manifest.exists(),
         "receiving a file does not run its parser"
     );
-    let media = crate::terminal_media::resolve(&right, &right_doc, &[], 32_768).unwrap();
+    let media = crate::terminal_media::resolve(&right, &right_doc, &[]).unwrap();
     assert_eq!(media.len(), 1);
     assert_eq!(media[0].bytes, bytes);
     assert!(manifest.exists());
@@ -100,7 +100,7 @@ fn native_capture_projects_exact_audio_and_inspects_it_only_when_a_prompt_needs_
     let copies = recover_documents(&mut right, &bob, None).unwrap();
     let recovered = right.read_document(&copies[0]).unwrap();
     assert_eq!(
-        crate::terminal_media::resolve(&right, &recovered, &[], 32_768).unwrap()[0].bytes,
+        crate::terminal_media::resolve(&right, &recovered, &[]).unwrap()[0].bytes,
         bytes
     );
 }
@@ -146,7 +146,7 @@ fn peer_references_cannot_read_or_publish_private_media_even_after_an_unrelated_
     copy(&bob, &mut alice);
     project_workspace(&mut local, &mut alice, None).unwrap();
     let document = local.read_document("page.md").unwrap();
-    assert!(crate::terminal_media::resolve(&local, &document, &[], 32_768).is_err());
+    assert!(crate::terminal_media::resolve(&local, &document, &[]).is_err());
     assert!(
         shared::original_for_document(
             local.root(),
@@ -174,7 +174,7 @@ fn peer_references_cannot_read_or_publish_private_media_even_after_an_unrelated_
     );
     let private_doc = local.read_document("Recovery/private.md").unwrap();
     assert_eq!(
-        crate::terminal_media::resolve(&local, &private_doc, &[], 32_768).unwrap()[0].bytes,
+        crate::terminal_media::resolve(&local, &private_doc, &[]).unwrap()[0].bytes,
         private_bytes
     );
     let view = alice.view(view.id).unwrap();
@@ -189,7 +189,7 @@ fn peer_references_cannot_read_or_publish_private_media_even_after_an_unrelated_
         .unwrap();
     let copies = recover_documents(&mut local, &alice, None).unwrap();
     let recovered = local.read_document(&copies[0]).unwrap();
-    assert!(crate::terminal_media::resolve(&local, &recovered, &[], 32_768).is_err());
+    assert!(crate::terminal_media::resolve(&local, &recovered, &[]).is_err());
     assert!(
         shared::original_for_document(
             local.root(),
@@ -296,7 +296,7 @@ fn dropped_images_share_as_ordinary_markdown_and_both_protocols_refuse_private_h
     project_workspace(&mut right, &mut bob, None).unwrap();
     let doc = right.read_document("picture.md").unwrap();
     assert_eq!(
-        crate::terminal_media::resolve(&right, &doc, &[], 32_768).unwrap()[0].bytes,
+        crate::terminal_media::resolve(&right, &doc, &[]).unwrap()[0].bytes,
         png
     );
     let project_id = right.manifest().project_id;
@@ -352,7 +352,7 @@ fn dropped_images_share_as_ordinary_markdown_and_both_protocols_refuse_private_h
         let store = session.store.as_mut().unwrap();
         project_workspace(store, &mut bob, None).unwrap();
         let spy = store.read_document("spy.md").unwrap();
-        assert!(crate::terminal_media::resolve(store, &spy, &[], 32_768).is_err());
+        assert!(crate::terminal_media::resolve(store, &spy, &[]).is_err());
         spy
     };
     let private_request = LoomAssetRequest {

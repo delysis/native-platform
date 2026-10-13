@@ -56,8 +56,12 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
     let identity = same_file::Handle::from_file(file.try_clone()?)?;
     let mut bytes = Vec::new();
     file.take(MAX_METADATA_BYTES + 1).read_to_end(&mut bytes)?;
+    #[cfg(all(test, unix))]
+    if let Some(interrupt) = tests::AFTER_READ.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_METADATA_BYTES
-        || same_file::Handle::from_path(path)? != identity
+        || same_file::Handle::from_file(options.open(path)?)? != identity
         || fs::symlink_metadata(path)?.file_type().is_symlink()
     {
         return Err(invalid("Collection metadata changed while reading."));
@@ -187,4 +191,86 @@ pub(super) fn load_snapshot(
     let mut snapshot: CollectionSnapshot = serde_json::from_slice(&bytes)?;
     snapshot.id = id.into();
     Ok(snapshot)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        pub(super) static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_metadata_replacement_refuses_without_a_fifo_peer() {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let project = tempfile::tempdir().expect("project");
+        fs::create_dir(project.path().join(".loom")).expect("private directory");
+        let root = project.path().to_owned();
+        let path = root.join(".loom/probe.json");
+        let retained = root.join(".loom/retained.json");
+        fs::write(&path, b"retained author bytes\r\n").expect("ordinary file");
+        let (swapped, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker_retained = retained.clone();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(
+                read(&worker_path).expect("ordinary collection metadata read"),
+                b"retained author bytes\r\n".to_vec()
+            );
+            let replaced = worker_path.clone();
+            AFTER_READ.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&replaced, worker_retained).expect("retain original inode");
+                    nix::unistd::mkfifo(
+                        &replaced,
+                        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                    )
+                    .expect("owned FIFO");
+                    swapped.send(()).expect("replacement observer");
+                }));
+            });
+            finished.send(read(&worker_path)).expect("read observer");
+        });
+        ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement boundary");
+        let early = result.recv_timeout(Duration::from_secs(5));
+        let needed_peer = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        // Rescue the old blocking reopen before joining; a timeout alone is not
+        // called a product hang. The assertion is whether a peer was required.
+        let rescue = needed_peer.then(|| {
+            open(
+                &path,
+                OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("release the controlled old reopen")
+        });
+        let outcome = early.unwrap_or_else(|_| {
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rescued read result")
+        });
+        worker.join().expect("physical read worker join");
+        drop(rescue);
+        assert!(
+            outcome.is_err(),
+            "replacement must never supply collection metadata"
+        );
+        assert_eq!(
+            fs::read(retained).expect("retained original"),
+            b"retained author bytes\r\n"
+        );
+        assert!(
+            !needed_peer,
+            "identity refusal waited for an unrelated FIFO peer"
+        );
+    }
 }

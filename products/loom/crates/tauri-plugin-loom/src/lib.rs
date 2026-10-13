@@ -500,6 +500,32 @@ fn recorded_loompad_batch(
         .transpose()
 }
 
+fn recorded_weave_first_word_choices(
+    store: &ProjectStore,
+    context_recipe_artifact_id: ArtifactId,
+) -> Result<Option<llama_native_types::FirstWordChoicePolicy>, IpcFailure> {
+    let missing = || {
+        IpcFailure::new(
+            "generation_provenance_missing",
+            "This retained Weave family has no first-word policy binding. Read its existing status; do not retry it under an inferred policy.",
+            false,
+        )
+    };
+    let bytes = store
+        .generation_context_evidence(context_recipe_artifact_id)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(missing)?;
+    let evidence: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+    })?;
+    // An explicit null means no first-word constraint. Absence is not that
+    // policy: older evidence cannot prove an exact semantic retry.
+    let value = evidence.get("first_word_choices").ok_or_else(missing)?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+    })
+}
+
 #[derive(Debug)]
 struct PreparedProject {
     id: CommandId,
@@ -8455,11 +8481,23 @@ fn replay_weave_if_recorded(
         }
         let policy_matches = match &speculation {
             Some(batch) => policy.matches_loompad_batch(batch),
-            None => !matches!(
-                policy,
-                ValidatedWeavePolicy::LoompadV2 { .. }
-                    | ValidatedWeavePolicy::LoompadVisualV3 { .. }
-            ),
+            None => {
+                let mut matches = !matches!(
+                    policy,
+                    ValidatedWeavePolicy::LoompadV2 { .. }
+                        | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                );
+                for started in &family.generations {
+                    if recorded_weave_first_word_choices(
+                        store,
+                        started.generation.context_recipe_artifact_id,
+                    )? != policy.first_word_choices()
+                    {
+                        matches = false;
+                    }
+                }
+                matches
+            }
         };
         let family_matches = policy_matches
             && resolved.is_some_and(|resolved| {
@@ -8792,6 +8830,7 @@ fn weave_start_inner<R: Runtime>(
         _ => None,
     };
     let _model_lifecycle = lock_model_lifecycle(state)?;
+    let first_word_choices = policy.first_word_choices();
     let authorized_model = server_weave::Engine::bind(policy, state)?;
     let branch_count = authorized_model.branch_count();
     let max_cases = authorized_model.max_cases();
@@ -9075,6 +9114,7 @@ fn weave_start_inner<R: Runtime>(
                     serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media })
                 }
             };
+            evidence["first_word_choices"] = serde_json::json!(first_word_choices);
             if let Some(id) = archive_blob {
                 evidence["archive_friends_pack_blob_id"] = serde_json::json!(id);
             }
@@ -10618,9 +10658,10 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    let mut failed = false;
     if let Err(error) = state.generation_lifecycle.quiesce() {
         eprintln!("Loom could not quiesce generation lifecycle before runtime exit: {error}");
-        return;
+        failed = true;
     }
 
     // Owning `phase` is an application-wide admission barrier. Worker
@@ -10628,9 +10669,13 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
     // cancellation authority are attached, making a detached start
     // impossible at this point in safe code.
     let desktop_workers = state.join_desktop_workers_for_exit();
+    if let Err(error) = tauri::async_runtime::block_on(state.speech_input.shutdown()) {
+        eprintln!("Loom speech teardown: {error}");
+        failed = true;
+    }
     if let Err(error) = state.shutdown_inference() {
         eprintln!("Loom inference teardown: {}", error.message);
-        return;
+        failed = true;
     }
     let _model_lifecycle = state
         .model_lifecycle
@@ -10642,12 +10687,17 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let native_runtime = state.native_runtime.shutdown_for_process_exit();
     *model_registry = ModelRegistry::Empty;
-    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
-    let joined = proof.joined_worker_count();
     if let Err(error) = state.generation_lifecycle.close() {
         eprintln!("Loom generation lifecycle did not close before runtime exit: {error}");
+        failed = true;
+    }
+    if failed {
+        // Physical drains still ran. Do not turn their completion into a
+        // successful authorization after any independent finalizer failed.
         return;
     }
+    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
+    let joined = proof.joined_worker_count();
     *phase = ApplicationPhase::ExitAuthorized;
     state.exit_authorized.store(true, Ordering::Release);
     eprintln!("Loom joined {joined} owned worker(s) before unpreventable runtime exit");

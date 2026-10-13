@@ -1447,4 +1447,107 @@ mod tests {
         wav[40..44].copy_from_slice(&2_u32.to_le_bytes());
         wav
     }
+
+    #[test]
+    fn unpreventable_exit_drains_speech_and_desktop_owners_before_drop_even_after_speech_error() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use tauri::Manager as _;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        for fail_shutdown in [false, true] {
+            let microphone = Arc::new(TestMicrophone::default());
+            microphone.fail_shutdown.store(fail_shutdown, SeqCst);
+            microphone.active.store(true, SeqCst);
+            let mut speech = SpeechInputService::new(None);
+            speech.microphone = microphone.clone();
+            speech
+                .bind_scope("project".into(), "session".into())
+                .expect("scope");
+            let (_, backend) = test_host(&speech);
+            let speech = Arc::new(speech);
+            let task_finished = Arc::new(AtomicBool::new(false));
+            let completed = Arc::clone(&task_finished);
+            tauri::async_runtime::block_on(async {
+                speech
+                    .tasks
+                    .lock()
+                    .expect("tasks")
+                    .workers
+                    .spawn(async move {
+                        completed.store(true, SeqCst);
+                    });
+            });
+
+            let mut state = crate::PluginState::default();
+            state.speech_input = Arc::clone(&speech);
+            *state.model.lock().expect("model registry") = crate::ModelRegistry::ResidencyUnknown {
+                reason: "controlled prior unknown residency".into(),
+            };
+            let download_finished = Arc::new(AtomicBool::new(false));
+            {
+                let admission = crate::lock_application_admission(&state, "fixture download")
+                    .expect("ordinary admitted owner");
+                let cancellation = crate::DownloadCancellation::default();
+                let wait_cancelled = cancellation.clone();
+                let completed = Arc::clone(&download_finished);
+                state
+                    .download_workers
+                    .reserve(crate::CommandId::new(), &admission)
+                    .expect("reserve")
+                    .attach(
+                        std::thread::spawn(move || {
+                            while !wait_cancelled.is_cancelled() {
+                                std::thread::yield_now();
+                            }
+                            completed.store(true, SeqCst);
+                        }),
+                        cancellation,
+                    )
+                    .map_err(|error| error.failure)
+                    .expect("attach real owned thread");
+            }
+            let app = mock_builder()
+                .manage(state)
+                .build(mock_context(noop_assets()))
+                .expect("app");
+            crate::quiesce_unpreventable_runtime_exit(app.handle());
+            // Capture facts BEFORE Drop's independent fallback can conceal a missed drain.
+            let observed = {
+                let state = app.state::<crate::PluginState>();
+                (
+                    backend.shutdowns.load(SeqCst),
+                    microphone.active.load(SeqCst),
+                    speech.active_scope.lock().expect("scope").is_none(),
+                    speech.tasks.lock().expect("tasks").workers.is_empty(),
+                    task_finished.load(SeqCst),
+                    download_finished.load(SeqCst),
+                    matches!(
+                        *state.model.lock().expect("model"),
+                        crate::ModelRegistry::Empty
+                    ),
+                    state.exit_authorized.load(SeqCst),
+                    *state.application.lock().expect("phase"),
+                )
+            };
+            drop(app);
+            assert_eq!(
+                observed.0, 1,
+                "speech host must drain at the exit boundary, not only Drop"
+            );
+            assert!(!observed.1);
+            assert!(observed.2 && observed.3 && observed.4 && observed.5 && observed.6);
+            assert_eq!(
+                observed.7, !fail_shutdown,
+                "failed cleanup cannot authorize exit"
+            );
+            assert_eq!(
+                observed.8,
+                if fail_shutdown {
+                    crate::ApplicationPhase::Closing
+                } else {
+                    crate::ApplicationPhase::ExitAuthorized
+                }
+            );
+        }
+    }
 }
