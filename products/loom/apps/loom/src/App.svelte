@@ -6982,6 +6982,17 @@
     });
   }
 
+  function retainNativeCompletionFocus(): void {
+    if (!desktop) return;
+    void getCurrentWindow().setFocus().then(() => {
+      window.requestAnimationFrame(() => {
+        if (!componentMounted) return;
+        if (mode === 'source') sourceEditor?.focusCurrentSelection();
+        else visualEditor?.focusCurrentSelection();
+      });
+    }).catch(recordFailure);
+  }
+
   async function finishOpeningProject(
     opened: ProjectSnapshot,
     restoreSerial: number,
@@ -8511,7 +8522,7 @@
     } });
     if (authorization.authorized) {
       setNativeCompletionReversalArm(true);
-      if (desktop) void getCurrentWindow().setFocus().catch(recordFailure);
+      retainNativeCompletionFocus();
     }
     completionController = authorization.state;
     return authorization.authorized;
