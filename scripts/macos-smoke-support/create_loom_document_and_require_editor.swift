@@ -72,14 +72,14 @@ func jsonObject(in text: String, schema: String) -> [String: Any]? {
     return object
 }
 
-func currentDocumentId() -> String? {
-    descendants().compactMap { element in
+func documentIds() -> Set<String> {
+    Set(descendants().flatMap { element in
         [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
             .compactMap { attribute(element, $0 as CFString) as? String }
             .compactMap { jsonObject(in: $0, schema: "delysis.loom-completion-witness.v1") }
             .compactMap { ($0["pre_admission"] as? [String: Any])?["document_id"] as? String }
-            .first
-    }.first
+            .filter { !$0.isEmpty }
+    })
 }
 
 NSRunningApplication(processIdentifier: pid)?.activate(options: [])
@@ -95,7 +95,8 @@ guard let window = initialWindow else {
     exit(1)
 }
 let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
-guard let beforeDocumentId = currentDocumentId(), !beforeDocumentId.isEmpty else {
+let beforeDocumentIds = documentIds()
+guard !beforeDocumentIds.isEmpty else {
     fputs("could not bind the new-document check to Loom's current document identity\n", stderr)
     exit(1)
 }
@@ -136,7 +137,7 @@ guard AXUIElementPerformAction(create, kAXPressAction as CFString) == .success e
 
 let deadline = Date().addingTimeInterval(10)
 var afterTitle = beforeTitle
-var afterDocumentId = beforeDocumentId
+var afterDocumentId: String?
 var focusedEditor = false
 repeat {
     // Creating a document may replace WebKit's native accessibility window.
@@ -145,24 +146,28 @@ repeat {
     if let currentWindow = firstWindow() {
         afterTitle = stringAttribute(currentWindow, kAXTitleAttribute as CFString)
     }
-    afterDocumentId = currentDocumentId() ?? beforeDocumentId
+    afterDocumentId = documentIds().subtracting(beforeDocumentIds).sorted().first
     focusedEditor = descendants().contains { element in
         stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String &&
             (attribute(element, kAXFocusedAttribute as CFString) as? Bool) == true
     }
-    if afterDocumentId != beforeDocumentId && focusedEditor { break }
+    if afterDocumentId != nil && focusedEditor { break }
     Thread.sleep(forTimeInterval: 0.1)
 } while Date() < deadline
 
-guard afterDocumentId != beforeDocumentId, focusedEditor else {
-    fputs("new document did not expose and focus a fresh writing surface\n", stderr)
+guard let afterDocumentId, focusedEditor else {
+    fputs(
+        "new document did not expose and focus a fresh writing surface " +
+        "(before_ids=\(beforeDocumentIds.sorted()), after_ids=\(documentIds().sorted()), focused=\(focusedEditor))\n",
+        stderr
+    )
     exit(1)
 }
 
 let evidence: [String: Any] = [
     "title_before": beforeTitle,
     "title_after": afterTitle,
-    "document_id_before": beforeDocumentId,
+    "document_ids_before": beforeDocumentIds.sorted(),
     "document_id_after": afterDocumentId,
     "focused_editor_observed": focusedEditor
 ]
