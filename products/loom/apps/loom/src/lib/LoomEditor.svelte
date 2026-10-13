@@ -193,6 +193,7 @@
   let reportedCompletionAccessibilityIdentity = '';
   let reportedSelectionAccessibilityIdentity = '';
   let retainedRollbackPlan: GhostTextPlan | null = null;
+  let rollbackOptionLease = false;
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
@@ -936,7 +937,11 @@
     text: string
   ): boolean {
     const authorized = onGhostUnconsume(candidateId, presentationKey, text);
-    if (authorized) completionMutationAuthorized = true;
+    if (authorized) {
+      completionMutationAuthorized = true;
+      rollbackOptionLease = true;
+      setOptionHeld(true);
+    }
     return authorized;
   }
 
@@ -1287,6 +1292,7 @@
   }
 
   function releaseOptionState(): void {
+    rollbackOptionLease = false;
     setOptionHeld(false);
   }
 
@@ -1459,7 +1465,7 @@
         focus() {
           // Focus acquisition is a new interaction epoch. If Option is still
           // physically held, its next key event will re-establish that fact.
-          releaseOptionState();
+          if (!rollbackOptionLease) releaseOptionState();
           scheduleGhostPresentationSynchronization(true);
           return false;
         },

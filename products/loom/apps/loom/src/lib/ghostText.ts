@@ -216,7 +216,7 @@ export function dispatchGhostRollback(
         alternatives: plan.alternatives,
         hidden: plan.hidden,
         unconsumeText: '',
-        fanVisible: plan.fanVisible,
+        fanVisible: plan.fanVisible || plan.alternatives.length > 1,
         fanPinned: plan.fanPinned
       }
     } satisfies GhostTextMeta));
