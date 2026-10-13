@@ -11,6 +11,7 @@
   import {
     boundaryKeyKind, textBoundaryDelta, type BoundaryObservation
   } from './completionBoundaryDiagnostics';
+  import { removeBeforeUtf8Boundary } from './completionSession';
   import { applyRemoteDocument } from './remoteEditor';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
   import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
@@ -321,6 +322,25 @@
     return selectionBoundaryProof(state).byteOffset;
   }
 
+  function exactCompletionRollback(
+    _candidateId: string,
+    _presentationKey: string,
+    anchorByteOffset: number,
+    text: string,
+    from: number,
+    to: number
+  ): boolean {
+    if (!view || from < 0 || to !== view.state.selection.from ||
+        selectionBoundary(view.state) !== anchorByteOffset) return false;
+    const expected = removeBeforeUtf8Boundary(lastEmitted, anchorByteOffset, text);
+    if (expected === null) return false;
+    try {
+      return serializeVisualMarkdown(view.state.tr.delete(from, to).doc) === expected;
+    } catch {
+      return false;
+    }
+  }
+
   function reportGhostVisibility(): void {
     // Layout/scroll changes can invalidate glyphs without changing the plan.
     reportCompletionAccessibility();
@@ -468,7 +488,15 @@
       currentPlan.surfaceKey === snapshot.surfaceKey &&
       currentPlan.unconsumeText === snapshot.unconsumeText &&
       selectionBoundary(editorView.state) === currentPlan.anchorByteOffset &&
-      ghostRollbackTextIsExactAtSelection(editorView.state, currentPlan);
+      (ghostRollbackTextIsExactAtSelection(editorView.state, currentPlan) ||
+        exactCompletionRollback(
+          currentPlan.candidateId,
+          currentPlan.presentationKey,
+          currentPlan.anchorByteOffset,
+          currentPlan.unconsumeText,
+          editorView.state.selection.from - currentPlan.unconsumeText.length,
+          editorView.state.selection.from
+        ));
     // Option-down is observed in the window capture phase. During native AX
     // reconciliation the parent caret projection can briefly be unavailable,
     // even though the editor still proves the same scoped rollback bytes at
@@ -937,6 +965,7 @@
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: authorizeCompletionInsertion,
           unconsume: authorizeCompletionReversal,
+          rollbackExact: exactCompletionRollback,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
           navigate: () => {

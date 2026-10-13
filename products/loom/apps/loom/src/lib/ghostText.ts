@@ -69,6 +69,14 @@ export interface GhostTextHandlers {
     action: CompletionInsertionAction
   ) => boolean;
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
+  rollbackExact?: (
+    candidateId: string,
+    presentationKey: string,
+    anchorByteOffset: number,
+    text: string,
+    from: number,
+    to: number
+  ) => boolean;
   cycle?: (offset: number) => void;
   modifier?: (held: boolean) => void;
   navigate?: () => void;
@@ -841,7 +849,21 @@ export function createGhostTextPlugin(
                 plan.anchorByteOffset
               )
         ));
-        const exactRollbackAvailable = ghostRollbackTextIsExactAtSelection(view.state, plan);
+        const rollbackEnd = view.state.selection.from;
+        const rollbackStart = plan?.unconsumeText
+          ? rollbackEnd - plan.unconsumeText.length
+          : -1;
+        const exactRollbackAvailable = Boolean(plan && (
+          ghostRollbackTextIsExactAtSelection(view.state, plan) ||
+          handlers.rollbackExact?.(
+            plan.candidateId,
+            plan.presentationKey,
+            plan.anchorByteOffset,
+            plan.unconsumeText,
+            rollbackStart,
+            rollbackEnd
+          )
+        ));
         // Keep reporting the physical modifier when there is no completion.
         // When a plan does exist, however, only its live viewport witness may
         // project Option-held fan state back through the Svelte owner. The one
@@ -898,8 +920,6 @@ export function createGhostTextPlugin(
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
-            const rollbackEnd = view.state.selection.from;
-            const rollbackStart = rollbackEnd - plan.unconsumeText.length;
             const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
             const anchorByteOffset = plan.anchorByteOffset - removedBytes;
             if (anchorByteOffset < 0) return false;
