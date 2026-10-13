@@ -1739,19 +1739,13 @@ pub fn load_db() -> Result<ConversationDb> {
     Ok(store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default())
 }
 
-fn normalize_conversation_model_paths(conversation: &mut Conversation) -> bool {
-    let previous_selected = conversation.selected_model_path.take();
-    let previous_model = conversation.execution_profile.model_path.take();
-    let previous_mmproj = conversation.execution_profile.mmproj_path.take();
-    let selected = crate::config::normalize_optional_path(previous_selected.clone());
-    let model = crate::config::normalize_optional_path(previous_model.clone());
-    let mmproj = crate::config::normalize_optional_path(previous_mmproj.clone());
-    let changed =
-        previous_selected != selected || previous_model != model || previous_mmproj != mmproj;
-    conversation.selected_model_path = selected;
-    conversation.execution_profile.model_path = model;
-    conversation.execution_profile.mmproj_path = mmproj;
-    changed
+fn normalize_conversation_model_paths(conversation: &mut Conversation) {
+    conversation.selected_model_path =
+        crate::config::normalize_optional_path(conversation.selected_model_path.take());
+    conversation.execution_profile.model_path =
+        crate::config::normalize_optional_path(conversation.execution_profile.model_path.take());
+    conversation.execution_profile.mmproj_path =
+        crate::config::normalize_optional_path(conversation.execution_profile.mmproj_path.take());
 }
 
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
@@ -1910,6 +1904,14 @@ fn snippet(content: &str, query: &str) -> String {
     let lower = collapsed.to_lowercase();
     let start = lower
         .find(query)
+        .and_then(|match_byte| {
+            // A match can begin inside one source character's lowercase expansion.
+            let mut lowered_end = 0;
+            collapsed.chars().position(|character| {
+                lowered_end += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+                match_byte < lowered_end
+            })
+        })
         .map(|index| index.saturating_sub(40))
         .unwrap_or_default();
     collapsed.chars().skip(start).take(120).collect()

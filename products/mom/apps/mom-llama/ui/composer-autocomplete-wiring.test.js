@@ -85,6 +85,164 @@ test("acceptance gates interaction and reconciles every committed backend result
   assert.match(ui, /let autocompleteAccepting = false/);
   assert.match(ui, /if \(autocompleteAccepting\) return;[\s\S]*form\.dataset\.busy/);
   assert.match(ui, /if \(autocompleteAccepting\) \{[\s\S]*event\.preventDefault\(\);[\s\S]*return;/);
-  assert.match(ui, /acceptance\?\.status !== "passed"/);
+  assert.match(ui, /acceptance\?\.status !== "host_integrated"/);
   assert.match(ui, /if \(!responseIsExact \|\| !viewIsExact\) \{[\s\S]*await refreshChat\(\);/);
+});
+
+const vm = require("node:vm");
+const composer = require("./composer-key-policy.js");
+const wireFixtures = JSON.parse(fs.readFileSync(path.join(
+  __dirname, "..", "..", "..", "crates", "mom-llama-runtime", "tests", "fixtures",
+  "composer-autocomplete-results.json",
+), "utf8"));
+
+// The public Rust DTO/serde test checks these exact envelopes. Run the complete
+// bridge and its registered input/key listeners; no private selector is replaced.
+// This minimal DOM/IPC fixture does not boot an app, run a model or prove undo.
+const autocompleteBridge = async (generation, acceptance, selectionOffset = 0) => {
+  const listeners = new Map();
+  const timers = new Map();
+  const calls = [];
+  const edits = [];
+  const inputEvents = [];
+  const readOnlyAtAcceptance = [];
+  let nextTimer = 0;
+  const anchor = wireFixtures.generation.result.anchor;
+  const textNode = () => ({ textContent: "", replaceChildren() { this.textContent = ""; } });
+  const ghostAnchor = textNode();
+  const ghostSuffix = textNode();
+  const hidden = new Set(["hidden"]);
+  const ghost = {
+    setAttribute: (name) => hidden.add(name),
+    removeAttribute: (name) => hidden.delete(name),
+    querySelector: (selector) => selector === ".composer-ai-anchor" ? ghostAnchor : ghostSuffix,
+  };
+  const status = textNode();
+  const chat = { dataset: { currentConversation: anchor.conversation_id, conversationKind: "chat" } };
+  const form = { id: "chat-form", dataset: {}, querySelectorAll: () => [] };
+  const textarea = {
+    id: "message", value: anchor.draft, form, readOnly: false, style: {}, scrollHeight: 24,
+    selectionStart: anchor.selection_start_utf16 - selectionOffset,
+    selectionEnd: anchor.selection_end_utf16 - selectionOffset,
+    dataset: { activeLeaf: anchor.active_leaf_message_id, executionProfileVersion: "7" },
+    matches: (selector) => selector === "#chat-form textarea[name='message']",
+    closest: () => null, setAttribute() {}, removeAttribute() {},
+    setRangeText(suffix, start, end, mode) {
+      edits.push({ suffix, start, end, mode });
+      this.value = this.value.slice(0, start) + suffix + this.value.slice(end);
+      this.selectionStart = this.selectionEnd = start + suffix.length;
+    },
+    dispatchEvent(event) {
+      inputEvents.push(event.type);
+      event.target = this;
+      for (const listener of listeners.get(event.type) || []) listener(event);
+      return true;
+    },
+  };
+  form.elements = { namedItem: (name) => name === "message" ? textarea : null };
+  const document = {
+    activeElement: textarea,
+    getElementById: (id) => ({ chat, "chat-form": form, "composer-ai-ghost": ghost,
+      "composer-ai-status": status }[id] || null),
+    querySelector: (selector) => selector === "#chat-form textarea[name='message']" ? textarea : null,
+    querySelectorAll: () => [],
+    addEventListener(name, listener) {
+      const entries = listeners.get(name) || [];
+      entries.push(listener);
+      listeners.set(name, entries);
+    },
+  };
+  const window = {
+    setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+    clearTimeout: (id) => timers.delete(id), addEventListener() {},
+  };
+  vm.runInNewContext(ui, {
+    document, window, localStorage: { getItem: () => null, setItem() {} },
+    TextEncoder, TextDecoder, MomLlamaComposerKeyPolicy: composer,
+    Event: class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } },
+  }, { filename: "coop-hx.js", timeout: 1000 });
+  // The existing boot refusal settles before the fixture enables IPC. None of
+  // the app startup/native capabilities are supplied by this component control.
+  await new Promise(setImmediate);
+  window.__TAURI__ = { core: { invoke: async (command, payload) => {
+    calls.push({ command, payload: JSON.parse(JSON.stringify(payload)) });
+    if (command === "mom_llama_draft_update") return { status: "host_integrated" };
+    if (command === "mom_llama_composer_autocomplete") return structuredClone(generation);
+    if (command === "mom_llama_composer_autocomplete_accept") {
+      readOnlyAtAcceptance.push(textarea.readOnly);
+      return structuredClone(acceptance);
+    }
+    throw new Error(`Unexpected component IPC: ${command}`);
+  } } };
+  assert.ok(listeners.get("input")?.length);
+  assert.ok(listeners.get("keydown")?.length);
+  for (const listener of listeners.get("input")) listener({ target: textarea, isComposing: false });
+  for (const [id, timer] of [...timers].sort((a, b) => a[1].delay - b[1].delay)) {
+    if (!timers.delete(id)) continue;
+    await timer.callback();
+  }
+  const presented = { hidden: hidden.has("hidden"), suffix: ghostSuffix.textContent,
+    draft: textarea.value, announcement: status.textContent };
+  let defaultPrevented = false;
+  for (const listener of listeners.get("keydown")) {
+    listener({ target: textarea, key: "ArrowRight", keyCode: 39, isComposing: false,
+      preventDefault: () => { defaultPrevented = true; } });
+  }
+  await new Promise(setImmediate);
+  assert.ok(calls.every(({ command }) => ["mom_llama_draft_update",
+    "mom_llama_composer_autocomplete", "mom_llama_composer_autocomplete_accept"].includes(command)),
+  JSON.stringify(calls));
+  return { calls, edits, inputEvents, presented, defaultPrevented, readOnlyAtAcceptance,
+    value: textarea.value, readOnly: textarea.readOnly, hidden: hidden.has("hidden") };
+};
+
+test("public command envelopes reach autocomplete presentation and exact normal acceptance", async () => {
+  const anchor = wireFixtures.generation.result.anchor;
+  // Ordinary typing is persisted unchanged, even when a non-end selection makes
+  // autocomplete ineligible. This control precedes the causal status assertions.
+  const ordinary = await autocompleteBridge(wireFixtures.generation, wireFixtures.acceptance, 1);
+  assert.equal(ordinary.value, anchor.draft);
+  assert.equal(ordinary.calls.length, 1);
+  assert.equal(ordinary.calls[0].command, "mom_llama_draft_update");
+  assert.equal(ordinary.calls[0].payload.message, anchor.draft);
+  assert.equal(ordinary.defaultPrevented, false);
+  assert.deepEqual(ordinary.edits, []);
+  for (const result of [wireFixtures.generation_blocked, wireFixtures.generation_unready]) {
+    const refused = await autocompleteBridge(result, wireFixtures.acceptance);
+    assert.equal(refused.calls.filter(({ command }) => command === "mom_llama_composer_autocomplete").length, 1);
+    assert.equal(refused.presented.hidden, true);
+    assert.equal(refused.value, anchor.draft);
+    assert.equal(refused.defaultPrevented, false);
+    assert.deepEqual(refused.edits, []);
+  }
+  // The first BEFORE failure is here: the actual typed host_integrated envelope
+  // is discarded rather than presented. Acceptance assertions are then unreached.
+  const admitted = await autocompleteBridge(wireFixtures.generation, wireFixtures.acceptance);
+  assert.equal(admitted.presented.hidden, false, JSON.stringify(admitted));
+  assert.equal(admitted.presented.suffix, " world");
+  assert.equal(admitted.presented.draft, anchor.draft);
+  const requested = admitted.calls.find(({ command }) => command === "mom_llama_composer_autocomplete");
+  assert.deepEqual(requested.payload, { conversation: "conversation", draft: anchor.draft,
+    activeLeafMessageId: "leaf", executionProfileVersion: 7, selectionStartUtf16: 8,
+    selectionEndUtf16: 8, attachmentIds: [] });
+  const accepted = admitted.calls.find(({ command }) => command === "mom_llama_composer_autocomplete_accept");
+  assert.deepEqual(accepted.payload, { anchor, suffix: " world" });
+  assert.equal(admitted.defaultPrevented, true);
+  assert.deepEqual(admitted.readOnlyAtAcceptance, [true]);
+  assert.equal(admitted.value, wireFixtures.acceptance.result.message);
+  assert.deepEqual(admitted.edits, [{ suffix: " world", start: 8, end: 8, mode: "end" }]);
+  assert.deepEqual(admitted.inputEvents, ["input"]);
+  assert.equal(admitted.readOnly, false);
+  assert.equal(admitted.hidden, true);
+  for (const result of [wireFixtures.acceptance_blocked, wireFixtures.acceptance_unready]) {
+    const refused = await autocompleteBridge(wireFixtures.generation, result);
+    assert.equal(refused.presented.hidden, false);
+    assert.equal(refused.calls.filter(({ command }) => command === "mom_llama_composer_autocomplete_accept").length, 1);
+    assert.deepEqual(refused.readOnlyAtAcceptance, [true]);
+    assert.equal(refused.value, anchor.draft);
+    assert.equal(refused.readOnly, false);
+    assert.equal(refused.hidden, true);
+    assert.deepEqual(refused.edits, []);
+    assert.deepEqual(refused.inputEvents, []);
+  }
 });

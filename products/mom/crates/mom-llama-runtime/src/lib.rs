@@ -33,10 +33,9 @@ pub use attachments::{
     prepare_document_chat_in_scope,
 };
 pub use chat::{
-    ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
-    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel_in_scope, chat_continue_in_scope,
-    chat_regenerate_in_scope, chat_send_in_scope, chat_send_stream_in_scope,
-    chat_skip_reasoning_in_scope,
+    ChatCancelOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ChatSkipReasoningOutput,
+    ChatStreamEvent, chat_cancel_in_scope, chat_continue_in_scope, chat_regenerate_in_scope,
+    chat_send_in_scope, chat_send_stream_in_scope, chat_skip_reasoning_in_scope,
 };
 pub use composer::{
     ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,

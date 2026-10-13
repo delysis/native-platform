@@ -69,7 +69,6 @@
   let refreshedOutputRevision = -1;
 
   let visualSession = '';
-  let outputText: Record<string, string> = {};
   let outputSerial = 0;
   let outputDocuments: Record<string, OpenDocument> = {};
   let configuredDocument: OpenDocument | null = null;
@@ -221,7 +220,7 @@
     scope = next; configuredDocumentKey = ''; scopeSerial += 1; activeDraft = draft; following = true;
     runs = []; error = ''; dispatching = false; importing = false;
     refreshing = false; cancelRequested = false;
-    outputText = {}; outputDocuments = {}; outputSerial += 1;
+    outputDocuments = {}; outputSerial += 1;
     void refresh(next);
   }
   function captureScope(): () => boolean {
@@ -300,16 +299,16 @@
   }
   async function hydrateOutputs(_expected: string, history: TerminalRun[], _revision: number): Promise<void> {
     const serial = ++outputSerial, current = captureScope();
-    const texts: Record<string, string> = {}, opened: Record<string, OpenDocument> = {};
+    const opened: Record<string, OpenDocument> = {};
     for (const run of history) {
       if (!run.output_document_id) continue;
       try {
         const document = await readOutput(run);
-        texts[run.run_id] = document.text; opened[run.run_id] = document;
+        opened[run.run_id] = document;
       } catch (failure) { if (current() && serial === outputSerial) error = normalizeFailure(failure).message; }
       if (!current() || serial !== outputSerial) return;
     }
-    if (current() && serial === outputSerial) { outputText = texts; outputDocuments = opened; }
+    if (current() && serial === outputSerial) outputDocuments = opened;
   }
   async function prompt(input: string, current: () => boolean): Promise<string> {
     const owner = workspaceScope;
@@ -442,7 +441,7 @@
     {:else}
       <div class="history" aria-label="Retained conversation" bind:this={historyViewport} on:scroll={trackScroll}>
         {#each recentRuns as run (run.run_id)}
-          <ChatTurn {run} output={outputText[run.run_id] ?? run.preview}
+          <ChatTurn {run} output={outputDocuments[run.run_id]?.text ?? run.preview}
             pinned={Boolean(run.output_document_id && pinnedOutputs.has(run.output_document_id))}
             onOpen={run.output_document_id ? () => onOpenDocument(run.output_document_id!) : undefined}
             onPin={run.output_document_id && onPinOutput ? () => onPinOutput?.(run.output_document_id!) : undefined} />

@@ -15,8 +15,7 @@ use crate::now_ms;
 use crate::operation_scope::{ChatOperationLease, OperationScope};
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::applied_skill_prompt;
-use crate::store::RuntimeStore;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use llama_native_engine::GenerationTicket;
 use llama_native_types::{
     ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
@@ -28,8 +27,6 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-const ACTIVE_REQUESTS_NAMESPACE: &str = "active-requests.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatSendInput {
@@ -56,15 +53,14 @@ impl Default for ChatSendOptions {
 ///
 /// All exits from generation, including `?`, early blocked results, and
 /// unwinding, cross this guard. Its destructor is deliberately best-effort:
-/// the original error remains authoritative, while the request registry and
-/// stream still receive a terminal failure whenever their stores are usable.
+/// the original error remains authoritative, while the live lease is released
+/// and the stream receives a terminal failure whenever its callback is usable.
 struct ChatStreamLifecycle<'a, F>
 where
     F: FnMut(ChatStreamEvent) -> Result<()>,
 {
     request_id: String,
     conversation_id: String,
-    data_dir: PathBuf,
     options: ChatSendOptions,
     on_event: &'a mut Option<F>,
     operation: ChatOperationLease,
@@ -79,7 +75,6 @@ where
     fn new(
         request_id: &str,
         conversation_id: &str,
-        data_dir: &Path,
         options: ChatSendOptions,
         on_event: &'a mut Option<F>,
         operation: ChatOperationLease,
@@ -87,7 +82,6 @@ where
         Self {
             request_id: request_id.to_string(),
             conversation_id: conversation_id.to_string(),
-            data_dir: data_dir.to_path_buf(),
             options,
             on_event,
             operation,
@@ -119,11 +113,6 @@ where
     fn finish_cancelled(&mut self) -> Result<CommandResult<ChatSendOutput>> {
         self.operation.request_cancel();
         self.operation.arbitrate_terminal();
-        mark_request_state(
-            &self.data_dir,
-            &self.request_id,
-            ChatRequestState::Cancelled,
-        )?;
         self.finish(
             "cancelled",
             Some("The local model request was cancelled.".to_string()),
@@ -175,17 +164,11 @@ where
             return;
         }
         if self.operation.arbitrate_terminal() {
-            let _ = mark_request_state(
-                &self.data_dir,
-                &self.request_id,
-                ChatRequestState::Cancelled,
-            );
             let _ = self.finish(
                 "cancelled",
                 Some("The local model request was cancelled.".to_string()),
             );
         } else {
-            let _ = mark_request_state(&self.data_dir, &self.request_id, ChatRequestState::Failed);
             let _ = self.finish(
                 "failed",
                 Some("Generation ended before producing a completed response.".to_string()),
@@ -209,33 +192,6 @@ pub struct ChatSendOutput {
     pub completion_tokens: usize,
     pub cache_id: Option<String>,
     pub cache_reused: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatRequestState {
-    Running,
-    Completed,
-    CancelRequested,
-    Cancelled,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ActiveChatRequest {
-    pub request_id: String,
-    pub conversation_id: String,
-    pub pid: Option<u32>,
-    pub started_at: String,
-    pub updated_at: String,
-    pub state: ChatRequestState,
-    pub cancel_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct ActiveChatDb {
-    #[serde(default)]
-    pub requests: Vec<ActiveChatRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -634,19 +590,6 @@ where
         &attachment_context.current_text,
     );
     let request_id = Uuid::new_v4().to_string();
-    let cancel_path = format!("native://request/{request_id}");
-    register_active_request(
-        &settings.data_dir,
-        ActiveChatRequest {
-            request_id: request_id.clone(),
-            conversation_id: conversation.id.clone(),
-            pid: None,
-            started_at: now_ms().to_string(),
-            updated_at: now_ms().to_string(),
-            state: ChatRequestState::Running,
-            cancel_path: cancel_path.clone(),
-        },
-    )?;
     let operation = scope.register_chat(&request_id, &conversation.id)?;
     emit(
         &mut on_event,
@@ -666,7 +609,6 @@ where
     let mut stream = ChatStreamLifecycle::new(
         &request_id,
         &conversation.id,
-        &settings.data_dir,
         options,
         &mut on_event,
         operation,
@@ -708,7 +650,6 @@ where
         ) {
             Ok(handle) => handle,
             Err(blocked) => {
-                mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
                 return Ok(CommandResult::blocked(
                     "mom_llama.chat_send",
                     &blocked.readiness,
@@ -821,7 +762,6 @@ where
             Err(error) => return Err(chat_ticket_error(error)),
         };
         let Some(output) = outputs.into_iter().next() else {
-            mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
             return Ok(CommandResult::blocked(
                 "mom_llama.chat_send",
                 "blocked_native_runtime",
@@ -857,7 +797,6 @@ where
         return stream.finish_cancelled();
     }
     if assistant_text.trim().is_empty() {
-        mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
         return Ok(empty_native_response_result(
             reasoning_content.as_deref(),
             options.fake_fixture,
@@ -935,7 +874,6 @@ where
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
     )?;
-    mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Completed)?;
     let result = ChatSendOutput {
         request_id: request_id.clone(),
         conversation_id: conversation.id,
@@ -1042,22 +980,7 @@ pub fn chat_cancel_in_scope(
     scope: &OperationScope,
     conversation_id: &str,
 ) -> Result<CommandResult<ChatCancelOutput>> {
-    let settings = resolve_settings()?;
-    let db = load_active_requests(&settings.data_dir)?;
-    let Some(request) = db
-        .requests
-        .iter()
-        .rev()
-        .find(|request| {
-            request.conversation_id == conversation_id
-                && scope.chat_request_is_active(&request.request_id, conversation_id)
-                && matches!(
-                    request.state,
-                    ChatRequestState::Running | ChatRequestState::CancelRequested
-                )
-        })
-        .cloned()
-    else {
+    let Some(request_id) = scope.current_chat_request_id(conversation_id, true) else {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_cancel",
             "stub_blocked",
@@ -1068,8 +991,8 @@ pub fn chat_cancel_in_scope(
             ),
         ));
     };
-    let cancellation_accepted = scope.request_chat_cancellation(&request.request_id);
-    let native_sequences_cancelled = scope.cancel_native(&request.request_id, None);
+    let cancellation_accepted = scope.request_chat_cancellation(&request_id);
+    let native_sequences_cancelled = scope.cancel_native(&request_id, None);
     if !cancellation_accepted && native_sequences_cancelled == 0 {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_cancel",
@@ -1081,18 +1004,13 @@ pub fn chat_cancel_in_scope(
             ),
         ));
     }
-    mark_request_state(
-        &settings.data_dir,
-        &request.request_id,
-        ChatRequestState::CancelRequested,
-    )?;
     Ok(CommandResult::passed(
         "mom_llama.chat_cancel",
         "contracted",
         ChatCancelOutput {
-            request_id: request.request_id,
+            cancel_path: format!("native://request/{request_id}"),
+            request_id,
             conversation_id: conversation_id.to_string(),
-            cancel_path: request.cancel_path,
         },
         Vec::new(),
         Vec::new(),
@@ -1105,19 +1023,7 @@ pub fn chat_skip_reasoning_in_scope(
     scope: &OperationScope,
     conversation_id: &str,
 ) -> Result<CommandResult<ChatSkipReasoningOutput>> {
-    let settings = resolve_settings()?;
-    let db = load_active_requests(&settings.data_dir)?;
-    let Some(request) = db
-        .requests
-        .iter()
-        .rev()
-        .find(|request| {
-            request.conversation_id == conversation_id
-                && request.state == ChatRequestState::Running
-                && scope.chat_request_is_active(&request.request_id, conversation_id)
-        })
-        .cloned()
-    else {
+    let Some(request_id) = scope.current_chat_request_id(conversation_id, false) else {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_skip_reasoning",
             "stub_blocked",
@@ -1131,7 +1037,7 @@ pub fn chat_skip_reasoning_in_scope(
         ));
     };
     let branch_id = "assistant";
-    if scope.skip_native_reasoning(&request.request_id, Some(branch_id)) == 0 {
+    if scope.skip_native_reasoning(&request_id, Some(branch_id)) == 0 {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_skip_reasoning",
             "stub_blocked",
@@ -1146,7 +1052,7 @@ pub fn chat_skip_reasoning_in_scope(
         "mom_llama.chat_skip_reasoning",
         "contracted",
         ChatSkipReasoningOutput {
-            request_id: request.request_id,
+            request_id,
             conversation_id: conversation_id.to_string(),
             branch_id: branch_id.to_string(),
         },
@@ -1422,68 +1328,17 @@ fn stream_event(
     }
 }
 
-fn load_active_requests(data_dir: &Path) -> Result<ActiveChatDb> {
-    Ok(RuntimeStore::open(data_dir)?
-        .get(ACTIVE_REQUESTS_NAMESPACE)?
-        .unwrap_or_default())
-}
-
-fn register_active_request(data_dir: &Path, request: ActiveChatRequest) -> Result<()> {
-    mutate_active_requests(data_dir, |db| db.requests.push(request))
-}
-
-fn mark_request_state(data_dir: &Path, request_id: &str, state: ChatRequestState) -> Result<()> {
-    mutate_active_requests(data_dir, |db| {
-        for request in &mut db.requests {
-            if request.request_id == request_id {
-                request.state = state.clone();
-                request.updated_at = now_ms().to_string();
-            }
-        }
-    })
-    .with_context(|| "failed to persist active request state")
-}
-
-fn mutate_active_requests(data_dir: &Path, mutation: impl FnOnce(&mut ActiveChatDb)) -> Result<()> {
-    RuntimeStore::open(data_dir)?.mutate(ACTIVE_REQUESTS_NAMESPACE, ActiveChatDb::default, |db| {
-        mutation(db);
-        Ok(())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveChatRequest, ChatAttachmentContext, ChatRequestState, ChatSendOptions,
-        ChatStreamLifecycle, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
-        apply_conversation_model_pair, build_native_messages, empty_native_response_result,
-        load_active_requests, native_context_messages, parse_reasoning_output,
-        register_active_request, user_turn_is_empty,
+        ChatAttachmentContext, ChatSendOptions, ChatStreamLifecycle, Message, MessageRole,
+        ReasoningStreamParser, ReasoningTarget, apply_conversation_model_pair,
+        build_native_messages, empty_native_response_result, native_context_messages,
+        parse_reasoning_output, user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
-    use std::path::{Path, PathBuf};
-
-    struct TestDataDir(PathBuf);
-
-    impl TestDataDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("mom-llama-chat-{label}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("create temporary runtime store");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDataDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use std::path::PathBuf;
 
     fn assistant_message(reasoning: Option<&str>, content: &str) -> Message {
         Message {
@@ -1595,20 +1450,6 @@ mod tests {
 
     #[test]
     fn dropping_started_stream_emits_one_failed_terminal_and_closes_registry_state() {
-        let data_dir = TestDataDir::new("failed-terminal");
-        register_active_request(
-            data_dir.path(),
-            ActiveChatRequest {
-                request_id: "request".to_string(),
-                conversation_id: "conversation".to_string(),
-                pid: None,
-                started_at: "1".to_string(),
-                updated_at: "1".to_string(),
-                state: ChatRequestState::Running,
-                cancel_path: "native://request/request".to_string(),
-            },
-        )
-        .expect("register request");
         let mut events = Vec::new();
         let mut callback = Some(|event| {
             events.push(event);
@@ -1619,7 +1460,6 @@ mod tests {
             let mut stream = ChatStreamLifecycle::new(
                 "request",
                 "conversation",
-                data_dir.path(),
                 ChatSendOptions::default(),
                 &mut callback,
                 scope
@@ -1633,14 +1473,12 @@ mod tests {
         assert_eq!(events[0].event, "failed");
         assert_eq!(events[0].request_id, "request");
         assert!(events[0].real_engine_invoked);
-        let requests = load_active_requests(data_dir.path()).expect("load request registry");
-        assert_eq!(requests.requests[0].state, ChatRequestState::Failed);
+        assert_eq!(scope.active_operation_count(), 0);
     }
 
     #[test]
     fn cancelled_receipt_and_terminal_preserve_the_same_invocation_fact() {
         for invoked in [false, true] {
-            let data_dir = TestDataDir::new("cancelled-invocation");
             let scope = OperationScope::detached();
             let mut events = Vec::new();
             let mut callback = Some(|event| {
@@ -1651,7 +1489,6 @@ mod tests {
                 let mut stream = ChatStreamLifecycle::new(
                     "request",
                     "conversation",
-                    data_dir.path(),
                     ChatSendOptions::default(),
                     &mut callback,
                     scope
@@ -1669,13 +1506,12 @@ mod tests {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].event, "cancelled");
             assert_eq!(events[0].real_engine_invoked, invoked);
-            assert!(!scope.chat_request_is_active("request", "conversation"));
+            assert_eq!(scope.active_operation_count(), 0);
         }
     }
 
     #[test]
     fn explicit_terminal_prevents_destructor_from_emitting_a_second_terminal() {
-        let data_dir = TestDataDir::new("completed-terminal");
         let mut events = Vec::new();
         let mut callback = Some(|event| {
             events.push(event);
@@ -1686,7 +1522,6 @@ mod tests {
             let mut stream = ChatStreamLifecycle::new(
                 "request",
                 "conversation",
-                data_dir.path(),
                 ChatSendOptions::default(),
                 &mut callback,
                 scope
@@ -1701,6 +1536,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "completed");
         assert!(!events[0].real_engine_invoked);
+        assert_eq!(scope.active_operation_count(), 0);
     }
 
     #[test]

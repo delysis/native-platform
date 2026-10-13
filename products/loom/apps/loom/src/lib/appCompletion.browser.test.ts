@@ -790,3 +790,248 @@ it.each([
     await keyboard.cleanup();
   }
 }, 20_000);
+
+it('keeps the actual writer choice through rejection, four-slot absence and re-admission', async () => {
+  restoreStorage = Object.entries(localStorage); localStorage.clear();
+  restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
+  Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+  const sourceText = 'Intro\n\nSuffix';
+  const sourceBlob = await sha256(sourceText);
+  const exactPromptBlob = await sha256(sourceText.slice(0, 7));
+  const opened: OpenDocument = { summary: {
+    document_id: 'intent-doc', relative_path: 'Intent.md', title: 'Intent', kind: 'prose',
+    revision_id: 'intent-revision', active_blob_id: sourceBlob, word_count: 2, externally_modified: false
+  }, visible_blob_id: sourceBlob, text: sourceText, transient_draft: null };
+  const project: ProjectSnapshot = { project_id: 'intent-project', session_id: 'intent-session',
+    title: 'Owned intent fixture', root: '/injected/intent', schema_version: 1,
+    pending_recovery: 0, documents: [opened.summary] };
+  const model: ModelCapabilitySummary = {
+    model_id: 'intent-injected-writer', display_name: 'Injected transport; no inference', local: true,
+    loaded: true, header_verified: true, completion: true, chat: false, fill_in_middle: false,
+    output_tokens: true, logprobs: false, model_path: '/injected/intent.gguf', file_bytes: 1,
+    architecture: 'gemma4', context_tokens: 4096, model_sha256: 'a'.repeat(64),
+    projector_present: false, projector_sha256: null, media_kinds: [], policy_candidate: null,
+    policy_verified: { profile_id: 'gemma_4_e2b_base_q8_loom_v1', rank: 0 },
+    tested_profile: 'gemma_4_e2b_base_q8_loom_v1'
+  };
+  let admission: WeaveStarted | null = null;
+  let admissions = 0;
+  let nativePolicyEnabled = false;
+  let preferences = { revision: '0', last_local_model: null,
+    project_suggestions: { [project.project_id]: false } };
+  function currentBranches(active: WeaveStarted): BranchCard[] {
+    return active.branches.map((branch): BranchCard => ({ ...branch, status: 'generating' }));
+  }
+  let populated = false;
+  let sequence = 1;
+  const texts = ['ordinary default prose ', '123.', 'unchosen alternative prose ', 'fourth ordinary prose '];
+  let snapshotReads = 0;
+  const writes: string[] = [];
+  const unexpected: string[] = [];
+  const pending = new Set<Promise<unknown>>();
+  function snapshot(): CompletionSnapshot {
+    snapshotReads += 1;
+    const active = admission;
+    const current = active ? currentBranches(active) : [];
+    return { project_id: project.project_id, session_id: project.session_id,
+      document_id: opened.summary.document_id, branches: current, next_cursor: null, has_more: false,
+      active_operations: active ? [{ request_id: active.request_id, attempt_id: `${active.request_id}:1`,
+        operation_sequence: '1', phase: 'running', cancellation_requested: false,
+        authoritative_terminal: null, final_projection: null, progress_sequences: [String(sequence)],
+        branches: current.map((branch, index) => ({ run_id: branch.run_id, branch_id: branch.branch_id,
+          partial_text: populated ? { text: texts[index], sequence: String(sequence),
+            utf8_byte_len: String(new TextEncoder().encode(texts[index]).byteLength) } : null })) }] : []
+    };
+  }
+  async function reply(command: string, args: Record<string, any>): Promise<unknown> {
+    switch (command) {
+      case 'plugin:loom|cabal_snapshot': return null;
+      case 'plugin:loom|preferences_get': return preferences;
+      case 'plugin:loom|preferences_update':
+        expect(args).toEqual({ change: { kind: 'suggestions', project_id: project.project_id, enabled: true } });
+        preferences = { revision: '1', last_local_model: null,
+          project_suggestions: { [project.project_id]: true } };
+        return preferences;
+      case 'plugin:loom|application_close_pending': return false;
+      case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id,
+        workspace_session_id: 'intent-workspace-session', roots: [{ id: 'owner', name: project.title,
+          owner: true, available: true, path: project.root, project_id: project.project_id }] };
+      case 'plugin:loom|document_open': return opened;
+      case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'intent-context' };
+      case 'plugin:loom|workspace_template_get': return { enabled: false, document_id: null,
+        revision_id: null, error: null, config: { panes: {} } };
+      case 'plugin:loom|build_model_policy_get': return { name: 'writer-gemma4-base-v2', activation: 'quiet_default',
+        canonical_sha256: '2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2' };
+      case 'plugin:loom|model_catalog_list': throw { code: 'injected_catalog_unavailable', message: 'Owned fixture has no catalog' };
+      case 'plugin:loom|model_list': return [model];
+      case 'plugin:loom|inference_status': return { suggestions: null };
+      case 'plugin:loom|model_download_list':
+      case 'plugin:loom|workspace_pane_list':
+      case 'plugin:loom|terminal_list':
+      case 'plugin:loom|material_list':
+      case 'plugin:loom|co_writer_list': return [];
+      case 'plugin:loom|suggestions_set':
+        expect(args).toEqual({ projectId: project.project_id, sessionId: project.session_id,
+          enabled: expect.any(Boolean) });
+        nativePolicyEnabled = args.enabled;
+        return;
+      case 'plugin:loom|focus_mode_set': return;
+      case 'plugin:loom|visual_ghost_rendered': expect(args).toEqual({}); return;
+      case 'plugin:loom|completion_snapshot': return snapshot();
+      case 'plugin:loom|weave_start': {
+        admissions += 1;
+        expect(admissions, 'one public enable admits this exact fixture family').toBe(1);
+        expect(nativePolicyEnabled, 'native policy must acknowledge the public enable first').toBe(true);
+        expect(args).toEqual({ projectId: project.project_id, sessionId: project.session_id,
+          commandId: expect.stringMatching(/^[0-9A-HJKMNP-TV-Z]{26}$/u),
+          documentId: opened.summary.document_id, relativePath: opened.summary.relative_path,
+          sourceRevisionId: opened.summary.revision_id, expectedVisibleBlobId: sourceBlob,
+          cursorByte: 7, policy: { kind: 'automatic_visual_v4' } });
+        admission = { command_id: args.commandId, request_id: `weave-${args.commandId}`,
+          project_id: args.projectId, session_id: args.sessionId, document_id: args.documentId,
+          source_revision_id: args.sourceRevisionId, exact_prompt_blob_id: exactPromptBlob, speculation: null,
+          branches: ['a', 'b', 'c', 'd'].map((slot, index): BranchCard => ({
+            run_id: `intent-run-${slot}`, branch_id: `intent-branch-${slot}`, weave_command_id: args.commandId,
+            document_id: args.documentId, candidate_id: null, source_revision_id: args.sourceRevisionId,
+            target_start_byte: args.cursorByte, target_end_byte: args.cursorByte, text: '',
+            output_blob_id: null, output_byte_len: null, status: 'queued', seed: String(index),
+            model_id: model.model_id, selection: null, error: null, error_truncated: false,
+            created_at_unix_ms: index + 1
+          })) };
+        return admission;
+      }
+      case 'plugin:loom|weave_status':
+        expect(args).toEqual({ projectId: project.project_id, sessionId: project.session_id,
+          commandId: admission?.command_id ?? expect.stringMatching(/^[0-9A-HJKMNP-TV-Z]{26}$/u) });
+        return admission ? { ...admission, branches: currentBranches(admission) } satisfies WeaveStarted : null;
+      case 'plugin:loom|document_draft_upsert':
+      case 'plugin:loom|document_checkpoint':
+        writes.push(command); throw new Error('This owned no-accept fixture authorizes no writes');
+      default: unexpected.push(command); throw new Error(`Unexpected intent-fixture operation: ${command}`);
+    }
+  }
+  transport.invoke.mockImplementation((command: string, args: Record<string, any> = {}) => {
+    const admitted = reply(command, args);
+    pending.add(admitted);
+    void admitted.then(() => pending.delete(admitted), () => pending.delete(admitted));
+    return admitted;
+  });
+  function wake(): void {
+    expect(admission, 'a wake cannot invent an admitted family').not.toBeNull();
+    const active = admission!;
+    const envelope: DesktopGenerationEnvelope = { project_id: active.project_id, session_id: active.session_id,
+      document_id: active.document_id, request_id: active.request_id, event: { event: 'generation', payload: {
+        event_id: `intent-event-${sequence}`, run_id: active.branches[0].run_id, branch_id: active.branches[0].branch_id,
+        sequence, kind: { kind: 'text_delta', text: 'wake only; actual snapshot owns projection' }, occurred_at_ms: sequence
+      } } };
+    for (const listener of transport.listeners.get('loom://generation') ?? []) listener({ payload: envelope });
+  }
+  const { getCompletionSnapshot } = await import('./ipc');
+  async function barrier(): Promise<void> {
+    await getCompletionSnapshot(project.project_id, project.session_id, opened.summary.document_id, []);
+    await Promise.allSettled([...pending]);
+    await tick();
+    // Join the renderer's real rejection-frame boundary, not an elapsed-time
+    // guess. Assertions below use actual published phase/DOM output.
+    await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
+    await tick();
+  }
+  const target = document.createElement('div'); document.body.append(target);
+  mounted = mount(App, { target });
+  const keyboard = userEvent.setup();
+  let stage = 'ordinary startup end13 and connected interior caret7';
+  let observed: { glyph: string | null; witness: Record<string, any>; author: string; writes: string[]; unexpected: string[] } | null = null;
+  try {
+    await expect.element(page.getByRole('textbox', { name: 'Intent, manuscript editor', exact: true })).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Intent, manuscript editor', exact: true }).element();
+    // Visibility precedes startup's real post-paint focus-at-end owner. Join
+    // that ordinary publication before placing the causal interior caret.
+    await getPreferences();
+    await barrier();
+    await expect.poll(() => completionWitness().pre_admission?.caret_byte).toBe(13);
+    await expect.poll(() => completionWitness().editor_selection).toMatchObject({
+      empty: true, caret_at_end: true, caret_byte_offset: 13
+    });
+    editor.focus();
+    await barrier();
+    expect(editor.isConnected).toBe(true);
+    expect(document.activeElement).toBe(editor);
+    const paragraph = Array.from(editor.querySelectorAll('p')).find(node => node.textContent === 'Suffix');
+    expect(paragraph, 'real connected second paragraph is a fixture prerequisite').toBeDefined();
+    const node = paragraph!.firstChild!;
+    window.getSelection()!.setBaseAndExtent(node, 0, node, 0);
+    document.dispatchEvent(new Event('selectionchange'));
+    await expect.poll(() => completionWitness().pre_admission?.caret_byte).toBe(7);
+    stage = 'ordinary startup-discovered writer with suggestions off';
+    await expect.poll(() => completionWitness().writer_id).toBe(model.model_id);
+    await expect.poll(() => completionWitness().autocomplete_enabled).toBe(false);
+    expect(admissions).toBe(0);
+    expect(nativePolicyEnabled).toBe(false);
+    expect(writes).toEqual([]);
+    stage = 'actual editor shortcut enable and exact weave admission';
+    const enable = new KeyboardEvent('keydown', { key: 'G', code: 'KeyG', metaKey: true,
+      shiftKey: true, bubbles: true, cancelable: true });
+    editor.dispatchEvent(enable);
+    expect(enable.defaultPrevented, 'the actual App handles the public enable shortcut').toBe(true);
+    await expect.poll(() => completionWitness().autocomplete_enabled).toBe(true);
+    await expect.poll(() => completionWitness().pre_admission?.caret_byte).toBe(7);
+    await expect.poll(() => admissions, { timeout: 10000 }).toBe(1);
+    await barrier();
+    expect(nativePolicyEnabled).toBe(true);
+    expect(completionWitness().writer_id).toBe(model.model_id);
+    expect(writes).toEqual([]);
+    stage = 'admitted defaultA, real writerB, refusal and re-admission oracles';
+    populated = true; wake();
+    await expect.poll(() => ({
+      glyph: glyph(), witness: completionWitness(), snapshotReads,
+      writes: [...writes], unexpected: [...unexpected]
+    })).toMatchObject({ glyph: texts[0] });
+    await keyboard.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await expect.poll(() => completionWitness().selected_run_id).toBe('intent-run-b');
+    await expect.poll(glyph).toBe('123.');
+    expect(glyph(), 'initial exact writer B glyph is required before any causal assertion').toBe('123.');
+    expect(authorDomText(editor)).toBe('IntroSuffix');
+    expect(writes).toEqual([]);
+    texts[1] = '123. 5-meter-long desk. The office was empty.'; sequence = 2;
+    const before = snapshotReads; wake();
+    await expect.poll(() => snapshotReads).toBeGreaterThan(before);
+    await expect.poll(() => completionWitness().family_phase?.kind).toBe('pending');
+    expect(glyph()).toBeNull(); // Absence alone is not the INTENT cause oracle.
+    texts[1] += ' Another sentence follows.'; sequence = 3;
+    wake(); await barrier();
+    await expect.poll(() => glyph() === texts[2] || completionWitness().family_phase?.kind === 'pending').toBe(true);
+    observed = { glyph: glyph(), witness: completionWitness(), author: authorDomText(editor),
+      writes: [...writes], unexpected: [...unexpected] };
+  } catch (error) {
+    const editorAtFailure = document.querySelector('.loom-prosemirror');
+    console.error('Real-App intent fixture failure', JSON.stringify({
+      stage, glyph: glyph(), witness: completionWitness(),
+      author_text: editorAtFailure ? authorDomText(editorAtFailure) : null,
+      admission, preferences, native_policy_enabled: nativePolicyEnabled, snapshotReads,
+      pending_replies: pending.size, writes: [...writes], unexpected: [...unexpected], observed,
+      ipc_calls: transport.invoke.mock.calls.map(call => [...call])
+    }));
+    throw error;
+  } finally {
+    await keyboard.cleanup();
+    // Drain admitted replies and the actual owning IPC lane before component
+    // teardown, while its mock exists. All replies settle; none stay pending.
+    await getCompletionSnapshot(project.project_id, project.session_id, opened.summary.document_id, []);
+    await getPreferences();
+    await Promise.allSettled([...pending]);
+    if (mounted) await unmount(mounted);
+    mounted = null;
+    // Join any teardown-admitted work too, before afterEach removes the mock.
+    await getCompletionSnapshot(project.project_id, project.session_id, opened.summary.document_id, []);
+    await getPreferences();
+    await Promise.allSettled([...pending]);
+  }
+  expect(pending.size).toBe(0);
+  expect(observed, 'all ordinary glyph/caret/refusal prerequisites must finish').not.toBeNull();
+  expect(observed!.writes).toEqual([]);
+  expect(observed!.unexpected).toEqual([]);
+  expect(observed!.author).toBe('IntroSuffix');
+  expect(observed!.glyph, `writer B must not become visible unchosen C after re-admission: ${JSON.stringify(observed!.witness)}`).toBeNull();
+  expect(observed!.witness.family_phase.kind).toBe('pending');
+}, 20_000);

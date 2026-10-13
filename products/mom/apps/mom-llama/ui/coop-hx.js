@@ -1937,7 +1937,7 @@
           attachmentIds: anchor.attachment_ids,
         });
         if (serial !== autocompleteSerial) return;
-        if (response?.status !== "passed") {
+        if (response?.status !== "host_integrated") {
           cancelComposerAutocomplete({ native: false });
           return;
         }
@@ -1993,7 +1993,7 @@
         suffix: presented.suffix,
       });
       const accepted = acceptance?.result;
-      if (acceptance?.status !== "passed") {
+      if (acceptance?.status !== "host_integrated") {
         cancelComposerAutocomplete({ native: false });
         return false;
       }

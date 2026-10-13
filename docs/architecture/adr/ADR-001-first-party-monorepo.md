@@ -89,3 +89,12 @@ After a path cutover, roll back the affected component to its last parity-proven
 ## Consequences
 
 Atomic platform/product changes, one dependency graph, one lockfile, and cross-product vertical tests become possible. CI and repository policy become more centralized. Product release cadence remains independent, while accidental divergence becomes harder. Migration must be staged carefully because a broad repository move cannot substitute for correctness, parity, or data-recovery proof.
+
+## Loom EASL retirement — 2026-10-12
+
+The [current retirement decision](../LOOM-EASL-RETIREMENT-2026-10-12.md)
+supersedes the 2026-10-10 dependency scope above. The experimental native
+editor, `loom-markdown` and `loom-text-session` SDKs are withdrawn by explicit
+product choice, accepting external API breaks. Root policy no longer allows
+an EASL Git dependency; retained native bindings and isolated Signal pins
+remain exact. Earlier source and verification records remain historical.

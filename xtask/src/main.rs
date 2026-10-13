@@ -273,9 +273,6 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
                     "https://github.com/delysis/llama-cpp-rs" => {
                         ("llama-cpp-rs", "b508f1c7652c751513c361c7e4fdeb090fbed577")
                     }
-                    "https://github.com/delysis/easl" => {
-                        ("easl", "6d7c913a5b8d6874ab56f5168d222dc95964afb9")
-                    }
                     "https://github.com/whisperfish/presage"
                         if manifest.ends_with("products/loom/signal/Cargo.toml") =>
                     {
@@ -450,28 +447,6 @@ mod tests {
         let error = check_git_dependencies(&manifest, Path::new("Cargo.toml"))
             .expect_err("first-party Git source must fail");
         assert!(error.to_string().contains("forbidden Git dependency"));
-    }
-
-    #[test]
-    fn canonical_easl_git_dependency_requires_the_qualified_revision() {
-        let pinned: toml::Value = toml::from_str(
-            r#"dependency = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }"#,
-        ).expect("pinned manifest");
-        check_git_dependencies(&pinned, Path::new("Cargo.toml"))
-            .expect("qualified canonical source");
-        for fields in [
-            "rev = \"deadbeef\"",
-            "branch = \"main\"",
-            "rev = \"6d7c913a5b8d6874ab56f5168d222dc95964afb9\", tag = \"moving\"",
-        ] {
-            let source = format!(
-                "dependency = {{ git = \"https://github.com/delysis/easl.git\", {fields} }}"
-            );
-            let manifest: toml::Value = toml::from_str(&source).expect("test manifest");
-            let error = check_git_dependencies(&manifest, Path::new("Cargo.toml"))
-                .expect_err("unsealed source");
-            assert!(error.to_string().contains("unsealed easl dependency"));
-        }
     }
 
     #[test]

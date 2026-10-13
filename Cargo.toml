@@ -6,9 +6,6 @@ members = [
     "crates/desktop-vault",
     "crates/desktop-generation-policy",
     "products/loom/crates/loom-config",
-    "products/loom/crates/loom-markdown",
-    "products/loom/crates/loom-text-session",
-    "products/loom/experiments/easl-interface",
     "crates/services/archive-friends",
 
     "crates/desktop-launch",
@@ -219,9 +216,6 @@ strip = "symbols"
 strip = "none"
 
 [patch.crates-io]
-# EASL owns these text-engine repairs; keep all consumers on its exact revision.
-harfrust = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
-parley = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }
 # Keep verified ONNX Runtime DLLs beside Windows test/example executables.

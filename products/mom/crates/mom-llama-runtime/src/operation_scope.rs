@@ -153,7 +153,7 @@ struct ToolLoopOperation {
 
 struct OperationRegistries {
     next_mcp_id: u64,
-    chats: BTreeMap<String, ChatOperation>,
+    chats: Vec<(String, ChatOperation)>,
     mentions: MentionCancelRegistry,
     mcp: BTreeMap<u64, McpOperation>,
     tool_loops: HashMap<String, ToolLoopOperation>,
@@ -171,7 +171,7 @@ struct OperationScopeInner {
 
 /// Runtime-local authority for every live Mom product operation.
 ///
-/// Durable request documents remain recovery and user-visible state. This
+/// Conversations and audit receipts remain durable product state. This
 /// scope is the sole in-process cancellation/control owner, so two runtime
 /// instances cannot discover or cancel each other's live work.
 #[derive(Clone)]
@@ -250,7 +250,7 @@ impl OperationScope {
             native_key,
             registries: Mutex::new(OperationRegistries {
                 next_mcp_id: 0,
-                chats: BTreeMap::new(),
+                chats: Vec::new(),
                 mentions: BTreeMap::new(),
                 mcp: BTreeMap::new(),
                 tool_loops: HashMap::new(),
@@ -308,20 +308,20 @@ impl OperationScope {
             .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("chat operation registry is unavailable"))?;
-        if registries.chats.contains_key(request_id) {
+        if registries.chats.iter().any(|(id, _)| id == request_id) {
             anyhow::bail!("chat request identity is already active in this runtime");
         }
         let cancellation = Arc::new(ChatCancelControl::new(
             self.0.quiescing.load(Ordering::Acquire),
         ));
-        registries.chats.insert(
+        registries.chats.push((
             request_id.to_owned(),
             ChatOperation {
                 conversation_id: conversation_id.to_owned(),
                 cancellation: Arc::clone(&cancellation),
                 identity: Arc::clone(&identity),
             },
-        );
+        ));
         Ok(ChatOperationLease {
             scope: self.clone(),
             request_id: request_id.to_owned(),
@@ -330,18 +330,24 @@ impl OperationScope {
         })
     }
 
-    pub(crate) fn chat_request_is_active(&self, request_id: &str, conversation_id: &str) -> bool {
-        self.0
-            .registries
-            .lock()
-            .ok()
-            .and_then(|registries| {
-                registries
-                    .chats
-                    .get(request_id)
-                    .map(|operation| operation.conversation_id == conversation_id)
-            })
-            .unwrap_or(false)
+    pub(crate) fn current_chat_request_id(
+        &self,
+        conversation_id: &str,
+        allow_cancel_requested: bool,
+    ) -> Option<String> {
+        self.0.registries.lock().ok().and_then(|registries| {
+            registries
+                .chats
+                .iter()
+                .rev()
+                .find_map(|(request_id, operation)| {
+                    let state = operation.cancellation.0.load(Ordering::Acquire);
+                    (operation.conversation_id == conversation_id
+                        && (state == CHAT_RUNNING
+                            || (allow_cancel_requested && state == CHAT_CANCELLED)))
+                        .then(|| request_id.clone())
+                })
+        })
     }
 
     pub(crate) fn request_chat_cancellation(&self, request_id: &str) -> bool {
@@ -352,8 +358,9 @@ impl OperationScope {
             .and_then(|registries| {
                 registries
                     .chats
-                    .get(request_id)
-                    .map(|operation| operation.cancellation.request_cancel())
+                    .iter()
+                    .find(|(id, _)| id == request_id)
+                    .map(|(_, operation)| operation.cancellation.request_cancel())
             })
             .unwrap_or(false)
     }
@@ -575,7 +582,11 @@ impl ChatOperationLease {
             .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("chat operation registry is unavailable"))?;
-        let Some(operation) = registries.chats.get(&self.request_id) else {
+        let Some((_, operation)) = registries
+            .chats
+            .iter()
+            .find(|(id, _)| id == &self.request_id)
+        else {
             return Ok(None);
         };
         if !Arc::ptr_eq(&operation.identity, &self.identity)
@@ -592,12 +603,10 @@ impl Drop for ChatOperationLease {
         let Ok(mut registries) = self.scope.0.registries.lock() else {
             return;
         };
-        if registries
-            .chats
-            .get(&self.request_id)
-            .is_some_and(|operation| Arc::ptr_eq(&operation.identity, &self.identity))
-        {
-            registries.chats.remove(&self.request_id);
+        if let Some(index) = registries.chats.iter().position(|(id, operation)| {
+            id == &self.request_id && Arc::ptr_eq(&operation.identity, &self.identity)
+        }) {
+            registries.chats.remove(index);
         }
     }
 }
@@ -769,7 +778,12 @@ mod tests {
         assert!(!right_mention.cancellation_requested());
         assert!(!right_mcp.cancellation_requested());
         assert!(!right_tool.cancellation_requested());
-        assert!(right.chat_request_is_active("same-chat-request", "same-conversation"));
+        assert_eq!(
+            right
+                .current_chat_request_id("same-conversation", false)
+                .as_deref(),
+            Some("same-chat-request")
+        );
         assert_eq!(left.active_operation_count(), 4);
         assert_eq!(right.active_operation_count(), 4);
 

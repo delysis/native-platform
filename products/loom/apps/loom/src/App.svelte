@@ -301,6 +301,7 @@
     bindCompletionAnchor,
     cancelCompletionSchedule,
     clearCompletionSession as clearCompletionControllerSession,
+    clearWriterCompletionChoice,
     clearUnpresentableVisualKeys,
     completionActivityExists as controllerHasCompletionActivity,
     completionControllerView,
@@ -7450,6 +7451,9 @@
 
   function updateFromSource(display: string): void {
     if (transition !== 'idle') return;
+    if (completionController.pendingText === null) {
+      completionController = clearWriterCompletionChoice(completionController);
+    }
     sourceDisplayText = display;
     sourceDirty = true;
     if (!sourceComposing) {
@@ -7561,7 +7565,10 @@
     );
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
+      : selectedInlineSuggestion?.targetByte ??
+        (completionController.selectionIntent.contextKey === completionContextKey
+          ? completionController.selectionIntent.writerChoice?.targetByte : null) ??
+        completionController.generationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
       if (completionWasActive) {
         completionController = bindCompletionAnchor(
@@ -7608,7 +7615,10 @@
     ) return;
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
+      : selectedInlineSuggestion?.targetByte ??
+        (completionController.selectionIntent.contextKey === completionContextKey
+          ? completionController.selectionIntent.writerChoice?.targetByte : null) ??
+        completionController.generationIntent?.anchorByte ?? null;
     if (expected === null) {
       completionController = bindCompletionAnchor(
         completionController,
@@ -8850,11 +8860,6 @@
     if (event.key === 'Escape' && addMenuOpen) { event.preventDefault(); addMenuOpen = false; return; }
     if (event.key === 'Escape' && (activeMaterial || materialsOpen)) { event.preventDefault(); closeMaterial(); return; }
     if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
-    if (event.key === 'Escape' && documentContextTarget) {
-      event.preventDefault();
-      closeDocumentContextMenu();
-      return;
-    }
     if (event.key === 'Escape' && modelManagerOpen) {
       event.preventDefault();
       closeModelManager();

@@ -99,6 +99,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'audio_synthesize',
   // Peer cancellation can wait for a network reply; ordinary saves keep moving.
   'terminal_cancel',
+  'workspace_pane_cancel',
   'build_model_policy_get',
   'shader_preview',
   'model_catalog_list',
