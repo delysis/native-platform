@@ -194,6 +194,7 @@
   let reportedSelectionAccessibilityIdentity = '';
   let retainedRollbackPlan: GhostTextPlan | null = null;
   let rollbackOptionLease = false;
+  let rollbackKeyDownHandled = false;
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
@@ -1238,6 +1239,32 @@
     return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
+  function projectedRollbackPlan(): GhostTextPlan | null {
+    if (
+      !view ||
+      !ghostCandidateId ||
+      !ghostPresentationKey ||
+      !surfaceKey ||
+      ghostAnchorByteOffset === null ||
+      !ghostUnconsumeText
+    ) return null;
+    return {
+      candidateId: ghostCandidateId,
+      position: view.state.selection.from,
+      presentationKey: ghostPresentationKey,
+      surfaceKey,
+      anchorByteOffset: ghostAnchorByteOffset,
+      text: ghostText,
+      insertsOnAccept: ghostInsertsOnAccept,
+      alternatives: ghostAlternatives,
+      hidden: ghostHidden,
+      unconsumeText: ghostUnconsumeText,
+      fanVisible: false,
+      fanPinned: false,
+      renderEpoch: 0
+    };
+  }
+
   function handleExactRollbackChord(event: KeyboardEvent): boolean {
     if (
       event.key === 'ArrowLeft' &&
@@ -1256,7 +1283,14 @@
         !interactiveTarget;
       if (!targetsEditor) return false;
       const livePlan = currentGhostTextPlan(view.state);
-      const plan = livePlan ?? retainedRollbackPlan;
+      // A full fan acceptance clears the decoration in the same transaction
+      // that inserts its prose. The controller projects the exact rollback
+      // authority back on the next Svelte turn, but WebKit can deliver the
+      // native key before ProseMirror has rebuilt the hidden decoration. The
+      // projected props carry the same scoped identity, byte anchor, and
+      // rollback text, so admit them only through the ordinary exact document
+      // postimage and controller authorization checks below.
+      const plan = livePlan ?? retainedRollbackPlan ?? projectedRollbackPlan();
       const rollbackEnd = view.state.selection.from;
       const rollbackStart = plan?.unconsumeText
         ? rollbackEnd - plan.unconsumeText.length
@@ -1288,7 +1322,8 @@
   }
 
   function handleWindowKeyDown(event: KeyboardEvent): void {
-    if (handleExactRollbackChord(event)) return;
+    rollbackKeyDownHandled = handleExactRollbackChord(event);
+    if (rollbackKeyDownHandled) return;
     if (!hasExactFocus()) {
       setOptionHeld(false);
       return;
@@ -1303,6 +1338,17 @@
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
+    if (
+      rollbackKeyDownHandled &&
+      event.key === 'ArrowLeft' &&
+      event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey
+    ) {
+      rollbackKeyDownHandled = false;
+      return;
+    }
+    rollbackKeyDownHandled = false;
     if (handleExactRollbackChord(event)) return;
     if (!hasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
