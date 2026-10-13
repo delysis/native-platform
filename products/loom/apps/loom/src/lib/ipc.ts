@@ -984,12 +984,14 @@ export function listenForReverseCompletion(handler: () => void): Promise<Unliste
 }
 
 let completionReversalArmDesired = false;
+let completionReversalArmApplied = false;
 let completionReversalArmInFlight: Promise<void> | null = null;
 
 async function flushCompletionReversalArm(): Promise<void> {
   while (true) {
     const armed = completionReversalArmDesired;
     await invoke('completion_reversal_arm', { armed });
+    completionReversalArmApplied = armed;
     if (armed === completionReversalArmDesired) return;
   }
 }
@@ -999,6 +1001,9 @@ export function armCompletionReversal(armed: boolean): Promise<void> {
   completionReversalArmDesired = armed;
   completionReversalArmInFlight ??= flushCompletionReversalArm().finally(() => {
     completionReversalArmInFlight = null;
+    if (completionReversalArmApplied !== completionReversalArmDesired) {
+      void armCompletionReversal(completionReversalArmDesired);
+    }
   });
   return completionReversalArmInFlight;
 }
