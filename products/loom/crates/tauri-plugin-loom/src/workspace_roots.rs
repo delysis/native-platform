@@ -217,11 +217,45 @@ fn ordinary_directory(path: &Path) -> Result<()> {
 }
 fn directory_identity(path: &Path) -> Result<String> {
     ordinary_directory(path)?;
-    let handle = same_file::Handle::from_path(path).map_err(io)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let open = || {
+        let file = options.open(path).map_err(io)?;
+        if !file.metadata().map_err(io)?.is_dir() {
+            return Err(failure("The selected folder is not an ordinary directory."));
+        }
+        same_file::Handle::from_file(file).map_err(io)
+    };
+    let handle = open()?;
     let mut digest = IdentityDigest::default();
     digest.write(std::env::consts::OS.as_bytes());
     handle.hash(&mut digest);
-    if handle != same_file::Handle::from_path(path).map_err(io)? {
+    #[cfg(all(test, unix))]
+    tests::BEFORE_DIRECTORY_RECHECK.with(|hook| {
+        let matches = hook
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| target == path);
+        if matches && let Some((_, interrupt)) = hook.borrow_mut().take() {
+            interrupt();
+        }
+    });
+    if handle != open()? {
         return Err(failure("The selected folder changed."));
     }
     Ok(format!("{:x}", digest.0.finalize()))
@@ -295,12 +329,16 @@ fn read_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(all(test, unix))]
+    if let Some(interrupt) = tests::BEFORE_GRANT_OPEN.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
     }
     let file = options.open(path).map_err(io)?;
     let identity = same_file::Handle::from_file(file.try_clone().map_err(io)?).map_err(io)?;
@@ -309,8 +347,12 @@ fn read_file(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     file.take(maximum + 1).read_to_end(&mut bytes).map_err(io)?;
+    #[cfg(all(test, unix))]
+    if let Some(interrupt) = tests::AFTER_GRANT_READ.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
     if u64::try_from(bytes.len()).map_err(io)? > maximum
-        || identity != same_file::Handle::from_path(path).map_err(io)?
+        || identity != same_file::Handle::from_file(options.open(path).map_err(io)?).map_err(io)?
     {
         return Err(failure("The workspace grant changed while reading."));
     }
@@ -568,6 +610,18 @@ mod tests {
     use super::*;
     use loom_document::DocumentContent;
 
+    type DirectoryRecheckHook = Option<(PathBuf, Box<dyn FnOnce()>)>;
+
+    thread_local! {
+        pub(super) static BEFORE_GRANT_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_GRANT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_DIRECTORY_RECHECK:
+            std::cell::RefCell<DirectoryRecheckHook> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     fn setup() -> (tempfile::TempDir, ProjectStore, ProjectStore, PathBuf) {
         let temporary = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temporary.path()).unwrap();
@@ -789,5 +843,127 @@ mod tests {
             )
             .unwrap();
         assert!(list(&owner, &private).is_err());
+    }
+
+    #[test]
+    fn mounted_root_grant_replacement_refuses_without_a_fifo_peer() {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for after_read in [false, true] {
+            let (_temporary, mut owner, target, private) = setup();
+            let revision = current_revision(&owner).unwrap();
+            let mounted = mount(&mut owner, &target, &private, revision).unwrap();
+            assert_eq!(
+                resolve(&owner, &mounted.id, &private).unwrap(),
+                target.root()
+            );
+            let path = grant_path(&owner, &mounted.id, &private, false).unwrap();
+            let retained = path.with_extension("retained");
+            let original = fs::read(&path).unwrap();
+            let (at_boundary, boundary) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            let rescue_path = path.clone();
+            let rescue = std::thread::spawn(move || {
+                boundary.recv().expect("actual grant-open boundary");
+                let needed = completion.recv_timeout(Duration::from_secs(5)).is_err();
+                if needed {
+                    let _peer = open(&rescue_path, OFlags::RDWR | OFlags::NONBLOCK, Mode::empty())
+                        .expect("bounded rescue for the old blocking open");
+                    completion
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("read returned");
+                }
+                needed
+            });
+            let replaced = path.clone();
+            let previous = retained.clone();
+            let interrupt: Box<dyn FnOnce()> = Box::new(move || {
+                fs::rename(&replaced, &previous).unwrap();
+                nix::unistd::mkfifo(
+                    &replaced,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )
+                .unwrap();
+                at_boundary.send(()).unwrap();
+            });
+            if after_read {
+                AFTER_GRANT_READ.with(|hook| *hook.borrow_mut() = Some(interrupt));
+            } else {
+                BEFORE_GRANT_OPEN.with(|hook| *hook.borrow_mut() = Some(interrupt));
+            }
+            let outcome = resolve(&owner, &mounted.id, &private);
+            finished.send(()).unwrap();
+            let needed_peer = rescue.join().expect("joined rescue actor");
+            assert!(outcome.is_err());
+            assert_eq!(fs::read(&retained).unwrap(), original);
+            assert!(!needed_peer, "grant refusal waited for a FIFO peer");
+            fs::remove_file(&path).unwrap();
+            fs::rename(&retained, &path).unwrap();
+            assert_eq!(
+                resolve(&owner, &mounted.id, &private).unwrap(),
+                target.root()
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_root_directory_recheck_refuses_without_a_fifo_peer() {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_temporary, mut owner, target, private) = setup();
+        let revision = current_revision(&owner).unwrap();
+        let mounted = mount(&mut owner, &target, &private, revision).unwrap();
+        let path = target.root().to_path_buf();
+        assert_eq!(resolve(&owner, &mounted.id, &private).unwrap(), path);
+        drop(target);
+        let retained = path.with_file_name("retained-target");
+        let manifest = fs::read(path.join(".loom/project.json")).unwrap();
+        let (at_boundary, boundary) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let rescue_path = path.clone();
+        let rescue = std::thread::spawn(move || {
+            boundary.recv().expect("actual directory identity boundary");
+            let needed = completion.recv_timeout(Duration::from_secs(5)).is_err();
+            if needed {
+                let _peer = open(&rescue_path, OFlags::RDWR | OFlags::NONBLOCK, Mode::empty())
+                    .expect("bounded rescue for the old blocking open");
+                completion
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("resolve returned");
+            }
+            needed
+        });
+        let replaced = path.clone();
+        let previous = retained.clone();
+        BEFORE_DIRECTORY_RECHECK.with(|hook| {
+            *hook.borrow_mut() = Some((
+                path.clone(),
+                Box::new(move || {
+                    fs::rename(&replaced, &previous).unwrap();
+                    nix::unistd::mkfifo(
+                        &replaced,
+                        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                    )
+                    .unwrap();
+                    at_boundary.send(()).unwrap();
+                }),
+            ));
+        });
+        let outcome = resolve(&owner, &mounted.id, &private);
+        finished.send(()).unwrap();
+        let needed_peer = rescue.join().expect("joined rescue actor");
+        assert!(outcome.is_err());
+        assert_eq!(
+            fs::read(retained.join(".loom/project.json")).unwrap(),
+            manifest
+        );
+        assert!(!needed_peer, "directory refusal waited for a FIFO peer");
+        fs::remove_file(&path).unwrap();
+        fs::rename(&retained, &path).unwrap();
+        assert_eq!(resolve(&owner, &mounted.id, &private).unwrap(), path);
     }
 }

@@ -270,22 +270,138 @@ pub enum CacheInsertOutcome {
 struct CachedPrefix {
     value: Arc<PrefixCacheValue>,
     last_used_at_ms: u128,
+    memory_bytes: usize,
 }
 
-/// Validation is performed before taking a host-wide state lock.
-pub struct ValidatedPrefixCacheValue(PrefixCacheValue);
+/// Validation and retained-allocation accounting precede the host-wide lock.
+pub struct ValidatedPrefixCacheValue {
+    value: PrefixCacheValue,
+    memory_bytes: usize,
+}
 impl ValidatedPrefixCacheValue {
     pub fn new(value: PrefixCacheValue) -> Option<Self> {
-        value.is_valid().then_some(Self(value))
+        if !value.is_valid() {
+            return None;
+        }
+        let memory_bytes = retained_memory_bytes(&value)?;
+        Some(Self {
+            value,
+            memory_bytes,
+        })
+    }
+
+    /// Charge for this resident value, including token/metadata capacities and
+    /// its two cache-owned ID copies. Shared snapshot allocations are charged
+    /// in full per entry, not discounted on the assumption of another owner.
+    #[must_use]
+    pub const fn memory_bytes(&self) -> usize {
+        self.memory_bytes
     }
 }
 
+fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
+    use std::mem::size_of;
+
+    // Exhaustive destructuring keeps newly retained fields in the accounting review.
+    let PrefixCacheValue { metadata, sequence } = value;
+    let PrefixCacheMetadata {
+        id,
+        tier: _,
+        owner_id,
+        label,
+        fingerprint,
+        token_ids,
+        token_sha256,
+        state_bytes: _,
+        created_at_ms: _,
+        last_used_at_ms: _,
+        state: _,
+        reconstruction,
+    } = metadata;
+    let CacheFingerprint {
+        prompt_form: _,
+        prompt_token_policy: _,
+        model_sha256,
+        binding_version,
+        build_id,
+        tokenizer_sha256,
+        chat_template_sha256,
+        multimodal_projector_sha256,
+        lora_adapters_sha256,
+        context_tokens: _,
+        batch_tokens: _,
+        max_sequences: _,
+        device,
+        rope_config_sha256,
+        kv_layout_sha256,
+    } = fingerprint;
+    let SequenceStateBlob {
+        sequence_id: _,
+        token_count: _,
+        bytes,
+        token_ids: sequence_tokens,
+    } = sequence;
+    let reconstruction_bytes = match reconstruction {
+        Some(SequenceReconstruction {
+            sequence_id: _,
+            header,
+            export_receipt: _,
+        }) => header.capacity(),
+        None => 0,
+    };
+    let mut total = [
+        size_of::<PrefixCacheValue>(),
+        size_of::<CachedPrefix>(),
+        2 * size_of::<Box<str>>(), // map key and LRU key
+        size_of::<Vec<u8>>(),      // the snapshot's Arc allocation owns a Vec header
+        4 * size_of::<usize>(),    // strong/weak counters for both Arc allocations
+        id.len().checked_mul(2)?,  // boxed cache keys have no spare capacity
+        id.capacity(),
+        owner_id.as_ref().map_or(0, String::capacity),
+        label.capacity(),
+        token_sha256.capacity(),
+        token_ids.capacity().checked_mul(size_of::<i32>())?,
+        sequence_tokens.capacity().checked_mul(size_of::<i32>())?,
+        bytes.capacity(),
+        reconstruction_bytes,
+        lora_adapters_sha256
+            .capacity()
+            .checked_mul(size_of::<String>())?,
+        multimodal_projector_sha256
+            .as_ref()
+            .map_or(0, String::capacity),
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)?;
+    for text in [
+        model_sha256,
+        binding_version,
+        build_id,
+        tokenizer_sha256,
+        chat_template_sha256,
+        device,
+        rope_config_sha256,
+        kv_layout_sha256,
+    ]
+    .into_iter()
+    .chain(lora_adapters_sha256)
+    {
+        total = total.checked_add(text.capacity())?;
+    }
+    Some(total)
+}
+
+/// A budget for resident value allocations and their cache-owned keys.
+///
+/// The charge includes allocated capacities, not just serialized state length.
+/// Allocator bookkeeping and map/deque spare buckets are not an RSS measurement;
+/// caller-held Arc values and lookup copies remain outside this cache's budget.
 #[derive(Debug)]
 pub struct MemoryPrefixCache {
     capacity_bytes: usize,
     used_bytes: usize,
-    values: HashMap<String, CachedPrefix>,
-    least_to_most_recent: VecDeque<String>,
+    values: HashMap<Box<str>, CachedPrefix>,
+    least_to_most_recent: VecDeque<Box<str>>,
 }
 
 impl MemoryPrefixCache {
@@ -332,40 +448,43 @@ impl MemoryPrefixCache {
     }
 
     pub fn insert_validated(&mut self, value: ValidatedPrefixCacheValue) -> CacheInsertOutcome {
-        let mut value = value.0;
-        if value.metadata.state_bytes > self.capacity_bytes {
+        let ValidatedPrefixCacheValue {
+            mut value,
+            memory_bytes,
+        } = value;
+        if memory_bytes > self.capacity_bytes {
             return CacheInsertOutcome::InvalidRejected;
         }
         value.metadata.tier = CacheTier::MemoryLru;
-        let id = value.metadata.id.clone();
+        let id: Box<str> = value.metadata.id.as_str().into();
         if let Some(previous) = self.values.remove(&id) {
-            self.used_bytes = self
-                .used_bytes
-                .saturating_sub(previous.value.metadata.state_bytes);
+            self.used_bytes -= previous.memory_bytes;
             self.remove_from_order(&id);
         }
-        self.used_bytes = self.used_bytes.saturating_add(value.metadata.state_bytes);
+
+        // Make room before adding: even a usize::MAX budget cannot overflow
+        // the accounting sum or evict the newly admitted value itself.
+        let mut evicted = Vec::new();
+        while self.used_bytes > self.capacity_bytes - memory_bytes {
+            let oldest = self
+                .least_to_most_recent
+                .pop_front()
+                .expect("charged entries retain an LRU position");
+            if let Some(removed) = self.values.remove(&oldest) {
+                self.used_bytes -= removed.memory_bytes;
+                evicted.push(oldest.into_string());
+            }
+        }
+        self.used_bytes += memory_bytes;
         self.values.insert(
             id.clone(),
             CachedPrefix {
                 last_used_at_ms: value.metadata.last_used_at_ms,
                 value: Arc::new(value),
+                memory_bytes,
             },
         );
         self.least_to_most_recent.push_back(id);
-
-        let mut evicted = Vec::new();
-        while self.used_bytes > self.capacity_bytes {
-            let Some(oldest) = self.least_to_most_recent.pop_front() else {
-                break;
-            };
-            if let Some(removed) = self.values.remove(&oldest) {
-                self.used_bytes = self
-                    .used_bytes
-                    .saturating_sub(removed.value.metadata.state_bytes);
-                evicted.push(oldest);
-            }
-        }
         CacheInsertOutcome::Stored {
             memory_resident: true,
             persistent_resident: false,
@@ -469,7 +588,7 @@ impl MemoryPrefixCache {
         stored.last_used_at_ms = now_ms;
         let value = Arc::clone(&stored.value);
         self.remove_from_order(id);
-        self.least_to_most_recent.push_back(id.to_string());
+        self.least_to_most_recent.push_back(id.into());
         Some(value)
     }
 
@@ -488,9 +607,7 @@ impl MemoryPrefixCache {
         let Some(value) = self.values.remove(id) else {
             return false;
         };
-        self.used_bytes = self
-            .used_bytes
-            .saturating_sub(value.value.metadata.state_bytes);
+        self.used_bytes -= value.memory_bytes;
         self.remove_from_order(id);
         true
     }
@@ -510,13 +627,13 @@ impl MemoryPrefixCache {
 
     pub fn clear(&mut self) {
         self.used_bytes = 0;
-        self.values.clear();
-        self.least_to_most_recent.clear();
+        self.values = HashMap::new();
+        self.least_to_most_recent = VecDeque::new();
     }
 
     fn remove_from_order(&mut self, id: &str) {
         self.least_to_most_recent
-            .retain(|candidate| candidate != id);
+            .retain(|candidate| candidate.as_ref() != id);
     }
 }
 
@@ -593,7 +710,8 @@ mod tests {
     #[test]
     fn shared_cache_hits_do_not_copy_payload_or_retain_owner_authority() {
         for count in [1, 16] {
-            let mut cache = MemoryPrefixCache::new(count * 256 * 1024);
+            let mut cache = MemoryPrefixCache::new(count * 512 * 1024);
+            let mut other_bytes = 0;
             for index in 1..count {
                 cache.insert(owned_value(
                     &format!("other-{index}"),
@@ -602,6 +720,7 @@ mod tests {
                     256 * 1024,
                     1,
                 ));
+                other_bytes = cache.used_bytes();
             }
             let original = owned_value("owned", "alice", &[1, 2], 256 * 1024, 1);
             let bytes = Arc::clone(&original.sequence.bytes);
@@ -639,23 +758,28 @@ mod tests {
                     .is_none()
             );
             assert_eq!(first.sequence.bytes.len(), 256 * 1024);
-            assert_eq!(cache.used_bytes(), (count - 1) * 256 * 1024);
+            assert_eq!(cache.used_bytes(), other_bytes);
+            assert_eq!(cache.len(), count - 1);
         }
     }
 
     #[test]
     fn checked_insert_distinguishes_invalid_capacity_and_admitted() {
-        let mut cache = MemoryPrefixCache::new(4);
+        let fits = value("fits", CacheTier::MemoryLru, &[1], 4, 0);
+        let capacity = ValidatedPrefixCacheValue::new(fits.clone())
+            .expect("valid fixture")
+            .memory_bytes();
+        let mut cache = MemoryPrefixCache::new(capacity);
         let mut malformed = value("bad", CacheTier::MemoryLru, &[1], 4, 0);
         malformed.sequence.token_count = 2;
         assert_eq!(cache.insert(malformed), CacheInsertOutcome::InvalidRejected);
         assert_eq!(
-            cache.insert(value("big", CacheTier::MemoryLru, &[1], 8, 0)),
+            cache.insert(value("big", CacheTier::MemoryLru, &[1], capacity + 1, 0)),
             CacheInsertOutcome::InvalidRejected
         );
         assert!(cache.is_empty());
         assert_eq!(
-            cache.insert(value("fits", CacheTier::MemoryLru, &[1], 4, 0)),
+            cache.insert(fits),
             CacheInsertOutcome::Stored {
                 memory_resident: true,
                 persistent_resident: false,
@@ -806,7 +930,11 @@ mod tests {
 
     #[test]
     fn memory_tier_is_bounded_lru_and_hits_promote_entries() {
-        let mut cache = MemoryPrefixCache::new(8);
+        let entry_bytes =
+            ValidatedPrefixCacheValue::new(value("a", CacheTier::PersonaPack, &[1], 4, 1))
+                .expect("valid fixture")
+                .memory_bytes();
+        let mut cache = MemoryPrefixCache::new(2 * entry_bytes);
         assert!(matches!(
             cache.insert(value("a", CacheTier::PersonaPack, &[1], 4, 1)),
             CacheInsertOutcome::Stored { evicted, .. } if evicted.is_empty()
@@ -827,12 +955,15 @@ mod tests {
         assert!(cache.lookup(&fingerprint(), &[2, 9], 5).is_none());
         assert!(cache.lookup(&fingerprint(), &[1, 9], 5).is_some());
         assert!(cache.lookup(&fingerprint(), &[3, 9], 5).is_some());
-        assert_eq!(cache.used_bytes(), 8);
+        assert_eq!(cache.used_bytes(), 2 * entry_bytes);
     }
 
     #[test]
     fn memory_owner_invalidation_is_exact_and_updates_capacity_accounting() {
-        let mut cache = MemoryPrefixCache::new(16);
+        let bob_bytes = ValidatedPrefixCacheValue::new(owned_value("bob", "bob", &[3], 4, 3))
+            .expect("valid fixture")
+            .memory_bytes();
+        let mut cache = MemoryPrefixCache::new(64 * 1024);
         cache.insert(owned_value("alice-a", "alice", &[1], 4, 1));
         cache.insert(owned_value("alice-b", "alice", &[2], 4, 2));
         cache.insert(owned_value("bob", "bob", &[3], 4, 3));
@@ -841,7 +972,7 @@ mod tests {
         removed.sort();
         assert_eq!(removed, ["alice-a".to_string(), "alice-b".to_string()]);
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.used_bytes(), 4);
+        assert_eq!(cache.used_bytes(), bob_bytes);
         assert!(cache.get("bob", 4).is_some());
         assert!(cache.get("alice-a", 4).is_none());
     }
@@ -853,5 +984,92 @@ mod tests {
         corrupt.metadata.token_sha256 = "wrong".to_string();
         assert_eq!(cache.insert(corrupt), CacheInsertOutcome::InvalidRejected);
         assert!(cache.is_empty());
+    }
+    #[test]
+    fn retained_token_and_metadata_allocations_cannot_hide_behind_tiny_state() {
+        let mut cache = MemoryPrefixCache::new(4096);
+        assert!(matches!(
+            cache.insert(value("kept", CacheTier::MemoryLru, &[1], 1, 0)),
+            CacheInsertOutcome::Stored { .. }
+        ));
+        let before = cache.used_bytes();
+        let tokens = vec![1; 16 * 1024];
+        let mut candidates = vec![value("kept", CacheTier::MemoryLru, &tokens, 1, 0)];
+
+        let mut spare_state = value("state-capacity", CacheTier::MemoryLru, &[1], 1, 0);
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        bytes.push(7);
+        spare_state.sequence.bytes = Arc::new(bytes);
+        candidates.push(spare_state);
+
+        let mut metadata = value("metadata", CacheTier::MemoryLru, &[1], 1, 0);
+        metadata.metadata.label = String::with_capacity(16 * 1024);
+        metadata.metadata.label.push('x');
+        candidates.push(metadata);
+
+        let mut fingerprint_value = value("fingerprint", CacheTier::MemoryLru, &[1], 1, 0);
+        fingerprint_value.metadata.fingerprint.lora_adapters_sha256 = vec!["x".repeat(16 * 1024)];
+        candidates.push(fingerprint_value);
+
+        let mut spare_tokens = value("token-capacity", CacheTier::MemoryLru, &[1], 1, 0);
+        spare_tokens.sequence.token_ids.reserve(16 * 1024);
+        candidates.push(spare_tokens);
+
+        let mut reconstruction = value("reconstruction", CacheTier::MemoryLru, &[1], 1, 0);
+        reconstruction.bind_reconstruction();
+        reconstruction
+            .metadata
+            .reconstruction
+            .as_mut()
+            .expect("bound reconstruction")
+            .header
+            .reserve(16 * 1024);
+        candidates.push(reconstruction);
+
+        for candidate in candidates {
+            assert!(candidate.is_valid(), "capacity is not corrupt metadata");
+            assert_eq!(candidate.metadata.state_bytes, 1);
+            assert_eq!(cache.insert(candidate), CacheInsertOutcome::InvalidRejected);
+            assert_eq!(cache.len(), 1, "rejection cannot evict the existing entry");
+            assert_eq!(cache.used_bytes(), before);
+            assert_eq!(
+                cache
+                    .get("kept", 1)
+                    .expect("old value retained")
+                    .sequence
+                    .token_count,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_state_entries_still_consume_a_finite_resident_budget() {
+        let mut cache = MemoryPrefixCache::new(4096);
+        for index in 0..100 {
+            assert!(matches!(
+                cache.insert(value(
+                    &format!("entry-{index}"),
+                    CacheTier::MemoryLru,
+                    &[1],
+                    1,
+                    0
+                )),
+                CacheInsertOutcome::Stored {
+                    memory_resident: true,
+                    ..
+                }
+            ));
+            assert!(cache.used_bytes() > 0);
+            assert!(cache.used_bytes() <= cache.capacity_bytes());
+        }
+        assert!(
+            cache.len() < 100,
+            "tiny snapshots cannot bypass allocation accounting"
+        );
+        assert!(cache.get("entry-99", 1).is_some());
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.used_bytes(), 0);
     }
 }

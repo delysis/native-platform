@@ -7,6 +7,22 @@ func serviceMainRunLoop(for seconds: TimeInterval = 0.05) {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
 }
 
+func canonicalIdentityBytes(_ value: [String: Any]) -> Data? {
+    var canonical = value
+    // Candidate order is a presentation concern: the cached family may be
+    // re-ranked while preserving the same selected candidate, visible glyph,
+    // and immutable terminal authority. Compare the family as a set so a
+    // harmless reordering cannot masquerade as lost native resume state.
+    if let candidates = canonical["candidates"] as? [[String: Any]] {
+        canonical["candidates"] = candidates.sorted {
+            let left = ($0["run_id"] as? String ?? "", $0["candidate_id"] as? String ?? "")
+            let right = ($1["run_id"] as? String ?? "", $1["candidate_id"] as? String ?? "")
+            return left < right
+        }
+    }
+    return try? JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys])
+}
+
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
     var timerFired = false
     let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { _ in
@@ -24,6 +40,18 @@ if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test"
     timer.invalidate()
     guard timerFired else {
         fputs("run-loop wait did not deliver its default-mode timer\n", stderr)
+        exit(1)
+    }
+    let first: [String: Any] = [
+        "selected_run_id": "run-b",
+        "candidates": [["run_id": "run-b", "candidate_id": "b"], ["run_id": "run-a", "candidate_id": "a"]]
+    ]
+    let reordered: [String: Any] = [
+        "candidates": [["candidate_id": "a", "run_id": "run-a"], ["candidate_id": "b", "run_id": "run-b"]],
+        "selected_run_id": "run-b"
+    ]
+    guard canonicalIdentityBytes(first) == canonicalIdentityBytes(reordered) else {
+        fputs("candidate-set identity changed after presentation reordering\n", stderr)
         exit(1)
     }
     print("idle/resume run-loop contract passed")
@@ -94,6 +122,10 @@ func fail(_ reason: String) -> Never {
 func guardsHold() -> Bool {
     !application.isTerminated && !guardPaths.contains { manager.fileExists(atPath: $0) }
 }
+func loomIsBackgrounded() -> Bool {
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
+    return frontmost.processIdentifier != pid
+}
 func rows(_ sql: String, offset: Bool = false) -> [[String]]? {
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
@@ -144,7 +176,7 @@ func snapshot() -> [String: Any]? {
 }
 func identityBytes(_ observation: [String: Any]) -> Data? {
     guard let value = observation["identity"] as? [String: Any] else { return nil }
-    return try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    return canonicalIdentityBytes(value)
 }
 func waitSnapshot(matching expected: Data? = nil) -> [String: Any]? {
     let deadline = ProcessInfo.processInfo.systemUptime + 15
@@ -216,14 +248,12 @@ let started = ProcessInfo.processInfo.systemUptime
 var polls = 0
 while ProcessInfo.processInfo.systemUptime - started < 75 {
     polls += 1
-    guard guardsHold(), application.isHidden,
-          NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+    guard guardsHold(), application.isHidden, loomIsBackgrounded(),
           storeIdentity() == stableStore else { fail("focus_process_generation_or_terminal_identity_changed") }
     serviceMainRunLoop()
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
-guard guardsHold(), application.isHidden,
-      NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+guard guardsHold(), application.isHidden, loomIsBackgrounded(),
       storeIdentity() == stableStore else { fail("final_idle_invariant_changed") }
 stage = "after_resume"
 showExactApplication()
@@ -243,6 +273,7 @@ guard waitFor({
 after = resumed
 let result: [String: Any] = ["schema": "delysis.loom-idle-resume-ghost-witness.v1", "pid": pid, "database": dbPath,
     "background_pid": finder.processIdentifier, "application_hidden_during_idle": true, "loom_frontmost_during_idle": false,
+    "background_focus_may_change": true,
     "minimum_idle_seconds": 75, "actual_idle_seconds": elapsed, "idle_polls": polls, "explicit_resume": true,
     "editor_focused_after_resume": true, "caret_utf16_after_resume": manuscript.utf16.count,
     "generation_runs_before_idle": baseline + 4, "generation_runs_after_resume": baseline + 4,

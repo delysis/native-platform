@@ -33,10 +33,9 @@ pub use attachments::{
     prepare_document_chat_in_scope,
 };
 pub use chat::{
-    ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
-    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel_in_scope, chat_continue_in_scope,
-    chat_regenerate_in_scope, chat_send_in_scope, chat_send_stream_in_scope,
-    chat_skip_reasoning_in_scope,
+    ChatCancelOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ChatSkipReasoningOutput,
+    ChatStreamEvent, chat_cancel_in_scope, chat_continue_in_scope, chat_regenerate_in_scope,
+    chat_send_in_scope, chat_send_stream_in_scope, chat_skip_reasoning_in_scope,
 };
 pub use composer::{
     ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
@@ -54,10 +53,10 @@ pub use conversation_store::{
     MessageBranchSibling, MessageCopy, MessageRole, MessageSpeakerKind, TextAttachmentImport,
     ToolBinding, conversation_delete, conversation_draft_open, conversation_draft_preview,
     conversation_draft_recipients, conversation_draft_recipients_update, conversation_draft_submit,
-    conversation_export, conversation_fork, conversation_import_json, conversation_list,
-    conversation_new, conversation_rename, conversation_search, conversation_select,
-    conversation_siblings, conversation_system_message_update, draft_clear, draft_get,
-    draft_update, message_branch_select, message_branches, message_copy, message_delete,
+    conversation_export, conversation_fork, conversation_import_file, conversation_import_json,
+    conversation_list, conversation_new, conversation_rename, conversation_search,
+    conversation_select, conversation_siblings, conversation_system_message_update, draft_clear,
+    draft_get, draft_update, message_branch_select, message_branches, message_copy, message_delete,
     message_edit, text_attachment_import,
 };
 pub use engine::{EngineCheckOptions, engine_check, engine_status};

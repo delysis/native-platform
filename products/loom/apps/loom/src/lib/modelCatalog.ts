@@ -3,6 +3,7 @@ import type {
   CuratedModelCatalogSnapshot,
   ModelCapabilitySummary
 } from './types';
+import { looksLikeVisionAdapter } from './modelPolicy';
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
@@ -14,13 +15,6 @@ function isPositiveSafeInteger(value: number): boolean {
 
 function expectedDownloadUrl(entry: CuratedModelCatalogEntry, artifactName: string): string {
   return `https://huggingface.co/${entry.repository}/resolve/${entry.revision}/${artifactName}?download=true`;
-}
-
-function isVisionAdapter(model: ModelCapabilitySummary): boolean {
-  return model.projector_present === true ||
-    model.media_kinds.length > 0 ||
-    /(^|[-_.])(mmproj|projector)([-_.]|$)/iu.test(model.display_name) ||
-    /(^|[/\\-_.])(mmproj|projector)([/\\-_.]|$)/iu.test(model.model_path);
 }
 
 function validateEntry(entry: CuratedModelCatalogEntry): void {
@@ -92,7 +86,7 @@ export function legacyLocalCatalogMatch(
   return model.local &&
     model.header_verified &&
     !model.loaded &&
-    !isVisionAdapter(model) &&
+    !looksLikeVisionAdapter(model) &&
     model.display_name.toLocaleLowerCase('en-US') ===
       entry.compatibility.legacy_local_file_name.toLocaleLowerCase('en-US') &&
     model.file_bytes === entry.compatibility.legacy_local_file_bytes;

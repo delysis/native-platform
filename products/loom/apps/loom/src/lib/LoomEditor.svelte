@@ -11,6 +11,7 @@
   import {
     boundaryKeyKind, textBoundaryDelta, type BoundaryObservation
   } from './completionBoundaryDiagnostics';
+  import { removeBeforeUtf8Boundary } from './completionSession';
   import { applyRemoteDocument } from './remoteEditor';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
   import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
@@ -24,13 +25,17 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
+    dispatchGhostRollback,
+    ghostRollbackTextIsExactAtSelection,
     setGhostFanPinned,
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
     visibleGhostWidgetObservation,
     type GhostTextPresentation,
+    type GhostTextPlan,
     type VisualCaretBoundaryFailure,
+    visualGhostTextInsertionTransaction,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
   import {
@@ -173,8 +178,8 @@
   let selectionReportTimer: number | undefined;
   let boundaryCacheDocument: ProseMirrorNode | null = null;
   let boundaryCacheCanonical = '';
-  let boundaryCacheFrom = -1;
-  let boundaryCacheTo = -1;
+  let boundaryCacheSelection: Selection | null = null;
+  let boundaryCacheStoredMarks: EditorState['storedMarks'] = null;
   let boundaryCacheValue: number | null = null;
   let boundaryCacheFailure: VisualCaretBoundaryFailure | null = null;
   let boundaryCacheDiagnostic: string | null = null;
@@ -188,6 +193,10 @@
   let formattingRestoreDeadline = 0;
   let reportedCompletionAccessibilityIdentity = '';
   let reportedSelectionAccessibilityIdentity = '';
+  let retainedRollbackPlan: GhostTextPlan | null = null;
+  let rollbackOptionLease = false;
+  let rollbackKeyDownHandled = false;
+  let lastExactRollbackAt = Number.NEGATIVE_INFINITY;
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
@@ -283,8 +292,8 @@
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
     boundaryCacheCanonical = '';
-    boundaryCacheFrom = -1;
-    boundaryCacheTo = -1;
+    boundaryCacheSelection = null;
+    boundaryCacheStoredMarks = null;
     boundaryCacheValue = null;
     boundaryCacheFailure = null;
     boundaryCacheDiagnostic = null;
@@ -298,8 +307,8 @@
     if (
       boundaryCacheDocument === state.doc &&
       boundaryCacheCanonical === lastEmitted &&
-      boundaryCacheFrom === state.selection.from &&
-      boundaryCacheTo === state.selection.to
+      boundaryCacheSelection === state.selection &&
+      boundaryCacheStoredMarks === state.storedMarks
     ) return {
       byteOffset: boundaryCacheValue,
       failure: boundaryCacheFailure,
@@ -308,8 +317,8 @@
     const proof = visualCaretBoundaryProof(state, lastEmitted);
     boundaryCacheDocument = state.doc;
     boundaryCacheCanonical = lastEmitted;
-    boundaryCacheFrom = state.selection.from;
-    boundaryCacheTo = state.selection.to;
+    boundaryCacheSelection = state.selection;
+    boundaryCacheStoredMarks = state.storedMarks;
     boundaryCacheValue = proof.byteOffset;
     boundaryCacheFailure = proof.failure;
     boundaryCacheDiagnostic = proof.diagnostic;
@@ -318,6 +327,25 @@
 
   function selectionBoundary(state: EditorState): number | null {
     return selectionBoundaryProof(state).byteOffset;
+  }
+
+  function exactCompletionRollback(
+    _candidateId: string,
+    _presentationKey: string,
+    anchorByteOffset: number,
+    text: string,
+    from: number,
+    to: number
+  ): boolean {
+    if (!view || from < 0 || !view.state.selection.empty ||
+        to !== view.state.selection.from) return false;
+    const expected = removeBeforeUtf8Boundary(lastEmitted, anchorByteOffset, text);
+    if (expected === null) return false;
+    try {
+      return serializeVisualMarkdown(view.state.tr.delete(from, to).doc) === expected;
+    } catch {
+      return false;
+    }
   }
 
   function reportGhostVisibility(): void {
@@ -454,7 +482,58 @@
       fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
       fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
-    setGhostText(editorView, presentation, forceRender);
+    const currentPlan = currentGhostTextPlan(editorView.state);
+    const retainExactRollback = !presentation &&
+      !snapshot.readonly &&
+      !snapshot.composing &&
+      snapshot.text === '' &&
+      snapshot.unconsumeText !== '' &&
+      currentPlan?.text === '' &&
+      currentPlan.hidden &&
+      currentPlan.candidateId === snapshot.candidateId &&
+      currentPlan.presentationKey === snapshot.presentationKey &&
+      currentPlan.surfaceKey === snapshot.surfaceKey &&
+      currentPlan.unconsumeText === snapshot.unconsumeText &&
+      selectionBoundary(editorView.state) === currentPlan.anchorByteOffset &&
+      (ghostRollbackTextIsExactAtSelection(editorView.state, currentPlan) ||
+        exactCompletionRollback(
+          currentPlan.candidateId,
+          currentPlan.presentationKey,
+          currentPlan.anchorByteOffset,
+          currentPlan.unconsumeText,
+          editorView.state.selection.from - currentPlan.unconsumeText.length,
+          editorView.state.selection.from
+        ));
+    // Option-down is observed in the window capture phase. During native AX
+    // reconciliation the parent caret projection can briefly be unavailable,
+    // even though the editor still proves the same scoped rollback bytes at
+    // the same caret. Do not erase that one-use authority between Option and
+    // ArrowLeft; every identity, byte, and live-selection check above must
+    // continue to match. A real caret move, edit, scope change, or revocation
+    // still clears the plan synchronously.
+    if (!retainExactRollback) setGhostText(editorView, presentation, forceRender);
+    else if (forceRender && currentPlan) setGhostText(editorView, {
+      ...currentPlan,
+      active: true
+    }, true);
+    const synchronizedPlan = currentGhostTextPlan(editorView.state);
+    if (
+      rollbackOnly &&
+      synchronizedPlan?.unconsumeText === snapshot.unconsumeText &&
+      synchronizedPlan.candidateId === snapshot.candidateId &&
+      synchronizedPlan.presentationKey === snapshot.presentationKey &&
+      synchronizedPlan.surfaceKey === snapshot.surfaceKey
+    ) {
+      retainedRollbackPlan = synchronizedPlan;
+    } else if (
+      snapshot.unconsumeText === '' ||
+      !retainedRollbackPlan ||
+      retainedRollbackPlan.candidateId !== snapshot.candidateId ||
+      retainedRollbackPlan.presentationKey !== snapshot.presentationKey ||
+      retainedRollbackPlan.surfaceKey !== snapshot.surfaceKey
+    ) {
+      retainedRollbackPlan = null;
+    }
     reportCompletionAccessibility();
     scheduleGhostVisibilityReport();
   }
@@ -824,13 +903,19 @@
     if (selectionBoundary(view.state) !== plan.anchorByteOffset) return result('caret_mismatch');
     const word = nextVisualSuggestionWord(plan.text);
     if (!word) return result('word_unavailable');
+    const insertion = visualGhostTextInsertionTransaction(
+      view.state,
+      plan.anchorByteOffset,
+      word
+    );
+    if (!insertion) return result('projection_failed');
     if (!authorizeCompletionInsertion(
       plan.candidateId,
       plan.presentationKey,
       word,
       'shuttle_word'
     )) return result('controller_rejected');
-    view.dispatch(view.state.tr.insertText(word));
+    view.dispatch(insertion);
     return result('inserted');
   }
 
@@ -839,8 +924,14 @@
     const plan = currentGhostTextPlan(view.state);
     if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
         !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    const insertion = visualGhostTextInsertionTransaction(
+      view.state,
+      plan.anchorByteOffset,
+      text
+    );
+    if (!insertion) return false;
     if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
-    view.dispatch(view.state.tr.insertText(text));
+    view.dispatch(insertion);
     return true;
   }
 
@@ -851,7 +942,22 @@
     action: CompletionInsertionAction
   ): boolean {
     const authorized = onGhostInsert(candidateId, presentationKey, text, action);
-    if (authorized) completionMutationAuthorized = true;
+    if (authorized) {
+      completionMutationAuthorized = true;
+      // WKWebView can publish a focused AX editor while its first responder is
+      // still settling after a fan Return/Tab transaction. Reassert the same
+      // editor after the controller projection and decoration teardown have
+      // each had a paint; this keeps the immediately following native editing
+      // chord on the writing surface without taking focus from a real control.
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        if (!view || view.isDestroyed) return;
+        const active = document.activeElement;
+        const interactive = active instanceof Element && active.closest(
+          'button, input, textarea, select, a[href], [contenteditable="true"]'
+        );
+        if (!interactive || view.dom.contains(active)) view.focus();
+      }));
+    }
     return authorized;
   }
 
@@ -861,7 +967,11 @@
     text: string
   ): boolean {
     const authorized = onGhostUnconsume(candidateId, presentationKey, text);
-    if (authorized) completionMutationAuthorized = true;
+    if (authorized) {
+      completionMutationAuthorized = true;
+      rollbackOptionLease = true;
+      setOptionHeld(true);
+    }
     return authorized;
   }
 
@@ -911,9 +1021,11 @@
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: authorizeCompletionInsertion,
           unconsume: authorizeCompletionReversal,
+          rollbackExact: exactCompletionRollback,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
           navigate: () => {
+            retainedRollbackPlan = null;
             onCaretNavigation();
             // Native navigation can leave the caret unchanged (Cmd-Right at
             // line end). Reconcile after the default action even when WebKit
@@ -1156,7 +1268,115 @@
     return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
+  function projectedRollbackPlan(): GhostTextPlan | null {
+    if (
+      !view ||
+      !ghostCandidateId ||
+      !ghostPresentationKey ||
+      !surfaceKey ||
+      ghostAnchorByteOffset === null ||
+      !ghostUnconsumeText
+    ) return null;
+    return {
+      candidateId: ghostCandidateId,
+      position: view.state.selection.from,
+      presentationKey: ghostPresentationKey,
+      surfaceKey,
+      anchorByteOffset: ghostAnchorByteOffset,
+      text: ghostText,
+      insertsOnAccept: ghostInsertsOnAccept,
+      alternatives: ghostAlternatives,
+      hidden: ghostHidden,
+      unconsumeText: ghostUnconsumeText,
+      fanVisible: false,
+      fanPinned: false,
+      renderEpoch: 0
+    };
+  }
+
+  function handleExactRollbackChord(event: KeyboardEvent): boolean {
+    if (
+      event.key === 'ArrowLeft' &&
+      event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      view
+    ) {
+      const target = event.target;
+      const targetElement = target instanceof Element ? target : null;
+      const interactiveTarget = targetElement?.closest(
+        'button, input, textarea, select, a[href], [contenteditable="true"]'
+      );
+      const targetsEditor = target === window || target === document ||
+        (target instanceof Node && view.dom.contains(target)) ||
+        !interactiveTarget;
+      if (!targetsEditor) return false;
+      const livePlan = currentGhostTextPlan(view.state);
+      // A full fan acceptance clears the decoration in the same transaction
+      // that inserts its prose. The controller projects the exact rollback
+      // authority back on the next Svelte turn, but WebKit can deliver the
+      // native key before ProseMirror has rebuilt the hidden decoration. The
+      // projected props carry the same scoped identity, byte anchor, and
+      // rollback text, so admit them only through the ordinary exact document
+      // postimage and controller authorization checks below.
+      const plan = livePlan ?? retainedRollbackPlan ?? projectedRollbackPlan();
+      observeVisualBoundary('visual_rollback_attempt', view.state.doc, view.state.doc, {
+        event_type: event.type,
+        trusted: event.isTrusted,
+        editor_focused: view.hasFocus(),
+        live_plan: livePlan !== null,
+        retained_plan: retainedRollbackPlan !== null,
+        projected_plan: projectedRollbackPlan() !== null,
+        plan_present: plan !== null,
+        candidate_matches: plan?.candidateId === ghostCandidateId,
+        presentation_matches: plan?.presentationKey === ghostPresentationKey,
+        surface_matches: plan?.surfaceKey === surfaceKey,
+        rollback_text_matches: plan?.unconsumeText === ghostUnconsumeText
+      });
+      const rollbackEnd = view.state.selection.from;
+      const rollbackStart = plan?.unconsumeText
+        ? rollbackEnd - plan.unconsumeText.length
+        : -1;
+      if (
+        plan?.unconsumeText &&
+        plan.candidateId === ghostCandidateId &&
+        plan.presentationKey === ghostPresentationKey &&
+        plan.surfaceKey === surfaceKey &&
+        plan.unconsumeText === ghostUnconsumeText &&
+        exactCompletionRollback(
+          plan.candidateId,
+          plan.presentationKey,
+          plan.anchorByteOffset,
+          plan.unconsumeText,
+          rollbackStart,
+          rollbackEnd
+        ) &&
+        authorizeCompletionReversal(plan.candidateId, plan.presentationKey, plan.unconsumeText)
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        lastExactRollbackAt = performance.now();
+        retainedRollbackPlan = null;
+        dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  export function reverseCompletion(): boolean {
+    if (performance.now() - lastExactRollbackAt < 100) return true;
+    return handleExactRollbackChord(new KeyboardEvent('keydown', {
+      key: 'ArrowLeft',
+      altKey: true,
+      bubbles: true,
+      cancelable: true
+    }));
+  }
+
   function handleWindowKeyDown(event: KeyboardEvent): void {
+    rollbackKeyDownHandled = handleExactRollbackChord(event);
+    if (rollbackKeyDownHandled) return;
     if (!hasExactFocus()) {
       setOptionHeld(false);
       return;
@@ -1171,11 +1391,28 @@
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
+    if (
+      rollbackKeyDownHandled &&
+      event.key === 'ArrowLeft' &&
+      event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey
+    ) {
+      rollbackKeyDownHandled = false;
+      return;
+    }
+    rollbackKeyDownHandled = false;
+    if (handleExactRollbackChord(event)) return;
     if (!hasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
 
   function releaseOptionState(): void {
+    rollbackOptionLease = false;
     setOptionHeld(false);
+  }
+
+  function releaseOptionStateUnlessRollbackLease(): void {
+    if (!rollbackOptionLease) releaseOptionState();
   }
 
   function handleWindowFocus(): void {
@@ -1280,12 +1517,19 @@
             reportSelection(next);
           }
         }
-        if (transaction.docChanged || transaction.selectionSet) {
+        if (transaction.storedMarksSet) {
+          clearBoundaryCache();
+          invalidateSelectionAccessibility();
+          reportSelection(next);
+          scheduleGhostPresentationSynchronization();
+        }
+        if (transaction.docChanged || transaction.selectionSet || transaction.storedMarksSet) {
           reportGhostVisibility();
         } else {
           scheduleGhostVisibilityReport();
         }
         if (transaction.docChanged) {
+          retainedRollbackPlan = null;
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
           localDocumentChanged = true;
@@ -1340,12 +1584,16 @@
         focus() {
           // Focus acquisition is a new interaction epoch. If Option is still
           // physically held, its next key event will re-establish that fact.
-          releaseOptionState();
+          if (!rollbackOptionLease) releaseOptionState();
           scheduleGhostPresentationSynchronization(true);
           return false;
         },
         blur() {
-          releaseOptionState();
+          // The native Option-Left shortcut can briefly move first-responder
+          // status while its exact rollback event crosses into WebKit. Keep
+          // that bounded lease until the physical Option-up, page hide, or a
+          // pointer interaction ends it.
+          releaseOptionStateUnlessRollbackLease();
           scheduleGhostVisibilityReport();
           return false;
         },
@@ -1377,7 +1625,7 @@
     window.addEventListener('focus', handleWindowFocus);
     window.addEventListener('keydown', handleWindowKeyDown, true);
     window.addEventListener('keyup', handleWindowKeyUp, true);
-    window.addEventListener('blur', releaseOptionState);
+    window.addEventListener('blur', releaseOptionStateUnlessRollbackLease);
     window.addEventListener('pagehide', releaseOptionState);
     window.addEventListener('pointerdown', releaseOptionState, true);
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -1398,6 +1646,7 @@
     // selection nor a delayed repair from the previous node tree can cross
     // this boundary.
     clearFormattingSelection();
+    retainedRollbackPlan = null;
     invalidateSelectionAccessibility();
     lastEmitted = incoming;
     const replacement = stateFor(incoming);
@@ -1464,7 +1713,7 @@
     window.removeEventListener('focus', handleWindowFocus);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);
-    window.removeEventListener('blur', releaseOptionState);
+    window.removeEventListener('blur', releaseOptionStateUnlessRollbackLease);
     window.removeEventListener('pagehide', releaseOptionState);
     window.removeEventListener('pointerdown', releaseOptionState, true);
     document.removeEventListener('visibilitychange', handleVisibilityChange);

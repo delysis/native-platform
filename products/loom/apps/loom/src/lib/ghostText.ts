@@ -1,12 +1,10 @@
-import { GHOST_PRESENTATION_ATTRIBUTE, observeInlineGhost, inlineGhostPreview, type InlineGhostObservation } from './inlineGhostObservation';
+import { GHOST_PRESENTATION_ATTRIBUTE, observeInlineGhost, type InlineGhostObservation } from './inlineGhostObservation';
 export { visualGhostInsertionIsVisible, type GhostClientRect } from './inlineGhostObservation';
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
+import { DOMSerializer, type Mark, type Slice } from 'prosemirror-model';
 import { Plugin, PluginKey, NodeSelection, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
-import {
-  insertionPreservesExtendedGraphemeEdges,
-  isExtendedGraphemeBoundary
-} from './graphemeBoundary';
+import { isExtendedGraphemeBoundary } from './graphemeBoundary';
 import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 import {
   nextVisualSuggestionWord,
@@ -69,6 +67,14 @@ export interface GhostTextHandlers {
     action: CompletionInsertionAction
   ) => boolean;
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
+  rollbackExact?: (
+    candidateId: string,
+    presentationKey: string,
+    anchorByteOffset: number,
+    text: string,
+    from: number,
+    to: number
+  ) => boolean;
   cycle?: (offset: number) => void;
   modifier?: (held: boolean) => void;
   navigate?: () => void;
@@ -165,6 +171,55 @@ export function planGhostText(
   };
 }
 
+/**
+ * Prove that the hidden rollback bytes still end at the live visual caret.
+ * This proof is deliberately independent of the decoration DOM: exhausted
+ * completion authority has no visible widget, and WebKit may reconcile its
+ * accessibility projection between the Option and ArrowLeft key events.
+ */
+export function ghostRollbackTextIsExactAtSelection(
+  state: EditorState,
+  plan: Pick<GhostTextPlan, 'unconsumeText'> | null
+): boolean {
+  if (!plan?.unconsumeText || !state.selection.empty || !(state.selection instanceof TextSelection)) {
+    return false;
+  }
+  const rollbackEnd = state.selection.from;
+  const rollbackStart = rollbackEnd - plan.unconsumeText.length;
+  return rollbackStart >= 0 &&
+    state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') === plan.unconsumeText;
+}
+
+export function dispatchGhostRollback(
+  view: EditorView,
+  plan: GhostTextPlan,
+  rollbackStart: number,
+  rollbackEnd: number
+): void {
+  const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
+  const anchorByteOffset = plan.anchorByteOffset - removedBytes;
+  if (rollbackStart < 0 || anchorByteOffset < 0) return;
+  view.dispatch(view.state.tr
+    .delete(rollbackStart, rollbackEnd)
+    .setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: {
+        active: true,
+        candidateId: plan.candidateId,
+        presentationKey: `${plan.presentationKey}:rollback:${removedBytes}`,
+        surfaceKey: plan.surfaceKey,
+        anchorByteOffset,
+        text: `${plan.unconsumeText}${plan.text}`,
+        insertsOnAccept: true,
+        alternatives: plan.alternatives,
+        hidden: plan.hidden,
+        unconsumeText: '',
+        fanVisible: plan.fanVisible || plan.alternatives.length > 1,
+        fanPinned: plan.fanPinned
+      }
+    } satisfies GhostTextMeta));
+}
+
 interface FlattenedTextCaret {
   text: string;
   offset: number;
@@ -203,15 +258,6 @@ function flattenedTextCaret(state: EditorState): FlattenedTextCaret | null {
 function visibleCaretIsExtendedGraphemeBoundary(state: EditorState): boolean {
   const caret = flattenedTextCaret(state);
   return caret !== null && isExtendedGraphemeBoundary(caret.text, caret.offset);
-}
-
-function insertionPreservesVisibleGraphemeEdges(
-  state: EditorState,
-  text: string
-): boolean {
-  const caret = flattenedTextCaret(state);
-  if (!caret) return false;
-  return insertionPreservesExtendedGraphemeEdges(caret.text, caret.offset, text);
 }
 
 function utf8BoundaryToUtf16Index(text: string, targetBytes: number): number | null {
@@ -297,8 +343,12 @@ function serializedBoundaryProof(
   }
 
   try {
+    // Current text-caret insertion inherits explicit typing marks. Setting even
+    // the same selection clears them. A structural node-edge probe deliberately
+    // creates a different selection and keeps that separate affinity policy.
+    const insertion = selection === state.selection ? state.tr : state.tr.setSelection(selection);
     const witnessed = serializeVisualMarkdown(
-      state.tr.setSelection(selection).insertText(CARET_BOUNDARY_WITNESS).doc
+      insertion.insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
     if (boundary < 0) return rejectedBoundary('witness_missing');
@@ -341,116 +391,120 @@ export function exactMarkdownByteOffsetAtSelection(
   return visualCaretBoundaryProof(state, canonicalMarkdown).byteOffset;
 }
 
-/**
- * Cheap context-neutral screen used while choosing among branch candidates.
- * The exact document-context proof below remains authoritative.
- */
-function beginsWithMarkupConstruct(text: string): boolean {
-  const prefix = text.trimStart();
-  return /^<(?:\/?[A-Za-z][A-Za-z0-9:-]*(?:[\s/>]|$)|!--|[!?])/u.test(prefix);
+interface VisualGhostInsertion {
+  transaction: Transaction;
+  inserted: Slice;
+  rendered: Slice;
+  visibleText: string;
 }
 
-export function visualGhostTextMayBePlainProse(text: string): boolean {
-  // Visual completion insertion uses one ProseMirror text transaction. A
-  // newline in that transaction would create text bytes that serialize as
-  // blocks without actually creating those block nodes, breaking the mounted
-  // document's parse/serialize identity. Source mode remains the explicit
-  // surface for multiline completion.
-  if (
-    !text ||
-    !/\S/u.test(text) ||
-    /[\r\n]/u.test(text) ||
-    beginsWithMarkupConstruct(text)
-  ) return false;
-
+/** Parse the promoted Markdown once and derive the exact ProseMirror change. */
+function prepareVisualGhostInsertion(
+  state: EditorState,
+  canonicalMarkdown: string,
+  anchorByteOffset: number,
+  text: string
+): VisualGhostInsertion | null {
+  if (exactMarkdownByteOffsetAtSelection(state, canonicalMarkdown) !== anchorByteOffset) return null;
+  const boundary = utf8BoundaryToUtf16Index(canonicalMarkdown, anchorByteOffset);
+  if (boundary === null) return null;
   try {
-    const left = '\uE100LOOM_LEFT\uE101';
-    const right = '\uE102LOOM_RIGHT\uE103';
-    // Continuations are inline text, not standalone Markdown documents. For
-    // example, "3. 5-meter-long desk" is literal inside an existing paragraph
-    // but a list at block start. The exact caret/document proof below rejects
-    // the latter; this neutral screen must not discard the former.
-    const wrapped = `${left}${text}${right}`;
-    const parsed = defaultMarkdownParser.parse(wrapped);
-    const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
-    if (
-      !paragraph ||
-      paragraph.type.name !== 'paragraph' ||
-      paragraph.textContent !== wrapped
-    ) {
-      return false;
-    }
-    let plain = true;
-    paragraph.descendants((node) => {
-      if (!node.isText || node.marks.length > 0) plain = false;
+    const promotedMarkdown =
+      canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
+    const target = parseVisualMarkdown(promotedMarkdown, state.schema);
+    if (promotedMarkdown.includes(CARET_BOUNDARY_WITNESS)) return null;
+    const witnessedMarkdown =
+      canonicalMarkdown.slice(0, boundary) + text + CARET_BOUNDARY_WITNESS +
+      canonicalMarkdown.slice(boundary);
+    const witnessedTarget = parseVisualMarkdown(witnessedMarkdown, state.schema);
+    let witnessPosition: number | null = null;
+    let witnessMarks: readonly Mark[] | null = null;
+    witnessedTarget.descendants((node, position) => {
+      if (!node.isText || node.text === undefined) return;
+      const offset = node.text.indexOf(CARET_BOUNDARY_WITNESS);
+      if (offset < 0 || witnessPosition !== null) return;
+      witnessPosition = position + offset;
+      witnessMarks = node.marks;
     });
-    return plain && defaultMarkdownSerializer.serialize(parsed) === wrapped;
+    if (witnessPosition === null || witnessMarks === null) return null;
+    const start = state.doc.content.findDiffStart(target.content);
+    const end = state.doc.content.findDiffEnd(target.content);
+    if (start === null || end === null) return null;
+    const inserted = target.slice(start, end.b);
+    let inlineText = true;
+    inserted.content.descendants((node) => {
+      if (!node.isText) inlineText = false;
+    });
+    if (!inlineText) return null;
+    const transaction = state.tr.replace(start, end.a, inserted);
+    transaction.setSelection(TextSelection.create(transaction.doc, witnessPosition));
+    transaction.setStoredMarks(witnessMarks);
+    if (!transaction.doc.eq(target)) return null;
+    // A diff slice ending at a textblock boundary carries an open edge whose
+    // standalone Fragment omits the final glyph even though replacement is
+    // exact. The witness makes the rendering range internal, so its DOM is the
+    // exact candidate and never a boundary-truncated preview.
+    const rendered = witnessedTarget.slice(state.selection.from, witnessPosition);
+    let renderedInlineText = true;
+    rendered.content.descendants((node) => {
+      if (!node.isText) renderedInlineText = false;
+    });
+    if (!renderedInlineText) return null;
+    const visibleText = rendered.content.textBetween(0, rendered.content.size, '\n', '\ufffc');
+    if (!visibleText) return null;
+    return { transaction, inserted, rendered, visibleText };
   } catch {
-    return false;
+    return null;
   }
 }
 
-/**
- * Return the longest exact leading slice that the visual editor can render as
- * literal prose. A completion may wander into Markdown or another paragraph
- * after a useful opening; hiding the entire suggestion in that case makes a
- * successful generation look broken. Partial slices are inserted as ordinary
- * edits and never promoted as if they were the full stored candidate.
- */
-export function visualGhostTextSafePrefix(text: string): string | null {
-  if (visualGhostTextMayBePlainProse(text)) return text;
-  // Never turn content inside or after a model-emitted markup envelope into a
-  // different candidate. Stored legacy families must remain fail closed even
-  // after native automatic V3 prevents new markup-led proposals.
-  if (!text || !/\S/u.test(text) || beginsWithMarkupConstruct(text)) return null;
-
-  const boundaries = new Set<number>();
-  for (const match of text.matchAll(/\n|[\s,.;:!?—]+/gu)) {
-    if (match.index > 0) boundaries.add(match.index);
-    boundaries.add(match.index + match[0].length);
-  }
-  for (const match of text.matchAll(/[*_`#[\]()>!-]/gu)) {
-    if (match.index > 0) boundaries.add(match.index);
-  }
-
-  const ordered = [...boundaries]
-    .filter((boundary) => boundary > 0 && boundary < text.length)
-    .sort((left, right) => right - left);
-  for (const boundary of ordered) {
-    const prefix = text.slice(0, boundary).replace(/[ \t\n]+$/u, '');
-    if (prefix && visualGhostTextMayBePlainProse(prefix)) return prefix;
-  }
-  return null;
-}
-
-/**
- * Prove that promoting the exact raw bytes yields canonical plain prose at the
- * exact visual caret. Inline text is checked against a literal ProseMirror
- * transaction. Multiline text is projected to a single-block safe prefix
- * before it can reach this boundary.
- */
+/** Exact structural assertion for a sampler-authorized Visual completion. */
 export function visualGhostTextIsFaithfulAtSelection(
   state: EditorState,
   canonicalMarkdown: string,
   anchorByteOffset: number,
   text: string
 ): boolean {
-  if (
-    exactMarkdownByteOffsetAtSelection(state, canonicalMarkdown) !== anchorByteOffset ||
-    !visualGhostTextMayBePlainProse(text) ||
-    !insertionPreservesVisibleGraphemeEdges(state, text)
-  ) return false;
-  const boundary = utf8BoundaryToUtf16Index(canonicalMarkdown, anchorByteOffset);
-  if (boundary === null) return false;
-  try {
-    const promotedMarkdown =
-      canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
-    const literalDocument = state.tr.insertText(text).doc;
-    return serializeVisualMarkdown(literalDocument) === promotedMarkdown &&
-      parseVisualMarkdown(promotedMarkdown, state.schema).eq(literalDocument);
-  } catch {
-    return false;
-  }
+  return prepareVisualGhostInsertion(
+    state,
+    canonicalMarkdown,
+    anchorByteOffset,
+    text
+  ) !== null;
+}
+
+export function visualGhostTextInsertionTransaction(
+  state: EditorState,
+  anchorByteOffset: number,
+  text: string
+): Transaction | null {
+  return prepareVisualGhostInsertion(
+    state,
+    serializeVisualMarkdown(state.doc),
+    anchorByteOffset,
+    text
+  )?.transaction ?? null;
+}
+
+function renderVisualGhost(
+  widget: HTMLElement,
+  state: EditorState,
+  plan: Pick<GhostTextPlan, 'anchorByteOffset' | 'text' | 'hidden'>
+): string | null {
+  widget.replaceChildren();
+  if (plan.hidden) return '';
+  const prepared = prepareVisualGhostInsertion(
+    state,
+    serializeVisualMarkdown(state.doc),
+    plan.anchorByteOffset,
+    plan.text
+  );
+  if (!prepared) return null;
+  widget.append(DOMSerializer.fromSchema(state.schema).serializeFragment(
+    prepared.rendered.content,
+    { document: widget.ownerDocument }
+  ));
+  return prepared.visibleText;
 }
 
 export function renderedGhostPresentationKey(state: EditorState): string {
@@ -473,7 +527,14 @@ export function visibleGhostWidgetObservation(view: EditorView): InlineGhostObse
   const clip = view.dom.closest<HTMLElement>('.editor-pane')?.getBoundingClientRect();
   if (!clip) return null;
   try {
-    return observeInlineGhost(widgets[0], plan.presentationKey, inlineGhostPreview(plan.text),
+    const expected = prepareVisualGhostInsertion(
+      view.state,
+      serializeVisualMarkdown(view.state.doc),
+      plan.anchorByteOffset,
+      plan.text
+    )?.visibleText;
+    if (!expected) return null;
+    return observeInlineGhost(widgets[0], plan.presentationKey, expected,
       view.coordsAtPos(plan.position), clip);
   } catch {
     return null;
@@ -504,7 +565,7 @@ function ghostWidget(
   widget.contentEditable = 'false';
   widget.draggable = false;
   widget.spellcheck = false;
-  widget.textContent = plan.hidden ? '' : inlineGhostPreview(plan.text);
+  renderVisualGhost(widget, view.state, plan);
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
@@ -562,7 +623,11 @@ function ghostWidget(
       number.className = 'loom-ghost-fan-index';
       number.textContent = String(index + 1);
       const text = document.createElement('span');
-      text.textContent = alternative.text;
+      if (renderVisualGhost(text, view.state, {
+        anchorByteOffset: plan.anchorByteOffset,
+        text: alternative.text,
+        hidden: false
+      }) === null) text.textContent = '';
       row.append(number, text);
       row.addEventListener('pointerdown', (event) => {
         event.preventDefault();
@@ -597,7 +662,7 @@ function synchronizeGhostWidgetDom(
   const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
   const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
   if (!container || !widget) return;
-  widget.textContent = plan.hidden ? '' : inlineGhostPreview(plan.text);
+  renderVisualGhost(widget, view.state, plan);
   widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -634,7 +699,13 @@ function synchronizeGhostWidgetDom(
     );
     row.id = domIds.optionId(index);
     const text = row.lastElementChild;
-    if (text) text.textContent = alternative.text;
+    if (text instanceof HTMLElement) {
+      if (renderVisualGhost(text, view.state, {
+        anchorByteOffset: plan.anchorByteOffset,
+        text: alternative.text,
+        hidden: false
+      }) === null) text.textContent = '';
+    }
   });
 }
 
@@ -764,7 +835,7 @@ export function createGhostTextPlugin(
         if (meta?.kind === 'set') return meta.presentation;
         if (meta?.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
         if (meta?.kind === 'pin') return current ? { ...current, fanPinned: meta.pinned } : current;
-        if (meta?.kind === 'clear' || transaction.docChanged) return null;
+        if (meta?.kind === 'clear' || transaction.docChanged || transaction.storedMarksSet) return null;
         // WebKit and ProseMirror may explicitly reassert the current selection
         // while restoring focus after an idle period. That transaction is not
         // caret navigation and must not discard an otherwise exact decoration.
@@ -822,12 +893,17 @@ export function createGhostTextPlugin(
         const rollbackStart = plan?.unconsumeText
           ? rollbackEnd - plan.unconsumeText.length
           : -1;
-        const exactRollbackAvailable = Boolean(
-          plan?.unconsumeText &&
-          rollbackStart >= 0 &&
-          view.state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') ===
-            plan.unconsumeText
-        );
+        const exactRollbackAvailable = Boolean(plan && (
+          ghostRollbackTextIsExactAtSelection(view.state, plan) ||
+          handlers.rollbackExact?.(
+            plan.candidateId,
+            plan.presentationKey,
+            plan.anchorByteOffset,
+            plan.unconsumeText,
+            rollbackStart,
+            rollbackEnd
+          )
+        ));
         // Keep reporting the physical modifier when there is no completion.
         // When a plan does exist, however, only its live viewport witness may
         // project Option-held fan state back through the Svelte owner. The one
@@ -884,28 +960,7 @@ export function createGhostTextPlugin(
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
-            const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
-            const anchorByteOffset = plan.anchorByteOffset - removedBytes;
-            if (anchorByteOffset < 0) return false;
-            view.dispatch(view.state.tr
-              .delete(rollbackStart, rollbackEnd)
-              .setMeta(ghostTextPluginKey, {
-                kind: 'set',
-                presentation: {
-                  active: true,
-                  candidateId: plan.candidateId,
-                  presentationKey: `${plan.presentationKey}:rollback:${removedBytes}`,
-                  surfaceKey: plan.surfaceKey,
-                  anchorByteOffset,
-                  text: `${plan.unconsumeText}${plan.text}`,
-                  insertsOnAccept: true,
-                  alternatives: plan.alternatives,
-                  hidden: plan.hidden,
-                  unconsumeText: '',
-                  fanVisible: plan.fanVisible,
-                  fanPinned: plan.fanPinned
-                }
-              } satisfies GhostTextMeta));
+            dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
             return true;
           }
         }
@@ -918,6 +973,12 @@ export function createGhostTextPlugin(
           !event.ctrlKey &&
           (event.key === 'Enter' || event.key === 'Tab')
         ) {
+          const insertion = visualGhostTextInsertionTransaction(
+            view.state,
+            plan.anchorByteOffset,
+            plan.text
+          );
+          if (!insertion) return false;
           if (!handlers.insert?.(
             plan.candidateId,
             plan.presentationKey,
@@ -925,7 +986,7 @@ export function createGhostTextPlugin(
             event.key === 'Enter' ? 'fan_return' : 'fan_tab'
           )) return false;
           event.preventDefault();
-          view.dispatch(view.state.tr.insertText(plan.text));
+          view.dispatch(insertion);
           return true;
         }
         if (
@@ -937,13 +998,18 @@ export function createGhostTextPlugin(
           exactAnchorVisible
         ) {
           const word = nextVisualSuggestionWord(plan.text);
-          if (!word || !handlers.insert?.(
+          const insertion = word && visualGhostTextInsertionTransaction(
+            view.state,
+            plan.anchorByteOffset,
+            word
+          );
+          if (!word || !insertion || !handlers.insert?.(
             plan.candidateId,
             plan.presentationKey,
             word,
             'option_word'
           )) return false;
-          view.dispatch(view.state.tr.insertText(word));
+          view.dispatch(insertion);
           return true;
         }
         if (
@@ -984,8 +1050,11 @@ export function createGhostTextPlugin(
             // A completed candidate still admits an explicit partial-word
             // insertion; whole-candidate promotion cannot accept a hidden suffix.
             const insertWord = plan.insertsOnAccept || word !== plan.text;
+            const insertion = word && insertWord
+              ? visualGhostTextInsertionTransaction(view.state, plan.anchorByteOffset, word)
+              : null;
             const accepted = word && (insertWord
-              ? Boolean(handlers.insert?.(
+              ? Boolean(insertion) && Boolean(handlers.insert?.(
                   plan.candidateId,
                   plan.presentationKey,
                   word,
@@ -994,7 +1063,7 @@ export function createGhostTextPlugin(
               : word === plan.text && handlers.accept(plan.candidateId, plan.presentationKey));
             if (accepted) {
               view.dispatch(insertWord
-                ? view.state.tr.insertText(word!)
+                ? insertion!
                 : clearTransaction(view));
               return true;
             }

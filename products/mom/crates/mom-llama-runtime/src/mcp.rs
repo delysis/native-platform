@@ -22,14 +22,12 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MCP_SERVERS_NAMESPACE: &str = "mcp-servers.v2";
-const MCP_TOOL_CATALOG_NAMESPACE: &str = "mcp-tool-catalog.v1";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MCP_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MCP_UNRELATED_MESSAGES: usize = 64;
 const MAX_MCP_TOOL_CONTENT_ITEMS: usize = 128;
 const MAX_CACHED_MCP_TOOLS: usize = 128;
 const MAX_CACHED_MCP_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
-const MAX_CACHED_MCP_SERVERS: usize = 16;
 const MAX_MCP_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_MCP_PUMP_READS: usize = 16;
 const MAX_MCP_PUMP_BYTES: usize = 128 * 1024;
@@ -77,21 +75,6 @@ pub struct McpTool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-struct McpToolCatalogDb {
-    #[serde(default)]
-    servers: Vec<McpToolCatalogEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct McpToolCatalogEntry {
-    server: String,
-    server_config_sha256: String,
-    frozen_server_config: McpServerConfig,
-    frozen_server_config_sha256: String,
-    tools: Vec<McpTool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -331,7 +314,7 @@ pub fn mcp_list_tools_in_scope(
     };
     let response = execute_mcp_request(scope, &server, "tools/list", json!({}))?;
     let tools = parse_mcp_tools(response)?;
-    let changed_paths = cache_persona_mcp_tool_catalog(&server, &tools)?
+    let changed_paths = stage_reviewed_mcp_executable(&server)?
         .into_iter()
         .map(|path| path.display().to_string())
         .collect();
@@ -346,126 +329,34 @@ pub fn mcp_list_tools_in_scope(
     ))
 }
 
-fn cache_persona_mcp_tool_catalog(
-    server: &McpServerConfig,
-    tools: &[McpTool],
-) -> Result<Vec<PathBuf>> {
+fn stage_reviewed_mcp_executable(server: &McpServerConfig) -> Result<Vec<PathBuf>> {
     if !server.args.is_empty() {
         return Ok(Vec::new());
     }
     let Ok(server_config_sha256) = exact_mcp_server_config_sha256(server) else {
         return Ok(Vec::new());
     };
-    if tools.len() > MAX_CACHED_MCP_TOOLS {
-        anyhow::bail!(
-            "MCP tool catalog exceeds the {} tool limit",
-            MAX_CACHED_MCP_TOOLS
-        );
-    }
-    let encoded = serde_json::to_vec(tools)?;
-    if encoded.len() as u64 > MAX_MCP_MESSAGE_BYTES {
-        anyhow::bail!(
-            "MCP tool catalog exceeds the {} byte limit",
-            MAX_MCP_MESSAGE_BYTES
-        );
-    }
     let settings = resolve_settings()?;
-    let store = RuntimeStore::open(&settings.data_dir)?;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (server, tools, server_config_sha256, settings, store);
+        let _ = (server, server_config_sha256, settings);
         anyhow::bail!("reviewed Persona MCP executable staging is unsupported on this platform")
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    cache_persona_mcp_tool_catalog_with_persistence(
-        &store,
-        &settings.data_dir,
-        server,
-        tools,
-        &server_config_sha256,
-        persist_persona_mcp_tool_catalog,
-    )
+    stage_reviewed_mcp_executable_in(&settings.data_dir, server, &server_config_sha256)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn persist_persona_mcp_tool_catalog(
-    store: &RuntimeStore,
-    entry: McpToolCatalogEntry,
-) -> Result<()> {
-    persist_persona_mcp_tool_catalog_with_hook(store, entry, |_| Ok(()))
-}
-
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
-fn persist_persona_mcp_tool_catalog_with_hook(
-    store: &RuntimeStore,
-    entry: McpToolCatalogEntry,
-    before_update: impl FnOnce(&McpToolCatalogDb) -> Result<()>,
-) -> Result<()> {
-    store.mutate(
-        MCP_TOOL_CATALOG_NAMESPACE,
-        McpToolCatalogDb::default,
-        |catalog| {
-            before_update(catalog)?;
-            catalog
-                .servers
-                .retain(|candidate| candidate.server != entry.server);
-            if catalog.servers.len() >= MAX_CACHED_MCP_SERVERS {
-                anyhow::bail!(
-                    "MCP tool catalog exceeds the {} reviewed server limit",
-                    MAX_CACHED_MCP_SERVERS
-                );
-            }
-            catalog.servers.push(entry);
-            catalog
-                .servers
-                .sort_by(|left, right| left.server.cmp(&right.server));
-            Ok(())
-        },
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cache_persona_mcp_tool_catalog_with_persistence(
-    store: &RuntimeStore,
+fn stage_reviewed_mcp_executable_in(
     data_dir: &Path,
     server: &McpServerConfig,
-    tools: &[McpTool],
     server_config_sha256: &str,
-    persist_catalog: impl FnOnce(&RuntimeStore, McpToolCatalogEntry) -> Result<()>,
 ) -> Result<Vec<PathBuf>> {
     let mut managed_store = lock_managed_mcp_store_for_write(data_dir)?;
-    let (frozen_server_config, frozen_server_config_sha256, newly_staged) =
+    let (frozen_server_config, frozen_server_config_sha256, _) =
         stage_mcp_server_for_persona_locked(server, server_config_sha256, &mut managed_store)?;
-    let entry = McpToolCatalogEntry {
-        server: server.name.clone(),
-        server_config_sha256: server_config_sha256.to_string(),
-        frozen_server_config: frozen_server_config.clone(),
-        frozen_server_config_sha256: frozen_server_config_sha256.clone(),
-        tools: tools.to_vec(),
-    };
-    if let Err(persist_error) = persist_catalog(store, entry) {
-        let rollback_error = rollback_new_unreferenced_managed_mcp_executable(
-            store,
-            &managed_store.dir,
-            &frozen_server_config.command,
-            newly_staged,
-        )
-        .err();
-        let seal_error = managed_store.seal().err();
-        drop(managed_store);
-        return match (rollback_error, seal_error) {
-            (None, None) => Err(persist_error),
-            (rollback_error, seal_error) => Err(anyhow::anyhow!(
-                "{persist_error:#}; managed MCP rollback error: {}; managed MCP seal error: {}",
-                rollback_error
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "none".to_string()),
-                seal_error
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "none".to_string())
-            )),
-        };
-    }
+    // Retained approvals own their frozen schema/configuration. Do not recreate a
+    // parallel catalog or delete staged bytes on behalf of an unobserved reader.
     managed_store.seal()?;
     drop(managed_store);
     validate_frozen_mcp_server(
@@ -474,39 +365,9 @@ fn cache_persona_mcp_tool_catalog_with_persistence(
         &frozen_server_config_sha256,
     )?;
     if exact_mcp_server_config_sha256(server)? != server_config_sha256 {
-        anyhow::bail!("configured MCP executable identity drifted while its catalog was reviewed");
+        anyhow::bail!("configured MCP executable identity drifted while it was staged");
     }
-    Ok(vec![
-        frozen_server_config.command,
-        store.path().to_path_buf(),
-    ])
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rollback_new_unreferenced_managed_mcp_executable(
-    store: &RuntimeStore,
-    managed_dir: &Path,
-    managed_path: &Path,
-    newly_staged: bool,
-) -> Result<()> {
-    if !newly_staged {
-        return Ok(());
-    }
-    let referenced = store
-        .get::<McpToolCatalogDb>(MCP_TOOL_CATALOG_NAMESPACE)?
-        .unwrap_or_default()
-        .servers
-        .iter()
-        .any(|entry| entry.frozen_server_config.command == managed_path);
-    if referenced {
-        return Ok(());
-    }
-    match fs::remove_file(managed_path) {
-        Ok(()) => File::open(managed_dir)?.sync_all()?,
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
+    Ok(vec![frozen_server_config.command])
 }
 
 fn parse_mcp_tools(response: Value) -> Result<Vec<McpTool>> {
@@ -1209,11 +1070,11 @@ impl McpStdioSession {
         let message = serialize_mcp_message(
             &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":params}),
         )
-        .map_err(McpCallSupervisionError::before_effect)?;
+        .map_err(McpCallSupervisionError::after_external_process_spawn)?;
         write_mcp_bytes_bounded(
-            self.stdin
-                .as_mut()
-                .ok_or_else(|| McpCallSupervisionError::before_effect("MCP stdin is closed"))?,
+            self.stdin.as_mut().ok_or_else(|| {
+                McpCallSupervisionError::after_external_process_spawn("MCP stdin is closed")
+            })?,
             &message,
             deadline,
             Some(should_cancel),
@@ -1345,6 +1206,7 @@ impl McpStdioSession {
 
     fn initialize(
         &mut self,
+        required_capability: &str,
         deadline: Instant,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
@@ -1387,11 +1249,12 @@ impl McpStdioSession {
             anyhow::bail!("MCP serverInfo must contain nonempty name and version");
         }
         if result
-            .pointer("/capabilities/tools")
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get(required_capability))
             .and_then(Value::as_object)
             .is_none()
         {
-            anyhow::bail!("MCP server did not negotiate the tools capability");
+            anyhow::bail!("MCP server did not negotiate the {required_capability} capability");
         }
         self.send(
             &json!({
@@ -1433,9 +1296,15 @@ fn execute_mcp_request_supervised(
     if cancellation_requested(should_cancel) {
         anyhow::bail!("MCP request was cancelled before server spawn");
     }
+    let required_capability = match method {
+        "tools/list" | "tools/call" => "tools",
+        "resources/list" | "resources/read" => "resources",
+        "prompts/list" | "prompts/get" => "prompts",
+        _ => anyhow::bail!("Unsupported MCP method {method}"),
+    };
     let deadline = mcp_request_deadline()?;
     let mut session = McpStdioSession::spawn(server)?;
-    session.initialize(deadline, should_cancel)?;
+    session.initialize(required_capability, deadline, should_cancel)?;
     if cancellation_requested(should_cancel) {
         anyhow::bail!("MCP request was cancelled before request dispatch");
     }
@@ -1475,7 +1344,7 @@ fn execute_mcp_effect_request_supervised(
             McpCallSupervisionError::at_process_spawn_boundary(error, process_spawned)
         })?;
     session
-        .initialize(deadline, Some(should_cancel))
+        .initialize("tools", deadline, Some(should_cancel))
         .map_err(McpCallSupervisionError::after_external_process_spawn)?;
     session
         .send(
@@ -2483,25 +2352,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MCP_PROTOCOL_VERSION, MCP_TOOL_CATALOG_NAMESPACE, McpCallSupervisionError,
-        McpEffectTerminal, McpServerConfig, McpTool, McpToolCatalogDb, McpToolCatalogEntry,
+        MCP_PROTOCOL_VERSION, McpCallSupervisionError, McpEffectTerminal, McpServerConfig,
         exact_mcp_server_config_sha256, execute_mcp_effect_request_supervised,
-        persist_persona_mcp_tool_catalog_with_hook, validate_frozen_mcp_server,
-        write_mcp_effect_message,
+        validate_frozen_mcp_server, write_mcp_effect_message,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use super::{
-        cache_persona_mcp_tool_catalog_with_persistence, freeze_mcp_server_for_persona,
-        persist_persona_mcp_tool_catalog,
-    };
+    use super::{freeze_mcp_server_for_persona, stage_reviewed_mcp_executable_in};
     use crate::store::RuntimeStore;
     use anyhow::Result;
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::thread;
 
     struct PartialWriter {
         remaining: usize,
@@ -2668,6 +2530,52 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn oversized_effect_frame_after_successful_spawn_is_outcome_unknown() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "mom-mcp-effect-frame-{}",
+            uuid::Uuid::new_v4().simple(),
+        ));
+        std::fs::create_dir_all(&directory)?;
+        struct OwnedDirectory(PathBuf);
+        impl Drop for OwnedDirectory {
+            fn drop(&mut self) {
+                crate::config::set_data_dir_override_for_tests(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        crate::config::set_data_dir_override_for_tests(Some(directory.clone()));
+        let _directory = OwnedDirectory(directory);
+        let server = standard_shell_server(
+            "printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}\\n'",
+        );
+        let ordinary = execute_mcp_effect_request_supervised(
+            &server,
+            "lookup",
+            json!({"query":"ordinary"}),
+            &object_schema_sha256(),
+            &|| false,
+        )?;
+        assert!(matches!(ordinary, McpEffectTerminal::Success(_)));
+        // This enters the actual spawned/initialized/re-listed session. It is
+        // not the counted-writer helper's distinct before-first-byte boundary.
+        let error = execute_mcp_effect_request_supervised(
+            &server,
+            "lookup",
+            json!({"query":"x".repeat(super::MAX_MCP_MESSAGE_BYTES as usize)}),
+            &object_schema_sha256(),
+            &|| false,
+        )
+        .expect_err("serialized frame exceeds the unchanged session ceiling");
+        assert!(error.to_string().contains("MCP request exceeds"));
+        assert!(
+            error.outcome_unknown(),
+            "successful process spawn is already irreversible"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn schema_drift_after_spawn_is_outcome_unknown() {
         let server = standard_shell_server(
             "printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}\\n'",
@@ -2791,86 +2699,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reviewed_catalog_updates_serialize_one_mutable_fact() -> Result<()> {
-        let data_dir = std::env::temp_dir().join(format!(
-            "mom-llama-mcp-catalog-race-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let store = RuntimeStore::open_with_key(&data_dir, [61_u8; 32])?;
-        let first_store = store.clone();
-        let (first_entered_tx, first_entered_rx) = mpsc::channel();
-        let (release_first_tx, release_first_rx) = mpsc::channel();
-        let first = thread::spawn(move || {
-            persist_persona_mcp_tool_catalog_with_hook(&first_store, catalog_entry("alpha"), |_| {
-                first_entered_tx.send(()).expect("signal first transaction");
-                release_first_rx.recv().expect("release first transaction");
-                Ok(())
-            })
-        });
-        first_entered_rx.recv()?;
-
-        let second_store = store.clone();
-        let (second_started_tx, second_started_rx) = mpsc::channel();
-        let (second_entered_tx, second_entered_rx) = mpsc::channel();
-        let second = thread::spawn(move || {
-            second_started_tx.send(()).expect("signal second contender");
-            persist_persona_mcp_tool_catalog_with_hook(
-                &second_store,
-                catalog_entry("beta"),
-                |catalog| {
-                    second_entered_tx
-                        .send(())
-                        .expect("signal second transaction");
-                    assert!(
-                        catalog.servers.iter().any(|entry| entry.server == "alpha"),
-                        "the second immediate transaction must observe the first commit"
-                    );
-                    Ok(())
-                },
-            )
-        });
-        second_started_rx.recv()?;
-        assert!(
-            matches!(
-                second_entered_rx.recv_timeout(std::time::Duration::from_millis(100)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "a second writer must not enter while the first immediate transaction is live"
-        );
-        release_first_tx.send(())?;
-        first.join().expect("first catalog writer")?;
-        second.join().expect("second catalog writer")?;
-        second_entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("second transaction entered after the first commit");
-
-        let catalog = store
-            .get::<McpToolCatalogDb>(MCP_TOOL_CATALOG_NAMESPACE)?
-            .expect("reviewed catalog");
-        assert_eq!(
-            catalog
-                .servers
-                .iter()
-                .map(|entry| entry.server.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha", "beta"]
-        );
-        std::fs::remove_dir_all(&data_dir)?;
-        Ok(())
-    }
-
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn catalog_fault_rolls_back_only_newly_staged_unreferenced_bytes() -> Result<()> {
+    fn reviewed_staging_restores_exact_bytes_without_rewriting_retained_catalog() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let data_dir = std::env::temp_dir().join(format!(
-            "mom-llama-mcp-catalog-fault-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-llama-mcp-staging-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir)?;
         let store = RuntimeStore::open_with_key(&data_dir, [62_u8; 32])?;
+        let retained = br#"{"servers":[{"historical":"preserve exact bytes"}]}"#;
+        store.put_bytes("mcp-tool-catalog.v1", retained)?;
         let server = McpServerConfig {
             executable_sha256: None,
             name: "reviewed".to_string(),
@@ -2879,54 +2718,38 @@ mod tests {
             enabled: true,
         };
         let server_hash = exact_mcp_server_config_sha256(&server)?;
-        let tools = vec![McpTool {
-            name: "lookup".to_string(),
-            description: None,
-            input_schema: json!({"type": "object"}),
-        }];
-        let injected = cache_persona_mcp_tool_catalog_with_persistence(
-            &store,
-            &data_dir,
-            &server,
-            &tools,
-            &server_hash,
-            |_, _| anyhow::bail!("injected catalog persistence failure"),
-        )
-        .expect_err("faulted catalog persistence must fail");
-        assert!(
-            injected
-                .to_string()
-                .contains("injected catalog persistence failure")
-        );
+        let changed = stage_reviewed_mcp_executable_in(&data_dir, &server, &server_hash)?;
+        assert_eq!(changed.len(), 1);
+        let managed_path = &changed[0];
+        let bytes = std::fs::read(managed_path)?;
+        assert_eq!(bytes, std::fs::read(&server.command)?);
         let managed_dir = data_dir.join(super::PERSONA_MCP_EXECUTABLES_DIR);
-        assert_eq!(std::fs::read_dir(&managed_dir)?.count(), 0);
+        assert_eq!(
+            std::fs::metadata(&managed_dir)?.permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(
+            store.get_bytes("mcp-tool-catalog.v1")?.as_deref(),
+            Some(retained.as_slice())
+        );
 
-        let changed = cache_persona_mcp_tool_catalog_with_persistence(
-            &store,
-            &data_dir,
-            &server,
-            &tools,
-            &server_hash,
-            persist_persona_mcp_tool_catalog,
-        )?;
-        let managed_path = changed[0].clone();
-        assert!(managed_path.is_file());
-
+        // A retained approval can reference an executable whose staged copy was lost.
+        // Re-review restores that same content-addressed path without using an index.
         std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::remove_file(&managed_path)?;
+        std::fs::remove_file(managed_path)?;
         std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o500))?;
-        cache_persona_mcp_tool_catalog_with_persistence(
-            &store,
-            &data_dir,
-            &server,
-            &tools,
-            &server_hash,
-            |_, _| anyhow::bail!("second injected catalog persistence failure"),
-        )
-        .expect_err("fault after restoring referenced bytes must fail");
-        assert!(
-            managed_path.is_file(),
-            "rollback must preserve newly restored bytes referenced by the durable catalog"
+        assert_eq!(
+            stage_reviewed_mcp_executable_in(&data_dir, &server, &server_hash)?,
+            changed
+        );
+        assert_eq!(std::fs::read(managed_path)?, bytes);
+        assert_eq!(
+            store.get_bytes("mcp-tool-catalog.v1")?.as_deref(),
+            Some(retained.as_slice())
+        );
+        assert_eq!(
+            std::fs::metadata(&managed_dir)?.permissions().mode() & 0o777,
+            0o500
         );
 
         std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700))?;
@@ -3061,25 +2884,5 @@ mod tests {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&json!({"type":"object"})).expect("schema"))
         )
-    }
-
-    fn catalog_entry(server: &str) -> McpToolCatalogEntry {
-        McpToolCatalogEntry {
-            server: server.to_string(),
-            server_config_sha256: format!("configured-{server}"),
-            frozen_server_config: McpServerConfig {
-                executable_sha256: None,
-                name: server.to_string(),
-                command: PathBuf::from(format!("/managed/{server}.bin")),
-                args: Vec::new(),
-                enabled: true,
-            },
-            frozen_server_config_sha256: format!("frozen-{server}"),
-            tools: vec![McpTool {
-                name: "lookup".to_string(),
-                description: None,
-                input_schema: json!({"type": "object"}),
-            }],
-        }
     }
 }

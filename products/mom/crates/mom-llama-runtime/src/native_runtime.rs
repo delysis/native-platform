@@ -756,6 +756,7 @@ mod tests {
     use crate::config::KvCachePolicy;
     use llama_native_cache::{
         CacheFingerprint, CacheInsertOutcome, CacheTier, PrefixCacheMetadata, PrefixCacheValue,
+        ValidatedPrefixCacheValue,
     };
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
 
@@ -824,7 +825,28 @@ mod tests {
 
     #[test]
     fn product_prefix_admission_preserves_storage_when_incoming_is_evicted() {
-        for memory_cache_bytes in [0, 3] {
+        let resident_budget = {
+            let mut incumbent = cache_value();
+            incumbent.metadata.id = "incumbent-0".to_string();
+            incumbent.bind_reconstruction();
+            let mut incoming = cache_value();
+            incoming.metadata.id = "incoming".to_string();
+            incoming.metadata.fingerprint.model_sha256 = "incoming-fixture".to_string();
+            incoming.bind_reconstruction();
+            [incumbent, incoming]
+                .into_iter()
+                .map(|value| {
+                    ValidatedPrefixCacheValue::new(value)
+                        .expect("valid resident fixture")
+                        .memory_bytes()
+                })
+                .max()
+                .expect("two resident fixtures")
+        };
+        // The cache charges complete retained allocations, not only the three
+        // serialized state bytes. Exercise disk-only admission and an exact
+        // one-entry resident budget explicitly.
+        for memory_cache_bytes in [0, resident_budget] {
             let directory = tempfile::tempdir().expect("isolated cache admission fixture");
             let store = crate::store::RuntimeStore::open_with_key(directory.path(), [31; 32])
                 .expect("encrypted store");

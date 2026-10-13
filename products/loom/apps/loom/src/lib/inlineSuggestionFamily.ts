@@ -1,13 +1,10 @@
 import { verifiedBodyMatchesBranch, type VerifiedBranchBody } from './branchBodyProof';
-import { candidateTextIsSurfaceable } from './candidateSurface';
 import { completionTextAtBoundary } from './completionSession';
 import {
   verifiedGhostSuggestion,
   type AutocompleteDisposition,
   type AutocompleteExhaustionReason
 } from './ghostSuggestion';
-import { visualGhostTextMayBePlainProse, visualGhostTextSafePrefix } from './ghostText';
-import { sourceGhostPresentationCompatible } from './sourceGhostText';
 import type { SuggestionAlternative } from './suggestionInteraction';
 import type {
   BranchCard,
@@ -39,7 +36,6 @@ export interface InlineSuggestionState {
   suggestionsEnabled: boolean;
   promotionReady: boolean;
   dismissedCandidateIds: string[];
-  unpresentableVisualKeys: string[];
   manuscriptText: string;
   sourceNewline: VerseNewlineKind | null;
 }
@@ -123,24 +119,14 @@ export function authoritativeInlineFamilyId(
  */
 export function projectInlineCandidateText(
   targetByte: number,
-  editorMode: 'visual' | 'source',
+  _editorMode: 'visual' | 'source',
   manuscriptText: string,
   rawText: string,
-  sourceNewline: VerseNewlineKind | null
+  _sourceNewline: VerseNewlineKind | null
 ): string | null {
-  const candidateText = editorMode === 'visual'
-    ? visualGhostTextSafePrefix(rawText)
-    : rawText;
-  const text = candidateText === null
-    ? null
-    : completionTextAtBoundary(manuscriptText, targetByte, candidateText);
-  if (!text || !candidateTextIsSurfaceable(text)) return null;
-  if (editorMode === 'visual') {
-    return visualGhostTextMayBePlainProse(text) ? text : null;
-  }
-  return sourceGhostPresentationCompatible(manuscriptText, text, sourceNewline)
-    ? text
-    : null;
+  const text = completionTextAtBoundary(manuscriptText, targetByte, rawText);
+  if (text === null || text.length === 0) return null;
+  return text;
 }
 
 export function projectedInlinePresentationKey(
@@ -150,7 +136,7 @@ export function projectedInlinePresentationKey(
 ): string {
   return projectedText === rawText
     ? rawPresentationKey
-    : `${rawPresentationKey}:prose-prefix:${new TextEncoder().encode(projectedText).byteLength}`;
+    : `${rawPresentationKey}:boundary:${new TextEncoder().encode(projectedText).byteLength}`;
 }
 
 export function inlineSuggestionFamily(
@@ -261,26 +247,13 @@ export function evaluateInlineSuggestionFamily(
         if (branch.status === 'queued' || branch.status === 'generating') {
           pending.add(branch.run_id);
         } else {
-          terminalShortfall.push({ candidateId, reason: 'unpresentable' });
+          terminalShortfall.push({ candidateId, reason: 'invalid' });
         }
         continue;
       }
       const rawPresentationKey = verified?.presentationKey ??
         (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
       const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
-      if (editorMode === 'visual') {
-        if (
-          state.unpresentableVisualKeys.includes(presentationKey)
-        ) {
-          if (branch.status === 'queued' || branch.status === 'generating') {
-            pending.add(branch.run_id);
-          } else {
-            terminalShortfall.push({ candidateId, reason: 'unpresentable' });
-          }
-          continue;
-        }
-      }
-
       batch.push({
         candidateId,
         presentationKey,

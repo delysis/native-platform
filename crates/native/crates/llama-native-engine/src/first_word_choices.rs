@@ -6,6 +6,7 @@ use llama_native_types::{
     FIRST_WORD_CHOICE_MAX_ATTEMPTS, FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS, FirstWordChoiceAttempt,
     FirstWordChoiceAttemptOutcome, FirstWordChoiceEvidence, FirstWordChoicePolicy,
     LeadingMarkupStatus, complete_first_word_key, leading_markup_status,
+    leading_visual_block_status,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ impl FirstWordGate {
         Self {
             evidence: FirstWordChoiceEvidence {
                 policy,
+                forbidden_token_ids: Vec::new(),
                 attempts: Vec::new(),
                 selected_attempt: None,
                 total_attempted_tokens: 0,
@@ -35,6 +37,10 @@ impl FirstWordGate {
             base_seed,
             initial_token_exclusions: Vec::new(),
         }
+    }
+
+    pub fn set_forbidden_token_ids(&mut self, token_ids: &BTreeSet<i32>) {
+        self.evidence.forbidden_token_ids = token_ids.iter().copied().collect();
     }
 
     pub fn pending(&self) -> bool {
@@ -81,11 +87,14 @@ impl FirstWordGate {
         finished: bool,
         reserved: &mut BTreeSet<String>,
     ) -> Admission {
-        let markup = self
-            .evidence
-            .policy
-            .rejects_leading_markup()
-            .then(|| leading_markup_status(text));
+        let markup = if self.evidence.policy.rejects_leading_visual_blocks() {
+            Some(leading_visual_block_status(text))
+        } else {
+            self.evidence
+                .policy
+                .rejects_leading_markup()
+                .then(|| leading_markup_status(text))
+        };
         let word_key = if markup == Some(LeadingMarkupStatus::NotMarkup) || markup.is_none() {
             complete_first_word_key(text, terminal_token_id.is_some())
         } else {
@@ -234,6 +243,35 @@ mod tests {
         assert_eq!(
             source.observe("\n\nwooden table", &[1], None, false, &mut BTreeSet::new()),
             Admission::Accepted
+        );
+    }
+
+    #[test]
+    fn visual_v5_admits_inline_markdown_before_emission() {
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV5, 41);
+        assert_eq!(
+            gate.observe(
+                "**boldly** continues ",
+                &[1, 2],
+                None,
+                false,
+                &mut BTreeSet::new()
+            ),
+            Admission::Accepted
+        );
+        assert_eq!(
+            gate.evidence.attempts[0].word_key.as_deref(),
+            Some("boldly")
+        );
+
+        let mut blocked = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV5, 41);
+        assert_eq!(
+            blocked.observe("23)", &[3], None, false, &mut BTreeSet::new()),
+            Admission::Pending
+        );
+        assert_eq!(
+            blocked.observe("23) item ", &[3, 4], None, false, &mut BTreeSet::new()),
+            Admission::Retry
         );
     }
 

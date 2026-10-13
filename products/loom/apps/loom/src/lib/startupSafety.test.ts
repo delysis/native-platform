@@ -4,7 +4,6 @@ import {
   attachWorkspaceProjectReply,
   restoreBeforeBackgroundWork,
   runCurrentWorkspaceStep,
-  shouldDiscoverModelsOnStartup,
   workspaceResumeAction
 } from './startupSafety';
 
@@ -114,13 +113,6 @@ describe('acquireStartupProject', () => {
       projectIsAbsent: (error) => (error as { code?: string }).code === 'project_not_open'
     })).rejects.toBe(failure);
     expect(openDefaultProject).not.toHaveBeenCalled();
-  });
-});
-
-describe('shouldDiscoverModelsOnStartup', () => {
-  it('prepares the local model library before a project opts into suggestions', () => {
-    expect(shouldDiscoverModelsOnStartup(false)).toBe(true);
-    expect(shouldDiscoverModelsOnStartup(true)).toBe(true);
   });
 });
 

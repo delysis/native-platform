@@ -24,6 +24,40 @@ pub(super) fn suggested_file_name(name: &str) -> String {
     }
 }
 
+fn open_directory(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let directory = {
+        use rustix::fs::{Mode, OFlags, open};
+        File::from(open(
+            path,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let directory = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        options.open(path)?
+    };
+    if !directory.metadata()?.is_dir() {
+        return Err(invalid("The export destination is not a folder."));
+    }
+    Ok(directory)
+}
+
 pub(super) fn write_new(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     if !destination.is_absolute()
         || destination
@@ -46,32 +80,7 @@ pub(super) fn write_new(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     }) {
         return Err(invalid("Originals cannot be exported inside a private .loom folder."));
     }
-    #[cfg(unix)]
-    let directory = {
-        use rustix::fs::{Mode, OFlags, open};
-        File::from(open(
-            &parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?)
-    };
-    #[cfg(not(unix))]
-    let directory = {
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            };
-            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        options.open(&parent)?
-    };
-    if !directory.metadata()?.is_dir() {
-        return Err(invalid("The export destination is not a folder."));
-    }
+    let directory = open_directory(&parent)?;
     let identity = same_file::Handle::from_file(directory.try_clone()?)?;
     #[cfg(unix)]
     let mut file = {
@@ -88,9 +97,13 @@ pub(super) fn write_new(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(parent.join(name))?;
+    #[cfg(all(test, unix))]
+    if let Some(interrupt) = tests::AFTER_CREATE.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
     // create_new also refuses an existing final symlink. A user selection never
     // grants permission to replace a file that appeared while the dialog ran.
-    if same_file::Handle::from_path(&parent)? != identity
+    if same_file::Handle::from_file(open_directory(&parent)?)? != identity
         || fs::symlink_metadata(&parent)?.file_type().is_symlink()
     {
         return Err(invalid("The export folder changed before writing."));
@@ -109,6 +122,12 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    thread_local! {
+        pub(super) static AFTER_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     #[test]
     fn original_export_preserves_exact_bytes_and_never_clobbers_a_destination() {
@@ -163,5 +182,77 @@ mod tests {
         );
         assert_eq!(suggested_file_name(".."), "attachment");
         assert_eq!(suggested_file_name(&"尾".repeat(1_000)), "尾".repeat(80));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_folder_replacement_refuses_without_a_fifo_peer_and_retains_partial_effect() {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let project = tempfile::tempdir().expect("export fixture");
+        let parent = project.path().join("chosen");
+        let retained = project.path().join("retained");
+        fs::create_dir(&parent).expect("chosen directory");
+        write_new(&parent.join("ordinary.txt"), b"exact original\r\n").expect("ordinary export");
+        let (swapped, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let worker_parent = parent.clone();
+        let worker_retained = retained.clone();
+        let worker = std::thread::spawn(move || {
+            let replaced = worker_parent.clone();
+            AFTER_CREATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&replaced, worker_retained).expect("retain chosen directory");
+                    nix::unistd::mkfifo(
+                        &replaced,
+                        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                    )
+                    .expect("owned FIFO");
+                    swapped.send(()).expect("replacement observer");
+                }));
+            });
+            finished
+                .send(write_new(
+                    &worker_parent.join("new.txt"),
+                    b"must not be published",
+                ))
+                .expect("export observer");
+        });
+        ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("after-create boundary");
+        let early = result.recv_timeout(Duration::from_secs(5));
+        let needed_peer = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        let rescue = needed_peer.then(|| {
+            open(
+                &parent,
+                OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("release the controlled old reopen")
+        });
+        let outcome = early.unwrap_or_else(|_| {
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rescued export result")
+        });
+        worker.join().expect("physical export worker join");
+        drop(rescue);
+        assert!(outcome.is_err());
+        assert_eq!(
+            fs::read(retained.join("ordinary.txt")).unwrap(),
+            b"exact original\r\n"
+        );
+        assert_eq!(
+            fs::read(retained.join("new.txt")).unwrap(),
+            b"",
+            "the owned create-new effect is retained, not silently rolled back or written"
+        );
+        assert!(
+            !needed_peer,
+            "folder identity refusal waited for a FIFO peer"
+        );
     }
 }

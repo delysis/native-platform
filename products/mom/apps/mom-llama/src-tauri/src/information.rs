@@ -554,6 +554,16 @@ impl MomInformation {
                     .to_string(),
             );
         }
+        {
+            let mut grants = self
+                .grants
+                .lock()
+                .map_err(|_| "Information grant state is unavailable".to_string())?;
+            grants.prune(now_unix_ms());
+            if grants.previews.len() >= MAX_PENDING_CAPABILITIES {
+                return Err("Too many attachment library previews are pending.".to_string());
+            }
+        }
         let input = exact_attachment_input(&anchor)?;
         let confirmed_at = Utc::now();
         let rights = ConfirmedRights::private(
@@ -1440,7 +1450,23 @@ fn wrap_model_evidence(
     user_message: &str,
     evidence: &InformationSearchResult,
 ) -> Result<String, String> {
-    let packet = serde_json::to_vec(evidence).map_err(display_error)?;
+    // Serialize into a bounded slice: a rejected packet never first grows a Vec
+    // to the size of the complete untrusted result.
+    let mut packet = vec![0_u8; MAX_MODEL_EVIDENCE_PACKET_BYTES];
+    let written = {
+        let mut remaining = packet.as_mut_slice();
+        serde_json::to_writer(&mut remaining, evidence).map_err(|error| {
+            if error.is_io() {
+                format!(
+                    "The serialized Information evidence packet exceeds the {MAX_MODEL_EVIDENCE_PACKET_BYTES}-byte model-context ceiling."
+                )
+            } else {
+                display_error(error)
+            }
+        })?;
+        MAX_MODEL_EVIDENCE_PACKET_BYTES - remaining.len()
+    };
+    packet.truncate(written);
     wrap_serialized_model_evidence(user_message, packet)
 }
 
@@ -1629,6 +1655,73 @@ mod tests {
             "The native picker did not return an absolute database file."
         );
         assert!(information.grants.lock().expect("grants").paths.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_preview_admission_refuses_before_acquiring_another_attachment() {
+        let directory = tempfile::tempdir().expect("owned runtime directory");
+        struct RuntimeDirectoryOverride;
+        impl Drop for RuntimeDirectoryOverride {
+            fn drop(&mut self) {
+                mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+            }
+        }
+        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+            directory.path().to_path_buf(),
+        ));
+        let _override = RuntimeDirectoryOverride;
+        let scope = mom_llama_runtime::OperationScope::detached();
+        let conversation = mom_llama_runtime::conversation_new(Some("Owned preview".to_string()))
+            .expect("source conversation")
+            .result
+            .expect("conversation result");
+        let attachment = mom_llama_runtime::attachment_import_pasted_text(
+            &scope,
+            &conversation.id,
+            "Exact ordinary preview text.".to_string(),
+        )
+        .expect("ordinary attachment")
+        .result
+        .expect("attachment result")
+        .attachment;
+        let catalog = mom_llama_runtime::attachment_preview(&attachment.id)
+            .expect("canonical preview")
+            .result
+            .expect("preview catalog");
+        let artifact = catalog.primary.as_ref().expect("canonical text artifact");
+        let anchor = AttachmentPreviewAnchor {
+            attachment_id: catalog.attachment_id.clone(),
+            root_sha256: catalog.root_sha256.clone(),
+            artifact_id: artifact.artifact_id.clone(),
+            policy_fingerprint: catalog.policy_fingerprint.clone(),
+        };
+        let information = MomInformation::open(directory.path()).expect("owned Information host");
+        for index in 0..MAX_PENDING_CAPABILITIES {
+            let preview = information
+                .preview_attachment(anchor.clone(), format!("Preview {index}"), true)
+                .expect("ordinary exact preview before capacity");
+            assert_eq!(preview.attachment_id, attachment.id);
+            assert!(preview.canonical_text_bytes > 0);
+            assert_eq!(preview.root_sha256, catalog.root_sha256);
+        }
+        let mut missing = anchor.clone();
+        missing.attachment_id = "absent-occurrence".to_string();
+        let error = information
+            .preview_attachment(missing, "Refused".to_string(), true)
+            .expect_err("capacity must refuse before attempting another acquisition");
+        assert_eq!(error, "Too many attachment library previews are pending.");
+        assert_eq!(
+            information.grants.lock().expect("registry").previews.len(),
+            MAX_PENDING_CAPABILITIES
+        );
+        assert!(
+            information
+                .preview_attachment(anchor, "No rights".to_string(), false)
+                .expect_err("rights remain mandatory")
+                .contains("rights confirmation")
+        );
+        assert_eq!(scope.active_operation_count(), 0);
     }
 
     #[test]
@@ -1872,6 +1965,36 @@ mod tests {
         assert!(wrapped.contains("\"release_id\":\"release\""));
         assert!(wrapped.contains("\"representation_id\":\"representation\""));
         assert!(wrapped.contains(&format!("\"excerpt_sha256\":\"{}\"", "1".repeat(64))));
+    }
+
+    #[test]
+    fn actual_evidence_serialization_preserves_exact_limit_and_rejects_one_more_byte() {
+        let mut evidence = InformationSearchResult {
+            query_id: "ordinary".to_string(),
+            complete: true,
+            warnings: vec![String::new()],
+            hits: Vec::new(),
+            elapsed_ms: 0,
+        };
+        let ordinary = wrap_model_evidence("Question", &evidence).expect("ordinary evidence");
+        assert!(ordinary.contains("\"query_id\":\"ordinary\""));
+        let overhead = serde_json::to_vec(&evidence)
+            .expect("encoded empty warning")
+            .len();
+        evidence.warnings[0] = "x".repeat(MAX_MODEL_EVIDENCE_PACKET_BYTES - overhead);
+        let exact = serde_json::to_vec(&evidence).expect("exact encoded evidence");
+        assert_eq!(exact.len(), MAX_MODEL_EVIDENCE_PACKET_BYTES);
+        assert!(
+            wrap_model_evidence("Question", &evidence)
+                .expect("exact ceiling")
+                .contains(&format!("bytes={} sha256={}", exact.len(), sha256(&exact)))
+        );
+        evidence.warnings[0].push('x');
+        assert!(
+            wrap_model_evidence("Question", &evidence)
+                .expect_err("one additional encoded byte must not produce a truncated packet")
+                .contains("model-context ceiling")
+        );
     }
 
     #[test]

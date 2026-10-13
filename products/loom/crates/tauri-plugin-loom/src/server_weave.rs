@@ -26,8 +26,10 @@ impl Engine {
                 ValidatedWeavePolicy::AutomaticV2
                     | ValidatedWeavePolicy::AutomaticV3
                     | ValidatedWeavePolicy::AutomaticVisualV4
+                    | ValidatedWeavePolicy::AutomaticVisualV5
                     | ValidatedWeavePolicy::LoompadV2 { .. }
                     | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV4 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {
@@ -290,7 +292,7 @@ pub(super) fn submit<R: Runtime>(
         let _ = worker.join();
         let _ = owner.shutdown_joined();
         fail_and_release_open_runs(state, &identity, &runs, &failure.message, app)?;
-        return Err(failure);
+        return Err(*failure);
     }
     gate.release();
     lifecycle_ticket.detach();
@@ -613,27 +615,30 @@ mod tests {
         let command = CommandId::new();
         // Focus blocks even explicitly configured servers before durable work.
         state.session.lock().unwrap().agency.set_focus_mode(true);
-        let start = || {
+        let start_with = |requested_command: CommandId, requested_policy: WeavePolicySnapshot| {
             tauri::async_runtime::block_on(weave_start(
                 project.to_string(),
                 session_id.to_string(),
-                command.to_string(),
+                requested_command.to_string(),
                 source.document_id.to_string(),
                 INITIAL_DOCUMENT.into(),
                 source.revision_id.to_string(),
                 source.blob_id.to_string(),
                 5,
-                policy,
+                requested_policy,
                 app.handle().clone(),
                 app.state::<PluginState>(),
             ))
         };
+        let start = || start_with(command, policy);
         if matches!(
             policy,
             WeavePolicySnapshot::AutomaticV3 {}
                 | WeavePolicySnapshot::AutomaticVisualV4 {}
+                | WeavePolicySnapshot::AutomaticVisualV5 {}
                 | WeavePolicySnapshot::LoompadV2 { .. }
                 | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                | WeavePolicySnapshot::LoompadVisualV4 { .. }
         ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
@@ -666,7 +671,9 @@ mod tests {
             started.speculation.is_some(),
             matches!(
                 policy,
-                WeavePolicySnapshot::LoompadV2 { .. } | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                WeavePolicySnapshot::LoompadV2 { .. }
+                    | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                    | WeavePolicySnapshot::LoompadVisualV4 { .. }
             )
         );
         if cancel {
@@ -717,6 +724,31 @@ mod tests {
         }
         assert_eq!(&calls.lock().unwrap()[..2], &["offline", "writer"]);
         let before_replay = calls.lock().unwrap().len();
+        if matches!(policy, WeavePolicySnapshot::AutomaticV2 {}) && !cancel {
+            for changed in [
+                WeavePolicySnapshot::AutomaticV3 {},
+                WeavePolicySnapshot::AutomaticVisualV4 {},
+                WeavePolicySnapshot::AutomaticVisualV5 {},
+            ] {
+                assert_eq!(
+                    start_with(command, changed)
+                        .expect_err("changed semantic retry")
+                        .code,
+                    "idempotency_conflict"
+                );
+                assert_eq!(
+                    start_with(CommandId::new(), changed)
+                        .expect_err("fresh hosted first-word admission remains unsupported")
+                        .code,
+                    "distinct_words_unavailable"
+                );
+                assert_eq!(calls.lock().unwrap().len(), before_replay);
+            }
+            assert_eq!(
+                std::fs::read(temporary.path().join("Writing").join(INITIAL_DOCUMENT)).unwrap(),
+                b"Once "
+            );
+        }
         // Exact replay must recover durable evidence before model/agency or
         // archive preparation. A newly invalid opt-in file cannot break it.
         {
@@ -768,6 +800,7 @@ mod tests {
     #[test]
     fn visual_v4_never_falls_back_to_a_server_without_native_admission_evidence() {
         exercise(false, WeavePolicySnapshot::AutomaticVisualV4 {});
+        exercise(false, WeavePolicySnapshot::AutomaticVisualV5 {});
     }
 
     #[test]
@@ -786,6 +819,13 @@ mod tests {
         exercise(
             false,
             WeavePolicySnapshot::LoompadVisualV3 {
+                sample_target: 4,
+                batch_offset: 0,
+            },
+        );
+        exercise(
+            false,
+            WeavePolicySnapshot::LoompadVisualV4 {
                 sample_target: 4,
                 batch_offset: 0,
             },

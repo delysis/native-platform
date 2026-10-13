@@ -4178,6 +4178,7 @@ mod tests {
 
         generation.first_word_choice = Some(crate::FirstWordChoiceEvidence {
             policy: crate::FirstWordChoicePolicy::DistinctV2,
+            forbidden_token_ids: Vec::new(),
             attempts: vec![crate::FirstWordChoiceAttempt {
                 seed: 7,
                 initial_token_exclusions: Vec::new(),

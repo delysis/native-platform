@@ -127,9 +127,10 @@ Concrete repairs:
   or when the rich history is empty. Native textarea history remains native.
 
 This is not a claim that every programmatic insertion across the product now
-shares one native undo mechanism. Completion acceptance/unconsume, import,
-dictation and other existing programmatic insertion owners are not refactored.
-Unconsume remains distinct from ordinary undo under the streaming contract.
+shares one native undo mechanism. Source completion acceptance and Option-Left
+reversal now enter native history; import, dictation and other existing
+programmatic insertion owners are not refactored. Unconsume remains distinct
+from ordinary undo under the streaming contract.
 Platform clipboard, native context-menu presentation and IME ordering require
 real WebKit and signed application qualification; synthetic events are not proof.
 

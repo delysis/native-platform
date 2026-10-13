@@ -163,8 +163,7 @@ export function missingDocumentRecoveryRequiresCopy(
 
 /** Never replace the sole in-memory recovery authority before it is safe. */
 export function missingDocumentRecoveryBlocksReplacement(
-  existing: MissingDocumentRecoveryGuard | null,
-  _incomingDocumentId: string
+  existing: MissingDocumentRecoveryGuard | null
 ): boolean {
   return missingDocumentRecoveryRequiresCopy(existing);
 }
@@ -207,7 +206,7 @@ export function beginMissingDocumentCaptureBoundary(
   const exactPending = pending && sameMissingDocumentCaptureIdentity(pending, incoming)
     ? pending
     : Object.freeze({ ...incoming });
-  return missingDocumentRecoveryBlocksReplacement(existing, incoming.documentId)
+  return missingDocumentRecoveryBlocksReplacement(existing)
     ? { kind: 'wait_for_recovery_copy', pending: exactPending }
     : { kind: 'capture', pending: exactPending };
 }

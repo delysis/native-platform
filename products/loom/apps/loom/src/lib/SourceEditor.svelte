@@ -46,6 +46,8 @@
     transferMayContainImageFile
   } from './attachments';
 
+  let lastExactRollbackAt = Number.NEGATIVE_INFINITY;
+
   const ownedCompletionInputAttributes: Record<string, string> = {
     autocorrect: 'off',
     autocomplete: 'off'
@@ -108,6 +110,7 @@
   let ghostSpan: HTMLSpanElement;
   let focused = false;
   let composing = false;
+  let completionEditActive = false;
   let exactGeometry = false;
   let selectionStart = 0;
   let selectionEnd = 0;
@@ -435,6 +438,9 @@
   }
 
   function handleInput(event: Event): void {
+    // execCommand reports its native edit synchronously. The completion owner
+    // must receive it once, after the exact edit and final caret are verified.
+    if (completionEditActive) return;
     if (element) onBoundaryObservation?.({
       kind: 'source_input', delta: textBoundaryDelta(value, element.value),
       facts: {
@@ -575,25 +581,20 @@
     if (
       candidate &&
       ghostUnconsumeText &&
-      ((event.altKey && !event.metaKey && !event.ctrlKey && event.key === 'ArrowLeft') ||
-        (!event.altKey && !event.shiftKey && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z')) &&
+      event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && event.key === 'ArrowLeft' &&
       element &&
+      nativeCompletionEditAvailable() &&
       element.selectionStart === element.selectionEnd &&
       element.value.slice(0, element.selectionStart).endsWith(ghostUnconsumeText) &&
       onGhostUnconsume(candidate.candidateId, candidate.presentationKey, ghostUnconsumeText)
     ) {
       event.preventDefault();
       event.stopPropagation();
+      lastExactRollbackAt = performance.now();
       const end = element.selectionStart;
-      element.setRangeText('', end - ghostUnconsumeText.length, end, 'end');
-      // This exact DOM mutation was authorized by the parent completion
-      // session. Record its value before Svelte echoes it back through the
-      // `value` prop so the reactive external-edit guard cannot suppress the
-      // newly restored remainder presentation.
-      observedValue = element.value;
+      const start = end - ghostUnconsumeText.length;
+      applyCompletionTextEdit(element.value.slice(0, start) + element.value.slice(end), start);
       suppressCurrentGhost();
-      readSelection(false, false);
-      onValueInput(element);
       return;
     }
     if (
@@ -728,23 +729,55 @@
       !element ||
       readonly ||
       !text ||
+      !nativeCompletionEditAvailable() ||
       !onGhostInsert(candidate.candidateId, candidate.presentationKey, text, action)
     ) return false;
     const start = element.selectionStart;
     const end = element.selectionEnd;
-    element.setRangeText(text, start, end, 'end');
-    if (element.selectionStart !== start + text.length) return false;
-    // The parent has already consumed these exact bytes. Distinguish its
-    // ensuing value-prop echo from a manual/external edit; otherwise the echo
-    // suppresses the new session remainder merely because it is new text.
-    observedValue = element.value;
-    readSelection(false, false);
-    onValueInput(element);
-    return true;
+    return applyCompletionTextEdit(
+      element.value.slice(0, start) + text + element.value.slice(end), start + text.length
+    );
+  }
+
+  function nativeCompletionEditAvailable(): boolean {
+    return Boolean(element && !readonly && !element.disabled && !element.readOnly &&
+      document.activeElement === element && typeof element.ownerDocument.execCommand === 'function');
+  }
+
+  function applyCompletionTextEdit(next: string, caret: number): boolean {
+    if (!element) return false;
+    completionEditActive = true;
+    try {
+      return applyNativeTextEdit(element, { value: next, selectionStart: caret, selectionEnd: caret });
+    } finally {
+      completionEditActive = false;
+      // Distinguish the authorized native edit from a value-prop echo. On
+      // refusal, report the unchanged text too: it retires pending authority.
+      observedValue = element.value;
+      readSelection(false, false);
+      onValueInput(element);
+    }
   }
 
   function handleDocumentSelectionChange(): void {
     if (document.activeElement === element) readSelection(true, true);
+  }
+
+  export function hasExactFocus(): boolean {
+    return document.activeElement === element;
+  }
+
+  export function reverseCompletion(): boolean {
+    if (performance.now() - lastExactRollbackAt < 100) return true;
+    const before = element?.value;
+    if (before === undefined) return false;
+    handleKeydown(new KeyboardEvent('keydown', {
+      key: 'ArrowLeft',
+      altKey: true,
+      bubbles: true,
+      cancelable: true
+    }));
+    return element?.value !== before;
   }
 
   export function focusAtDocumentEnd(): boolean {

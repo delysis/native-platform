@@ -111,9 +111,13 @@ pub(crate) fn read(root: &Path, path: &Path, maximum: u64) -> io::Result<Option<
     let identity = Handle::from_file(file.try_clone()?)?;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    #[cfg(all(test, unix))]
+    if let Some(interrupt) = tests::AFTER_READ.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
     if bytes.len() as u64 > limit
         || fs::symlink_metadata(path)?.file_type().is_symlink()
-        || Handle::from_path(path)? != identity
+        || Handle::from_file(open_file(path)?)? != identity
     {
         return Err(invalid("Private payload changed during the read."));
     }
@@ -152,6 +156,12 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    thread_local! {
+        pub(super) static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     fn project(secured: bool) -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -230,5 +240,79 @@ mod tests {
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(read(root.path(), &link, 4096).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_payload_replacement_refuses_without_a_fifo_peer() {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let project = tempfile::tempdir().expect("project");
+        fs::create_dir(project.path().join(".loom")).expect("private directory");
+        let root = project.path().to_owned();
+        let path = root.join(".loom/probe.json");
+        let retained = root.join(".loom/retained.json");
+        fs::write(&path, b"retained author bytes\r\n").expect("ordinary file");
+        let (swapped, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker_retained = retained.clone();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(
+                read(&root, &worker_path, 1024).expect("ordinary private read"),
+                Some(b"retained author bytes\r\n".to_vec())
+            );
+            let replaced = worker_path.clone();
+            AFTER_READ.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&replaced, worker_retained).expect("retain original inode");
+                    nix::unistd::mkfifo(
+                        &replaced,
+                        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                    )
+                    .expect("owned FIFO");
+                    swapped.send(()).expect("replacement observer");
+                }));
+            });
+            finished
+                .send(read(&root, &worker_path, 1024))
+                .expect("read observer");
+        });
+        ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement boundary");
+        let early = result.recv_timeout(Duration::from_secs(5));
+        let needed_peer = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        // Rescue the old blocking reopen before joining; a timeout alone is not
+        // called a product hang. The assertion is whether a peer was required.
+        let rescue = needed_peer.then(|| {
+            open(
+                &path,
+                OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("release the controlled old reopen")
+        });
+        let outcome = early.unwrap_or_else(|_| {
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rescued read result")
+        });
+        worker.join().expect("physical read worker join");
+        drop(rescue);
+        assert!(
+            outcome.is_err(),
+            "replacement must never supply private bytes"
+        );
+        assert_eq!(
+            fs::read(retained).expect("retained original"),
+            b"retained author bytes\r\n"
+        );
+        assert!(
+            !needed_peer,
+            "identity refusal waited for an unrelated FIFO peer"
+        );
     }
 }

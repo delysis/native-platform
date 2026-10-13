@@ -34,6 +34,41 @@ function setup() {
 }
 
 describe('named connected collections', () => {
+  it('refreshes retained definitions after a post-publication add failure without retrying', async () => {
+    const runtime = setup();
+    const retainedId = `material-${'b'.repeat(64)}`;
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === 'plugin:loom|import_accounts') {
+        return [{ service: 'drive', email: 'writer@example.test' }];
+      }
+      if (command === 'plugin:loom|collection_add') {
+        throw {
+          code: 'collection_definition_retained_grant_unconfirmed',
+          message: `Collection ${retainedId} was retained; reconnect it before retrying.`,
+          retained_collection_id: retainedId,
+          retained_collection_state: 'grant_unconfirmed'
+        };
+      }
+      throw new Error(`Unexpected command ${command}`);
+    });
+    const onCollectionRetained = vi.fn(async () => {});
+    const component = mount(ImportSources, { target: runtime.target, props: {
+      projectId: 'project', sessionId: 'session', onImported: vi.fn(async () => {}),
+      onOpen: vi.fn(async () => {}), onCollectionRetained
+    } });
+    try {
+      await page.getByRole('combobox', { name: 'Connected source', exact: true }).selectOptions('drive');
+      await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Research');
+      await page.getByRole('textbox', { name: 'Drive folder ID', exact: true }).fill('folder-one');
+      await page.getByRole('combobox', { name: 'Account', exact: true }).selectOptions('writer@example.test');
+      await page.getByRole('button', { name: 'Add collection', exact: true }).click();
+      await expect.element(page.getByRole('status')).toHaveTextContent(`Collection ${retainedId} was retained`);
+      expect(onCollectionRetained).toHaveBeenCalledExactlyOnceWith(retainedId, 'project', 'session');
+      expect(native.invoke.mock.calls.filter(([command]) => command === 'plugin:loom|collection_add')).toHaveLength(1);
+      await expect.element(page.getByRole('button', { name: 'Add collection', exact: true })).toBeDisabled();
+    } finally { await unmount(component); runtime.cleanup(); }
+  });
+
   it('requires a chosen account and concrete Drive folder, then adds one collection without inserting or opening sources', async () => {
     const runtime = setup();
     native.invoke.mockImplementation(async (command: string) => {
@@ -115,7 +150,7 @@ describe('named connected collections', () => {
       await unmount(component);
       status = { ...status, phase: 'interrupted', refresh_authorized: false };
       component = mount(CollectionProgress, { target: runtime.target, props });
-      await expect.element(page.getByText('Retained sources are available. Reconnect to refresh.', { exact: true })).toBeVisible();
+      await expect.element(page.getByRole('button', { name: 'Reconnect', exact: true })).toHaveAttribute('title', 'Retained sources are available. Reconnect to refresh.');
       expect(page.getByRole('button', { name: /Refresh|Resume|Stop/ }).query()).toBeNull();
     } finally { await unmount(component); runtime.cleanup(); }
   });

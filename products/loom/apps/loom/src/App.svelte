@@ -99,6 +99,9 @@
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
     listenForFileCommands,
+    listenForReverseCompletion,
+    armCompletionReversal,
+    armCompletionCandidate,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadCatalogModelCandidate,
@@ -147,17 +150,8 @@
   import { sourceCaretByte } from './lib/sourceCaret';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
-    verifiedGhostSuggestion,
-    type AutocompleteDisposition
+    verifiedGhostSuggestion
   } from './lib/ghostSuggestion';
-  import {
-    emptyAutocompleteRetryLedger,
-    planAutocompleteRetry,
-    type AutocompleteRetryLedger
-  } from './lib/autocompleteRetry';
-  import {
-    candidateTextIsSurfaceable
-  } from './lib/candidateSurface';
   import {
     evaluateInlineSuggestionFamily,
     inlineSuggestionFamily,
@@ -228,7 +222,6 @@
     attachWorkspaceProjectReply,
     restoreBeforeBackgroundWork,
     runCurrentWorkspaceStep,
-    shouldDiscoverModelsOnStartup,
     workspaceResumeAction
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
@@ -301,7 +294,7 @@
     bindCompletionAnchor,
     cancelCompletionSchedule,
     clearCompletionSession as clearCompletionControllerSession,
-    clearUnpresentableVisualKeys,
+    clearWriterCompletionChoice,
     completionActivityExists as controllerHasCompletionActivity,
     completionControllerView,
     completionExhausted,
@@ -314,7 +307,6 @@
     reconcileCompletionController,
     refreshCompletionCandidate,
     refreshCompatibleCompletionFamily,
-    rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
     retireCompletionCandidates,
@@ -322,7 +314,6 @@
     setDismissedCompletionCandidates,
     settleCompletionNavigation,
     shuttleScheduleKey as completionShuttleScheduleKey,
-    type AutocompleteRetryTicket,
     type CompletionControllerEffect,
     type CompletionSchedule
   } from './lib/completionController';
@@ -860,6 +851,7 @@
     selectionEmpty: true
   };
   let unlistenFileCommands: (() => void) | undefined;
+  let unlistenReverseCompletion: (() => void) | undefined;
   let unlistenDocumentFilesystemHints: (() => void) | undefined;
   let fileCommandInFlight = false;
   let renamingDocumentId: string | null = null;
@@ -898,7 +890,6 @@
   let requireExplicitCompletionFamily = false;
   let suggestionsIdleTimer: number | undefined;
   let suggestionWakeQueued = false;
-  let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let announcedGhostPresentationKey = '';
   let timedVisualGhostPresentationKey = '';
   let modelDownloadUrl = '';
@@ -1006,6 +997,7 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
+    reverseCompletion: () => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
@@ -1015,16 +1007,19 @@
   } | null = null;
   let sourceEditor: {
     applyRemoteValue: (text: string) => void;
+    hasExactFocus: () => boolean;
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
+    reverseCompletion: () => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: SourceTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let componentMounted = false;
+  let editorFocusEpoch = 0;
   let nativeFullscreen = false;
   let stopNativeFullscreenObservation: (() => void) | undefined;
   let desktopWorkspaceStarted = false;
@@ -1273,9 +1268,6 @@
   const modelDownloadPollBaseMs = 750;
   const modelDownloadPollMaxMs = 5_000;
   const suggestionsIdleDelayMs = 1_800;
-  const suggestionsRetryDelayMs = 350;
-  const maximumAutomaticSuggestionRetries = 1;
-  const maximumAutocompleteRetryWaits = 50;
   $: completionSurfaceVisible = mainPaneOpen && !customMain && !activeMaterial && !materialsOpen;
   $: completionAutomationActive = completionSurfaceVisible && completionEngineEnabled({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   function completionAutomationEnabled(
@@ -1289,7 +1281,6 @@
   $: pendingCompletionText = completionController.pendingText;
   $: completionGenerationIntent = completionController.generationIntent;
   $: dismissedCandidateIds = completionController.dismissedCandidateIds;
-  $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
   $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
@@ -1403,7 +1394,6 @@
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
-    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
     manuscriptText: documentText,
     sourceNewline: sourceGhostNewline
   });
@@ -1421,7 +1411,6 @@
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
-    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
     manuscriptText: sourceDisplayText,
     sourceNewline: sourceGhostNewline
   });
@@ -1441,8 +1430,7 @@
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    true,
-    mode === 'visual'
+    true
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {
@@ -1468,7 +1456,7 @@
           sourceGhostNewline
         )
       : null;
-    if (selected && text && candidateTextIsSurfaceable(text)) {
+    if (selected && text) {
       const rawPresentationKey = verified?.presentationKey ??
         (hasLiveProjection
           ? `stream:${selected.runId}:${liveSequence}`
@@ -1501,7 +1489,7 @@
         verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
         liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel: currentWriter,
         document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
-        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        dismissedCandidateIds,
         manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
       });
       refreshVisibleCompletionFamily(boundCompletionSession, originals);
@@ -1513,6 +1501,16 @@
   $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
   $: ghostAlternatives = completionView.alternatives;
   $: ghostUnconsumeText = completionView.unconsumeText;
+  $: if (componentMounted && desktop) {
+    void editorFocusEpoch;
+    const editorFocused = mode === 'source'
+      ? Boolean(sourceEditor?.hasExactFocus())
+      : Boolean(visualEditor?.hasExactFocus());
+    setNativeCompletionReversalArm(Boolean(ghostUnconsumeText && editorFocused));
+    void armCompletionCandidate(Boolean(selectedInlineSuggestion?.text && editorFocused)).catch((error) => {
+      if (componentMounted) recordFailure(error);
+    });
+  }
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
       ? ghostSuggestion
@@ -1617,8 +1615,6 @@
       ? `${boundCompletionSession.contextKey}:${boundCompletionSession.selectedRunId}:${acceptedCompletionText(boundCompletionSession).length}`
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
-  $: visualAutocompleteDisposition = visualFamilyEvaluation.disposition;
-  $: sourceAutocompleteDisposition = sourceFamilyEvaluation.disposition;
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -1726,20 +1722,6 @@
     ? `${completionContextKey}:${editVersion}:${completionLifecycle.phase}:${completionLifecycle.reason ?? 'ready'}`
     : '';
   $: resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
-  $: retryEvaluationSnapshot = {
-    enabled: desktop &&
-      branchPromotionReady &&
-      completionAutomationActive &&
-      Boolean(currentWriter) &&
-      activeBranchCount === 0 &&
-      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
-    disposition: mode === 'visual'
-      ? visualAutocompleteDisposition
-      : sourceAutocompleteDisposition
-  };
-  $: if (retryEvaluationSnapshot.enabled) {
-    maybeRetryExhaustedAutocomplete(retryEvaluationSnapshot.disposition);
-  }
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
@@ -2722,6 +2704,8 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      setNativeCompletionReversalArm(false);
+      void armCompletionCandidate(false);
       documentEpoch += 1;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);
@@ -2785,6 +2769,7 @@
       weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
+      unlistenReverseCompletion?.();
       unlistenDocumentFilesystemHints?.();
       if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
     };
@@ -2796,6 +2781,7 @@
       desktopWorkspaceStarted = true;
       void installWindowFocusHandler();
       void installFileCommandListener();
+      void installReverseCompletionListener();
       void installDocumentFilesystemHintListener();
       void installGenerationEventListener();
       void restoreDesktopWorkspace();
@@ -2852,7 +2838,6 @@
     stopBranchPolling();
     for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
     weaveStatusPollTimers.clear();
-    completionController = clearUnpresentableVisualKeys(completionController);
     branchRefreshSerial += 1;
     branchRefreshQueued = false;
     branchNextCursor = null;
@@ -4203,59 +4188,6 @@
       !branches.some((branch) => branch.candidate_id === promotionArmedCandidateId)
     ) {
       promotionArmedCandidateId = null;
-    }
-  }
-
-  function maybeRetryExhaustedAutocomplete(
-    disposition: AutocompleteDisposition
-  ): void {
-    if (
-      !desktop ||
-      !project ||
-      !document ||
-      !currentWriter ||
-      !completionAutomationActive ||
-      !branchPromotionReady
-    ) return;
-    const sourceRevisionId = document.summary.revision_id;
-    if (!sourceRevisionId) return;
-    const retryMode = mode === 'visual' || mode === 'source' ? mode : null;
-    if (!retryMode) return;
-    const targetByte = retryMode === 'visual'
-      ? visualGhostTargetByte
-      : sourceGhostTargetByte;
-    if (targetByte === null) return;
-    const budgetKey = [
-      project.project_id,
-      project.session_id,
-      document.summary.document_id,
-      sourceRevisionId,
-      editVersion
-    ].join(':');
-    const decision = planAutocompleteRetry(autocompleteRetryLedger, {
-      disposition,
-      budgetKey,
-      activeBranchCount: branches.filter(isBranchActive).length,
-      weaveStarting,
-      maximumRetries: maximumAutomaticSuggestionRetries
-    });
-    autocompleteRetryLedger = decision.ledger;
-    if (decision.kind === 'schedule') {
-      scheduleAutocompleteRetry({
-        projectId: project.project_id,
-        sessionId: project.session_id,
-        documentId: document.summary.document_id,
-        sourceRevisionId,
-        visibleBlobId: document.visible_blob_id,
-        documentEpoch,
-        editVersion,
-        intentEpoch: completionController.intentEpoch,
-        mode: retryMode,
-        targetByte,
-        modelId: currentWriter.model_id,
-        sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
-        waitsRemaining: maximumAutocompleteRetryWaits
-      });
     }
   }
 
@@ -6720,7 +6652,8 @@
     if (!workspaceRestoreIsCurrent(captured)) return;
     await recoverModelDownloads();
     if (!workspaceRestoreIsCurrent(captured)) return;
-    if (!shouldDiscoverModelsOnStartup(completionAutomationActive)) return;
+    // Loading the verified local writer is preparation, independent of the
+    // per-project suggestion preference.
     recordStartupTiming('writer_preload_queued', { suggestions_enabled: suggestionsEnabled });
     requestPreferredWriterEnsure(captured);
   }
@@ -6928,6 +6861,46 @@
     } catch (error) {
       if (componentMounted) recordFailure(error);
     }
+  }
+
+  async function installReverseCompletionListener(): Promise<void> {
+    try {
+      const unlisten = await listenForReverseCompletion(() => {
+        if (mode === 'source') sourceEditor?.reverseCompletion();
+        else visualEditor?.reverseCompletion();
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenReverseCompletion?.();
+      unlistenReverseCompletion = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
+  function synchronizeEditorFocusAfterDispatch(): void {
+    window.setTimeout(() => {
+      if (componentMounted) editorFocusEpoch += 1;
+    }, 0);
+  }
+
+  function setNativeCompletionReversalArm(armed: boolean): void {
+    void armCompletionReversal(armed).catch((error) => {
+      if (componentMounted) recordFailure(error);
+    });
+  }
+
+  function retainNativeCompletionFocus(): void {
+    if (!desktop) return;
+    void getCurrentWindow().setFocus().then(() => {
+      window.requestAnimationFrame(() => {
+        if (!componentMounted) return;
+        if (mode === 'source') sourceEditor?.focusCurrentSelection();
+        else visualEditor?.focusCurrentSelection();
+      });
+    }).catch(recordFailure);
   }
 
   async function finishOpeningProject(
@@ -7350,12 +7323,25 @@
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
           showMainPane();
           await tick();
+          await waitForWritingSurfacePaint();
           if (
             applicationClosePhase === 'running' &&
             requestSerial === navigationSerial &&
             projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
             document?.summary.document_id === target.documentId
-          ) focusCurrentWritingSurfaceAtEnd();
+          ) {
+            focusCurrentWritingSurfaceAtEnd();
+            // A document identity swap can remount the active editor after
+            // the first painted frame. Restore the caret once more after that
+            // remount instead of leaving focus on the menu command.
+            await waitForWritingSurfacePaint();
+            if (
+              applicationClosePhase === 'running' &&
+              requestSerial === navigationSerial &&
+              projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
+              document?.summary.document_id === target.documentId
+            ) focusCurrentWritingSurfaceAtEnd();
+          }
         }
       }
     }
@@ -7450,6 +7436,9 @@
 
   function updateFromSource(display: string): void {
     if (transition !== 'idle') return;
+    if (completionController.pendingText === null) {
+      completionController = clearWriterCompletionChoice(completionController);
+    }
     sourceDisplayText = display;
     sourceDirty = true;
     if (!sourceComposing) {
@@ -7561,7 +7550,10 @@
     );
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
+      : selectedInlineSuggestion?.targetByte ??
+        (completionController.selectionIntent.contextKey === completionContextKey
+          ? completionController.selectionIntent.writerChoice?.targetByte : null) ??
+        completionController.generationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
       if (completionWasActive) {
         completionController = bindCompletionAnchor(
@@ -7608,7 +7600,10 @@
     ) return;
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
+      : selectedInlineSuggestion?.targetByte ??
+        (completionController.selectionIntent.contextKey === completionContextKey
+          ? completionController.selectionIntent.writerChoice?.targetByte : null) ??
+        completionController.generationIntent?.anchorByte ?? null;
     if (expected === null) {
       completionController = bindCompletionAnchor(
         completionController,
@@ -7669,18 +7664,6 @@
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
-  function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
-    if (!completionGenerationIsArmed(
-      completionController.generationIntent,
-      completionContextKey,
-      ticket.editVersion
-    )) return;
-    armSuggestionSchedule(
-      { kind: 'exhausted_retry', ticket },
-      suggestionsRetryDelayMs
-    );
-  }
-
   function armSuggestionSchedule(schedule: CompletionSchedule, delay: number): void {
     clearSuggestionTimerHandle();
     completionController = setCompletionSchedule(completionController, null);
@@ -7729,81 +7712,12 @@
     });
   }
 
-  function rearmBoundedSuggestionSchedule(
-    schedule: CompletionSchedule,
-    delay: number
-  ): boolean {
-    if (schedule.kind === 'edit_pause') {
-      completionController = setCompletionSchedule(completionController, schedule);
-      queueScheduledSuggestionAttempt(schedule, delay);
-      return true;
-    }
-    if (schedule.ticket.waitsRemaining <= 0) {
-      completionController = setCompletionSchedule(completionController, null);
-      return false;
-    }
-    armSuggestionSchedule({
-      kind: 'exhausted_retry',
-      ticket: {
-        ...schedule.ticket,
-        waitsRemaining: schedule.ticket.waitsRemaining - 1
-      }
-    }, delay);
-    return true;
-  }
-
-  function retryTicketDisposition(
-    ticket: AutocompleteRetryTicket
-  ): AutocompleteDisposition | null {
-    if (
-      !project ||
-      !document ||
-      !currentWriter ||
-      !completionAutomationActive ||
-      project.project_id !== ticket.projectId ||
-      project.session_id !== ticket.sessionId ||
-      document.summary.document_id !== ticket.documentId ||
-      document.summary.revision_id !== ticket.sourceRevisionId ||
-      document.visible_blob_id !== ticket.visibleBlobId ||
-      documentEpoch !== ticket.documentEpoch ||
-      editVersion !== ticket.editVersion ||
-      completionController.intentEpoch !== ticket.intentEpoch ||
-      mode !== ticket.mode ||
-      currentWriter.model_id !== ticket.modelId ||
-      sourceGhostNewline !== ticket.sourceNewline ||
-      !branchPromotionReady
-    ) return null;
-    const targetByte = mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte;
-    if (targetByte !== ticket.targetByte) return null;
-    return evaluateInlineSuggestionFamily(targetByte, mode, {
-      branches,
-      authoritativeFamilyId: authoritativeCompletionFamilyId,
-      authoritativeFamilyIds: loompadFamilyIds,
-      requireExplicitFamily: requireExplicitCompletionFamily,
-      verifiedBodyByRun: verifiedBranchBodyByRun,
-      liveTextByRun: liveBranchTextByRun,
-      liveTextSequenceByRun: liveBranchTextSequenceByRun,
-      currentModel: currentWriter,
-      document,
-      suggestionsEnabled: true,
-      promotionReady: true,
-      dismissedCandidateIds,
-      unpresentableVisualKeys: mode === 'visual'
-        ? unpresentableVisualGhostPresentationKeys
-        : [],
-      manuscriptText: mode === 'visual' ? documentText : sourceDisplayText,
-      sourceNewline: ticket.sourceNewline
-    }).disposition;
-  }
-
   function loompadBackgroundPaused(): boolean {
     return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
   }
 
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
-    const targetEditVersion = schedule.kind === 'edit_pause'
-      ? schedule.editVersion
-      : schedule.ticket.editVersion;
+    const targetEditVersion = schedule.editVersion;
     if (
       terminalIsBusy() ||
       completionController.scheduled !== schedule ||
@@ -7827,24 +7741,6 @@
         completionController = setCompletionSchedule(completionController, null);
       }
       return;
-    }
-    if (schedule.kind === 'exhausted_retry') {
-      const disposition = retryTicketDisposition(schedule.ticket);
-      if (!disposition) {
-        completionController = setCompletionSchedule(completionController, null);
-        return;
-      }
-      if (disposition.kind === 'available' || disposition.kind === 'inactive') {
-        completionController = setCompletionSchedule(completionController, null);
-        return;
-      }
-      if (
-        disposition.kind === 'awaiting_candidates' ||
-        disposition.kind === 'awaiting_hydration'
-      ) {
-        rearmBoundedSuggestionSchedule(schedule, 200);
-        return;
-      }
     }
     const attempted = await startAutomaticWeave();
     if (completionController.scheduled !== schedule) return;
@@ -8267,16 +8163,18 @@
     anchorByteOffset: number,
     selectionPinned = false
   ): void {
-    completionController = rejectVisualPresentation(completionController, {
-      mode,
-      eligible: ghostSuggestion,
-      candidateId,
-      presentationKey,
-      surfaceKey,
-      currentSurfaceKey: visualGhostSurfaceKey,
-      anchorByte: anchorByteOffset,
-      selectionPinned
-    });
+    if (
+      mode !== 'visual' ||
+      ghostSuggestion?.candidateId !== candidateId ||
+      ghostSuggestion.presentationKey !== presentationKey ||
+      ghostSuggestion.targetByte !== anchorByteOffset ||
+      surfaceKey !== visualGhostSurfaceKey
+    ) return;
+    completionController = resetCompletionDiscovery(completionController);
+    recordLocalFailure(
+      'completion_projection_invariant',
+      `A sampler-authorized Visual completion could not be represented exactly${selectionPinned ? ' while pinned' : ''}.`
+    );
   }
 
   async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
@@ -8435,6 +8333,10 @@
       session_context_matches: completionController.session?.contextKey === completionContextKey,
       promotion_ready: branchPromotionReady, family_count: activeSuggestionFamily.length
     } });
+    if (authorization.authorized) {
+      setNativeCompletionReversalArm(true);
+      retainNativeCompletionFocus();
+    }
     completionController = authorization.state;
     return authorization.authorized;
   }
@@ -8444,13 +8346,25 @@
     presentationKey: string,
     text: string
   ): boolean {
+    const projected = eligibleGhostForCurrentMode();
     const authorization = authorizeCompletionUnconsume(completionController, {
-      eligible: eligibleGhostForCurrentMode(),
+      contextKey: completionContextKey,
+      eligible: projected,
       candidateId,
       presentationKey,
       text,
       manuscriptText: documentText
     });
+    observeCompletionBoundary({ kind: 'controller_unconsume', facts: {
+      authorized: authorization.authorized,
+      context_matches: completionController.session?.contextKey === completionContextKey,
+      candidate_matches: projected?.candidateId === candidateId,
+      presentation_matches: projected?.presentationKey === presentationKey,
+      pending_text: completionController.pendingText !== null,
+      session_present: Boolean(completionController.session),
+      accepted_chunk_count: completionController.session?.acceptedChunks.length ?? 0,
+      requested_utf8_bytes: new TextEncoder().encode(text).byteLength
+    } });
     completionController = authorization.state;
     return authorization.authorized;
   }
@@ -8850,11 +8764,6 @@
     if (event.key === 'Escape' && addMenuOpen) { event.preventDefault(); addMenuOpen = false; return; }
     if (event.key === 'Escape' && (activeMaterial || materialsOpen)) { event.preventDefault(); closeMaterial(); return; }
     if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
-    if (event.key === 'Escape' && documentContextTarget) {
-      event.preventDefault();
-      closeDocumentContextMenu();
-      return;
-    }
     if (event.key === 'Escape' && modelManagerOpen) {
       event.preventDefault();
       closeModelManager();
@@ -8976,7 +8885,7 @@
     if (!weaveCaptureStillCurrent(captured)) return false;
     if (captured.speculation) {
       const batch = started.speculation;
-      if (!batch || batch.admission_policy !== (captured.mode === 'visual' ? 'distinct_visual_prose_v4' : 'distinct_v2') ||
+      if (!batch || batch.admission_policy !== (captured.mode === 'visual' ? 'distinct_visual_prose_v5' : 'distinct_v2') ||
           !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
           batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
         throw new Error('The desktop returned choices for a different sampling boundary.');
@@ -9225,8 +9134,8 @@
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
         policy: captured.speculation
-          ? { kind: captured.mode === 'visual' ? 'loompad_visual_v3' : 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
-          : { kind: captured.mode === 'visual' ? 'automatic_visual_v4' : 'automatic_v2' }
+          ? { kind: captured.mode === 'visual' ? 'loompad_visual_v4' : 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          : { kind: captured.mode === 'visual' ? 'automatic_visual_v5' : 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -10953,6 +10862,7 @@
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
             {#if materialOwnerScope}{#key materialOwnerScope.sessionId}<ImportSources projectId={materialOwnerScope.projectId} sessionId={materialOwnerScope.sessionId} onOpen={openImportedSource} onImported={addImportedSources} onOpenFolder={openAnotherProject}
               onCollectionAdded={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) { ownerMaterialChanged(item, scope); void refreshMaterials(); } }}
+              onCollectionRetained={async (_id, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) await refreshMaterials(); }}
               onOpenCollection={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) openMaterial(item, undefined, scope); }} />{/key}{/if}
           </section>
         {/if}
@@ -11178,7 +11088,9 @@
             </div>
           {/if}
 
-          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={() => { materialOriginPane = null; }}>
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface"
+            on:focusin={() => { materialOriginPane = null; editorFocusEpoch += 1; }}
+            on:focusout={synchronizeEditorFocusAfterDispatch}>
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}

@@ -105,13 +105,22 @@ impl MemoryCacheState {
         if self.generation(value.metadata.owner_id.as_deref()) != expected {
             return false;
         }
-        if !value.is_valid() || value.metadata.state_bytes > self.cache.capacity_bytes() {
+        if !value.is_valid() {
             return false;
         }
-        if self.cache.contains_id(&value.metadata.id) {
+        let replaces_existing = self.cache.contains_id(&value.metadata.id);
+        if !matches!(
+            self.cache.insert(value),
+            llama_native_cache::CacheInsertOutcome::Stored {
+                memory_resident: true,
+                ..
+            }
+        ) {
+            return false;
+        }
+        if replaces_existing {
             self.global_generation = self.global_generation.saturating_add(1);
         }
-        self.cache.insert(value);
         true
     }
 
@@ -676,14 +685,6 @@ pub fn invalidate_cache(cache_id: &str) -> Result<()> {
     }
     invalidate_memory(cache_id);
     Ok(())
-}
-
-pub fn latest_verified_cache_path() -> Result<Option<PathBuf>> {
-    Ok(load_db()?
-        .entries
-        .into_iter()
-        .find(|entry| entry.state == CacheEntryState::Ready)
-        .map(|entry| PathBuf::from(encrypted_blob_uri(&entry.id))))
 }
 
 fn create_prefix_value(
@@ -1371,6 +1372,7 @@ fn encrypted_blob_uri(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::conversation_store::{Conversation, ConversationDb};
+    use llama_native_cache::ValidatedPrefixCacheValue;
     use sha2::{Digest, Sha256};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1481,14 +1483,30 @@ mod tests {
     fn memory_cache_budget_is_global_across_model_fingerprints() {
         let mut state = memory_cache().lock().expect("memory cache lock");
         state.clear();
-        state
-            .cache
-            .insert(test_cache_value("model-a", "fingerprint-a"));
-        state
-            .cache
-            .insert(test_cache_value("model-b", "fingerprint-b"));
+        let values = [
+            test_cache_value("model-a", "fingerprint-a"),
+            test_cache_value("model-b", "fingerprint-b"),
+        ];
+        let expected_bytes = values
+            .iter()
+            .cloned()
+            .map(|value| {
+                ValidatedPrefixCacheValue::new(value)
+                    .expect("valid cache fixture")
+                    .memory_bytes()
+            })
+            .sum::<usize>();
+        for value in values {
+            assert!(matches!(
+                state.cache.insert(value),
+                llama_native_cache::CacheInsertOutcome::Stored {
+                    memory_resident: true,
+                    ..
+                }
+            ));
+        }
         assert_eq!(state.cache.len(), 2);
-        assert_eq!(state.cache.used_bytes(), 2);
+        assert_eq!(state.cache.used_bytes(), expected_bytes);
         assert_eq!(state.cache.capacity_bytes(), DEFAULT_MEMORY_CACHE_BYTES);
         state.clear();
     }

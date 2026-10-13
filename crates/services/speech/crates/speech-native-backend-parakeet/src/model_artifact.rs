@@ -37,11 +37,29 @@ struct ModelFileManifest {
 }
 
 #[derive(Debug)]
-pub(crate) struct ModelArtifactError(String);
+pub(crate) enum ModelArtifactError {
+    Admission(String),
+    // A completed rename or an existing target is not an absent publication.
+    // Keep readiness failed, retain the target, and let retry verify and sync it.
+    PublicationUnconfirmed {
+        destination: PathBuf,
+        detail: String,
+    },
+}
 
 impl fmt::Display for ModelArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        match self {
+            Self::Admission(detail) => formatter.write_str(detail),
+            Self::PublicationUnconfirmed {
+                destination,
+                detail,
+            } => write!(
+                formatter,
+                "Parakeet model publication at {} remains unconfirmed; no rollback performed: {detail}",
+                destination.display(),
+            ),
+        }
     }
 }
 
@@ -66,7 +84,7 @@ pub(crate) fn prepare_model_dir(
     })?;
     let managed_dir = managed_model_dir(&managed_root, &manifest);
     if managed_dir.exists() {
-        verify_managed_model_dir(&managed_dir, &manifest)?;
+        confirm_managed_publication(&managed_dir, &manifest)?;
         return Ok(Some(managed_dir));
     }
 
@@ -309,7 +327,7 @@ fn copy_verified_candidate(
 
     let final_dir = managed_model_dir(managed_root, manifest);
     if final_dir.exists() {
-        verify_managed_model_dir(&final_dir, manifest)?;
+        confirm_managed_publication(&final_dir, manifest)?;
         return Ok(final_dir);
     }
 
@@ -334,7 +352,13 @@ fn copy_verified_candidate(
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    if let Err(error) = make_model_files_read_only(&staging, manifest) {
+    // All permission mutation belongs to the private stage. Once the name is
+    // visible, cleanup must never chmod or delete the committed model tree.
+    let permissions = make_model_files_read_only(&staging, manifest)
+        .and_then(|()| set_read_only_directory(&staging))
+        .and_then(|()| verify_managed_permissions(&staging, manifest))
+        .and_then(|()| sync_directory(&staging));
+    if let Err(error) = permissions {
         let _ = make_model_tree_writable(&staging, manifest);
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
@@ -343,13 +367,22 @@ fn copy_verified_candidate(
     match fs::rename(&staging, &final_dir) {
         Ok(()) => {}
         Err(_error) if final_dir.exists() => {
-            make_model_tree_writable(&staging, manifest)?;
-            fs::remove_dir_all(&staging).map_err(|cleanup_error| {
-                artifact_error(format!(
-                    "Parakeet model publish raced and staging cleanup failed: {cleanup_error}"
-                ))
+            make_model_tree_writable(&staging, manifest).map_err(|error| {
+                ModelArtifactError::PublicationUnconfirmed {
+                    destination: final_dir.clone(),
+                    detail: error.to_string(),
+                }
             })?;
-            verify_managed_model_dir(&final_dir, manifest)?;
+            fs::remove_dir_all(&staging).map_err(|cleanup_error| {
+                ModelArtifactError::PublicationUnconfirmed {
+                    destination: final_dir.clone(),
+                    detail: format!(
+                        "Private staging cleanup failed at {}: {cleanup_error}",
+                        staging.display(),
+                    ),
+                }
+            })?;
+            confirm_managed_publication(&final_dir, manifest)?;
             return Ok(final_dir);
         }
         Err(error) => {
@@ -360,14 +393,27 @@ fn copy_verified_candidate(
             )));
         }
     }
-    if let Err(error) = set_read_only_directory(&final_dir) {
-        let _ = make_model_tree_writable(&final_dir, manifest);
-        let _ = fs::remove_dir_all(&final_dir);
-        return Err(error);
-    }
-    sync_directory(&model_root)?;
-    verify_managed_model_dir(&final_dir, manifest)?;
+    confirm_managed_publication(&final_dir, manifest)?;
     Ok(final_dir)
+}
+
+// Reused on initial publication and every managed-target retry: an earlier
+// parent-sync failure cannot turn into success just because the name exists.
+fn confirm_managed_publication(
+    final_dir: &Path,
+    manifest: &ModelManifest,
+) -> Result<(), ModelArtifactError> {
+    verify_managed_model_dir(final_dir, manifest)
+        .and_then(|()| {
+            let parent = final_dir.parent().ok_or_else(|| {
+                artifact_error("Parakeet managed model publication has no parent directory")
+            })?;
+            sync_directory(parent)
+        })
+        .map_err(|error| ModelArtifactError::PublicationUnconfirmed {
+            destination: final_dir.to_path_buf(),
+            detail: error.to_string(),
+        })
 }
 
 fn copy_manifest_files(
@@ -795,6 +841,10 @@ fn set_private_file(path: &Path) -> Result<(), ModelArtifactError> {
 
 #[cfg(unix)]
 fn set_read_only_directory(path: &Path) -> Result<(), ModelArtifactError> {
+    #[cfg(test)]
+    if tests::reject_read_only_directory() {
+        return Err(artifact_error("injected directory permission failure"));
+    }
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o500)).map_err(|error| {
         artifact_error(format!(
@@ -811,6 +861,10 @@ fn set_read_only_directory(_path: &Path) -> Result<(), ModelArtifactError> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), ModelArtifactError> {
+    #[cfg(test)]
+    if tests::reject_directory_sync(path) {
+        return Err(artifact_error("injected parent directory sync failure"));
+    }
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
@@ -827,7 +881,7 @@ fn sync_directory(_path: &Path) -> Result<(), ModelArtifactError> {
 }
 
 fn artifact_error(detail: impl Into<String>) -> ModelArtifactError {
-    ModelArtifactError(detail.into())
+    ModelArtifactError::Admission(detail.into())
 }
 
 #[cfg(test)]
@@ -1160,5 +1214,131 @@ mod tests {
         verify_shared_model_dir(&snapshot, &manifest)
             .expect("ordinary regular snapshot remains valid");
         fs::remove_dir_all(root).expect("remove owned fixture");
+    }
+    #[cfg(unix)]
+    std::thread_local! {
+        static READ_ONLY_FAILURE: std::cell::RefCell<Option<(PathBuf, bool)>> = const {
+            std::cell::RefCell::new(None)
+        };
+        static SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn reject_read_only_directory() -> bool {
+        READ_ONLY_FAILURE.with(|failure| {
+            let mut failure = failure.borrow_mut();
+            let Some((destination, was_visible)) = failure.as_mut() else {
+                return false;
+            };
+            *was_visible = destination.exists();
+            true
+        })
+    }
+
+    #[cfg(unix)]
+    pub(super) fn reject_directory_sync(path: &Path) -> bool {
+        SYNC_FAILURE.with(|failure| failure.borrow().as_deref() == Some(path))
+    }
+
+    #[cfg(unix)]
+    struct ResetPublicationFailure;
+
+    #[cfg(unix)]
+    impl Drop for ResetPublicationFailure {
+        fn drop(&mut self) {
+            READ_ONLY_FAILURE.with(|failure| *failure.borrow_mut() = None);
+            SYNC_FAILURE.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn permission_failure_occurs_before_destination_visibility() {
+        let root = temporary_root("prepublication-permissions");
+        let candidate = root.join("candidate");
+        let managed = root.join("managed");
+        fs::create_dir_all(&candidate).expect("candidate");
+        let files = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ];
+        for (name, bytes) in files {
+            fs::write(candidate.join(name), bytes).expect("fixture");
+        }
+        let manifest = fixture_manifest(&files);
+        // Ordinary verified publication first; failure uses the same publication owner.
+        let ordinary_root = root.join("ordinary");
+        let ordinary = copy_verified_candidate(&candidate, &ordinary_root, &manifest)
+            .expect("ordinary publication");
+        verify_managed_model_dir(&ordinary, &manifest).expect("ordinary integrity");
+        let destination = managed_model_dir(&managed, &manifest);
+        let reset = ResetPublicationFailure;
+        READ_ONLY_FAILURE
+            .with(|failure| *failure.borrow_mut() = Some((destination.clone(), false)));
+        let error = copy_verified_candidate(&candidate, &managed, &manifest)
+            .expect_err("permission failure");
+        let was_visible =
+            READ_ONLY_FAILURE.with(|failure| failure.borrow().as_ref().expect("installed seam").1);
+        assert!(
+            !was_visible,
+            "a rejected permission mutation must not follow target visibility"
+        );
+        assert!(!destination.exists());
+        assert!(error.to_string().contains("directory permission failure"));
+        drop(reset);
+        make_model_tree_writable(&ordinary, &manifest).expect("fixture cleanup");
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_sync_failure_retains_publication_and_retry_rechecks_durability() {
+        let root = temporary_root("postpublication-sync");
+        let candidate = root.join("candidate");
+        let managed = root.join("managed");
+        fs::create_dir_all(&candidate).expect("candidate");
+        let files = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ];
+        for (name, bytes) in files {
+            fs::write(candidate.join(name), bytes).expect("fixture");
+        }
+        let manifest = fixture_manifest(&files);
+        let ordinary = copy_verified_candidate(&candidate, &root.join("ordinary"), &manifest)
+            .expect("ordinary publication");
+        verify_managed_model_dir(&ordinary, &manifest).expect("ordinary integrity");
+        let destination = managed_model_dir(&managed, &manifest);
+        let reset = ResetPublicationFailure;
+        SYNC_FAILURE.with(|failure| {
+            *failure.borrow_mut() = Some(managed.join(super::super::PARAKEET_MODEL_ID))
+        });
+        let error = copy_verified_candidate(&candidate, &managed, &manifest)
+            .expect_err("parent sync failure");
+        verify_managed_model_dir(&destination, &manifest).expect("visible verified bytes retained");
+        let detail = error.to_string();
+        assert!(detail.contains("publication"));
+        assert!(detail.contains(destination.to_str().expect("fixture UTF-8")));
+        assert!(detail.contains("no rollback performed"));
+        // Existing name is not proof that the failed durability step succeeded.
+        assert!(copy_verified_candidate(&candidate, &managed, &manifest).is_err());
+        drop(reset);
+        assert_eq!(
+            copy_verified_candidate(&candidate, &managed, &manifest).expect("durable retry"),
+            destination
+        );
+        for (name, bytes) in files {
+            assert_eq!(
+                fs::read(destination.join(name)).expect("preserved bytes"),
+                bytes
+            );
+        }
+        make_model_tree_writable(&destination, &manifest).expect("fixture cleanup");
+        make_model_tree_writable(&ordinary, &manifest).expect("fixture cleanup");
+        fs::remove_dir_all(root).expect("fixture cleanup");
     }
 }

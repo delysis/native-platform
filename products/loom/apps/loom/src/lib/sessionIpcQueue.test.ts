@@ -14,6 +14,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import {
   applicationClosePending,
+  cancelWorkspacePaneRun,
+  listWorkspacePaneRuns,
   cancelTerminalRun,
   runTerminal,
   closeProject,
@@ -288,5 +290,94 @@ describe('session IPC admission', () => {
 
     heldPage.resolve({ branches: [], next_cursor: null });
     await expect(page).resolves.toEqual({ branches: [], next_cursor: null });
+  });
+});
+
+describe.each(['resolved', 'failed'] as const)('workspace cancellation with %s history', (settlement) => {
+  it('dispatches Stop before a held history reply and leaves ordinary edits in FIFO order', async () => {
+    installDesktopRuntime();
+    const project = '0'.repeat(25) + 'A';
+    const session = '0'.repeat(25) + 'B';
+    const document = '0'.repeat(25) + 'C';
+    const revision = '0'.repeat(25) + 'D';
+    const ordinaryRun = '0'.repeat(25) + 'E';
+    const activeRun = '0'.repeat(25) + 'F';
+    const historyReply = deferred<unknown>();
+    const cancelReply = deferred<void>();
+    const owned: Promise<unknown>[] = [];
+    let cancellationSettled = false;
+    mocks.invoke.mockImplementation((command: string, args: Record<string, unknown>) => {
+      if (command === 'plugin:loom|workspace_pane_cancel') {
+        return args.runId === ordinaryRun ? Promise.resolve() : cancelReply.promise;
+      }
+      if (command === 'plugin:loom|workspace_pane_list') return historyReply.promise;
+      if (command === 'plugin:loom|document_open' || command === 'plugin:loom|project_current') {
+        return Promise.resolve(null);
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    try {
+      // The same public cancellation succeeds normally before the held-read schedule.
+      await expect(cancelWorkspacePaneRun(project, session, ordinaryRun)).resolves.toBeUndefined();
+      expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|workspace_pane_cancel', {
+        projectId: project, sessionId: session, runId: ordinaryRun
+      });
+      const history = listWorkspacePaneRuns(project, session);
+      owned.push(history);
+      const historyOutcome = history.then(
+        value => ({ value }),
+        error => ({ error })
+      );
+      await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
+      expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|workspace_pane_list', {
+        projectId: project, sessionId: session
+      });
+
+      const cancellation = cancelWorkspacePaneRun(project, session, activeRun).then(() => {
+        cancellationSettled = true;
+      });
+      owned.push(cancellation);
+      const edit = openDocument(project, session, document, revision, 'a'.repeat(64));
+      owned.push(edit);
+      await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+        'plugin:loom|workspace_pane_cancel',
+        { projectId: project, sessionId: session, runId: activeRun }
+      ));
+      // Cancellation bypasses the lane; the ordinary edit still waits for history.
+      expect(mocks.invoke.mock.calls.map(([command]) => command)).toEqual([
+        'plugin:loom|workspace_pane_cancel',
+        'plugin:loom|workspace_pane_list',
+        'plugin:loom|workspace_pane_cancel'
+      ]);
+      expect(cancellationSettled).toBe(false);
+
+      if (settlement === 'failed') historyReply.reject(new Error('history unavailable'));
+      else historyReply.resolve([]);
+      const outcome = await historyOutcome;
+      if (settlement === 'failed') expect(outcome).toMatchObject({ error: { message: 'history unavailable' } });
+      else expect(outcome).toEqual({ value: [] });
+      await expect(edit).resolves.toBeNull();
+      expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|document_open', {
+        projectId: project, sessionId: session, documentId: document,
+        expectedRevisionId: revision, expectedBlobId: 'a'.repeat(64)
+      });
+      expect(mocks.invoke.mock.calls.map(([command]) => command)).toEqual([
+        'plugin:loom|workspace_pane_cancel',
+        'plugin:loom|workspace_pane_list',
+        'plugin:loom|workspace_pane_cancel',
+        'plugin:loom|document_open'
+      ]);
+      expect(cancellationSettled).toBe(false);
+      cancelReply.resolve();
+      await expect(cancellation).resolves.toBeUndefined();
+      expect(cancellationSettled).toBe(true);
+    } finally {
+      // Release every owned reply before awaiting the public FIFO drain on failure too.
+      historyReply.resolve([]);
+      cancelReply.resolve();
+      await Promise.allSettled(owned);
+      await expect(currentProjectSession()).resolves.toBeNull();
+    }
   });
 });

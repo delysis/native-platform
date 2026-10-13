@@ -1,10 +1,12 @@
 # Streaming completion contract
 
 Preview length and acceptance length are separate. Ghost mode renders the entire
-currently authorized, editor-safe prefix, in both Visual and Source. Later
+currently authorized prefix, in both Visual and Source. Later
 native deltas grow that preview. A word acceptance inserts one exact prefix;
-it must neither hide the remaining preview nor stop its stream. Visual's existing
-canonical-prose projection still applies; Source owns multiline Markdown.
+it must neither hide the remaining preview nor stop its stream. Visual parses
+inline Markdown through the same ProseMirror schema used by the manuscript, so
+marks such as `**bold**` render as marks and serialize back to the exact Markdown.
+Source owns multiline Markdown.
 
 Loompad suppresses inline Ghost but renders four next-word choices with their
 streaming continuations. Emphasize the exact prefix that a W/A/S/D action accepts;
@@ -18,11 +20,20 @@ only if its entire old text remains an exact prefix. It may not rewrite, truncat
 reuse an old presentation identity, revive a retired policy, or update an obsolete
 session. Do not change authority while an insertion is pending. Unconsume removes
 only the exact last accepted chunk; ordinary editor undo remains a different action.
+In Source, Command-Z (Control-Z where applicable) and redo use the native textarea
+history, including accepted completion text. Option/Alt-Left is the exact completion
+reversal; undo does not restore completion authority or regenerate its ghost.
 
 A matching presentation key is insufficient evidence of a rendered preview.
 The actual connected, visible DOM text must equal the authorized prefix before
 inline acceptance. Offscreen-caret, focus, composition, canonical Markdown,
-grapheme, model, document, revision and family checks remain in force.
+model, document, revision and family checks remain in force. These establish the
+editor and candidate identity; they do not review generated content. Autocomplete
+does not score, qualify or reject completed prose, salvage a prefix, rotate to a
+sibling, or request a replacement family after generation. Visual sends the whole
+sampler-authorized candidate directly through the manuscript's ProseMirror parser.
+Any content that must never reach that parser must be masked or rejected by the
+native sampler before emission.
 
 ## Executable regressions
 
@@ -88,13 +99,19 @@ never postpone the current preview until an exponential subtree is complete.
 A four-run refill is not evidence of four immediately available children at every
 deeper prefix. No such exhaustive scheduler is supplied by the preview repair.
 
-Visual automatic V4 withholds leading line breaks and markup before native emission.
-Rejected proposals remain in the bounded attempt ledger; numeric prose and literal
-`<3 forever` remain eligible. Source uses its existing automatic V2 policy and
-retains multiline Markdown. V3 records keep their original policy semantics.
-The captured editor mode fixes the request policy across an uncertain-command retry.
+Visual automatic V5 masks every non-EOG vocabulary token whose decoded piece
+contains an ASCII control byte, including tab, CR, LF, NUL and DEL, before every
+sampler draw. Non-EOG control, user-defined, unknown and unused vocabulary tokens,
+and undecodable pieces, are masked by the same rule. The sorted mask is
+part of the immutable native evidence, and receipt validation rejects any masked
+token in an attempt or admitted output. Inline Markdown punctuation remains
+eligible. The earlier leading-markup proposal gate still runs before emission;
+numeric prose and literal `<3 forever` remain eligible. Source uses its existing
+automatic V2 policy and retains multiline Markdown. V3 and V4 records keep their
+original policy semantics. The captured editor mode fixes the request policy
+across an uncertain-command retry.
 
-Visual Loompad uses `loompad_visual_v3` with the same native visual-prose
-admission as Visual Ghost. Source Loompad retains `loompad_v2`. The immutable
+Visual Loompad uses `loompad_visual_v4` with the same native Visual V5 policy as
+Visual Ghost. Source Loompad retains `loompad_v2`. The immutable
 batch records its admission policy; replay and presentation reject a different
 surface policy. Four-slot families and the 4/16/64/256 sampling caps are unchanged.

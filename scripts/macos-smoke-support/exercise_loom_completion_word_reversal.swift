@@ -4,12 +4,21 @@ func isOwnedManuscriptEditor(role: String, labels: [String]) -> Bool {
     role == "AXTextArea" && labels.contains("Untitled, manuscript editor")
 }
 
-func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+func expectedInsertedCandidatePrefix(original: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Data? {
     guard insertedBytes > 0, insertedBytes <= candidate.count,
-          !whole || insertedBytes == candidate.count else { return false }
+          !whole || insertedBytes == candidate.count else { return nil }
     var expected = original
     expected.append(candidate.prefix(insertedBytes))
-    return observed == expected
+    return expected
+}
+
+func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+    expectedInsertedCandidatePrefix(
+        original: original,
+        candidate: candidate,
+        insertedBytes: insertedBytes,
+        whole: whole
+    ) == observed
 }
 
 // Derive the remaining fan from persisted bytes and independently SHA-verified
@@ -33,6 +42,11 @@ func manuscriptEndCaret(original: Data, expected: Data) -> Int? {
     guard expected.starts(with: original),
           let text = String(data: expected, encoding: .utf8) else { return nil }
     return text.utf16.count
+}
+
+func hasRemainderAfterOneWord(_ candidate: Data) -> Bool {
+    guard let text = String(data: candidate, encoding: .utf8) else { return false }
+    return text.split(whereSeparator: { $0.isWhitespace }).count >= 2
 }
 
 func insertionContractTests() {
@@ -77,6 +91,9 @@ func insertionContractTests() {
     check(manuscriptEndCaret(original: original, expected: Data("hello 🜁".utf8)) == 8, "caret uses UTF-16 rather than bytes")
     check(manuscriptEndCaret(original: original, expected: Data("Hello one".utf8)) == nil, "reject changed original at refocus")
     check(manuscriptEndCaret(original: Data(), expected: Data([0xff])) == nil, "reject invalid manuscript encoding")
+    check(hasRemainderAfterOneWord(Data("one two".utf8)), "multiword candidate retains a remainder")
+    check(!hasRemainderAfterOneWord(Data("one".utf8)), "one-word candidate is exhausted")
+    check(!hasRemainderAfterOneWord(Data([0xff])), "reject invalid candidate encoding")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -423,16 +440,27 @@ func waitForAccessibleFan(
 
 @discardableResult
 func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
-    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else {
         return false
     }
     event.flags = flags
-    event.postToPid(pid)
+    // Exercise the same system dispatch path as a physical keyboard. PID-only
+    // injection bypasses native menu/global-shortcut resolution and therefore
+    // cannot prove a chord that WebKit itself consumes. The caller has already
+    // bound and foreground-checked `pid` before this journey begins.
+    event.post(tap: .cghidEventTap)
     return true
 }
 
 func readManuscript() -> Data? {
     try? Data(contentsOf: URL(fileURLWithPath: manuscript), options: [.uncached])
+}
+
+func readEditorBytes() -> Data? {
+    guard let surface = editor(),
+          let value = attribute(surface, kAXValueAttribute as CFString) as? String else { return nil }
+    return Data(value.utf8)
 }
 
 func sha256(_ data: Data) -> String {
@@ -480,6 +508,64 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
         Thread.sleep(forTimeInterval: 0.05)
     } while Date() < deadline
     return false
+}
+
+func waitForEditorFocus(timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return false }
+        if editor().map({
+            (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true
+        }) == true { return true }
+        Thread.sleep(forTimeInterval: 0.02)
+    } while Date() < deadline
+    return false
+}
+
+func editorFocusedAtEnd(of bytes: Data) -> Bool {
+    guard let text = String(data: bytes, encoding: .utf8),
+          let surface = editor(),
+          (attribute(surface, kAXFocusedAttribute as CFString) as? Bool) == true,
+          let range = selectedRange(surface) else { return false }
+    return range.location == text.utf16.count && range.length == 0
+}
+
+func waitForExactEditorInsertion(
+    original: Data,
+    candidate: Data,
+    insertedBytes: Int,
+    whole: Bool,
+    timeout: TimeInterval
+) -> Data? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return nil }
+        if let observed = readEditorBytes(), exactInsertedCandidatePrefix(
+            original: original,
+            observed: observed,
+            candidate: candidate,
+            insertedBytes: insertedBytes,
+            whole: whole
+        ) { return observed }
+        Thread.sleep(forTimeInterval: 0.02)
+    } while Date() < deadline
+    return nil
+}
+
+func waitForExactPersistedInsertion(
+    original: Data,
+    candidate: Data,
+    insertedBytes: Int,
+    whole: Bool,
+    timeout: TimeInterval
+) -> Data? {
+    guard let expected = expectedInsertedCandidatePrefix(
+        original: original,
+        candidate: candidate,
+        insertedBytes: insertedBytes,
+        whole: whole
+    ), waitForExactManuscript(expected, timeout: timeout) else { return nil }
+    return expected
 }
 
 func focusWritingSurface(expected: Data, timeout: TimeInterval) -> AXUIElement? {
@@ -561,7 +647,7 @@ func verifiedCandidateBytes(_ candidate: [String: Any]) -> Data? {
     guard parts.count == 2 || parts.count == 4, parts[0] != "stream", !parts[0].isEmpty,
           parts[1].count == 64, parts[1].allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
     let hash = parts[1], length = integer(candidate, "text_utf8_bytes")
-    if parts.count == 4 && (parts[2] != "prose-prefix" || Int(parts[3]) != length) { return nil }
+    if parts.count == 4 && (parts[2] != "boundary" || Int(parts[3]) != length) { return nil }
     let path = URL(fileURLWithPath: manuscript).deletingLastPathComponent()
         .appendingPathComponent(".loom/blobs/sha256").appendingPathComponent(String(hash.prefix(2)))
         .appendingPathComponent(String(hash.dropFirst(2)))
@@ -732,6 +818,39 @@ guard let rolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
 }
 let rolledBack = rolledBackEvidence.witness
 
+// Shuttle must have a cached remainder after its first timed word. Otherwise
+// exhausting a legitimate one-word candidate immediately authorizes a new
+// generation family, which would make the later no-regeneration assertion
+// test a false premise. Choose the longest independently verified multiword
+// candidate and move the native fan to it while Option is still held.
+guard let shuttleRunId = runIds
+    .filter({ expectedCandidates[$0].map(hasRemainderAfterOneWord) == true })
+    .max(by: { expectedCandidates[$0]!.count < expectedCandidates[$1]!.count }),
+      let initialIndex = runIds.firstIndex(of: initialRunId),
+      let shuttleIndex = runIds.firstIndex(of: shuttleRunId) else {
+    releaseOptionAndFail("the verified completion family had no multiword candidate for Shuttle")
+}
+var shuttleSelected = rolledBack
+let shuttleSelectionSteps = (shuttleIndex - initialIndex + runIds.count) % runIds.count
+if shuttleSelectionSteps > 0 {
+    for step in 1...shuttleSelectionSteps {
+        guard postKey(125, down: true, flags: [.maskAlternate]),
+              postKey(125, down: false, flags: [.maskAlternate]) else {
+            releaseOptionAndFail("could not select Shuttle's verified multiword candidate")
+        }
+        let expectedRunId = runIds[(initialIndex + step) % runIds.count]
+        guard let selectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
+            let rendered = visual(witness)
+            return sameFamily(witness, context: context, runIds: runIds) &&
+                string(witness, "selected_run_id") == expectedRunId &&
+                bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+        }) else {
+            releaseOptionAndFail("the native fan did not reach Shuttle's verified multiword candidate")
+        }
+        shuttleSelected = selectedEvidence.witness
+    }
+}
+
 postKey(58, down: false, flags: [])
 guard let optionReleased = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
@@ -761,7 +880,11 @@ guard let shuttleEnabled = waitForWitness(timeout: 10, { witness in
 }) else {
     releaseOptionAndFail("Shuttle did not hide the inline presentation while retaining the exact cached family")
 }
-guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
+// The system-level Command-Shift-J event can briefly move native focus while
+// WebKit processes the shortcut. Re-establish the explicit writing-surface
+// prerequisite before judging whether the foreground-only Shuttle fires.
+guard focusWritingSurface(expected: original, timeout: 5) != nil,
+      let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let shuttleAccepted = waitForWitness(timeout: 10, { witness in
           let action = lastAction(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
@@ -773,7 +896,7 @@ guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeou
               integer(witness, "accepted_utf8_bytes") > 0 &&
               bool(witness, "authority_frozen") &&
               string(action, "kind") == "shuttle_word" &&
-              string(action, "run_id") == initialRunId &&
+              string(action, "run_id") == shuttleRunId &&
               integer(action, "accepted_utf8_bytes") == integer(witness, "accepted_utf8_bytes") &&
               integer(action, "sequence") > integer(lastAction(wordAccepted), "sequence")
       }) else {
@@ -843,7 +966,7 @@ guard postKey(58, down: true, flags: [.maskAlternate]),
       let returnSelectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
-              string(witness, "selected_run_id") != initialRunId &&
+              string(witness, "selected_run_id") != shuttleRunId &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
       }) else {
     releaseOptionAndFail("could not select a non-default cached run for fan Return")
@@ -853,32 +976,60 @@ let returnRunId = string(returnSelected, "selected_run_id")
 let returnPreviousSequence = integer(lastAction(returnSelected), "sequence")
 guard postKey(36, down: true, flags: [.maskAlternate]),
       postKey(36, down: false, flags: [.maskAlternate]),
-      let returnAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let returnAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
+          let renderedKey = string(witness, "rendered_presentation_key")
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
-              bool(rendered, "optionHeld") &&
+              !renderedKey.isEmpty &&
+              string(rendered, "selectedPresentationKey") == renderedKey &&
+              bool(rendered, "inlineHidden") &&
+              stringArray(rendered, "alternativeRunIds").isEmpty &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_return" &&
               string(action, "run_id") == returnRunId &&
               integer(action, "sequence") > returnPreviousSequence
       }) else {
-    releaseOptionAndFail("fan Return did not persist the selected cached remainder")
+    releaseOptionAndFail("fan Return did not apply the selected cached remainder")
 }
 let returnAction = lastAction(returnAccepted)
-guard exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
-      integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
-      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
-      postKey(123, down: true, flags: [.maskAlternate]),
+// The app witness and WebKit's key-dispatch target settle on adjacent render
+// turns. Match the browser contract's two-paint handoff without approaching
+// the 1.8-second candidate-exhaustion schedule.
+Thread.sleep(forTimeInterval: 0.25)
+let returnCandidate = expectedCandidates[returnRunId]
+let returnAcceptedBytes = returnCandidate.flatMap { candidate in
+    waitForExactPersistedInsertion(
+          original: original,
+          candidate: candidate,
+          insertedBytes: integer(returnAction, "inserted_utf8_bytes"),
+          whole: true,
+          timeout: 2
+      )
+}
+let returnInsertionExact = returnAcceptedBytes.map {
+    exactInsertion($0, witness: returnAccepted, whole: true)
+} ?? false
+let returnByteCountExact = integer(returnAction, "accepted_utf8_bytes") ==
+    integer(returnAction, "inserted_utf8_bytes")
+let returnEditorFocused = waitForEditorFocus(timeout: 1)
+guard returnCandidate != nil, returnAcceptedBytes != nil, returnInsertionExact,
+      returnByteCountExact, returnEditorFocused else {
+    releaseOptionAndFail("fan Return pre-reversal guard failed: candidate=\(returnCandidate != nil) persisted_bytes=\(returnAcceptedBytes != nil) insertion=\(returnInsertionExact) byte_count=\(returnByteCountExact) focus=\(returnEditorFocused)")
+}
+guard let exactReturnAcceptedBytes = returnAcceptedBytes else {
+    releaseOptionAndFail("fan Return accepted bytes disappeared after exact validation")
+}
+guard postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
-      waitForExactManuscript(original, timeout: 30),
       let returnRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readManuscript() == original &&
+              editorFocusedAtEnd(of: original) &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
@@ -920,32 +1071,45 @@ let tabRunId = string(tabSelected, "selected_run_id")
 let tabPreviousSequence = integer(lastAction(tabSelected), "sequence")
 guard postKey(48, down: true, flags: [.maskAlternate]),
       postKey(48, down: false, flags: [.maskAlternate]),
-      let tabAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let tabAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
+          let renderedKey = string(witness, "rendered_presentation_key")
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
-              bool(rendered, "optionHeld") &&
+              !renderedKey.isEmpty &&
+              string(rendered, "selectedPresentationKey") == renderedKey &&
+              bool(rendered, "inlineHidden") &&
+              stringArray(rendered, "alternativeRunIds").isEmpty &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_tab" &&
               string(action, "run_id") == tabRunId &&
               integer(action, "sequence") > tabPreviousSequence
       }) else {
-    releaseOptionAndFail("fan Tab did not persist the selected cached remainder")
+    releaseOptionAndFail("fan Tab did not apply the selected cached remainder")
 }
 let tabAction = lastAction(tabAccepted)
-guard exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
+Thread.sleep(forTimeInterval: 0.25)
+guard let tabCandidate = expectedCandidates[tabRunId],
+      let tabAcceptedBytes = waitForExactPersistedInsertion(
+          original: original,
+          candidate: tabCandidate,
+          insertedBytes: integer(tabAction, "inserted_utf8_bytes"),
+          whole: true,
+          timeout: 2
+      ),
+      exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
       integer(tabAction, "accepted_utf8_bytes") == integer(tabAction, "inserted_utf8_bytes"),
-      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+      editor().map({ (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true }) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
-      waitForExactManuscript(original, timeout: 30),
       let tabRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readManuscript() == original &&
+              editorFocusedAtEnd(of: original) &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
@@ -1001,6 +1165,8 @@ let evidence: [String: Any] = [
     "cycled_up_witness": cycledUp,
     "word_accepted_witness": wordAccepted,
     "rolled_back_witness": rolledBack,
+    "shuttle_selected_run_id": shuttleRunId,
+    "shuttle_selected_witness": shuttleSelected,
     "option_released_witness": optionReleased,
     "shuttle_enabled_witness": shuttleEnabled,
     "shuttle_accepted_witness": shuttleAccepted,
@@ -1010,12 +1176,14 @@ let evidence: [String: Any] = [
     "shuttle_rollback_released_witness": shuttleRollbackReleased,
     "fan_return_selected_witness": returnSelected,
     "fan_return_accepted_witness": returnAccepted,
-    "fan_return_accepted_sha256": sha256(returnAcceptedBytes),
+    "fan_return_accepted_sha256": sha256(exactReturnAcceptedBytes),
+    "fan_return_acceptance_source": "exact persisted manuscript plus live AX focus",
     "fan_return_rolled_back_witness": returnRolledBack,
     "fan_return_released_witness": returnReleased,
     "fan_tab_selected_witness": tabSelected,
     "fan_tab_accepted_witness": tabAccepted,
     "fan_tab_accepted_sha256": sha256(tabAcceptedBytes),
+    "fan_tab_acceptance_source": "exact persisted manuscript plus live AX focus",
     "fan_tab_rolled_back_witness": tabRolledBack,
     "fan_tab_released_witness": tabReleased,
     "engine_disabled_witness": engineDisabled

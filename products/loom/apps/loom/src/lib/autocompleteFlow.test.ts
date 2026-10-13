@@ -2,10 +2,6 @@ import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-ma
 import { EditorState, Selection } from 'prosemirror-state';
 import type { EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
-import {
-  emptyAutocompleteRetryLedger,
-  planAutocompleteRetry
-} from './autocompleteRetry';
 import { autocompleteDisposition } from './ghostSuggestion';
 import { createGhostTextPlugin, setGhostText } from './ghostText';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
@@ -70,64 +66,31 @@ async function hydratedBranch(
 }
 
 describe('synthetic autocomplete disposition to acceptance flow', () => {
-  it('schedules one bounded replacement when the editor rejects the final presentation', async () => {
-    const candidate = await hydratedBranch(
-      'run-context',
-      'candidate-context',
-      ' morning'
+  it('does not score or replace a verified autocomplete generation after completion', async () => {
+    const repeated = await hydratedBranch(
+      'run-repeated',
+      'candidate-repeated',
+      ` ${'rain '.repeat(32)}`
     );
     const disposition = autocompleteDisposition({
       active: true,
-      branches: [candidate.branch],
-      verifiedBodyByRun: { 'run-context': candidate.body },
+      branches: [repeated.branch],
+      verifiedBodyByRun: { 'run-repeated': repeated.body },
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [`candidate-context:${candidate.body.blobId}`],
       targetByte: 61
     });
     expect(disposition).toEqual({
-      kind: 'exhausted',
-      candidates: [{ candidateId: 'candidate-context', reason: 'unpresentable' }]
+      kind: 'available',
+      suggestion: {
+        candidateId: 'candidate-repeated',
+        presentationKey: `candidate-repeated:${repeated.body.blobId}`,
+        targetByte: 61,
+        text: repeated.body.text
+      }
     });
-    expect(planAutocompleteRetry(emptyAutocompleteRetryLedger(), {
-      disposition,
-      budgetKey: 'document:revision:gemma',
-      activeBranchCount: 0,
-      weaveStarting: false,
-      maximumRetries: 1
-    }).kind).toBe('schedule');
   });
 
-  it('retries the observed rejected family, then handles Tab only for a verified replacement', async () => {
-    const upperLoop = `.\n\n${'The platform smelled of wet iron. '.repeat(18)}`.trimEnd();
-    const lowerLoop = `.\n\n${'the platform smelled of wet iron.\n\n'.repeat(16)}`.trimEnd();
-    const rejectedHydrated = await Promise.all([
-      hydratedBranch('run-upper', 'candidate-upper', upperLoop),
-      hydratedBranch('run-lower', 'candidate-lower', lowerLoop),
-      hydratedBranch('run-period', 'candidate-period', '.')
-    ]);
-    const rejected = rejectedHydrated.map((item) => item.branch);
-    const rejectedHydration = {
-      'run-upper': rejectedHydrated[0].body,
-      'run-lower': rejectedHydrated[1].body,
-      'run-period': rejectedHydrated[2].body
-    };
-    const exhausted = autocompleteDisposition({
-      active: true,
-      branches: rejected,
-      verifiedBodyByRun: rejectedHydration,
-      dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
-      targetByte: 61
-    });
-    expect(exhausted.kind).toBe('exhausted');
-    expect(planAutocompleteRetry(emptyAutocompleteRetryLedger(), {
-      disposition: exhausted,
-      budgetKey: 'document:revision:gemma',
-      activeBranchCount: 0,
-      weaveStarting: false,
-      maximumRetries: 1
-    }).kind).toBe('schedule');
-
+  it('handles Tab only for the first verified candidate and never shops for a replacement', async () => {
     const clean = await hydratedBranch(
       'run-clean',
       'candidate-clean',
@@ -135,14 +98,13 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
     );
     const available = autocompleteDisposition({
       active: true,
-      branches: [...rejected, clean.branch],
-      verifiedBodyByRun: { ...rejectedHydration, 'run-clean': clean.body },
+      branches: [clean.branch],
+      verifiedBodyByRun: { 'run-clean': clean.body },
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 61
     });
     expect(available.kind).toBe('available');
-    if (available.kind !== 'available') throw new Error('expected verified replacement');
+    if (available.kind !== 'available') throw new Error('expected verified candidate');
 
     let accepted: { candidateId: string; presentationKey: string; text: string } | null = null;
     const plugin = createGhostTextPlugin({
@@ -181,13 +143,8 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
     });
 
     const handled = plugin.props.handleKeyDown?.call(plugin, view, {
-      key: 'Tab',
-      keyCode: 9,
-      isComposing: false,
-      shiftKey: false,
-      metaKey: false,
-      ctrlKey: false,
-      altKey: false
+      key: 'Tab', keyCode: 9, isComposing: false, shiftKey: false,
+      metaKey: false, ctrlKey: false, altKey: false
     } as KeyboardEvent);
     expect(handled).toBe(true);
     expect(accepted).toEqual({

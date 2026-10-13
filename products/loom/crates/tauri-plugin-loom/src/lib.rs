@@ -160,6 +160,8 @@ pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
 pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+pub const REVERSE_COMPLETION_MENU_ID: &str = "loom.edit.reverse-completion";
+pub const REVERSE_COMPLETION_EVENT: &str = "loom://reverse-completion";
 const LOOM_ASSET_SCHEME: &str = "loom-asset";
 const LOOM_ASSET_TOKEN_VERSION: &str = "v3";
 const LOOM_CONTEXT_MEDIA_TOKEN_VERSION: &str = "v2";
@@ -498,6 +500,32 @@ fn recorded_loompad_batch(
             })
         })
         .transpose()
+}
+
+fn recorded_weave_first_word_choices(
+    store: &ProjectStore,
+    context_recipe_artifact_id: ArtifactId,
+) -> Result<Option<llama_native_types::FirstWordChoicePolicy>, IpcFailure> {
+    let missing = || {
+        IpcFailure::new(
+            "generation_provenance_missing",
+            "This retained Weave family has no first-word policy binding. Read its existing status; do not retry it under an inferred policy.",
+            false,
+        )
+    };
+    let bytes = store
+        .generation_context_evidence(context_recipe_artifact_id)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(missing)?;
+    let evidence: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+    })?;
+    // An explicit null means no first-word constraint. Absence is not that
+    // policy: older evidence cannot prove an exact semantic retry.
+    let value = evidence.get("first_word_choices").ok_or_else(missing)?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+    })
 }
 
 #[derive(Debug)]
@@ -877,8 +905,10 @@ mod automatic_writer_authority {
                 ValidatedWeavePolicy::AutomaticV2
                 | ValidatedWeavePolicy::AutomaticV3
                 | ValidatedWeavePolicy::AutomaticVisualV4
+                | ValidatedWeavePolicy::AutomaticVisualV5
                 | ValidatedWeavePolicy::LoompadV2 { .. }
-                | ValidatedWeavePolicy::LoompadVisualV3 { .. } => {
+                | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                | ValidatedWeavePolicy::LoompadVisualV4 { .. } => {
                     AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
                         loaded,
                         build_policy,
@@ -1161,7 +1191,7 @@ struct GenerationWorkerReservation<'registry, 'admission> {
 
 #[derive(Debug)]
 struct GenerationWorkerAttachError {
-    failure: IpcFailure,
+    failure: Box<IpcFailure>,
     worker: JoinHandle<()>,
     owner: GenerationWorkerOwner,
 }
@@ -1911,22 +1941,22 @@ impl GenerationWorkerReservation<'_, '_> {
             Ok(Some(lease)) => lease.identity().sequence,
             Ok(None) => {
                 return Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_lifecycle_missing",
                         "the generation worker has no authoritative lifecycle reservation",
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 });
             }
             Err(error) => {
                 return Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_lifecycle_failed",
                         error.to_string(),
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 });
@@ -1938,11 +1968,11 @@ impl GenerationWorkerReservation<'_, '_> {
             .note_worker_started(lifecycle_worker_id)
         {
             return Err(GenerationWorkerAttachError {
-                failure: IpcFailure::new(
+                failure: Box::new(IpcFailure::new(
                     "generation_worker_lifecycle_failed",
                     error.to_string(),
                     false,
-                ),
+                )),
                 worker,
                 owner,
             });
@@ -1955,7 +1985,7 @@ impl GenerationWorkerReservation<'_, '_> {
                     .lifecycle
                     .note_worker_joined(lifecycle_worker_id);
                 return Err(GenerationWorkerAttachError {
-                    failure,
+                    failure: Box::new(failure),
                     worker,
                     owner,
                 });
@@ -1977,11 +2007,11 @@ impl GenerationWorkerReservation<'_, '_> {
                     .lifecycle
                     .note_worker_joined(lifecycle_worker_id);
                 Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_state_changed",
                         "the desktop generation worker reservation changed before attachment",
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 })
@@ -2376,6 +2406,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
         emit_application_close_request(app);
         return;
     }
+    if menu_id == REVERSE_COMPLETION_MENU_ID {
+        let _ = app.emit(REVERSE_COMPLETION_EVENT, ());
+        return;
+    }
     if let Some(command) = file_menu_command(menu_id) {
         let _ = app.emit(FILE_COMMAND_EVENT, FileMenuCommandEvent { command });
     }
@@ -2394,6 +2428,10 @@ pub struct IpcFailure {
     message: String,
     retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    retained_collection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_collection_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     speculation_recovery: Option<Box<LoompadRecovery>>,
 }
 
@@ -2403,8 +2441,16 @@ impl IpcFailure {
             code,
             message: message.into(),
             retryable,
+            retained_collection_id: None,
+            retained_collection_state: None,
             speculation_recovery: None,
         }
+    }
+
+    fn with_retained_collection(mut self, id: &str, state: &'static str) -> Self {
+        self.retained_collection_id = Some(id.to_string());
+        self.retained_collection_state = Some(state);
+        self
     }
 
     fn attachment(error: &AttachmentStoreError) -> Self {
@@ -2990,11 +3036,16 @@ enum WeavePolicySnapshot {
     AutomaticV2 {},
     AutomaticV3 {},
     AutomaticVisualV4 {},
+    AutomaticVisualV5 {},
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
     LoompadVisualV3 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
+    LoompadVisualV4 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -3026,11 +3077,16 @@ enum ValidatedWeavePolicy {
     AutomaticV2,
     AutomaticV3,
     AutomaticVisualV4,
+    AutomaticVisualV5,
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
     LoompadVisualV3 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
+    LoompadVisualV4 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -8453,13 +8509,25 @@ fn replay_weave_if_recorded(
                 ));
             }
         }
-        let policy_matches = match &speculation {
-            Some(batch) => policy.matches_loompad_batch(batch),
-            None => !matches!(
+        let policy_matches = if let Some(batch) = &speculation {
+            policy.matches_loompad_batch(batch)
+        } else {
+            let mut matches = !matches!(
                 policy,
                 ValidatedWeavePolicy::LoompadV2 { .. }
                     | ValidatedWeavePolicy::LoompadVisualV3 { .. }
-            ),
+                    | ValidatedWeavePolicy::LoompadVisualV4 { .. }
+            );
+            for started in &family.generations {
+                if recorded_weave_first_word_choices(
+                    store,
+                    started.generation.context_recipe_artifact_id,
+                )? != policy.first_word_choices()
+                {
+                    matches = false;
+                }
+            }
+            matches
         };
         let family_matches = policy_matches
             && resolved.is_some_and(|resolved| {
@@ -8775,12 +8843,17 @@ fn weave_start_inner<R: Runtime>(
         | ValidatedWeavePolicy::LoompadVisualV3 {
             sample_target,
             batch_offset,
+        }
+        | ValidatedWeavePolicy::LoompadVisualV4 {
+            sample_target,
+            batch_offset,
         } => {
             ensure_no_active_generations(state, "extending idle choices")?;
             Some((
                 *sample_target,
                 *batch_offset,
                 match &policy {
+                    ValidatedWeavePolicy::LoompadVisualV4 { .. } => "loompad_visual_v4",
                     ValidatedWeavePolicy::LoompadVisualV3 { .. } => "loompad_visual_v3",
                     _ => "loompad_v2",
                 },
@@ -8792,6 +8865,7 @@ fn weave_start_inner<R: Runtime>(
         _ => None,
     };
     let _model_lifecycle = lock_model_lifecycle(state)?;
+    let first_word_choices = policy.first_word_choices();
     let authorized_model = server_weave::Engine::bind(policy, state)?;
     let branch_count = authorized_model.branch_count();
     let max_cases = authorized_model.max_cases();
@@ -9075,6 +9149,7 @@ fn weave_start_inner<R: Runtime>(
                     serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media })
                 }
             };
+            evidence["first_word_choices"] = serde_json::json!(first_word_choices);
             if let Some(id) = archive_blob {
                 evidence["archive_friends_pack_blob_id"] = serde_json::json!(id);
             }
@@ -9457,7 +9532,7 @@ fn weave_start_inner<R: Runtime>(
         let failure = if desktop_panicked || backend_joined.worker_panicked() {
             state.generation_workers.record_join_failure()
         } else {
-            failure
+            *failure
         };
         if let Err(persistence) =
             fail_and_release_open_runs(state, &identity, &runs, &failure.message, app)
@@ -9534,11 +9609,16 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
         WeavePolicySnapshot::AutomaticV3 {} => ValidatedWeavePolicy::AutomaticV3,
         WeavePolicySnapshot::AutomaticVisualV4 {} => ValidatedWeavePolicy::AutomaticVisualV4,
+        WeavePolicySnapshot::AutomaticVisualV5 {} => ValidatedWeavePolicy::AutomaticVisualV5,
         WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
         }
         | WeavePolicySnapshot::LoompadVisualV3 {
+            sample_target,
+            batch_offset,
+        }
+        | WeavePolicySnapshot::LoompadVisualV4 {
             sample_target,
             batch_offset,
         } => {
@@ -9552,7 +9632,12 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
                     false,
                 ));
             }
-            if matches!(policy, WeavePolicySnapshot::LoompadVisualV3 { .. }) {
+            if matches!(policy, WeavePolicySnapshot::LoompadVisualV4 { .. }) {
+                ValidatedWeavePolicy::LoompadVisualV4 {
+                    sample_target,
+                    batch_offset,
+                }
+            } else if matches!(policy, WeavePolicySnapshot::LoompadVisualV3 { .. }) {
                 ValidatedWeavePolicy::LoompadVisualV3 {
                     sample_target,
                     batch_offset,
@@ -9608,6 +9693,10 @@ impl ValidatedWeavePolicy {
             | Self::LoompadVisualV3 {
                 sample_target,
                 batch_offset,
+            }
+            | Self::LoompadVisualV4 {
+                sample_target,
+                batch_offset,
             } => {
                 *sample_target == batch.sample_target
                     && *batch_offset == batch.batch_offset
@@ -9623,6 +9712,9 @@ impl ValidatedWeavePolicy {
             Self::AutomaticVisualV4 | Self::LoompadVisualV3 { .. } => {
                 Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
             }
+            Self::AutomaticVisualV5 | Self::LoompadVisualV4 { .. } => {
+                Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5)
+            }
             Self::AutomaticV3 => {
                 Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
             }
@@ -9635,18 +9727,23 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5
             | Self::LoompadV2 { .. }
-            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
 
     const fn max_tokens(&self) -> u32 {
         match self {
-            Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4 => {
-                AUTOMATIC_WEAVE_MAX_TOKENS_V2
-            }
-            Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. } => 128,
+            Self::AutomaticV2
+            | Self::AutomaticV3
+            | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::LoompadV2 { .. }
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
@@ -9656,8 +9753,10 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5
             | Self::LoompadV2 { .. }
-            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
@@ -9665,15 +9764,24 @@ impl ValidatedWeavePolicy {
     fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
         let preset = match (self, kind) {
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Prose,
             ) => WeavePreset::AutomaticProseV2,
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Verse,
             ) => WeavePreset::AutomaticVerseV2,
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Hybrid,
             ) => {
                 return Err(IpcFailure::new(
@@ -9682,7 +9790,12 @@ impl ValidatedWeavePolicy {
                     false,
                 ));
             }
-            (Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. }, _) => WeavePreset::LoompadV2,
+            (
+                Self::LoompadV2 { .. }
+                | Self::LoompadVisualV3 { .. }
+                | Self::LoompadVisualV4 { .. },
+                _,
+            ) => WeavePreset::LoompadV2,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
@@ -10618,9 +10731,10 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    let mut failed = false;
     if let Err(error) = state.generation_lifecycle.quiesce() {
         eprintln!("Loom could not quiesce generation lifecycle before runtime exit: {error}");
-        return;
+        failed = true;
     }
 
     // Owning `phase` is an application-wide admission barrier. Worker
@@ -10628,9 +10742,13 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
     // cancellation authority are attached, making a detached start
     // impossible at this point in safe code.
     let desktop_workers = state.join_desktop_workers_for_exit();
+    if let Err(error) = tauri::async_runtime::block_on(state.speech_input.shutdown()) {
+        eprintln!("Loom speech teardown: {error}");
+        failed = true;
+    }
     if let Err(error) = state.shutdown_inference() {
         eprintln!("Loom inference teardown: {}", error.message);
-        return;
+        failed = true;
     }
     let _model_lifecycle = state
         .model_lifecycle
@@ -10642,12 +10760,17 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let native_runtime = state.native_runtime.shutdown_for_process_exit();
     *model_registry = ModelRegistry::Empty;
-    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
-    let joined = proof.joined_worker_count();
     if let Err(error) = state.generation_lifecycle.close() {
         eprintln!("Loom generation lifecycle did not close before runtime exit: {error}");
+        failed = true;
+    }
+    if failed {
+        // Physical drains still ran. Do not turn their completion into a
+        // successful authorization after any independent finalizer failed.
         return;
     }
+    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
+    let joined = proof.joined_worker_count();
     *phase = ApplicationPhase::ExitAuthorized;
     state.exit_authorized.store(true, Ordering::Release);
     eprintln!("Loom joined {joined} owned worker(s) before unpreventable runtime exit");
@@ -14212,6 +14335,10 @@ mod tests {
                 "loompad_visual_v3",
                 llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4,
             ),
+            (
+                "loompad_visual_v4",
+                llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5,
+            ),
         ] {
             for target in [4, 16, 64, 256] {
                 let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
@@ -14384,6 +14511,10 @@ mod tests {
                 "automatic_visual_v4",
                 ValidatedWeavePolicy::AutomaticVisualV4,
             ),
+            (
+                "automatic_visual_v5",
+                ValidatedWeavePolicy::AutomaticVisualV5,
+            ),
         ] {
             let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
                 "kind": kind
@@ -14406,6 +14537,10 @@ mod tests {
             Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
         );
         assert_eq!(
+            ValidatedWeavePolicy::AutomaticVisualV5.first_word_choices(),
+            Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5)
+        );
+        assert_eq!(
             ValidatedWeavePolicy::AutomaticV3.first_word_choices(),
             Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
         );
@@ -14417,6 +14552,7 @@ mod tests {
             ValidatedWeavePolicy::AutomaticV2,
             ValidatedWeavePolicy::AutomaticV3,
             ValidatedWeavePolicy::AutomaticVisualV4,
+            ValidatedWeavePolicy::AutomaticVisualV5,
         ] {
             assert_eq!(
                 policy

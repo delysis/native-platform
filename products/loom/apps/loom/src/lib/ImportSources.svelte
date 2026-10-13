@@ -15,6 +15,7 @@
   export let onOpenFolder: () => Promise<void> = async () => {};
   export let onImported: (items: ContextAttachment[], projectId: string, sessionId: string) => Promise<void>;
   export let onCollectionAdded: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
+  export let onCollectionRetained: (id: string, projectId: string, sessionId: string) => Promise<void> = async () => {};
   export let onOpenCollection: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
   let collection: MaterialEntry | null = null;
   async function publishImported(): Promise<void> {
@@ -51,6 +52,14 @@
     }
     return String(error);
   }
+  function retainedCollectionId(error: unknown): string | null {
+    if (!error || typeof error !== 'object') return null;
+    const value = error as Record<string, unknown>;
+    return typeof value.retained_collection_id === 'string' &&
+      typeof value.retained_collection_state === 'string'
+      ? value.retained_collection_id
+      : null;
+  }
   async function refresh(): Promise<void> {
     try { accounts = await importAccounts(projectId, sessionId); }
     catch (error) { message = errorText(error); }
@@ -59,12 +68,12 @@
 
   async function connect(): Promise<void> {
     operationId = newUlid();
-    busy = true; authorizing = true; message = 'Finish authorization in your browser. This request expires in three minutes.';
+    busy = true; authorizing = true; message = 'Authorizing';
     try {
       const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret, operationId);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
       chosenEmail = result.email ?? ''; configuring = false; report = null;
-      message = `Connected ${result.email}. Choose the sources to add.`;
+      message = `Connected ${result.email}`;
     } catch (error) { message = errorText(error); }
     finally { clientSecret = ''; busy = false; authorizing = false; operationId = ''; }
   }
@@ -73,20 +82,27 @@
     try {
       await disconnectImportAccount(projectId, sessionId, service, account ?? '');
       await refresh(); report = null;
-      message = 'Connection removed from this device. Imported files remain in the project. You can also revoke Loom in your Google account settings.';
+      message = 'Disconnected';
     } catch (error) { message = errorText(error); }
     finally { busy = false; }
   }
   async function addConnectedCollection(): Promise<void> {
     if (!canAddCollection || !selectedScope || !account || busy) return;
     const scope = { projectId, sessionId };
-    busy = true; message = 'Adding collection…';
+    busy = true; message = 'Adding';
     let added: MaterialEntry | null = null;
     try {
       added = await addCollection(scope.projectId, scope.sessionId, collectionName.trim(), selectedScope, account);
       await refreshCollection(scope.projectId, scope.sessionId, added.id, 'fresh');
       message = '';
-    } catch (error) { message = errorText(error); }
+    } catch (error) {
+      message = errorText(error);
+      const retained = retainedCollectionId(error);
+      if (retained) {
+        collectionName = '';
+        await onCollectionRetained(retained, scope.projectId, scope.sessionId);
+      }
+    }
     finally {
       if (added) {
         collection = added;
@@ -112,7 +128,7 @@
       return;
     }
     operationId = newUlid();
-    busy = true; message = 'Reading local sources…';
+    busy = true; message = 'Reading';
     try {
       const imported = await chooseWorkspaceSources(projectId, sessionId, operationId);
       if (imported.workspace_id !== projectId || imported.workspace_session_id !== sessionId || imported.operation_id !== operationId) throw new Error('The source import belongs to a different workspace.');
@@ -125,7 +141,7 @@
   }
   async function web(): Promise<void> {
     operationId = newUlid();
-    busy = true; message = 'Importing the public web document…';
+    busy = true; message = 'Importing';
     try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); unboundSources = new Set(); await publishImported(); message = report.failures.length ? `${report.imported.length} retained; ${report.failures.length} failed or skipped.` : 'Source added.'; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
@@ -183,20 +199,20 @@
       {#each availableAccounts as item}<option value={item.email ?? ''}>{item.email}</option>{/each}
     </select></label>
     <button disabled={busy} aria-label="Connect another account" title="Connect another account" on:click={() => configuring = true}>Connect</button>
-    {#if account}<p>Connected: {account} <button disabled={busy} on:click={() => void disconnect()}>Disconnect</button></p>{/if}
+    {#if account}<p>{account} <button disabled={busy} title="Remove this device's connection; imported files remain. You can also revoke Loom in your Google account settings." on:click={() => void disconnect()}>Disconnect</button></p>{/if}
     <label>Name <input bind:value={collectionName} maxlength="160" disabled={busy} placeholder="Research" /></label>
-    <label>{source === 'drive' ? 'Drive folder ID' : 'Gmail search'}
-      <input bind:value={query} maxlength="2048" disabled={busy} placeholder={source === 'drive' ? 'Folder ID' : 'label:Research newer_than:30d'} />
+    <label title={source === 'drive' ? 'Drive folder ID' : 'Gmail search'}>{source === 'drive' ? 'Folder' : 'Search'}
+      <input aria-label={source === 'drive' ? 'Drive folder ID' : 'Gmail search'} bind:value={query} maxlength="2048" disabled={busy} placeholder={source === 'drive' ? 'Folder ID' : 'label:Research newer_than:30d'} />
     </label>
     <button disabled={busy || !canAddCollection} aria-label="Add collection" title="Add collection" on:click={() => void addConnectedCollection()}>Add</button>
   {:else}
     <label title="Google Desktop app OAuth client ID">Client <input aria-label="Client ID" bind:value={clientId} disabled={busy} autocomplete="off" maxlength="512" /></label>
     <label>Secret <input aria-label="Client secret" type="password" bind:value={clientSecret} disabled={busy} autocomplete="off" maxlength="1024" /></label>
     {#if configuring}<button disabled={busy} aria-label="Back to accounts" title="Back to accounts" on:click={() => configuring = false}>Back</button>{/if}
-    <button disabled={busy || !clientId.trim()} aria-label={`Connect ${service === 'drive' ? 'Drive' : 'Gmail'}`} title="Connect a Google Desktop app OAuth client with read-only access; credentials stay in the system credential store" on:click={() => void connect()}>Connect</button>
+    <button disabled={busy || !clientId.trim()} aria-label={`Connect ${service === 'drive' ? 'Drive' : 'Gmail'}`} title="Connect a Google Desktop app OAuth client with read-only access; credentials stay in the system credential store. Finish authorization in your browser within three minutes." on:click={() => void connect()}>Connect</button>
   {/if}
   {/if}
-  {#if busy && operationId}<button on:click={() => { void cancelWorkspaceSourceImport(projectId, sessionId, operationId).then(() => { message = "Stopping… Completed sources remain available."; }).catch((error) => message = errorText(error)); }}>{authorizing ? "Cancel connection" : "Stop import"}</button>{/if}
+  {#if busy && operationId}<button aria-label={authorizing ? 'Cancel connection' : 'Stop import'} title={authorizing ? 'Cancel browser authorization' : 'Stop import; completed sources remain available'} on:click={() => { void cancelWorkspaceSourceImport(projectId, sessionId, operationId).then(() => { message = 'Stopping'; }).catch((error) => message = errorText(error)); }}>{authorizing ? 'Cancel' : 'Stop'}</button>{/if}
   <p role="status">{message}</p>
   {#if report}
     <div class="results">

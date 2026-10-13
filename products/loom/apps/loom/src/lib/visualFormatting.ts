@@ -241,7 +241,7 @@ function listCommand(state: EditorState, ordered: boolean): Command {
   return withVisibleTextSelectionResult(command);
 }
 
-export function visualFormatCommand(
+function visualFormatCommand(
   state: EditorState,
   action: VisualFormatAction,
   href = ''

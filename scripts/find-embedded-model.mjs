@@ -21,9 +21,14 @@ const modelExtensions = new Set([
 ]);
 const ggufMagic = Buffer.from("GGUF");
 
-function hasGgufMagic(file) {
-  const descriptor = fs.openSync(file, "r");
+function isEmbeddedModel(file, extension) {
+  const descriptor = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
+  );
   try {
+    if (!fs.fstatSync(descriptor).isFile()) return false;
+    if (modelExtensions.has(extension)) return true;
     const header = Buffer.alloc(ggufMagic.length);
     return fs.readSync(descriptor, header, 0, header.length, 0) === header.length &&
       header.equals(ggufMagic);
@@ -49,7 +54,7 @@ function findModel(directory) {
     // Application bundles legitimately contain framework symlinks. Do not
     // follow them outside the bundle or inspect the same payload twice.
     if (!entry.isFile()) continue;
-    if (modelExtensions.has(extension) || hasGgufMagic(candidate)) return candidate;
+    if (isEmbeddedModel(candidate, extension)) return candidate;
   }
   return null;
 }

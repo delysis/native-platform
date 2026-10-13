@@ -19,7 +19,7 @@ function main() {
   // All heads must already exist locally. A missing head is not silently
   // omitted. This tool does not contact GitHub or rewrite the source refs.
   for (const sha of Object.values(HEADS)) check(git(source, ['rev-parse', `${sha}^{commit}`]).trim() === sha, `missing preserved head ${sha}`);
-  exclusiveDirectory(out);
+  exclusiveDirectory(out, source);
   const bare = path.join(out, 'easl-research.git');
   git(source, ['init', '--bare', bare]);
   const preservation = [];

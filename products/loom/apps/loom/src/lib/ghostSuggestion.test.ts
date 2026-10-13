@@ -155,7 +155,6 @@ describe('selectVerifiedGhostSuggestion', () => {
       branches: [hydrated.branch],
       verifiedBodyByRun: {},
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 9
     };
     expect(selectVerifiedGhostSuggestion(waiting)).toBeNull();
@@ -177,7 +176,6 @@ describe('selectVerifiedGhostSuggestion', () => {
       branches: [hydrated.branch],
       verifiedBodyByRun: { 'run-1': hydrated.body },
       dismissedCandidateIds: [] as string[],
-      unpresentablePresentationKeys: [] as string[],
       targetByte: 9
     };
     expect(selectVerifiedGhostSuggestion({ ...selection, targetByte: 8 })).toBeNull();
@@ -188,7 +186,7 @@ describe('selectVerifiedGhostSuggestion', () => {
     expect(selectVerifiedGhostSuggestion({ ...selection, active: false })).toBeNull();
   });
 
-  it('keeps degenerate model loops in provenance without presenting them', async () => {
+  it('does not score a completed generation after sampling', async () => {
     const loop = ` She ${'her '.repeat(24)}`;
     const hydrated = await hydratedBranch({ text: loop });
     expect(selectVerifiedGhostSuggestion({
@@ -196,12 +194,11 @@ describe('selectVerifiedGhostSuggestion', () => {
       branches: [hydrated.branch],
       verifiedBodyByRun: { 'run-1': hydrated.body },
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 9
-    })).toBeNull();
+    })).toMatchObject({ candidateId: 'candidate-1', text: loop });
   });
 
-  it('skips a hydrated c630-shaped loop and selects the next exact branch', async () => {
+  it('keeps branch order instead of shopping for a preferred generation', async () => {
     const loop = ` ${'Be'.repeat(180)}[image]\n\nS`;
     const clean = ' Beyond the wet glass, a bicycle bell answered.';
     const loopHydrated = await hydratedBranch({ text: loop });
@@ -220,19 +217,18 @@ describe('selectVerifiedGhostSuggestion', () => {
         'run-2': cleanHydrated.body
       },
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 9
     })).toEqual({
-      candidateId: 'candidate-2',
-      presentationKey: `candidate-2:${cleanHydrated.body.blobId}`,
+      candidateId: 'candidate-1',
+      presentationKey: `candidate-1:${loopHydrated.body.blobId}`,
       targetByte: 9,
-      text: clean
+      text: loop
     });
     expect(loopHydrated.branch.text).toBe(loop);
     expect(loopHydrated.branch.output_blob_id).toBe(loopHydrated.body.blobId);
   });
 
-  it('types a fully hydrated rejected family as exhausted instead of ready', async () => {
+  it('makes the first hydrated generation available without content scoring', async () => {
     const repeatedUpper = `\.\n\n${'The platform smelled of wet iron. '.repeat(18)}`.trimEnd();
     const repeatedLower = `\.\n\n${'the platform smelled of wet iron.\n\n'.repeat(16)}`.trimEnd();
     const hydrated = await Promise.all([
@@ -262,16 +258,11 @@ describe('selectVerifiedGhostSuggestion', () => {
         'run-period': hydrated[2].body
       },
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 9
     });
-    expect(disposition).toEqual({
-      kind: 'exhausted',
-      candidates: [
-        { candidateId: 'candidate-upper', reason: 'repetition' },
-        { candidateId: 'candidate-lower', reason: 'repetition' },
-        { candidateId: 'candidate-period', reason: 'too_short' }
-      ]
+    expect(disposition).toMatchObject({
+      kind: 'available',
+      suggestion: { candidateId: 'candidate-upper', text: repeatedUpper }
     });
   });
 
@@ -281,57 +272,10 @@ describe('selectVerifiedGhostSuggestion', () => {
       branches: [branch()],
       verifiedBodyByRun: {},
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: 9
     })).toEqual({ kind: 'awaiting_hydration', runIds: ['run-1'] });
   });
 
-  it('keeps presentation compatibility inside the typed disposition', async () => {
-    const incompatible = await hydratedBranch({ text: ' rain\rbreak' });
-    expect(autocompleteDisposition({
-      active: true,
-      branches: [incompatible.branch],
-      verifiedBodyByRun: { 'run-1': incompatible.body },
-      dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
-      targetByte: 9,
-      presentationCompatible: (text) => !text.includes('\r')
-    })).toEqual({
-      kind: 'exhausted',
-      candidates: [{ candidateId: 'candidate-1', reason: 'unpresentable' }]
-    });
-  });
 
-  it('skips a surface-rejected presentation and selects the next exact branch', async () => {
-    const first = await hydratedBranch({
-      run_id: 'run-first',
-      candidate_id: 'candidate-first',
-      text: ' first'
-    });
-    const second = await hydratedBranch({
-      run_id: 'run-second',
-      candidate_id: 'candidate-second',
-      text: ' second'
-    });
 
-    expect(autocompleteDisposition({
-      active: true,
-      branches: [first.branch, second.branch],
-      verifiedBodyByRun: {
-        'run-first': first.body,
-        'run-second': second.body
-      },
-      dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [`candidate-first:${first.body.blobId}`],
-      targetByte: 9
-    })).toEqual({
-      kind: 'available',
-      suggestion: {
-        candidateId: 'candidate-second',
-        presentationKey: `candidate-second:${second.body.blobId}`,
-        targetByte: 9,
-        text: ' second'
-      }
-    });
-  });
 });

@@ -1512,12 +1512,12 @@ fn run() -> Result<()> {
                 path,
                 json,
             } => {
-                let content = match (content, path) {
-                    (Some(content), _) => content,
-                    (None, Some(path)) => std::fs::read_to_string(path)?,
-                    (None, None) => String::new(),
+                let result = match (content, path) {
+                    (Some(content), _) => mom_llama_runtime::conversation_import_json(&content)?,
+                    (None, Some(path)) => mom_llama_runtime::conversation_import_file(&path)?,
+                    (None, None) => mom_llama_runtime::conversation_import_json("")?,
                 };
-                print_result(mom_llama_runtime::conversation_import_json(&content)?, json)
+                print_result(result, json)
             }
         },
         Command::Settings { command } => match command {

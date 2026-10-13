@@ -238,6 +238,11 @@ fn write_profiles(project_root: &Path, store: &CoWriterProfiles) -> Result<(), C
     let sealed = codec.seal(&namespace, &bytes)?;
     let mut file = AtomicWriteFile::options().open(&path)?;
     file.write_all(&sealed)?;
+    #[cfg(test)]
+    if let Some(interrupt) = tests::BEFORE_COMMIT.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
+    codec.validate_root(project_root)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -266,6 +271,11 @@ fn profile_path(project_root: &Path) -> Result<PathBuf, CoWriterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     #[test]
     fn encrypted_co_writer_profiles_preserve_context_without_plaintext() {
@@ -344,5 +354,65 @@ mod tests {
         assert_eq!(second.created_at_unix_ms, 10);
         assert_eq!(second.updated_at_unix_ms, 20);
         assert_eq!(list(project.path()).expect("list profiles").len(), 1);
+    }
+
+    #[test]
+    fn profile_save_refuses_protection_change_after_sealing_without_replacing_prior_bytes() {
+        for protected in [false, true] {
+            let project = tempfile::tempdir().expect("project");
+            fs::create_dir(project.path().join(".loom")).expect("private directory");
+            if protected {
+                desktop_vault::ProjectVault::initialize_with_key(project.path(), [53; 32])
+                    .expect("isolated injected key");
+            }
+            set_document_context_snapshot(project.path(), "source", "First author context.", &[])
+                .expect("initial source");
+            let saved = save_from_document(project.path(), "source", "Voice", 1)
+                .expect("ordinary public save");
+            let path = profile_path(project.path()).expect("profile path");
+            let before = fs::read(&path).expect("retained profile bytes");
+            let header = project.path().join(".loom/vault.json");
+            let original_header = fs::read(&header).ok();
+            set_document_context_snapshot(project.path(), "source", "New author context.", &[])
+                .expect("new source remains independently owned");
+            let changed_header = header.clone();
+            BEFORE_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if protected {
+                        fs::remove_file(changed_header).expect("external header removal");
+                    } else {
+                        fs::write(changed_header, b"external protection header")
+                            .expect("external header addition");
+                    }
+                }));
+            });
+            let result = save_from_document(project.path(), "source", "Voice", 2);
+            let after = fs::read(&path).expect("retained profile remains");
+            match original_header {
+                Some(bytes) => fs::write(&header, bytes).expect("restore exact owned header"),
+                None => fs::remove_file(&header).expect("restore ordinary project"),
+            }
+            assert!(
+                result.is_err(),
+                "changed protection must refuse publication"
+            );
+            assert_eq!(
+                after, before,
+                "rejection must not replace prior ciphertext or plaintext"
+            );
+            assert_eq!(list(project.path()).expect("reopen"), vec![saved.clone()]);
+            assert_eq!(
+                apply_to_document(project.path(), "target", &saved.id)
+                    .expect("old profile")
+                    .markdown,
+                "First author context."
+            );
+            assert_eq!(
+                document_context_snapshot(project.path(), "source")
+                    .expect("new source")
+                    .markdown,
+                "New author context."
+            );
+        }
     }
 }

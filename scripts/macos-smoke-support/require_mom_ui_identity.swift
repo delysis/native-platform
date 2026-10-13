@@ -3,7 +3,7 @@ import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
 let application = AXUIElementCreateApplication(pid)
-let personaPanelWitness = "Use a Persona's menu to start a conversation, edit its profile, or remove it from the library."
+let settingsMenuLabel = "Settings…"
 let legacyMarkers = [
     "Gentle explainer",
     "Warm, plain language",
@@ -86,14 +86,14 @@ repeat {
         fputs("legacy Mom UI text is visible in the exact PID: \(legacy)\n", stderr)
         exit(1)
     }
-    settingsControl = pressableControl(exactLabel: "Settings")
+    settingsControl = pressableControl(exactLabel: settingsMenuLabel)
     if settingsControl != nil { break }
     Thread.sleep(forTimeInterval: 0.1)
 } while Date() < settingsDeadline
 
 guard let settingsControl,
       AXUIElementPerformAction(settingsControl, kAXPressAction as CFString) == .success else {
-    fputs("the exact Mom PID did not expose a pressable Settings control\n", stderr)
+    fputs("the exact Mom PID did not expose its Settings menu command\n", stderr)
     exit(1)
 }
 
@@ -120,7 +120,12 @@ repeat {
         fputs("legacy Mom UI text is visible in the exact PID: \(legacy)\n", stderr)
         exit(1)
     }
-    if containsExactString(personaPanelWitness) {
+    let personaActions = strings.filter {
+        let value = normalized($0)
+        return (value.hasPrefix("edit ") && value.hasSuffix(" persona")) ||
+            value.hasPrefix("actions for ")
+    }
+    if containsExactString("Personas") && !personaActions.isEmpty {
         guard let closeControl = pressableControl(exactLabel: "Close settings"),
               AXUIElementPerformAction(closeControl, kAXPressAction as CFString) == .success else {
             fputs("the exact Mom PID exposed Personas but Settings could not be closed\n", stderr)
@@ -129,19 +134,20 @@ repeat {
         let restoreDeadline = Date().addingTimeInterval(20)
         repeat {
             if pressableControl(exactLabel: "Close settings") == nil,
-               pressableControl(exactLabel: "Settings") != nil {
+               pressableControl(exactLabel: settingsMenuLabel) != nil {
                 break
             }
             Thread.sleep(forTimeInterval: 0.1)
         } while Date() < restoreDeadline
         guard pressableControl(exactLabel: "Close settings") == nil,
-              pressableControl(exactLabel: "Settings") != nil else {
+              pressableControl(exactLabel: settingsMenuLabel) != nil else {
             fputs("the exact Mom PID did not restore the initial chat surface after closing Settings\n", stderr)
             exit(1)
         }
         let evidence: [String: Any] = [
             "pid": pid,
-            "current_marker": personaPanelWitness,
+            "current_marker": personaActions.sorted().first!,
+            "settings_command": settingsMenuLabel,
             "legacy_markers_observed": 0,
             "accessibility_strings_scanned": strings.count
         ]
@@ -152,5 +158,5 @@ repeat {
     Thread.sleep(forTimeInterval: 0.1)
 } while Date() < deadline
 
-fputs("the exact Mom PID did not expose the current Persona-menu accessibility marker\n", stderr)
+fputs("the exact Mom PID did not expose a current Persona action in Settings\n", stderr)
 exit(1)

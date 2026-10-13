@@ -928,12 +928,7 @@ fn start_run<R: Runtime>(
     }
     let media = if !literal && (model.is_some() || remote_target.is_some()) {
         let media = if scope == RunScope::Document {
-            crate::terminal_media::resolve(
-                read_context.documents,
-                &source,
-                &sources,
-                model.as_ref().map_or(2048, resident_context_tokens),
-            )?
+            crate::terminal_media::resolve(read_context.documents, &source, &sources)?
         } else if uses_capture {
             capture_media
         } else {
@@ -1248,7 +1243,7 @@ fn spawn_worker<R: Runtime>(
         start.release();
         let _ = error.worker.join();
         error.owner.shutdown_joined();
-        return Err(error.failure);
+        return Err(*error.failure);
     }
     start.release();
     ticket.detach();

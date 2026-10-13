@@ -176,8 +176,28 @@ pub(crate) async fn collection_add(
     operation.publish_to_store(&state, |store| {
         let current = workspace_template::collection_definitions(store)?;
         workspace_template::upsert_collection(store, current.revision_id, &def)?;
-        storage::save_grant(store, &root, &def, &account_email).map_err(failure)?;
-        materials::resolve(store, &def.id).map_err(Into::into)
+        storage::save_grant(store, &root, &def, &account_email).map_err(|error| {
+            IpcFailure::new(
+                "collection_definition_retained_grant_unconfirmed",
+                format!(
+                    "Collection {} was retained; reconnect it before retrying. {error}",
+                    def.id,
+                ),
+                true,
+            )
+            .with_retained_collection(&def.id, "grant_unconfirmed")
+        })?;
+        materials::resolve(store, &def.id).map_err(|error| {
+            IpcFailure::new(
+                "collection_definition_and_grant_retained_resolution_failed",
+                format!(
+                    "Collection {} and its grant were retained; reopen sources to continue. {error}",
+                    def.id,
+                ),
+                true,
+            )
+            .with_retained_collection(&def.id, "grant_retained_resolution_failed")
+        })
     })
 }
 

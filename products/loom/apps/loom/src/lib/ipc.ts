@@ -99,6 +99,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'audio_synthesize',
   // Peer cancellation can wait for a network reply; ordinary saves keep moving.
   'terminal_cancel',
+  'workspace_pane_cancel',
   'build_model_policy_get',
   'shader_preview',
   'model_catalog_list',
@@ -860,7 +861,8 @@ export interface WeaveStartArgs {
     | { kind: 'automatic_v2' }
     | { kind: 'automatic_v3' }
     | { kind: 'automatic_visual_v4' }
-    | { kind: 'loompad_v2' | 'loompad_visual_v3'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
+    | { kind: 'automatic_visual_v5' }
+    | { kind: 'loompad_v2' | 'loompad_visual_v3' | 'loompad_visual_v4'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
     | {
         kind: 'manual_v2';
         branch_count: number;
@@ -970,6 +972,46 @@ export function listenForFileCommands(
     });
   }
   return listen<FileCommandEvent>('loom://file-command', ({ payload }) => handler(payload));
+}
+
+export function listenForReverseCompletion(handler: () => void): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Completion reversal requires the Loom desktop runtime.'
+    });
+  }
+  return listen('loom://reverse-completion', handler);
+}
+
+let completionReversalArmDesired = false;
+let completionReversalArmApplied = false;
+let completionReversalArmInFlight: Promise<void> | null = null;
+
+async function flushCompletionReversalArm(): Promise<void> {
+  while (true) {
+    const armed = completionReversalArmDesired;
+    await invoke('completion_reversal_arm', { armed });
+    completionReversalArmApplied = armed;
+    if (armed === completionReversalArmDesired) return;
+  }
+}
+
+export function armCompletionReversal(armed: boolean): Promise<void> {
+  if (!isDesktopRuntime()) return Promise.resolve();
+  completionReversalArmDesired = armed;
+  completionReversalArmInFlight ??= flushCompletionReversalArm().finally(() => {
+    completionReversalArmInFlight = null;
+    if (completionReversalArmApplied !== completionReversalArmDesired) {
+      void armCompletionReversal(completionReversalArmDesired);
+    }
+  });
+  return completionReversalArmInFlight;
+}
+
+export function armCompletionCandidate(active: boolean): Promise<void> {
+  if (!isDesktopRuntime()) return Promise.resolve();
+  return invoke('completion_candidate_arm', { active });
 }
 
 export function setFocusMode(

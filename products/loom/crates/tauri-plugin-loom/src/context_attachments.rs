@@ -1629,43 +1629,76 @@ fn cached_preamble(key: &PreambleCacheKey) -> Option<PreambleCacheValue> {
 }
 
 fn cache_preamble(key: PreambleCacheKey, value: PreambleCacheValue) {
-    let value_bytes = preamble_value_bytes(&value);
-    if value_bytes > PREAMBLE_CACHE_BYTES {
-        return;
+    if let Ok(mut cache) = preamble_cache().lock() {
+        cache.insert(key, value);
     }
-    let Ok(mut cache) = preamble_cache().lock() else {
-        return;
-    };
-    if let Some(index) = cache
-        .entries
-        .iter()
-        .position(|(candidate, _)| candidate == &key)
-        && let Some((_, previous)) = cache.entries.remove(index)
-    {
-        cache.retained_bytes = cache
-            .retained_bytes
-            .saturating_sub(preamble_value_bytes(&previous));
-    }
-    while cache.entries.len() >= PREAMBLE_CACHE_ENTRIES
-        || cache.retained_bytes.saturating_add(value_bytes) > PREAMBLE_CACHE_BYTES
-    {
-        let Some((_, evicted)) = cache.entries.pop_front() else {
-            break;
-        };
-        cache.retained_bytes = cache
-            .retained_bytes
-            .saturating_sub(preamble_value_bytes(&evicted));
-    }
-    cache.retained_bytes = cache.retained_bytes.saturating_add(value_bytes);
-    cache.entries.push_back((key, value));
 }
 
-fn preamble_value_bytes(value: &PreambleCacheValue) -> usize {
-    value.text.len().saturating_add(
-        value.excerpts.len().saturating_mul(
-            std::mem::size_of::<ContextExcerptEvidence>() + 3 * Sha256::output_size(),
-        ),
-    )
+impl PreambleCache {
+    fn insert(&mut self, key: PreambleCacheKey, value: PreambleCacheValue) {
+        let value_bytes = preamble_entry_bytes(&key, &value);
+        if value_bytes > PREAMBLE_CACHE_BYTES {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == &key)
+            && let Some((previous_key, previous)) = self.entries.remove(index)
+        {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(preamble_entry_bytes(&previous_key, &previous));
+        }
+        while self.entries.len() >= PREAMBLE_CACHE_ENTRIES
+            || self.retained_bytes.saturating_add(value_bytes) > PREAMBLE_CACHE_BYTES
+        {
+            let Some((evicted_key, evicted)) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(preamble_entry_bytes(&evicted_key, &evicted));
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(value_bytes);
+        self.entries.push_back((key, value));
+    }
+}
+
+/// Retained logical bytes: entry fields, occupied vector slots and owned byte
+/// lengths. This is not allocator/RSS accounting: spare capacity, allocator
+/// overhead, caller clones and manifest parsing are outside this cache budget.
+fn preamble_entry_bytes(key: &PreambleCacheKey, value: &PreambleCacheValue) -> usize {
+    let mut bytes = std::mem::size_of::<(PreambleCacheKey, PreambleCacheValue)>()
+        .saturating_add(key.project_root.as_os_str().as_encoded_bytes().len())
+        .saturating_add(key.manual_text_sha256.as_ref().map_or(0, String::len));
+    for text in [
+        &key.document_id,
+        &key.context_revision,
+        &key.manuscript_query_sha256,
+        &value.text,
+    ] {
+        bytes = bytes.saturating_add(text.len());
+    }
+    for strings in [&key.attachment_ids, &key.attachment_text_fingerprints] {
+        bytes = bytes.saturating_add(strings.len().saturating_mul(std::mem::size_of::<String>()));
+        for text in strings {
+            bytes = bytes.saturating_add(text.len());
+        }
+    }
+    bytes = bytes.saturating_add(
+        value
+            .excerpts
+            .len()
+            .saturating_mul(std::mem::size_of::<ContextExcerptEvidence>()),
+    );
+    for excerpt in &value.excerpts {
+        bytes = bytes
+            .saturating_add(excerpt.attachment_id.len())
+            .saturating_add(excerpt.source_text_sha256.len())
+            .saturating_add(excerpt.excerpt_sha256.len());
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -2513,6 +2546,11 @@ fn install_immutable(
     let namespace = crate::private_sidecar::namespace(project_root, path)?;
     file.write_all(&codec.seal(&namespace, bytes)?)?;
     file.sync_all()?;
+    #[cfg(test)]
+    if let Some(interrupt) = tests::BEFORE_IMMUTABLE_LINK.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
+    codec.validate_root(project_root)?;
     match fs::hard_link(&temp, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2544,6 +2582,11 @@ fn replace_atomically(
     let codec = crate::private_sidecar::PayloadCodec::open(project_root)?;
     let namespace = crate::private_sidecar::namespace(project_root, path)?;
     file.write_all(&codec.seal(&namespace, bytes)?)?;
+    #[cfg(test)]
+    if let Some(interrupt) = tests::BEFORE_CONTEXT_REPLACE.with(|hook| hook.borrow_mut().take()) {
+        interrupt();
+    }
+    codec.validate_root(project_root)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -2569,6 +2612,13 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static BEFORE_IMMUTABLE_LINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_CONTEXT_REPLACE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
     use std::fmt::Write as _;
     use std::io::Cursor;
 
@@ -4119,5 +4169,144 @@ mod tests {
         bytes.extend_from_slice(&2_u32.to_le_bytes());
         bytes.extend_from_slice(&0_i16.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn prepared_cache_accounts_for_complete_logical_entries_on_insert_replace_and_evict() {
+        let key = PreambleCacheKey {
+            project_root: PathBuf::from("owned-project"),
+            document_id: "document".into(),
+            policy: RETRIEVAL_SCHEMA,
+            attachment_ids: vec!["a".repeat(64)],
+            attachment_text_fingerprints: vec!["b".repeat(64)],
+            manual_text_sha256: Some("c".repeat(64)),
+            context_revision: "d".repeat(64),
+            manuscript_query_sha256: "e".repeat(64),
+            retrieval_rebalance_epoch: 0,
+            context_budget: PREAMBLE_CACHE_BYTES,
+        };
+        let value = PreambleCacheValue {
+            text: "ordinary prepared context".into(),
+            excerpts: vec![ContextExcerptEvidence {
+                attachment_id: "a".repeat(64),
+                source_text_sha256: "b".repeat(64),
+                start_byte: 0,
+                end_byte: 1,
+                excerpt_sha256: "f".repeat(64),
+            }],
+        };
+        // Explicit fixture allocation lengths, not the production accounting helper:
+        // five owned key hashes, two String vector slots, three hex excerpt hashes.
+        let fixed = std::mem::size_of::<(PreambleCacheKey, PreambleCacheValue)>()
+            + key.project_root.as_os_str().as_encoded_bytes().len()
+            + "document".len()
+            + 5 * 64
+            + 2 * std::mem::size_of::<String>()
+            + std::mem::size_of::<ContextExcerptEvidence>()
+            + 3 * 64;
+        let mut cache = PreambleCache::default();
+        cache.insert(key.clone(), value.clone());
+        assert_eq!(cache.retained_bytes, fixed + value.text.len());
+        assert_eq!(cache.entries.len(), 1);
+
+        let mut exact = value.clone();
+        exact.text = "x".repeat(PREAMBLE_CACHE_BYTES - fixed);
+        cache.insert(key.clone(), exact.clone());
+        assert_eq!(cache.retained_bytes, PREAMBLE_CACHE_BYTES);
+        assert_eq!(cache.entries.len(), 1);
+        let mut too_large = exact;
+        too_large.text.push('x');
+        cache.insert(key.clone(), too_large);
+        assert_eq!(cache.retained_bytes, PREAMBLE_CACHE_BYTES);
+        assert_eq!(
+            cache.entries[0].1.text.len(),
+            PREAMBLE_CACHE_BYTES - fixed,
+            "over-budget replacement must leave the previously cached entry intact"
+        );
+
+        let mut second = key.clone();
+        second.document_id = "next-doc".into(); // same owned length, different identity
+        cache.insert(second.clone(), value.clone());
+        assert_eq!(cache.entries.len(), 1, "the full old entry must be evicted");
+        assert_eq!(cache.entries[0].0, second);
+        assert_eq!(cache.retained_bytes, fixed + value.text.len());
+        cache.insert(key, value.clone());
+        assert_eq!(cache.retained_bytes, 2 * (fixed + value.text.len()));
+        for index in 0..PREAMBLE_CACHE_ENTRIES {
+            let mut another = second.clone();
+            another.document_id = format!("doc-{index:04}"); // eight bytes
+            cache.insert(another, value.clone());
+        }
+        assert_eq!(cache.entries.len(), PREAMBLE_CACHE_ENTRIES);
+        assert_eq!(
+            cache.retained_bytes,
+            PREAMBLE_CACHE_ENTRIES * (fixed + value.text.len())
+        );
+    }
+
+    #[test]
+    fn context_publication_rechecks_protection_for_replacement_and_immutable_receipts() {
+        for protected in [false, true] {
+            for immutable in [false, true] {
+                let project = tempfile::tempdir().expect("isolated project");
+                fs::create_dir(project.path().join(".loom")).unwrap();
+                if protected {
+                    desktop_vault::ProjectVault::initialize_with_key(project.path(), [59; 32])
+                        .expect("explicit test key, no system keychain");
+                }
+                set_document_context_snapshot(
+                    project.path(),
+                    "doc",
+                    "Original author context",
+                    &[],
+                )
+                .expect("ordinary context publication");
+                let original_receipt = serde_json::json!({"source": "ordinary retained origin"});
+                let original_id = record_import_origin(project.path(), &original_receipt)
+                    .expect("ordinary immutable publication");
+                let path = attachment_root(project.path())
+                    .unwrap()
+                    .join("document-context.json");
+                let before = fs::read(&path).unwrap();
+                let header = project.path().join(".loom/vault.json");
+                let original_header = fs::read(&header).ok();
+                let changed = header.clone();
+                let interrupt: Box<dyn FnOnce()> = Box::new(move || {
+                    if protected {
+                        fs::remove_file(changed).unwrap();
+                    } else {
+                        fs::write(changed, b"changed protection").unwrap();
+                    }
+                });
+                let refused = if immutable {
+                    BEFORE_IMMUTABLE_LINK.with(|hook| *hook.borrow_mut() = Some(interrupt));
+                    record_import_origin(
+                        project.path(),
+                        &serde_json::json!({"source": "new origin"}),
+                    )
+                    .is_err()
+                } else {
+                    BEFORE_CONTEXT_REPLACE.with(|hook| *hook.borrow_mut() = Some(interrupt));
+                    set_document_context_snapshot(project.path(), "doc", "Replacement", &[])
+                        .is_err()
+                };
+                match original_header {
+                    Some(bytes) => fs::write(&header, bytes).unwrap(),
+                    None => fs::remove_file(&header).unwrap(),
+                }
+                assert!(refused, "changed protection cannot authorize a publication");
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(
+                    document_context_snapshot(project.path(), "doc")
+                        .unwrap()
+                        .markdown,
+                    "Original author context"
+                );
+                assert_eq!(
+                    read_import_origin(project.path(), &original_id).unwrap(),
+                    original_receipt
+                );
+            }
+        }
     }
 }

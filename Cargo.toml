@@ -5,10 +5,6 @@ members = [
     "crates/operation-lifecycle",
     "crates/desktop-vault",
     "crates/desktop-generation-policy",
-    "products/loom/crates/loom-config",
-    "products/loom/crates/loom-markdown",
-    "products/loom/crates/loom-text-session",
-    "products/loom/experiments/easl-interface",
     "crates/services/archive-friends",
 
     "crates/desktop-launch",
@@ -58,6 +54,7 @@ members = [
     "products/loom/crates/loom-cli",
     "products/loom/crates/loom-document",
     "products/loom/crates/loom-host",
+    "products/loom/crates/loom-macos-shortcut",
     "products/loom/crates/loom-store",
     "products/loom/crates/loom-signal-protocol",
     "products/loom/crates/loom-types",
@@ -84,7 +81,6 @@ desktop-vault = { path = "crates/desktop-vault" }
 desktop-speech = { path = "crates/desktop-speech" }
 desktop-generation-policy = { path = "crates/desktop-generation-policy" }
 operation-lifecycle = { path = "crates/operation-lifecycle" }
-loom-config = { path = "products/loom/crates/loom-config" }
 desktop-launch = { path = "crates/desktop-launch" }
 workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
@@ -219,9 +215,6 @@ strip = "symbols"
 strip = "none"
 
 [patch.crates-io]
-# EASL owns these text-engine repairs; keep all consumers on its exact revision.
-harfrust = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
-parley = { git = "https://github.com/delysis/easl.git", rev = "6d7c913a5b8d6874ab56f5168d222dc95964afb9" }
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }
 # Keep verified ONNX Runtime DLLs beside Windows test/example executables.

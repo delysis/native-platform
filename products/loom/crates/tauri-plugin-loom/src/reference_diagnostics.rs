@@ -18,10 +18,8 @@ pub(super) struct ReferenceDiagnostic {
 
 fn diagnose(
     context: material_context::ReadContext<'_>,
-    text: &str,
-) -> Result<Vec<ReferenceDiagnostic>, IpcFailure> {
-    let references = loom_document::document_references(text)
-        .map_err(|error| IpcFailure::new("document_reference_invalid", error.to_string(), false))?;
+    references: Vec<loom_document::DocumentReference>,
+) -> Vec<ReferenceDiagnostic> {
     let mut checked = HashMap::new();
     let mut diagnostics = Vec::new();
     for reference in references {
@@ -46,7 +44,7 @@ fn diagnose(
             });
         }
     }
-    Ok(diagnostics)
+    diagnostics
 }
 
 #[tauri::command]
@@ -79,7 +77,7 @@ pub(super) async fn document_reference_diagnostics(
         &owner.session_id.to_string(),
     )?
     .with_mounted(&mounted);
-    diagnose(context, &text)
+    Ok(diagnose(context, references))
 }
 
 #[cfg(all(test, unix))]
@@ -95,7 +93,10 @@ mod tests {
         std::fs::write(root.path().join("b/Notes.md"), "Two").unwrap();
         let store = loom_store::ProjectStore::open_folder(root.path()).unwrap();
         let text = "🌒 @Missing @Notes @\"a/Notes.md\"\n\n> @Quoted\n\n`@Code`\n\n@Missing";
-        let diagnostics = diagnose((&store).into(), text).unwrap();
+        let diagnostics = diagnose(
+            (&store).into(),
+            loom_document::document_references(text).unwrap(),
+        );
         let marked: Vec<_> = diagnostics
             .iter()
             .map(|item| &text[item.start..item.end])

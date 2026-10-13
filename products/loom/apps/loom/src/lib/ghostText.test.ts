@@ -9,6 +9,7 @@ import {
   exactMarkdownByteOffsetAtSelection,
   visualCaretBoundaryProof,
   ghostTextPluginKey,
+  ghostRollbackTextIsExactAtSelection,
   planGhostText,
   renderedGhostPresentationKey,
   setCompletionOptionAccessibility,
@@ -16,9 +17,8 @@ import {
   setGhostText,
   VISUAL_TAB_INDENT,
   visualGhostInsertionIsVisible,
+  visualGhostTextInsertionTransaction,
   visualGhostTextIsFaithfulAtSelection,
-  visualGhostTextMayBePlainProse,
-  visualGhostTextSafePrefix,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -323,6 +323,25 @@ describe('visual ghost widget', () => {
     expect(modifierStates).toEqual([true, false]);
   });
 
+  it('proves rollback bytes only at the live collapsed caret', () => {
+    const doc = defaultMarkdownParser.parse('A one waits');
+    const exact = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, 6)
+    });
+    const plan = { unconsumeText: ' one' };
+
+    expect(ghostRollbackTextIsExactAtSelection(exact, plan)).toBe(true);
+    expect(ghostRollbackTextIsExactAtSelection(
+      exact.apply(exact.tr.setSelection(TextSelection.create(doc, 5))),
+      plan
+    )).toBe(false);
+    expect(ghostRollbackTextIsExactAtSelection(
+      exact.apply(exact.tr.setSelection(TextSelection.create(doc, 2, 6))),
+      plan
+    )).toBe(false);
+  });
+
   it('keeps Option held while an exact hidden rollback restores the fan family', () => {
     const modifierStates: boolean[] = [];
     const unconsumed: string[] = [];
@@ -405,6 +424,7 @@ describe('visual ghost widget', () => {
       kind: 'set',
       presentation: {
         ...suggestion,
+        anchorByteOffset: 7,
         text: ' for rain.',
         fanVisible: true,
         alternatives: [
@@ -543,6 +563,15 @@ describe('visual ghost visibility authority', () => {
 });
 
 describe('exact visual caret to Markdown boundary', () => {
+  it('uses explicit current typing marks rather than resetting their affinity', () => {
+    const plain = stateAtEnd('hello');
+    const boldTyping = plain.apply(plain.tr.addStoredMark(plain.schema.marks.strong.create()));
+    expect(visualCaretBoundaryProof(boldTyping, 'hello').failure).toBe('canonical_mismatch');
+    const bold = stateAtEnd('**bold**');
+    const plainTyping = bold.apply(bold.tr.setStoredMarks([]));
+    expect(exactMarkdownByteOffsetAtSelection(plainTyping, '**bold**')).toBe(8);
+  });
+
   function boundary(markdown: string, position: number): number | null {
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({
@@ -636,17 +665,16 @@ describe('exact visual caret to Markdown boundary', () => {
   });
 });
 
-describe('faithful visual ghost projection', () => {
+describe('visual ghost projection', () => {
   function stateAt(markdown: string, position: number): EditorState {
     const doc = defaultMarkdownParser.parse(markdown);
     return EditorState.create({ doc, selection: TextSelection.create(doc, position) });
   }
 
-  it('admits literal inline prose only when promoted Markdown has the same document', () => {
+  it('projects literal inline prose at the exact document boundary', () => {
     const markdown = 'The rain waits.';
     const state = stateAt(markdown, Selection.atEnd(defaultMarkdownParser.parse(markdown)).from);
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBePlainProse(' for morning.')).toBe(true);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -669,27 +697,21 @@ describe('faithful visual ghost projection', () => {
     )).toBe(true);
   });
 
-  it('rejects multiline block structure, Markdown controls, and the wrong anchor', () => {
+  it('renders and inserts inline Markdown while retaining exact anchor authority', () => {
     const markdown = 'The rain waits.';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBePlainProse(' **boldly**')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\nMorning came.\n\nThe bells answered.')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\n# Morning came.')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\n- Morning came.')).toBe(false);
-    expect(visualGhostTextIsFaithfulAtSelection(
-      state,
-      markdown,
-      anchor,
-      '\n\nMorning came.\n\nThe bells answered.'
-    )).toBe(false);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
       anchor,
       ' **boldly**'
-    )).toBe(false);
+    )).toBe(true);
+    const insertion = visualGhostTextInsertionTransaction(state, anchor, ' **boldly**');
+    expect(insertion).not.toBeNull();
+    expect(defaultMarkdownSerializer.serialize(insertion!.doc)).toBe(`${markdown} **boldly**`);
+    expect(insertion!.doc.lastChild?.lastChild?.marks.map(mark => mark.type.name)).toContain('strong');
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -698,46 +720,15 @@ describe('faithful visual ghost projection', () => {
     )).toBe(false);
   });
 
-  it('surfaces the useful prose prefix when a completion later wanders into markup', () => {
-    expect(visualGhostTextSafePrefix(' The door opened.\n# Notes')).toBe(' The door opened.');
-    expect(visualGhostTextSafePrefix(' The door opened.\n\nMorning came.'))
-      .toBe(' The door opened.');
-    expect(visualGhostTextSafePrefix(' She waited **boldly**')).toBe(' She waited');
-    expect(visualGhostTextSafePrefix(' **boldly**')).toBeNull();
-    expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');
-  });
-
-  it('keeps numeric punctuation literal at a proven prose caret without admitting a list at block start', () => {
+  it('keeps numeric punctuation literal at a proven prose caret', () => {
     const text = '3. 5-meter-long desk. The office was empty.';
     const markdown = 'The lantern lit the ';
     const doc = parseVisualMarkdown(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
-    expect(visualGhostTextSafePrefix(text)).toBe(text);
     expect(visualGhostTextIsFaithfulAtSelection(state, markdown, markdown.length, text)).toBe(true);
-    const empty = parseVisualMarkdown('');
-    expect(visualGhostTextIsFaithfulAtSelection(
-      EditorState.create({ doc: empty, selection: Selection.atEnd(empty) }), '', 0, text
-    )).toBe(false);
   });
 
-  it('never salvages prose from a markup-led stored candidate', () => {
-    for (const observed of [
-      '<strong>I’m going to college</strong> moreover prose follows.',
-      '  </em> prose follows.',
-      '<x-card/> prose follows.',
-      '<strong class="lead"',
-      '<!-- model comment',
-      '<!DOCTYPE html>',
-      '<?xml version="1.0"?>'
-    ]) {
-      expect(visualGhostTextMayBePlainProse(observed), observed).toBe(false);
-      expect(visualGhostTextSafePrefix(observed), observed).toBeNull();
-    }
-    expect(visualGhostTextSafePrefix('<3 forever')).toBe('<3 forever');
-    expect(visualGhostTextSafePrefix('< word')).toBe('< word');
-  });
-
-  it('rejects candidate edges that join a human grapheme', () => {
+  it('lets ProseMirror render candidate edges that join a human grapheme', () => {
     const cases = [
       { markdown: 'e', text: '\u0301 morning' },
       { markdown: '👩', text: '\u200d👩 together' },
@@ -747,24 +738,22 @@ describe('faithful visual ghost projection', () => {
       const doc = defaultMarkdownParser.parse(markdown);
       const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
       const anchor = new TextEncoder().encode(markdown).byteLength;
-      expect(visualGhostTextMayBePlainProse(text)).toBe(true);
       expect(visualGhostTextIsFaithfulAtSelection(
         state,
         markdown,
         anchor,
         text
-      )).toBe(false);
+      )).toBe(true);
     }
   });
 
-  it('rejects a candidate whose trailing regional indicator joins the suffix', () => {
+  it('lets ProseMirror render a candidate whose trailing regional indicator joins the suffix', () => {
     const markdown = 'A 🇳 waits';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
     const anchor = new TextEncoder().encode('A ').byteLength;
     const text = '🇺';
-    expect(visualGhostTextMayBePlainProse(text)).toBe(true);
-    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(false);
+    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(true);
   });
 });
 

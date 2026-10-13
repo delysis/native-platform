@@ -3,13 +3,33 @@ import './consolidation-release.test.mjs';
 import './consolidation-head-review.test.mjs';
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import fs, { readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { exclusiveDirectory } from '../consolidation/stack-lib.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = relative => readFileSync(path.join(root, relative), 'utf8');
+
+test('fresh consolidation output cannot materialize through a parent alias into source', (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'consolidation-output-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const source = path.join(temporary, 'source');
+  const outside = path.join(temporary, 'outside');
+  fs.mkdirSync(source);
+  fs.mkdirSync(outside);
+  const alias = path.join(outside, 'source-alias');
+  fs.symlinkSync(source, alias, 'dir');
+  assert.throws(
+    () => exclusiveDirectory(path.join(alias, 'new-output'), source),
+    /materialize outside source/u,
+  );
+  const output = path.join(outside, 'new-output');
+  exclusiveDirectory(output, source);
+  assert.equal(fs.realpathSync(output), path.join(fs.realpathSync(outside), 'new-output'));
+});
 
 test('one executable selects existing owners without a subprocess shim', () => {
   const entry = read('products/loom/apps/loom/src-tauri/src/main.rs');

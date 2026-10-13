@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 51,
+  "expected_test_count": 50,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -259,22 +259,6 @@
       "harness": "libtest"
     },
     {
-      "package": "loom-easl-interface",
-      "selector": "lib",
-      "name": "loom_easl_interface",
-      "kinds": [
-        "lib"
-      ],
-      "src_path": "products/loom/experiments/easl-interface/src/lib.rs",
-      "manifest_path": "products/loom/experiments/easl-interface/Cargo.toml",
-      "platforms": [
-        "linux",
-        "macos",
-        "windows"
-      ],
-      "harness": "libtest"
-    },
-    {
       "package": "desktop-model-discovery",
       "selector": "lib",
       "name": "desktop_model_discovery",
@@ -326,11 +310,6 @@
       "package": "mom-llama-app",
       "src_path": "products/mom/apps/mom-llama/src-tauri/build.rs",
       "sha256": "487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f"
-    },
-    {
-      "package": "loom-easl-interface",
-      "src_path": "products/loom/experiments/easl-interface/build.rs",
-      "sha256": "3690c792cb663b26e4eb4db9d7f4dff3a3314be7d88b60cf3bd59e0786530285"
     }
   ],
   "entries": [
@@ -897,6 +876,23 @@
       ]
     },
     {
+      "test_id": "real_chat_cancellation_emits_one_terminal_after_native_join",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime cancellation test cannot promote visible GUI, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
       "test_id": "real_four_persona_group_cancels_one_target_without_touching_sources",
       "package": "mom-llama-runtime",
       "target": "test:runtime",
@@ -1111,38 +1107,6 @@
       ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test cannot promote peer/network, product, packaged-app, cross-platform, or release readiness.",
-      "platforms": [
-        "linux",
-        "macos",
-        "windows"
-      ]
-    },
-    {
-      "test_id": "renderer::tests::render_appearance_review",
-      "package": "loom-easl-interface",
-      "target": "lib",
-      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
-      "prerequisite": "requires an isolated EASL_REVIEW_DIRECTORY and local system fonts",
-      "required_environment": [
-        "EASL_REVIEW_DIRECTORY"
-      ],
-      "evidence_class": "synthetic-native-rendering",
-      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
-      "platforms": [
-        "linux",
-        "macos",
-        "windows"
-      ]
-    },
-    {
-      "test_id": "renderer::tests::profile_native_view",
-      "package": "loom-easl-interface",
-      "target": "lib",
-      "source": "products/loom/experiments/easl-interface/src/renderer.rs",
-      "prerequisite": "manual optimized native renderer timing with local system fonts",
-      "required_environment": [],
-      "evidence_class": "synthetic-native-performance",
-      "promotion_prohibition": "Passing these synthetic rendering checks cannot promote current interface parity, native interaction, operating-system input, or release acceptance.",
       "platforms": [
         "linux",
         "macos",

@@ -2,10 +2,11 @@ use crate::config::resolve_settings;
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use llama_native_types::SamplingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -591,23 +592,29 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
 }
 
 pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let now = now_ms().to_string();
     let settings = resolve_settings()?;
-    let id = Uuid::new_v4().to_string();
-    let conversation = new_conversation(title, &settings, id, now)?;
-    db.selected_conversation_id = Some(conversation.id.clone());
-    db.conversations.insert(0, conversation.clone());
-    let path = save_db(&db)?;
-    Ok(CommandResult::passed(
-        "mom_llama.conversation_new",
-        "contracted",
-        conversation,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let now = now_ms().to_string();
+            let id = Uuid::new_v4().to_string();
+            let conversation = new_conversation(title, &settings, id, now)?;
+            db.selected_conversation_id = Some(conversation.id.clone());
+            db.conversations.insert(0, conversation.clone());
+            Ok(CommandResult::passed(
+                "mom_llama.conversation_new",
+                "contracted",
+                conversation,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 fn new_conversation(
@@ -805,35 +812,62 @@ pub fn conversation_system_message_update(
     id: &str,
     system_message: Option<String>,
 ) -> Result<CommandResult<Conversation>> {
-    let (db, mut conversation) = get_or_create_conversation(id)?;
-    let system_message = system_message
-        .map(|message| message.trim().to_string())
-        .filter(|message| !message.is_empty());
-    if conversation.execution_profile.system_message == system_message {
-        return Ok(CommandResult::passed(
-            "mom_llama.conversation_system_message_update",
-            "contracted",
-            project_conversation(&conversation)?,
-            Vec::new(),
-            vec!["conversation instructions unchanged".to_string()],
-            false,
-            false,
-        ));
-    }
-    conversation.execution_profile.system_message = system_message;
-    conversation.execution_profile.version =
-        conversation.execution_profile.version.saturating_add(1);
-    conversation.updated_at = now_ms().to_string();
-    let path = upsert_conversation(db, conversation.clone())?;
-    Ok(CommandResult::passed(
-        "mom_llama.conversation_system_message_update",
-        "contracted",
-        project_conversation(&conversation)?,
-        vec![path.display().to_string()],
-        vec!["conversation-scoped instructions; blank inherits the app default".to_string()],
-        false,
-        false,
-    ))
+    get_or_create_conversation(id)?;
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(id, documents)?;
+            let conversation = db
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("conversation was removed before instructions committed")
+                })?;
+            let system_message = system_message
+                .map(|message| message.trim().to_string())
+                .filter(|message| !message.is_empty());
+            if conversation.execution_profile.system_message == system_message {
+                return Ok(CommandResult::passed(
+                    "mom_llama.conversation_system_message_update",
+                    "contracted",
+                    project_conversation(conversation)?,
+                    Vec::new(),
+                    vec!["conversation instructions unchanged".to_string()],
+                    false,
+                    false,
+                ));
+            }
+            conversation.execution_profile.system_message = system_message;
+            conversation.execution_profile.version = conversation
+                .execution_profile
+                .version
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("conversation profile version exhausted"))?;
+            conversation.updated_at = now_ms().to_string();
+            if conversation.kind == ConversationKind::PersonaTemplate {
+                crate::personas::record_persona_versions_from_documents(
+                    &[&*conversation],
+                    documents,
+                )?;
+            }
+            let projected = project_conversation(conversation)?;
+            db.selected_conversation_id = Some(id.to_string());
+            Ok(CommandResult::passed(
+                "mom_llama.conversation_system_message_update",
+                "contracted",
+                projected,
+                vec![store.path().display().to_string()],
+                vec![
+                    "conversation-scoped instructions; blank inherits the app default".to_string(),
+                ],
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutation>> {
@@ -890,51 +924,98 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
     ))
 }
 
+// Encoded import bytes have a separate ceiling from decoded document text.
+const MAX_CONVERSATION_IMPORT_BYTES: u64 = 128 * 1024 * 1024;
+
+pub fn conversation_import_file(path: &Path) -> Result<CommandResult<Conversation>> {
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = options
+        .open(path)
+        .context("could not open conversation import")?;
+    // Bind admission to the opened descriptor, not an earlier picker observation.
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "conversation import must be a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_CONVERSATION_IMPORT_BYTES,
+        "conversation import exceeds the {MAX_CONVERSATION_IMPORT_BYTES}-byte limit"
+    );
+    let mut content = String::new();
+    file.take(MAX_CONVERSATION_IMPORT_BYTES + 1)
+        .read_to_string(&mut content)
+        .context("could not read UTF-8 conversation import")?;
+    // The sentinel also catches growth after metadata admission; never truncate JSON.
+    anyhow::ensure!(
+        content.len() as u64 <= MAX_CONVERSATION_IMPORT_BYTES,
+        "conversation import exceeds the {MAX_CONVERSATION_IMPORT_BYTES}-byte limit"
+    );
+    conversation_import_json(&content)
+}
+
 pub fn conversation_import_json(content: &str) -> Result<CommandResult<Conversation>> {
     let mut imported = serde_json::from_str::<Conversation>(content)?;
-    let mut db = load_db()?;
-    let handle = match crate::personas::validate_imported_conversation_handle(
-        &db,
-        &imported.execution_profile.mention_handle,
-        &imported.title,
-    )? {
-        Ok(handle) => handle,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let handle = match crate::personas::validate_imported_conversation_handle(
+                db,
+                &imported.execution_profile.mention_handle,
+                &imported.title,
+                documents,
+            )? {
+                Ok(handle) => handle,
+                Err(blocker) => {
+                    return Ok(CommandResult::blocked(
+                        "mom_llama.conversation_import",
+                        "stub_blocked",
+                        blocker,
+                    ));
+                }
+            };
+            imported.execution_profile.mention_handle = handle;
+            if imported.execution_profile.model_path.is_none() {
+                imported.execution_profile.model_path = imported.selected_model_path.clone();
+            }
+            if imported.id.trim().is_empty()
+                || db
+                    .conversations
+                    .iter()
+                    .any(|conversation| conversation.id == imported.id)
+            {
+                imported.id = Uuid::new_v4().to_string();
+            }
+            for message in &mut imported.messages {
+                message.conversation_id = imported.id.clone();
+            }
+            imported.updated_at = now_ms().to_string();
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &imported.id,
+                documents,
+            )?;
+            db.selected_conversation_id = Some(imported.id.clone());
+            db.conversations.insert(0, imported.clone());
+            Ok(CommandResult::passed(
                 "mom_llama.conversation_import",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
-    imported.execution_profile.mention_handle = handle;
-    if imported.execution_profile.model_path.is_none() {
-        imported.execution_profile.model_path = imported.selected_model_path.clone();
-    }
-    if imported.id.trim().is_empty()
-        || db
-            .conversations
-            .iter()
-            .any(|conversation| conversation.id == imported.id)
-    {
-        imported.id = Uuid::new_v4().to_string();
-    }
-    for message in &mut imported.messages {
-        message.conversation_id = imported.id.clone();
-    }
-    imported.updated_at = now_ms().to_string();
-    db.selected_conversation_id = Some(imported.id.clone());
-    db.conversations.insert(0, imported.clone());
-    let path = save_db(&db)?;
-    Ok(CommandResult::passed(
-        "mom_llama.conversation_import",
-        "contracted",
-        imported,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+                "contracted",
+                imported,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn conversation_export(
@@ -994,74 +1075,91 @@ pub fn message_edit(
     message_id: &str,
     content: String,
 ) -> Result<CommandResult<Message>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(conversation_not_found(
-            "mom_llama.message_edit",
-            conversation_id,
-        ));
-    };
-    let Some(message) = conversation
-        .messages
-        .iter()
-        .find(|message| message.id == message_id)
-        .cloned()
-    else {
-        return Ok(message_not_found("mom_llama.message_edit", message_id));
-    };
-    if matches!(&message.role, MessageRole::System | MessageRole::Tool) {
-        return Ok(CommandResult::blocked(
-            "mom_llama.message_edit",
-            "stub_blocked",
-            Blocker::new(
-                "message_role_not_editable",
-                format!("{:?} messages cannot be edited.", message.role),
-                vec!["Edit the conversation system message or rerun the tool instead.".to_string()],
-            ),
-        ));
-    }
-    let attribution = message.attribution.clone();
-    let mut edited = message;
-    edited.id = Uuid::new_v4().to_string();
-    edited.content = content;
-    edited.created_at = now_ms().to_string();
-    edited.receipt_id = None;
-    edited.branch_index = None;
-    edited.branch_count = None;
-    conversation.messages.push(edited.clone());
-    conversation.active_leaf_message_id = Some(
-        attribution
-            .as_ref()
-            .and_then(|attribution| {
-                clone_later_attributed_peers(conversation, message_id, &edited.id, attribution)
-            })
-            .unwrap_or_else(|| edited.id.clone()),
-    );
-    conversation.updated_at = now_ms().to_string();
-    if conversation.kind == ConversationKind::PersonaTemplate {
-        conversation.execution_profile.version =
-            conversation.execution_profile.version.saturating_add(1);
-    }
-    let persona_version =
-        (conversation.kind == ConversationKind::PersonaTemplate).then(|| conversation.clone());
-    let path = if let Some(persona) = persona_version {
-        crate::personas::save_persona_with_version(&db, &persona)?
-    } else {
-        save_db(&db)?
-    };
-    Ok(CommandResult::passed(
-        "mom_llama.message_edit",
-        "contracted",
-        edited,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            else {
+                return Ok(conversation_not_found(
+                    "mom_llama.message_edit",
+                    conversation_id,
+                ));
+            };
+            let Some(message) = conversation
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+                .cloned()
+            else {
+                return Ok(message_not_found("mom_llama.message_edit", message_id));
+            };
+            if matches!(&message.role, MessageRole::System | MessageRole::Tool) {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.message_edit",
+                    "stub_blocked",
+                    Blocker::new(
+                        "message_role_not_editable",
+                        format!("{:?} messages cannot be edited.", message.role),
+                        vec![
+                            "Edit the conversation system message or rerun the tool instead."
+                                .to_string(),
+                        ],
+                    ),
+                ));
+            }
+            let attribution = message.attribution.clone();
+            let mut edited = message;
+            edited.id = Uuid::new_v4().to_string();
+            edited.content = content;
+            edited.created_at = now_ms().to_string();
+            edited.receipt_id = None;
+            edited.branch_index = None;
+            edited.branch_count = None;
+            conversation.messages.push(edited.clone());
+            conversation.active_leaf_message_id = Some(
+                attribution
+                    .as_ref()
+                    .and_then(|attribution| {
+                        clone_later_attributed_peers(
+                            conversation,
+                            message_id,
+                            &edited.id,
+                            attribution,
+                        )
+                    })
+                    .unwrap_or_else(|| edited.id.clone()),
+            );
+            conversation.updated_at = now_ms().to_string();
+            if conversation.kind == ConversationKind::PersonaTemplate {
+                conversation.execution_profile.version = conversation
+                    .execution_profile
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Persona version exhausted"))?;
+            }
+            if conversation.kind == ConversationKind::PersonaTemplate {
+                crate::personas::record_persona_versions_from_documents(
+                    &[&*conversation],
+                    documents,
+                )?;
+            }
+            Ok(CommandResult::passed(
+                "mom_llama.message_edit",
+                "contracted",
+                edited,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn message_delete(
@@ -1129,8 +1227,11 @@ pub fn message_delete(
     }
     conversation.updated_at = now_ms().to_string();
     if conversation.kind == ConversationKind::PersonaTemplate {
-        conversation.execution_profile.version =
-            conversation.execution_profile.version.saturating_add(1);
+        conversation.execution_profile.version = conversation
+            .execution_profile
+            .version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Persona version exhausted"))?;
     }
     let path = crate::attachments::persist_conversations_with_attachment_gc(
         &db,
@@ -1192,57 +1293,68 @@ pub fn conversation_fork(
     conversation_id: &str,
     message_id: &str,
 ) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(source) = db
-        .conversations
-        .iter()
-        .find(|conversation| conversation.id == conversation_id)
-        .cloned()
-    else {
-        return Ok(conversation_not_found(
-            "mom_llama.conversation_fork",
-            conversation_id,
-        ));
-    };
-    let active = active_path_messages(&source)?;
-    let Some(index) = active.iter().position(|message| message.id == message_id) else {
-        return Ok(message_not_found("mom_llama.conversation_fork", message_id));
-    };
-    let now = now_ms().to_string();
-    let fork_id = Uuid::new_v4().to_string();
-    let mut messages = active[..=index].to_vec();
-    for message in &mut messages {
-        message.conversation_id = fork_id.clone();
-    }
-    crate::attachments::snapshot_message_attachments(&fork_id, &mut messages)?;
-    let fork = Conversation {
-        id: fork_id.clone(),
-        title: format!("{} fork", source.title),
-        created_at: now.clone(),
-        updated_at: now,
-        kind: ConversationKind::Chat,
-        execution_profile: source.execution_profile,
-        selected_model_path: source.selected_model_path,
-        source_conversation_id: Some(source.id.clone()),
-        source_message_id: Some(message_id.to_string()),
-        branch_root_message_id: Some(message_id.to_string()),
-        active_leaf_message_id: messages.last().map(|message| message.id.clone()),
-        recipient_ids: source.recipient_ids,
-        current_skill_ids: source.current_skill_ids,
-        messages,
-    };
-    db.selected_conversation_id = Some(fork_id);
-    db.conversations.insert(0, fork.clone());
-    let path = save_db(&db)?;
-    Ok(CommandResult::passed(
-        "mom_llama.conversation_fork",
-        "contracted",
-        fork,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let _attachments = crate::attachments::lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(source) = db
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .cloned()
+            else {
+                return Ok(conversation_not_found(
+                    "mom_llama.conversation_fork",
+                    conversation_id,
+                ));
+            };
+            let active = active_path_messages(&source)?;
+            let Some(index) = active.iter().position(|message| message.id == message_id) else {
+                return Ok(message_not_found("mom_llama.conversation_fork", message_id));
+            };
+            let now = now_ms().to_string();
+            let fork_id = Uuid::new_v4().to_string();
+            let mut messages = active[..=index].to_vec();
+            for message in &mut messages {
+                message.conversation_id = fork_id.clone();
+            }
+            crate::attachments::snapshot_message_attachments_from_documents(
+                &fork_id,
+                &mut messages,
+                documents,
+            )?;
+            let fork = Conversation {
+                id: fork_id.clone(),
+                title: format!("{} fork", source.title),
+                created_at: now.clone(),
+                updated_at: now,
+                kind: ConversationKind::Chat,
+                execution_profile: source.execution_profile,
+                selected_model_path: source.selected_model_path,
+                source_conversation_id: Some(source.id.clone()),
+                source_message_id: Some(message_id.to_string()),
+                branch_root_message_id: Some(message_id.to_string()),
+                active_leaf_message_id: messages.last().map(|message| message.id.clone()),
+                recipient_ids: source.recipient_ids,
+                current_skill_ids: source.current_skill_ids,
+                messages,
+            };
+            db.selected_conversation_id = Some(fork_id);
+            db.conversations.insert(0, fork.clone());
+            Ok(CommandResult::passed(
+                "mom_llama.conversation_fork",
+                "contracted",
+                fork,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn message_branches(
@@ -1305,41 +1417,47 @@ pub fn message_branch_select(
     conversation_id: &str,
     message_id: &str,
 ) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(conversation_not_found(
-            "mom_llama.message_branch_select",
-            conversation_id,
-        ));
-    };
-    if !conversation
-        .messages
-        .iter()
-        .any(|message| message.id == message_id)
-    {
-        return Ok(message_not_found(
-            "mom_llama.message_branch_select",
-            message_id,
-        ));
-    }
-    let leaf = preferred_leaf_from(conversation, message_id)?;
-    conversation.active_leaf_message_id = Some(leaf);
-    conversation.updated_at = now_ms().to_string();
-    let projected = project_conversation(conversation)?;
-    let path = save_db(&db)?;
-    Ok(CommandResult::passed(
-        "mom_llama.message_branch_select",
-        "contracted",
-        projected,
-        vec![path.display().to_string()],
-        Vec::new(),
-        false,
-        false,
-    ))
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            else {
+                return Ok(conversation_not_found(
+                    "mom_llama.message_branch_select",
+                    conversation_id,
+                ));
+            };
+            if !conversation
+                .messages
+                .iter()
+                .any(|message| message.id == message_id)
+            {
+                return Ok(message_not_found(
+                    "mom_llama.message_branch_select",
+                    message_id,
+                ));
+            }
+            let leaf = preferred_leaf_from(conversation, message_id)?;
+            conversation.active_leaf_message_id = Some(leaf);
+            conversation.updated_at = now_ms().to_string();
+            let projected = project_conversation(conversation)?;
+            Ok(CommandResult::passed(
+                "mom_llama.message_branch_select",
+                "contracted",
+                projected,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
 }
 
 pub fn conversation_siblings(
@@ -1739,19 +1857,13 @@ pub fn load_db() -> Result<ConversationDb> {
     Ok(store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default())
 }
 
-fn normalize_conversation_model_paths(conversation: &mut Conversation) -> bool {
-    let previous_selected = conversation.selected_model_path.take();
-    let previous_model = conversation.execution_profile.model_path.take();
-    let previous_mmproj = conversation.execution_profile.mmproj_path.take();
-    let selected = crate::config::normalize_optional_path(previous_selected.clone());
-    let model = crate::config::normalize_optional_path(previous_model.clone());
-    let mmproj = crate::config::normalize_optional_path(previous_mmproj.clone());
-    let changed =
-        previous_selected != selected || previous_model != model || previous_mmproj != mmproj;
-    conversation.selected_model_path = selected;
-    conversation.execution_profile.model_path = model;
-    conversation.execution_profile.mmproj_path = mmproj;
-    changed
+fn normalize_conversation_model_paths(conversation: &mut Conversation) {
+    conversation.selected_model_path =
+        crate::config::normalize_optional_path(conversation.selected_model_path.take());
+    conversation.execution_profile.model_path =
+        crate::config::normalize_optional_path(conversation.execution_profile.model_path.take());
+    conversation.execution_profile.mmproj_path =
+        crate::config::normalize_optional_path(conversation.execution_profile.mmproj_path.take());
 }
 
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
@@ -1910,6 +2022,14 @@ fn snippet(content: &str, query: &str) -> String {
     let lower = collapsed.to_lowercase();
     let start = lower
         .find(query)
+        .and_then(|match_byte| {
+            // A match can begin inside one source character's lowercase expansion.
+            let mut lowered_end = 0;
+            collapsed.chars().position(|character| {
+                lowered_end += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+                match_byte < lowered_end
+            })
+        })
         .map(|index| index.saturating_sub(40))
         .unwrap_or_default();
     collapsed.chars().skip(start).take(120).collect()

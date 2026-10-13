@@ -9,7 +9,7 @@ use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
 use tauri::utils::config::WindowConfig;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod application;
@@ -24,6 +24,22 @@ const FILE_OPEN_PROJECT_ACCELERATOR: &str = "CmdOrCtrl+O";
 const FILE_SAVE_ACCELERATOR: &str = "CmdOrCtrl+S";
 const FILE_EXPORT_COPY_ACCELERATOR: &str = "CmdOrCtrl+Shift+S";
 const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
+
+#[tauri::command]
+fn completion_reversal_arm(armed: bool) {
+    #[cfg(target_os = "macos")]
+    loom_macos_shortcut::set_armed(armed);
+    #[cfg(not(target_os = "macos"))]
+    let _ = armed;
+}
+
+#[tauri::command]
+fn completion_candidate_arm(active: bool) {
+    #[cfg(target_os = "macos")]
+    loom_macos_shortcut::set_candidate_active(active);
+    #[cfg(not(target_os = "macos"))]
+    let _ = active;
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -69,6 +85,10 @@ pub fn run() {
         // so every graceful quit enters the joined-worker close coordinator.
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
+        .invoke_handler(tauri::generate_handler![
+            completion_reversal_arm,
+            completion_candidate_arm
+        ])
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
         .setup(move |app| {
@@ -80,6 +100,13 @@ pub fn run() {
                         .data_store_identifier(identifier)
                         .build()?;
                 }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                loom_macos_shortcut::install(move || {
+                    let _ = handle.emit(tauri_plugin_loom::REVERSE_COMPLETION_EVENT, ());
+                });
             }
             Ok(())
         })
@@ -190,6 +217,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
         Some(APPLICATION_QUIT_ACCELERATOR),
     )?;
     let file = build_file_menu(app, &quit)?;
+    let edit = build_edit_menu(app)?;
     let window = Submenu::with_id_and_items(
         app,
         WINDOW_SUBMENU_ID,
@@ -241,20 +269,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                 ],
             )?,
             &file,
-            &Submenu::with_items(
-                app,
-                "Edit",
-                true,
-                &[
-                    &PredefinedMenuItem::undo(app, None)?,
-                    &PredefinedMenuItem::redo(app, None)?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::cut(app, None)?,
-                    &PredefinedMenuItem::copy(app, None)?,
-                    &PredefinedMenuItem::paste(app, None)?,
-                    &PredefinedMenuItem::select_all(app, None)?,
-                ],
-            )?,
+            &edit,
             #[cfg(target_os = "macos")]
             &Submenu::with_items(
                 app,
@@ -264,6 +279,31 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
             )?,
             &window,
             &help,
+        ],
+    )
+}
+
+fn build_edit_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
+    Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                tauri_plugin_loom::REVERSE_COMPLETION_MENU_ID,
+                "Reverse Completion",
+                true,
+                None::<&str>,
+            )?,
         ],
     )
 }

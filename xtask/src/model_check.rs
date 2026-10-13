@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -27,7 +27,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
     let model = PathBuf::from(&args[0])
         .canonicalize()
         .context("open model fixture")?;
-    let mut file = File::open(&model)?;
+    let mut file = open_model_fixture(&model)?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -124,10 +124,44 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn open_model_fixture(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).context("open model fixture")?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "model fixture must be an ordinary file"
+    );
+    Ok(file)
+}
+
 fn toolchain_program(name: &str) -> Result<PathBuf> {
     let output = Command::new("rustup")
         .args(["which", "--toolchain", "1.95.0", name])
         .output()?;
     ensure!(output.status.success(), "Rust 1.95 {name} is unavailable");
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::open_model_fixture;
+
+    #[test]
+    fn model_fixture_fifo_is_refused_without_waiting_for_a_writer() {
+        let temporary = tempfile::tempdir().expect("isolated model fixture");
+        let fifo = temporary.path().join("model.gguf");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create FIFO");
+        let error = open_model_fixture(&fifo).expect_err("FIFO must not be admitted");
+        assert!(error.to_string().contains("ordinary file"));
+    }
 }

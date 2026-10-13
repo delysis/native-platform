@@ -815,6 +815,9 @@ impl Gateway {
                 if cancellation.is_cancelled() {
                     return Err(request_cancelled(&request_id));
                 }
+                if let Some(quota) = &lease.quota {
+                    quota.start_execution();
+                }
                 let ticket = backend
                     .execute(BackendRequest {
                         request: request.clone(),
@@ -4052,5 +4055,69 @@ mod tests {
         })
         .await
         .expect("fixture request must drain");
+    }
+    #[tokio::test]
+    async fn rejected_exact_preflight_releases_tokens_but_execute_failure_stays_unknown() {
+        let mut backend_descriptor = descriptor("preflight", BackendLocation::LocalEmbedded);
+        backend_descriptor.models[0].quota.tokens_per_minute = Some(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(CountingFailureBackend {
+                descriptor: backend_descriptor,
+                calls: Arc::clone(&calls),
+            }))
+            .expect("register actual router backend");
+        let route_key = ("preflight".to_string(), "preflight-model".to_string());
+        let quota = gateway
+            .state
+            .read()
+            .expect("gateway state")
+            .quotas
+            .get(&route_key)
+            .expect("configured quota")
+            .clone();
+
+        for _ in 0..2 {
+            let mut request = request();
+            request.model = ModelSelector::ExactRoute {
+                backend_id: route_key.0.clone(),
+                model_id: route_key.1.clone(),
+            };
+            request.sampling.max_output_tokens = Some(20);
+            let error = match gateway
+                .execute_with_exact_input_count(
+                    request,
+                    Arc::new(fte_types::RequestCancellation::default()),
+                )
+                .await
+            {
+                Ok(_) => panic!("backend has no exact counting capability"),
+                Err(error) => error,
+            };
+            assert_eq!(error.class, ErrorClass::Capability);
+            assert_eq!(calls.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(quota.headroom(), Some(1.0));
+            assert_eq!(gateway.status().active_requests, 0);
+        }
+
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: route_key.0,
+            model_id: route_key.1,
+        };
+        request.sampling.max_output_tokens = Some(20);
+        let error = match gateway.execute(request).await {
+            Ok(_) => panic!("fixture execute fails after entry"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "fixture_provider_unavailable");
+        assert_eq!(calls.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(
+            quota.headroom(),
+            Some(0.0),
+            "execute errors cannot prove zero work"
+        );
+        assert_eq!(gateway.status().active_requests, 0);
     }
 }

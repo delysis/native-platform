@@ -1,7 +1,8 @@
 use crate::config::resolve_settings;
 use crate::conversation_store::{
-    ChatTemplatePolicy, Conversation, Message, MessageRole, active_leaf_id, active_path_messages,
-    get_or_create_conversation, upsert_conversation,
+    CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb, Message,
+    MessageRole, active_leaf_id, active_path_messages, get_or_create_conversation,
+    upsert_conversation,
 };
 use crate::mcp::{McpTool, mcp_call_tool_supervised, mcp_list_tools_in_scope};
 use crate::native_runtime::resident_model_for_profile;
@@ -512,16 +513,16 @@ fn tool_loop_run_with_events(
     let request_id = Uuid::new_v4().to_string();
     let (control, operation) =
         register_tool_loop(scope, &settings.data_dir, &request_id, conversation_id)?;
-    emit_tool_loop_event(
-        &mut on_event,
-        ToolLoopStreamEvent::new(&request_id, conversation_id, "started", None),
-    )?;
     let mut lifecycle = ToolLoopLifecycle {
         data_dir: settings.data_dir.clone(),
         request_id: request_id.clone(),
         finished: false,
         _operation: operation,
     };
+    emit_tool_loop_event(
+        &mut on_event,
+        ToolLoopStreamEvent::new(&request_id, conversation_id, "started", None),
+    )?;
     let (_, source_conversation) = get_or_create_conversation(conversation_id)?;
     let model_path = source_conversation
         .execution_profile
@@ -704,7 +705,9 @@ fn tool_loop_run_with_events(
         let mut model_started =
             ToolLoopStreamEvent::new(&request_id, conversation_id, "model_started", Some(turn));
         model_started.model_request_id = Some(model_request_id.clone());
-        model_started.real_engine_invoked = true;
+        // This event announces admission intent, not observed native work.
+        // Only events from an admitted ticket and its output carry invocation evidence.
+        model_started.real_engine_invoked = false;
         emit_tool_loop_event(&mut on_event, model_started)?;
         let ticket = handle
             .generate(request)
@@ -1608,18 +1611,32 @@ fn update_message_metrics(
     prompt_tokens: usize,
     completion_tokens: usize,
 ) -> Result<()> {
-    let (db, mut conversation) = get_or_create_conversation(conversation_id)?;
-    if let Some(message) = conversation
-        .messages
-        .iter_mut()
-        .find(|message| message.id == message_id)
-    {
-        message.prompt_tokens = Some(prompt_tokens);
-        message.completion_tokens = Some(completion_tokens);
-        conversation.updated_at = now_ms().to_string();
-        upsert_conversation(db, conversation)?;
-    }
-    Ok(())
+    RuntimeStore::current()?.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |conversations, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                conversation_id,
+                documents,
+            )?;
+            let conversation = conversations
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("conversation was removed before metrics publication")
+                })?;
+            let message = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+                .ok_or_else(|| anyhow::anyhow!("message was removed before metrics publication"))?;
+            message.prompt_tokens = Some(prompt_tokens);
+            message.completion_tokens = Some(completion_tokens);
+            conversation.updated_at = now_ms().to_string();
+            Ok(())
+        },
+    )
 }
 
 fn utf8_prefix(value: &str, max_bytes: usize) -> (&str, bool) {
@@ -1726,5 +1743,65 @@ mod tests {
         assert_eq!(scope.active_operation_count(), 1);
         drop(operation);
         assert_eq!(scope.active_operation_count(), 0);
+    }
+    #[test]
+    fn tool_metrics_update_only_the_existing_message_in_the_current_store() -> anyhow::Result<()> {
+        struct OwnedDir(std::path::PathBuf);
+        impl Drop for OwnedDir {
+            fn drop(&mut self) {
+                crate::config::set_data_dir_override_for_tests(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mom-tool-metrics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory)?;
+        crate::config::set_data_dir_override_for_tests(Some(directory.clone()));
+        let _dir = OwnedDir(directory);
+        let conversation = crate::conversation_new(Some("Metrics source".into()))?
+            .result
+            .expect("source");
+        let (message_id, _) = super::append_message(
+            &conversation.id,
+            crate::MessageRole::Tool,
+            "Preserve tool prose and receipt association.".into(),
+            Some("original model".into()),
+            Some("original receipt".into()),
+        )?;
+        let other = crate::conversation_new(Some("Preserve current selection".into()))?
+            .result
+            .expect("other conversation");
+        let mut expected = crate::conversation_store::load_db()?;
+        super::update_message_metrics(&conversation.id, &message_id, 17, 23)?;
+        let actual = crate::conversation_store::load_db()?;
+        let stored = actual
+            .conversations
+            .iter()
+            .find(|value| value.id == conversation.id)
+            .expect("stored conversation");
+        let expected_conversation = expected
+            .conversations
+            .iter_mut()
+            .find(|value| value.id == conversation.id)
+            .expect("expected conversation");
+        expected_conversation
+            .updated_at
+            .clone_from(&stored.updated_at);
+        let message = expected_conversation
+            .messages
+            .iter_mut()
+            .find(|value| value.id == message_id)
+            .expect("exact target");
+        message.prompt_tokens = Some(17);
+        message.completion_tokens = Some(23);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.selected_conversation_id.as_deref(),
+            Some(other.id.as_str())
+        );
+        assert!(super::update_message_metrics(&conversation.id, "removed-message", 1, 2).is_err());
+        assert!(super::update_message_metrics("removed-conversation", &message_id, 1, 2).is_err());
+        assert_eq!(crate::conversation_store::load_db()?, actual);
+        Ok(())
     }
 }

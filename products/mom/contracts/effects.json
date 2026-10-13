@@ -225,7 +225,7 @@
     },
     {
       "effect_id": "mom_llama.effects.chat_send.v1",
-      "reads": ["selected_model", "conversation", "skills", "settings", "compatible_prefix_cache", "encrypted_reviewed_mcp_tool_catalog"],
+      "reads": ["selected_model", "conversation", "skills", "settings", "compatible_prefix_cache"],
       "writes": ["conversation", "encrypted_receipt", "optional_session_cache"],
       "network": [],
       "process": [],
@@ -316,7 +316,7 @@
     },
     {
       "effect_id": "mom_llama.effects.consult_generate.v1",
-      "reads": ["selected_models", "host_conversation_snapshot", "persona_or_live_chat_snapshots", "persona_group", "settings", "persona_prefix_caches", "encrypted_reviewed_mcp_tool_catalog", "reviewed_content_addressed_mcp_executable_identity"],
+      "reads": ["selected_models", "host_conversation_snapshot", "persona_or_live_chat_snapshots", "persona_group", "settings", "persona_prefix_caches", "reviewed_content_addressed_mcp_executable_identity"],
       "writes": ["mention_invocation", "attributed_host_messages", "optional_synthesis", "encrypted_receipts"],
       "network": [],
       "process": [],
@@ -552,7 +552,7 @@
     {
       "effect_id": "mom_llama.effects.mcp_stdio.v1",
       "reads": ["allowlisted_absolute_executable", "encrypted_mcp_config", "typed_request", "reviewed_content_addressed_mcp_executable_bytes", "pre_and_post_spawn_path_identity_detection_without_atomic_exec_claim", "configured_mcp_process_may_read_os_permitted_files"],
-      "writes": ["encrypted_reviewed_mcp_tool_catalog", "content_addressed_managed_mcp_executable", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
+      "writes": ["content_addressed_managed_mcp_executable", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
       "network": ["configured_mcp_process_may_access_network"],
       "process": ["configured_external_mcp_stdio_process"],
       "secrets": ["configured_mcp_process_may_access_os_permitted_secrets"],

@@ -4,6 +4,7 @@ use super::first_word_choices::{Admission, FirstWordGate};
 use super::*;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+use llama_cpp_2::token_type::LlamaTokenAttr;
 use llama_native_types::FIRST_WORD_CHOICE_MAX_EOG_TOKENS;
 use std::collections::BTreeSet;
 
@@ -59,6 +60,39 @@ fn sample_saved_logits(
     // snapshot, so exactly one explicit accept restores those same semantics.
     sampler.accept(token);
     Ok(Some(token))
+}
+
+fn token_piece_contains_visual_control(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| *byte < b' ' || *byte == 0x7f)
+}
+
+fn visual_control_token_ids(model: &LlamaModel) -> BTreeSet<i32> {
+    let mut forbidden = BTreeSet::new();
+    for token_id in 0..model.n_vocab() {
+        let token = LlamaToken::new(token_id);
+        if model.is_eog_token(token) {
+            continue;
+        }
+        // A piece that cannot be decoded by the same path used for emission
+        // has no place on the Visual surface either. Mask it rather than turn
+        // vocabulary inspection into a model-wide startup failure.
+        let attributes = model.token_attr(token);
+        let special = [
+            LlamaTokenAttr::Unknown,
+            LlamaTokenAttr::Unused,
+            LlamaTokenAttr::Control,
+            LlamaTokenAttr::UserDefined,
+        ]
+        .into_iter()
+        .any(|attribute| attributes.contains(attribute));
+        if special
+            || generated_token_piece(model, token)
+                .map_or(true, |bytes| token_piece_contains_visual_control(&bytes))
+        {
+            forbidden.insert(token_id);
+        }
+    }
+    forbidden
 }
 
 fn discard_proposal(branch: &mut ActiveBranch<'_>) {
@@ -194,10 +228,18 @@ pub(super) fn generate(
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
+    let forbidden_token_ids = if policy.rejects_visual_control_tokens() {
+        visual_control_token_ids(model)
+    } else {
+        BTreeSet::new()
+    };
     let mut gates = branches
         .iter()
         .map(|branch| FirstWordGate::new(policy, branch.request.sampling.seed))
         .collect::<Vec<_>>();
+    for gate in &mut gates {
+        gate.set_forbidden_token_ids(&forbidden_token_ids);
+    }
     let mut reserved = BTreeSet::new();
     // Nonempty choices cannot begin with EOG. This explicit static mask avoids
     // zero-token retries without pretending that a previous EOG owns a word.
@@ -251,10 +293,12 @@ pub(super) fn generate(
             }
             let token = if gate.pending() && branch.generated == 0 {
                 gate.begin_attempt(&initial_exclusions);
+                let mut sampling_exclusions = initial_exclusions.clone();
+                sampling_exclusions.extend(forbidden_token_ids.iter().copied());
                 let Some(token) = sample_saved_logits(
                     &mut branch.sampler,
                     &prompt_logits[index],
-                    &initial_exclusions,
+                    &sampling_exclusions,
                 )?
                 else {
                     gate.exhaust_initial_support();
@@ -268,7 +312,15 @@ pub(super) fn generate(
                 initial_exclusions.insert(token.0);
                 token
             } else {
-                branch.sampler.sample(context, branch.logit_index)
+                let logits = context.get_logits_ith(branch.logit_index);
+                let Some(token) =
+                    sample_saved_logits(&mut branch.sampler, logits, &forbidden_token_ids)?
+                else {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "visual_token_support_exhausted".to_string();
+                    continue;
+                };
+                token
             };
             let terminal = model.is_eog_token(token);
             let was_pending = gate.pending();
@@ -397,6 +449,26 @@ pub(super) fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visual_control_mask_keeps_unicode_and_markdown_punctuation() {
+        for allowed in [
+            b" ordinary".as_slice(),
+            " **bold**".as_bytes(),
+            " café".as_bytes(),
+        ] {
+            assert!(!token_piece_contains_visual_control(allowed));
+        }
+        for forbidden in [
+            b"\tindent".as_slice(),
+            b"line\n",
+            b"\r\n",
+            b"\0hidden",
+            b"\x7f",
+        ] {
+            assert!(token_piece_contains_visual_control(forbidden));
+        }
+    }
     use llama_native_types::FirstWordChoiceAttemptOutcome;
 
     #[test]
