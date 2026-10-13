@@ -19,7 +19,6 @@ fs4.workspace = true
 fte-types = { path = "../../../fte/crates/fte-types" }
 fte-router = { path = "../../../fte/crates/fte-router" }
 fte-providers = { path = "../../../fte/crates/fte-providers" }
-fte-store = { path = "../../../fte/crates/fte-store" }
 url = "2.5.8"
 information-native-acquire.workspace = true
 information-native-backend-sqlite.workspace = true
@@ -38,7 +37,7 @@ http.workspace = true
 image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
-loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
+loom-host = { path = "../loom-host" }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
 loom-preferences = { path = "../loom-preferences" }

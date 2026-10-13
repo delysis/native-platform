@@ -18,5 +18,9 @@ serde_json.workspace = true
 [dev-dependencies]
 uuid.workspace = true
 
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+nix.workspace = true
+rusqlite.workspace = true
+
 [lints]
 workspace = true

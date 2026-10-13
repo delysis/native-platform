@@ -94,7 +94,6 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 atomic-write-file = "=0.3.0"
 axum = "0.8.9"
-bytes = "1.11.1"
 chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -106,14 +105,10 @@ fs4 = "1.1.0"
 http = "1"
 http-body-util = "0.1"
 hound = "3.5.1"
-jsonschema = { version = "0.49.8", default-features = false }
-ndarray = { version = "0.17.2", default-features = false, features = ["std"] }
 nix = { version = "0.30.1", features = ["fs", "process", "signal", "time"] }
 notify = "8.2.0"
 parakeet-rs = "0.3.7"
 rand = "0.9"
-rand_chacha = "0.9.0"
-rand_core = "0.9.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 same-file = "1.0.6"
@@ -126,12 +121,10 @@ sysinfo = { version = "0.38.4", default-features = false, features = ["system"] 
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
-tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.9.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
-tracing = "0.1.44"
 ulid = { version = "1.2.1", features = ["serde"] }
 unicase = "2.9.0"
 unicode-normalization = "0.1.25"
@@ -165,17 +158,14 @@ quick-xml = { version = "0.41.0", default-features = false, features = ["seriali
 ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
 tar = { version = "0.4.46", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
-fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
 fte-router = { path = "products/fte/crates/fte-router" }
 fte-store = { path = "products/fte/crates/fte-store" }
 fte-types = { path = "products/fte/crates/fte-types" }
-tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
 information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
 information-native-attachment-bridge = { path = "crates/services/information/crates/information-native-attachment-bridge" }
 information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
 information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
-information-native-backend-overture = { path = "crates/services/information/crates/information-native-backend-overture" }
 information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
 information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
 information-native-backend-zim = { path = "crates/services/information/crates/information-native-backend-zim" }

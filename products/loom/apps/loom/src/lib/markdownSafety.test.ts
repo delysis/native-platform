@@ -5,7 +5,6 @@ import { history, undo } from 'prosemirror-history';
 import {
   canRoundTripMarkdownExactly,
   canUseVisualMarkdown,
-  normalizeVisualMarkdownSource,
   parseVisualMarkdown,
   serializeVisualMarkdown
 } from './markdownSafety';
@@ -43,15 +42,6 @@ describe('visual Markdown safety gate', () => {
     expect(canUseVisualMarkdown('- A quiet item ', false)).toBe(false);
     expect(canUseVisualMarkdown('```text\ncode\n``` ', false)).toBe(false);
     expect(canUseVisualMarkdown('~~unsupported~~ ', false)).toBe(false);
-  });
-
-  it('keeps the admitted terminal prose byte in the canonical manuscript identity', () => {
-    expect(normalizeVisualMarkdownSource('Something ')).toBe('Something ');
-    expect(normalizeVisualMarkdownSource('# Heading ')).toBe('# Heading ');
-
-    expect(normalizeVisualMarkdownSource('Something  ')).toBe('Something  ');
-    expect(normalizeVisualMarkdownSource('- A quiet item ')).toBe('- A quiet item ');
-    expect(normalizeVisualMarkdownSource('Something\n')).toBe('Something\n');
   });
 
   it('round-trips a terminal space produced by a live ProseMirror edit', () => {

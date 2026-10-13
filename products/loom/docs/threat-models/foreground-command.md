@@ -1,5 +1,10 @@
 # Foreground command authority
 
+This page retains the historical research-import/promotion threat model.
+The current Loom Tauri command registry has no research-import or
+research-promotion command. The public `loom-host` foreground authority types
+remain SDK contracts.
+
 ## Claim
 
 `VerifiedForegroundCommand` means only:

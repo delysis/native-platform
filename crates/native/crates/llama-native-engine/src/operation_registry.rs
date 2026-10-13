@@ -1,12 +1,11 @@
 use llama_native_types::{NativeError, NativeErrorCode};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 type NativeResult<T> = Result<T, NativeError>;
-const DEFAULT_PROGRESS_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestClass {
@@ -183,7 +182,6 @@ impl ActiveRequest {
             cancellation_requested: self.controls.cancellation_requested(),
             authoritative_terminal: lifecycle.terminal,
             final_projection: lifecycle.terminal,
-            progress_projection: lifecycle.progress.iter().copied().collect(),
         }
     }
 }
@@ -229,7 +227,6 @@ pub(crate) struct RequestTerminal {
 struct RequestLifecycle {
     phase: RequestPhase,
     terminal: Option<RequestTerminal>,
-    progress: VecDeque<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,14 +237,12 @@ pub(crate) struct RequestSnapshot {
     pub(crate) cancellation_requested: bool,
     pub(crate) authoritative_terminal: Option<RequestTerminal>,
     pub(crate) final_projection: Option<RequestTerminal>,
-    pub(crate) progress_projection: Vec<u64>,
 }
 
 #[derive(Debug)]
 struct RegistryState {
     phase: RegistryPhase,
     next_nonce: u64,
-    progress_capacity: usize,
     active: HashMap<String, Arc<ActiveRequest>>,
     attempts: BTreeMap<u64, Arc<ActiveRequest>>,
     expected_worker_ids: Vec<String>,
@@ -282,15 +277,10 @@ pub(crate) struct RequestRegistry {
 
 impl RequestRegistry {
     pub(crate) fn new() -> Self {
-        Self::with_config(0, DEFAULT_PROGRESS_CAPACITY)
-    }
-
-    pub(crate) fn with_config(next_nonce: u64, progress_capacity: usize) -> Self {
         Self {
             state: Mutex::new(RegistryState {
                 phase: RegistryPhase::Running,
-                next_nonce,
-                progress_capacity,
+                next_nonce: 0,
                 active: HashMap::new(),
                 attempts: BTreeMap::new(),
                 expected_worker_ids: Vec::new(),
@@ -357,7 +347,6 @@ impl RequestRegistry {
             lifecycle: Mutex::new(RequestLifecycle {
                 phase: RequestPhase::Reserved,
                 terminal: None,
-                progress: VecDeque::new(),
             }),
         });
         state.active.insert(request_id, Arc::clone(&entry));
@@ -403,26 +392,6 @@ impl RequestRegistry {
         }
         lifecycle.phase = to;
         self.drained.notify_all();
-        Ok(())
-    }
-
-    pub(crate) fn publish_progress(&self, lease: &RequestLease, sequence: u64) -> NativeResult<()> {
-        self.require_current(lease)?;
-        let capacity = self.lock_recovering_poison().progress_capacity;
-        let mut lifecycle = lease
-            .entry
-            .lifecycle
-            .lock()
-            .map_err(|_| registry_error("native request lifecycle is poisoned"))?;
-        if lifecycle.phase != RequestPhase::Running || lifecycle.terminal.is_some() {
-            return Err(invalid_transition());
-        }
-        if capacity != 0 {
-            while lifecycle.progress.len() >= capacity {
-                lifecycle.progress.pop_front();
-            }
-            lifecycle.progress.push_back(sequence);
-        }
         Ok(())
     }
 
@@ -690,10 +659,6 @@ impl RequestLease {
 
     pub(crate) fn running(&self) -> NativeResult<()> {
         self.registry.start(self)
-    }
-
-    pub(crate) fn progress(&self, sequence: u64) -> NativeResult<()> {
-        self.registry.publish_progress(self, sequence)
     }
 
     pub(crate) fn finished(&self, class: RequestTerminalClass) -> NativeResult<()> {

@@ -884,10 +884,12 @@ fn start_run<R: Runtime>(
         folder_budget.admit(&value)?;
         if let Value::Documents { documents } = value.unscoped()
             && !(scope == RunScope::Workspace && name == "document")
+            && !documents.is_empty()
         {
+            let local_artifacts =
+                crate::material_context::local_artifact_ids(read_context.documents, [&value])?;
             for document in documents {
-                if crate::material_context::local_artifact_ids(read_context.documents, [&value])?
-                    .contains(&document.artifact_id)
+                if local_artifacts.contains(&document.artifact_id)
                     && seen_documents.insert(document.document_id)
                 {
                     sources.push(document.clone());

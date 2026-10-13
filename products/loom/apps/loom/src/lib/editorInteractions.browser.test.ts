@@ -2142,3 +2142,95 @@ it('Source legacy IME Tab does not indent, accept completion, steal focus or swa
   expect(ime.defaultPrevented).toBe(false); expect(input.value).toBe('unchanged'); expect(input.selectionStart).toBe(4);
   const menu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true }); input.dispatchEvent(menu); expect(menu.defaultPrevented).toBe(false);
 });
+
+it.each(['text', 'markdown'] as const)(
+  'refuses a delayed public %s insertion before the typed document is projected', async (kind) => {
+    const initial = 'alpha beta gamma';
+    const target = document.createElement('div');
+    document.body.append(target);
+    let releaseOnMutation: (() => void) | null = null;
+    const trace: Record<string, string | boolean | null> = { kind };
+    const harness = mount(EditorBrowserHarness, {
+      target,
+      props: {
+        initialValue: initial,
+        autocomplete: false,
+        onImmediateDocumentMutation: () => releaseOnMutation?.()
+      }
+    });
+    mounted = harness;
+    const visual = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await visual.click();
+    const editor = visual.element();
+    const projected = () =>
+      page.getByRole('status', { name: 'Serialized Markdown' }).element().textContent ?? '';
+
+    async function placeCaret(atEnd: boolean): Promise<void> {
+      const paragraphs = editor.querySelectorAll('p');
+      const text = paragraphs.item(atEnd ? paragraphs.length - 1 : 0)?.firstChild;
+      expect(text).not.toBeNull();
+      const range = document.createRange();
+      range.setStart(text!, atEnd ? text!.textContent!.length : 0);
+      range.collapse(true);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    }
+
+    function insertPrepared(prepared: Promise<string>): Promise<boolean> {
+      if (kind === 'text') return harness.insertPreparedText(prepared);
+      const caret = window.getSelection()!.getRangeAt(0).getBoundingClientRect();
+      return harness.insertPreparedMarkdown(prepared, caret.left, caret.top + caret.height / 2);
+    }
+
+    // Establish both actual insertion and selection-only navigation before fault.
+    await placeCaret(true);
+    expect(await insertPrepared(Promise.resolve('Prepared Ω'))).toBe(true);
+    await expect.poll(() => editor.textContent).toBe(`${initial}Prepared Ω`);
+    await expect.poll(projected).toContain('Prepared Ω');
+    await placeCaret(true);
+    let releaseSelection!: (text: string) => void;
+    const selected = insertPrepared(new Promise<string>((resolve) => { releaseSelection = resolve; }));
+    await placeCaret(false);
+    releaseSelection('Kept λ');
+    expect(await selected).toBe(true);
+    await expect.poll(() => editor.textContent).toBe(`${initial}Prepared ΩKept λ`);
+    await expect.poll(projected).toContain('Kept λ');
+
+    // Capture a real public anchor, then type in the live PM editor. Releasing
+    // from its immediate callback queues the async return before projection.
+    await placeCaret(true);
+    const capturedText = editor.textContent ?? '';
+    const capturedSource = projected();
+    let releaseLate!: (text: string) => void;
+    const pending = insertPrepared(new Promise<string>((resolve) => { releaseLate = resolve; }));
+    const prepared = 'Late δ';
+    const result = pending.then((inserted) => {
+      trace.inserted = inserted;
+      trace.resultText = editor.textContent;
+      trace.resultSource = projected();
+      return inserted;
+    });
+    trace.capturedText = capturedText;
+    trace.capturedSource = capturedSource;
+    trace.prepared = prepared;
+    releaseOnMutation = () => {
+      releaseOnMutation = null;
+      trace.mutationText = editor.textContent;
+      trace.mutationSource = projected();
+      releaseLate(prepared);
+    };
+    await placeCaret(false);
+    await userEvent.keyboard('!');
+    const inserted = await result;
+    expect(trace.mutationText, JSON.stringify(trace)).toBe(`!${capturedText}`);
+    expect(trace.mutationSource, JSON.stringify(trace)).toBe(capturedSource);
+    expect(inserted, JSON.stringify(trace)).toBe(false);
+    expect(trace.resultText, JSON.stringify(trace)).toBe(`!${capturedText}`);
+    expect(trace.resultSource, JSON.stringify(trace)).toBe(capturedSource);
+    await expect.poll(projected).toBe(`!${capturedSource}`);
+    expect(editor.textContent).toBe(`!${capturedText}`);
+  }
+);

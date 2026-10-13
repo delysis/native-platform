@@ -105,13 +105,10 @@ server-held preview and never removes Attachment or external source bytes.
 
 ## Persona tool authority
 
-Persona answer text is presentation data and is never scanned for JSON or tool
-syntax. A tool-bound Persona drafts ordinary prose, then the resident Native
-worker runs a separate JSON-schema-constrained `PersonaToolDecision` phase.
-Only a complete verified `Call` decision for one attached server/tool and its
-exact input schema can reach MCP policy validation; `Final` leaves the draft
-untouched. Denied and ask-policy tools still fail closed, and one Persona turn
-can execute at most one exact tool call.
+Fresh Persona consultations generate ordinary prose; Personas do not grant MCP
+tools. Stored tool bindings remain profile data. Existing frozen approvals retain
+their exact call, policy, source/model identity, deadline, effect and recovery
+checks. Persona answer text is never scanned for JSON or tool syntax.
 
 ## Enforced negative boundaries
 

@@ -189,7 +189,6 @@ pub(super) fn handoff_messages(
     user_id: &str,
     addressed: &str,
     participants: &str,
-    tools: &[BoundMentionTool],
 ) -> std::result::Result<PreparedHandoff, Blocker> {
     let fingerprint = handle.status().fingerprint.ok_or_else(|| {
         blocker(
@@ -226,10 +225,8 @@ pub(super) fn handoff_messages(
     let boundary = ChatMessage {
         role: ChatRole::System,
         content: format!(
-            "You are @{}, temporarily invited from a separate local conversation. Your source history above is an immutable snapshot and will not be changed by this reply. Recent host context follows. Reply directly to the final addressed message as your established perspective. Do not claim access to omitted history. Attached media is labelled by its exact source occurrence; historical images are not new host uploads. Addressed participants: {}.{}",
-            snapshot.handle,
-            participants,
-            mention_tool_instructions(tools)
+            "You are @{}, temporarily invited from a separate local conversation. Your source history above is an immutable snapshot and will not be changed by this reply. Recent host context follows. Reply directly to the final addressed message as your established perspective. Do not claim access to omitted history. Attached media is labelled by its exact source occurrence; historical images are not new host uploads. Addressed participants: {}.",
+            snapshot.handle, participants,
         ),
     };
     let template = profile_chat_template(&snapshot.profile);
@@ -320,12 +317,6 @@ pub(super) fn handoff_messages(
         )
         .map_err(|error| error.blocker)?;
     let (media, media_sources) = media_builder.finish();
-    if !media.is_empty() && !tools.is_empty() {
-        return Err(blocker(
-            "mention_media_tool_continuation_unsupported",
-            "This Persona's constrained tool-decision and approval continuation are text-only; media cannot be silently discarded. Use a media-capable Persona without attached tools or an explicitly transformed text attachment.",
-        ));
-    }
     let messages = framed(
         &system,
         selected_source,

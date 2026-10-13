@@ -84,12 +84,6 @@ interface CompletionRecoveryFixture {
   delivery_cases: Array<{
     case_id: string;
     event_indexes: number[];
-    expected_applied_sequences: number[];
-    expected_event_projection: {
-      status: BranchCard['status'];
-      candidate_id: string | null;
-      text: string;
-    };
   }>;
 }
 

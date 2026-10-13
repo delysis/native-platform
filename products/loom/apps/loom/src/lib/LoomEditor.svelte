@@ -17,7 +17,6 @@
   import { objectNavigation } from './objectNavigation';
   import { shaderCodeBlockView } from './shaderCodeBlock';
   import {
-    normalizeVisualMarkdownSource,
     parseVisualMarkdown,
     serializeVisualMarkdown
   } from './markdownSafety';
@@ -158,9 +157,8 @@
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
-  let lastEmitted = normalizeVisualMarkdownSource(value);
+  let lastEmitted = value;
   let projectionTimer: number | undefined;
-  let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
   let completionMutationAuthorized = false;
   let composing = false;
@@ -514,15 +512,6 @@
     projectionTimer = window.setTimeout(projectDocument, delay);
   }
 
-  function scheduleExternalNormalization(original: string, normalized: string): void {
-    if (original === normalized) return;
-    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
-    normalizationTimer = window.setTimeout(() => {
-      normalizationTimer = undefined;
-      if (view && value === original && lastEmitted === normalized) onChange(normalized);
-    }, 0);
-  }
-
   export function flushPending(): boolean {
     if (composing || (view && !flushMediaObjectDrafts(view))) return false;
     projectDocument();
@@ -613,6 +602,8 @@
     markdown: string;
     from: number;
     to: number;
+    view: EditorView;
+    document: ProseMirrorNode;
   } | null {
     if (!view || readonly || composing) return null;
     // Clicking a source places the browser caret inside its label. Derivations
@@ -623,6 +614,8 @@
     return {
       surfaceKey,
       markdown: lastEmitted,
+      view,
+      document: view.state.doc,
       from: afterReference ?? view.state.selection.from,
       to: afterReference ?? view.state.selection.to
     };
@@ -632,15 +625,19 @@
     if (!view || readonly || composing) return null;
     const position = view.posAtCoords({ left: clientX, top: clientY });
     const selection = position ? Selection.near(view.state.doc.resolve(position.pos)) : view.state.selection;
-    return { surfaceKey, markdown: lastEmitted, from: selection.from, to: selection.to };
+    return {
+      surfaceKey, markdown: lastEmitted, from: selection.from, to: selection.to,
+      view, document: view.state.doc
+    };
   }
 
   export function insertMarkdownAtAnchor(
-    anchor: { surfaceKey: string; markdown: string; from: number; to: number }, markdown: string
+    anchor: NonNullable<ReturnType<typeof captureTextInsertionAnchor>>, markdown: string
   ): boolean {
     if (!view || readonly || composing || anchor.surfaceKey !== surfaceKey ||
         anchor.markdown !== lastEmitted || anchor.from < 0 || anchor.to < anchor.from ||
-        anchor.to > view.state.doc.content.size) return false;
+        anchor.to > view.state.doc.content.size || view !== anchor.view ||
+        view.isDestroyed || !view.state.doc.eq(anchor.document)) return false;
     const imported = parse(markdown);
     view.dispatch(view.state.tr.replaceRange(anchor.from, anchor.to, imported.slice(0, imported.content.size)));
     projectDocument();
@@ -649,7 +646,7 @@
   }
 
   export function insertTextAtAnchor(
-    anchor: { surfaceKey: string; markdown: string; from: number; to: number },
+    anchor: NonNullable<ReturnType<typeof captureTextInsertionAnchor>>,
     text: string
   ): boolean {
     if (
@@ -661,7 +658,10 @@
       anchor.markdown !== lastEmitted ||
       anchor.from < 0 ||
       anchor.to < anchor.from ||
-      anchor.to > view.state.doc.content.size
+      anchor.to > view.state.doc.content.size ||
+      view !== anchor.view ||
+      view.isDestroyed ||
+      !view.state.doc.eq(anchor.document)
     ) return false;
     view.dispatch(view.state.tr.insertText(text, anchor.from, anchor.to));
     projectDocument();
@@ -1188,7 +1188,7 @@
   }
 
   onMount(() => {
-    const initialMarkdown = normalizeVisualMarkdownSource(value);
+    const initialMarkdown = value;
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
@@ -1371,7 +1371,6 @@
     });
     observeVisualBoundary('visual_mount', value, view.state.doc, { focused: view.hasFocus() });
     reportSelection(view.state);
-    scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
     scheduleGhostPresentationSynchronization();
     window.addEventListener('resize', reportGhostVisibility);
@@ -1394,24 +1393,23 @@
   onDestroy(() => referenceDiagnostics.dispose());
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
-    const normalized = normalizeVisualMarkdownSource(value);
+    const incoming = value;
     // The parent replaced the document authority. Neither a captured
     // selection nor a delayed repair from the previous node tree can cross
     // this boundary.
     clearFormattingSelection();
     invalidateSelectionAccessibility();
-    lastEmitted = normalized;
-    const replacement = stateFor(normalized);
+    lastEmitted = incoming;
+    const replacement = stateFor(incoming);
     const next = collaborative ? applyRemoteDocument(view.state, replacement.doc) : replacement;
     observeVisualBoundary('visual_external_value', view.state.doc, next.doc, {
       incoming_utf8_bytes: new TextEncoder().encode(value).byteLength,
-      normalization_exact: value === normalized, focused: view.hasFocus()
+      normalization_exact: value === incoming, focused: view.hasFocus()
     }, value);
     view.updateState(next);
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
-    scheduleExternalNormalization(value, normalized);
   }
 
   $: if (view) {
@@ -1451,7 +1449,6 @@
   onDestroy(() => {
     clearFormattingSelection();
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
-    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (rejectionFrame !== undefined) window.cancelAnimationFrame(rejectionFrame);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (ghostSynchronizationFrame !== undefined) {

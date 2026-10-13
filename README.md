@@ -20,8 +20,8 @@ scope changes since the sealed ADR import.
   Signal worker. Both use the root compiler pin. [Package groups](ci/package-groups.json)
   record the root inventory; [Signal's manifest](products/loom/signal/Cargo.toml)
   owns its separately locked SQLCipher dependency graph.
-- One root `Cargo.lock` resolves exact `rusqlite 0.39.0` and one
-  `libsqlite3-sys 0.37.0` native link.
+- [`Cargo.toml`](Cargo.toml) and the root [`Cargo.lock`](Cargo.lock) own the
+  workspace SQLite versions and its single `libsqlite3-sys` dependency.
 - One pnpm 11.16.0 workspace and root `pnpm-lock.yaml` own the FTE, Mom, and
   Loom applications. Each resolves the same pinned local Tauri CLI version.
 - `ci/package-groups.json` assigns every package to exactly one primary group

@@ -2536,7 +2536,6 @@ fn run_worker(
                     let _ = result.send(embedding_runtime::EmbeddingCompletion::failed(error));
                     continue;
                 }
-                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let owner_call_sequence = embedding_call_sequence;
                 let Some(next_call_sequence) = embedding_call_sequence.checked_add(1) else {
@@ -2638,7 +2637,6 @@ fn run_worker(
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
-                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, request.cases.len());
                 let statically_sealable =
                     is_statically_sealable_generation_batch(&request, admission);
@@ -2781,7 +2779,6 @@ fn run_worker(
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
-                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, request.branches.len());
                 let result = generate_batch(
                     &model,
@@ -2836,7 +2833,6 @@ fn run_worker(
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
-                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let result = generate_multimodal(
                     &model,
@@ -2875,7 +2871,6 @@ fn run_worker(
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
-                let _ = request_lease.progress(0);
                 let owner_call_sequence = controlled_call_sequence;
                 let Some(next_call_sequence) = controlled_call_sequence.checked_add(1) else {
                     let _ = result_tx.send(Err(NativeError::new(

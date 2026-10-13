@@ -370,7 +370,14 @@ fn attachment_import_with_identity(
     path: &Path,
     attachment_id: Option<&str>,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
-    let file = match File::open(path) {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(_) => {
             return Ok(CommandResult::blocked(
