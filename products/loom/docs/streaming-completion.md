@@ -18,6 +18,9 @@ only if its entire old text remains an exact prefix. It may not rewrite, truncat
 reuse an old presentation identity, revive a retired policy, or update an obsolete
 session. Do not change authority while an insertion is pending. Unconsume removes
 only the exact last accepted chunk; ordinary editor undo remains a different action.
+In Source, Command-Z (Control-Z where applicable) and redo use the native textarea
+history, including accepted completion text. Option/Alt-Left is the exact completion
+reversal; undo does not restore completion authority or regenerate its ghost.
 
 A matching presentation key is insufficient evidence of a rendered preview.
 The actual connected, visible DOM text must equal the authorized prefix before

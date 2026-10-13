@@ -1,5 +1,5 @@
 import { mount, tick, unmount } from 'svelte';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import '../app.css';
 import EditorBrowserHarness from './EditorBrowserHarness.svelte';
@@ -1764,8 +1764,7 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent).toBe('');
   });
 
-  it.each(['{Alt>}{ArrowLeft}{/Alt}', '{Meta>}z{/Meta}'])(
-    'keeps the selected MD remainder visible, then reverses it with %s', async (undoKey) => {
+  it('keeps the selected MD remainder visible, then reverses it with Option-Left', async () => {
     const keyboard = userEvent.setup();
     renderSource('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
@@ -1785,13 +1784,54 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
 
-    await keyboard.keyboard(undoKey);
+    await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' there friend', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
     await keyboard.cleanup();
+  });
+
+  it('accepted Source text participates in ordinary native undo and redo', async () => {
+    renderSource('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+    const input = page.getByRole('textbox', { name: 'Markdown source editor' }).element() as HTMLTextAreaElement;
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await expect.poll(() => input.value).toBe('hello world ');
+    const mod = /Mac/.test(navigator.platform) ? 'Meta' : 'Control';
+    await userEvent.keyboard(`{${mod}>}z{/${mod}}`);
+    await expect.poll(() => input.value).toBe('hello');
+    await expect.poll(() => page.getByRole('status', { name: 'Source Markdown' }).element().textContent).toBe('hello');
+    await expect.element(page.getByText(' world again', { exact: true })).not.toBeInTheDocument();
+    await userEvent.keyboard(`{${mod}>}{Shift>}z{/Shift}{/${mod}}`);
+    await expect.poll(() => input.value).toBe('hello world ');
+    await expect.poll(() => page.getByRole('status', { name: 'Source Markdown' }).element().textContent).toBe('hello world ');
+    await userEvent.keyboard('typed');
+    await expect.poll(() => input.value).toBe('hello world typed');
+    await userEvent.keyboard(`{${mod}>}z{/${mod}}`);
+    await expect.poll(() => input.value).toBe('hello world ');
+    await userEvent.keyboard(`{${mod}>}{Shift>}z{/Shift}{/${mod}}`);
+    await expect.poll(() => input.value).toBe('hello world typed');
+  });
+
+  it('a refused native completion edit retires its pending authority without deleting author text', async () => {
+    renderSource('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+    const input = page.getByRole('textbox', { name: 'Markdown source editor' }).element() as HTMLTextAreaElement;
+    const command = vi.spyOn(document, 'execCommand').mockReturnValue(false);
+    try {
+      await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+      await expect.poll(() => input.value).toBe('hello');
+      await expect.element(page.getByRole('status', { name: 'Source Generation Requests' })).toHaveTextContent('1');
+      await expect.element(page.getByText(' world again', { exact: true })).not.toBeInTheDocument();
+      await userEvent.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+      expect(input.value).toBe('hello');
+    } finally { command.mockRestore(); }
   });
 
   it('docks the source completion lens and preserves its accessible options after scroll', async () => {
