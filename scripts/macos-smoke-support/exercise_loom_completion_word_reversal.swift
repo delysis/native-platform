@@ -443,6 +443,12 @@ func readManuscript() -> Data? {
     try? Data(contentsOf: URL(fileURLWithPath: manuscript), options: [.uncached])
 }
 
+func readEditorBytes() -> Data? {
+    guard let surface = editor(),
+          let value = attribute(surface, kAXValueAttribute as CFString) as? String else { return nil }
+    return Data(value.utf8)
+}
+
 func sha256(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
@@ -488,6 +494,28 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
         Thread.sleep(forTimeInterval: 0.05)
     } while Date() < deadline
     return false
+}
+
+func waitForExactEditorInsertion(
+    original: Data,
+    candidate: Data,
+    insertedBytes: Int,
+    whole: Bool,
+    timeout: TimeInterval
+) -> Data? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return nil }
+        if let observed = readEditorBytes(), exactInsertedCandidatePrefix(
+            original: original,
+            observed: observed,
+            candidate: candidate,
+            insertedBytes: insertedBytes,
+            whole: whole
+        ) { return observed }
+        Thread.sleep(forTimeInterval: 0.02)
+    } while Date() < deadline
+    return nil
 }
 
 func focusWritingSurface(expected: Data, timeout: TimeInterval) -> AXUIElement? {
@@ -894,7 +922,6 @@ let returnRunId = string(returnSelected, "selected_run_id")
 let returnPreviousSequence = integer(lastAction(returnSelected), "sequence")
 guard postKey(36, down: true, flags: [.maskAlternate]),
       postKey(36, down: false, flags: [.maskAlternate]),
-      let returnAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let returnAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
@@ -908,18 +935,26 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
               string(action, "run_id") == returnRunId &&
               integer(action, "sequence") > returnPreviousSequence
       }) else {
-    releaseOptionAndFail("fan Return did not persist the selected cached remainder")
+    releaseOptionAndFail("fan Return did not apply the selected cached remainder")
 }
 let returnAction = lastAction(returnAccepted)
-guard exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
+guard let returnCandidate = expectedCandidates[returnRunId],
+      let returnAcceptedBytes = waitForExactEditorInsertion(
+          original: original,
+          candidate: returnCandidate,
+          insertedBytes: integer(returnAction, "inserted_utf8_bytes"),
+          whole: true,
+          timeout: 2
+      ),
+      exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
       integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
-      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+      editor().map({ (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true }) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
-      waitForExactManuscript(original, timeout: 30),
       let returnRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readEditorBytes() == original &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
@@ -961,7 +996,6 @@ let tabRunId = string(tabSelected, "selected_run_id")
 let tabPreviousSequence = integer(lastAction(tabSelected), "sequence")
 guard postKey(48, down: true, flags: [.maskAlternate]),
       postKey(48, down: false, flags: [.maskAlternate]),
-      let tabAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let tabAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
@@ -975,18 +1009,26 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
               string(action, "run_id") == tabRunId &&
               integer(action, "sequence") > tabPreviousSequence
       }) else {
-    releaseOptionAndFail("fan Tab did not persist the selected cached remainder")
+    releaseOptionAndFail("fan Tab did not apply the selected cached remainder")
 }
 let tabAction = lastAction(tabAccepted)
-guard exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
+guard let tabCandidate = expectedCandidates[tabRunId],
+      let tabAcceptedBytes = waitForExactEditorInsertion(
+          original: original,
+          candidate: tabCandidate,
+          insertedBytes: integer(tabAction, "inserted_utf8_bytes"),
+          whole: true,
+          timeout: 2
+      ),
+      exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
       integer(tabAction, "accepted_utf8_bytes") == integer(tabAction, "inserted_utf8_bytes"),
-      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+      editor().map({ (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true }) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
-      waitForExactManuscript(original, timeout: 30),
       let tabRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readEditorBytes() == original &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
@@ -1054,11 +1096,13 @@ let evidence: [String: Any] = [
     "fan_return_selected_witness": returnSelected,
     "fan_return_accepted_witness": returnAccepted,
     "fan_return_accepted_sha256": sha256(returnAcceptedBytes),
+    "fan_return_acceptance_source": "live AX editor value",
     "fan_return_rolled_back_witness": returnRolledBack,
     "fan_return_released_witness": returnReleased,
     "fan_tab_selected_witness": tabSelected,
     "fan_tab_accepted_witness": tabAccepted,
     "fan_tab_accepted_sha256": sha256(tabAcceptedBytes),
+    "fan_tab_acceptance_source": "live AX editor value",
     "fan_tab_rolled_back_witness": tabRolledBack,
     "fan_tab_released_witness": tabReleased,
     "engine_disabled_witness": engineDisabled
