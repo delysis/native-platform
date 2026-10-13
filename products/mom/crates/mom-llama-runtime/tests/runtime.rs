@@ -2587,17 +2587,15 @@ fn concurrent_public_conversation_creates_preserve_every_committed_author() -> R
             std::thread::spawn(move || {
                 set_data_dir_override_for_tests(Some(directory));
                 start.wait();
-                let result = (|| -> Result<Vec<Conversation>> {
-                    (0..8)
-                        .map(|index| {
-                            mom_llama_runtime::conversation_new(Some(format!(
-                                "Author {worker}/{index}"
-                            )))?
-                            .result
-                            .context("committed public create")
-                        })
-                        .collect()
-                })();
+                let result: Result<Vec<Conversation>> = (0..8)
+                    .map(|index| {
+                        mom_llama_runtime::conversation_new(Some(format!(
+                            "Author {worker}/{index}"
+                        )))?
+                        .result
+                        .context("committed public create")
+                    })
+                    .collect();
                 set_data_dir_override_for_tests(None);
                 result
             })

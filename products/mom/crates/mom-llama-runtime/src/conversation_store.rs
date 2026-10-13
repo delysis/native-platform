@@ -833,7 +833,7 @@ pub fn conversation_system_message_update(
                 return Ok(CommandResult::passed(
                     "mom_llama.conversation_system_message_update",
                     "contracted",
-                    project_conversation(&conversation)?,
+                    project_conversation(conversation)?,
                     Vec::new(),
                     vec!["conversation instructions unchanged".to_string()],
                     false,
@@ -969,7 +969,7 @@ pub fn conversation_import_json(content: &str) -> Result<CommandResult<Conversat
         |db, documents| {
             crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
             let handle = match crate::personas::validate_imported_conversation_handle(
-                &db,
+                db,
                 &imported.execution_profile.mention_handle,
                 &imported.title,
                 documents,

@@ -287,7 +287,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
                 }
             };
             let handle = match validate_available_handle(
-                &db,
+                db,
                 None,
                 None,
                 &input.mention_handle,
@@ -3437,7 +3437,8 @@ mod tests {
             PERSONA_VERSIONS_NAMESPACE,
             &serde_json::json!({"versions":false}),
         )?;
-        let snapshot = || -> anyhow::Result<Vec<(String, Vec<u8>, Vec<u8>, i64)>> {
+        type EncryptedDocumentSnapshot = Vec<(String, Vec<u8>, Vec<u8>, i64)>;
+        let snapshot = || -> anyhow::Result<EncryptedDocumentSnapshot> {
             let connection = rusqlite::Connection::open(store.path())?;
             let mut statement = connection.prepare("SELECT namespace, nonce, ciphertext, updated_at FROM encrypted_documents ORDER BY namespace")?;
             let rows = statement.query_map([], |row| {
