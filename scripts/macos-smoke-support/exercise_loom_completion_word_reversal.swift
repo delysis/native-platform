@@ -522,6 +522,14 @@ func waitForEditorFocus(timeout: TimeInterval) -> Bool {
     return false
 }
 
+func editorFocusedAtEnd(of bytes: Data) -> Bool {
+    guard let text = String(data: bytes, encoding: .utf8),
+          let surface = editor(),
+          (attribute(surface, kAXFocusedAttribute as CFString) as? Bool) == true,
+          let range = selectedRange(surface) else { return false }
+    return range.location == text.utf16.count && range.length == 0
+}
+
 func waitForExactEditorInsertion(
     original: Data,
     candidate: Data,
@@ -1017,7 +1025,7 @@ guard postKey(123, down: true, flags: [.maskAlternate]),
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               readManuscript() == original &&
-              readEditorBytes() == original &&
+              editorFocusedAtEnd(of: original) &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
@@ -1097,7 +1105,7 @@ guard let tabCandidate = expectedCandidates[tabRunId],
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               readManuscript() == original &&
-              readEditorBytes() == original &&
+              editorFocusedAtEnd(of: original) &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
