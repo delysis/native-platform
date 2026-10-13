@@ -501,6 +501,18 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
     return false
 }
 
+func waitForEditorFocus(timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return false }
+        if editor().map({
+            (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true
+        }) == true { return true }
+        Thread.sleep(forTimeInterval: 0.02)
+    } while Date() < deadline
+    return false
+}
+
 func waitForExactEditorInsertion(
     original: Data,
     candidate: Data,
@@ -951,18 +963,30 @@ let returnAction = lastAction(returnAccepted)
 // turns. Match the browser contract's two-paint handoff without approaching
 // the 1.8-second candidate-exhaustion schedule.
 Thread.sleep(forTimeInterval: 0.25)
-guard let returnCandidate = expectedCandidates[returnRunId],
-      let returnAcceptedBytes = waitForExactEditorInsertion(
+let returnCandidate = expectedCandidates[returnRunId]
+let returnAcceptedBytes = returnCandidate.flatMap { candidate in
+    waitForExactEditorInsertion(
           original: original,
-          candidate: returnCandidate,
+          candidate: candidate,
           insertedBytes: integer(returnAction, "inserted_utf8_bytes"),
           whole: true,
           timeout: 2
-      ),
-      exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
-      integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
-      editor().map({ (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true }) == true,
-      postKey(123, down: true, flags: [.maskAlternate]),
+      )
+}
+let returnInsertionExact = returnAcceptedBytes.map {
+    exactInsertion($0, witness: returnAccepted, whole: true)
+} ?? false
+let returnByteCountExact = integer(returnAction, "accepted_utf8_bytes") ==
+    integer(returnAction, "inserted_utf8_bytes")
+let returnEditorFocused = waitForEditorFocus(timeout: 1)
+guard returnCandidate != nil, returnAcceptedBytes != nil, returnInsertionExact,
+      returnByteCountExact, returnEditorFocused else {
+    releaseOptionAndFail("fan Return pre-reversal guard failed: candidate=\(returnCandidate != nil) editor_bytes=\(returnAcceptedBytes != nil) insertion=\(returnInsertionExact) byte_count=\(returnByteCountExact) focus=\(returnEditorFocused)")
+}
+guard let exactReturnAcceptedBytes = returnAcceptedBytes else {
+    releaseOptionAndFail("fan Return accepted bytes disappeared after exact validation")
+}
+guard postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
       let returnRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
@@ -1113,7 +1137,7 @@ let evidence: [String: Any] = [
     "shuttle_rollback_released_witness": shuttleRollbackReleased,
     "fan_return_selected_witness": returnSelected,
     "fan_return_accepted_witness": returnAccepted,
-    "fan_return_accepted_sha256": sha256(returnAcceptedBytes),
+    "fan_return_accepted_sha256": sha256(exactReturnAcceptedBytes),
     "fan_return_acceptance_source": "live AX editor value",
     "fan_return_rolled_back_witness": returnRolledBack,
     "fan_return_released_witness": returnReleased,
