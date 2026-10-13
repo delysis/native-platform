@@ -22,6 +22,7 @@ func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
 
 struct CanonicalSelection {
     let value: String
+    let selectedText: String?
     let raw: CFRange
     let canonical: CFRange
     let terminalLineBreakUtf16: Int
@@ -38,8 +39,11 @@ func canonicalSelection(_ element: AXUIElement) -> CanonicalSelection? {
     let canonicalLocation = min(max(raw.location, 0), canonicalValueUtf16)
     let rawEnd = max(raw.location, 0) + max(raw.length, 0)
     let canonicalEnd = min(max(rawEnd, canonicalLocation), canonicalValueUtf16)
+    var selectedText = attribute(element, kAXSelectedTextAttribute as CFString) as? String
+    while selectedText?.last == "\n" || selectedText?.last == "\r" { selectedText?.removeLast() }
     return CanonicalSelection(
         value: value,
+        selectedText: selectedText,
         raw: raw,
         canonical: CFRange(
             location: canonicalLocation,
@@ -120,8 +124,9 @@ repeat {
     focused = (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true
     if let current = observed,
        current.value == expected,
-       current.canonical.location == 0,
-       current.canonical.length == expected.utf16.count,
+       ((current.canonical.location == 0 &&
+         current.canonical.length == expected.utf16.count) ||
+        current.selectedText == expected),
        focused,
        bool(observedSelectionWitness, "available"),
        !bool(observedSelectionWitness, "empty"),
@@ -165,8 +170,9 @@ repeat {
 } while Date() < deadline
 guard let observed,
       observed.value == expected,
-      observed.canonical.location == 0,
-      observed.canonical.length == expected.utf16.count,
+      ((observed.canonical.location == 0 &&
+        observed.canonical.length == expected.utf16.count) ||
+       observed.selectedText == expected),
       focused,
       bool(observedSelectionWitness, "available"),
       !bool(observedSelectionWitness, "empty"),
@@ -196,6 +202,7 @@ let evidence: [String: Any] = [
         "length": observed.canonical.length,
         "raw_location": observed.raw.location,
         "raw_length": observed.raw.length,
+        "selected_text_utf16": observed.selectedText?.utf16.count ?? -1,
         "terminal_line_break_utf16": observed.terminalLineBreakUtf16
     ],
     "internal_selection": observedSelectionWitness
