@@ -760,6 +760,18 @@
     if (document.activeElement === element) readSelection(true, true);
   }
 
+  export function reverseCompletion(): boolean {
+    const before = element?.value;
+    if (before === undefined) return false;
+    handleKeydown(new KeyboardEvent('keydown', {
+      key: 'ArrowLeft',
+      altKey: true,
+      bubbles: true,
+      cancelable: true
+    }));
+    return element?.value !== before;
+  }
+
   export function focusAtDocumentEnd(): boolean {
     if (!element || readonly) return false;
     hideCurrentGhost();

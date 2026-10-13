@@ -1349,6 +1349,15 @@
     return false;
   }
 
+  export function reverseCompletion(): boolean {
+    return handleExactRollbackChord(new KeyboardEvent('keydown', {
+      key: 'ArrowLeft',
+      altKey: true,
+      bubbles: true,
+      cancelable: true
+    }));
+  }
+
   function handleWindowKeyDown(event: KeyboardEvent): void {
     rollbackKeyDownHandled = handleExactRollbackChord(event);
     if (rollbackKeyDownHandled) return;

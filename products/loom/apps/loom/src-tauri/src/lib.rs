@@ -23,6 +23,7 @@ const FILE_NEW_DOCUMENT_ACCELERATOR: &str = "CmdOrCtrl+N";
 const FILE_OPEN_PROJECT_ACCELERATOR: &str = "CmdOrCtrl+O";
 const FILE_SAVE_ACCELERATOR: &str = "CmdOrCtrl+S";
 const FILE_EXPORT_COPY_ACCELERATOR: &str = "CmdOrCtrl+Shift+S";
+const REVERSE_COMPLETION_ACCELERATOR: &str = "Alt+Left";
 const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -253,6 +254,14 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                     &PredefinedMenuItem::copy(app, None)?,
                     &PredefinedMenuItem::paste(app, None)?,
                     &PredefinedMenuItem::select_all(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        tauri_plugin_loom::REVERSE_COMPLETION_MENU_ID,
+                        "Reverse Completion",
+                        true,
+                        Some(REVERSE_COMPLETION_ACCELERATOR),
+                    )?,
                 ],
             )?,
             #[cfg(target_os = "macos")]

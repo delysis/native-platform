@@ -973,6 +973,16 @@ export function listenForFileCommands(
   return listen<FileCommandEvent>('loom://file-command', ({ payload }) => handler(payload));
 }
 
+export function listenForReverseCompletion(handler: () => void): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Completion reversal requires the Loom desktop runtime.'
+    });
+  }
+  return listen('loom://reverse-completion', handler);
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,

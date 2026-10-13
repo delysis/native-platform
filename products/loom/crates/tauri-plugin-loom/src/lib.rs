@@ -160,6 +160,8 @@ pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
 pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+pub const REVERSE_COMPLETION_MENU_ID: &str = "loom.edit.reverse-completion";
+pub const REVERSE_COMPLETION_EVENT: &str = "loom://reverse-completion";
 const LOOM_ASSET_SCHEME: &str = "loom-asset";
 const LOOM_ASSET_TOKEN_VERSION: &str = "v3";
 const LOOM_CONTEXT_MEDIA_TOKEN_VERSION: &str = "v2";
@@ -2400,6 +2402,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
     if menu_id == APPLICATION_QUIT_MENU_ID {
         let _ = prepare_application_exit_request(app);
         emit_application_close_request(app);
+        return;
+    }
+    if menu_id == REVERSE_COMPLETION_MENU_ID {
+        let _ = app.emit(REVERSE_COMPLETION_EVENT, ());
         return;
     }
     if let Some(command) = file_menu_command(menu_id) {

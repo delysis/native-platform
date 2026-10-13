@@ -99,6 +99,7 @@
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
     listenForFileCommands,
+    listenForReverseCompletion,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadCatalogModelCandidate,
@@ -860,6 +861,7 @@
     selectionEmpty: true
   };
   let unlistenFileCommands: (() => void) | undefined;
+  let unlistenReverseCompletion: (() => void) | undefined;
   let unlistenDocumentFilesystemHints: (() => void) | undefined;
   let fileCommandInFlight = false;
   let renamingDocumentId: string | null = null;
@@ -1006,6 +1008,7 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
+    reverseCompletion: () => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
@@ -1019,6 +1022,7 @@
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
+    reverseCompletion: () => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
@@ -2785,6 +2789,7 @@
       weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
+      unlistenReverseCompletion?.();
       unlistenDocumentFilesystemHints?.();
       if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
     };
@@ -2796,6 +2801,7 @@
       desktopWorkspaceStarted = true;
       void installWindowFocusHandler();
       void installFileCommandListener();
+      void installReverseCompletionListener();
       void installDocumentFilesystemHintListener();
       void installGenerationEventListener();
       void restoreDesktopWorkspace();
@@ -6926,6 +6932,23 @@
       }
       unlistenFileCommands?.();
       unlistenFileCommands = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
+  async function installReverseCompletionListener(): Promise<void> {
+    try {
+      const unlisten = await listenForReverseCompletion(() => {
+        if (mode === 'source') sourceEditor?.reverseCompletion();
+        else visualEditor?.reverseCompletion();
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenReverseCompletion?.();
+      unlistenReverseCompletion = unlisten;
     } catch (error) {
       if (componentMounted) recordFailure(error);
     }
