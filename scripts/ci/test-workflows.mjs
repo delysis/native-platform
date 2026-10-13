@@ -352,8 +352,10 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /remainingFanMatches/);
   assert.match(smoke, /string\(\$0, "run_id"\) == alternatives\[index - 1\]/);
   assert.match(smoke, /waitForAccessibleFan/);
-  assert.match(smoke, /fan Return did not persist the selected cached remainder/);
-  assert.match(smoke, /fan Tab did not persist the selected cached remainder/);
+  assert.match(smoke, /fan Return did not apply the selected cached remainder/);
+  assert.match(smoke, /fan Tab did not apply the selected cached remainder/);
+  assert.match(smoke, /fan_return_acceptance_source": "live AX editor value"/);
+  assert.match(smoke, /rendered_presentation_key/);
   assert.match(smoke, /shared engine on-to-off did not clear the cached completion session/);
   assert.match(smoke, /normalizedRunIds/);
   assert.match(smoke, /cached_completion_interactions: cachedCompletionInteractions/);
