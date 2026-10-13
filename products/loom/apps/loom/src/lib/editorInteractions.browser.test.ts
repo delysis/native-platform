@@ -2174,6 +2174,38 @@ it('rich beforeinput history uses ProseMirror transactions and retains formattin
   expect(editor.querySelector('strong')).not.toBeNull();
 });
 
+it('ordinary bold typing and history work without completion authority', async () => {
+  render('hello');
+  await tick();
+  const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+  await editor.click();
+  await userEvent.keyboard('{End}');
+  const mod = /Mac/.test(navigator.platform) ? 'Meta' : 'Control';
+  await userEvent.keyboard(`{${mod}>}b{/${mod}}x`);
+  await expect.poll(() => editor.element().querySelector('strong')?.textContent).toBe('x');
+  await expect.element(page.getByRole('status', { name: 'Serialized Markdown' })).toHaveTextContent('**x**');
+  await userEvent.keyboard(`{${mod}>}z{/${mod}}`);
+  await expect.poll(() => editor.element().textContent).toBe('hello');
+  await userEvent.keyboard(`{${mod}>}{Shift>}z{/Shift}{/${mod}}`);
+  await expect.poll(() => editor.element().querySelector('strong')?.textContent).toBe('x');
+});
+
+it('changing typing marks retires a visible completion before its old bytes can be accepted', async () => {
+  render('hello', [
+    { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+  ]);
+  await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+  const mod = /Mac/.test(navigator.platform) ? 'Meta' : 'Control';
+  await userEvent.keyboard(`{${mod}>}b{/${mod}}`);
+  await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent ?? '').toBe('');
+  await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+  await expect.element(page.getByRole('status', { name: 'Serialized Markdown' })).toHaveTextContent('hello');
+  const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+  expect(editor.element().textContent).toBe('hello');
+  await userEvent.keyboard('x');
+  await expect.poll(() => editor.element().querySelector('strong')?.textContent).toBe('x');
+});
+
 it('Source legacy IME Tab does not indent, accept completion, steal focus or swallow native text menus', async () => {
   renderSource('unchanged', []);
   const input = page.getByRole('textbox', { name: 'Markdown source editor' }).element() as HTMLTextAreaElement;

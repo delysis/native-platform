@@ -543,6 +543,15 @@ describe('visual ghost visibility authority', () => {
 });
 
 describe('exact visual caret to Markdown boundary', () => {
+  it('uses explicit current typing marks rather than resetting their affinity', () => {
+    const plain = stateAtEnd('hello');
+    const boldTyping = plain.apply(plain.tr.addStoredMark(plain.schema.marks.strong.create()));
+    expect(visualCaretBoundaryProof(boldTyping, 'hello').failure).toBe('canonical_mismatch');
+    const bold = stateAtEnd('**bold**');
+    const plainTyping = bold.apply(bold.tr.setStoredMarks([]));
+    expect(exactMarkdownByteOffsetAtSelection(plainTyping, '**bold**')).toBe(8);
+  });
+
   function boundary(markdown: string, position: number): number | null {
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({

@@ -173,8 +173,8 @@
   let selectionReportTimer: number | undefined;
   let boundaryCacheDocument: ProseMirrorNode | null = null;
   let boundaryCacheCanonical = '';
-  let boundaryCacheFrom = -1;
-  let boundaryCacheTo = -1;
+  let boundaryCacheSelection: Selection | null = null;
+  let boundaryCacheStoredMarks: EditorState['storedMarks'] = null;
   let boundaryCacheValue: number | null = null;
   let boundaryCacheFailure: VisualCaretBoundaryFailure | null = null;
   let boundaryCacheDiagnostic: string | null = null;
@@ -283,8 +283,8 @@
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
     boundaryCacheCanonical = '';
-    boundaryCacheFrom = -1;
-    boundaryCacheTo = -1;
+    boundaryCacheSelection = null;
+    boundaryCacheStoredMarks = null;
     boundaryCacheValue = null;
     boundaryCacheFailure = null;
     boundaryCacheDiagnostic = null;
@@ -298,8 +298,8 @@
     if (
       boundaryCacheDocument === state.doc &&
       boundaryCacheCanonical === lastEmitted &&
-      boundaryCacheFrom === state.selection.from &&
-      boundaryCacheTo === state.selection.to
+      boundaryCacheSelection === state.selection &&
+      boundaryCacheStoredMarks === state.storedMarks
     ) return {
       byteOffset: boundaryCacheValue,
       failure: boundaryCacheFailure,
@@ -308,8 +308,8 @@
     const proof = visualCaretBoundaryProof(state, lastEmitted);
     boundaryCacheDocument = state.doc;
     boundaryCacheCanonical = lastEmitted;
-    boundaryCacheFrom = state.selection.from;
-    boundaryCacheTo = state.selection.to;
+    boundaryCacheSelection = state.selection;
+    boundaryCacheStoredMarks = state.storedMarks;
     boundaryCacheValue = proof.byteOffset;
     boundaryCacheFailure = proof.failure;
     boundaryCacheDiagnostic = proof.diagnostic;
@@ -1280,7 +1280,13 @@
             reportSelection(next);
           }
         }
-        if (transaction.docChanged || transaction.selectionSet) {
+        if (transaction.storedMarksSet) {
+          clearBoundaryCache();
+          invalidateSelectionAccessibility();
+          reportSelection(next);
+          scheduleGhostPresentationSynchronization();
+        }
+        if (transaction.docChanged || transaction.selectionSet || transaction.storedMarksSet) {
           reportGhostVisibility();
         } else {
           scheduleGhostVisibilityReport();

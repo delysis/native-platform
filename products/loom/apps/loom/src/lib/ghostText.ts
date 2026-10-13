@@ -297,8 +297,12 @@ function serializedBoundaryProof(
   }
 
   try {
+    // Current text-caret insertion inherits explicit typing marks. Setting even
+    // the same selection clears them. A structural node-edge probe deliberately
+    // creates a different selection and keeps that separate affinity policy.
+    const insertion = selection === state.selection ? state.tr : state.tr.setSelection(selection);
     const witnessed = serializeVisualMarkdown(
-      state.tr.setSelection(selection).insertText(CARET_BOUNDARY_WITNESS).doc
+      insertion.insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
     if (boundary < 0) return rejectedBoundary('witness_missing');
@@ -764,7 +768,7 @@ export function createGhostTextPlugin(
         if (meta?.kind === 'set') return meta.presentation;
         if (meta?.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
         if (meta?.kind === 'pin') return current ? { ...current, fanPinned: meta.pinned } : current;
-        if (meta?.kind === 'clear' || transaction.docChanged) return null;
+        if (meta?.kind === 'clear' || transaction.docChanged || transaction.storedMarksSet) return null;
         // WebKit and ProseMirror may explicitly reassert the current selection
         // while restoring focus after an idle period. That transaction is not
         // caret navigation and must not discard an otherwise exact decoration.
