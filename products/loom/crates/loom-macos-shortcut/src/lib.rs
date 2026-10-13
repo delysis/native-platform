@@ -37,7 +37,12 @@ pub fn install(notify: impl Fn() + Send + Sync + 'static) {
                 | NSEventModifierFlags::Control
                 | NSEventModifierFlags::Shift,
         );
-        if CANDIDATE_ACTIVE.load(Ordering::Acquire)
+        // A fan acceptance keeps Option held while Return/Tab is dispatched.
+        // That same native event is stronger than the renderer's eventually
+        // delivered candidate-active update and closes the immediate reversal
+        // race without affecting an ordinary acceptance key.
+        let fan_acceptance = modifiers.contains(NSEventModifierFlags::Option);
+        if (CANDIDATE_ACTIVE.load(Ordering::Acquire) || fan_acceptance)
             && unmodified
             && matches!(
                 event_ref.keyCode(),
