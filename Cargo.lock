@@ -767,6 +767,7 @@ dependencies = [
  "attachment-native-host",
  "attachment-native-types",
  "clap",
+ "nix",
  "serde",
  "serde_json",
 ]
@@ -4784,8 +4785,10 @@ dependencies = [
  "information-native-retrieval",
  "information-native-store",
  "information-native-types",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "url",
 ]
 
@@ -5902,7 +5905,6 @@ dependencies = [
  "fs4",
  "libc",
  "loom-document",
- "loom-host",
  "loom-types",
  "rusqlite",
  "rustix 1.1.4",

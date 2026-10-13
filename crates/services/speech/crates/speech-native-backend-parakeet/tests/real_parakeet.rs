@@ -265,19 +265,39 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
     ));
     eprintln!("real streaming Parakeet transcript: {stream_transcript}");
 
-    let cancelled_ticket = gateway
-        .transcribe(request("parakeet-real-cancelled", wav.clone()))
+    let mut cancelled_ticket = gateway
+        .transcribe(stream_request("parakeet-real-cancelled", format))
         .await
-        .expect("start cancelled request");
-    let peer_ticket = gateway
-        .transcribe(request("parakeet-real-peer", wav))
+        .expect("start held-input cancelled request");
+    assert!(cancelled_ticket.audio_sink.is_some());
+    let started = cancelled_ticket
+        .events
+        .recv()
         .await
-        .expect("start peer request");
+        .expect("held-input request must start");
+    assert!(matches!(
+        &started,
+        TranscriptionEvent::Started { request_id, route }
+            if request_id.0 == "parakeet-real-cancelled"
+                && route.backend_id == PARAKEET_BACKEND_ID
+                && route.model_id.as_deref() == Some(PARAKEET_MODEL_ID)
+    ));
+    let peer_admission = gateway.transcribe(request("parakeet-real-peer", wav));
+    tokio::pin!(peer_admission);
+    tokio::select! {
+        biased;
+        _ = &mut peer_admission => panic!("peer must queue behind the held one-slot request"),
+        _ = std::future::ready(()) => {}
+    }
     assert_eq!(
         gateway.cancel(&SpeechRequestId("parakeet-real-cancelled".to_string())),
         1
     );
-    let (cancelled_events, cancelled_result) = drain(cancelled_ticket).await;
+    let (mut cancelled_events, cancelled_result) = drain(cancelled_ticket).await;
+    cancelled_events.insert(0, started);
+    let peer_ticket = peer_admission
+        .await
+        .expect("admit peer after cancelled request drains");
     let (peer_events, peer_result) = drain(peer_ticket).await;
     assert_eq!(
         cancelled_result,

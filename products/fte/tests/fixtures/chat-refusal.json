@@ -1,0 +1,20 @@
+{
+  "id": "fixture-refusal",
+  "object": "chat.completion",
+  "model": "fixture-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "refusal": "Cannot comply 日本語🔒.\nKeep this exact."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4,
+    "completion_tokens": 3
+  }
+}

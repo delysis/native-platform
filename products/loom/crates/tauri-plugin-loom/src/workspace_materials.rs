@@ -38,9 +38,9 @@ pub(crate) fn current(
 }
 
 pub(crate) fn prepare(store: &mut ProjectStore) -> Result<(), IpcFailure> {
+    materials::metadata::refuse_legacy_bindings(store.root())
+        .map_err(|error| failure(error.to_string()))?;
     load_template(store)?;
-    // One anchored observation supplies both adoption and immutable retention.
-    materials::adopt_previous_bindings(store).map_err(|error| failure(error.to_string()))?;
     Ok(())
 }
 
@@ -169,46 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn existing_metadata_is_preserved_once_and_cannot_resurrect_removed_bindings() {
-        let (_root, mut store) = project();
-        let entry = source(&mut store, "Research");
-        let (_, configured) = current(&store).unwrap();
-        let previous = serde_json::to_vec(
-            &serde_json::json!({"schema":"loom.materials.v1", "items":configured.unwrap()}),
-        )
-        .unwrap();
-        let path = store.root().join(".loom/materials/bindings.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, &previous).unwrap();
-        store
-            .save_document(
-                TEMPLATE_PATH,
-                DocumentContent::Prose("# My workspace\n".into()),
-                "fixture without definitions",
-            )
-            .unwrap();
-        prepare(&mut store).unwrap();
-        assert_eq!(materials::list(&store).unwrap()[0].id, entry.id);
-        assert!(!path.exists());
-        let preserved = store.root().join(".loom/materials").join(format!(
-            "bindings-{}.json",
-            loom_types::BlobId::digest(&previous)
-        ));
-        assert_eq!(fs::read(preserved).unwrap(), previous);
-        materials::remove(&mut store, &entry.id).unwrap();
-        prepare(&mut store).unwrap();
-        assert!(materials::list(&store).unwrap().is_empty());
-        assert!(materials::read(&store, &entry.id).is_err());
-        assert!(
-            crate::context_attachments::describe_source(
-                store.root(),
-                entry.attachment_id.as_deref().unwrap()
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn stale_configuration_and_unsaved_edits_are_never_overwritten() {
         let (_root, mut store) = project();
         let first = source(&mut store, "First");
@@ -272,5 +232,196 @@ mod tests {
             Err(materials::MaterialError::NeedsAuthorization(_))
         ));
         assert_eq!(fs::read(library).unwrap(), original);
+    }
+
+    #[test]
+    fn retired_bindings_refuse_material_admission_and_preparation_without_mutation() {
+        for encrypted in [false, true] {
+            for configured in [false, true] {
+                let parent = tempfile::tempdir().unwrap();
+                let root = parent.path().join("Writing");
+                let (mut store, _) = if encrypted {
+                    fs::create_dir_all(root.join(".loom")).unwrap();
+                    let vault =
+                        desktop_vault::ProjectVault::initialize_with_key(&root, [51; 32]).unwrap();
+                    ProjectStore::initialize_with_vault(&root, "Writing", vault).unwrap()
+                } else {
+                    ProjectStore::initialize(&root, "Writing").unwrap()
+                };
+                let entry = source(&mut store, "Research");
+                let (_, items) = current(&store).unwrap();
+                let previous = serde_json::to_vec(&serde_json::json!({
+                    "schema": "loom.materials.v1", "items": items.unwrap()
+                }))
+                .unwrap();
+                if !configured {
+                    store
+                        .save_document(
+                            TEMPLATE_PATH,
+                            DocumentContent::Prose("# Workspace\n".into()),
+                            "fixture without definitions",
+                        )
+                        .unwrap();
+                }
+                let source_path = crate::context_attachments::original_path(
+                    store.root(),
+                    entry.attachment_id.as_deref().unwrap(),
+                )
+                .unwrap();
+                let original_source = fs::read(&source_path).unwrap();
+                let path = store.root().join(".loom/materials/bindings.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let stored = crate::private_sidecar::PayloadCodec::open(store.root())
+                    .unwrap()
+                    .seal(".loom/materials/bindings.json", &previous)
+                    .unwrap();
+                fs::write(&path, &stored).unwrap();
+                let workspace = fs::read(store.root().join(TEMPLATE_PATH)).unwrap();
+                let counts = store.counts().unwrap();
+                let names = fs::read_dir(path.parent().unwrap())
+                    .unwrap()
+                    .map(|item| item.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let listed = materials::list(&store);
+                let admitted = materials::admit(&store, &entry.id, 1_024);
+                let prepared = prepare(&mut store);
+                assert!(
+                    listed.is_err() && admitted.is_err() && prepared.is_err(),
+                    "retired admission: encrypted={encrypted}, configured={configured}, list={listed:?}, admit={admitted:?}, prepare={prepared:?}, legacy_after={:?}",
+                    fs::read(&path).ok()
+                );
+                assert_eq!(fs::read(&path).unwrap(), stored);
+                assert_eq!(
+                    fs::read(store.root().join(TEMPLATE_PATH)).unwrap(),
+                    workspace
+                );
+                assert_eq!(store.counts().unwrap(), counts);
+                assert_eq!(fs::read(&source_path).unwrap(), original_source);
+                assert_eq!(
+                    fs::read_dir(path.parent().unwrap())
+                        .unwrap()
+                        .map(|item| item.unwrap().file_name())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    names
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_binding_presence_refuses_unsafe_leafs_without_following_them() {
+        use std::os::unix::fs::symlink;
+        for kind in ["directory", "symlink", "dangling", "hardlink"] {
+            let (_parent, mut store) = project();
+            let entry = source(&mut store, "Current");
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("untouched");
+            fs::write(&target, b"untouched private source").unwrap();
+            let path = store.root().join(".loom/materials/bindings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            match kind {
+                "directory" => fs::create_dir(&path).unwrap(),
+                "symlink" => symlink(&target, &path).unwrap(),
+                "dangling" => symlink(outside.path().join("missing"), &path).unwrap(),
+                "hardlink" => fs::hard_link(&target, &path).unwrap(),
+                _ => unreachable!(),
+            }
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let link = metadata
+                .file_type()
+                .is_symlink()
+                .then(|| fs::read_link(&path).unwrap());
+            let workspace = fs::read(store.root().join(TEMPLATE_PATH)).unwrap();
+            let counts = store.counts().unwrap();
+            let listed = materials::list(&store);
+            let admitted = materials::admit(&store, &entry.id, 1_024);
+            let prepared = prepare(&mut store);
+            assert!(
+                listed.is_err() && admitted.is_err() && prepared.is_err(),
+                "retired {kind}: list={listed:?}, admit={admitted:?}, prepare={prepared:?}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"untouched private source");
+            assert_eq!(
+                fs::read(store.root().join(TEMPLATE_PATH)).unwrap(),
+                workspace
+            );
+            assert_eq!(store.counts().unwrap(), counts);
+            assert_eq!(
+                fs::symlink_metadata(&path).unwrap().file_type(),
+                metadata.file_type()
+            );
+            if let Some(link) = link {
+                assert_eq!(fs::read_link(&path).unwrap(), link);
+            }
+        }
+    }
+
+    #[test]
+    fn archive_only_metadata_never_revives_bindings_or_blocks_retained_evidence() {
+        let (_parent, mut store) = project();
+        let entry = source(&mut store, "Exact retained source");
+        let retained = materials::read(&store, &entry.id).unwrap();
+        let evidence = &retained.evidence[0];
+        let (_, items) = current(&store).unwrap();
+        let previous = serde_json::to_vec(&serde_json::json!({
+            "schema": "loom.materials.v1", "items": items.unwrap()
+        }))
+        .unwrap();
+        materials::remove(&mut store, &entry.id).unwrap();
+        let archive = store.root().join(".loom/materials").join(format!(
+            "bindings-{}.json",
+            loom_types::BlobId::digest(&previous)
+        ));
+        fs::write(&archive, &previous).unwrap();
+        let workspace = fs::read(store.root().join(TEMPLATE_PATH)).unwrap();
+        let counts = store.counts().unwrap();
+        prepare(&mut store).unwrap();
+        assert!(materials::list(&store).unwrap().is_empty());
+        assert!(materials::admit(&store, &entry.id, 1_024).is_err());
+        assert_eq!(
+            materials::read_evidence(&store, &entry.id, &evidence.id)
+                .unwrap()
+                .text,
+            retained.text
+        );
+        assert_eq!(fs::read(&archive).unwrap(), previous);
+        assert_eq!(
+            fs::read(store.root().join(TEMPLATE_PATH)).unwrap(),
+            workspace
+        );
+        assert_eq!(store.counts().unwrap(), counts);
+    }
+
+    #[test]
+    fn retired_bindings_refuse_before_adopting_an_unregistered_workspace_document() {
+        let (_parent, mut store) = project();
+        let workspace_path = store.root().join(TEMPLATE_PATH);
+        let author_bytes = b"# Author-owned workspace\r\nKeep exact bytes.\r\n";
+        fs::write(&workspace_path, author_bytes).unwrap();
+        assert!(
+            !store
+                .list_documents()
+                .unwrap()
+                .iter()
+                .any(|document| document.relative_path == TEMPLATE_PATH)
+        );
+        let path = store.root().join(".loom/materials/bindings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let retired = b"{\"schema\":\"loom.materials.v1\",\"items\":[]}";
+        fs::write(&path, retired).unwrap();
+        let counts = store.counts().unwrap();
+        let result = prepare(&mut store);
+        assert!(result.is_err(), "retired pre-load result={result:?}");
+        assert_eq!(store.counts().unwrap(), counts);
+        assert!(
+            !store
+                .list_documents()
+                .unwrap()
+                .iter()
+                .any(|document| document.relative_path == TEMPLATE_PATH)
+        );
+        assert_eq!(fs::read(&workspace_path).unwrap(), author_bytes);
+        assert_eq!(fs::read(&path).unwrap(), retired);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 }

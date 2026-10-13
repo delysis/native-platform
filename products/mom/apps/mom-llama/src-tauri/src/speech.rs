@@ -324,7 +324,9 @@ impl MomSpeech {
                 ));
             }
         };
-        let current = assistant_message_target(conversation_id, message_id)?;
+        let current = assistant_message_target(conversation_id, message_id).inspect_err(|_| {
+            self.finish_operation(operation, &request_id);
+        })?;
         if match &current {
             Ok(current) => current.text_sha256 != target.text_sha256,
             Err(_) => true,
@@ -452,7 +454,10 @@ impl MomSpeech {
                 ));
             }
         };
-        let current = mom_llama_runtime::attachment_transcription_input(conversation_id, anchor)?;
+        let current = mom_llama_runtime::attachment_transcription_input(conversation_id, anchor)
+            .inspect_err(|_| {
+                self.finish_operation(operation, &request_id);
+            })?;
         if match &current {
             Ok(current) => {
                 current.anchor != input.anchor
@@ -476,7 +481,10 @@ impl MomSpeech {
             self.finish_operation(operation, &request_id);
             return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
         }
-        let selection = match select_resident_parakeet(&self.executor.descriptors()?) {
+        let descriptors = self.executor.descriptors().inspect_err(|_| {
+            self.finish_operation(operation, &request_id);
+        })?;
+        let selection = match select_resident_parakeet(&descriptors) {
             Ok(selection) => selection,
             Err(blocker) => {
                 self.finish_operation(operation, &request_id);
@@ -1561,5 +1569,608 @@ mod tests {
         );
         speech.finish_operation("operation-456", &first);
         assert!(speech.state.lock().expect("state").active.is_empty());
+    }
+
+    mod postflight_cleanup {
+        use super::*;
+        use mom_llama_runtime::conversation_store::{Message, load_db, save_db};
+        use speech_native_types::{SpeechResolvedRoute, SpeechUsage};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const MESSAGE_TEXT: &str = "An exact owned assistant message.";
+        const MOCK_WAV: &[u8] = b"mock-complete-wav";
+        // The existing Runtime attachment fixture: one silent PCM sample.
+        const ATTACHMENT_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
+            fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
+            data\x02\x00\x00\x00\x00\x00";
+
+        struct OwnedSpeechStore {
+            _directory: tempfile::TempDir,
+            store: PathBuf,
+            invalid_store: PathBuf,
+            conversation_id: String,
+            message_id: String,
+        }
+
+        impl Drop for OwnedSpeechStore {
+            fn drop(&mut self) {
+                mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+            }
+        }
+
+        impl OwnedSpeechStore {
+            fn new() -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    std::env::var("LLAMA_NATIVE_KIT_STORE_KEY_HEX")
+                        .is_ok_and(|key| key == "17".repeat(32)),
+                    "owned speech fixtures require the explicit repeated-17 test key"
+                );
+                let directory = tempfile::tempdir()?;
+                let store = directory.path().join("store");
+                let invalid_store = directory.path().join("regular-file-not-a-directory");
+                std::fs::write(&invalid_store, b"owned postflight fault")?;
+                let mut fixture = Self {
+                    _directory: directory,
+                    store,
+                    invalid_store,
+                    conversation_id: String::new(),
+                    message_id: "speech-owned-message".to_string(),
+                };
+                fixture.restore();
+                fixture.conversation_id =
+                    mom_llama_runtime::conversation_new(Some("Owned speech source".to_string()))?
+                        .result
+                        .expect("owned conversation")
+                        .id;
+                let mut db = load_db()?;
+                let conversation = db
+                    .conversations
+                    .iter_mut()
+                    .find(|item| item.id == fixture.conversation_id)
+                    .expect("owned conversation persisted");
+                conversation.messages.push(Message {
+                    id: fixture.message_id.clone(),
+                    conversation_id: fixture.conversation_id.clone(),
+                    role: MessageRole::Assistant,
+                    content: MESSAGE_TEXT.to_string(),
+                    created_at: "1".to_string(),
+                    parent_id: None,
+                    model: None,
+                    receipt_id: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    reasoning_content: None,
+                    reasoning_incomplete: false,
+                    branch_index: None,
+                    branch_count: None,
+                    attribution: None,
+                    attachment_ids: Vec::new(),
+                });
+                conversation.active_leaf_message_id = Some(fixture.message_id.clone());
+                save_db(&db)?;
+                Ok(fixture)
+            }
+
+            fn restore(&self) {
+                mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+                    self.store.clone(),
+                ));
+            }
+
+            fn audio_anchor(&self) -> anyhow::Result<AttachmentPreviewAnchor> {
+                let path = self.store.join("owned.wav");
+                std::fs::write(&path, ATTACHMENT_WAV)?;
+                let imported = mom_llama_runtime::attachment_import(
+                    &mom_llama_runtime::OperationScope::detached(),
+                    &self.conversation_id,
+                    &path,
+                )?
+                .result
+                .expect("real owned attachment import");
+                let catalog = mom_llama_runtime::attachment_preview(&imported.attachment.id)?
+                    .result
+                    .expect("current attachment catalog");
+                let artifact_id = catalog
+                    .primary
+                    .as_ref()
+                    .expect("canonical audio preview")
+                    .artifact_id
+                    .clone();
+                Ok(AttachmentPreviewAnchor {
+                    attachment_id: catalog.attachment_id,
+                    root_sha256: catalog.root_sha256,
+                    artifact_id,
+                    policy_fingerprint: catalog.policy_fingerprint,
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct MockPostflightExecutor {
+            after_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+            inventory_error: Arc<AtomicBool>,
+            foreign_request: AtomicBool,
+            calls: AtomicUsize,
+        }
+
+        impl MockPostflightExecutor {
+            fn respond(&self, request_id: SpeechRequestId) -> SpeechRequestId {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let effect = self
+                    .after_response
+                    .lock()
+                    .expect("owned response effect")
+                    .take();
+                if let Some(effect) = effect {
+                    effect();
+                }
+                if self.foreign_request.load(Ordering::Relaxed) {
+                    SpeechRequestId("foreign-response-request".to_string())
+                } else {
+                    request_id
+                }
+            }
+        }
+
+        #[async_trait]
+        impl SpeechExecutor for MockPostflightExecutor {
+            fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError> {
+                if self.inventory_error.load(Ordering::Relaxed) {
+                    Err(SpeechHostError::StateUnavailable)
+                } else {
+                    Ok(vec![apple_descriptor(), parakeet_descriptor()])
+                }
+            }
+
+            async fn synthesize(
+                &self,
+                request: SynthesisRequest,
+            ) -> Result<SynthesisResponse, String> {
+                assert_eq!(
+                    request.context.routing.privacy,
+                    SpeechPrivacyPolicy::LocalOnly
+                );
+                assert_eq!(
+                    request.input,
+                    SynthesisInput::Text {
+                        text: MESSAGE_TEXT.to_string()
+                    }
+                );
+                Ok(SynthesisResponse {
+                    request_id: self.respond(request.context.request_id),
+                    route: SpeechResolvedRoute {
+                        backend_id: APPLE_BACKEND_ID.to_string(),
+                        model_id: None,
+                        voice_id: Some("voice.local".to_string()),
+                        backend_kind: SpeechBackendKind::PlatformOnDevice,
+                        network: NetworkBehavior::Never,
+                    },
+                    // Envelope bytes only; no synthesis, decoding or playback.
+                    output: SynthesisOutput::Complete {
+                        audio: MOCK_WAV.to_vec(),
+                        format: AudioOutputFormat::Wav,
+                    },
+                    duration_ms: Some(1),
+                    alignments: Vec::new(),
+                    usage: SpeechUsage::default(),
+                })
+            }
+
+            async fn transcribe(
+                &self,
+                request: TranscriptionRequest,
+            ) -> Result<TranscriptionResponse, String> {
+                assert_eq!(
+                    request.context.routing.privacy,
+                    SpeechPrivacyPolicy::LocalOnly
+                );
+                assert_eq!(
+                    request.input,
+                    TranscriptionInput::Complete {
+                        audio: AudioInput::Encoded {
+                            format: EncodedAudioFormat::Wav,
+                            data: ATTACHMENT_WAV.to_vec()
+                        }
+                    }
+                );
+                Ok(TranscriptionResponse {
+                    request_id: self.respond(request.context.request_id),
+                    route: SpeechResolvedRoute {
+                        backend_id: PARAKEET_BACKEND_ID.to_string(),
+                        model_id: Some(PARAKEET_MODEL_ID.to_string()),
+                        voice_id: None,
+                        backend_kind: SpeechBackendKind::EmbeddedModel,
+                        network: NetworkBehavior::Never,
+                    },
+                    text: "Owned mock transcript.".to_string(),
+                    language: Some("en".to_string()),
+                    segments: Vec::new(),
+                    // Required response-envelope flag; this fixture proves no inference.
+                    usage: SpeechUsage {
+                        real_local_inference: true,
+                        ..SpeechUsage::default()
+                    },
+                })
+            }
+
+            fn cancel(&self, _: &SpeechRequestId) -> usize {
+                0
+            }
+
+            fn quiesce(&self) -> Result<(), SpeechHostError> {
+                Ok(())
+            }
+
+            async fn shutdown(&self) -> Result<(), SpeechHostError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[allow(clippy::too_many_lines)]
+        async fn read_aloud_releases_exact_slot_after_source_store_error() -> anyhow::Result<()> {
+            let fixture = OwnedSpeechStore::new()?;
+            let executor = Arc::new(MockPostflightExecutor::default());
+            let speech = Arc::new(MomSpeech {
+                executor: executor.clone(),
+                state: Mutex::new(SpeechState::default()),
+            });
+            // Prove the public path reaches ordinary publication before any fault.
+            let output = speech
+                .read_aloud(
+                    &fixture.conversation_id,
+                    &fixture.message_id,
+                    "tts-positive-before-fault",
+                )
+                .await?
+                .result
+                .expect("ordinary playback");
+            assert_eq!(
+                output.binding.text_sha256,
+                sha256_hex(MESSAGE_TEXT.as_bytes())
+            );
+            assert_eq!(
+                speech
+                    .playback_bytes(
+                        &output.playback_id,
+                        &fixture.message_id,
+                        &output.binding.text_sha256,
+                        &output.binding.backend_descriptor_sha256,
+                    )
+                    .expect("ordinary exact playback bytes"),
+                MOCK_WAV
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert!(
+                speech
+                    .stop(None, Some(&output.playback_id))?
+                    .result
+                    .expect("stop playback")
+                    .playback_released
+            );
+
+            executor.foreign_request.store(true, Ordering::Relaxed);
+            let foreign = speech
+                .read_aloud(
+                    &fixture.conversation_id,
+                    &fixture.message_id,
+                    "tts-foreign-response",
+                )
+                .await?;
+            assert_eq!(
+                foreign.blocker.expect("foreign response refusal").code,
+                "speech_provenance_mismatch"
+            );
+            executor.foreign_request.store(false, Ordering::Relaxed);
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert!(
+                speech
+                    .state
+                    .lock()
+                    .expect("speech state")
+                    .playback
+                    .is_empty()
+            );
+
+            let message_id = fixture.message_id.clone();
+            *executor.after_response.lock().expect("response effect") = Some(Box::new(move || {
+                let mut db = load_db().expect("owned source store");
+                db.conversations
+                    .iter_mut()
+                    .flat_map(|conversation| conversation.messages.iter_mut())
+                    .find(|message| message.id == message_id)
+                    .expect("owned source message")
+                    .content = "Changed source.".into();
+                save_db(&db).expect("save changed source");
+            }));
+            let stale = speech
+                .read_aloud(
+                    &fixture.conversation_id,
+                    &fixture.message_id,
+                    "tts-source-changed",
+                )
+                .await?;
+            assert_eq!(
+                stale.blocker.expect("changed source refusal").code,
+                "speech_read_aloud_stale"
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert!(
+                speech
+                    .state
+                    .lock()
+                    .expect("speech state")
+                    .playback
+                    .is_empty()
+            );
+            let mut db = load_db()?;
+            db.conversations
+                .iter_mut()
+                .flat_map(|conversation| conversation.messages.iter_mut())
+                .find(|message| message.id == fixture.message_id)
+                .expect("owned source message")
+                .content = MESSAGE_TEXT.into();
+            save_db(&db)?;
+
+            let weak = Arc::downgrade(&speech);
+            *executor.after_response.lock().expect("response effect") = Some(Box::new(move || {
+                weak.upgrade()
+                    .expect("owned speech")
+                    .stop(Some("tts-stop-after-response"), None)
+                    .expect("stop admitted speech");
+            }));
+            let stopped = speech
+                .read_aloud(
+                    &fixture.conversation_id,
+                    &fixture.message_id,
+                    "tts-stop-after-response",
+                )
+                .await?;
+            assert_eq!(
+                stopped.blocker.expect("stopped response refusal").code,
+                "speech_cancelled"
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert!(
+                speech
+                    .state
+                    .lock()
+                    .expect("speech state")
+                    .playback
+                    .is_empty()
+            );
+
+            for index in 0..MAX_ACTIVE_SPEECH_OPERATIONS + 2 {
+                let invalid_store = fixture.invalid_store.clone();
+                *executor.after_response.lock().expect("response effect") =
+                    Some(Box::new(move || {
+                        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+                            invalid_store,
+                        ));
+                    }));
+                let calls = executor.calls.load(Ordering::Relaxed);
+                let result = speech
+                    .read_aloud(
+                        &fixture.conversation_id,
+                        &fixture.message_id,
+                        &format!("tts-postflight-error-{index}"),
+                    )
+                    .await;
+                fixture.restore();
+                assert!(
+                    result.is_err(),
+                    "TTS must retain the postflight outer error at iteration {index}; public result={result:?}"
+                );
+                let error = result.expect_err("post-response Store error must remain outer error");
+                assert!(
+                    error.downcast_ref::<std::io::Error>().is_some(),
+                    "retain the original I/O error: {error:#}"
+                );
+                assert_eq!(executor.calls.load(Ordering::Relaxed), calls + 1);
+                let state = speech.state.lock().expect("speech state");
+                assert!(
+                    state.playback.is_empty(),
+                    "failed source revalidation published audio"
+                );
+            }
+            let recovered = speech
+                .read_aloud(
+                    &fixture.conversation_id,
+                    &fixture.message_id,
+                    "tts-positive-after-errors",
+                )
+                .await?
+                .result
+                .expect("capacity recovered");
+            assert_eq!(
+                speech
+                    .playback_bytes(
+                        &recovered.playback_id,
+                        &fixture.message_id,
+                        &recovered.binding.text_sha256,
+                        &recovered.binding.backend_descriptor_sha256,
+                    )
+                    .expect("recovered exact playback bytes"),
+                MOCK_WAV
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert_eq!(
+                std::fs::read(&fixture.invalid_store)?,
+                b"owned postflight fault"
+            );
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_lines)]
+        async fn transcription_postflight_error(inventory_error: bool) -> anyhow::Result<()> {
+            let fixture = OwnedSpeechStore::new()?;
+            let anchor = fixture.audio_anchor()?;
+            let input = mom_llama_runtime::attachment_transcription_input(
+                &fixture.conversation_id,
+                &anchor,
+            )?
+            .expect("current actual attachment authority");
+            assert_eq!(input.bytes, ATTACHMENT_WAV);
+            assert_eq!(input.bytes_sha256, input.blob_object_id);
+            let executor = Arc::new(MockPostflightExecutor::default());
+            let speech = Arc::new(MomSpeech {
+                executor: executor.clone(),
+                state: Mutex::new(SpeechState::default()),
+            });
+            let published = speech
+                .transcribe_attachment(
+                    &fixture.conversation_id,
+                    &anchor,
+                    "stt-positive-before-fault",
+                )
+                .await?
+                .result
+                .expect("ordinary transcript");
+            assert_eq!(published.transcript, "Owned mock transcript.");
+            assert_eq!(published.provenance.audio_sha256, input.bytes_sha256);
+            assert_eq!(published.provenance.root_sha256, anchor.root_sha256);
+            assert_eq!(published.provenance.artifact_id, anchor.artifact_id);
+            assert_eq!(
+                published.provenance.policy_fingerprint,
+                anchor.policy_fingerprint
+            );
+            assert!(published.insertion_requires_explicit_normal_edit);
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+
+            let calls = executor.calls.load(Ordering::Relaxed);
+            let foreign_source = speech
+                .transcribe_attachment("foreign-conversation", &anchor, "stt-foreign-conversation")
+                .await?;
+            assert_eq!(
+                foreign_source.blocker.expect("foreign source refusal").code,
+                "attachment_transcription_conversation_mismatch"
+            );
+            let mut stale_anchor = anchor.clone();
+            stale_anchor.policy_fingerprint = "changed-policy".to_string();
+            let stale = speech
+                .transcribe_attachment(&fixture.conversation_id, &stale_anchor, "stt-stale-source")
+                .await?;
+            assert_eq!(
+                stale.blocker.expect("stale source refusal").code,
+                "attachment_preview_stale"
+            );
+            assert_eq!(
+                executor.calls.load(Ordering::Relaxed),
+                calls,
+                "source refusals precede speech dispatch"
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+
+            executor.foreign_request.store(true, Ordering::Relaxed);
+            let foreign = speech
+                .transcribe_attachment(&fixture.conversation_id, &anchor, "stt-foreign-response")
+                .await?;
+            assert_eq!(
+                foreign.blocker.expect("foreign response refusal").code,
+                "speech_provenance_mismatch"
+            );
+            executor.foreign_request.store(false, Ordering::Relaxed);
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+
+            let weak = Arc::downgrade(&speech);
+            *executor.after_response.lock().expect("response effect") = Some(Box::new(move || {
+                weak.upgrade()
+                    .expect("owned speech")
+                    .stop(Some("stt-stop-after-response"), None)
+                    .expect("stop admitted speech");
+            }));
+            let stopped = speech
+                .transcribe_attachment(&fixture.conversation_id, &anchor, "stt-stop-after-response")
+                .await?;
+            assert_eq!(
+                stopped.blocker.expect("stopped response refusal").code,
+                "speech_cancelled"
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+
+            for index in 0..MAX_ACTIVE_SPEECH_OPERATIONS + 2 {
+                if inventory_error {
+                    let fail_inventory = executor.inventory_error.clone();
+                    *executor.after_response.lock().expect("response effect") =
+                        Some(Box::new(move || {
+                            fail_inventory.store(true, Ordering::Relaxed);
+                        }));
+                } else {
+                    let invalid_store = fixture.invalid_store.clone();
+                    *executor.after_response.lock().expect("response effect") =
+                        Some(Box::new(move || {
+                            mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+                                invalid_store,
+                            ));
+                        }));
+                }
+                let calls = executor.calls.load(Ordering::Relaxed);
+                let result = speech
+                    .transcribe_attachment(
+                        &fixture.conversation_id,
+                        &anchor,
+                        &format!("stt-postflight-error-{index}"),
+                    )
+                    .await;
+                fixture.restore();
+                executor.inventory_error.store(false, Ordering::Relaxed);
+                assert!(
+                    result.is_err(),
+                    "STT must retain the postflight outer error: inventory={inventory_error}, iteration={index}; public result={result:?}"
+                );
+                let error = result.expect_err("post-response outer error must remain an error");
+                if inventory_error {
+                    assert_eq!(
+                        error.downcast_ref::<SpeechHostError>(),
+                        Some(&SpeechHostError::StateUnavailable)
+                    );
+                } else {
+                    assert!(
+                        error.downcast_ref::<std::io::Error>().is_some(),
+                        "retain the original I/O error: {error:#}"
+                    );
+                }
+                assert_eq!(executor.calls.load(Ordering::Relaxed), calls + 1);
+                let state = speech.state.lock().expect("speech state");
+                assert!(
+                    state.playback.is_empty(),
+                    "transcription must not publish playback"
+                );
+            }
+            let recovered = speech
+                .transcribe_attachment(
+                    &fixture.conversation_id,
+                    &anchor,
+                    "stt-positive-after-errors",
+                )
+                .await?
+                .result
+                .expect("capacity recovered");
+            assert_eq!(recovered.transcript, "Owned mock transcript.");
+            assert_eq!(recovered.provenance.audio_sha256, input.bytes_sha256);
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            assert_eq!(
+                std::fs::read(fixture.store.join("owned.wav"))?,
+                ATTACHMENT_WAV
+            );
+            assert_eq!(
+                std::fs::read(&fixture.invalid_store)?,
+                b"owned postflight fault"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn transcribe_releases_exact_slot_after_attachment_store_error() -> anyhow::Result<()>
+        {
+            transcription_postflight_error(false).await
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn transcribe_releases_exact_slot_after_resident_inventory_error()
+        -> anyhow::Result<()> {
+            transcription_postflight_error(true).await
+        }
     }
 }

@@ -13,6 +13,7 @@ type FinalSenders =
 #[derive(Default)]
 struct FixtureBackend {
     pending: FinalSenders,
+    reported_usage: Mutex<GatewayUsage>,
     deferred: AtomicBool,
     panic_next: AtomicBool,
     defer_setup: AtomicBool,
@@ -96,7 +97,7 @@ impl GatewayBackend for FixtureBackend {
                 model: request.route.model_id.clone(),
                 route: request.route,
                 output: vec![],
-                usage: GatewayUsage::default(),
+                usage: self.reported_usage.lock().expect("fixture usage").clone(),
                 output_groups: Vec::new(),
                 status: TerminalStatus::Completed,
                 previous_response_id: None,
@@ -478,4 +479,77 @@ async fn closed_worker_can_be_replaced_before_old_waiter_cleanup_without_clearin
     bounded(owner.wait_playground(&next))
         .await
         .expect_err("replacement cancelled");
+}
+
+#[tokio::test]
+async fn desktop_activity_keeps_exact_public_usage_and_marks_unrepresentable_totals_unknown() {
+    let (owner, database, backend) = fixture();
+    let max = u64::from(u32::MAX);
+    let reports = [
+        (Some(7), Some(3), Some(10)),
+        (Some(max), Some(0), Some(max)),
+        (None, None, None),
+        (Some(max), Some(1), None),
+        (Some(max + 1), Some(0), None),
+    ];
+    for (index, (input, output, stored)) in reports.into_iter().enumerate() {
+        *backend.reported_usage.lock().expect("fixture usage") = GatewayUsage {
+            input_tokens: input,
+            output_tokens: output,
+            provenance: if input.is_some() && output.is_some() {
+                fte_types::UsageProvenance::Exact
+            } else {
+                fte_types::UsageProvenance::Unknown
+            },
+            ..GatewayUsage::default()
+        };
+        let response = bounded(owner.chat(chat()))
+            .await
+            .expect("public desktop completion");
+        if let (Some(input), Some(output)) = (input, output) {
+            assert_eq!(response["usage"]["prompt_tokens"].as_u64(), Some(input));
+            assert_eq!(
+                response["usage"]["completion_tokens"].as_u64(),
+                Some(output)
+            );
+            assert_eq!(
+                response["usage"]["total_tokens"].as_u64(),
+                Some(input + output)
+            );
+            assert_eq!(response["usage"]["x_usage_provenance"], "exact");
+        } else {
+            assert_eq!(response["usage"]["x_usage_provenance"], "unknown");
+        }
+        let logs = database.get_recent_logs(10).expect("stored activity");
+        assert_eq!(logs.len(), index + 1);
+        assert_eq!(logs[0].provider_id, "activity-fixture");
+        assert_eq!(logs[0].model_id, "activity-model");
+        assert_eq!(logs[0].status_code, 200);
+        assert_eq!(
+            logs[0].tokens_used,
+            stored,
+            "report {index}: public response={response}; activity={}",
+            serde_json::to_string(&logs).expect("activity JSON")
+        );
+    }
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 5);
+    let summary = database.get_global_log_summary().expect("global summary");
+    assert_eq!(summary.request_count, 5);
+    assert_eq!(summary.total_tokens, max + 10);
+    assert_eq!(summary.unknown_usage_requests, 3);
+    let providers = database
+        .get_provider_log_summaries()
+        .expect("provider summary");
+    let summary = providers.get("activity-fixture").expect("fixture activity");
+    assert_eq!(summary.request_count, 5);
+    assert_eq!(summary.total_tokens, max + 10);
+    assert_eq!(summary.unknown_usage_requests, 3);
+    let activity = serde_json::to_value(database.get_recent_logs(10).expect("logs"))
+        .expect("public activity projection");
+    assert!(activity[0]["tokens_used"].is_null());
+    assert!(activity[1]["tokens_used"].is_null());
+    assert!(activity[2]["tokens_used"].is_null());
+    assert_eq!(activity[3]["tokens_used"].as_u64(), Some(max));
+    assert_eq!(activity[4]["tokens_used"].as_u64(), Some(10));
+    assert!(!activity.to_string().contains("private prompt"));
 }

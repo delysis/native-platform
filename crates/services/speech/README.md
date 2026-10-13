@@ -14,7 +14,7 @@ product conversation state.
 | `speech-native-router` | Privacy and capability gates plus deterministic model and voice selection. |
 | `speech-native-host` | Backend registry, dispatch, cancellation, and orderly shutdown. |
 | `speech-native-platform` | Conservative platform capability discovery and the proven Apple TTS adapter. |
-| `speech-native-backend-parakeet` | Resident local Parakeet STT using exact manifest-verified, content-addressed managed weights. |
+| `speech-native-backend-parakeet` | Resident local Parakeet STT using exact manifest-verified shared Hub snapshots or content-addressed managed weights. |
 
 STT and TTS live together because they share audio formats, streaming and
 backpressure, cancellation, platform permission semantics, voice/model
@@ -46,11 +46,15 @@ joined shutdown at its composition root. A Rust consumer may inject and use an
 
 ## Verification
 
+Follow the owning [guidance](AGENTS.md) and root
+[CONTRIBUTING.md](../../../CONTRIBUTING.md) for tool pins, affected reverse
+consumers, and the clean-tree gate. From the repository root, run the affected
+service group:
+
 ```sh
-cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-boundaries.sh
+node scripts/ci/cargo-group.mjs test service-speech
+node scripts/ci/cargo-group.mjs clippy service-speech
+bash crates/services/speech/scripts/check-boundaries.sh
 ```
 
 Real Apple TTS and Parakeet STT proofs remain environment-gated and must label

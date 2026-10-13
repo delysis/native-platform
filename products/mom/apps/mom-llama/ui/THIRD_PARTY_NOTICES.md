@@ -18,4 +18,16 @@ Path data is rendered by Rust in `src-tauri/src/view.rs`; no Lucide JavaScript
 or Svelte runtime is included. The inspected upstream UI pins
 `@lucide/svelte` 1.25.0.
 
-The Lucide ISC license is copied verbatim in `LUCIDE-LICENSE.txt`.
+The historical Lucide ISC notice is retained in `LUCIDE-LICENSE.txt`.
+
+### Pinned geometry additions
+
+`chevron-down` and `git-branch` inner SVG geometry is copied from
+`lucide-icons/lucide` commit `70562c1ee1c4fdcf736fe97bc893fb8511927934`,
+`icons/chevron-down.svg` and `icons/git-branch.svg`. The existing Rust SVG
+wrapper retains its size, stroke, CSS and accessibility contract.
+
+The complete pinned upstream `LICENSE`, including its Lucide ISC notice and
+Feather MIT terms, is appended verbatim to `LUCIDE-LICENSE.txt`. That license
+identifies `chevron-down` as Feather-derived. This bounded addition does not
+establish exact originating revisions for the older embedded glyphs.

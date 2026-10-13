@@ -2732,8 +2732,15 @@ mod tests {
                 .code,
             "persona_not_found"
         );
-        crate::attachments::persist_drafts_with_attachment_gc(&stale_drafts, &BTreeSet::new())
-            .expect("attempt stale Persona draft resurrection");
+        crate::attachments::persist_drafts_with_attachment_gc(
+            &stale_drafts,
+            &store
+                .get::<DraftDb>(DRAFTS_NAMESPACE)
+                .expect("read current draft preimage for tombstone filter control")
+                .unwrap_or_default(),
+            &BTreeSet::new(),
+        )
+        .expect("attempt stale Persona draft resurrection");
         assert!(
             store
                 .get::<DraftDb>(DRAFTS_NAMESPACE)

@@ -1649,8 +1649,10 @@ fn load_manifests_for_gc_from_documents(
 /// Persist a draft mutation and reclaim only staged attachments explicitly
 /// unlinked by that mutation. The attachment index, draft, manifests, and
 /// content-addressed objects change in one SQLite transaction.
+/// The original draft snapshot must still match when that transaction commits.
 pub(crate) fn persist_drafts_with_attachment_gc(
     drafts: &DraftDb,
+    expected_drafts: &DraftDb,
     removed_attachment_ids: &BTreeSet<String>,
 ) -> Result<PathBuf> {
     let _lifecycle = lock_attachment_lifecycle()?;
@@ -1659,7 +1661,7 @@ pub(crate) fn persist_drafts_with_attachment_gc(
         conversations_to_write: None,
         drafts_to_write: Some(drafts),
         expected_conversations: Some(&conversations),
-        expected_drafts: None,
+        expected_drafts: Some(expected_drafts),
         effective_conversations: &conversations,
         effective_drafts: drafts,
         removed_attachment_ids,
@@ -4876,6 +4878,187 @@ mod tests {
             .expect("preparation must return a typed result")
             .expect_err("content mismatch must block");
         assert_eq!(blocked.blocker.code, "attachment_content_mismatch");
+    }
+
+    fn persist_draft_cas_fixture(
+        proposed: &DraftDb,
+        expected: &DraftDb,
+        removed_ids: &BTreeSet<String>,
+    ) -> Result<PathBuf> {
+        // This fixture calls the real persistence owner. Forwarding the
+        // original snapshot is the sole before/after adapter difference.
+        let _ = expected;
+        persist_drafts_with_attachment_gc(proposed, expected, removed_ids)
+    }
+
+    type DraftCasDocumentBytes = std::collections::BTreeMap<String, Option<Vec<u8>>>;
+
+    fn draft_cas_document_namespaces(records: &[&AttachmentRecord]) -> BTreeSet<String> {
+        let store = RuntimeStore::current().expect("owned draft CAS store");
+        let mut namespaces = BTreeSet::from([
+            CONVERSATIONS_NAMESPACE.to_string(),
+            DRAFTS_NAMESPACE.to_string(),
+            ATTACHMENTS_NAMESPACE.to_string(),
+        ]);
+        for record in records {
+            let namespace = record
+                .manifest_namespace
+                .as_ref()
+                .expect("publicly staged manifest namespace");
+            let manifest = store
+                .get::<AttachmentManifest>(namespace)
+                .expect("read publicly staged manifest")
+                .expect("publicly staged manifest");
+            namespaces.insert(namespace.clone());
+            namespaces.extend(
+                manifest_object_ids(&manifest)
+                    .iter()
+                    .map(|id| object_namespace_str(id)),
+            );
+        }
+        namespaces
+    }
+
+    fn draft_cas_document_bytes(namespaces: &BTreeSet<String>) -> DraftCasDocumentBytes {
+        let store = RuntimeStore::current().expect("owned draft CAS store");
+        namespaces
+            .iter()
+            .map(|namespace| {
+                (
+                    namespace.clone(),
+                    store.get_bytes(namespace).expect("read owned stored bytes"),
+                )
+            })
+            .collect()
+    }
+
+    fn stale_draft_replacement_preserves_publicly_staged_chip(clear: bool) {
+        let _session = TestDataDir::new(if clear {
+            "stale-draft-clear-cas"
+        } else {
+            "stale-draft-update-cas"
+        });
+        let target = new_conversation("Target ordinary conversation");
+        let other = new_conversation("Other ordinary conversation");
+        let target_attachment = stage_text(&target.id, "Owned target attachment bytes.");
+        crate::conversation_store::draft_update(
+            Some(&target.id),
+            "Original target draft".to_string(),
+            vec![target_attachment.id.clone()],
+        )
+        .expect("ordinary initial draft mutation");
+
+        let expected = load_drafts().expect("original pre-mutation DraftDb");
+        let mut proposed = expected.clone();
+        if clear {
+            proposed
+                .drafts
+                .retain(|draft| draft.conversation_id.as_deref() != Some(target.id.as_str()));
+        } else {
+            let draft = proposed
+                .drafts
+                .iter_mut()
+                .find(|draft| draft.conversation_id.as_deref() == Some(target.id.as_str()))
+                .expect("target draft in pre-mutation snapshot");
+            draft.message = "Proposed stale target update".to_string();
+            draft.attachment_ids.clear();
+            draft.updated_at = now_ms().to_string();
+        }
+        let removed_ids = BTreeSet::from([target_attachment.id.clone()]);
+
+        // This is the actual public producer. Its lifecycle lock and encrypted
+        // atomic publication complete before the stale persistence call below.
+        let other_attachment = stage_text(&other.id, "Different owned survivor attachment bytes.");
+        let published_other = crate::conversation_store::draft_update(
+            Some(&other.id),
+            "Other independently published draft".to_string(),
+            vec![other_attachment.id.clone()],
+        )
+        .expect("publish the other ordinary conversation draft")
+        .result
+        .expect("published other draft result");
+        let published = load_drafts().expect("DraftDb after the public producer");
+        assert_ne!(
+            published, expected,
+            "the fixture must make the preimage stale"
+        );
+        assert_eq!(
+            published_other.attachment_ids,
+            vec![other_attachment.id.clone()]
+        );
+        let namespaces = draft_cas_document_namespaces(&[&target_attachment, &other_attachment]);
+        let before = draft_cas_document_bytes(&namespaces);
+        assert!(before.values().all(Option::is_some));
+        let conversations = load_db().expect("conversations before draft-only replacement");
+
+        let outcome = persist_draft_cas_fixture(&proposed, &expected, &removed_ids);
+        let selected_error = outcome.as_ref().err().map(ToString::to_string);
+        let observed = load_drafts().expect("DraftDb after the persistence attempt");
+        let observed_other = crate::conversation_store::draft_get(Some(&other.id))
+            .expect("public read of the other draft")
+            .result
+            .expect("other draft result");
+        let after = draft_cas_document_bytes(&namespaces);
+        assert!(
+            selected_error
+                .as_deref()
+                .is_some_and(|error| error == "draft state changed before attachment GC commit")
+                && observed == published
+                && observed_other == published_other
+                && after == before,
+            "stale whole-DraftDb replacement must refuse without collateral publication or GC: \
+             clear={clear}, outcome={outcome:?}, observed_drafts={observed:?}, \
+             expected_current_drafts={published:?}, other_chip_retained={}, stored_bytes_unchanged={}",
+            observed_other == published_other,
+            after == before,
+        );
+        assert_eq!(load_db().expect("unchanged conversations"), conversations);
+
+        // A fresh public mutation still performs its authorized staged GC.
+        crate::conversation_store::draft_update(
+            Some(&target.id),
+            "Fresh target edit".to_string(),
+            Vec::new(),
+        )
+        .expect("fresh target mutation must pass");
+        assert_manifest_and_blob_absent(&target_attachment);
+        let current_other = crate::conversation_store::draft_get(Some(&other.id))
+            .expect("read unaffected survivor after fresh target GC")
+            .result
+            .expect("survivor draft");
+        assert_eq!(current_other, published_other);
+        let survivor = draft_cas_document_namespaces(&[&other_attachment]);
+        for namespace in survivor.difference(&BTreeSet::from([
+            CONVERSATIONS_NAMESPACE.to_string(),
+            DRAFTS_NAMESPACE.to_string(),
+            ATTACHMENTS_NAMESPACE.to_string(),
+        ])) {
+            assert_eq!(
+                RuntimeStore::current()
+                    .expect("store after fresh target GC")
+                    .get_bytes(namespace)
+                    .expect("read survivor manifest/object"),
+                before[namespace],
+            );
+        }
+        crate::conversation_store::draft_clear(Some(&other.id)).expect("fresh clear must pass");
+        assert_manifest_and_blob_absent(&other_attachment);
+        assert!(
+            load_attachment_db()
+                .expect("attachment index after authorized GC")
+                .attachments
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_draft_update_cannot_erase_another_conversations_staged_chip() {
+        stale_draft_replacement_preserves_publicly_staged_chip(false);
+    }
+
+    #[test]
+    fn stale_draft_clear_cannot_erase_another_conversations_staged_chip() {
+        stale_draft_replacement_preserves_publicly_staged_chip(true);
     }
 }
 

@@ -152,21 +152,22 @@ impl CatalogIndex {
     /// Build an index from caller-provided typed data. Any serialized trust
     /// claim remains only a declaration; this constructor never grants it.
     pub fn new(catalog: InformationCatalog) -> Result<Self, CatalogError> {
+        catalog.validate()?;
+        validate_catalogue_sources(&catalog)?;
         let bytes = serde_json::to_vec(&catalog)?;
         let authority = CatalogAuthority::Unverified {
             declared: catalog.declared_trust.clone(),
             catalog_sha256: sha256_hex(&bytes),
         };
-        Self::new_with_authority(catalog, authority)
+        Self::from_validated_catalog(catalog, authority)
     }
 
-    fn new_with_authority(
+    // The caller has validated this owned catalog and its source URIs.
+    fn from_validated_catalog(
         catalog: InformationCatalog,
         authority: CatalogAuthority,
     ) -> Result<Self, CatalogError> {
-        catalog.validate()?;
         authority.validate()?;
-        validate_catalogue_sources(&catalog)?;
         let search_documents = catalog
             .resources
             .iter()
@@ -192,7 +193,7 @@ impl CatalogIndex {
             declared: catalog.declared_trust.clone(),
             catalog_sha256: sha256_hex(bytes),
         };
-        Self::new_with_authority(catalog, authority)
+        Self::from_validated_catalog(catalog, authority)
     }
 
     /// Grant built-in authority only after exact comparison with a digest
@@ -213,7 +214,7 @@ impl CatalogIndex {
             return Err(CatalogError::DigestMismatch { expected, observed });
         }
         let catalog = load_catalog_json_with_limit(bytes, DEFAULT_MAX_CATALOG_BYTES)?;
-        Self::new_with_authority(
+        Self::from_validated_catalog(
             catalog,
             CatalogAuthority::BuiltInPinned {
                 catalog_sha256: observed,
@@ -229,7 +230,7 @@ impl CatalogIndex {
         approved_at: DateTime<Utc>,
     ) -> Result<Self, CatalogError> {
         let catalog = load_catalog_json_with_limit(bytes, DEFAULT_MAX_CATALOG_BYTES)?;
-        Self::new_with_authority(
+        Self::from_validated_catalog(
             catalog,
             CatalogAuthority::LocallyApproved {
                 catalog_sha256: sha256_hex(bytes),
@@ -959,6 +960,13 @@ pub(crate) fn validate_provider_source_uri(uri: &Url) -> Result<(), CatalogError
         ));
     }
     Ok(())
+}
+
+fn is_legal_xml_10_character(character: char) -> bool {
+    matches!(character, '\u{9}' | '\u{A}' | '\u{D}')
+        || ('\u{20}'..='\u{D7FF}').contains(&character)
+        || ('\u{E000}'..='\u{FFFD}').contains(&character)
+        || ('\u{10000}'..='\u{10FFFF}').contains(&character)
 }
 
 #[cfg(test)]

@@ -178,9 +178,7 @@ impl fte_router::GatewayOutcomeObserver for DesktopActivityObserver {
             let _ = database.log_request(
                 outcome.provider.as_deref().unwrap_or("gateway"),
                 outcome.model.as_deref().unwrap_or("unresolved"),
-                outcome
-                    .tokens
-                    .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX)),
+                outcome.tokens.and_then(|tokens| u32::try_from(tokens).ok()),
                 u64::try_from(outcome.elapsed.as_millis()).unwrap_or(u64::MAX),
                 i32::from(outcome.status),
             );

@@ -1665,6 +1665,24 @@ fn occurrence_from_row(
         ));
     }
     let mut metadata_truncated = false;
+    let passage = PassageRecord {
+        book_key: bounded_required(
+            passage.book_key,
+            MAX_METADATA_CHARS,
+            &mut metadata_truncated,
+        ),
+        book_name: bounded_required(
+            passage.book_name,
+            MAX_METADATA_CHARS,
+            &mut metadata_truncated,
+        ),
+        normalized_reference: bounded_required(
+            passage.normalized_reference,
+            MAX_METADATA_CHARS,
+            &mut metadata_truncated,
+        ),
+        ..passage
+    };
     let occurrence_key =
         bounded_required(row.get(0)?, MAX_IDENTIFIER_CHARS, &mut metadata_truncated);
     let raw_reference = bounded_required(row.get(1)?, MAX_METADATA_CHARS, &mut metadata_truncated);
@@ -2585,6 +2603,210 @@ mod tests {
         create_file_fixture(&path)?;
         let backend = ScriptureBackend::open(fixture_config(&path)?)?;
         Ok((directory, backend))
+    }
+
+    #[test]
+    fn joined_book_name_loss_makes_occurrence_lookup_partial() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("joined-label.db");
+        let source_label = "x".repeat(16_386);
+        let connection = Connection::open(&path)?;
+        create_fixture(&connection)?;
+        connection.execute(
+            "UPDATE scripture_passages SET book_name = ?1 WHERE passage_id = 1",
+            params![&source_label],
+        )?;
+        drop(connection);
+        let backend = ScriptureBackend::open(fixture_config(&path)?)?;
+        let (resource_id, release_id, representation_id) = fixture_ids()?;
+        let mut request = LookupRequest {
+            resource_id,
+            release_id,
+            representation_id,
+            purpose: RetrievalPurpose::LocalUi,
+            collection: Some(OCCURRENCE_COLLECTION.to_string()),
+            key: "100".to_string(),
+            max_context_chars: 4_000,
+            timeout_ms: 5_000,
+        };
+        let result = backend.lookup(&request)?;
+        let returned_label = result.hit.metadata["book_name"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("occurrence book_name is not text"))?;
+        assert!(
+            !result.complete,
+            "joined label loss was reported complete: source_chars={}, returned_chars={}, \
+             metadata_truncated={}, complete={}",
+            source_label.chars().count(),
+            returned_label.chars().count(),
+            result.hit.metadata["metadata_truncated"],
+            result.complete,
+        );
+        assert_eq!(result.hit.metadata["metadata_truncated"], json!(true));
+        assert_eq!(returned_label, "x".repeat(16_384));
+        assert!(!result.warnings.is_empty());
+
+        request.collection = Some(PASSAGE_COLLECTION.to_string());
+        request.key = "1".to_string();
+        let passage = backend.lookup(&request)?;
+        assert!(passage.complete);
+        assert!(passage.warnings.is_empty());
+        assert_eq!(passage.hit.metadata["book_name"], json!(source_label));
+        assert_eq!(passage.hit.snippet, "John.3.16");
+        passage.hit.validate()?;
+        Ok(())
+    }
+
+    fn assert_occurrence_label_routes(
+        path: &Path,
+        metadata_key: &str,
+        source_label: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let before_bytes = fs::read(path)?;
+        let before_identity = FileIdentity::observe(path)?;
+        let before_sidecars = SidecarSet::observe(path)?;
+        let backend = ScriptureBackend::open(fixture_config(path)?)?;
+        let (resource_id, release_id, representation_id) = fixture_ids()?;
+        let lookup = backend.lookup(&LookupRequest {
+            resource_id: resource_id.clone(),
+            release_id: release_id.clone(),
+            representation_id: representation_id.clone(),
+            purpose: RetrievalPurpose::LocalUi,
+            collection: Some(OCCURRENCE_COLLECTION.to_string()),
+            key: "100".to_string(),
+            max_context_chars: 4_000,
+            timeout_ms: 5_000,
+        })?;
+        let read = backend.read(&ReadRequest {
+            resource_id,
+            release_id,
+            representation_id,
+            purpose: RetrievalPurpose::LocalUi,
+            locator: lookup.hit.locator.clone(),
+            max_context_chars: 4_000,
+            timeout_ms: 5_000,
+        })?;
+        let search = backend.search(&fixture_query("John.3.16", QuerySyntax::NaturalTerms)?)?;
+        assert_eq!(search.hits.len(), 3);
+        let searched = search
+            .hits
+            .iter()
+            .find(|hit| hit.evidence_id == lookup.hit.evidence_id)
+            .ok_or_else(|| std::io::Error::other("search omitted occurrence 100"))?;
+        let truncated = source_label.chars().count() > 16_384;
+        let expected_label: String = source_label.chars().take(16_384).collect();
+        assert_eq!(
+            lookup.complete, !truncated,
+            "{metadata_key} lookup completeness"
+        );
+        assert_eq!(
+            read.complete, !truncated,
+            "{metadata_key} read completeness"
+        );
+        assert_eq!(
+            search.complete, !truncated,
+            "{metadata_key} search completeness"
+        );
+        assert_eq!(lookup.warnings.is_empty(), !truncated);
+        assert_eq!(read.warnings, lookup.warnings);
+        assert_eq!(
+            search
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("made this response partial")),
+            truncated,
+        );
+        for hit in [&lookup.hit, &read.hit, searched] {
+            assert_eq!(hit.metadata[metadata_key], json!(expected_label));
+            assert_eq!(hit.metadata["metadata_truncated"], json!(truncated));
+            assert_eq!(hit.evidence_id, lookup.hit.evidence_id);
+            assert_eq!(hit.resource_id, lookup.hit.resource_id);
+            assert_eq!(hit.release_id, lookup.hit.release_id);
+            assert_eq!(hit.representation_id, lookup.hit.representation_id);
+            assert_eq!(hit.backend_id, lookup.hit.backend_id);
+            assert_eq!(hit.document_id.as_deref(), Some("DOC-1"));
+            assert_eq!(hit.passage_id.as_deref(), Some("1"));
+            assert_eq!(hit.title, "Fixture Homily");
+            assert_eq!(hit.creator.as_deref(), Some("A. Writer"));
+            assert_eq!(hit.source_uri.as_deref(), Some("fixture://source/one"));
+            assert_eq!(
+                hit.source_fingerprint.as_deref(),
+                Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            );
+            assert_eq!(
+                hit.locator,
+                EvidenceLocator::Record {
+                    collection: Some(OCCURRENCE_COLLECTION.to_string()),
+                    key: "100".to_string(),
+                }
+            );
+            assert_eq!(hit.score.semantics, ScoreSemantics::RankOnly);
+            assert_eq!(hit.snippet, "John 3:16");
+            assert_eq!(hit.context, "For God so loved the world.");
+            assert_eq!(
+                hit.excerpt_sha256,
+                evidence_text_sha256("John 3:16", "For God so loved the world.")
+            );
+            assert_eq!(hit.rights, lookup.hit.rights);
+            assert_eq!(hit.use_policy, lookup.hit.use_policy);
+            for (key, ordinary) in [
+                ("book_key", "John"),
+                ("book_name", "John"),
+                ("normalized_reference", "John.3.16"),
+            ] {
+                if key != metadata_key {
+                    assert_eq!(hit.metadata[key], json!(ordinary));
+                }
+            }
+            hit.validate()?;
+        }
+        drop(backend);
+        assert_eq!(fs::read(path)?, before_bytes);
+        assert_eq!(FileIdentity::observe(path)?, before_identity);
+        assert_eq!(SidecarSet::observe(path)?, before_sidecars);
+        Ok(())
+    }
+
+    #[test]
+    fn occurrence_label_boundaries_preserve_public_routes_and_source() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let ordinary_path = directory.path().join("ordinary.db");
+        create_file_fixture(&ordinary_path)?;
+        assert_occurrence_label_routes(&ordinary_path, "book_name", "John")?;
+        for (metadata_key, update, fill) in [
+            (
+                "book_key",
+                "UPDATE scripture_passages SET book_key = ?1 WHERE passage_id = 1",
+                "界",
+            ),
+            (
+                "book_name",
+                "UPDATE scripture_passages SET book_name = ?1 WHERE passage_id = 1",
+                "x",
+            ),
+            (
+                "normalized_reference",
+                "UPDATE scripture_passages SET normalized_reference = ?1 WHERE passage_id = 1",
+                "界",
+            ),
+        ] {
+            for chars in [16_384, 16_385, 16_386] {
+                let path = directory.path().join(format!("{metadata_key}-{chars}.db"));
+                let connection = Connection::open(&path)?;
+                create_fixture(&connection)?;
+                let prefix = if metadata_key == "normalized_reference" {
+                    "John.3.16"
+                } else {
+                    "J"
+                };
+                let label = format!("{prefix}{}", fill.repeat(chars - prefix.chars().count()));
+                connection.execute(update, params![&label])?;
+                drop(connection);
+                assert_occurrence_label_routes(&path, metadata_key, &label)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]

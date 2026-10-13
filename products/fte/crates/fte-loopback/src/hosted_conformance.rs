@@ -1560,3 +1560,810 @@ async fn native_continuation_requires_explicit_items_without_a_provider_handle()
         .await
         .expect("native gateway drained");
 }
+
+async fn require_anthropic_ordinary_replay(content: Value) {
+    // These opaque values are protocol sentinels, not provider-issued crypto.
+    let provider = json!({
+        "content":content,
+        "stop_reason":"tool_use",
+        "usage":{"input_tokens":4,"output_tokens":3}
+    });
+    let tools = json!([{"name":"lookup","input_schema":{"type":"object"}}]);
+    let user = json!({"role":"user","content":"hello"});
+    let (status, text, first_capture) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        provider.to_string().into_bytes(),
+        "/v1/messages",
+        json!({"model":"fixture-model","max_tokens":16,"messages":[user],"tools":tools}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let response: Value = serde_json::from_str(&text).expect("ordinary Messages response");
+    let returned = response["content"].clone();
+    let result = json!({
+        "role":"user",
+        "content":[{"type":"tool_result","tool_use_id":"call_1","content":"found"}]
+    });
+    let (replay_status, replay_text, replay_capture) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        br#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":1}}"#.to_vec(),
+        "/v1/messages",
+        json!({
+            "model":"fixture-model","max_tokens":16,"tools":tools,
+            "messages":[user,{"role":"assistant","content":returned},result]
+        }),
+    )
+    .await;
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "ordinary Anthropic replay: {}",
+        json!({
+            "first_response_text": &text,
+            "first_provider_requests": &first_capture,
+            "replay_status": replay_status.as_u16(),
+            "replay_response_text": &replay_text,
+            "replay_provider_requests": &replay_capture,
+        })
+    );
+    assert_eq!(first_capture.len(), 1);
+    assert_eq!(replay_capture.len(), 1);
+    assert_eq!(
+        response["content"], content,
+        "ordinary response lost block state"
+    );
+    assert_eq!(
+        replay_capture[0]["messages"][1]["content"], content,
+        "assistant replay changed block order or opaque bytes"
+    );
+    assert_eq!(
+        replay_capture[0]["messages"][2]["content"][0],
+        json!({
+            "type":"tool_result","tool_use_id":"call_1",
+            "content":[{"type":"text","text":"found"}],"is_error":false
+        })
+    );
+    assert_eq!(response["stop_reason"], "tool_use");
+    assert_eq!(response["usage"]["input_tokens"], 4);
+    assert_eq!(response["usage"]["output_tokens"], 3);
+}
+
+#[tokio::test]
+async fn hosted_anthropic_ordinary_signed_thinking_replays_unchanged() {
+    require_anthropic_ordinary_replay(json!([
+        {"type":"thinking","thinking":"Check 日本語.\nKeep order.","signature":"fixture_sig_日本語+A/=="},
+        {"type":"text","text":"Looking up."},
+        {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+    ]))
+    .await;
+}
+
+#[tokio::test]
+async fn hosted_anthropic_ordinary_redacted_and_signed_blocks_replay_in_order() {
+    require_anthropic_ordinary_replay(json!([
+        {"type":"redacted_thinking","data":"fixture_cipher_日本語/+=one"},
+        {"type":"thinking","thinking":"Visible continuation.","signature":"fixture_sig_two/=="},
+        {"type":"redacted_thinking","data":"fixture_cipher_two/+=two"},
+        {"type":"text","text":"Looking up."},
+        {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+    ]))
+    .await;
+}
+
+#[tokio::test]
+async fn hosted_anthropic_ordinary_text_and_tool_replay_remains_unchanged() {
+    require_anthropic_ordinary_replay(json!([
+        {"type":"text","text":"Looking up."},
+        {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+    ]))
+    .await;
+}
+
+#[tokio::test]
+async fn hosted_anthropic_canonical_reasoning_replays_ordinary_producer_state() {
+    use fte_types::{BackendRequest, GatewayBackend, GenerationInput, InputItem, ResolvedRoute};
+
+    // No cryptographic authority is claimed for the fixture signature/data.
+    let content = json!([
+        {"type":"redacted_thinking","data":"fixture_canonical_cipher_日本語/+=one"},
+        {"type":"thinking","thinking":"Check 日本語.\nKeep order.","signature":"fixture_canonical_sig+A/=="},
+        {"type":"redacted_thinking","data":"fixture_canonical_cipher_two/+=two"},
+        {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+    ]);
+    let bytes = json!({
+        "content":content,"stop_reason":"tool_use",
+        "usage":{"input_tokens":4,"output_tokens":3}
+    })
+    .to_string()
+    .into_bytes();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("canonical replay provider listener");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("canonical replay address")
+    );
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider_capture = Arc::clone(&captured);
+    let provider = axum::Router::new().fallback(move |Json(body): Json<Value>| {
+        let captured = Arc::clone(&provider_capture);
+        let bytes = bytes.clone();
+        async move {
+            captured
+                .lock()
+                .expect("canonical replay capture")
+                .push(body);
+            ([(header::CONTENT_TYPE, "application/json")], bytes)
+        }
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("canonical replay provider");
+    });
+    let mut config = HostedProviderConfig::anthropic("fixture", "Fixture", "fixture", Vec::new());
+    config.endpoints = fte_providers::HostedEndpoints {
+        messages: Some(endpoint),
+        ..Default::default()
+    };
+    let backend =
+        HostedProviderBackend::new(config, Arc::new(Secrets)).expect("canonical replay backend");
+    let initial: AnthropicMessagesRequest = serde_json::from_value(json!({
+        "model":"fixture-model","max_tokens":16,
+        "messages":[{"role":"user","content":"hello"}],
+        "tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+    }))
+    .expect("ordinary initial request");
+    let mut request = initial
+        .into_gateway(EdgeDefaults {
+            privacy: fte_types::PrivacyPolicy::HostedAllowed,
+            profile: fte_types::RouteProfile::Auto,
+        })
+        .expect("canonical initial request");
+    let route = ResolvedRoute {
+        backend_id: "fixture".into(),
+        model_id: "fixture-model".into(),
+        display_name: "Fixture".into(),
+        location: BackendLocation::Hosted,
+        catalog_version: "fixture".into(),
+    };
+    let response = backend
+        .execute(BackendRequest {
+            request: request.clone(),
+            route: route.clone(),
+            provider_previous_response_id: None,
+        })
+        .await
+        .expect("ordinary producer ticket")
+        .final_response()
+        .await
+        .expect("ordinary producer response");
+    // Reconstruct public canonical input from the actual producer's output.
+    // No hand-authored replacement for the opaque state is injected.
+    let replay: Vec<InputItem> = serde_json::from_value(
+        serde_json::to_value(&response.output).expect("canonical output bytes"),
+    )
+    .expect("canonical replay input");
+    let GenerationInput::Chat { items } = &mut request.input else {
+        panic!("initial request must remain Chat");
+    };
+    items.extend(replay);
+    items.push(InputItem::FunctionResult {
+        id: None,
+        call_id: "call_1".into(),
+        output: vec![fte_types::ContentBlock::Text {
+            text: "found".into(),
+        }],
+        is_error: false,
+    });
+    request.request_id = RequestId::new();
+    let replayed = backend
+        .execute(BackendRequest {
+            request: request.clone(),
+            route: route.clone(),
+            provider_previous_response_id: None,
+        })
+        .await
+        .expect("canonical replay ticket")
+        .final_response()
+        .await
+        .expect("canonical replay response");
+    let mut precedence = request.clone();
+    precedence.request_id = RequestId::new();
+    let GenerationInput::Chat { items } = &mut precedence.input else {
+        panic!("canonical replay must remain Chat");
+    };
+    let mut mixed_signed_state = false;
+    for item in items {
+        if let InputItem::Reasoning {
+            opaque_continuation: Some(Value::Object(opaque)),
+            ..
+        } = item
+            && opaque.contains_key("thinking")
+        {
+            opaque.insert("redacted_thinking".into(), json!("fixture_mixed_ignored"));
+            mixed_signed_state = true;
+        }
+    }
+    assert!(
+        mixed_signed_state,
+        "actual producer must supply signed state"
+    );
+    backend
+        .execute(BackendRequest {
+            request: precedence,
+            route: route.clone(),
+            provider_previous_response_id: None,
+        })
+        .await
+        .expect("existing mixed-state signed precedence")
+        .final_response()
+        .await
+        .expect("mixed-state response");
+    let mut refusal_codes = Vec::new();
+    for (item, code) in [
+        (
+            InputItem::Reasoning {
+                id: None,
+                summary: vec!["unsigned".into()],
+                opaque_continuation: None,
+            },
+            "anthropic_reasoning_continuity_missing",
+        ),
+        (
+            InputItem::Reasoning {
+                id: None,
+                summary: vec!["not a native redacted summary".into()],
+                opaque_continuation: Some(json!({"redacted_thinking":"fixture_refused"})),
+            },
+            "anthropic_reasoning_continuity_missing",
+        ),
+        (
+            InputItem::ProviderOpaque {
+                provider: "gemini".into(),
+                item: json!({"role":"assistant","content":[]}),
+            },
+            "provider_state_incompatible",
+        ),
+    ] {
+        let mut refused = request.clone();
+        refused.request_id = RequestId::new();
+        refused.input = GenerationInput::Chat { items: vec![item] };
+        let error = match backend
+            .execute(BackendRequest {
+                request: refused,
+                route: route.clone(),
+                provider_previous_response_id: None,
+            })
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported continuation must refuse before dispatch"),
+        };
+        refusal_codes.push((error.code, code));
+    }
+    backend.shutdown().await.expect("canonical replay drain");
+    stop.send(()).expect("canonical provider shutdown");
+    server.await.expect("canonical provider joined");
+    let captured = captured.lock().expect("canonical replay capture").clone();
+    assert_eq!(captured.len(), 3);
+    for (actual, expected) in refusal_codes {
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(
+        captured[1]["messages"][1]["content"], content,
+        "canonical replay lost producer-created reasoning or changed block order"
+    );
+    assert_eq!(
+        captured[1]["messages"][2]["content"][0]["tool_use_id"],
+        "call_1"
+    );
+    assert_eq!(
+        captured[2]["messages"][1]["content"]
+            .as_array()
+            .expect("mixed-state assistant blocks")
+            .iter()
+            .find(|block| block["type"] == "thinking"),
+        Some(&content[1]),
+        "existing signed branch must retain precedence over extra redacted state"
+    );
+    assert_eq!(replayed.usage.input_tokens, Some(4));
+    assert_eq!(replayed.usage.output_tokens, Some(3));
+    assert_eq!(replayed.output.len(), response.output.len());
+    assert!(matches!(
+        &response.output[0],
+        fte_types::OutputItem::Reasoning {
+            summary,
+            opaque_continuation: Some(opaque),
+            ..
+        } if summary.is_empty()
+            && opaque["redacted_thinking"] == "fixture_canonical_cipher_日本語/+=one"
+    ));
+}
+
+#[tokio::test]
+async fn hosted_chat_refusal_history_roundtrips_without_losing_designation() {
+    let ordinary = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Ordinary 日本語."},"finish_reason":"stop"}]});
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        ordinary.to_string().into_bytes(),
+        "/v1/chat/completions",
+        chat_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ordinary_response: Value = serde_json::from_str(&text).expect("ordinary response");
+    let ordinary_message = ordinary_response["choices"][0]["message"].clone();
+    assert_eq!(ordinary_message, ordinary["choices"][0]["message"]);
+    assert_eq!(captured.len(), 1);
+    let ordinary_history = json!({"model":"fixture-model","messages":[
+        {"role":"user","content":"hello"}, ordinary_message, {"role":"user","content":"follow up"}
+    ]});
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        ordinary.to_string().into_bytes(),
+        "/v1/chat/completions",
+        ordinary_history,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured[0]["messages"][1],
+        json!({
+            "role":"assistant","content":[{"type":"text","text":"Ordinary 日本語."}]
+        })
+    );
+
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/chat-refusal.json"))
+            .expect("shared provider/UI refusal fixture");
+    for refusal in [
+        fixture["choices"][0]["message"]["refusal"]
+            .as_str()
+            .expect("refusal"),
+        "",
+    ] {
+        let mut provider = fixture.clone();
+        provider["choices"][0]["message"]["refusal"] = json!(refusal);
+        let (first_status, first_text, first_capture) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/chat/completions",
+            chat_request(false),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_text}");
+        let first: Value =
+            serde_json::from_str(&first_text).expect("real hosted refusal projection");
+        let returned = first["choices"][0]["message"].clone();
+        assert_eq!(returned, provider["choices"][0]["message"]);
+        assert_eq!(first["choices"][0]["finish_reason"], "stop");
+        assert_eq!(first_capture.len(), 1);
+        let history = json!({"model":"fixture-model","messages":[
+            {"role":"user","content":"hello"}, returned, {"role":"user","content":"follow up"}
+        ]});
+        let (replay_status, replay_text, replay_capture) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            ordinary.to_string().into_bytes(),
+            "/v1/chat/completions",
+            history.clone(),
+        )
+        .await;
+        assert_eq!(
+            replay_status,
+            StatusCode::OK,
+            "refusal history: {}",
+            json!({
+                "first_response":first_text,"first_provider_requests":first_capture,
+                "replay_status":replay_status.as_u16(),"replay_response":replay_text,
+                "replay_provider_requests":replay_capture
+            })
+        );
+        assert_eq!(replay_capture.len(), 1);
+        assert_eq!(replay_capture[0]["messages"][1], returned);
+        let canonical = serde_json::from_value::<fte_protocols::OpenAiChatRequest>(history.clone())
+            .expect("strict public Chat history")
+            .into_gateway(fte_protocols::EdgeDefaults::default())
+            .expect("typed refusal history");
+        assert_eq!(
+            serde_json::to_value(&canonical.input).expect("canonical history")["items"][1],
+            json!({
+                "type":"message","id":null,"role":"assistant",
+                "content":[{"type":"refusal","text":refusal}]
+            })
+        );
+        for (protocol, code) in [
+            ("responses", "responses_refusal_history_unsupported"),
+            ("anthropic", "refusal_history_unsupported"),
+            ("gemini", "refusal_history_unsupported"),
+        ] {
+            let (status, text, captured) = hosted_exchange_captured(
+                protocol,
+                "application/json",
+                b"{}".to_vec(),
+                "/v1/chat/completions",
+                history.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{protocol}: {text}");
+            let error: Value = serde_json::from_str(&text).expect("typed unsupported history");
+            assert_eq!(error["error"]["code"], code);
+            assert!(
+                captured.is_empty(),
+                "unsupported history dispatched: {captured:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_refusal_history_preserves_ordinary_controls_and_refuses_unsupported_shapes() {
+    let answer = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#.to_vec();
+    let tool = json!({"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"term\":\"日本語\"}"}});
+    for message in [
+        json!({"role":"assistant","content":"ordinary","refusal":null}),
+        json!({"role":"assistant","content":null}),
+        json!({"role":"assistant","content":null,"tool_calls":[tool.clone()]}),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            answer.clone(),
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[message.clone()]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ordinary history: {message}: {text}"
+        );
+        assert_eq!(captured.len(), 1);
+        if message.get("tool_calls").is_some() {
+            assert_eq!(
+                captured[0]["messages"][0]["tool_calls"],
+                json!([tool.clone()])
+            );
+        } else if message["content"].is_null() {
+            assert_eq!(captured[0]["messages"][0]["content"], json!([]));
+        } else {
+            assert_eq!(
+                captured[0]["messages"][0]["content"],
+                json!([{"type":"text","text":"ordinary"}])
+            );
+        }
+        assert!(captured[0]["messages"][0].get("refusal").is_none());
+    }
+    for (message, expected) in [
+        (
+            json!({"role":"user","content":null,"refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"tool","tool_call_id":"call_1","content":null,"refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":"ordinary","refusal":"no"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","tool_calls":[tool]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"no"}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"one"},{"type":"refusal","refusal":"two"}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":7}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","unsupported":true}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"role":"assistant","content":null,"refusal":"no","encrypted_content":"must not vanish"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured(
+            "chat",
+            "application/json",
+            answer.clone(),
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[message.clone()]}),
+        )
+        .await;
+        assert_eq!(status, expected, "unsupported history: {message}: {text}");
+        assert!(captured.is_empty());
+    }
+    let prompt = "\n  raw tail\t";
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat",
+        "application/json",
+        br#"{"choices":[{"index":0,"text":" continuation\n","finish_reason":"stop"}]}"#.to_vec(),
+        "/v1/completions",
+        json!({"model":"fixture-model","prompt":prompt}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(captured[0]["prompt"], prompt);
+    let completion: Value = serde_json::from_str(&text).expect("raw completion");
+    assert_eq!(completion["choices"][0]["text"], " continuation\n");
+    let (status, text, captured) = hosted_exchange_captured(
+        "chat", "application/json", answer, "/v1/completions",
+        json!({"model":"fixture-model","prompt":prompt,"messages":[{"role":"assistant","refusal":"no"}]}),
+    ).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+    assert!(captured.is_empty());
+}
+
+#[tokio::test]
+async fn hosted_gemini_count_keeps_plain_contents_and_wraps_system_context() {
+    let ordinary = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"Count this ordinary prompt."}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        ordinary.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    let contents = json!([{"role":"user","parts":[{"text":"Count this ordinary prompt."}]}]);
+    assert_eq!(captured, vec![json!({"contents":contents})]);
+
+    let mut with_system = ordinary;
+    with_system["system"] = json!("系統 instruction ∆");
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        with_system,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    assert_eq!(
+        captured,
+        vec![json!({
+            "generateContentRequest":{
+                "model":"models/fixture-model",
+                "contents":contents,
+                "systemInstruction":{"parts":[{"text":"系統 instruction ∆"}]}
+            }
+        })],
+        "only the documented nested envelope may carry system context"
+    );
+}
+
+#[tokio::test]
+async fn hosted_gemini_count_keeps_plain_contents_and_wraps_tool_context() {
+    let ordinary = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"Count this ordinary prompt."}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        ordinary.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    let contents = json!([{"role":"user","parts":[{"text":"Count this ordinary prompt."}]}]);
+    assert_eq!(captured, vec![json!({"contents":contents})]);
+
+    let mut with_tools = ordinary;
+    with_tools["tools"] = json!([{
+        "name":"lookup", "description":"Look up an owned record.",
+        "input_schema":{"type":"object","properties":{"name":{"type":"string"}}}
+    }]);
+    let (status, text, captured) = hosted_exchange_captured(
+        "gemini",
+        "application/json",
+        Vec::new(),
+        "/v1/messages/count_tokens",
+        with_tools,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count result")["input_tokens"],
+        4
+    );
+    assert_eq!(
+        captured,
+        vec![json!({
+            "generateContentRequest":{
+                "model":"models/fixture-model",
+                "contents":contents,
+                "tools":[{"functionDeclarations":[{
+                    "name":"lookup", "description":"Look up an owned record.",
+                    "parameters":{"type":"object","properties":{"name":{"type":"string"}}}
+                }]}]
+            }
+        })],
+        "only the documented nested envelope may carry function declarations"
+    );
+}
+
+#[tokio::test]
+async fn hosted_anthropic_count_preserves_direct_thinking_and_strict_admission() {
+    let plain = json!({
+        "model":"fixture-model",
+        "messages":[{"role":"user","content":"count me"}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        b"{}".to_vec(),
+        "/v1/messages/count_tokens",
+        plain.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("count response")["input_tokens"],
+        4
+    );
+    assert_eq!(captured.len(), 1);
+    let plain_count = captured[0].clone();
+    assert_eq!(
+        plain_count,
+        json!({
+            "model":"fixture-model",
+            "messages":[{"role":"user","content":[{"type":"text","text":"count me"}]}]
+        })
+    );
+    for field in ["tool_choice", "disable_parallel_tool_use"] {
+        let mut unsupported = plain.clone();
+        unsupported[field] = if field == "tool_choice" {
+            json!({"type":"auto"})
+        } else {
+            json!(true)
+        };
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            b"{}".to_vec(),
+            "/v1/messages/count_tokens",
+            unsupported,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {text}");
+        assert!(
+            captured.is_empty(),
+            "unsupported direct-count field was dispatched: {captured:?}"
+        );
+    }
+    for thinking in [
+        json!({"type":"enabled","budget_tokens":1024}),
+        json!({"type":"adaptive"}),
+        json!({"type":"disabled"}),
+    ] {
+        let mut body = plain.clone();
+        body["thinking"] = thinking.clone();
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            b"{}".to_vec(),
+            "/v1/messages/count_tokens",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{thinking}: {text}");
+        let mut expected = plain_count.clone();
+        expected["thinking"] = thinking;
+        assert_eq!(
+            captured,
+            vec![expected],
+            "direct count lost admitted thinking: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_anthropic_count_preflight_keeps_generation_tools_and_choice() {
+    let provider = json!({
+        "content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":4,"output_tokens":1}
+    });
+    let plain = json!({
+        "model":"fixture-model","max_tokens":16,"stream":true,"temperature":0.5,
+        "messages":[{"role":"user","content":"hello"}]
+    });
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic",
+        "application/json",
+        provider.to_string().into_bytes(),
+        "/v1/messages",
+        plain.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured.len(),
+        2,
+        "ordinary count and generation: {captured:?}"
+    );
+    assert_eq!(captured[0]["messages"], captured[1]["messages"]);
+    assert!(captured[0].get("tool_choice").is_none());
+    for field in ["max_tokens", "stream", "temperature"] {
+        assert!(captured[0].get(field).is_none(), "count included {field}");
+        assert_eq!(captured[1][field], plain[field]);
+    }
+    for choice in [
+        None,
+        Some(json!({"type":"none"})),
+        Some(json!({"type":"auto","disable_parallel_tool_use":false})),
+        Some(json!({"type":"any","disable_parallel_tool_use":true})),
+        Some(json!({"type":"tool","name":"lookup","disable_parallel_tool_use":false})),
+    ] {
+        let expected = choice.clone().unwrap_or_else(|| json!({"type":"auto"}));
+        let mut body = plain.clone();
+        body["tools"] = json!([{"name":"lookup","input_schema":{"type":"object"}}]);
+        if let Some(choice) = choice {
+            body["tool_choice"] = choice;
+        }
+        let (status, text, captured) = hosted_exchange_captured(
+            "anthropic",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/messages",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{expected}: {text}");
+        assert_eq!(captured.len(), 2, "count and generation: {captured:?}");
+        assert_eq!(
+            captured[1]["tool_choice"], expected,
+            "generation choice: {captured:?}"
+        );
+        assert_eq!(
+            captured[0]["tool_choice"], expected,
+            "count choice: {captured:?}"
+        );
+        let mut count_projection = captured[1].clone();
+        let fields = count_projection.as_object_mut().expect("generation body");
+        for field in ["max_tokens", "stream", "temperature"] {
+            fields.remove(field);
+        }
+        assert_eq!(
+            captured[0], count_projection,
+            "count and generation prompt diverged: {text}"
+        );
+    }
+}

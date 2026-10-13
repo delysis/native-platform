@@ -64,23 +64,6 @@ impl AdmittedOvertureRelease {
     pub fn provenance(&self) -> &OvertureReleaseProvenance {
         &self.provenance
     }
-
-    pub(crate) fn validate_for_query(&self) -> Result<(), OvertureError> {
-        let provenance = &self.provenance;
-        validate_release_id(&provenance.release_id)?;
-        let source = validate_stac_uri(&provenance.catalog_source_uri)?;
-        if source.path() != format!("/{}/catalog.json", provenance.release_id)
-            || provenance.catalog_bytes == 0
-            || provenance.catalog_bytes > MAX_STAC_DOCUMENT_BYTES as u64
-            || normalize_sha256(&provenance.catalog_sha256)? != provenance.catalog_sha256
-            || provenance.stac_version != OVERTURE_STAC_VERSION
-        {
-            return Err(OvertureError::InvalidStacIdentity(
-                "release identity is not exact and canonical".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Exact identity of one STAC-advertised GeoParquet partition.
@@ -251,7 +234,6 @@ pub fn admit_overture_partition(
     selection: &OvertureSelection,
     admission: OverturePartitionAdmission,
 ) -> Result<VerifiedOverturePartition, OvertureError> {
-    release.validate_for_query()?;
     let release = release.provenance();
     selection.validate()?;
     let item_source = validate_stac_uri(&admission.item.source_uri)?;

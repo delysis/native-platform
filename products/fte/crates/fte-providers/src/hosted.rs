@@ -1140,50 +1140,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
         body.insert("system".to_string(), Value::Array(system));
     }
     insert_anthropic_sampling(&mut body, request)?;
-    if !request.request.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            json!(
-                request
-                    .request
-                    .tools
-                    .iter()
-                    .map(|tool| json!({
-                        "name":tool.name,
-                        "description":tool.description,
-                        "input_schema":tool.input_schema
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        let mut choice = match &request.request.tool_policy.selection {
-            fte_types::ToolSelection::None => json!({"type":"none"}),
-            fte_types::ToolSelection::Auto => json!({"type":"auto"}),
-            fte_types::ToolSelection::Required => json!({"type":"any"}),
-            fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
-        };
-        if let Some(disable_parallel) = request
-            .request
-            .provider_extensions
-            .get("anthropic.disable_parallel_tool_use")
-        {
-            if !disable_parallel.is_boolean()
-                || matches!(
-                    request.request.tool_policy.selection,
-                    fte_types::ToolSelection::None
-                )
-            {
-                return Err(capability_error(
-                    &request.request.request_id,
-                    &request.route.backend_id,
-                    "anthropic_parallel_tool_policy_invalid",
-                    "disable_parallel_tool_use needs a boolean and an enabled tool choice",
-                ));
-            }
-            choice["disable_parallel_tool_use"] = disable_parallel.clone();
-        }
-        body.insert("tool_choice".to_string(), choice);
-    }
+    insert_anthropic_tools(&mut body, request)?;
     apply_anthropic_cache_breakpoints(
         &mut body,
         &request.request.cache.provider_breakpoints,
@@ -1238,17 +1195,19 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
     }
-    if !request.request.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            anthropic_tools_value(&request.request.tools),
-        );
-    }
+    insert_anthropic_tools(&mut body, request)?;
     apply_anthropic_cache_breakpoints(
         &mut body,
         &request.request.cache.provider_breakpoints,
         &request.request.request_id,
     )?;
+    if let Some(thinking) = request
+        .request
+        .provider_extensions
+        .get("anthropic.thinking")
+    {
+        body.insert("thinking".to_string(), thinking.clone());
+    }
     Ok(Value::Object(body))
 }
 
@@ -1478,12 +1437,27 @@ fn gemini_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             count.insert(key.to_string(), value.clone());
         }
     }
+    if count.contains_key("systemInstruction") || count.contains_key("tools") {
+        let model = request
+            .route
+            .model_id
+            .strip_prefix("models/")
+            .unwrap_or(&request.route.model_id);
+        count.insert("model".to_string(), json!(format!("models/{model}")));
+        return Ok(json!({"generateContentRequest":count}));
+    }
     Ok(Value::Object(count))
 }
 
 fn gemini_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "gemini",
+            "refusal_history_unsupported",
+            "Gemini cannot preserve a tagged assistant refusal in history",
+        )),
         fte_types::ContentBlock::Image { source, .. }
         | fte_types::ContentBlock::Audio { source, .. }
         | fte_types::ContentBlock::Document { source, .. } => match source {
@@ -1564,6 +1538,12 @@ fn openai_input_item(item: &fte_types::InputItem) -> Result<Value, GatewayError>
 fn openai_input_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"type":"input_text","text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "openai",
+            "responses_refusal_history_unsupported",
+            "this Responses input owner has no admitted refusal replay contract",
+        )),
         fte_types::ContentBlock::Image { source, detail } => {
             Ok(json!({"type":"input_image","image_url":media_url(source),"detail":detail}))
         }
@@ -1615,10 +1595,27 @@ fn openai_chat_messages(
     let mut messages = Vec::new();
     for item in items {
         match item {
-            fte_types::InputItem::Message { role, content, .. } => messages.push(json!({
-                "role":role_name(*role),
-                "content":content.iter().map(openai_chat_content).collect::<Result<Vec<_>,_>>()?,
-            })),
+            fte_types::InputItem::Message { role, content, .. } => {
+                if let Some(fte_types::ContentBlock::Refusal { text }) = content
+                    .iter()
+                    .find(|block| matches!(block, fte_types::ContentBlock::Refusal { .. }))
+                {
+                    if *role != fte_types::MessageRole::Assistant || content.len() != 1 {
+                        return Err(capability_error(
+                            request_id,
+                            "openai-compatible",
+                            "refusal_history_shape_unsupported",
+                            "refusal history requires a single assistant refusal block",
+                        ));
+                    }
+                    messages.push(json!({"role":"assistant","content":null,"refusal":text}));
+                } else {
+                    messages.push(json!({
+                        "role":role_name(*role),
+                        "content":content.iter().map(openai_chat_content).collect::<Result<Vec<_>,_>>()?,
+                    }));
+                }
+            }
             fte_types::InputItem::FunctionCall {
                 call_id,
                 name,
@@ -1747,6 +1744,16 @@ fn anthropic_messages_from_items(
                         "assistant",
                         vec![json!({"type":"thinking","thinking":thinking,"signature":signature})],
                     );
+                } else if summary.is_empty()
+                    && let Some(Value::String(data)) = opaque_continuation
+                        .as_ref()
+                        .and_then(|opaque| opaque.get("redacted_thinking"))
+                {
+                    append_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        vec![json!({"type":"redacted_thinking","data":data})],
+                    );
                 } else if !summary.is_empty() {
                     return Err(capability_error(
                         request_id,
@@ -1783,6 +1790,12 @@ fn append_anthropic_content(messages: &mut Vec<Value>, role: &str, content: Vec<
 fn anthropic_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
     match block {
         fte_types::ContentBlock::Text { text } => Ok(json!({"type":"text","text":text})),
+        fte_types::ContentBlock::Refusal { .. } => Err(capability_error(
+            &RequestId::new(),
+            "anthropic",
+            "refusal_history_unsupported",
+            "Anthropic cannot preserve a tagged assistant refusal in history",
+        )),
         fte_types::ContentBlock::Image { source, .. } => {
             Ok(json!({"type":"image","source":anthropic_media(source)}))
         }
@@ -2025,6 +2038,47 @@ fn reject_unbound_tool_execution(request: &BackendRequest) -> Result<(), Gateway
         .request
         .tool_policy
         .validate_tools(&request.request.tools, &request.request.request_id)
+}
+
+fn insert_anthropic_tools(
+    body: &mut Map<String, Value>,
+    request: &BackendRequest,
+) -> Result<(), GatewayError> {
+    if request.request.tools.is_empty() {
+        return Ok(());
+    }
+    body.insert(
+        "tools".to_string(),
+        anthropic_tools_value(&request.request.tools),
+    );
+    let mut choice = match &request.request.tool_policy.selection {
+        fte_types::ToolSelection::None => json!({"type":"none"}),
+        fte_types::ToolSelection::Auto => json!({"type":"auto"}),
+        fte_types::ToolSelection::Required => json!({"type":"any"}),
+        fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
+    };
+    if let Some(disable_parallel) = request
+        .request
+        .provider_extensions
+        .get("anthropic.disable_parallel_tool_use")
+    {
+        if !disable_parallel.is_boolean()
+            || matches!(
+                request.request.tool_policy.selection,
+                fte_types::ToolSelection::None
+            )
+        {
+            return Err(capability_error(
+                &request.request.request_id,
+                &request.route.backend_id,
+                "anthropic_parallel_tool_policy_invalid",
+                "disable_parallel_tool_use needs a boolean and an enabled tool choice",
+            ));
+        }
+        choice["disable_parallel_tool_use"] = disable_parallel.clone();
+    }
+    body.insert("tool_choice".to_string(), choice);
+    Ok(())
 }
 
 fn anthropic_tools_value(tools: &[fte_types::ToolDefinition]) -> Value {

@@ -44,9 +44,11 @@ Historical receipts remain evidence about the historical bundle only.
   provider gateway that owns their credentials and accounting.
 - OpenAI-compatible audio endpoints are codecs at FTE's loopback edge.
 - Microphone capture and playback remain product responsibilities.
-- Curated model assets are admitted by immutable manifest identity and copied
-  into private content-addressed managed storage before load; mutable cache
-  filenames are compatibility discovery hints, never authority.
+- Curated model assets are admitted by exact manifest lengths and SHA-256.
+  The selected manifest-pinned shared Hub snapshot is verified and loaded in
+  place; other candidates are copied into private content-addressed managed
+  storage. Model bytes are verified before and after load. Mutable refs and
+  cache locators alone never confer authority.
 
 The legacy `fte.speech.*` serialized schema identifiers remain stable in the
 0.1 line so stored receipts and fixtures do not become unreadable. Rust package

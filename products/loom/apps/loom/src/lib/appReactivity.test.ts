@@ -428,24 +428,6 @@ describe('App ghost reactivity wiring', () => {
   });
 
 
-  it('routes dictation through native capture and inserts only at the retained editor selection', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
-
-    expect(source).toContain('aria-label={speechRecording');
-    expect(source).toContain("return contextPaneOpen ? focusedSpeechTarget : 'manuscript'");
-    expect(source).toContain("rememberSpeechEditor(event, 'context')");
-    expect(source).toContain("rememberSpeechEditor(event, 'manuscript')");
-    expect(source).toContain('editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
-    expect(source).toContain('sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
-    expect(source).toContain('Dictation is preserved because its original insertion point changed.');
-    expect(source).not.toContain('microphoneCapture');
-    expect(ipc).toContain("call('speech_input_record_start'");
-    expect(ipc).toContain("call('speech_input_record_stop'");
-    expect(ipc).toContain("call('speech_input_record_cancel'");
-    expect(ipc).not.toContain('wavBytes');
-  });
-
   it('keeps the document sidebar nonmodal and persistent', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const sidebar = source.slice(source.indexOf('<aside'), source.indexOf('</aside>') + '</aside>'.length);

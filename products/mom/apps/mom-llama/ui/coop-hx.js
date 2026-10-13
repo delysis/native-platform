@@ -283,6 +283,7 @@
   };
   const attachmentTranscripts = new WeakMap();
   let activeSpeechPlayback = null;
+  let speechPlaybackEpoch = null;
 
   const restoreReadAloudButton = (button) => {
     if (!button) return;
@@ -296,6 +297,8 @@
   };
 
   const stopSpeechPlayback = async ({ notifyNative = true } = {}) => {
+    // Revoke pending byte verification and publication as well as live media.
+    speechPlaybackEpoch = {};
     const playback = activeSpeechPlayback;
     activeSpeechPlayback = null;
     if (!playback) return;
@@ -312,10 +315,15 @@
 
   const renderSpeechPlayback = async (button, result, bytes) => {
     const binding = result.binding;
+    const epoch = speechPlaybackEpoch;
     if (await sha256Hex(bytes) !== binding.wav_sha256) {
       throw new Error("speech_provenance_mismatch: Complete WAV bytes changed at IPC.");
     }
-    await stopSpeechPlayback();
+    if (epoch !== speechPlaybackEpoch || button.dataset.playback !== result.playback_id) return;
+    const stopped = stopSpeechPlayback();
+    const publicationEpoch = speechPlaybackEpoch;
+    await stopped;
+    if (publicationEpoch !== speechPlaybackEpoch || button.dataset.playback !== result.playback_id) return;
     const row = button.closest(".message-row");
     if (
       !row?.isConnected
@@ -357,7 +365,9 @@
       const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
       progress.textContent = `${current.toFixed(1)} / ${duration.toFixed(1)} seconds`;
     });
-    audio.addEventListener("ended", () => void stopSpeechPlayback());
+    audio.addEventListener("ended", () => {
+      if (activeSpeechPlayback?.audio === audio) void stopSpeechPlayback();
+    });
     await audio.play().catch(() => {});
   };
 
@@ -917,13 +927,16 @@
     shell()?.classList.remove("settings-open");
     const toggle = document.querySelector('[data-action="settings-open"]');
     toggle?.setAttribute("aria-expanded", "false");
-    if (hadFocus) toggle?.focus();
+    if (hadFocus) {
+      (toggle || document.querySelector("#chat-form textarea[name='message']"))?.focus();
+    }
     sizeComposer();
   };
 
   const setModalVisibility = (id, visible) => {
     const modal = document.getElementById(id);
     if (!modal) return;
+    if (id === "attachment-library-modal" && !visible) clearAttachmentLibraryPreview(modal);
     modal.hidden = !visible;
     modal.classList.toggle("is-hidden", !visible);
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
@@ -934,7 +947,10 @@
     if (element) element.textContent = value == null ? "" : String(value);
   };
 
+  let attachmentLibraryPreviewEpoch = null;
+
   const clearAttachmentLibraryPreview = (modal) => {
+    attachmentLibraryPreviewEpoch = {};
     delete modal.dataset.previewId;
     delete modal.dataset.impactSha256;
     modal.querySelector('[data-action="attachment-library-commit"]')?.setAttribute("disabled", "");
@@ -968,6 +984,8 @@
     if (!document.getElementById("attachment-library-rights")?.checked) {
       throw new Error("Confirm private local-use rights before reviewing this publish.");
     }
+    clearAttachmentLibraryPreview(modal);
+    const epoch = attachmentLibraryPreviewEpoch;
     const preview = await invoke("mom_llama_attachment_library_preview", {
       anchor: {
         attachment_id: modal.dataset.attachment || "",
@@ -978,6 +996,10 @@
       title: document.getElementById("attachment-library-item-title")?.value || "Attachment text",
       confirmedPrivateUse: true,
     });
+    if (epoch !== attachmentLibraryPreviewEpoch
+      || document.getElementById("attachment-library-modal") !== modal
+      || modal.hidden
+      || !document.getElementById("attachment-library-rights")?.checked) return;
     modal.dataset.previewId = preview.preview_id;
     modal.dataset.impactSha256 = preview.impact_sha256;
     setText("attachment-library-root", preview.root_sha256);
@@ -1005,12 +1027,16 @@
     if (!modal?.dataset.previewId || !modal.dataset.impactSha256) {
       throw new Error("Review the exact attachment library item before publishing it.");
     }
+    const epoch = attachmentLibraryPreviewEpoch;
     const result = await invoke("mom_llama_attachment_library_commit", {
       previewId: modal.dataset.previewId,
       impactSha256: modal.dataset.impactSha256,
     });
     report(result);
-    setModalVisibility("attachment-library-modal", false);
+    if (epoch === attachmentLibraryPreviewEpoch
+      && document.getElementById("attachment-library-modal") === modal) {
+      setModalVisibility("attachment-library-modal", false);
+    }
     await refreshManagedAttachments();
   };
 
@@ -2664,19 +2690,20 @@
       }
       if (button.dataset.playback) {
         const playback = button.dataset.playback;
-        delete button.dataset.playback;
-        await invoke("mom_llama_speech_stop", { playback });
         restoreReadAloudButton(button);
+        await invoke("mom_llama_speech_stop", { playback });
         return;
       }
       if (button.dataset.operation) {
         const operation = button.dataset.operation;
-        delete button.dataset.operation;
-        await invoke("mom_llama_speech_stop", { operation });
         restoreReadAloudButton(button);
+        await invoke("mom_llama_speech_stop", { operation });
         return;
       }
-      await stopSpeechPlayback();
+      const stopped = stopSpeechPlayback();
+      const epoch = speechPlaybackEpoch;
+      await stopped;
+      if (epoch !== speechPlaybackEpoch || !button.isConnected) return;
       const conversation = selectedConversation();
       const message = button.dataset.message;
       const operation = speechOperationToken();
@@ -2696,7 +2723,8 @@
         if (response?.status === "blocked" || !response?.result) return;
         const result = response.result;
         retainedPlayback = result.playback_id;
-        if (button.dataset.operation === operation) delete button.dataset.operation;
+        if (button.dataset.operation !== operation || epoch !== speechPlaybackEpoch) return;
+        delete button.dataset.operation;
         button.dataset.playback = result.playback_id;
         if (
           selectedConversation() !== conversation
@@ -2720,17 +2748,20 @@
         if (retainedPlayback) {
           await invoke("mom_llama_speech_stop", { playback: retainedPlayback }).catch(() => {});
         }
-        if (button.dataset.operation === operation) delete button.dataset.operation;
-        if (activeSpeechPlayback?.button !== button) restoreReadAloudButton(button);
+        if (activeSpeechPlayback?.button !== button
+          && (button.dataset.operation === operation
+            || (retainedPlayback && button.dataset.playback === retainedPlayback))) {
+          restoreReadAloudButton(button);
+        }
       }
     },
     "attachment-transcribe": async (button) => {
       if (button.dataset.operation) {
         const operation = button.dataset.operation;
         delete button.dataset.operation;
-        await invoke("mom_llama_speech_stop", { operation });
         commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
         button.textContent = "Transcribe audio";
+        await invoke("mom_llama_speech_stop", { operation });
         return;
       }
       const preview = button.closest("[data-attachment-preview]");
@@ -2764,9 +2795,11 @@
         ) return;
         renderAttachmentTranscript(button, result);
       } finally {
-        if (button.dataset.operation === operation) delete button.dataset.operation;
-        commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
-        button.textContent = "Transcribe audio";
+        if (button.dataset.operation === operation) {
+          delete button.dataset.operation;
+          commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
+          button.textContent = "Transcribe audio";
+        }
       }
     },
     "speech-transcript-insert": async (button) => {
@@ -3542,6 +3575,11 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.matches("#attachment-library-item-title, #attachment-library-rights")) {
+      const modal = document.getElementById("attachment-library-modal");
+      if (modal) clearAttachmentLibraryPreview(modal);
+      return;
+    }
     if (event.target.matches("[data-model-search]")) {
       const query = event.target.value.trim().toLocaleLowerCase();
       event.target.closest(".model-picker-popover")

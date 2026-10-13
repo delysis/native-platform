@@ -1,6 +1,7 @@
 use crate::{CliResult, fail};
-use information_native_types::{RightsStatement, UsePolicy};
+use information_native_types::{QueryId, RightsStatement, UsePolicy};
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Take};
 use std::path::Path;
@@ -97,4 +98,36 @@ pub(crate) fn validate_values(
         }
     }
     Ok(())
+}
+
+pub(crate) fn query_id(value: Option<&String>) -> CliResult<QueryId> {
+    match value {
+        Some(value) => Ok(QueryId::parse(value.clone())?),
+        None => Ok(QueryId::new()),
+    }
+}
+
+pub(crate) fn compiled_fields(
+    values: &[crate::KeyValueArg],
+    max_fields: usize,
+) -> CliResult<BTreeMap<String, String>> {
+    if values.len() > max_fields {
+        return fail(format!(
+            "query has {} field filters, exceeding the {max_fields}-filter limit",
+            values.len()
+        ));
+    }
+    let mut fields = BTreeMap::new();
+    for field in values {
+        if fields
+            .insert(field.key.clone(), field.value.clone())
+            .is_some()
+        {
+            return fail(format!(
+                "query field {:?} was supplied more than once",
+                field.key
+            ));
+        }
+    }
+    Ok(fields)
 }

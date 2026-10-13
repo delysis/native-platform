@@ -1,6 +1,6 @@
 use crate::{
     CatalogError, DEFAULT_MAX_DISCOVERY_BYTES, DiscoveryAsset, DiscoveryProvider, DiscoveryRecord,
-    resolve_provider_href, validate_provider_source_uri,
+    is_legal_xml_10_character, resolve_provider_href, validate_provider_source_uri,
 };
 use chrono::{DateTime, Utc};
 use information_native_types::ResourceKind;
@@ -19,7 +19,7 @@ const MAX_LINKS: usize = 100_000;
 const MAX_TAGS: usize = 4_096;
 const MAX_ATTRIBUTES: usize = 64;
 const MAX_XML_DEPTH: usize = 128;
-const ACQUISITION_REL_FRAGMENT: &str = "opds-spec.org/acquisition";
+const ACQUISITION_REL_PREFIX: &str = "http://opds-spec.org/acquisition";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -176,7 +176,7 @@ impl OpdsLink {
     pub fn is_acquisition(&self) -> bool {
         self.rel
             .split_ascii_whitespace()
-            .any(|relation| relation.contains(ACQUISITION_REL_FRAGMENT))
+            .any(|relation| relation.starts_with(ACQUISITION_REL_PREFIX))
     }
 }
 
@@ -511,13 +511,6 @@ fn validate_xml_10_text(value: &str) -> Result<(), CatalogError> {
     Err(CatalogError::Provider(
         "OPDS text contains a character that is not legal in XML 1.0".to_string(),
     ))
-}
-
-fn is_legal_xml_10_character(character: char) -> bool {
-    matches!(character, '\u{9}' | '\u{A}' | '\u{D}')
-        || ('\u{20}'..='\u{D7FF}').contains(&character)
-        || ('\u{E000}'..='\u{FFFD}').contains(&character)
-        || ('\u{10000}'..='\u{10FFFF}').contains(&character)
 }
 
 fn append_field(target: &mut String, text: &str, field: &str) -> Result<(), CatalogError> {

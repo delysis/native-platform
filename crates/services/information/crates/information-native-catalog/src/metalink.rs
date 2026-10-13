@@ -1,4 +1,4 @@
-use crate::{CatalogError, DiscoveryAsset};
+use crate::{CatalogError, DiscoveryAsset, is_legal_xml_10_character};
 use information_native_types::{ArtifactDescriptor, ArtifactId, ArtifactMirror, ArtifactRole};
 use quick_xml::XmlVersion;
 use quick_xml::escape::resolve_xml_entity;
@@ -447,13 +447,6 @@ fn validate_xml_10_text(value: &str) -> Result<(), CatalogError> {
     Err(provider_error(
         "Metalink text contains a character that is not legal in XML 1.0",
     ))
-}
-
-fn is_legal_xml_10_character(character: char) -> bool {
-    matches!(character, '\u{9}' | '\u{A}' | '\u{D}')
-        || ('\u{20}'..='\u{D7FF}').contains(&character)
-        || ('\u{E000}'..='\u{FFFD}').contains(&character)
-        || ('\u{10000}'..='\u{10FFFF}').contains(&character)
 }
 
 fn parse_file_name(start: &BytesStart<'_>, reader: &Reader<&[u8]>) -> Result<String, CatalogError> {

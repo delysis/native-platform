@@ -1424,6 +1424,7 @@ pub fn draft_update(
     attachment_ids: Vec<String>,
 ) -> Result<CommandResult<DraftMessage>> {
     let mut db = load_drafts()?;
+    let expected_drafts = db.clone();
     let key = draft_key(conversation_id);
     let previous_attachment_ids = db
         .drafts
@@ -1464,7 +1465,11 @@ pub fn draft_update(
         .difference(&retained_attachment_ids)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let path = crate::attachments::persist_drafts_with_attachment_gc(&db, &removed_attachment_ids)?;
+    let path = crate::attachments::persist_drafts_with_attachment_gc(
+        &db,
+        &expected_drafts,
+        &removed_attachment_ids,
+    )?;
     Ok(CommandResult::passed(
         "mom_llama.draft_update",
         "contracted",
@@ -1478,6 +1483,7 @@ pub fn draft_update(
 
 pub fn draft_clear(conversation_id: Option<&str>) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_drafts()?;
+    let expected_drafts = db.clone();
     let key = draft_key(conversation_id);
     let before = db.drafts.len();
     let mut removed_attachment_ids = BTreeSet::new();
@@ -1489,7 +1495,11 @@ pub fn draft_clear(conversation_id: Option<&str>) -> Result<CommandResult<Conver
             true
         }
     });
-    let path = crate::attachments::persist_drafts_with_attachment_gc(&db, &removed_attachment_ids)?;
+    let path = crate::attachments::persist_drafts_with_attachment_gc(
+        &db,
+        &expected_drafts,
+        &removed_attachment_ids,
+    )?;
     Ok(CommandResult::passed(
         "mom_llama.draft_clear",
         "contracted",

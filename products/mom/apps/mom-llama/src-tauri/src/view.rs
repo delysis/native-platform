@@ -2481,7 +2481,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
             data-effect=(control.effect)
             data-action=(action)
             data-message=(message.id.clone())
-            data-message-content=(message.content.clone()) {
+            data-message-content=[(action == "message-edit").then_some(message.content.as_str())] {
             (icon_markup(icon))
             span class="sr-only" { (control.label) }
         }
@@ -3715,6 +3715,8 @@ fn icon_markup(name: &str) -> Markup {
 
 fn icon_paths(name: &str) -> Markup {
     PreEscaped(match name {
+        "chevron-down" => r#"<path d="m6 9 6 6 6-6" />"#,
+        "git-branch" => r#"<path d="M15 6a9 9 0 0 0-9 9V3" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" />"#,
         "panel-left" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#,
         "settings" => r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#,
         "square-pen" => r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>"#,
@@ -5410,6 +5412,57 @@ mod tests {
                 "button does not use an approved visual component: {start_tag}"
             );
             rest = &after[end + 1..];
+        }
+    }
+
+    #[test]
+    fn message_actions_retain_exact_source_only_for_the_actual_editor() {
+        let content = "Source <tag> & \"quoted\"\n**exact**";
+        let message = test_message("fixture-message", MessageRole::Assistant, content);
+        let markup = message_actions(&message, false, true, true, true).into_string();
+        assert_eq!(
+            markup.matches("data-message-content=").count(),
+            1,
+            "non-Edit actions duplicate source despite native identifier-based consumers"
+        );
+        let mut actions = 0;
+        for suffix in markup.split("<button ").skip(1) {
+            let tag = suffix.split_once('>').expect("action start tag").0;
+            let action = attribute(tag, "data-action").expect("action identity");
+            assert_eq!(attribute(tag, "data-message"), Some("fixture-message"));
+            assert!(attribute(tag, "data-command").is_some());
+            assert!(attribute(tag, "data-tauri-command").is_some());
+            assert!(attribute(tag, "data-effect").is_some());
+            if action == "message-edit" {
+                assert_eq!(
+                    decode_html_attribute(
+                        attribute(tag, "data-message-content").expect("exact editor source")
+                    ),
+                    content
+                );
+            } else {
+                assert!(
+                    attribute(tag, "data-message-content").is_none(),
+                    "redundant source on {action}"
+                );
+            }
+            actions += 1;
+        }
+        assert_eq!(actions, 8);
+        for action in [
+            "message-copy",
+            "message-read-aloud",
+            "message-raw-toggle",
+            "message-edit",
+            "conversation-fork",
+            "chat-regenerate",
+            "chat-continue",
+            "message-delete",
+        ] {
+            assert!(
+                markup.contains(&format!(r#"data-action="{action}""#)),
+                "missing actual action {action}"
+            );
         }
     }
 }

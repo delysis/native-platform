@@ -317,7 +317,6 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
     limits: OvertureQueryLimits,
     backend: &B,
 ) -> Result<OvertureQueryResult, OvertureError> {
-    release.validate_for_query()?;
     let release_provenance = release.provenance();
     selection.validate()?;
     limits.validate()?;
@@ -332,7 +331,7 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
     let mut seen = BTreeSet::new();
     let mut partition_bytes = 0_u64;
     let mut row_groups = 0_u64;
-    for partition in &mut partitions {
+    for partition in &partitions {
         validate_partition_binding(release_provenance, selection, partition.identity())?;
         let identity_sha256 = partition.identity().identity_sha256();
         if !seen.insert(identity_sha256) {
@@ -346,13 +345,16 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
         row_groups = row_groups
             .checked_add(u64::from(partition.identity().row_group_count))
             .ok_or(OvertureError::LimitExceeded("row group count"))?;
-        partition.verify_unchanged()?;
     }
     if partition_bytes > limits.max_total_partition_bytes {
         return Err(OvertureError::LimitExceeded("partition bytes"));
     }
     if row_groups > limits.max_row_groups {
         return Err(OvertureError::LimitExceeded("row group count"));
+    }
+
+    for partition in &mut partitions {
+        partition.verify_unchanged()?;
     }
 
     let predicate = PushdownPredicate::from_selection(selection)?;

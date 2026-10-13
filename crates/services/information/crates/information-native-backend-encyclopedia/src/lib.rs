@@ -12,7 +12,7 @@
 
 use information_native_retrieval::{
     BackendDescriptor, BackendHealth, BackendHealthStatus, BackendReadResult, BackendSearchResult,
-    LookupRequest, ReadRequest, ResourceBackend,
+    LookupRequest, ReadRequest, ResourceBackend, strip_backend_sql_profile_whitespace,
 };
 use information_native_types::{
     ErrorClass, EvidenceHit, EvidenceLocator, EvidenceScore, ExternalAccessMode,
@@ -1385,7 +1385,7 @@ fn validate_encyclopedia_schema(connection: &Connection) -> Result<(), Informati
                 "articles_fts is missing from the encyclopedia profile",
             )
         })?;
-    let normalized = strip_ascii_whitespace(&fts_sql).to_ascii_lowercase();
+    let normalized = strip_backend_sql_profile_whitespace(&fts_sql).to_ascii_lowercase();
     let expected = "createvirtualtablearticles_ftsusingfts5(title,plain_text,content='articles',content_rowid='id')";
     if normalized != expected {
         return Err(integrity_error(
@@ -1486,13 +1486,6 @@ fn require_table_shape(
         ));
     }
     Ok(())
-}
-
-fn strip_ascii_whitespace(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect()
 }
 
 fn validate_query_for_backend(
@@ -2835,6 +2828,96 @@ mod tests {
         assert!(second.starts_with("volatile-encyclopedia-reference-v1:"));
         assert_ne!(first, second);
         assert!(backend.source_identity().sha256.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn external_content_fts_rejects_literal_space_alias() -> Result<(), Box<dyn Error>> {
+        let (_directory, path) = create_fixture()?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            DROP TABLE articles_fts;
+            CREATE TABLE "art icles" (id INTEGER PRIMARY KEY, title TEXT, plain_text TEXT);
+            INSERT INTO "art icles" VALUES
+                (1, 'Different backing title', 'Bindingwitness exists only in the whitespace-distinct backing table.');
+            CREATE VIRTUAL TABLE articles_fts USING fts5(
+                title, plain_text, content='art icles', content_rowid='id'
+            );
+            INSERT INTO articles_fts(articles_fts) VALUES('rebuild');
+            "#,
+        )?;
+        drop(connection);
+        let bytes_before = fs::read(&path)?;
+        let identity_before = FileIdentity::observe(&path)?;
+        let sidecars_before = SidecarSet::observe(&path)?;
+        let outcome = match EncyclopediaBackend::open(fixture_config(&path)?) {
+            Err(error) => Err(error),
+            Ok(backend) => {
+                let mut query = fixture_query("bindingwitness")?;
+                query.filters.document_ids.push("1".to_string());
+                let search = backend.search(&query);
+                Ok(format!(
+                    "public open accepted wrong FTS binding; public search={search:?}"
+                ))
+            }
+        };
+        assert_eq!(fs::read(&path)?, bytes_before);
+        assert_eq!(FileIdentity::observe(&path)?, identity_before);
+        assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
+        let error = outcome
+            .expect_err("compiled profile must refuse a whitespace-distinct FTS content table");
+        assert_eq!(error.class, ErrorClass::Integrity);
+        assert_eq!(error.code, "encyclopedia_profile_invalid_fts");
+        Ok(())
+    }
+
+    #[test]
+    fn external_content_fts_accepts_outside_whitespace_and_ascii_case() -> Result<(), Box<dyn Error>>
+    {
+        let (_directory, path) = create_fixture()?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE articles_fts;
+             CrEaTe ViRtUaL TaBlE articles_fts UsInG fts5(\n\ttitle,\n plain_text,\r\n
+                 content='ARTICLES',\n content_rowid='ID'\n);
+             INSERT INTO articles_fts(articles_fts) VALUES('rebuild');",
+        )?;
+        drop(connection);
+        let bytes_before = fs::read(&path)?;
+        let identity_before = FileIdentity::observe(&path)?;
+        let sidecars_before = SidecarSet::observe(&path)?;
+        let backend = EncyclopediaBackend::open(fixture_config(&path)?)?;
+        let mut query = fixture_query("quantum mechanics")?;
+        query
+            .filters
+            .fields
+            .insert("origin".to_string(), "Britannica 2015".to_string());
+        let result = backend.search(&query)?;
+        assert!(result.complete);
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.document_id.as_deref(), Some("1"));
+        assert_eq!(hit.title, "Quantum mechanics");
+        assert_eq!(hit.metadata.get("origin"), Some(&json!("Britannica 2015")));
+        assert_eq!(hit.use_policy.local_search, UsePermission::Allowed);
+        assert_eq!(hit.use_policy.model_context, UsePermission::Forbidden);
+        assert_eq!(hit.use_policy.excerpt_export, UsePermission::Forbidden);
+        assert_eq!(hit.use_policy.redistribution, UsePermission::Forbidden);
+        assert_eq!(
+            hit.excerpt_sha256,
+            evidence_text_sha256(&hit.snippet, &hit.context)
+        );
+        hit.validate()?;
+        query.purpose = RetrievalPurpose::ModelContext;
+        let refusal = backend
+            .search(&query)
+            .expect_err("formatting must not widen purpose authority");
+        assert_eq!(refusal.class, ErrorClass::Permission);
+        drop(backend);
+        assert_eq!(fs::read(&path)?, bytes_before);
+        assert_eq!(FileIdentity::observe(&path)?, identity_before);
+        assert_eq!(SidecarSet::observe(&path)?, sidecars_before);
         Ok(())
     }
 

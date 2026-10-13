@@ -1049,8 +1049,12 @@ fn cancel_native(host: &NativeHost, request_id: &RequestId, target: CancelTarget
         CancelTarget::Request => host.cancel(&request_id.0, None),
         CancelTarget::Output(index) => {
             let completion = format!("completion-{index}");
-            host.cancel(&request_id.0, Some(&completion))
-                + (index == 0) as usize * host.cancel(&request_id.0, Some("assistant"))
+            let cancelled = host.cancel(&request_id.0, Some(&completion));
+            if index == 0 {
+                cancelled + host.cancel(&request_id.0, Some("assistant"))
+            } else {
+                cancelled
+            }
         }
     }
 }

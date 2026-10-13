@@ -32,7 +32,6 @@ pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
 pub(crate) use grants::{forget_selected_grant, persist_selected_grant, restore_selected_grants};
 pub(crate) use query::{MaterialCount, count_documents};
 
-const SCHEMA: &str = "loom.materials.v1";
 const MAX_BINDINGS: usize = 4096;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVIDENCE_BYTES: u64 = 70 * 1024 * 1024;
@@ -126,12 +125,9 @@ enum Source {
     Attachment { attachment_id: String },
     Library { path: PathBuf },
 }
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Bindings {
-    schema: String,
     items: Vec<Binding>,
-    #[serde(skip)]
     revision: Option<loom_types::RevisionId>,
 }
 
@@ -321,6 +317,7 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    metadata::refuse_legacy_bindings(store.root())?;
     let (configuration_revision, configured) = crate::workspace_template::materials::current(store)
         .map_err(|error| invalid(error.message))?;
     let workspace_observation = if let Some(revision) = configuration_revision {
@@ -341,22 +338,10 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
     } else {
         None
     };
-    let mut legacy_observation = None;
-    let (items, metadata_revision) = if let Some(items) = configured {
-        (
-            items,
-            workspace_observation
-                .as_ref()
-                .map(|snapshot| snapshot.revision.clone()),
-        )
-    } else if let Some(snapshot) = metadata::Snapshot::open(store.root())? {
-        let items = decode_bindings(store, &snapshot.bytes)?.items;
-        let revision = Some(snapshot.revision.clone());
-        legacy_observation = Some(snapshot);
-        (items, revision)
-    } else {
-        (Vec::new(), None)
-    };
+    let items = configured.unwrap_or_default();
+    let metadata_revision = workspace_observation
+        .as_ref()
+        .map(|snapshot| snapshot.revision.clone());
     validate_project_retention(store, &items)?;
     let mut entries = items
         .iter()
@@ -379,9 +364,6 @@ pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
         entries.push(item);
     }
     if let Some(snapshot) = workspace_observation {
-        snapshot.ensure_current(store.root())?;
-    }
-    if let Some(snapshot) = legacy_observation {
         snapshot.ensure_current(store.root())?;
     }
     Ok(entries)
@@ -1325,53 +1307,20 @@ fn read_safe(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
+    #[cfg(unix)]
+    metadata::refuse_legacy_bindings(store.root())?;
     let (revision, configured) = crate::workspace_template::materials::current(store)
         .map_err(|error| invalid(error.message))?;
-    let items = match configured {
-        Some(items) => items,
-        None => unconfigured_bindings(store)?.unwrap_or_default(),
-    };
+    // Non-Unix keeps its current-fence read capability, without a
+    // native nofollow presence guarantee. No fallback is admitted.
+    #[cfg(not(unix))]
+    if configured.is_none() {
+        metadata::refuse_legacy_bindings(store.root())?;
+    }
+    let items = configured.unwrap_or_default();
     validate_project_retention(store, &items)?;
     validate_bindings(&items)?;
-    Ok(Bindings {
-        schema: SCHEMA.into(),
-        items,
-        revision,
-    })
-}
-
-pub(crate) fn unconfigured_bindings(store: &ProjectStore) -> Result<Option<Vec<Binding>>> {
-    metadata::Snapshot::open(store.root())?
-        .map(|snapshot| decode_bindings(store, &snapshot.bytes).map(|bindings| bindings.items))
-        .transpose()
-}
-
-fn decode_bindings(store: &ProjectStore, bytes: &[u8]) -> Result<Bindings> {
-    let bindings: Bindings = serde_json::from_slice(bytes)?;
-    if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
-        return Err(invalid("unsupported material bindings"));
-    }
-    validate_project_retention(store, &bindings.items)?;
-    validate_bindings(&bindings.items)?;
-    Ok(bindings)
-}
-
-pub(crate) fn adopt_previous_bindings(store: &mut ProjectStore) -> Result<()> {
-    let Some(snapshot) = metadata::Snapshot::open(store.root())? else {
-        return Ok(());
-    };
-    let items = decode_bindings(store, &snapshot.bytes)?.items;
-    let (revision, configured) = crate::workspace_template::materials::current(store)
-        .map_err(|error| invalid(error.message))?;
-    snapshot.ensure_current(store.root())?;
-    if configured.is_none() {
-        crate::workspace_template::materials::save(store, revision, &items)
-            .map_err(|error| invalid(error.message))?;
-    }
-    // If another writer replaced the legacy generation while configuration was
-    // saved, retain it in place and require reconciliation; never reread and
-    // silently archive a different generation or resurrect obsolete bindings.
-    snapshot.preserve(store.root())
+    Ok(Bindings { items, revision })
 }
 
 fn validate_project_retention(store: &ProjectStore, items: &[Binding]) -> Result<()> {

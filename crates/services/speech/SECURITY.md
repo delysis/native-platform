@@ -10,8 +10,8 @@ Platform discovery must remain noninteractive. A capability is eligible for a
 local-only route only when current runtime evidence proves that it is available
 and never uses the network.
 
-The Tauri plugin exposes no commands unless the embedding application grants a
-matching capability. Its default permission allows status inspection only.
+Embedding applications own explicitly granted Speech commands and permissions.
+The core crates provide no generic Tauri plugin or default IPC permission.
 
 ## Reporting
 

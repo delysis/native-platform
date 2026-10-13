@@ -697,3 +697,152 @@ fn query_rehashes_partition_after_engine_returns() {
     );
     assert!(matches!(result, Err(OvertureError::PartitionChanged)));
 }
+
+#[derive(Default)]
+struct CountingEmptyBackend {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl OvertureHeavyBackend for CountingEmptyBackend {
+    fn query(
+        &self,
+        request: OvertureEngineRequest<'_>,
+    ) -> Result<EngineOutput, OvertureEngineError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(EngineOutput {
+            proof: PushdownReceipt {
+                contract: OVERTURE_BACKEND_CONTRACT.to_string(),
+                predicate_sha256: request.predicate().sha256.clone(),
+                mechanism: PushdownMechanism::ParquetStatisticsAndRowFilter,
+                partitions: request
+                    .partitions()
+                    .iter()
+                    .map(|partition| PartitionPushdownReceipt {
+                        partition_identity_sha256: partition.identity().identity_sha256(),
+                        total_row_groups: partition.identity().row_group_count,
+                        selected_row_groups: Vec::new(),
+                        rows_decoded: 0,
+                    })
+                    .collect(),
+            },
+            features: Vec::new(),
+        })
+    }
+}
+
+fn admitted_query_pair(temp: &TempDir) -> Vec<VerifiedOverturePartition> {
+    vec![
+        admitted_partition(temp),
+        admitted_partition_named(
+            temp,
+            "00001",
+            "part-00001-fixture-c000.zstd.parquet",
+            "second.parquet",
+            &parquet_bytes(),
+        ),
+    ]
+}
+
+fn pair_limits(partitions: &[VerifiedOverturePartition]) -> OvertureQueryLimits {
+    assert_eq!(partitions.len(), 2);
+    OvertureQueryLimits {
+        max_total_partition_bytes: partitions[0]
+            .identity()
+            .partition_bytes
+            .checked_add(partitions[1].identity().partition_bytes)
+            .unwrap_or_else(|| panic!("tiny fixture byte total overflow")),
+        max_row_groups: u64::from(partitions[0].identity().row_group_count)
+            .checked_add(u64::from(partitions[1].identity().row_group_count))
+            .unwrap_or_else(|| panic!("tiny fixture group total overflow")),
+        ..OvertureQueryLimits::default()
+    }
+}
+
+fn assert_aggregate_cap_precedes_file_recheck(axis: &'static str) {
+    for mutate in [false, true] {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let partitions = admitted_query_pair(&temp);
+        let mut limits = pair_limits(&partitions);
+        match axis {
+            "partition bytes" => limits.max_total_partition_bytes -= 1,
+            "row group count" => limits.max_row_groups -= 1,
+            _ => panic!("unknown fixture aggregate axis"),
+        }
+        assert!(partitions.iter().all(|partition| {
+            partition.identity().partition_bytes <= limits.max_total_partition_bytes
+                && u64::from(partition.identity().row_group_count) <= limits.max_row_groups
+        }));
+        if mutate {
+            let mut changed = parquet_bytes();
+            changed[5] ^= 0x20;
+            fs::write(temp.path().join("partition.parquet"), changed)
+                .unwrap_or_else(|error| panic!("mutate fixture: {error}"));
+        }
+        let backend = CountingEmptyBackend::default();
+        let result = execute_overture_query(
+            &admitted_release(),
+            &selection(),
+            partitions,
+            limits,
+            &backend,
+        );
+        assert!(matches!(result, Err(OvertureError::LimitExceeded(observed)) if observed == axis));
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn aggregate_partition_bytes_refuse_before_same_length_file_recheck() {
+    assert_aggregate_cap_precedes_file_recheck("partition bytes");
+}
+
+#[test]
+fn aggregate_row_groups_refuse_before_same_length_file_recheck() {
+    assert_aggregate_cap_precedes_file_recheck("row group count");
+}
+
+#[test]
+fn exact_aggregate_limits_keep_pre_engine_file_recheck() {
+    for mutate in [false, true] {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let partitions = admitted_query_pair(&temp);
+        let limits = pair_limits(&partitions);
+        let mut expected_identities = partitions
+            .iter()
+            .map(|partition| partition.identity().identity_sha256())
+            .collect::<Vec<_>>();
+        expected_identities.sort();
+        if mutate {
+            let mut changed = parquet_bytes();
+            changed[5] ^= 0x20;
+            fs::write(temp.path().join("partition.parquet"), changed)
+                .unwrap_or_else(|error| panic!("mutate fixture: {error}"));
+        }
+        let backend = CountingEmptyBackend::default();
+        let result = execute_overture_query(
+            &admitted_release(),
+            &selection(),
+            partitions,
+            limits,
+            &backend,
+        );
+        if mutate {
+            assert!(matches!(result, Err(OvertureError::PartitionChanged)));
+            assert_eq!(backend.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        } else {
+            let result = result.unwrap_or_else(|error| panic!("exact aggregate query: {error}"));
+            assert!(result.features.is_empty());
+            assert_eq!(
+                result
+                    .proof
+                    .partitions
+                    .iter()
+                    .map(|receipt| receipt.partition_identity_sha256.clone())
+                    .collect::<Vec<_>>(),
+                expected_identities
+            );
+            assert_eq!(backend.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+}

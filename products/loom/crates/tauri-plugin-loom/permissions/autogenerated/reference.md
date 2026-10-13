@@ -162,7 +162,7 @@ Promote an explicitly selected private candidate into the active manuscript thro
 </td>
 <td>
 
-Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.
+Download an explicitly requested GGUF over HTTPS into the selected shared model cache. Every request requires an expected SHA-256 digest and a hard byte ceiling.
 
 </td>
 </tr>

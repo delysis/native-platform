@@ -23,6 +23,34 @@ const HARD_MAX_ROUTED_BACKENDS: usize = 64;
 const HARD_MAX_BACKEND_HITS: usize = 10_000;
 const HARD_MAX_BACKEND_WARNINGS: usize = 256;
 
+/// Remove ASCII whitespace outside quote delimiters in compiled backend SQL profiles.
+/// Quoted content and doubled delimiters are retained; callers own case folding.
+#[must_use]
+pub fn strip_backend_sql_profile_whitespace(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    let mut quoted = None;
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quoted {
+            normalized.push(character);
+            if character == delimiter {
+                if characters.peek() == Some(&delimiter) {
+                    normalized.push(delimiter);
+                    let _ = characters.next();
+                } else {
+                    quoted = None;
+                }
+            }
+        } else if matches!(character, '\'' | '"' | '`') {
+            quoted = Some(character);
+            normalized.push(character);
+        } else if !character.is_ascii_whitespace() {
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
 /// Exact identity and truthful capabilities of one mounted backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -972,6 +1000,42 @@ mod tests {
         QuerySyntax, RightsStatement, ScoreSemantics, UsePolicy,
     };
     use std::error::Error;
+
+    #[test]
+    fn fts_normalization_preserves_quoted_whitespace_and_doubled_quotes() {
+        for (input, expected) in [
+            (
+                " content = 'art icles' , content_rowid = 'id' ",
+                "content='art icles',content_rowid='id'",
+            ),
+            (
+                " content = 'art'' icles' , content_rowid = 'id' ",
+                "content='art'' icles',content_rowid='id'",
+            ),
+            (
+                " content = \"art\"\" icles\" , content_rowid = 'id' ",
+                "content=\"art\"\" icles\",content_rowid='id'",
+            ),
+            (
+                " content = `art`` icles` , content_rowid = 'id' ",
+                "content=`art`` icles`,content_rowid='id'",
+            ),
+            (
+                " content = '' , content_rowid = 'id' ",
+                "content='',content_rowid='id'",
+            ),
+            (
+                " content = 'articles' , content_rowid = 'id' ",
+                "content='articles',content_rowid='id'",
+            ),
+        ] {
+            assert_eq!(
+                strip_backend_sql_profile_whitespace(input),
+                expected,
+                "quoted SQL characters are identity: {input}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct FakeBackend {

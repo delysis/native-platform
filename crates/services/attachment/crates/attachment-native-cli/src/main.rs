@@ -6,7 +6,7 @@ use attachment_native_types::{
 };
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -120,8 +120,7 @@ fn load_config(path: Option<&Path>) -> Result<AttachmentHostConfig, String> {
 }
 
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> Result<T, String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("failed to open {label} {}: {error}", path.display()))?;
+    let mut file = open_regular_file(path, label)?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(MAX_CONFIG_BYTES + 1)
@@ -144,17 +143,7 @@ fn open_attachment(
     media_type: Option<String>,
     max_root_bytes: u64,
 ) -> Result<ProvidedAttachment, String> {
-    let file = File::open(path)
-        .map_err(|error| format!("failed to open attachment {}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("failed to inspect attachment {}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "attachment {} is not a regular file",
-            path.display()
-        ));
-    }
+    let file = open_regular_file(path, "attachment")?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -162,6 +151,26 @@ fn open_attachment(
         .to_string();
     ProvidedAttachment::read_bounded(name, media_type, file, max_root_bytes)
         .map_err(|error| error.to_string())
+}
+
+fn open_regular_file(path: &Path, label: &str) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("failed to open {label} {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect {label} {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} {} is not a regular file", path.display()));
+    }
+    Ok(file)
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), String> {

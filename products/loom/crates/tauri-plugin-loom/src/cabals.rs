@@ -1335,7 +1335,14 @@ fn project_document(
 ) -> Result<SharedDocument, IpcFailure> {
     assets::prepare_project(store, cabal)?;
     let paths = namespace(&cabal.views().map_err(failure)?)?;
-    project_document_at(store, cabal, id, &paths[&id], true)?
+    let path = paths.get(&id).ok_or_else(|| {
+        IpcFailure::new(
+            "cabal_history_pending",
+            "The shared edit is durable; its causal history is still arriving.",
+            true,
+        )
+    })?;
+    project_document_at(store, cabal, id, path, true)?
         .ok_or_else(|| failure("This shared document was removed"))
 }
 
@@ -2122,6 +2129,162 @@ mod tests {
             .expect("document");
         project_document(&mut store, &mut cabal, view.id).expect("first projection");
         (store, cabal, view)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pending_history_edit_is_durable_and_projection_refuses_without_panicking() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (mut store, mut local, first) = fixture(directory.path());
+        let ordinary_text = "First\n\nLast, ordinary edit\n";
+        let ordinary = local
+            .edit(&Edit {
+                document: first.id,
+                client: Uuid::new_v4(),
+                basis: first.heads,
+                text: ordinary_text.into(),
+            })
+            .expect("ordinary admitted edit");
+        let projected = project_document(&mut store, &mut local, ordinary.merged.id)
+            .expect("ordinary projection");
+        assert_eq!(projected.shared.id, first.id);
+        assert_eq!(projected.shared.text, ordinary_text);
+        let initial = store.read_document(&first.name).expect("ordinary writing");
+        assert_eq!(initial.text, ordinary_text);
+
+        let peer = Identity::generate().expect("friend");
+        let invitation = local
+            .invite(local.identity().public_key().into())
+            .expect("invite");
+        let roster = local
+            .admit(&invitation.token, peer.public_key(), "Fern")
+            .expect("admit");
+        let mut remote =
+            Cabal::import(&directory.path().join("remote.db"), peer, roster).expect("remote cabal");
+        remote
+            .apply(
+                local
+                    .missing_causal(&remote.sync_state().expect("state"))
+                    .expect("initial page"),
+            )
+            .expect("initial sync");
+        let remote_client = Uuid::new_v4();
+        for index in 0..140 {
+            remote
+                .edit(&Edit {
+                    document: first.id,
+                    client: remote_client,
+                    basis: remote.view(first.id).expect("remote basis").heads,
+                    text: format!("First, remote {index}\n\nLast, ordinary edit\n"),
+                })
+                .expect("remote edit");
+        }
+        let page = remote
+            .missing_causal(&local.sync_state().expect("state"))
+            .expect("page");
+        assert_eq!(page.len(), 128);
+        local.apply(page).expect("partial signed history");
+        assert!(local.views().expect("partial views").is_empty());
+        assert_eq!(
+            local
+                .view_at(first.id, &ordinary.local_heads)
+                .expect("observed basis")
+                .text,
+            ordinary_text
+        );
+
+        let authored = "First\n\nLast, edited while history is pending\n";
+        let edit = Edit {
+            document: first.id,
+            client: Uuid::new_v4(),
+            basis: ordinary.local_heads,
+            text: authored.into(),
+        };
+        let before = local.hashes().expect("before local edit");
+        let saved = local.edit(&edit).expect("known-basis admitted edit");
+        let admitted = local.hashes().expect("admitted history");
+        assert_ne!(
+            admitted, before,
+            "The signed local edit must actually be admitted"
+        );
+        assert_eq!(
+            local
+                .view_at(first.id, &saved.local_heads)
+                .expect("local saved view")
+                .text,
+            authored
+        );
+        let identity = local.identity().clone();
+        drop(local);
+        let mut local = Cabal::open(&directory.path().join("cabal.db"), identity)
+            .expect("reopen admitted partial history");
+        assert_eq!(local.hashes().expect("durable admitted history"), admitted);
+        assert!(local.views().expect("reopened partial views").is_empty());
+        let writing = store.root().join(&first.name);
+        let bytes = std::fs::read(&writing).expect("ordinary source bytes");
+        assert_eq!(bytes, ordinary_text.as_bytes());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project_document(&mut store, &mut local, first.id)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "A durable known-basis edit with pending signed history must return a pending error, not panic; admitted_heads={:?}",
+            saved.local_heads
+        );
+        let problem = outcome
+            .expect("returned projection outcome")
+            .expect_err("An incomplete namespace cannot project a guessed path");
+        assert_eq!(problem.code, "cabal_history_pending");
+        assert!(problem.retryable);
+        assert!(problem.message.contains("durable"));
+        assert_eq!(
+            std::fs::read(&writing).expect("preserved ordinary writing"),
+            bytes
+        );
+        assert_eq!(
+            local.hashes().expect("unchanged admitted history"),
+            admitted
+        );
+        assert_eq!(
+            store
+                .read_document(&first.name)
+                .expect("same local identity")
+                .document_id,
+            initial.document_id
+        );
+
+        let retry = local.edit(&edit).expect("exact admitted edit retry");
+        assert_eq!(retry.local_heads, saved.local_heads);
+        assert_eq!(local.hashes().expect("no duplicate retry change"), admitted);
+        let repeated = project_document(&mut store, &mut local, first.id)
+            .expect_err("Pending history remains a refusal on exact retry");
+        assert_eq!(repeated.code, "cabal_history_pending");
+        assert!(repeated.retryable);
+        assert_eq!(std::fs::read(&writing).expect("retry source bytes"), bytes);
+        for _ in 0..4 {
+            let page = remote
+                .missing_causal(&local.sync_state().expect("state"))
+                .expect("remaining page");
+            if page.is_empty() {
+                break;
+            }
+            local.apply(page).expect("catch up");
+        }
+        assert_eq!(local.views().expect("complete history").len(), 1);
+        let complete =
+            project_document(&mut store, &mut local, first.id).expect("complete projection");
+        assert_eq!(complete.shared.id, first.id);
+        let merged = store.read_document(&first.name).expect("merged writing");
+        assert_eq!(merged.document_id, initial.document_id);
+        assert_eq!(
+            merged.text,
+            "First, remote 139\n\nLast, edited while history is pending\n"
+        );
+        assert_eq!(
+            std::fs::read(&writing).expect("projected source bytes"),
+            merged.text.as_bytes()
+        );
     }
 
     #[test]

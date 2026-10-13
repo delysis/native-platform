@@ -493,7 +493,18 @@ fn verify_shared_model_dir(
         if metadata.file_type().is_symlink() {
             let resolved = fs::canonicalize(&selected)
                 .map_err(|e| artifact_error(format!("Could not resolve HF artifact: {e}")))?;
-            if resolved != blobs.join(&file.sha256) {
+            let git_blob = resolved
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.len() == 40
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                });
+            if resolved.parent() != Some(blobs.as_path())
+                || (!git_blob && resolved != blobs.join(&file.sha256))
+            {
                 return Err(artifact_error(
                     "HF snapshot must resolve to its manifest-bound blob",
                 ));
@@ -1042,5 +1053,112 @@ mod tests {
             .expect("shared HF fixture");
         assert!(verify_shared_model_dir(&snapshot, &manifest).is_err());
         fs::remove_dir_all(root).expect("shared HF fixture");
+    }
+
+    #[cfg(unix)]
+    fn shared_git_snapshot_fixture() -> (PathBuf, PathBuf, PathBuf, ModelManifest) {
+        // Git SHA-1 of b"blob 2\0{}", independently checked with git hash-object.
+        const TOKENIZER_GIT_BLOB: &str = "9e26dfeeb6e641a33dae4961196235bdb965b21b";
+        let root = temporary_root("shared-hf-git");
+        let files = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"{}".as_slice()),
+        ];
+        let manifest = fixture_manifest(&files);
+        validate_manifest(&manifest).expect("bounded fixture manifest");
+        let repository = root.join("models--altunenes--parakeet-rs");
+        let snapshot = repository
+            .join("snapshots")
+            .join(&manifest.revision)
+            .join(&manifest.subdirectory);
+        let blobs = repository.join("blobs");
+        fs::create_dir_all(&snapshot).expect("shared HF fixture");
+        fs::create_dir_all(&blobs).expect("shared HF fixture");
+        for ((name, bytes), expected) in files.iter().zip(&manifest.files) {
+            let locator = if *name == "tokenizer.json" {
+                TOKENIZER_GIT_BLOB
+            } else {
+                &expected.sha256
+            };
+            let blob = blobs.join(locator);
+            fs::write(&blob, bytes).expect("shared HF fixture");
+            std::os::unix::fs::symlink(&blob, snapshot.join(name)).expect("shared HF fixture");
+        }
+        (root, snapshot, blobs, manifest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_snapshot_accepts_git_locator_and_rechecks_all_raw_digests() {
+        let (root, snapshot, _blobs, manifest) = shared_git_snapshot_fixture();
+        assert_eq!(
+            exact_hugging_face_candidate_in_root(&root, &manifest),
+            Some(snapshot.clone())
+        );
+        probe_model_dir_shape(&snapshot, &manifest, false).expect("shape is not hash authority");
+        verify_shared_model_dir(&snapshot, &manifest).expect("exact raw bytes under Git locator");
+        assert!(!root.join("managed").exists());
+
+        for expected in &manifest.files {
+            let selected = snapshot.join(&expected.name);
+            let blob = fs::canonicalize(&selected).expect("owned fixture blob");
+            let original = fs::read(&blob).expect("owned fixture bytes");
+            let mut changed = original.clone();
+            changed[0] ^= 1;
+            fs::write(&blob, changed).expect("same-length fixture tamper");
+            let error = verify_shared_model_dir(&snapshot, &manifest)
+                .expect_err("a locator cannot confer raw content authority");
+            assert!(error.to_string().contains("exact length/SHA-256"));
+            fs::write(&blob, &original).expect("restore owned fixture bytes");
+            verify_shared_model_dir(&snapshot, &manifest).expect("restored exact raw bytes");
+            assert_eq!(fs::read(&blob).expect("unchanged source bytes"), original);
+        }
+
+        let mut wrong_bundle = manifest.clone();
+        wrong_bundle.combined_sha256 = "0".repeat(64);
+        let error = verify_shared_model_dir(&snapshot, &wrong_bundle)
+            .expect_err("individual hashes do not substitute for the bundle hash");
+        assert!(error.to_string().contains("combined length/SHA-256"));
+        verify_shared_model_dir(&snapshot, &manifest).expect("correct bundle remains unchanged");
+        fs::remove_dir_all(root).expect("remove owned fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_snapshot_rejects_noncanonical_nested_and_outside_blob_locators() {
+        let (root, snapshot, blobs, manifest) = shared_git_snapshot_fixture();
+        let selected = snapshot.join("tokenizer.json");
+        let git_blob = fs::canonicalize(&selected).expect("owned Git fixture blob");
+        let git_name = git_blob
+            .file_name()
+            .expect("fixture leaf")
+            .to_str()
+            .expect("hex leaf");
+        let targets = [
+            blobs.join("arbitrary-tokenizer"),
+            blobs.join("0".repeat(64)),
+            blobs.join(git_name.to_ascii_uppercase()),
+            blobs.join(format!("x{git_name}")),
+            blobs.join("nested").join(git_name),
+            root.join("outside").join(git_name),
+        ];
+        fs::remove_file(&selected).expect("remove original fixture alias");
+        fs::remove_file(&git_blob).expect("avoid case-insensitive fixture name collision");
+        for target in targets {
+            fs::create_dir_all(target.parent().expect("fixture parent"))
+                .expect("create owned fixture parent");
+            fs::write(&target, b"{}").expect("write exact bytes under refused locator");
+            std::os::unix::fs::symlink(&target, &selected).expect("owned fixture alias");
+            let error = verify_shared_model_dir(&snapshot, &manifest)
+                .expect_err("exact bytes do not admit an arbitrary or unconfined locator");
+            assert!(error.to_string().contains("manifest-bound blob"));
+            fs::remove_file(&selected).expect("remove refused fixture alias");
+        }
+
+        fs::write(&selected, b"{}").expect("ordinary copied snapshot file");
+        verify_shared_model_dir(&snapshot, &manifest)
+            .expect("ordinary regular snapshot remains valid");
+        fs::remove_dir_all(root).expect("remove owned fixture");
     }
 }
