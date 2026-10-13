@@ -60,6 +60,28 @@ func firstWindow() -> AXUIElement? {
     (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first
 }
 
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func currentDocumentId() -> String? {
+    descendants().compactMap { element in
+        [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { attribute(element, $0 as CFString) as? String }
+            .compactMap { jsonObject(in: $0, schema: "delysis.loom-completion-witness.v1") }
+            .compactMap { ($0["pre_admission"] as? [String: Any])?["document_id"] as? String }
+            .first
+    }.first
+}
+
 NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 let windowDeadline = Date().addingTimeInterval(5)
 var initialWindow: AXUIElement?
@@ -73,6 +95,10 @@ guard let window = initialWindow else {
     exit(1)
 }
 let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
+guard let beforeDocumentId = currentDocumentId(), !beforeDocumentId.isEmpty else {
+    fputs("could not bind the new-document check to Loom's current document identity\n", stderr)
+    exit(1)
+}
 let addDeadline = Date().addingTimeInterval(5)
 var add: AXUIElement?
 repeat {
@@ -110,6 +136,7 @@ guard AXUIElementPerformAction(create, kAXPressAction as CFString) == .success e
 
 let deadline = Date().addingTimeInterval(10)
 var afterTitle = beforeTitle
+var afterDocumentId = beforeDocumentId
 var focusedEditor = false
 repeat {
     // Creating a document may replace WebKit's native accessibility window.
@@ -118,15 +145,16 @@ repeat {
     if let currentWindow = firstWindow() {
         afterTitle = stringAttribute(currentWindow, kAXTitleAttribute as CFString)
     }
+    afterDocumentId = currentDocumentId() ?? beforeDocumentId
     focusedEditor = descendants().contains { element in
         stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String &&
             (attribute(element, kAXFocusedAttribute as CFString) as? Bool) == true
     }
-    if afterTitle != beforeTitle && focusedEditor { break }
+    if afterDocumentId != beforeDocumentId && focusedEditor { break }
     Thread.sleep(forTimeInterval: 0.1)
 } while Date() < deadline
 
-guard afterTitle != beforeTitle, focusedEditor else {
+guard afterDocumentId != beforeDocumentId, focusedEditor else {
     fputs("new document did not expose and focus a fresh writing surface\n", stderr)
     exit(1)
 }
@@ -134,6 +162,8 @@ guard afterTitle != beforeTitle, focusedEditor else {
 let evidence: [String: Any] = [
     "title_before": beforeTitle,
     "title_after": afterTitle,
+    "document_id_before": beforeDocumentId,
+    "document_id_after": afterDocumentId,
     "focused_editor_observed": focusedEditor
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
