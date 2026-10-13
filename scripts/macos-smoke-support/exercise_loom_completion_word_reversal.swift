@@ -435,7 +435,11 @@ func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
         return false
     }
     event.flags = flags
-    event.postToPid(pid)
+    // Exercise the same system dispatch path as a physical keyboard. PID-only
+    // injection bypasses native menu/global-shortcut resolution and therefore
+    // cannot prove a chord that WebKit itself consumes. The caller has already
+    // bound and foreground-checked `pid` before this journey begins.
+    event.post(tap: .cghidEventTap)
     return true
 }
 
