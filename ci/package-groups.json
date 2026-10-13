@@ -75,6 +75,7 @@
       "loom-cli",
       "loom-document",
       "loom-host",
+      "loom-macos-shortcut",
       "loom-signal-protocol",
       "loom-store",
       "loom-types",
@@ -148,6 +149,7 @@
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
+      "loom-macos-shortcut",
       "mom-llama-app",
       "speech-native-backend-parakeet",
       "speech-native-platform"
