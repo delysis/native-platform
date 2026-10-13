@@ -33,6 +33,7 @@
     visibleGhostWidgetPresentationKey,
     visibleGhostWidgetObservation,
     type GhostTextPresentation,
+    type GhostTextPlan,
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
@@ -191,6 +192,7 @@
   let formattingRestoreDeadline = 0;
   let reportedCompletionAccessibilityIdentity = '';
   let reportedSelectionAccessibilityIdentity = '';
+  let retainedRollbackPlan: GhostTextPlan | null = null;
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
@@ -510,6 +512,24 @@
       ...currentPlan,
       active: true
     }, true);
+    const synchronizedPlan = currentGhostTextPlan(editorView.state);
+    if (
+      rollbackOnly &&
+      synchronizedPlan?.unconsumeText === snapshot.unconsumeText &&
+      synchronizedPlan.candidateId === snapshot.candidateId &&
+      synchronizedPlan.presentationKey === snapshot.presentationKey &&
+      synchronizedPlan.surfaceKey === snapshot.surfaceKey
+    ) {
+      retainedRollbackPlan = synchronizedPlan;
+    } else if (
+      snapshot.unconsumeText === '' ||
+      !retainedRollbackPlan ||
+      retainedRollbackPlan.candidateId !== snapshot.candidateId ||
+      retainedRollbackPlan.presentationKey !== snapshot.presentationKey ||
+      retainedRollbackPlan.surfaceKey !== snapshot.surfaceKey
+    ) {
+      retainedRollbackPlan = null;
+    }
     reportCompletionAccessibility();
     scheduleGhostVisibilityReport();
   }
@@ -970,6 +990,7 @@
           cycle: onGhostCycle,
           modifier: setOptionHeld,
           navigate: () => {
+            retainedRollbackPlan = null;
             onCaretNavigation();
             // Native navigation can leave the caret unchanged (Cmd-Right at
             // line end). Reconcile after the default action even when WebKit
@@ -1231,13 +1252,18 @@
       !event.ctrlKey &&
       view
     ) {
-      const plan = currentGhostTextPlan(view.state);
+      const livePlan = currentGhostTextPlan(view.state);
+      const plan = livePlan ?? retainedRollbackPlan;
       const rollbackEnd = view.state.selection.from;
       const rollbackStart = plan?.unconsumeText
         ? rollbackEnd - plan.unconsumeText.length
         : -1;
       if (
         plan?.unconsumeText &&
+        plan.candidateId === ghostCandidateId &&
+        plan.presentationKey === ghostPresentationKey &&
+        plan.surfaceKey === surfaceKey &&
+        plan.unconsumeText === ghostUnconsumeText &&
         exactCompletionRollback(
           plan.candidateId,
           plan.presentationKey,
@@ -1250,6 +1276,7 @@
       ) {
         event.preventDefault();
         event.stopImmediatePropagation();
+        retainedRollbackPlan = null;
         dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
       }
     }
@@ -1377,6 +1404,7 @@
           scheduleGhostVisibilityReport();
         }
         if (transaction.docChanged) {
+          retainedRollbackPlan = null;
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
           localDocumentChanged = true;
@@ -1489,6 +1517,7 @@
     // selection nor a delayed repair from the previous node tree can cross
     // this boundary.
     clearFormattingSelection();
+    retainedRollbackPlan = null;
     invalidateSelectionAccessibility();
     lastEmitted = incoming;
     const replacement = stateFor(incoming);
