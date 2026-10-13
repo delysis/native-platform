@@ -610,13 +610,15 @@ mod tests {
     use super::*;
     use loom_document::DocumentContent;
 
+    type DirectoryRecheckHook = Option<(PathBuf, Box<dyn FnOnce()>)>;
+
     thread_local! {
         pub(super) static BEFORE_GRANT_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
         pub(super) static AFTER_GRANT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
         pub(super) static BEFORE_DIRECTORY_RECHECK:
-            std::cell::RefCell<Option<(PathBuf, Box<dyn FnOnce()>)>> =
+            std::cell::RefCell<DirectoryRecheckHook> =
             const { std::cell::RefCell::new(None) };
     }
 

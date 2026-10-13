@@ -290,7 +290,7 @@ pub(super) fn submit<R: Runtime>(
         let _ = worker.join();
         let _ = owner.shutdown_joined();
         fail_and_release_open_runs(state, &identity, &runs, &failure.message, app)?;
-        return Err(failure);
+        return Err(*failure);
     }
     gate.release();
     lifecycle_ticket.detach();

@@ -1187,7 +1187,7 @@ struct GenerationWorkerReservation<'registry, 'admission> {
 
 #[derive(Debug)]
 struct GenerationWorkerAttachError {
-    failure: IpcFailure,
+    failure: Box<IpcFailure>,
     worker: JoinHandle<()>,
     owner: GenerationWorkerOwner,
 }
@@ -1937,22 +1937,22 @@ impl GenerationWorkerReservation<'_, '_> {
             Ok(Some(lease)) => lease.identity().sequence,
             Ok(None) => {
                 return Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_lifecycle_missing",
                         "the generation worker has no authoritative lifecycle reservation",
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 });
             }
             Err(error) => {
                 return Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_lifecycle_failed",
                         error.to_string(),
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 });
@@ -1964,11 +1964,11 @@ impl GenerationWorkerReservation<'_, '_> {
             .note_worker_started(lifecycle_worker_id)
         {
             return Err(GenerationWorkerAttachError {
-                failure: IpcFailure::new(
+                failure: Box::new(IpcFailure::new(
                     "generation_worker_lifecycle_failed",
                     error.to_string(),
                     false,
-                ),
+                )),
                 worker,
                 owner,
             });
@@ -1981,7 +1981,7 @@ impl GenerationWorkerReservation<'_, '_> {
                     .lifecycle
                     .note_worker_joined(lifecycle_worker_id);
                 return Err(GenerationWorkerAttachError {
-                    failure,
+                    failure: Box::new(failure),
                     worker,
                     owner,
                 });
@@ -2003,11 +2003,11 @@ impl GenerationWorkerReservation<'_, '_> {
                     .lifecycle
                     .note_worker_joined(lifecycle_worker_id);
                 Err(GenerationWorkerAttachError {
-                    failure: IpcFailure::new(
+                    failure: Box::new(IpcFailure::new(
                         "generation_worker_state_changed",
                         "the desktop generation worker reservation changed before attachment",
                         false,
-                    ),
+                    )),
                     worker,
                     owner,
                 })
@@ -8491,25 +8491,24 @@ fn replay_weave_if_recorded(
                 ));
             }
         }
-        let policy_matches = match &speculation {
-            Some(batch) => policy.matches_loompad_batch(batch),
-            None => {
-                let mut matches = !matches!(
-                    policy,
-                    ValidatedWeavePolicy::LoompadV2 { .. }
-                        | ValidatedWeavePolicy::LoompadVisualV3 { .. }
-                );
-                for started in &family.generations {
-                    if recorded_weave_first_word_choices(
-                        store,
-                        started.generation.context_recipe_artifact_id,
-                    )? != policy.first_word_choices()
-                    {
-                        matches = false;
-                    }
+        let policy_matches = if let Some(batch) = &speculation {
+            policy.matches_loompad_batch(batch)
+        } else {
+            let mut matches = !matches!(
+                policy,
+                ValidatedWeavePolicy::LoompadV2 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+            );
+            for started in &family.generations {
+                if recorded_weave_first_word_choices(
+                    store,
+                    started.generation.context_recipe_artifact_id,
+                )? != policy.first_word_choices()
+                {
+                    matches = false;
                 }
-                matches
             }
+            matches
         };
         let family_matches = policy_matches
             && resolved.is_some_and(|resolved| {
@@ -9509,7 +9508,7 @@ fn weave_start_inner<R: Runtime>(
         let failure = if desktop_panicked || backend_joined.worker_panicked() {
             state.generation_workers.record_join_failure()
         } else {
-            failure
+            *failure
         };
         if let Err(persistence) =
             fail_and_release_open_runs(state, &identity, &runs, &failure.message, app)

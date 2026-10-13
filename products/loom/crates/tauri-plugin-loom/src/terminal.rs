@@ -1243,7 +1243,7 @@ fn spawn_worker<R: Runtime>(
         start.release();
         let _ = error.worker.join();
         error.owner.shutdown_joined();
-        return Err(error.failure);
+        return Err(*error.failure);
     }
     start.release();
     ticket.detach();
