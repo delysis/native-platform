@@ -5,8 +5,6 @@ import {
   type AutocompleteDisposition,
   type AutocompleteExhaustionReason
 } from './ghostSuggestion';
-import { visualGhostTextInlineCandidate, visualGhostTextMayBeInlineMarkdown } from './ghostText';
-import { sourceGhostPresentationCompatible } from './sourceGhostText';
 import type { SuggestionAlternative } from './suggestionInteraction';
 import type {
   BranchCard,
@@ -121,24 +119,14 @@ export function authoritativeInlineFamilyId(
  */
 export function projectInlineCandidateText(
   targetByte: number,
-  editorMode: 'visual' | 'source',
+  _editorMode: 'visual' | 'source',
   manuscriptText: string,
   rawText: string,
-  sourceNewline: VerseNewlineKind | null
+  _sourceNewline: VerseNewlineKind | null
 ): string | null {
-  const candidateText = editorMode === 'visual'
-    ? visualGhostTextInlineCandidate(rawText)
-    : rawText;
-  const text = candidateText === null
-    ? null
-    : completionTextAtBoundary(manuscriptText, targetByte, candidateText);
-  if (!text || !/\S/u.test(text)) return null;
-  if (editorMode === 'visual') {
-    return visualGhostTextMayBeInlineMarkdown(text) ? text : null;
-  }
-  return sourceGhostPresentationCompatible(manuscriptText, text, sourceNewline)
-    ? text
-    : null;
+  const text = completionTextAtBoundary(manuscriptText, targetByte, rawText);
+  if (text === null || text.length === 0) return null;
+  return text;
 }
 
 export function projectedInlinePresentationKey(
@@ -148,7 +136,7 @@ export function projectedInlinePresentationKey(
 ): string {
   return projectedText === rawText
     ? rawPresentationKey
-    : `${rawPresentationKey}:prose-prefix:${new TextEncoder().encode(projectedText).byteLength}`;
+    : `${rawPresentationKey}:boundary:${new TextEncoder().encode(projectedText).byteLength}`;
 }
 
 export function inlineSuggestionFamily(
@@ -259,7 +247,7 @@ export function evaluateInlineSuggestionFamily(
         if (branch.status === 'queued' || branch.status === 'generating') {
           pending.add(branch.run_id);
         } else {
-          terminalShortfall.push({ candidateId, reason: 'unpresentable' });
+          terminalShortfall.push({ candidateId, reason: 'invalid' });
         }
         continue;
       }

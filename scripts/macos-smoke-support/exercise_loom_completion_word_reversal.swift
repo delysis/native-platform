@@ -647,7 +647,7 @@ func verifiedCandidateBytes(_ candidate: [String: Any]) -> Data? {
     guard parts.count == 2 || parts.count == 4, parts[0] != "stream", !parts[0].isEmpty,
           parts[1].count == 64, parts[1].allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
     let hash = parts[1], length = integer(candidate, "text_utf8_bytes")
-    if parts.count == 4 && (parts[2] != "prose-prefix" || Int(parts[3]) != length) { return nil }
+    if parts.count == 4 && (parts[2] != "boundary" || Int(parts[3]) != length) { return nil }
     let path = URL(fileURLWithPath: manuscript).deletingLastPathComponent()
         .appendingPathComponent(".loom/blobs/sha256").appendingPathComponent(String(hash.prefix(2)))
         .appendingPathComponent(String(hash.dropFirst(2)))

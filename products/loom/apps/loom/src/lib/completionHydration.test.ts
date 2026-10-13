@@ -46,15 +46,16 @@ async function hydrate(state: InlineSuggestionState, bodies: BranchBody[], indic
   }
 }
 
-test('terminal summaries with unusable live partials wait for body authority', () => {
+test('terminal summaries keep an exact live projection without content qualification', () => {
   const { state } = fixture();
-  assert.deepEqual(evaluation(state).phase, { kind: 'awaiting_hydration', runIds: ['run-0', 'run-1', 'run-2', 'run-3'] });
+  assert.equal(evaluation(state).phase.kind, 'ready');
+  assert.equal(evaluation(state).candidates[0].text, ' ');
 });
 
-test('the last unverified member prevents a partially hydrated family from triggering replacement', async () => {
+test('hydration replaces an exact live projection only with verified body authority', async () => {
   const { state, bodies } = fixture();
   await hydrate(state, bodies, [0, 1, 2]);
-  assert.deepEqual(evaluation(state).phase, { kind: 'awaiting_hydration', runIds: ['run-3'] });
+  assert.equal(evaluation(state).phase.kind, 'ready');
   await hydrate(state, bodies, [3]);
   assert.equal(evaluation(state).phase.kind, 'ready');
   assert.equal(evaluation(state).candidates.length, 4);
@@ -70,7 +71,8 @@ test('a complete authorized live family remains visible while terminal bodies ar
   assert.equal(result.candidates[0].presentationKey, 'stream:run-0:7');
 });
 
-for (const text of ['', ' ']) test(`verified unusable output ${JSON.stringify(text)} remains a terminal invariant failure`, async () => {
+test('an empty verified output remains a terminal invariant failure', async () => {
+  const text = '';
   const { state, bodies } = fixture(text);
   await hydrate(state, bodies);
   state.liveTextByRun = {};
@@ -78,12 +80,22 @@ for (const text of ['', ' ']) test(`verified unusable output ${JSON.stringify(te
   assert.equal(evaluation(state).phase.kind, 'terminal_shortfall');
 });
 
-test('a proof for a different immutable blob does not end hydration', async () => {
+test('whitespace output is not disqualified after generation', async () => {
+  const { state, bodies } = fixture(' ');
+  await hydrate(state, bodies);
+  state.liveTextByRun = {};
+  state.liveTextSequenceByRun = {};
+  assert.equal(evaluation(state).phase.kind, 'ready');
+  assert.equal(evaluation(state).candidates[0].text, ' ');
+});
+
+test('a proof for a different immutable blob falls back to exact live authority', async () => {
   const { state, bodies } = fixture();
   await hydrate(state, bodies);
   state.branches[3].output_blob_id = 'a'.repeat(64);
   state.branches[3].text = '';
-  assert.deepEqual(evaluation(state).phase, { kind: 'awaiting_hydration', runIds: ['run-3'] });
+  assert.equal(evaluation(state).phase.kind, 'ready');
+  assert.equal(evaluation(state).candidates[3].text, ' ');
 });
 
 test('stale document authority cannot make either streamed or hydrated bytes visible', async () => {

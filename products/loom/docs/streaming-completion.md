@@ -27,11 +27,13 @@ reversal; undo does not restore completion authority or regenerate its ghost.
 A matching presentation key is insufficient evidence of a rendered preview.
 The actual connected, visible DOM text must equal the authorized prefix before
 inline acceptance. Offscreen-caret, focus, composition, canonical Markdown,
-grapheme, model, document, revision and family checks remain in force.
-These are structural identity checks, not a content-quality filter. Autocomplete
-does not score a completed candidate, reject its prose, or request a replacement
-family after generation. A sampler-authorized Visual candidate that cannot be
-projected exactly is an invariant failure and is never replaced by a sibling.
+model, document, revision and family checks remain in force. These establish the
+editor and candidate identity; they do not review generated content. Autocomplete
+does not score, qualify or reject completed prose, salvage a prefix, rotate to a
+sibling, or request a replacement family after generation. Visual sends the whole
+sampler-authorized candidate directly through the manuscript's ProseMirror parser.
+Any content that must never reach that parser must be masked or rejected by the
+native sampler before emission.
 
 ## Executable regressions
 

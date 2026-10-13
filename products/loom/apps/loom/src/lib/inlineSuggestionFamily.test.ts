@@ -97,21 +97,15 @@ function state(manuscriptText: string): InlineSuggestionState {
 }
 
 describe('inline suggestion family', () => {
-  it('reports a terminal invariant failure without selecting a replacement', () => {
+  it('does not qualify or reject completed Visual output', () => {
     const selection = state('hello');
     selection.branches = selection.branches.map((branch) => ({ ...branch, status: 'ready' }));
     selection.liveTextByRun['run-4'] = '\n\nA heading cannot be an inline visual ghost.';
 
     const evaluation = evaluateInlineSuggestionFamily(5, 'visual', selection);
-    expect(evaluation.candidates).toEqual([]);
-    expect(evaluation.phase).toEqual({
-      kind: 'terminal_shortfall',
-      candidates: [{ candidateId: 'run:run-4', reason: 'unpresentable' }]
-    });
-    expect(evaluation.disposition).toEqual({
-      kind: 'exhausted',
-      candidates: [{ candidateId: 'run:run-4', reason: 'unpresentable' }]
-    });
+    expect(evaluation.candidates).toHaveLength(4);
+    expect(evaluation.candidates[3].text).toBe('\n\nA heading cannot be an inline visual ghost.');
+    expect(evaluation.phase).toEqual({ kind: 'ready' });
   });
 
   it('does not regenerate a family merely because its published choices were dismissed', () => {
@@ -143,11 +137,10 @@ describe('inline suggestion family', () => {
     expect(inlineSuggestionFamily(5, 'visual', state('hello'))[0]).toMatchObject({
       runId: 'run-1',
       targetByte: 5,
-      presentationKey: 'stream:run-1:7:prose-prefix:16',
+      presentationKey: 'stream:run-1:7:boundary:16',
       text: ' world continues',
       insertsOnAccept: true
     });
-    expect(inlineSuggestionFamily(5, 'visual', state(''))).toEqual([]);
   });
 
   it('keys equal-byte-length live replacements by text-delta sequence', () => {
@@ -161,11 +154,11 @@ describe('inline suggestion family', () => {
 
     expect(first).toMatchObject({
       text: ' cats arrive',
-      presentationKey: 'stream:run-1:41:prose-prefix:12'
+      presentationKey: 'stream:run-1:41:boundary:12'
     });
     expect(second).toMatchObject({
       text: ' dogs arrive',
-      presentationKey: 'stream:run-1:42:prose-prefix:12'
+      presentationKey: 'stream:run-1:42:boundary:12'
     });
   });
 
@@ -175,14 +168,14 @@ describe('inline suggestion family', () => {
     expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
   });
 
-  it('never salvages a visual prefix from multiline sampler output', () => {
+  it('passes sampler output through whole without post-generation qualification', () => {
     expect(projectInlineCandidateText(
       5,
       'visual',
       'hello',
       ' world.\n\nA new paragraph.',
       null
-    )).toBeNull();
+    )).toBe(' world.\n\nA new paragraph.');
     expect(projectInlineCandidateText(
       5,
       'source',
@@ -196,7 +189,7 @@ describe('inline suggestion family', () => {
       'hello',
       '\n\nA new paragraph.',
       null
-    )).toBeNull();
+    )).toBe('\n\nA new paragraph.');
   });
 
   it('surfaces only the exact live authoritative four-run family', () => {
@@ -251,7 +244,7 @@ describe('inline suggestion family', () => {
     const candidates = inlineSuggestionFamily(5, 'visual', selection);
     expect(candidates.map(candidate => candidate.runId)).toEqual(['run-4','run-3','run-2','run-1','run-8','run-7','run-6']);
     expect(candidates.find(candidate => candidate.runId === 'run-1')).toMatchObject({
-      text: ' world continues', presentationKey: 'stream:run-1:7:prose-prefix:16', insertsOnAccept: true
+      text: ' world continues', presentationKey: 'stream:run-1:7:boundary:16', insertsOnAccept: true
     });
     selection.authoritativeFamilyId = FAMILY_ONE;
     selection.requireExplicitFamily = false;

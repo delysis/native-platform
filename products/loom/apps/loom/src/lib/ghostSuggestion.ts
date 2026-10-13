@@ -18,8 +18,7 @@ export interface GhostSuggestionSelection {
 }
 
 export type AutocompleteExhaustionReason =
-  | 'invalid'
-  | 'unpresentable';
+  | 'invalid';
 
 export type AutocompleteDisposition =
   | { kind: 'inactive' }
@@ -57,8 +56,7 @@ export function verifiedGhostSuggestion(
     branch.target_end_byte !== branch.target_start_byte ||
     !verifiedBodyMatchesBranch(body, branch) ||
     branch.text !== body.text ||
-    !body.text ||
-    !/\S/u.test(body.text)
+    !body.text
   ) return null;
 
   const actualBytes = new TextEncoder().encode(body.text).byteLength;

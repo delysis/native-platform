@@ -4,10 +4,7 @@ import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-ma
 import { DOMSerializer, type Mark, type Slice } from 'prosemirror-model';
 import { Plugin, PluginKey, NodeSelection, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
-import {
-  insertionPreservesExtendedGraphemeEdges,
-  isExtendedGraphemeBoundary
-} from './graphemeBoundary';
+import { isExtendedGraphemeBoundary } from './graphemeBoundary';
 import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 import {
   nextVisualSuggestionWord,
@@ -263,15 +260,6 @@ function visibleCaretIsExtendedGraphemeBoundary(state: EditorState): boolean {
   return caret !== null && isExtendedGraphemeBoundary(caret.text, caret.offset);
 }
 
-function insertionPreservesVisibleGraphemeEdges(
-  state: EditorState,
-  text: string
-): boolean {
-  const caret = flattenedTextCaret(state);
-  if (!caret) return false;
-  return insertionPreservesExtendedGraphemeEdges(caret.text, caret.offset, text);
-}
-
 function utf8BoundaryToUtf16Index(text: string, targetBytes: number): number | null {
   if (!Number.isSafeInteger(targetBytes) || targetBytes < 0) return null;
   const encoder = new TextEncoder();
@@ -403,59 +391,6 @@ export function exactMarkdownByteOffsetAtSelection(
   return visualCaretBoundaryProof(state, canonicalMarkdown).byteOffset;
 }
 
-/**
- * Cheap context-neutral screen used while choosing among branch candidates.
- * The exact document-context proof below remains authoritative.
- */
-function beginsWithMarkupConstruct(text: string): boolean {
-  const prefix = text.trimStart();
-  return /^<(?:\/?[A-Za-z][A-Za-z0-9:-]*(?:[\s/>]|$)|!--|[!?])/u.test(prefix);
-}
-
-export function visualGhostTextMayBeInlineMarkdown(text: string): boolean {
-  // Visual completion insertion uses one ProseMirror text transaction. A
-  // newline in that transaction would create text bytes that serialize as
-  // blocks without actually creating those block nodes, breaking the mounted
-  // document's parse/serialize identity. Source mode remains the explicit
-  // surface for multiline completion.
-  if (
-    !text ||
-    !/\S/u.test(text) ||
-    /[\r\n]/u.test(text) ||
-    beginsWithMarkupConstruct(text)
-  ) return false;
-
-  try {
-    const left = '\uE100LOOM_LEFT\uE101';
-    const right = '\uE102LOOM_RIGHT\uE103';
-    // Continuations are inline text, not standalone Markdown documents. For
-    // example, "3. 5-meter-long desk" is literal inside an existing paragraph
-    // but a list at block start. The exact caret/document proof below rejects
-    // the latter; this neutral screen must not discard the former.
-    const wrapped = `${left}${text}${right}`;
-    const parsed = defaultMarkdownParser.parse(wrapped);
-    const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
-    if (
-      !paragraph ||
-      paragraph.type.name !== 'paragraph'
-    ) {
-      return false;
-    }
-    let inlineText = true;
-    paragraph.descendants((node) => {
-      if (!node.isText) inlineText = false;
-    });
-    return inlineText && defaultMarkdownSerializer.serialize(parsed) === wrapped;
-  } catch {
-    return false;
-  }
-}
-
-/** Preserve the sampler output exactly; Visual never salvages a prefix. */
-export function visualGhostTextInlineCandidate(text: string): string | null {
-  return visualGhostTextMayBeInlineMarkdown(text) ? text : null;
-}
-
 interface VisualGhostInsertion {
   transaction: Transaction;
   inserted: Slice;
@@ -470,23 +405,18 @@ function prepareVisualGhostInsertion(
   anchorByteOffset: number,
   text: string
 ): VisualGhostInsertion | null {
-  if (
-    exactMarkdownByteOffsetAtSelection(state, canonicalMarkdown) !== anchorByteOffset ||
-    !visualGhostTextMayBeInlineMarkdown(text)
-  ) return null;
+  if (exactMarkdownByteOffsetAtSelection(state, canonicalMarkdown) !== anchorByteOffset) return null;
   const boundary = utf8BoundaryToUtf16Index(canonicalMarkdown, anchorByteOffset);
   if (boundary === null) return null;
   try {
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
     const target = parseVisualMarkdown(promotedMarkdown, state.schema);
-    if (serializeVisualMarkdown(target) !== promotedMarkdown) return null;
     if (promotedMarkdown.includes(CARET_BOUNDARY_WITNESS)) return null;
     const witnessedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + CARET_BOUNDARY_WITNESS +
       canonicalMarkdown.slice(boundary);
     const witnessedTarget = parseVisualMarkdown(witnessedMarkdown, state.schema);
-    if (serializeVisualMarkdown(witnessedTarget) !== witnessedMarkdown) return null;
     let witnessPosition: number | null = null;
     let witnessMarks: readonly Mark[] | null = null;
     witnessedTarget.descendants((node, position) => {
@@ -521,8 +451,7 @@ function prepareVisualGhostInsertion(
     });
     if (!renderedInlineText) return null;
     const visibleText = rendered.content.textBetween(0, rendered.content.size, '\n', '\ufffc');
-    if (!visibleText || !/\S/u.test(visibleText) ||
-        !insertionPreservesVisibleGraphemeEdges(state, visibleText)) return null;
+    if (!visibleText) return null;
     return { transaction, inserted, rendered, visibleText };
   } catch {
     return null;

@@ -19,8 +19,6 @@ import {
   visualGhostInsertionIsVisible,
   visualGhostTextInsertionTransaction,
   visualGhostTextIsFaithfulAtSelection,
-  visualGhostTextMayBeInlineMarkdown,
-  visualGhostTextInlineCandidate,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -667,17 +665,16 @@ describe('exact visual caret to Markdown boundary', () => {
   });
 });
 
-describe('faithful visual ghost projection', () => {
+describe('visual ghost projection', () => {
   function stateAt(markdown: string, position: number): EditorState {
     const doc = defaultMarkdownParser.parse(markdown);
     return EditorState.create({ doc, selection: TextSelection.create(doc, position) });
   }
 
-  it('admits literal inline prose only when promoted Markdown has the same document', () => {
+  it('projects literal inline prose at the exact document boundary', () => {
     const markdown = 'The rain waits.';
     const state = stateAt(markdown, Selection.atEnd(defaultMarkdownParser.parse(markdown)).from);
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBeInlineMarkdown(' for morning.')).toBe(true);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -700,21 +697,11 @@ describe('faithful visual ghost projection', () => {
     )).toBe(true);
   });
 
-  it('admits inline Markdown, rejects block structure, and rejects the wrong anchor', () => {
+  it('renders and inserts inline Markdown while retaining exact anchor authority', () => {
     const markdown = 'The rain waits.';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBeInlineMarkdown(' **boldly**')).toBe(true);
-    expect(visualGhostTextMayBeInlineMarkdown('\n\nMorning came.\n\nThe bells answered.')).toBe(false);
-    expect(visualGhostTextMayBeInlineMarkdown('\n\n# Morning came.')).toBe(false);
-    expect(visualGhostTextMayBeInlineMarkdown('\n\n- Morning came.')).toBe(false);
-    expect(visualGhostTextIsFaithfulAtSelection(
-      state,
-      markdown,
-      anchor,
-      '\n\nMorning came.\n\nThe bells answered.'
-    )).toBe(false);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -733,45 +720,15 @@ describe('faithful visual ghost projection', () => {
     )).toBe(false);
   });
 
-  it('keeps the complete sampler output or rejects the complete candidate', () => {
-    expect(visualGhostTextInlineCandidate(' The door opened.\n# Notes')).toBeNull();
-    expect(visualGhostTextInlineCandidate(' The door opened.\n\nMorning came.')).toBeNull();
-    expect(visualGhostTextInlineCandidate(' She waited **boldly**')).toBe(' She waited **boldly**');
-    expect(visualGhostTextInlineCandidate(' **boldly**')).toBe(' **boldly**');
-    expect(visualGhostTextInlineCandidate(' ordinary prose')).toBe(' ordinary prose');
-  });
-
-  it('keeps numeric punctuation literal at a proven prose caret without admitting a list at block start', () => {
+  it('keeps numeric punctuation literal at a proven prose caret', () => {
     const text = '3. 5-meter-long desk. The office was empty.';
     const markdown = 'The lantern lit the ';
     const doc = parseVisualMarkdown(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
-    expect(visualGhostTextInlineCandidate(text)).toBe(text);
     expect(visualGhostTextIsFaithfulAtSelection(state, markdown, markdown.length, text)).toBe(true);
-    const empty = parseVisualMarkdown('');
-    expect(visualGhostTextIsFaithfulAtSelection(
-      EditorState.create({ doc: empty, selection: Selection.atEnd(empty) }), '', 0, text
-    )).toBe(false);
   });
 
-  it('never salvages prose from a markup-led stored candidate', () => {
-    for (const observed of [
-      '<strong>I’m going to college</strong> moreover prose follows.',
-      '  </em> prose follows.',
-      '<x-card/> prose follows.',
-      '<strong class="lead"',
-      '<!-- model comment',
-      '<!DOCTYPE html>',
-      '<?xml version="1.0"?>'
-    ]) {
-      expect(visualGhostTextMayBeInlineMarkdown(observed), observed).toBe(false);
-      expect(visualGhostTextInlineCandidate(observed), observed).toBeNull();
-    }
-    expect(visualGhostTextInlineCandidate('<3 forever')).toBe('<3 forever');
-    expect(visualGhostTextInlineCandidate('< word')).toBe('< word');
-  });
-
-  it('rejects candidate edges that join a human grapheme', () => {
+  it('lets ProseMirror render candidate edges that join a human grapheme', () => {
     const cases = [
       { markdown: 'e', text: '\u0301 morning' },
       { markdown: '👩', text: '\u200d👩 together' },
@@ -781,24 +738,22 @@ describe('faithful visual ghost projection', () => {
       const doc = defaultMarkdownParser.parse(markdown);
       const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
       const anchor = new TextEncoder().encode(markdown).byteLength;
-      expect(visualGhostTextMayBeInlineMarkdown(text)).toBe(true);
       expect(visualGhostTextIsFaithfulAtSelection(
         state,
         markdown,
         anchor,
         text
-      )).toBe(false);
+      )).toBe(true);
     }
   });
 
-  it('rejects a candidate whose trailing regional indicator joins the suffix', () => {
+  it('lets ProseMirror render a candidate whose trailing regional indicator joins the suffix', () => {
     const markdown = 'A 🇳 waits';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
     const anchor = new TextEncoder().encode('A ').byteLength;
     const text = '🇺';
-    expect(visualGhostTextMayBeInlineMarkdown(text)).toBe(true);
-    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(false);
+    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(true);
   });
 });
 
