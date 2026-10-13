@@ -4,12 +4,21 @@ func isOwnedManuscriptEditor(role: String, labels: [String]) -> Bool {
     role == "AXTextArea" && labels.contains("Untitled, manuscript editor")
 }
 
-func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+func expectedInsertedCandidatePrefix(original: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Data? {
     guard insertedBytes > 0, insertedBytes <= candidate.count,
-          !whole || insertedBytes == candidate.count else { return false }
+          !whole || insertedBytes == candidate.count else { return nil }
     var expected = original
     expected.append(candidate.prefix(insertedBytes))
-    return observed == expected
+    return expected
+}
+
+func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+    expectedInsertedCandidatePrefix(
+        original: original,
+        candidate: candidate,
+        insertedBytes: insertedBytes,
+        whole: whole
+    ) == observed
 }
 
 // Derive the remaining fan from persisted bytes and independently SHA-verified
@@ -535,6 +544,22 @@ func waitForExactEditorInsertion(
     return nil
 }
 
+func waitForExactPersistedInsertion(
+    original: Data,
+    candidate: Data,
+    insertedBytes: Int,
+    whole: Bool,
+    timeout: TimeInterval
+) -> Data? {
+    guard let expected = expectedInsertedCandidatePrefix(
+        original: original,
+        candidate: candidate,
+        insertedBytes: insertedBytes,
+        whole: whole
+    ), waitForExactManuscript(expected, timeout: timeout) else { return nil }
+    return expected
+}
+
 func focusWritingSurface(expected: Data, timeout: TimeInterval) -> AXUIElement? {
     guard let caret = manuscriptEndCaret(original: Data(prefix.utf8), expected: expected),
           let runningApplication = NSRunningApplication(processIdentifier: pid) else { return nil }
@@ -965,7 +990,7 @@ let returnAction = lastAction(returnAccepted)
 Thread.sleep(forTimeInterval: 0.25)
 let returnCandidate = expectedCandidates[returnRunId]
 let returnAcceptedBytes = returnCandidate.flatMap { candidate in
-    waitForExactEditorInsertion(
+    waitForExactPersistedInsertion(
           original: original,
           candidate: candidate,
           insertedBytes: integer(returnAction, "inserted_utf8_bytes"),
@@ -981,7 +1006,7 @@ let returnByteCountExact = integer(returnAction, "accepted_utf8_bytes") ==
 let returnEditorFocused = waitForEditorFocus(timeout: 1)
 guard returnCandidate != nil, returnAcceptedBytes != nil, returnInsertionExact,
       returnByteCountExact, returnEditorFocused else {
-    releaseOptionAndFail("fan Return pre-reversal guard failed: candidate=\(returnCandidate != nil) editor_bytes=\(returnAcceptedBytes != nil) insertion=\(returnInsertionExact) byte_count=\(returnByteCountExact) focus=\(returnEditorFocused)")
+    releaseOptionAndFail("fan Return pre-reversal guard failed: candidate=\(returnCandidate != nil) persisted_bytes=\(returnAcceptedBytes != nil) insertion=\(returnInsertionExact) byte_count=\(returnByteCountExact) focus=\(returnEditorFocused)")
 }
 guard let exactReturnAcceptedBytes = returnAcceptedBytes else {
     releaseOptionAndFail("fan Return accepted bytes disappeared after exact validation")
@@ -991,6 +1016,7 @@ guard postKey(123, down: true, flags: [.maskAlternate]),
       let returnRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readManuscript() == original &&
               readEditorBytes() == original &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
@@ -1055,7 +1081,7 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
 let tabAction = lastAction(tabAccepted)
 Thread.sleep(forTimeInterval: 0.25)
 guard let tabCandidate = expectedCandidates[tabRunId],
-      let tabAcceptedBytes = waitForExactEditorInsertion(
+      let tabAcceptedBytes = waitForExactPersistedInsertion(
           original: original,
           candidate: tabCandidate,
           insertedBytes: integer(tabAction, "inserted_utf8_bytes"),
@@ -1070,6 +1096,7 @@ guard let tabCandidate = expectedCandidates[tabRunId],
       let tabRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
+              readManuscript() == original &&
               readEditorBytes() == original &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
@@ -1138,13 +1165,13 @@ let evidence: [String: Any] = [
     "fan_return_selected_witness": returnSelected,
     "fan_return_accepted_witness": returnAccepted,
     "fan_return_accepted_sha256": sha256(exactReturnAcceptedBytes),
-    "fan_return_acceptance_source": "live AX editor value",
+    "fan_return_acceptance_source": "exact persisted manuscript plus live AX focus",
     "fan_return_rolled_back_witness": returnRolledBack,
     "fan_return_released_witness": returnReleased,
     "fan_tab_selected_witness": tabSelected,
     "fan_tab_accepted_witness": tabAccepted,
     "fan_tab_accepted_sha256": sha256(tabAcceptedBytes),
-    "fan_tab_acceptance_source": "live AX editor value",
+    "fan_tab_acceptance_source": "exact persisted manuscript plus live AX focus",
     "fan_tab_rolled_back_witness": tabRolledBack,
     "fan_tab_released_witness": tabReleased,
     "engine_disabled_witness": engineDisabled
