@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 49,
+  "expected_test_count": 50,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -869,6 +869,23 @@
       ],
       "evidence_class": "real-product-model-runtime",
       "promotion_prohibition": "Passing this CLI test cannot promote native GUI, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "real_chat_cancellation_emits_one_terminal_after_native_join",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime cancellation test cannot promote visible GUI, packaged-app, cross-platform, or release readiness.",
       "platforms": [
         "linux",
         "macos",
