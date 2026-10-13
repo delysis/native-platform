@@ -16,6 +16,7 @@ static CANDIDATE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_armed(armed: bool) {
     REVERSAL_ARMED.store(armed, Ordering::Release);
+    acceptance_log(&format!("completion reversal armed={armed}"));
 }
 
 pub fn set_candidate_active(active: bool) {
@@ -50,12 +51,14 @@ pub fn install(notify: impl Fn() + Send + Sync + 'static) {
             )
         {
             REVERSAL_ARMED.store(true, Ordering::Release);
+            acceptance_log("completion acceptance key armed reversal");
         }
         if event_ref.keyCode() == LEFT_ARROW_KEY_CODE
             && modifiers.contains(NSEventModifierFlags::Option)
             && unmodified
             && REVERSAL_ARMED.swap(false, Ordering::AcqRel)
         {
+            acceptance_log("completion reversal key consumed");
             notify();
             return std::ptr::null_mut();
         }
@@ -70,5 +73,11 @@ pub fn install(notify: impl Fn() + Send + Sync + 'static) {
         std::mem::forget(monitor);
     } else {
         eprintln!("Loom could not install completion reversal monitor");
+    }
+}
+
+fn acceptance_log(message: &str) {
+    if std::env::var_os("DELYSIS_LOOM_ACCEPTANCE_DIR").is_some() {
+        eprintln!("loom-macos-shortcut: {message}");
     }
 }
