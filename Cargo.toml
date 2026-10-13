@@ -5,7 +5,6 @@ members = [
     "crates/operation-lifecycle",
     "crates/desktop-vault",
     "crates/desktop-generation-policy",
-    "products/loom/crates/loom-config",
     "crates/services/archive-friends",
 
     "crates/desktop-launch",
@@ -81,7 +80,6 @@ desktop-vault = { path = "crates/desktop-vault" }
 desktop-speech = { path = "crates/desktop-speech" }
 desktop-generation-policy = { path = "crates/desktop-generation-policy" }
 operation-lifecycle = { path = "crates/operation-lifecycle" }
-loom-config = { path = "products/loom/crates/loom-config" }
 desktop-launch = { path = "crates/desktop-launch" }
 workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }

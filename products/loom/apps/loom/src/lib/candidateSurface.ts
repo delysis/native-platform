@@ -118,8 +118,3 @@ export function candidateSurfaceDecision(text: string): CandidateSurfaceDecision
 export function candidateTextIsSurfaceable(text: string): boolean {
   return candidateSurfaceDecision(text).surface;
 }
-
-export function candidateSurfaceReason(text: string): string | null {
-  const decision = candidateSurfaceDecision(text);
-  return decision.surface ? null : decision.reason;
-}

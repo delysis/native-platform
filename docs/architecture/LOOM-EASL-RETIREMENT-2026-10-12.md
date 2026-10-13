@@ -29,9 +29,14 @@ package identities, sources, checksums and ordered dependency edges stay exact.
 All platforms and features represented by the current lock are considered.
 The separate Signal and Attachment fuzz workspaces and locks remain.
 
-`loom-config` remains a separate workspace root with its current tests/API.
-After retirement its former app/session runtime consumers disappear; a wider
-configuration-SDK withdrawal is not part of this decision.
+The initial three-root retirement kept `loom-config` separate. The subsequent
+checked-consumer public API decision also withdraws this configuration SDK:
+`.mine.toml`, frozen generation profiles, model/download and Google client
+configuration, workspace layouts and its Markdown configuration helpers.
+Its former runtime consumers were already retired; no retained product imports it.
+This accepts external API breaks. The live Tauri `.loom.md` parser and source-bound
+`FunctionRecipe` remain with their current owners. No user configuration or source
+file is rewritten, and no implementation is ported.
 
 Dated experiment records and all previous failed receipts remain attached to
 their original Source. The original public implementation is recoverable at
