@@ -45,9 +45,8 @@ pub fn run() {
     let event_exit_allowed = Arc::clone(&exit_allowed);
     let shutdown_started = Arc::new(AtomicBool::new(false));
     let event_shutdown_started = Arc::clone(&shutdown_started);
-    let mut plugin_builder = tauri_plugin_free_token_energy::Builder::new()
-        .with_gateway(plugin_gateway)
-        .with_default_loopback();
+    let mut plugin_builder =
+        tauri_plugin_free_token_energy::Builder::new(plugin_gateway).with_default_loopback();
     if let Some(isolation) = &acceptance {
         plugin_builder = plugin_builder.with_app_data_dir(isolation.root().to_path_buf());
     }

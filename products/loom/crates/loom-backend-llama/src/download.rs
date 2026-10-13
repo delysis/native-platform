@@ -507,7 +507,8 @@ where
             total_bytes: self.request.expected_bytes,
             resumed_from_bytes: initial_bytes,
         })?;
-        let (hasher, hashed_bytes) = hash_open_file(&mut file, path, self.cancellation).await?;
+        let (hasher, hashed_bytes) =
+            hash_open_file(&mut file, path, initial_bytes, self.cancellation).await?;
         if hashed_bytes != initial_bytes {
             return Err(DownloadError::PartialFileChanged);
         }
@@ -702,7 +703,7 @@ where
             .await
             .map_err(|source| io_error("synchronize partial file", partial_path, source))?;
         let (disk_hasher, disk_bytes) =
-            hash_open_file(partial, partial_path, self.cancellation).await?;
+            hash_open_file(partial, partial_path, completed.bytes, self.cancellation).await?;
         let disk_digest = finalize_digest(&disk_hasher);
         validate_download(self.request, disk_bytes, disk_digest)?;
         if disk_bytes != completed.bytes || disk_digest != completed.digest {
@@ -1292,13 +1293,14 @@ async fn hash_regular_path(
     }
     let file = File::open(path).map_err(|source| io_error("open file", path, source))?;
     let mut file = tokio::fs::File::from_std(file);
-    let (hasher, bytes) = hash_open_file(&mut file, path, cancellation).await?;
+    let (hasher, bytes) = hash_open_file(&mut file, path, metadata.len(), cancellation).await?;
     Ok((bytes, finalize_digest(&hasher)))
 }
 
 async fn hash_open_file(
     file: &mut tokio::fs::File,
     path: &Path,
+    admitted_bytes: u64,
     cancellation: &DownloadCancellation,
 ) -> Result<(Sha256, u64), DownloadError> {
     file.seek(SeekFrom::Start(0))
@@ -1317,16 +1319,22 @@ async fn hash_open_file(
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
-        bytes = bytes
+        let next_bytes = bytes
             .checked_add(
                 u64::try_from(read).map_err(|_| DownloadError::DownloadTooLarge {
-                    limit: MAX_MODEL_DOWNLOAD_BYTES,
+                    limit: admitted_bytes,
                 })?,
             )
             .ok_or(DownloadError::DownloadTooLarge {
-                limit: MAX_MODEL_DOWNLOAD_BYTES,
+                limit: admitted_bytes,
             })?;
+        if next_bytes > admitted_bytes {
+            return Err(DownloadError::DownloadTooLarge {
+                limit: admitted_bytes,
+            });
+        }
+        hasher.update(&buffer[..read]);
+        bytes = next_bytes;
     }
     Ok((hasher, bytes))
 }
@@ -1572,6 +1580,133 @@ mod tests {
         );
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
         assert!(!partial.exists());
+        assert!(result.partial_removed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_growth_stops_at_the_admitted_hash_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("model.gguf");
+        let partial = directory.path().join("model.gguf.part");
+        let mut bytes = vec![0x5a; HASH_BUFFER_BYTES + 17];
+        bytes[..4].copy_from_slice(&GGUF_MAGIC);
+        std::fs::write(&partial, &bytes).unwrap();
+        let growth = vec![0x33; HASH_BUFFER_BYTES * 2 + 7];
+        let mut value = request(target.clone(), &bytes);
+        value.max_bytes = u64::try_from(bytes.len() + growth.len() + 1).unwrap();
+        let admitted_bytes = u64::try_from(bytes.len()).unwrap();
+        let mut phases = Vec::new();
+        let result = download_gguf(&value, &DownloadCancellation::default(), |event| {
+            phases.push(event.phase);
+            if event.phase == DownloadPhase::HashingPartial {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&partial)
+                    .unwrap()
+                    .write_all(&growth)
+                    .unwrap();
+            }
+            DownloadControl::Continue
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(DownloadError::DownloadTooLarge { limit }) if limit == admitted_bytes
+        ));
+        bytes.extend_from_slice(&growth);
+        assert_eq!(std::fs::read(&partial).unwrap(), bytes);
+        assert!(!target.exists());
+        assert_eq!(phases, [DownloadPhase::HashingPartial]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_growth_stops_at_the_completed_hash_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("model.gguf");
+        let partial = directory.path().join("model.gguf.part");
+        let mut bytes = vec![0x5a; HASH_BUFFER_BYTES + 17];
+        bytes[..4].copy_from_slice(&GGUF_MAGIC);
+        std::fs::write(&partial, &bytes).unwrap();
+        let growth = vec![0x33; HASH_BUFFER_BYTES * 2 + 7];
+        let mut value = request(target.clone(), &bytes);
+        value.max_bytes = u64::try_from(bytes.len() + growth.len() + 1).unwrap();
+        let admitted_bytes = u64::try_from(bytes.len()).unwrap();
+        let mut phases = Vec::new();
+        let result = download_gguf(&value, &DownloadCancellation::default(), |event| {
+            phases.push(event.phase);
+            if event.phase == DownloadPhase::Verifying {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&partial)
+                    .unwrap()
+                    .write_all(&growth)
+                    .unwrap();
+            }
+            DownloadControl::Continue
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(DownloadError::DownloadTooLarge { limit }) if limit == admitted_bytes
+        ));
+        bytes.extend_from_slice(&growth);
+        assert_eq!(std::fs::read(&partial).unwrap(), bytes);
+        assert!(!target.exists());
+        assert_eq!(
+            phases,
+            [DownloadPhase::HashingPartial, DownloadPhase::Verifying]
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_multichunk_partial_keeps_exact_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("model.gguf");
+        let partial = directory.path().join("model.gguf.part");
+        let mut bytes = vec![0x5a; HASH_BUFFER_BYTES + 17];
+        bytes[..4].copy_from_slice(&GGUF_MAGIC);
+        std::fs::write(&partial, &bytes).unwrap();
+        let mut value = request(target.clone(), &bytes);
+        value.max_bytes = u64::try_from(bytes.len()).unwrap();
+        let result = download_gguf(&value, &DownloadCancellation::default(), |_| {
+            DownloadControl::Continue
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.bytes, value.max_bytes);
+        assert_eq!(result.sha256, digest(&bytes));
+        assert_eq!(
+            result.disposition,
+            DownloadDisposition::DownloadedResumed {
+                resumed_from_bytes: value.max_bytes
+            }
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(!partial.exists());
+        assert!(result.partial_removed);
+    }
+
+    #[tokio::test]
+    async fn admitted_multichunk_existing_target_without_expected_size_is_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("model.gguf");
+        let mut bytes = vec![0x5a; HASH_BUFFER_BYTES + 17];
+        bytes[..4].copy_from_slice(&GGUF_MAGIC);
+        std::fs::write(&target, &bytes).unwrap();
+        let mut value = request(target.clone(), &bytes);
+        value.expected_bytes = None;
+        value.max_bytes = u64::try_from(bytes.len()).unwrap();
+        let result = download_gguf(&value, &DownloadCancellation::default(), |_| {
+            DownloadControl::Continue
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.bytes, value.max_bytes);
+        assert_eq!(result.sha256, digest(&bytes));
+        assert_eq!(result.disposition, DownloadDisposition::ReusedExisting);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
         assert!(result.partial_removed);
     }
 

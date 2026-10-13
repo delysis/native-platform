@@ -10,7 +10,7 @@ use fte_types::{
     GenerationInput, InputItem, MessageRole, ModelSelector, OutputGroup, OutputItem, PrivacyPolicy,
     ProviderCacheBreakpoint, ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile,
     RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, TerminalStatus, ToolDefinition,
-    ToolExecutionPolicy, ToolOwner, ToolPolicy, UsageProvenance,
+    ToolExecutionPolicy, ToolOwner, ToolPolicy, ToolSelection, UsageProvenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -190,8 +190,12 @@ impl OpenAiChatRequest {
             .unwrap_or_default()
             .into_iter()
             .map(OpenAiFunctionTool::into_canonical)
-            .collect();
-        let tool_policy = parse_openai_tool_choice(self.tool_choice.as_ref(), !tools.is_empty())?;
+            .collect::<Result<_, _>>()?;
+        let tool_policy = parse_openai_tool_choice(
+            self.tool_choice.as_ref(),
+            &tools,
+            OpenAiToolChoiceSurface::Chat,
+        )?;
         let mut request = base_request(
             request_id,
             self.user.unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string()),
@@ -224,12 +228,14 @@ impl OpenAiChatRequest {
         request.response_format = self
             .response_format
             .map(OpenAiResponseFormat::into_canonical)
+            .transpose()?
             .unwrap_or_default();
         request.storage.store_response = self.store.unwrap_or(false);
-        if self.parallel_tool_calls == Some(false) {
-            request
-                .provider_extensions
-                .insert("openai.parallel_tool_calls".to_string(), Value::Bool(false));
+        if let Some(parallel) = self.parallel_tool_calls {
+            request.provider_extensions.insert(
+                "openai.parallel_tool_calls".to_string(),
+                Value::Bool(parallel),
+            );
         }
         Ok(request)
     }
@@ -248,6 +254,12 @@ pub struct OpenAiMessage {
 impl OpenAiMessage {
     fn into_items(self) -> Result<Vec<InputItem>, GatewayError> {
         let request_id = RequestId::new();
+        reject_if(
+            &request_id,
+            self.name.is_some(),
+            "chat_participant_name_unsupported",
+            "participant names cannot be preserved on the canonical chat surface",
+        )?;
         if self.tool_call_id.is_some() && self.tool_calls.is_some() {
             return Err(GatewayError::invalid_request(
                 &request_id,
@@ -311,7 +323,6 @@ impl OpenAiMessage {
             return Ok(items);
         }
         let role = parse_role(&request_id, &self.role)?;
-        let _ = self.name;
         let content = match self.content {
             Some(content) => content.into_blocks()?,
             None => Vec::new(),
@@ -428,14 +439,20 @@ pub struct OpenAiFunctionTool {
 }
 
 impl OpenAiFunctionTool {
-    fn into_canonical(self) -> ToolDefinition {
-        ToolDefinition {
+    fn into_canonical(self) -> Result<ToolDefinition, GatewayError> {
+        reject_if(
+            &RequestId::new(),
+            self.kind != "function",
+            "chat_tool_definition_type_unsupported",
+            "Chat Completions tool definitions support only function tools",
+        )?;
+        Ok(ToolDefinition {
             name: self.function.name,
             description: self.function.description,
             input_schema: self.function.parameters,
             strict: self.function.strict.unwrap_or(false),
             owner: ToolOwner::Client,
-        }
+        })
     }
 }
 
@@ -458,16 +475,24 @@ pub enum OpenAiResponseFormat {
 }
 
 impl OpenAiResponseFormat {
-    fn into_canonical(self) -> ResponseFormat {
-        match self {
+    fn into_canonical(self) -> Result<ResponseFormat, GatewayError> {
+        Ok(match self {
             Self::Text => ResponseFormat::Text,
             Self::JsonObject => ResponseFormat::JsonObject,
-            Self::JsonSchema { json_schema } => ResponseFormat::JsonSchema {
-                name: json_schema.name,
-                schema: json_schema.schema,
-                strict: json_schema.strict.unwrap_or(false),
-            },
-        }
+            Self::JsonSchema { json_schema } => {
+                reject_if(
+                    &RequestId::new(),
+                    json_schema.description.is_some(),
+                    "json_schema_description_unsupported",
+                    "JSON-schema descriptions cannot be preserved on the canonical response format",
+                )?;
+                ResponseFormat::JsonSchema {
+                    name: json_schema.name,
+                    schema: json_schema.schema,
+                    strict: json_schema.strict.unwrap_or(false),
+                }
+            }
+        })
     }
 }
 
@@ -554,10 +579,19 @@ impl OpenAiResponsesRequest {
             previous_response_id: self.previous_response_id,
         };
         request.tools = tools;
-        request.tool_policy =
-            parse_openai_tool_choice(self.tool_choice.as_ref(), !request.tools.is_empty())?;
+        request.tool_policy = parse_openai_tool_choice(
+            self.tool_choice.as_ref(),
+            &request.tools,
+            OpenAiToolChoiceSurface::Responses,
+        )?;
         if let Some(text) = self.text {
-            request.response_format = text.format.unwrap_or_default().into_canonical();
+            reject_if(
+                &request.request_id,
+                text.verbosity.is_some(),
+                "responses_text_verbosity_unsupported",
+                "text verbosity is not implemented on this public surface",
+            )?;
+            request.response_format = text.format.unwrap_or_default().into_canonical()?;
         }
         if let Some(key) = self.prompt_cache_key {
             request.cache.mode = CacheMode::ProviderNative;
@@ -699,12 +733,19 @@ impl OpenAiResponseInputItem {
                 id,
                 summary,
                 encrypted_content,
-            } => Ok(InputItem::Reasoning {
-                id,
-                summary: summary.into_iter().map(|value| value.text).collect(),
-                opaque_continuation: encrypted_content
-                    .map(|content| json!({"encrypted_content": content})),
-            }),
+            } => {
+                reject_if(
+                    &request_id,
+                    summary.iter().any(|value| value.kind != "summary_text"),
+                    "responses_reasoning_summary_type_unsupported",
+                    "reasoning summary entries must use summary_text",
+                )?;
+                Ok(InputItem::Reasoning {
+                    id,
+                    summary: summary.into_iter().map(|value| value.text).collect(),
+                    opaque_continuation: encrypted_content.map(Value::String),
+                })
+            }
         }
     }
 }
@@ -770,21 +811,29 @@ pub enum OpenAiTextFormat {
 }
 
 impl OpenAiTextFormat {
-    fn into_canonical(self) -> ResponseFormat {
-        match self {
+    fn into_canonical(self) -> Result<ResponseFormat, GatewayError> {
+        Ok(match self {
             Self::Text => ResponseFormat::Text,
             Self::JsonObject => ResponseFormat::JsonObject,
             Self::JsonSchema {
                 name,
+                description,
                 schema,
                 strict,
-                ..
-            } => ResponseFormat::JsonSchema {
-                name,
-                schema,
-                strict: strict.unwrap_or(false),
-            },
-        }
+            } => {
+                reject_if(
+                    &RequestId::new(),
+                    description.is_some(),
+                    "json_schema_description_unsupported",
+                    "JSON-schema descriptions cannot be preserved on the canonical response format",
+                )?;
+                ResponseFormat::JsonSchema {
+                    name,
+                    schema,
+                    strict: strict.unwrap_or(false),
+                }
+            }
+        })
     }
 }
 
@@ -818,7 +867,7 @@ impl AnthropicMessagesRequest {
             items.push(InputItem::Message {
                 id: None,
                 role: MessageRole::System,
-                content: system.into_blocks(),
+                content: system.into_blocks()?,
             });
         }
         for message in self.messages {
@@ -847,7 +896,27 @@ impl AnthropicMessagesRequest {
             defaults,
         );
         request.tools = tools;
-        request.tool_policy = parse_anthropic_tool_choice(self.tool_choice.as_ref());
+        request.tool_policy =
+            parse_anthropic_tool_choice(self.tool_choice.as_ref(), !request.tools.is_empty());
+        request
+            .tool_policy
+            .validate_tools(&request.tools, &request.request_id)?;
+        if let Some(disable_parallel) = self
+            .tool_choice
+            .as_ref()
+            .and_then(AnthropicToolChoice::disable_parallel_tool_use)
+        {
+            reject_if(
+                &request.request_id,
+                request.tools.is_empty(),
+                "anthropic_parallel_tool_policy_invalid",
+                "parallel tool policy requires supplied tools",
+            )?;
+            request.provider_extensions.insert(
+                "anthropic.disable_parallel_tool_use".to_string(),
+                Value::Bool(disable_parallel),
+            );
+        }
         if !cache_breakpoints.is_empty() {
             request.cache.mode = CacheMode::ProviderNative;
             request.cache.requirement = CacheRequirement::Required;
@@ -880,12 +949,19 @@ pub enum AnthropicSystem {
 }
 
 impl AnthropicSystem {
-    fn into_blocks(self) -> Vec<ContentBlock> {
+    fn into_blocks(self) -> Result<Vec<ContentBlock>, GatewayError> {
         match self {
-            Self::Text(text) => vec![ContentBlock::Text { text }],
+            Self::Text(text) => Ok(vec![ContentBlock::Text { text }]),
             Self::Blocks(blocks) => blocks
                 .into_iter()
-                .filter_map(AnthropicContentBlock::into_system_block)
+                .map(|block| match block {
+                    AnthropicContentBlock::Text { text, .. } => Ok(ContentBlock::Text { text }),
+                    _ => Err(GatewayError::invalid_request(
+                        &RequestId::new(),
+                        "anthropic_system_content_unsupported",
+                        "Anthropic system content supports only text blocks",
+                    )),
+                })
                 .collect(),
         }
     }
@@ -902,6 +978,12 @@ impl AnthropicMessage {
     fn into_items(self) -> Result<Vec<InputItem>, GatewayError> {
         let request_id = RequestId::new();
         let role = parse_role(&request_id, &self.role)?;
+        reject_if(
+            &request_id,
+            !matches!(role, MessageRole::User | MessageRole::Assistant),
+            "anthropic_message_role_invalid",
+            "Anthropic messages must use user or assistant roles",
+        )?;
         match self.content {
             AnthropicContent::Text(text) => Ok(vec![InputItem::Message {
                 id: None,
@@ -909,27 +991,33 @@ impl AnthropicMessage {
                 content: vec![ContentBlock::Text { text }],
             }]),
             AnthropicContent::Blocks(blocks) => {
+                reject_if(
+                    &request_id,
+                    blocks.is_empty(),
+                    "anthropic_message_content_empty",
+                    "Anthropic messages require at least one content block",
+                )?;
                 let mut message_blocks = Vec::new();
                 let mut items = Vec::new();
                 for block in blocks {
                     match block {
-                        AnthropicContentBlock::Text {
-                            text,
-                            cache_control,
-                        } => {
-                            if cache_control.is_some() {
-                                // Cache breakpoints are preserved on the request below via
-                                // provider extensions once a hosted Anthropic route is selected.
-                            }
+                        AnthropicContentBlock::Text { text, .. } => {
                             message_blocks.push(ContentBlock::Text { text });
                         }
                         AnthropicContentBlock::Image { source } => {
                             message_blocks.push(ContentBlock::Image {
-                                source: source.into_media_source(),
+                                source: source.into_media_source()?,
                                 detail: None,
                             });
                         }
                         AnthropicContentBlock::ToolUse { id, name, input } => {
+                            reject_if(
+                                &request_id,
+                                role != MessageRole::Assistant,
+                                "anthropic_tool_use_role_invalid",
+                                "tool_use requires an assistant message",
+                            )?;
+                            push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                             items.push(InputItem::FunctionCall {
                                 id: None,
                                 call_id: id,
@@ -943,10 +1031,17 @@ impl AnthropicMessage {
                             is_error,
                             ..
                         } => {
+                            reject_if(
+                                &request_id,
+                                role != MessageRole::User,
+                                "anthropic_tool_result_role_invalid",
+                                "tool_result requires a user message",
+                            )?;
+                            push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                             items.push(InputItem::FunctionResult {
                                 id: None,
                                 call_id: tool_use_id,
-                                output: content.into_blocks(),
+                                output: content.into_blocks()?,
                                 is_error: is_error.unwrap_or(false),
                             });
                         }
@@ -964,19 +1059,24 @@ impl AnthropicMessage {
                         }
                     }
                 }
-                if !message_blocks.is_empty() {
-                    items.insert(
-                        0,
-                        InputItem::Message {
-                            id: None,
-                            role,
-                            content: message_blocks,
-                        },
-                    );
-                }
+                push_anthropic_message_segment(&mut items, &mut message_blocks, role);
                 Ok(items)
             }
         }
+    }
+}
+
+fn push_anthropic_message_segment(
+    items: &mut Vec<InputItem>,
+    content: &mut Vec<ContentBlock>,
+    role: MessageRole,
+) {
+    if !content.is_empty() {
+        items.push(InputItem::Message {
+            id: None,
+            role,
+            content: std::mem::take(content),
+        });
     }
 }
 
@@ -988,12 +1088,12 @@ pub enum AnthropicContent {
 }
 
 impl AnthropicContent {
-    fn into_blocks(self) -> Vec<ContentBlock> {
+    fn into_blocks(self) -> Result<Vec<ContentBlock>, GatewayError> {
         match self {
-            Self::Text(text) => vec![ContentBlock::Text { text }],
+            Self::Text(text) => Ok(vec![ContentBlock::Text { text }]),
             Self::Blocks(blocks) => blocks
                 .into_iter()
-                .filter_map(AnthropicContentBlock::into_system_block)
+                .map(AnthropicContentBlock::into_tool_result_block)
                 .collect(),
         }
     }
@@ -1030,22 +1130,29 @@ pub enum AnthropicContentBlock {
 }
 
 impl AnthropicContentBlock {
-    fn into_system_block(self) -> Option<ContentBlock> {
+    fn into_tool_result_block(self) -> Result<ContentBlock, GatewayError> {
         match self {
-            Self::Text { text, .. } => Some(ContentBlock::Text { text }),
-            Self::Image { source } => Some(ContentBlock::Image {
-                source: source.into_media_source(),
+            Self::Text {
+                text,
+                cache_control,
+            } => {
+                reject_if(
+                    &RequestId::new(),
+                    cache_control.is_some(),
+                    "anthropic_nested_cache_control_unsupported",
+                    "nested tool result cache control is not implemented; mark the tool_result block",
+                )?;
+                Ok(ContentBlock::Text { text })
+            }
+            Self::Image { source } => Ok(ContentBlock::Image {
+                source: source.into_media_source()?,
                 detail: None,
             }),
-            Self::Thinking {
-                thinking,
-                signature,
-            } => Some(ContentBlock::Thinking {
-                text: thinking,
-                signature,
-            }),
-            Self::RedactedThinking { data } => Some(ContentBlock::RedactedThinking { data }),
-            Self::ToolUse { .. } | Self::ToolResult { .. } => None,
+            _ => Err(GatewayError::invalid_request(
+                &RequestId::new(),
+                "anthropic_tool_result_content_unsupported",
+                "tool results support text and image blocks on this public surface",
+            )),
         }
     }
 }
@@ -1060,11 +1167,22 @@ pub struct AnthropicMediaSource {
 }
 
 impl AnthropicMediaSource {
-    fn into_media_source(self) -> fte_types::MediaSource {
-        fte_types::MediaSource::Bytes {
+    fn into_media_source(self) -> Result<fte_types::MediaSource, GatewayError> {
+        reject_if(
+            &RequestId::new(),
+            self.kind != "base64"
+                || !matches!(
+                    self.media_type.as_str(),
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                )
+                || self.data.is_empty(),
+            "anthropic_image_source_invalid",
+            "image source requires non-empty base64 data and a supported image media type",
+        )?;
+        Ok(fte_types::MediaSource::Bytes {
             mime_type: self.media_type,
             data_base64: self.data,
-        }
+        })
     }
 }
 
@@ -1092,17 +1210,33 @@ fn anthropic_cache_breakpoints(
             }
         }
     }
-    for (message_index, message) in request.messages.iter().enumerate() {
+    let mut message_index = 0usize;
+    let mut content_offset = 0usize;
+    let mut previous_role = None;
+    for message in &request.messages {
+        if let Some(previous) = previous_role
+            && previous != message.role.as_str()
+        {
+            message_index += 1;
+            content_offset = 0;
+        }
+        previous_role = Some(message.role.as_str());
         if let AnthropicContent::Blocks(blocks) = &message.content {
             for (content_index, block) in blocks.iter().enumerate() {
                 if let Some(control) = block.cache_control() {
                     breakpoints.push(parse_anthropic_cache_control(
                         request_id,
-                        format!("messages.{message_index}.content.{content_index}"),
+                        format!(
+                            "messages.{message_index}.content.{}",
+                            content_offset + content_index
+                        ),
                         control,
                     )?);
                 }
             }
+            content_offset += blocks.len();
+        } else {
+            content_offset += 1;
         }
     }
     if let Some(tools) = &request.tools {
@@ -1188,7 +1322,7 @@ impl AnthropicTool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AnthropicToolChoice {
     Auto {
         disable_parallel_tool_use: Option<bool>,
@@ -1201,6 +1335,24 @@ pub enum AnthropicToolChoice {
         disable_parallel_tool_use: Option<bool>,
     },
     None,
+}
+
+impl AnthropicToolChoice {
+    fn disable_parallel_tool_use(&self) -> Option<bool> {
+        match self {
+            Self::Auto {
+                disable_parallel_tool_use,
+            }
+            | Self::Any {
+                disable_parallel_tool_use,
+            }
+            | Self::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+            Self::None => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1312,19 +1464,48 @@ fn parse_role(request_id: &RequestId, role: &str) -> Result<MessageRole, Gateway
     }
 }
 
+#[derive(Clone, Copy)]
+enum OpenAiToolChoiceSurface {
+    Chat,
+    Responses,
+}
+
 fn parse_openai_tool_choice(
     choice: Option<&Value>,
-    has_tools: bool,
+    tools: &[ToolDefinition],
+    surface: OpenAiToolChoiceSurface,
 ) -> Result<ToolPolicy, GatewayError> {
     let request_id = RequestId::new();
-    let execution = match choice {
-        None if has_tools => ToolExecutionPolicy::ClientOnly,
-        None => ToolExecutionPolicy::Deny,
-        Some(Value::String(value)) if value == "none" => ToolExecutionPolicy::Deny,
-        Some(Value::String(value)) if matches!(value.as_str(), "auto" | "required") => {
-            ToolExecutionPolicy::ClientOnly
+    let selection = match choice {
+        None if !tools.is_empty() => ToolSelection::Auto,
+        None => ToolSelection::None,
+        Some(Value::String(value)) if value == "none" => ToolSelection::None,
+        Some(Value::String(value)) if value == "auto" => ToolSelection::Auto,
+        Some(Value::String(value)) if value == "required" => ToolSelection::Required,
+        Some(Value::Object(object))
+            if object.len() == 2
+                && object.get("type").and_then(Value::as_str) == Some("function") =>
+        {
+            let name = match surface {
+                OpenAiToolChoiceSurface::Chat => object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .filter(|function| function.len() == 1)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str),
+                OpenAiToolChoiceSurface::Responses => object.get("name").and_then(Value::as_str),
+            }
+            .ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request_id,
+                    "tool_choice_invalid",
+                    "named tool_choice has an invalid dialect shape",
+                )
+            })?;
+            ToolSelection::Named {
+                name: name.to_string(),
+            }
         }
-        Some(Value::Object(_)) => ToolExecutionPolicy::ClientOnly,
         Some(_) => {
             return Err(GatewayError::invalid_request(
                 &request_id,
@@ -1333,18 +1514,30 @@ fn parse_openai_tool_choice(
             ));
         }
     };
-    Ok(ToolPolicy {
-        execution,
+    let policy = ToolPolicy {
+        selection,
+        execution: ToolExecutionPolicy::ClientOnly,
         max_turns: None,
-    })
+    };
+    policy.validate_tools(tools, &request_id)?;
+    Ok(policy)
 }
 
-fn parse_anthropic_tool_choice(choice: Option<&AnthropicToolChoice>) -> ToolPolicy {
+fn parse_anthropic_tool_choice(
+    choice: Option<&AnthropicToolChoice>,
+    has_tools: bool,
+) -> ToolPolicy {
     ToolPolicy {
-        execution: match choice {
-            Some(AnthropicToolChoice::None) | None => ToolExecutionPolicy::Deny,
-            Some(_) => ToolExecutionPolicy::ClientOnly,
+        selection: match choice {
+            None if !has_tools => ToolSelection::None,
+            Some(AnthropicToolChoice::None) => ToolSelection::None,
+            Some(AnthropicToolChoice::Any { .. }) => ToolSelection::Required,
+            Some(AnthropicToolChoice::Tool { name, .. }) => {
+                ToolSelection::Named { name: name.clone() }
+            }
+            Some(AnthropicToolChoice::Auto { .. }) | None => ToolSelection::Auto,
         },
+        execution: ToolExecutionPolicy::ClientOnly,
         max_turns: None,
     }
 }
@@ -1671,11 +1864,13 @@ pub fn openai_chat_json(response: &GatewayResponse) -> Value {
         }
         json!({"index":group.index,"message":message,"finish_reason":openai_finish(&group.finish_reason)})
     }).collect::<Vec<_>>();
-    json!({
+    let mut body = json!({
         "id":format!("chatcmpl_{}", response.id), "object":"chat.completion", "model":response.model,
         "choices":choices, "usage":openai_legacy_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
-    })
+    });
+    omit_unavailable_legacy_usage(&mut body);
+    body
 }
 
 #[must_use]
@@ -1684,11 +1879,22 @@ pub fn openai_completion_json(response: &GatewayResponse) -> Value {
         let text = group.output_indices.iter().filter_map(|index| response.output.get(*index)).map(output_item_text).collect::<String>();
         json!({"index":group.index,"text":text,"finish_reason":openai_finish(&group.finish_reason),"logprobs":Value::Null})
     }).collect::<Vec<_>>();
-    json!({
+    let mut body = json!({
         "id":format!("cmpl_{}", response.id), "object":"text_completion", "model":response.model,
         "choices":choices, "usage":openai_legacy_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
-    })
+    });
+    omit_unavailable_legacy_usage(&mut body);
+    body
+}
+
+fn omit_unavailable_legacy_usage(body: &mut Value) {
+    // CompletionUsage is optional, but its total_tokens field is not nullable.
+    if body.get("usage") == Some(&Value::Null)
+        && let Some(body) = body.as_object_mut()
+    {
+        body.remove("usage");
+    }
 }
 
 fn anthropic_stop(response: &GatewayResponse) -> (&'static str, Option<&str>) {
@@ -1788,7 +1994,9 @@ pub struct AnthropicStreamEncoder {
     next_block_index: usize,
     blocks: BTreeMap<AnthropicBlockKey, usize>,
     stopped_blocks: BTreeSet<usize>,
-    delta_blocks: BTreeSet<usize>,
+    block_starts: BTreeMap<usize, Value>,
+    emitted_deltas: BTreeMap<usize, String>,
+    completed_blocks: BTreeMap<usize, Value>,
     items: BTreeMap<usize, OutputItem>,
     terminal: bool,
 }
@@ -1801,10 +2009,17 @@ impl AnthropicStreamEncoder {
             next_block_index: 0,
             blocks: BTreeMap::new(),
             stopped_blocks: BTreeSet::new(),
-            delta_blocks: BTreeSet::new(),
+            block_starts: BTreeMap::new(),
+            emitted_deltas: BTreeMap::new(),
+            completed_blocks: BTreeMap::new(),
             items: BTreeMap::new(),
             terminal: false,
         }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     pub fn encode(&mut self, event: &GatewayEvent) -> Vec<SseEvent> {
@@ -1833,12 +2048,19 @@ impl AnthropicStreamEncoder {
                             &mut events,
                         );
                     }
-                    OutputItem::Reasoning { .. } => {
-                        self.ensure_block(
-                            AnthropicBlockKey::Item(*output_index),
-                            json!({"type":"thinking","thinking":""}),
-                            &mut events,
-                        );
+                    OutputItem::Reasoning {
+                        summary,
+                        opaque_continuation,
+                        ..
+                    } => {
+                        let part = anthropic_reasoning_part(summary, opaque_continuation.as_ref());
+                        if let Some(start) = anthropic_content_block_start(&part) {
+                            self.ensure_block(
+                                AnthropicBlockKey::Item(*output_index),
+                                start,
+                                &mut events,
+                            );
+                        }
                     }
                     OutputItem::Message { .. } => {}
                 }
@@ -1868,11 +2090,7 @@ impl AnthropicStreamEncoder {
                     json!({"type":"text","text":""}),
                     &mut events,
                 );
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":delta}}),
-                });
+                self.emit_delta(index, "text_delta", "text", delta, &mut events);
             }
             GatewayEvent::ReasoningSummaryDelta {
                 output_index,
@@ -1884,11 +2102,7 @@ impl AnthropicStreamEncoder {
                     json!({"type":"thinking","thinking":""}),
                     &mut events,
                 );
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":delta}}),
-                });
+                self.emit_delta(index, "thinking_delta", "thinking", delta, &mut events);
             }
             GatewayEvent::FunctionArgumentsDelta {
                 output_index,
@@ -1907,11 +2121,13 @@ impl AnthropicStreamEncoder {
                     .unwrap_or_else(|| json!({"type":"tool_use","id":"","name":"","input":{}}));
                 let index =
                     self.ensure_block(AnthropicBlockKey::Item(*output_index), block, &mut events);
-                self.delta_blocks.insert(index);
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":delta}}),
-                });
+                self.emit_delta(
+                    index,
+                    "input_json_delta",
+                    "partial_json",
+                    delta,
+                    &mut events,
+                );
             }
             GatewayEvent::ContentPartCompleted {
                 output_index,
@@ -1927,6 +2143,31 @@ impl AnthropicStreamEncoder {
                 output_index, item, ..
             } => self.complete_output_item(*output_index, item, &mut events),
             GatewayEvent::Completed { response, .. } => {
+                let mut final_blocks = BTreeSet::new();
+                for (output_index, item) in response.output.iter().enumerate() {
+                    match item {
+                        OutputItem::Message { content, .. } => {
+                            for (content_index, part) in content.iter().enumerate() {
+                                if anthropic_content_block_start(part).is_some() {
+                                    final_blocks.insert(AnthropicBlockKey::Content(
+                                        output_index,
+                                        content_index,
+                                    ));
+                                }
+                            }
+                        }
+                        OutputItem::FunctionCall { .. } | OutputItem::Reasoning { .. } => {
+                            final_blocks.insert(AnthropicBlockKey::Item(output_index));
+                        }
+                    }
+                    self.complete_output_item(output_index, item, &mut events);
+                }
+                if self.blocks.keys().any(|key| !final_blocks.contains(key)) {
+                    self.projection_error(&mut events);
+                }
+                if self.terminal {
+                    return events;
+                }
                 self.finish_content_blocks(&mut events);
                 let (stop_reason, stop_sequence) = anthropic_stop(response);
                 events.push(SseEvent {
@@ -1970,11 +2211,146 @@ impl AnthropicStreamEncoder {
         let index = self.next_block_index;
         self.next_block_index += 1;
         self.blocks.insert(key, index);
+        self.block_starts.insert(index, content_block.clone());
         events.push(SseEvent {
             event: "content_block_start".to_string(),
             data: json!({"type":"content_block_start","index":index,"content_block":content_block}),
         });
         index
+    }
+
+    fn projection_error(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.terminal {
+            events.push(SseEvent {
+                event: "error".to_string(),
+                data: json!({"type":"error","error":{"type":"api_error","code":"stream_projection_incomplete","message":"Streamed content conflicts with authoritative block completion"}}),
+            });
+            self.terminal = true;
+        }
+    }
+
+    fn emit_delta(
+        &mut self,
+        index: usize,
+        kind: &str,
+        field: &str,
+        delta: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.terminal {
+            return;
+        }
+        if self.stopped_blocks.contains(&index) {
+            self.projection_error(events);
+            return;
+        }
+        let expected_block = match kind {
+            "text_delta" => "text",
+            "thinking_delta" => "thinking",
+            "input_json_delta" => "tool_use",
+            _ => {
+                self.projection_error(events);
+                return;
+            }
+        };
+        if self
+            .block_starts
+            .get(&index)
+            .and_then(|block| block["type"].as_str())
+            != Some(expected_block)
+        {
+            self.projection_error(events);
+            return;
+        }
+        self.emitted_deltas
+            .entry(index)
+            .or_default()
+            .push_str(delta);
+        let mut value = json!({"type":kind});
+        value[field] = json!(delta);
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({"type":"content_block_delta","index":index,"delta":value}),
+        });
+    }
+
+    fn complete_block(
+        &mut self,
+        key: AnthropicBlockKey,
+        start: Value,
+        completed: Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.terminal {
+            return;
+        }
+        let index = self.ensure_block(key, start.clone(), events);
+        if self.block_starts.get(&index) != Some(&start) {
+            self.projection_error(events);
+            return;
+        }
+        if let Some(previous) = self.completed_blocks.get(&index) {
+            if previous != &completed {
+                self.projection_error(events);
+            }
+            return;
+        }
+        let emitted = self.emitted_deltas.get(&index).cloned().unwrap_or_default();
+        let (kind, field, full) = match completed["type"].as_str() {
+            Some("text") => (
+                "text_delta",
+                "text",
+                completed["text"].as_str().unwrap_or_default().to_string(),
+            ),
+            Some("thinking") => (
+                "thinking_delta",
+                "thinking",
+                completed["thinking"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            Some("tool_use") => {
+                // Complete JSON may differ in whitespace or object-key order.
+                // Compare its value before considering a missing canonical suffix.
+                if serde_json::from_str::<Value>(&emitted).ok().as_ref()
+                    == Some(&completed["input"])
+                {
+                    self.completed_blocks.insert(index, completed);
+                    self.stop_block(index, events);
+                    return;
+                }
+                (
+                    "input_json_delta",
+                    "partial_json",
+                    completed["input"].to_string(),
+                )
+            }
+            Some("redacted_thinking") => {
+                self.completed_blocks.insert(index, completed);
+                self.stop_block(index, events);
+                return;
+            }
+            _ => {
+                self.projection_error(events);
+                return;
+            }
+        };
+        let Some(suffix) = full.strip_prefix(&emitted) else {
+            self.projection_error(events);
+            return;
+        };
+        if !suffix.is_empty() {
+            self.emit_delta(index, kind, field, suffix, events);
+        }
+        if let Some(signature) = completed.get("signature").and_then(Value::as_str) {
+            events.push(SseEvent {
+                event: "content_block_delta".to_string(),
+                data: json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
+            });
+        }
+        self.completed_blocks.insert(index, completed);
+        self.stop_block(index, events);
     }
 
     fn complete_content_part(
@@ -1986,33 +2362,17 @@ impl AnthropicStreamEncoder {
         let Some(start) = anthropic_content_block_start(part) else {
             return;
         };
-        let index = self.ensure_block(key, start, events);
-        if !self.delta_blocks.contains(&index) {
-            match part {
-                ContentBlock::Text { text } if !text.is_empty() => events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
-                }),
-                ContentBlock::Thinking { text, .. } if !text.is_empty() => {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
-                    });
-                }
-                _ => {}
+        let completed = match part {
+            ContentBlock::Text { text } => json!({"type":"text","text":text}),
+            ContentBlock::Thinking { text, signature } => {
+                json!({"type":"thinking","thinking":text,"signature":signature})
             }
-        }
-        if let ContentBlock::Thinking {
-            signature: Some(signature),
-            ..
-        } = part
-        {
-            events.push(SseEvent {
-                event: "content_block_delta".to_string(),
-                data: json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
-            });
-        }
-        self.stop_block(index, events);
+            ContentBlock::RedactedThinking { data } => {
+                json!({"type":"redacted_thinking","data":data})
+            }
+            _ => return,
+        };
+        self.complete_block(key, start, completed, events);
     }
 
     fn complete_output_item(
@@ -2037,32 +2397,23 @@ impl AnthropicStreamEncoder {
                 arguments,
                 ..
             } => {
-                let index = self.ensure_block(
+                self.complete_block(
                     AnthropicBlockKey::Item(output_index),
                     json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":arguments}),
                     events,
                 );
-                if !self.delta_blocks.contains(&index) {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string())}}),
-                    });
-                }
-                self.stop_block(index, events);
             }
-            OutputItem::Reasoning { summary, .. } => {
-                let index = self.ensure_block(
+            OutputItem::Reasoning {
+                summary,
+                opaque_continuation,
+                ..
+            } => {
+                self.complete_content_part(
                     AnthropicBlockKey::Item(output_index),
-                    json!({"type":"thinking","thinking":""}),
+                    &anthropic_reasoning_part(summary, opaque_continuation.as_ref()),
                     events,
                 );
-                if !self.delta_blocks.contains(&index) && !summary.is_empty() {
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":summary.join("\n")}}),
-                    });
-                }
-                self.stop_block(index, events);
             }
         }
     }
@@ -2082,6 +2433,25 @@ impl AnthropicStreamEncoder {
         indices.dedup();
         for index in indices {
             self.stop_block(index, events);
+        }
+    }
+}
+
+fn anthropic_reasoning_part(summary: &[String], opaque: Option<&Value>) -> ContentBlock {
+    if let Some(data) = opaque
+        .and_then(|value| value.get("redacted_thinking"))
+        .and_then(Value::as_str)
+    {
+        ContentBlock::RedactedThinking {
+            data: data.to_string(),
+        }
+    } else {
+        ContentBlock::Thinking {
+            text: summary.join("\n"),
+            signature: opaque
+                .and_then(|value| value.get("signature"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }
     }
 }
@@ -2115,10 +2485,14 @@ fn output_item_text(item: &OutputItem) -> String {
 fn openai_usage(usage: &GatewayUsage) -> Value {
     let input = usage.input_tokens.unwrap_or_default();
     let output = usage.output_tokens.unwrap_or_default();
+    let Some(total) = input.checked_add(output) else {
+        // ResponseUsage permits null; retain the original counters in GatewayUsage.
+        return Value::Null;
+    };
     json!({
         "input_tokens":input,
         "output_tokens":output,
-        "total_tokens":input + output,
+        "total_tokens":total,
         "input_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "output_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2132,10 +2506,13 @@ fn openai_usage(usage: &GatewayUsage) -> Value {
 fn openai_legacy_usage(usage: &GatewayUsage) -> Value {
     let prompt = usage.input_tokens.unwrap_or_default();
     let completion = usage.output_tokens.unwrap_or_default();
+    let Some(total) = prompt.checked_add(completion) else {
+        return Value::Null;
+    };
     json!({
         "prompt_tokens":prompt,
         "completion_tokens":completion,
-        "total_tokens":prompt + completion,
+        "total_tokens":total,
         "prompt_tokens_details":{"cached_tokens":usage.cache_read_tokens.unwrap_or_default()},
         "completion_tokens_details":{"reasoning_tokens":usage.reasoning_tokens.unwrap_or_default()},
         "x_usage_provenance": match usage.provenance {
@@ -2161,6 +2538,66 @@ mod tests {
     use fte_types::{BackendLocation, ResolvedRoute};
 
     #[test]
+    fn public_usage_totals_are_unavailable_on_overflow_without_losing_counters() {
+        for (input, output, total) in [
+            (0, 0, Some(0)),
+            (u64::MAX, 0, Some(u64::MAX)),
+            (u64::MAX - 1, 1, Some(u64::MAX)),
+            (u64::MAX, 1, None),
+        ] {
+            let usage = GatewayUsage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                provenance: UsageProvenance::Exact,
+                ..GatewayUsage::default()
+            };
+            for (body, input_key, output_key) in [
+                (openai_usage(&usage), "input_tokens", "output_tokens"),
+                (
+                    openai_legacy_usage(&usage),
+                    "prompt_tokens",
+                    "completion_tokens",
+                ),
+            ] {
+                if let Some(total) = total {
+                    assert_eq!(body[input_key], input);
+                    assert_eq!(body[output_key], output);
+                    assert_eq!(body["total_tokens"], total);
+                    assert_eq!(body["x_usage_provenance"], "exact");
+                } else {
+                    assert_eq!(body, Value::Null);
+                }
+            }
+            assert_eq!(usage.input_tokens, Some(input));
+            assert_eq!(usage.output_tokens, Some(output));
+            assert_eq!(usage.provenance, UsageProvenance::Exact);
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_replay_preserves_the_opaque_string() {
+        for encrypted in ["", "opaque_日本語🔒"] {
+            let request: OpenAiResponsesRequest = serde_json::from_value(json!({
+                "model":"auto",
+                "input":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}],
+                "store":false
+            }))
+            .expect("decode reasoning replay");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("canonical reasoning replay");
+            let GenerationInput::Chat { items } = request.input else {
+                panic!("reasoning must remain typed Items");
+            };
+            assert!(matches!(
+                &items[0],
+                InputItem::Reasoning { opaque_continuation: Some(Value::String(value)), .. }
+                    if value == encrypted
+            ));
+        }
+    }
+
+    #[test]
     fn openai_surfaces_use_their_protocol_specific_usage_keys() {
         let request_id = RequestId::new();
         let route = ResolvedRoute {
@@ -2172,6 +2609,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id,
             model: route.model_id.clone(),
             route,
@@ -2221,6 +2659,144 @@ mod tests {
     }
 
     #[test]
+    fn required_or_named_tool_selection_keeps_client_execution_ownership() {
+        for choice in [
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+            json!("none"),
+        ] {
+            let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}],"tool_choice":choice})).expect("tool choice DTO");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("preserved choice");
+            assert_eq!(
+                request.tool_policy.execution,
+                ToolExecutionPolicy::ClientOnly
+            );
+            assert_eq!(request.tools[0].owner, ToolOwner::Client);
+        }
+        let request: OpenAiResponsesRequest = serde_json::from_value(json!({"model":"auto","input":"hello","tools":[{"type":"function","name":"lookup","parameters":{}}],"tool_choice":{"type":"function","function":{"name":"lookup"}}})).expect("malformed dialect object DTO");
+        assert_eq!(
+            request
+                .into_gateway(EdgeDefaults::default())
+                .expect_err("Chat shape cannot silently become a Responses choice")
+                .code,
+            "tool_choice_invalid"
+        );
+        let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[{"role":"user","content":"hello"}],"tool_choice":"required"})).expect("required without definitions DTO");
+        assert_eq!(
+            request
+                .into_gateway(EdgeDefaults::default())
+                .expect_err("required without definitions")
+                .code,
+            "tool_choice_definition_missing"
+        );
+    }
+
+    #[test]
+    fn chat_known_fields_are_handled_or_explicitly_rejected() {
+        let ordinary = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        for (body, code) in [
+            (
+                json!({"model":"auto","messages":[{"role":"user","content":"hello","name":"participant"}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[{"role":"tool","tool_call_id":"call_1","content":"result","name":"participant"}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[{"role":"assistant","name":"participant","tool_calls":[{"type":"function","id":"call_1","function":{"name":"lookup","arguments":"{}"}}]}]}),
+                "chat_participant_name_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[],"tools":[{"type":"not_function","function":{"name":"lookup","parameters":{}}}]}),
+                "chat_tool_definition_type_unsupported",
+            ),
+            (
+                json!({"model":"auto","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","description":"must not vanish","schema":{}}}}),
+                "json_schema_description_unsupported",
+            ),
+        ] {
+            let request: OpenAiChatRequest = serde_json::from_value(body).expect("known field DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported known field must fail")
+                    .code,
+                code
+            );
+        }
+        let request: OpenAiChatRequest =
+            serde_json::from_value(ordinary).expect("ordinary chat DTO");
+        request
+            .into_gateway(EdgeDefaults::default())
+            .expect("ordinary chat remains supported");
+        for parallel in [false, true] {
+            let request: OpenAiChatRequest = serde_json::from_value(
+                json!({"model":"auto","messages":[],"parallel_tool_calls":parallel}),
+            )
+            .expect("parallel flag DTO");
+            let request = request
+                .into_gateway(EdgeDefaults::default())
+                .expect("parallel flag supported");
+            assert_eq!(
+                request.provider_extensions["openai.parallel_tool_calls"],
+                parallel
+            );
+        }
+        let request: OpenAiChatRequest = serde_json::from_value(json!({"model":"auto","messages":[],"tools":[{"type":"function","function":{"name":"lookup","description":"kept","parameters":{}}}],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{}}}})).expect("valid tools and format DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("valid tools and format remain supported");
+        assert_eq!(request.tools[0].description.as_deref(), Some("kept"));
+        assert!(matches!(
+            request.response_format,
+            ResponseFormat::JsonSchema { .. }
+        ));
+    }
+
+    #[test]
+    fn responses_known_text_and_summary_fields_do_not_vanish() {
+        for (body, code) in [
+            (
+                json!({"model":"auto","input":"hello","text":{"verbosity":"high"}}),
+                "responses_text_verbosity_unsupported",
+            ),
+            (
+                json!({"model":"auto","input":"hello","text":{"format":{"type":"json_schema","name":"answer","description":"must not vanish","schema":{}}}}),
+                "json_schema_description_unsupported",
+            ),
+            (
+                json!({"model":"auto","input":[{"type":"reasoning","summary":[{"type":"not_summary_text","text":"must not reinterpret"}]}]}),
+                "responses_reasoning_summary_type_unsupported",
+            ),
+        ] {
+            let request: OpenAiResponsesRequest =
+                serde_json::from_value(body).expect("known field DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported known field must fail")
+                    .code,
+                code
+            );
+        }
+        let request: OpenAiResponsesRequest = serde_json::from_value(json!({"model":"auto","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"kept"}]}],"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}})).expect("valid known field DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("supported text and summary remain supported");
+        assert!(matches!(
+            request.response_format,
+            ResponseFormat::JsonSchema { .. }
+        ));
+        let GenerationInput::Chat { items } = request.input else {
+            panic!("typed reasoning input");
+        };
+        assert!(matches!(&items[0], InputItem::Reasoning { summary, .. } if summary == &["kept"]));
+    }
+
+    #[test]
     fn unknown_fields_are_rejected_instead_of_dropped() {
         let error = serde_json::from_value::<OpenAiResponsesRequest>(json!({
             "model":"auto",
@@ -2262,6 +2838,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: RequestId::new(),
             model: route.model_id.clone(),
             route,
@@ -2383,6 +2960,78 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_mixed_blocks_keep_canonical_order_and_rebind_consecutive_roles() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model":"auto","max_tokens":16,
+            "messages":[
+                {"role":"assistant","content":[{"type":"text","text":"A"},{"type":"tool_use","id":"call_1","name":"lookup","input":{}},{"type":"text","text":"B","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":[{"type":"text","text":"C","cache_control":{"type":"ephemeral","ttl":"1h"}}]}
+            ]
+        })).expect("mixed Anthropic DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("ordered canonical request");
+        assert_eq!(
+            request.cache.provider_breakpoints[0].path,
+            "messages.0.content.2"
+        );
+        assert_eq!(
+            request.cache.provider_breakpoints[1].path,
+            "messages.0.content.3"
+        );
+        let GenerationInput::Chat { items } = request.input else {
+            panic!("canonical chat");
+        };
+        assert!(
+            matches!(&items[0], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "A"))
+        );
+        assert!(
+            matches!(&items[1], InputItem::FunctionCall { call_id, .. } if call_id == "call_1")
+        );
+        assert!(
+            matches!(&items[2], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "B"))
+        );
+        assert!(
+            matches!(&items[3], InputItem::Message { content, .. } if matches!(&content[0], ContentBlock::Text { text } if text == "C"))
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_result_media_and_nested_content_are_not_reinterpreted() {
+        for (content, code) in [
+            (
+                json!([{"type":"image","source":{"type":"not_base64","media_type":"image/png","data":"AQ=="}}]),
+                "anthropic_image_source_invalid",
+            ),
+            (
+                json!([{"type":"tool_use","id":"nested","name":"lookup","input":{}}]),
+                "anthropic_tool_result_content_unsupported",
+            ),
+            (
+                json!([{"type":"text","text":"nested marker","cache_control":{"type":"ephemeral"}}]),
+                "anthropic_nested_cache_control_unsupported",
+            ),
+        ] {
+            let request: AnthropicMessagesRequest = serde_json::from_value(json!({"model":"auto","max_tokens":16,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":content}]}]})).expect("known nested content DTO");
+            assert_eq!(
+                request
+                    .into_gateway(EdgeDefaults::default())
+                    .expect_err("unsupported nested content fails")
+                    .code,
+                code
+            );
+        }
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({"model":"auto","max_tokens":16,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQ=="}}]}]}]})).expect("image result DTO");
+        let request = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("image result canonical lowering");
+        assert_eq!(
+            request.input.required_modalities(),
+            vec![fte_types::Modality::Text, fte_types::Modality::Image]
+        );
+    }
+
+    #[test]
     fn anthropic_cache_breakpoints_keep_order_path_and_ttl() {
         let request: AnthropicMessagesRequest = serde_json::from_value(json!({
             "model":"hosted/anthropic",
@@ -2410,6 +3059,187 @@ mod tests {
             gateway.cache.provider_breakpoints[1].ttl,
             Some(ProviderCacheTtl::FiveMinutes)
         );
+    }
+
+    #[test]
+    fn anthropic_repeated_part_and_item_completion_emits_one_block() {
+        for part in [
+            ContentBlock::Text {
+                text: "日本語".to_string(),
+            },
+            ContentBlock::Thinking {
+                text: "check".to_string(),
+                signature: Some("sig_exact".to_string()),
+            },
+        ] {
+            let request_id = RequestId::new();
+            let mut encoder = AnthropicStreamEncoder::new(1);
+            let completion = GatewayEvent::ContentPartCompleted {
+                request_id: request_id.clone(),
+                output_index: 0,
+                content_index: 0,
+                part: part.clone(),
+            };
+            let first = encoder.encode(&completion);
+            assert_eq!(
+                first.last().expect("block stop").event,
+                "content_block_stop"
+            );
+            assert!(encoder.encode(&completion).is_empty());
+            assert!(
+                encoder
+                    .encode(&GatewayEvent::OutputItemCompleted {
+                        request_id,
+                        output_index: 0,
+                        item: OutputItem::Message {
+                            id: "msg_1".to_string(),
+                            role: MessageRole::Assistant,
+                            content: vec![part],
+                        },
+                    })
+                    .is_empty()
+            );
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|event| event.event == "content_block_stop")
+                    .count(),
+                1
+            );
+            assert!(first.iter().all(|event| event.event != "error"));
+        }
+    }
+
+    #[test]
+    fn anthropic_completion_reconciles_missing_suffix_and_rejects_conflicts() {
+        let request_id = RequestId::new();
+        let mut encoder = AnthropicStreamEncoder::new(1);
+        encoder.encode(&GatewayEvent::TextDelta {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            delta: "日本".to_string(),
+        });
+        let completion = encoder.encode(&GatewayEvent::ContentPartCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: ContentBlock::Text {
+                text: "日本語".to_string(),
+            },
+        });
+        assert_eq!(completion[0].data["delta"]["text"], "語");
+        assert_eq!(completion[1].event, "content_block_stop");
+        let conflict = encoder.encode(&GatewayEvent::ContentPartCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: ContentBlock::Text {
+                text: "contradiction".to_string(),
+            },
+        });
+        assert_eq!(conflict.len(), 1);
+        assert_eq!(
+            conflict[0].data["error"]["code"],
+            "stream_projection_incomplete"
+        );
+        assert!(
+            encoder
+                .encode(&GatewayEvent::TextDelta {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "late".to_string(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anthropic_stopped_thinking_rejects_a_different_signature_and_late_delta() {
+        for conflict_signature in [true, false] {
+            let request_id = RequestId::new();
+            let mut encoder = AnthropicStreamEncoder::new(1);
+            let first = encoder.encode(&GatewayEvent::ContentPartCompleted {
+                request_id: request_id.clone(),
+                output_index: 0,
+                content_index: 0,
+                part: ContentBlock::Thinking {
+                    text: "check".to_string(),
+                    signature: Some("sig_1".to_string()),
+                },
+            });
+            assert_eq!(first[first.len() - 2].data["delta"]["signature"], "sig_1");
+            assert_eq!(
+                first.last().expect("stop after signature").event,
+                "content_block_stop"
+            );
+            let conflict = if conflict_signature {
+                GatewayEvent::ContentPartCompleted {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    part: ContentBlock::Thinking {
+                        text: "check".to_string(),
+                        signature: Some("sig_2".to_string()),
+                    },
+                }
+            } else {
+                GatewayEvent::TextDelta {
+                    request_id,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "late".to_string(),
+                }
+            };
+            let events = encoder.encode(&conflict);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, "error");
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_completion_compares_json_values_and_deduplicates() {
+        let request_id = RequestId::new();
+        let item = OutputItem::FunctionCall {
+            id: "tool_1".to_string(),
+            call_id: "call_1".to_string(),
+            name: "lookup".to_string(),
+            arguments: json!({"a":1,"b":2}),
+        };
+        let mut encoder = AnthropicStreamEncoder::new(1);
+        encoder.encode(&GatewayEvent::OutputItemAdded {
+            request_id: request_id.clone(),
+            group_index: None,
+            output_index: 0,
+            item: item.clone(),
+        });
+        encoder.encode(&GatewayEvent::FunctionArgumentsDelta {
+            request_id: request_id.clone(),
+            output_index: 0,
+            delta: "{ \"b\":2, \"a\":1 }".to_string(),
+        });
+        let completion = GatewayEvent::OutputItemCompleted {
+            request_id: request_id.clone(),
+            output_index: 0,
+            item,
+        };
+        let stopped = encoder.encode(&completion);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].event, "content_block_stop");
+        assert!(encoder.encode(&completion).is_empty());
+        let conflict = encoder.encode(&GatewayEvent::OutputItemCompleted {
+            request_id,
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: "tool_1".to_string(),
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                arguments: json!({"a":9}),
+            },
+        });
+        assert_eq!(conflict.len(), 1);
+        assert_eq!(conflict[0].event, "error");
     }
 
     #[test]
@@ -2448,10 +3278,17 @@ mod tests {
         );
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: "model".to_string(),
             route,
-            output: vec![],
+            output: vec![OutputItem::Message {
+                id: "msg_1".to_string(),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
+            }],
             usage: GatewayUsage::default(),
             output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
@@ -2502,6 +3339,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route: route.clone(),
@@ -2605,6 +3443,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp_1".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: "model".to_string(),
             route: route.clone(),

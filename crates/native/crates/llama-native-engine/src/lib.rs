@@ -1005,7 +1005,7 @@ impl NativeModelInner {
         match self.command_tx.try_send(build(lease)) {
             Ok(()) => {
                 self.speculative_admission
-                    .preempt_for_foreground(control.identity().sequence);
+                    .preempt_for_foreground(Arc::clone(&control));
                 Ok(control)
             }
             Err(error) => {
@@ -7840,7 +7840,7 @@ mod tests {
         }
     }
 
-    fn test_admission_handle(
+    pub(super) fn test_admission_handle(
         status: ResidentModelStatus,
         queue_capacity: usize,
     ) -> (
@@ -7897,7 +7897,7 @@ mod tests {
         assert_eq!(status.active_sequences, 0);
     }
 
-    fn admission_test_status() -> ResidentModelStatus {
+    pub(super) fn admission_test_status() -> ResidentModelStatus {
         ResidentModelStatus {
             model_id: "model".to_owned(),
             model_path: PathBuf::new(),
@@ -8180,7 +8180,18 @@ mod tests {
             .reserve(control)
             .expect("timed speculative lane reserves");
 
-        assert_eq!(admission.preempt_for_foreground(41), 1);
+        let (foreground, foreground_lease) = registry
+            .reserve(
+                "timed-foreground",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("foreground owner reserves");
+        foreground_lease.queued().expect("foreground queues");
+        assert_eq!(admission.preempt_for_foreground(foreground), 1);
         assert!(cancellation.load(Ordering::Acquire));
         clock.set(
             u64::try_from(SPECULATIVE_PREEMPTION_LIMIT.as_millis()).expect("200ms fits u64") + 1,
@@ -8188,10 +8199,12 @@ mod tests {
         let observe = Arc::new(Barrier::new(2));
         let observer_barrier = Arc::clone(&observe);
         let observer_admission = Arc::clone(&admission);
+        let foreground_sequence = foreground_lease.sequence();
         let observer = std::thread::spawn(move || {
             observer_barrier.wait();
-            observer_admission.observe_foreground_running(41);
+            observer_admission.observe_foreground_running(foreground_sequence);
         });
+        foreground_lease.running().expect("foreground runs");
         observe.wait();
         observer.join().expect("clock observer joins");
         assert_eq!(
@@ -12328,5 +12341,180 @@ mod tests {
         let joined = owner.shutdown_joined()?;
         assert!(verified_embedding.belongs_to_joined_model(&joined));
         Ok(())
+    }
+
+    #[test]
+    fn released_foreground_without_running_allows_speculative_readmission() {
+        for abandon_command in [false, true] {
+            let (handle, command_rx, speculative_rx) =
+                test_admission_handle(admission_test_status(), COMMAND_CAPACITY);
+            let speculative = handle
+                .generate_speculative(admission_generation_request("orphan-watch-speculative"))
+                .expect("initial speculative request is admitted");
+            let foreground = handle
+                .generate(admission_generation_request("orphan-watch-foreground"))
+                .expect("foreground preempts the speculative request");
+            let unrelated = handle
+                .generate(admission_generation_request("unrelated-foreground"))
+                .expect("unrelated foreground is admitted after the watched request");
+            assert!(speculative.control.snapshot().cancellation_requested);
+            assert_eq!(
+                foreground.control.snapshot().phase,
+                operation_registry::RequestPhase::Queued
+            );
+
+            let watched_command = command_rx.recv().expect("watched foreground queues first");
+            reject_queued_command(
+                command_rx
+                    .recv()
+                    .expect("unrelated foreground queues second"),
+            );
+            assert_eq!(
+                unrelated
+                    .wait()
+                    .expect_err("unrelated request is rejected")
+                    .code,
+                NativeErrorCode::Cancelled
+            );
+            assert_eq!(
+                handle.speculative_admission_status(),
+                SpeculativeAdmissionStatus::Occupied,
+                "an unrelated release cannot retire the watched foreground"
+            );
+
+            let SpeculativeWorkerCommand { command, _permit } = speculative_rx
+                .recv()
+                .expect("preempted speculative command remains queued");
+            reject_queued_command(command);
+            assert_eq!(
+                speculative
+                    .wait()
+                    .expect_err("preempted speculative request is rejected")
+                    .code,
+                NativeErrorCode::Cancelled
+            );
+            drop(_permit);
+            assert_eq!(
+                handle.speculative_admission_status(),
+                SpeculativeAdmissionStatus::Occupied,
+                "releasing the speculative lane does not release its foreground owner"
+            );
+
+            if abandon_command {
+                drop(watched_command);
+            } else {
+                reject_queued_command(watched_command);
+            }
+            assert_eq!(
+                foreground.control.snapshot().phase,
+                operation_registry::RequestPhase::Released,
+                "the actual executor lease releases without a Running transition"
+            );
+            assert_eq!(
+                foreground
+                    .wait()
+                    .expect_err("foreground returns its actual terminal result")
+                    .code,
+                if abandon_command {
+                    NativeErrorCode::WorkerStopped
+                } else {
+                    NativeErrorCode::Cancelled
+                }
+            );
+
+            // Exercise public reservation directly, before a status read can
+            // prune the abandoned watch. No elapsed Running latency exists.
+            let next = handle
+                .generate_speculative(admission_generation_request("readmitted-speculative"))
+                .expect("released foreground cannot strand the speculative lane");
+            let SpeculativeWorkerCommand { command, _permit } = speculative_rx
+                .recv()
+                .expect("readmitted speculative command is queued");
+            reject_queued_command(command);
+            assert_eq!(
+                next.wait()
+                    .expect_err("readmitted fixture is rejected")
+                    .code,
+                NativeErrorCode::Cancelled
+            );
+            assert_eq!(
+                handle.speculative_admission_status(),
+                SpeculativeAdmissionStatus::Occupied,
+                "the newly admitted speculative executor still owns its permit"
+            );
+            drop(_permit);
+            assert_eq!(
+                handle.speculative_admission_status(),
+                SpeculativeAdmissionStatus::Available
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_terminal_reply_keeps_preemption_until_executor_release() {
+        let (handle, command_rx, speculative_rx) =
+            test_admission_handle(admission_test_status(), COMMAND_CAPACITY);
+        let speculative = handle
+            .generate_speculative(admission_generation_request("terminal-watch-speculative"))
+            .expect("initial speculative request is admitted");
+        let foreground = handle
+            .generate(admission_generation_request("terminal-watch-foreground"))
+            .expect("foreground preempts the speculative request");
+        let SpeculativeWorkerCommand { command, _permit } =
+            speculative_rx.recv().expect("speculative command queues");
+        reject_queued_command(command);
+        assert_eq!(
+            speculative
+                .wait()
+                .expect_err("speculative request is rejected")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        drop(_permit);
+
+        let WorkerCommand::GenerateBatch {
+            request_lease,
+            result_tx,
+            ..
+        } = command_rx.recv().expect("foreground command queues")
+        else {
+            panic!("public generation must queue the actual batch command");
+        };
+        request_lease
+            .cancel_queued()
+            .expect("actual queued owner becomes terminal");
+        assert_eq!(
+            foreground.control.snapshot().phase,
+            operation_registry::RequestPhase::Terminal
+        );
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Occupied,
+            "terminal classification alone does not release executor authority"
+        );
+        result_tx
+            .send(Err(NativeError::new(
+                NativeErrorCode::Cancelled,
+                "terminal owner fixture cancels the admitted request",
+            )))
+            .expect("actual final reply is delivered");
+        assert_eq!(
+            foreground
+                .wait()
+                .expect_err("public ticket sees actual cancellation")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Occupied,
+            "delivery does not substitute for the non-clonable executor lease"
+        );
+        drop(request_lease);
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Available,
+            "only actual executor release retires this preemption watch"
+        );
     }
 }

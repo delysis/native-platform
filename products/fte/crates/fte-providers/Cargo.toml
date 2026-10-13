@@ -9,8 +9,6 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-bytes.workspace = true
-fte-store = { path = "../fte-store" }
 fte-types = { path = "../fte-types" }
 futures.workspace = true
 reqwest.workspace = true

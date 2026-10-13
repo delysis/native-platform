@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::Write;
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -32,6 +33,7 @@ pub const MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION: usize = 250_000;
 pub const MAX_MANAGED_SEGMENTS_PER_DOCUMENT: usize = 10_000;
 pub const MAX_MANAGED_SEGMENT_BYTES: usize = 1024 * 1024;
 pub const MAX_MANAGED_TEXT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_MANAGED_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -91,6 +93,8 @@ string_id!(ArtifactId);
 string_id!(InstallationId);
 string_id!(QueryId);
 string_id!(ManagedMaterializationId);
+string_id!(ManagedRemovalId);
+string_id!(ManagedActivationId);
 string_id!(ManagedDocumentId);
 string_id!(ManagedSegmentId);
 
@@ -115,6 +119,33 @@ impl QueryId {
 }
 
 impl Default for QueryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedActivationId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::parse(Uuid::new_v4().to_string())
+            .expect("UUID managed activation ids are always valid")
+    }
+}
+
+impl Default for ManagedActivationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedRemovalId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::parse(Uuid::new_v4().to_string()).expect("UUID managed removal ids are always valid")
+    }
+}
+
+impl Default for ManagedRemovalId {
     fn default() -> Self {
         Self::new()
     }
@@ -572,6 +603,7 @@ pub struct ManagedDocumentsV1 {
 
 impl ManagedDocumentsV1 {
     pub fn compute_content_sha256(&self) -> Result<String, ContractError> {
+        self.validate_admission_dimensions()?;
         let mut canonical = self.clone();
         canonical.content_sha256 = "0".repeat(64);
         let encoded = serde_json::to_vec(&canonical)
@@ -584,7 +616,83 @@ impl ManagedDocumentsV1 {
         Ok(())
     }
 
+    /// Check dimensions before cloning, hashing or encoding the whole value.
+    /// This preserves the existing numerical limits; it changes rejection order
+    /// for a value that is both oversized and otherwise invalid.
+    fn validate_admission_dimensions(&self) -> Result<(), ContractError> {
+        if self.documents.is_empty()
+            || self.documents.len() > MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION
+        {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed document count must be between 1 and {MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION}"
+            )));
+        }
+        let mut segments = 0_usize;
+        let mut text_bytes = 0_u64;
+        for document in &self.documents {
+            if document.segments.is_empty()
+                || document.segments.len() > MAX_MANAGED_SEGMENTS_PER_DOCUMENT
+            {
+                return Err(ContractError::LimitExceeded(format!(
+                    "managed document segment count must be between 1 and {MAX_MANAGED_SEGMENTS_PER_DOCUMENT}"
+                )));
+            }
+            segments = segments
+                .checked_add(document.segments.len())
+                .ok_or(ContractError::IntegerOverflow)?;
+            if segments > MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION {
+                return Err(ContractError::LimitExceeded(format!(
+                    "managed segment count exceeds {MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION}"
+                )));
+            }
+            for segment in &document.segments {
+                if segment.text.len() > MAX_MANAGED_SEGMENT_BYTES {
+                    return Err(ContractError::LimitExceeded(format!(
+                        "managed segment text exceeds {MAX_MANAGED_SEGMENT_BYTES} bytes"
+                    )));
+                }
+                text_bytes = text_bytes
+                    .checked_add(
+                        u64::try_from(segment.text.len())
+                            .map_err(|_| ContractError::IntegerOverflow)?,
+                    )
+                    .ok_or(ContractError::IntegerOverflow)?;
+                if text_bytes > MAX_MANAGED_TEXT_BYTES {
+                    return Err(ContractError::LimitExceeded(format!(
+                        "managed text exceeds {MAX_MANAGED_TEXT_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bound the exact pretty-JSON manifest written by the store, including its
+    /// final newline. Counting uses the current serializer and stops at the cap;
+    /// it does not allocate a copy of the serialized text or change hash framing.
+    pub fn validate_manifest_projection_bytes(&self, max_bytes: u64) -> Result<(), ContractError> {
+        self.validate_admission_dimensions()?;
+        let mut counter = ManagedManifestByteCounter {
+            written: 0,
+            max_bytes,
+            exceeded: false,
+        };
+        let result = serde_json::to_writer_pretty(&mut counter, self);
+        if counter.exceeded {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed manifest exceeds the {max_bytes}-byte projection limit"
+            )));
+        }
+        result.map_err(|error| ContractError::Serialization(error.to_string()))?;
+        counter.write_all(b"\n").map_err(|_| {
+            ContractError::LimitExceeded(format!(
+                "managed manifest exceeds the {max_bytes}-byte projection limit"
+            ))
+        })
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_admission_dimensions()?;
         require_schema(MANAGED_DOCUMENTS_SCHEMA, &self.schema)?;
         validate_identifier(
             "managed.materialization_id",
@@ -595,11 +703,6 @@ impl ManagedDocumentsV1 {
         validate_identifier("managed.representation_id", self.representation_id.as_str())?;
         self.provenance.validate()?;
         validate_sha256(&self.content_sha256)?;
-        if self.compute_content_sha256()? != self.content_sha256 {
-            return Err(ContractError::InvalidContract(
-                "managed documents content fingerprint does not match its contents".to_string(),
-            ));
-        }
         if self.source_artifacts.is_empty() {
             return Err(ContractError::InvalidContract(
                 "managed documents have no immutable source artifacts".to_string(),
@@ -614,18 +717,8 @@ impl ManagedDocumentsV1 {
                 ));
             }
         }
-        if self.documents.is_empty()
-            || self.documents.len() > MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION
-        {
-            return Err(ContractError::LimitExceeded(format!(
-                "managed document count must be between 1 and {MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION}"
-            )));
-        }
-
         let mut document_ids = BTreeSet::new();
         let mut segment_ids = BTreeSet::new();
-        let mut segment_count = 0_usize;
-        let mut text_bytes = 0_u64;
         for document in &self.documents {
             document.validate(&source_artifacts)?;
             if !document_ids.insert(&document.document_id) {
@@ -633,32 +726,48 @@ impl ManagedDocumentsV1 {
                     document.document_id.to_string(),
                 ));
             }
-            segment_count = segment_count
-                .checked_add(document.segments.len())
-                .ok_or(ContractError::IntegerOverflow)?;
-            if segment_count > MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION {
-                return Err(ContractError::LimitExceeded(format!(
-                    "managed segment count exceeds {MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION}"
-                )));
-            }
             for segment in &document.segments {
                 if !segment_ids.insert(&segment.segment_id) {
                     return Err(ContractError::DuplicateIdentifier(
                         segment.segment_id.to_string(),
                     ));
                 }
-                let bytes = u64::try_from(segment.text.len())
-                    .map_err(|_| ContractError::IntegerOverflow)?;
-                text_bytes = text_bytes
-                    .checked_add(bytes)
-                    .ok_or(ContractError::IntegerOverflow)?;
             }
         }
-        if text_bytes > MAX_MANAGED_TEXT_BYTES {
-            return Err(ContractError::LimitExceeded(format!(
-                "managed text exceeds {MAX_MANAGED_TEXT_BYTES} bytes"
-            )));
+        if self.compute_content_sha256()? != self.content_sha256 {
+            return Err(ContractError::InvalidContract(
+                "managed documents content fingerprint does not match its contents".to_string(),
+            ));
         }
+        Ok(())
+    }
+}
+
+struct ManagedManifestByteCounter {
+    written: u64,
+    max_bytes: u64,
+    exceeded: bool,
+}
+
+impl Write for ManagedManifestByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| std::io::Error::other("manifest byte count overflow"))?;
+        let Some(written) = self
+            .written
+            .checked_add(length)
+            .filter(|count| *count <= self.max_bytes)
+        else {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "manifest projection byte limit exceeded",
+            ));
+        };
+        self.written = written;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -885,6 +994,7 @@ pub fn default_managed_document_use_policy() -> UsePolicy {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsReceipt {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
     pub materialization_id: ManagedMaterializationId,
     pub resource_id: ResourceId,
     pub release_id: ReleaseId,
@@ -1048,7 +1158,14 @@ impl ManagedDocumentsSearchHit {
         for statement in &self.rights {
             statement.validate()?;
         }
-        self.use_policy.validate_with_rights(&self.rights)
+        self.use_policy.validate_with_rights(&self.rights)?;
+        if self.use_policy.permission_for(RetrievalPurpose::LocalUi) != UsePermission::Allowed {
+            return Err(ContractError::InvalidContract(
+                "managed local-search hit does not allow its local UI retrieval purpose"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1056,6 +1173,9 @@ impl ManagedDocumentsSearchHit {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalPlan {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
@@ -1068,6 +1188,7 @@ pub struct ManagedDocumentsRemovalPlan {
 impl ManagedDocumentsRemovalPlan {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)?;
         require_text(
@@ -1087,14 +1208,41 @@ impl ManagedDocumentsRemovalPlan {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalRequest {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub operation_id: ManagedRemovalId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
+    pub observed_managed_bytes: u64,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
 }
 
+impl ManagedDocumentsRemovalPlan {
+    /// Bind fresh caller consent to this exact activation and byte impact.
+    #[must_use]
+    pub fn confirmed_request(
+        &self,
+        operation_id: ManagedRemovalId,
+    ) -> ManagedDocumentsRemovalRequest {
+        ManagedDocumentsRemovalRequest {
+            schema: self.schema.clone(),
+            activation_id: self.activation_id.clone(),
+            operation_id,
+            activated_at: self.activated_at,
+            manifest_sha256: self.manifest_sha256.clone(),
+            observed_managed_bytes: self.observed_managed_bytes,
+            materialization_id: self.materialization_id.clone(),
+            content_sha256: self.content_sha256.clone(),
+            database_sha256: self.database_sha256.clone(),
+        }
+    }
+}
+
 impl ManagedDocumentsRemovalRequest {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)
     }
@@ -1104,6 +1252,10 @@ impl ManagedDocumentsRemovalRequest {
 #[serde(deny_unknown_fields)]
 pub struct ManagedDocumentsRemovalReceipt {
     pub schema: String,
+    pub activation_id: ManagedActivationId,
+    pub operation_id: ManagedRemovalId,
+    pub activated_at: DateTime<Utc>,
+    pub manifest_sha256: String,
     pub materialization_id: ManagedMaterializationId,
     pub content_sha256: String,
     pub database_sha256: String,
@@ -1115,6 +1267,7 @@ pub struct ManagedDocumentsRemovalReceipt {
 impl ManagedDocumentsRemovalReceipt {
     pub fn validate(&self) -> Result<(), ContractError> {
         require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.content_sha256)?;
         validate_sha256(&self.database_sha256)?;
         if self.external_source_bytes_removed {
@@ -3279,6 +3432,139 @@ mod tests {
         assert_eq!(policy.excerpt_export, UsePermission::Forbidden);
         assert_eq!(policy.redistribution, UsePermission::Forbidden);
         assert!(policy.validate_with_rights(&rights).is_ok());
+    }
+
+    fn managed_manifest_fixture(text: &str) -> Result<ManagedDocumentsV1, ContractError> {
+        let source_id = ArtifactId::parse("fixture-source")?;
+        let locator = EvidenceLocator::Record {
+            collection: None,
+            key: "record-1".to_string(),
+        };
+        let mut segment = ManagedTextSegment {
+            segment_id: ManagedSegmentId::parse("segment-1")?,
+            ordinal: 0,
+            text: text.to_string(),
+            text_sha256: String::new(),
+            locator: locator.clone(),
+        };
+        segment.refresh_text_sha256();
+        let mut value =
+            ManagedDocumentsV1 {
+                schema: MANAGED_DOCUMENTS_SCHEMA.to_string(),
+                materialization_id: ManagedMaterializationId::parse("fixture-materialization")?,
+                resource_id: ResourceId::parse("fixture-resource")?,
+                release_id: ReleaseId::parse("fixture-release")?,
+                representation_id: RepresentationId::parse("fixture-representation")?,
+                created_at: "2026-08-24T12:00:00Z".parse().map_err(
+                    |error: chrono::ParseError| ContractError::InvalidContract(error.to_string()),
+                )?,
+                provenance: Provenance {
+                    publisher: "Fixture".to_string(),
+                    source_uri: "file:///fixture.txt".to_string(),
+                    upstream_record_id: None,
+                    source_inputs: vec!["fixture-source".to_string()],
+                    transformation: Some("identity fixture".to_string()),
+                    metadata: BTreeMap::new(),
+                },
+                source_artifacts: vec![ManagedSourceArtifact {
+                    artifact_id: source_id.clone(),
+                    source_uri: "file:///fixture.txt".to_string(),
+                    bytes: 1,
+                    sha256: "1".repeat(64),
+                    immutable: true,
+                }],
+                documents: vec![ManagedDocument {
+                    document_id: ManagedDocumentId::parse("document-1")?,
+                    title: "Fixture".to_string(),
+                    creator: None,
+                    source_uri: None,
+                    locator: locator.clone(),
+                    immutable: true,
+                    visibility: Default::default(),
+                    lineage: vec![ManagedDocumentLineage {
+                        source_artifact_id: source_id,
+                        source_record_id: "record-1".to_string(),
+                        source_record_sha256: "1".repeat(64),
+                        source_locator: locator,
+                        transformation: "identity fixture".to_string(),
+                    }],
+                    rights: default_managed_document_rights(),
+                    use_policy: default_managed_document_use_policy(),
+                    segments: vec![segment],
+                }],
+                content_sha256: "0".repeat(64),
+            };
+        value.refresh_content_sha256()?;
+        Ok(value)
+    }
+
+    #[test]
+    fn manifest_counter_matches_exact_pretty_serialization_including_escaping_and_newline()
+    -> Result<(), ContractError> {
+        for text in ["ordinary text", "é\"\\\u{0001}\n𐀀", "line one\nline two"] {
+            let mut value = managed_manifest_fixture(text)?;
+            value.documents[0].creator = Some("".to_string());
+            value.provenance.metadata.insert(
+                "escaped".to_string(),
+                serde_json::json!([null, "é\"\\", {}]),
+            );
+            value.refresh_content_sha256()?;
+            let mut bytes = serde_json::to_vec_pretty(&value)
+                .map_err(|error| ContractError::Serialization(error.to_string()))?;
+            bytes.push(b'\n');
+            let exact = u64::try_from(bytes.len()).map_err(|_| ContractError::IntegerOverflow)?;
+            assert!(matches!(
+                value.validate_manifest_projection_bytes(exact - 1),
+                Err(ContractError::LimitExceeded(_))
+            ));
+            value.validate_manifest_projection_bytes(exact)?;
+            value.validate_manifest_projection_bytes(exact + 1)?;
+            let mut prior_canonical = value.clone();
+            prior_canonical.content_sha256 = "0".repeat(64);
+            let prior_bytes = serde_json::to_vec(&prior_canonical)
+                .map_err(|error| ContractError::Serialization(error.to_string()))?;
+            assert_eq!(
+                value.compute_content_sha256()?,
+                format!("{:x}", Sha256::digest(prior_bytes)),
+                "current compact identity bytes remain unchanged"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn managed_admission_dimensions_precede_whole_value_fingerprint_rejection()
+    -> Result<(), ContractError> {
+        let mut value = managed_manifest_fixture("ordinary text")?;
+        value.content_sha256 = "invalid fingerprint".to_string();
+        value.documents[0].segments[0].text = "x".repeat(MAX_MANAGED_SEGMENT_BYTES + 1);
+        assert!(matches!(
+            value.validate(),
+            Err(ContractError::LimitExceeded(_))
+        ));
+        assert!(matches!(
+            value.compute_content_sha256(),
+            Err(ContractError::LimitExceeded(_))
+        ));
+        assert!(matches!(
+            value.validate_manifest_projection_bytes(MAX_MANAGED_MANIFEST_PROJECTION_BYTES),
+            Err(ContractError::LimitExceeded(_))
+        ));
+        let mut value = managed_manifest_fixture("ordinary text")?;
+        let segment = value.documents[0].segments[0].clone();
+        value.documents[0].segments = vec![segment; MAX_MANAGED_SEGMENTS_PER_DOCUMENT + 1];
+        assert!(matches!(
+            value.compute_content_sha256(),
+            Err(ContractError::LimitExceeded(_))
+        ));
+        let mut value = managed_manifest_fixture("ordinary text")?;
+        let document = value.documents[0].clone();
+        value.documents = vec![document; MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION + 1];
+        assert!(matches!(
+            value.compute_content_sha256(),
+            Err(ContractError::LimitExceeded(_))
+        ));
+        Ok(())
     }
 
     #[test]

@@ -227,6 +227,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_late_usage_cannot_refund_or_charge_a_new_window() {
+        let quota = Quota::new(QuotaLimits {
+            tokens_per_minute: Some(100),
+            ..Default::default()
+        });
+        let start = Instant::now();
+        let old = quota
+            .reserve_at(&RequestId::new(), Some(20), start)
+            .expect("old reservation");
+        let current = quota
+            .reserve_at(&RequestId::new(), Some(30), start + Duration::from_secs(61))
+            .expect("new window reservation");
+        old.settle(Some(12));
+        let state = quota.state.lock().expect("quota windows");
+        assert_eq!(state.minute.reserved, 30);
+        assert_eq!(state.minute.tokens, 0);
+        assert!(!state.minute.unknown);
+        drop(state);
+        current.settle(Some(7));
+        let state = quota.state.lock().expect("quota windows");
+        assert_eq!(state.minute.reserved, 0);
+        assert_eq!(state.minute.tokens, 7);
+    }
+
+    #[test]
     fn request_reservations_are_atomic_and_unknown_limits_remain_unknown() {
         let quota = Quota::new(QuotaLimits {
             requests_per_minute: Some(1),

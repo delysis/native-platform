@@ -30,8 +30,8 @@ use information_native_retrieval::{
     ResourceBackend, RetrievalRouter,
 };
 use information_native_store::{
-    ActiveManagedDocumentsProjection, ActiveManagedMaterialization, ExternalRegistrationRequest,
-    ManagedStore, PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
+    ActiveManagedMaterialization, ActiveManagedReceipt, ExternalRegistrationRequest, ManagedStore,
+    PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
     TransferSummary,
 };
 use information_native_types::{
@@ -42,8 +42,7 @@ use information_native_types::{
     ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
     ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
     ManagedDocumentsV1, ManagedMaterializationId, PlannedArtifact, ReleaseId, RepresentationFormat,
-    RepresentationId, ResourceId, ResourceRecord, RetrievalPurpose, RightsStatement,
-    SourceIdentity, UsePolicy,
+    RepresentationId, ResourceId, ResourceRecord, RightsStatement, SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -150,22 +149,6 @@ pub struct MaterializedZimDocuments {
 #[serde(default, deny_unknown_fields)]
 pub struct MountInstallationOptions {
     pub allow_private_model_context: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "name", content = "arguments", rename_all = "snake_case")]
-pub enum InformationToolCall {
-    OfflineInformationSearch(InformationQuery),
-    OfflineInformationRead(ReadRequest),
-    OfflineInformationLookup(LookupRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
-pub enum InformationToolResult {
-    Search(EvidenceSet),
-    Read(BackendReadResult),
-    Lookup(BackendReadResult),
 }
 
 pub struct InformationHost {
@@ -551,36 +534,6 @@ impl InformationHost {
         Ok(descriptor)
     }
 
-    pub fn mount_registered_community_archive(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-        allow_private_model_context: bool,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, COMMUNITY_PROFILE_NAME)?;
-        let mut config = CommunityArchiveBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        config.allow_private_model_context = allow_private_model_context;
-        self.mount_community_archive(config)
-    }
-
     pub fn mount_encyclopedia(
         &self,
         config: EncyclopediaBackendConfig,
@@ -591,34 +544,6 @@ impl InformationHost {
         Ok(descriptor)
     }
 
-    pub fn mount_registered_encyclopedia(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, ENCYCLOPEDIA_PROFILE_NAME)?;
-        let mut config = EncyclopediaBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        self.mount_encyclopedia(config)
-    }
-
     pub fn mount_scripture(
         &self,
         config: ScriptureBackendConfig,
@@ -627,34 +552,6 @@ impl InformationHost {
         let descriptor = backend.descriptor().clone();
         self.register_backend(backend)?;
         Ok(descriptor)
-    }
-
-    pub fn mount_registered_scripture(
-        &self,
-        registration: &ExternalRegistration,
-        backend_id: impl Into<String>,
-        label: impl Into<String>,
-    ) -> Result<BackendDescriptor, HostError> {
-        require_registered_profile(registration, SCRIPTURE_PROFILE_NAME)?;
-        let mut config = ScriptureBackendConfig::new(
-            backend_id,
-            label,
-            registration.resource_id.clone(),
-            registration.release_id.clone(),
-            registration.representation_id.clone(),
-            &registration.absolute_path,
-            registration.access_mode,
-            registration.provenance.publisher.clone(),
-        );
-        config.verified_source_sha256 = registration.identity.sha256.clone();
-        if registration.access_mode
-            == information_native_types::ExternalAccessMode::ImmutableReadOnly
-        {
-            config.verified_source_identity = Some(registration.identity.clone());
-        }
-        config.rights = registration.rights.clone();
-        config.use_policy = registration.use_policy;
-        self.mount_scripture(config)
     }
 
     /// Bind a durable managed package or external registration into the live
@@ -961,7 +858,7 @@ impl InformationHost {
     pub fn list_active_managed_documents(
         &self,
         max_entries: usize,
-    ) -> Result<ActiveManagedDocumentsProjection, HostError> {
+    ) -> Result<Vec<ActiveManagedReceipt>, HostError> {
         Ok(self.store.list_active_managed_documents(max_entries)?)
     }
 
@@ -996,26 +893,6 @@ impl InformationHost {
         request: &ManagedDocumentsRemovalRequest,
     ) -> Result<ManagedDocumentsRemovalReceipt, HostError> {
         Ok(self.store.remove_managed_documents(request)?)
-    }
-
-    pub fn execute_tool(
-        &self,
-        call: InformationToolCall,
-    ) -> Result<InformationToolResult, HostError> {
-        match call {
-            InformationToolCall::OfflineInformationSearch(mut query) => {
-                query.purpose = RetrievalPurpose::ModelContext;
-                self.search(&query).map(InformationToolResult::Search)
-            }
-            InformationToolCall::OfflineInformationRead(mut request) => {
-                request.purpose = RetrievalPurpose::ModelContext;
-                self.read(&request).map(InformationToolResult::Read)
-            }
-            InformationToolCall::OfflineInformationLookup(mut request) => {
-                request.purpose = RetrievalPurpose::ModelContext;
-                self.lookup(&request).map(InformationToolResult::Lookup)
-            }
-        }
     }
 
     #[must_use]
@@ -1248,18 +1125,6 @@ fn platform_http_resume_policy(sidecar: &Path) -> ResumePolicy {
     }
 }
 
-fn require_registered_profile(
-    registration: &ExternalRegistration,
-    expected_profile: &str,
-) -> Result<(), HostError> {
-    if registration.format.kind != FormatKind::SqliteFts5
-        || registration.format.profile.as_deref() != Some(expected_profile)
-    {
-        return Err(HostError::BackendFormatMismatch);
-    }
-    Ok(())
-}
-
 fn mount_artifact_error(message: impl Into<String>) -> HostError {
     InformationError::new(
         ErrorClass::Integrity,
@@ -1423,7 +1288,8 @@ fn store_information_error(error: &StoreError) -> InformationError {
             false,
         ),
         StoreError::CommittedDurabilityUnknown { .. }
-        | StoreError::ManagedDocumentsCommitted { .. } => (
+        | StoreError::ManagedDocumentsCommitted { .. }
+        | StoreError::ManagedDocumentsRemovalIncomplete { .. } => (
             ErrorClass::Io,
             "information_store_commit_durability_unknown",
             true,
@@ -1914,8 +1780,8 @@ mod tests {
         CoverageDescriptor, FormatKind, InformationCapability, Publisher, QUERY_SCHEMA,
         QueryBudget, QueryFilters, QueryId, QuerySyntax, RedistributionPolicy,
         RepresentationDescriptor, RepresentationFormat, RepresentationId, ResourceDescriptor,
-        ResourceId, ResourceKind, ResourceRelease, RetrievalTarget, RightsStatement,
-        RuntimeRequirement, SubsetSupport, UsePermission, UsePolicy,
+        ResourceId, ResourceKind, ResourceRelease, RetrievalPurpose, RetrievalTarget,
+        RightsStatement, RuntimeRequirement, SubsetSupport, UsePermission, UsePolicy,
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};

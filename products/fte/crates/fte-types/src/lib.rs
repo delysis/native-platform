@@ -14,6 +14,11 @@ use uuid::Uuid;
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
+/// Application-owned hosted credentials, resolved per provider operation.
+pub trait SecretResolver: Send + Sync {
+    fn resolve(&self, provider: &str) -> Result<Option<String>, GatewayError>;
+}
+
 /// Injected response persistence. The gateway owns ordering relative to its
 /// terminal event; products own the storage implementation and its lifetime.
 pub trait ResponseStore: Send + Sync {
@@ -102,6 +107,8 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     pub fn validate(&self) -> Result<(), GatewayError> {
+        self.tool_policy
+            .validate_tools(&self.tools, &self.request_id)?;
         if let ModelSelector::Priority { routes } = &self.model
             && (routes.is_empty()
                 || routes.len() > 16
@@ -360,9 +367,48 @@ pub enum ToolOwner {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPolicy {
+    /// Model selection is independent of authority to execute its chosen tool.
+    #[serde(default)]
+    pub selection: ToolSelection,
     #[serde(default)]
     pub execution: ToolExecutionPolicy,
     pub max_turns: Option<u32>,
+}
+
+impl ToolPolicy {
+    pub fn validate_tools(
+        &self,
+        tools: &[ToolDefinition],
+        request_id: &RequestId,
+    ) -> Result<(), GatewayError> {
+        let valid = match &self.selection {
+            ToolSelection::None | ToolSelection::Auto => true,
+            ToolSelection::Required => !tools.is_empty(),
+            ToolSelection::Named { name } => {
+                !name.trim().is_empty() && tools.iter().any(|tool| tool.name == *name)
+            }
+        };
+        if !valid {
+            return Err(GatewayError::invalid_request(
+                request_id,
+                "tool_choice_definition_missing",
+                "required or named tool selection needs matching supplied tool definitions",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolSelection {
+    None,
+    #[default]
+    Auto,
+    Required,
+    Named {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -528,6 +574,9 @@ pub struct StreamPolicy {
 pub struct BackendRequest {
     pub request: GatewayRequest,
     pub route: ResolvedRoute,
+    /// Resolved by the router from the local previous response and its route.
+    /// Public request IDs never supply this provider-owned handle directly.
+    pub provider_previous_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -646,6 +695,9 @@ impl BackendReadiness {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GatewayResponse {
     pub id: String,
+    /// Upstream Responses handle; `id` remains the local public identity.
+    /// The producing backend/model are owned by `route` in this same record.
+    pub provider_response_id: Option<String>,
     pub request_id: RequestId,
     pub model: String,
     pub route: ResolvedRoute,
@@ -940,6 +992,9 @@ pub trait TicketLifecycleLease: Send + Sync {
     fn finish(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
     /// Record an early terminal while the executor may still be draining.
     fn terminal(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
+    /// Settle authoritative usage discovered while draining an already-public
+    /// terminal. This must not publish a response or change that terminal.
+    fn settle_usage(&self, _result: &Result<GatewayResponse, GatewayError>) {}
     /// Release only after final publication and executor completion.
     fn release(&self) -> Result<(), GatewayError>;
 }
@@ -1176,6 +1231,12 @@ impl GatewayTicket {
                 fn release(&self) -> Result<(), GatewayError> {
                     self.lease.as_ref().map_or(Ok(()), |lease| lease.release())
                 }
+
+                fn settle_usage(&self, result: &Result<GatewayResponse, GatewayError>) {
+                    if let Some(lease) = &self.lease {
+                        lease.settle_usage(result);
+                    }
+                }
             }
 
             let release = ExecutorRelease {
@@ -1361,7 +1422,10 @@ impl GatewayTicket {
                         observe_terminal(&mut observer, &result);
                         let _ = final_tx.send(result);
                         if retains_executor {
-                            let _ = upstream_final.await;
+                            let late_result = upstream_final.await.unwrap_or_else(|_| {
+                                Err(GatewayError::unavailable(&request_for_task, "backend_result_channel_closed", "the backend stopped before returning an authoritative result"))
+                            });
+                            release.settle_usage(&late_result);
                             let _ = release.release();
                         }
                         return;
@@ -1920,6 +1984,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route,
@@ -1982,6 +2047,7 @@ mod tests {
             };
             let response = GatewayResponse {
                 id: "resp".to_string(),
+                provider_response_id: None,
                 request_id: request_id.clone(),
                 model: route.model_id.clone(),
                 route,
@@ -2066,6 +2132,7 @@ mod tests {
         };
         let response = GatewayResponse {
             id: "resp".to_string(),
+            provider_response_id: None,
             request_id: request_id.clone(),
             model: route.model_id.clone(),
             route,

@@ -14,8 +14,7 @@
 
 mod managed_documents;
 pub use managed_documents::{
-    ActiveManagedDocument, ActiveManagedDocumentsProjection, ActiveManagedMaterialization,
-    ActiveManagedReceipt, ActiveManagedSegment,
+    ActiveManagedDocument, ActiveManagedMaterialization, ActiveManagedReceipt, ActiveManagedSegment,
 };
 
 use chrono::{DateTime, Utc};
@@ -24,8 +23,8 @@ use information_native_types::{
     AcquisitionTransport, ArtifactAcquisition, ArtifactId, ContractError,
     EXTERNAL_REGISTRATION_SCHEMA, ExternalAccessMode, ExternalRegistration, INSTALL_RECEIPT_SCHEMA,
     InstallPlan, InstallReceipt, InstallationId, InstallationState, InstalledArtifact,
-    ManagedMaterializationId, Provenance, ReleaseId, RepresentationFormat, RepresentationId,
-    ResourceId, RightsStatement, SourceIdentity, UsePolicy,
+    ManagedDocumentsRemovalRequest, ManagedMaterializationId, Provenance, ReleaseId,
+    RepresentationFormat, RepresentationId, ResourceId, RightsStatement, SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -77,6 +76,14 @@ pub enum StoreError {
         content_sha256: String,
         database_sha256: String,
         visible: bool,
+        #[source]
+        source: Box<StoreError>,
+    },
+    #[error(
+        "managed documents removal {request:?} is admitted, but completion is not acknowledged: {source}"
+    )]
+    ManagedDocumentsRemovalIncomplete {
+        request: Box<ManagedDocumentsRemovalRequest>,
         #[source]
         source: Box<StoreError>,
     },

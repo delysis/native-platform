@@ -239,13 +239,15 @@ result carries:
   record key);
 - source URI, rights/attribution, and provenance notes.
 
-Prompt construction is intentionally downstream. The host exposes a JSON tool
-schema and typed result, but never concatenates evidence with instructions.
-Model-facing calls are forced to `model_context`, require exact
-resource/release/representation targets, and fail closed when policy forbids
-that purpose. Timeouts are cooperative soft deadlines: the router discards late
-backend responses, while SQLite backends also install progress-handler
-deadlines so long queries are interrupted inside the database engine.
+Prompt construction is intentionally downstream. The CLI exposes the host's JSON
+tool definitions; applications invoke typed `search`, `read`, and `lookup`
+methods and receive evidence results. The definitions require `model_context`
+and exact resource/release/representation targets. Typed requests retain their
+explicit purpose, and the router fails closed when policy forbids it. Neither
+the host nor router concatenates evidence with instructions. Timeouts are
+cooperative soft deadlines: the router discards late backend responses, while
+SQLite backends also install progress-handler deadlines so long queries are
+interrupted inside the database engine.
 
 ## SQLite boundary
 

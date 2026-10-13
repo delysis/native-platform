@@ -8,12 +8,13 @@ use super::{
 use chrono::{DateTime, Utc};
 use information_native_types::{
     EvidenceLocator, MANAGED_DOCUMENTS_RECEIPT_SCHEMA, MANAGED_DOCUMENTS_REMOVAL_SCHEMA,
-    MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedDocumentId, ManagedDocumentLineage,
-    ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
-    ManagedDocumentsRemovalRequest, ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest,
-    ManagedDocumentsSearchResult, ManagedDocumentsV1, ManagedMaterializationId, ManagedSegmentId,
-    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RightsStatement,
-    UsePolicy,
+    MANAGED_DOCUMENTS_SEARCH_SCHEMA, MAX_MANAGED_MANIFEST_PROJECTION_BYTES, ManagedActivationId,
+    ManagedDocumentId, ManagedDocumentLineage, ManagedDocumentsReceipt,
+    ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt, ManagedDocumentsRemovalRequest,
+    ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
+    ManagedDocumentsV1, ManagedMaterializationId, ManagedRemovalId, ManagedSegmentId,
+    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RetrievalPurpose,
+    RightsStatement, UsePermission, UsePolicy,
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -27,13 +28,18 @@ use std::path::{Path, PathBuf};
 const MANAGED_DOCUMENTS_DIRECTORY: &str = "managed-documents-v1";
 const ACTIVE_DIRECTORY: &str = "active";
 const STAGING_DIRECTORY: &str = "staging";
+const REMOVALS_DIRECTORY: &str = "removals";
+const REMOVAL_INTENT_FILE: &str = "intent.json";
+const REMOVAL_TERMINAL_FILE: &str = "terminal.json";
+const REMOVAL_TERMINAL_PENDING_FILE: &str = "terminal.pending.json";
+const REMOVAL_OWNER_FILE: &str = "operation.json";
+const REMOVAL_REPRESENTATION_DIRECTORY: &str = "representation";
 const DATABASE_FILE: &str = "documents.sqlite3";
 const MANIFEST_FILE: &str = "manifest.json";
 const RECEIPT_FILE: &str = "receipt.json";
 const EXPECTED_ACTIVE_FILES: [&str; 3] = [DATABASE_FILE, MANIFEST_FILE, RECEIPT_FILE];
 const MAX_ACTIVE_PROJECTION_ENTRIES: usize = 256;
 const MAX_RECEIPT_PROJECTION_BYTES: u64 = 64 * 1024;
-const MAX_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Path-free projection for one active immutable managed representation.
 /// Canonical text remains inside the managed database. The producing method's
@@ -42,6 +48,7 @@ const MAX_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveManagedMaterialization {
+    pub activation_id: ManagedActivationId,
     pub materialization_id: ManagedMaterializationId,
     pub resource_id: ResourceId,
     pub release_id: ReleaseId,
@@ -79,16 +86,10 @@ pub struct ActiveManagedSegment {
     pub locator: EvidenceLocator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ActiveManagedDocumentsProjection {
-    pub complete: bool,
-    pub entries: Vec<ActiveManagedReceipt>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveManagedReceipt {
+    pub activation_id: ManagedActivationId,
     pub materialization_id: ManagedMaterializationId,
     pub resource_id: ResourceId,
     pub release_id: ReleaseId,
@@ -132,6 +133,59 @@ fn observe_publish_boundary(boundary: PublishBoundary) {
 #[cfg(not(test))]
 fn observe_publish_boundary(_boundary: PublishBoundary) {}
 
+/// One retained Information-owned operation record. It is evidence of an
+/// exact request admitted by a caller, never a product permission grant.
+/// Terminal records remain in the private store until explicit owner cleanup;
+/// opening a store does not resume operations or erase their failed evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RemovalJournal {
+    schema: String,
+    request: ManagedDocumentsRemovalRequest,
+    source_receipt: ManagedDocumentsReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalBoundary {
+    IntentSynced,
+    Hidden,
+    HideSynced,
+    DatabaseUnlinked,
+    ManifestUnlinked,
+    ReceiptUnlinked,
+    RepresentationRemoved,
+    TerminalFileSynced,
+    TerminalRenamed,
+    TerminalSynced,
+    OwnerUnlinked,
+    DirectoryRemoved,
+    ParentSynced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMOVAL_FAULT: std::cell::Cell<Option<RemovalBoundary>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn observe_removal_boundary(boundary: RemovalBoundary) -> Result<(), StoreError> {
+    #[cfg(test)]
+    REMOVAL_FAULT.with(|fault| {
+        if fault.get() == Some(boundary) {
+            fault.set(None);
+            return Err(StoreError::Io {
+                operation: "observe managed documents removal boundary",
+                path: PathBuf::new(),
+                source: std::io::Error::other(format!("injected removal fault at {boundary:?}")),
+            });
+        }
+        Ok(())
+    })?;
+    let _ = boundary;
+    Ok(())
+}
+
 impl ManagedStore {
     /// Enumerate a caller-bounded discoverability projection of active receipt
     /// identities without exposing managed or source filesystem paths. This
@@ -141,7 +195,7 @@ impl ManagedStore {
     pub fn list_active_managed_documents(
         &self,
         max_entries: usize,
-    ) -> Result<ActiveManagedDocumentsProjection, StoreError> {
+    ) -> Result<Vec<ActiveManagedReceipt>, StoreError> {
         if max_entries == 0 || max_entries > MAX_ACTIVE_PROJECTION_ENTRIES {
             return Err(StoreError::RegistryCorrupt(format!(
                 "managed documents projection cap must be between 1 and {MAX_ACTIVE_PROJECTION_ENTRIES}"
@@ -171,14 +225,10 @@ impl ManagedStore {
                 paths.len()
             )));
         }
-        let entries = paths
+        paths
             .iter()
             .map(|path| active_receipt_projection(self, path))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ActiveManagedDocumentsProjection {
-            complete: true,
-            entries,
-        })
+            .collect()
     }
 
     /// Resolve one exact active representation through full receipt, manifest,
@@ -208,9 +258,9 @@ impl ManagedStore {
         materialization_id: &ManagedMaterializationId,
         max_manifest_bytes: u64,
     ) -> Result<ActiveManagedMaterialization, StoreError> {
-        if max_manifest_bytes == 0 || max_manifest_bytes > MAX_MANIFEST_PROJECTION_BYTES {
+        if max_manifest_bytes == 0 || max_manifest_bytes > MAX_MANAGED_MANIFEST_PROJECTION_BYTES {
             return Err(StoreError::RegistryCorrupt(format!(
-                "managed documents manifest projection cap must be between 1 and {MAX_MANIFEST_PROJECTION_BYTES} bytes"
+                "managed documents manifest projection cap must be between 1 and {MAX_MANAGED_MANIFEST_PROJECTION_BYTES} bytes"
             )));
         }
         let _lock = self.try_lock()?;
@@ -237,6 +287,11 @@ impl ManagedStore {
 
         let key = materialization_key(&materialization.materialization_id);
         let active = active_root(self).join(&key);
+        if path_exists(&removing_path(self, &materialization.materialization_id))? {
+            return Err(StoreError::ManagedDocumentsConflict(
+                materialization.materialization_id.clone(),
+            ));
+        }
         if path_exists(&active)? {
             let receipt = validate_active_materialization(self, &active)?;
             if receipt_matches_materialization(&receipt, materialization) {
@@ -311,8 +366,12 @@ impl ManagedStore {
             ));
         }
         let receipt = validate_active_materialization(self, &active)?;
+        let (_, manifest_sha256, _) = hash_file(&active.join(MANIFEST_FILE))?;
         let plan = ManagedDocumentsRemovalPlan {
             schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+            activation_id: receipt.activation_id,
+            activated_at: receipt.activated_at,
+            manifest_sha256,
             materialization_id: receipt.materialization_id,
             content_sha256: receipt.content_sha256,
             database_sha256: receipt.database_sha256,
@@ -325,9 +384,10 @@ impl ManagedStore {
         Ok(plan)
     }
 
-    /// Remove exactly one confirmed managed representation. A deterministic
-    /// removal-stage name makes the operation retryable after an interrupted
-    /// delete without accepting a renderer-supplied path.
+    /// Admit one exact caller-confirmed operation, then hide and remove only its
+    /// Information-owned activation. The journal outlives all representation
+    /// bytes and replays the same terminal result after an interrupted response.
+    /// No operation is resumed merely by reopening the store.
     pub fn remove_managed_documents(
         &self,
         request: &ManagedDocumentsRemovalRequest,
@@ -335,67 +395,55 @@ impl ManagedStore {
         request.validate()?;
         let _lock = self.try_lock()?;
         ensure_layout(self)?;
-        let key = materialization_key(&request.materialization_id);
-        let active = active_root(self).join(&key);
-        let removing = staging_root(self).join(format!("removing-{key}"));
+        let active = active_path(self, &request.materialization_id);
+        let removing = removing_path(self, &request.materialization_id);
+        let operation = removal_operation_path(self, &request.operation_id);
 
-        let target = if path_exists(&active)? {
+        let journal = if path_exists(&operation)? {
+            let journal = read_removal_journal(self, &operation)?;
+            if journal.request != *request {
+                return Err(StoreError::ManagedDocumentsIdentityMismatch);
+            }
+            journal
+        } else {
+            // A new operation cannot borrow a hidden generation or infer
+            // authority/completion from absence.
             if path_exists(&removing)? {
                 return Err(StoreError::ManagedDocumentsConflict(
                     request.materialization_id.clone(),
                 ));
             }
-            let receipt = validate_active_materialization(self, &active)?;
-            require_exact_receipt(&receipt, request)?;
-            make_materialization_directory_writable(&active)?;
-            if let Err(error) = fs::rename(&active, &removing) {
-                let _ = make_materialization_directory_immutable(&active);
-                return Err(StoreError::Io {
-                    operation: "hide managed documents before removal",
-                    path: removing.clone(),
-                    source: error,
-                });
+            if !path_exists(&active)? {
+                return Err(StoreError::ManagedDocumentsNotFound(
+                    request.materialization_id.clone(),
+                ));
             }
-            removing
-        } else if path_exists(&removing)? {
-            removing
-        } else {
-            return Err(StoreError::ManagedDocumentsNotFound(
-                request.materialization_id.clone(),
-            ));
-        };
-
-        let finish = || {
-            sync_publication_roots(self)?;
-            let receipt: ManagedDocumentsReceipt =
-                read_json(&target.join(RECEIPT_FILE), "managed documents receipt")?;
-            receipt.validate()?;
-            require_exact_receipt(&receipt, request)?;
-            let removed_managed_bytes = directory_bytes(&target)?;
-            finish_removal(&target, &receipt)?;
-            sync_directory(&staging_root(self))?;
-
-            let removal = ManagedDocumentsRemovalReceipt {
+            let receipt = validate_active_materialization(self, &active)?;
+            require_exact_removal_source(&active, &receipt, request)?;
+            let journal = RemovalJournal {
                 schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-                materialization_id: request.materialization_id.clone(),
-                content_sha256: request.content_sha256.clone(),
-                database_sha256: request.database_sha256.clone(),
-                removed_managed_bytes,
-                external_source_bytes_removed: false,
-                removed_at: Utc::now(),
+                request: request.clone(),
+                source_receipt: receipt,
             };
-            removal.validate()?;
-            Ok(removal)
+            create_private_dir(&operation)?;
+            write_new_json(
+                &operation.join(REMOVAL_INTENT_FILE),
+                &journal,
+                "managed removal intent",
+            )?;
+            journal
         };
-        let removal = finish().map_err(|source| StoreError::ManagedDocumentsCommitted {
-            materialization_id: request.materialization_id.clone(),
-            content_sha256: request.content_sha256.clone(),
-            database_sha256: request.database_sha256.clone(),
-            visible: false,
-            source: Box::new(source),
-        })?;
+        // Do not hide any representation until its exact intent is durable.
+        sync_directory(&operation)?;
+        sync_directory(&removals_root(self))?;
+        sync_directory(&documents_root(self))?;
+        sync_directory(&self.root)?;
 
-        Ok(removal)
+        let result = finish_removal_operation(self, &journal, &operation, &active, &removing);
+        result.map_err(|source| StoreError::ManagedDocumentsRemovalIncomplete {
+            request: Box::new(journal.request),
+            source: Box::new(source),
+        })
     }
 }
 
@@ -446,6 +494,7 @@ fn projection_from_parts(
         })
         .collect();
     Ok(ActiveManagedMaterialization {
+        activation_id: receipt.activation_id,
         materialization_id: receipt.materialization_id,
         resource_id: receipt.resource_id,
         release_id: receipt.release_id,
@@ -484,6 +533,7 @@ fn active_receipt_projection(
 
 fn receipt_projection_from_receipt(receipt: ManagedDocumentsReceipt) -> ActiveManagedReceipt {
     ActiveManagedReceipt {
+        activation_id: receipt.activation_id,
         materialization_id: receipt.materialization_id,
         resource_id: receipt.resource_id,
         release_id: receipt.release_id,
@@ -511,6 +561,7 @@ fn active_projection_without_database(
     manifest.validate()?;
     let synthetic_receipt = ManagedDocumentsReceipt {
         schema: MANAGED_DOCUMENTS_RECEIPT_SCHEMA.to_string(),
+        activation_id: receipt.activation_id.clone(),
         materialization_id: receipt.materialization_id.clone(),
         resource_id: receipt.resource_id.clone(),
         release_id: receipt.release_id.clone(),
@@ -595,6 +646,7 @@ fn build_and_activate(
     let key = materialization_key(&materialization.materialization_id);
     let receipt = ManagedDocumentsReceipt {
         schema: MANAGED_DOCUMENTS_RECEIPT_SCHEMA.to_string(),
+        activation_id: ManagedActivationId::new(),
         materialization_id: materialization.materialization_id.clone(),
         resource_id: materialization.resource_id.clone(),
         release_id: materialization.release_id.clone(),
@@ -856,6 +908,7 @@ fn search_database(
              JOIN segments s ON s.rowid = segments_fts.rowid
              JOIN documents d ON d.document_id = s.document_id
              WHERE segments_fts MATCH ?1
+               AND json_extract(d.use_policy_json, '$.local_search') = 'allowed'
              ORDER BY bm25(segments_fts), s.document_id, s.ordinal
              LIMIT ?2",
         )
@@ -883,6 +936,14 @@ fn search_database(
     for row in rows {
         let row =
             row.map_err(|source| sqlite_error("read managed documents search row", source))?;
+        let use_policy: UsePolicy =
+            decode_json(&row.use_policy_json, "managed document use policy")?;
+        if use_policy.permission_for(RetrievalPurpose::LocalUi) != UsePermission::Allowed {
+            return Err(StoreError::RegistryCorrupt(
+                "managed local search returned a document without local-search permission"
+                    .to_string(),
+            ));
+        }
         let lineage: Vec<ManagedDocumentLineage> =
             decode_json(&row.lineage_json, "managed document lineage")?;
         let source_artifacts = source_artifacts_for_lineage(manifest, &lineage)?;
@@ -904,7 +965,7 @@ fn search_database(
             source_artifacts,
             lineage,
             rights: decode_json(&row.rights_json, "managed document rights")?,
-            use_policy: decode_json(&row.use_policy_json, "managed document use policy")?,
+            use_policy,
         });
     }
     Ok(ManagedDocumentsSearchResult {
@@ -1048,40 +1109,349 @@ fn validate_materialization_directory(path: &Path, require_all: bool) -> Result<
     Ok(())
 }
 
-fn finish_removal(path: &Path, receipt: &ManagedDocumentsReceipt) -> Result<(), StoreError> {
-    validate_materialization_directory(path, false)?;
-    make_materialization_writable(path)?;
-    let database = path.join(DATABASE_FILE);
-    if path_exists(&database)? {
-        let (_, observed_sha256, _) = hash_file(&database)?;
-        if !digest_equal(&receipt.database_sha256, &observed_sha256) {
+fn read_removal_journal(
+    store: &ManagedStore,
+    operation: &Path,
+) -> Result<RemovalJournal, StoreError> {
+    validate_removal_operation_directory(operation)?;
+    let journal: RemovalJournal = read_json_bounded(
+        &operation.join(REMOVAL_INTENT_FILE),
+        "managed removal intent",
+        MAX_RECEIPT_PROJECTION_BYTES,
+    )?;
+    if journal.schema != MANAGED_DOCUMENTS_REMOVAL_SCHEMA {
+        return Err(StoreError::RegistryCorrupt(
+            "managed removal intent schema is incompatible".to_string(),
+        ));
+    }
+    journal.request.validate()?;
+    journal.source_receipt.validate()?;
+    require_exact_receipt(&journal.source_receipt, &journal.request)?;
+    if journal.source_receipt.activation_id != journal.request.activation_id
+        || journal.source_receipt.activated_at != journal.request.activated_at
+        || store
+            .root
+            .join(&journal.source_receipt.managed_relative_path)
+            != active_path(store, &journal.request.materialization_id)
+        || removal_operation_path(store, &journal.request.operation_id) != operation
+    {
+        return Err(StoreError::ManagedDocumentsIdentityMismatch);
+    }
+    Ok(journal)
+}
+
+fn validate_removal_operation_directory(path: &Path) -> Result<(), StoreError> {
+    reject_symlink(path)?;
+    enforce_private_directory(path)?;
+    for entry in fs::read_dir(path)
+        .map_err(|source| StoreError::io("read managed removal operation", path, source))?
+    {
+        let entry = entry.map_err(|source| {
+            StoreError::io("read managed removal operation entry", path, source)
+        })?;
+        let name = entry.file_name();
+        if ![
+            REMOVAL_INTENT_FILE,
+            REMOVAL_TERMINAL_FILE,
+            REMOVAL_TERMINAL_PENDING_FILE,
+        ]
+        .iter()
+        .any(|expected| name == *expected)
+            || !entry
+                .file_type()
+                .map_err(|source| {
+                    StoreError::io(
+                        "inspect managed removal operation entry",
+                        &entry.path(),
+                        source,
+                    )
+                })?
+                .is_file()
+        {
+            return Err(StoreError::UnsafePath {
+                path: entry.path(),
+                reason: "unexpected or nonregular managed removal operation entry",
+            });
+        }
+        enforce_private_file(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn require_exact_removal_source(
+    path: &Path,
+    receipt: &ManagedDocumentsReceipt,
+    request: &ManagedDocumentsRemovalRequest,
+) -> Result<(), StoreError> {
+    require_exact_receipt(receipt, request)?;
+    let (_, manifest_sha256, _) = hash_file(&path.join(MANIFEST_FILE))?;
+    if receipt.activation_id != request.activation_id
+        || receipt.activated_at != request.activated_at
+        || !digest_equal(&manifest_sha256, &request.manifest_sha256)
+        || directory_bytes(path)? != request.observed_managed_bytes
+    {
+        return Err(StoreError::ManagedDocumentsIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn finish_removal_operation(
+    store: &ManagedStore,
+    journal: &RemovalJournal,
+    operation: &Path,
+    active: &Path,
+    removing: &Path,
+) -> Result<ManagedDocumentsRemovalReceipt, StoreError> {
+    let request = &journal.request;
+    let terminal = operation.join(REMOVAL_TERMINAL_FILE);
+    let pending_terminal = operation.join(REMOVAL_TERMINAL_PENDING_FILE);
+    let representation = removing.join(REMOVAL_REPRESENTATION_DIRECTORY);
+    let terminal_exists = path_exists(&terminal)?;
+    let pending_terminal_exists = path_exists(&pending_terminal)?;
+
+    if terminal_exists || pending_terminal_exists {
+        // Terminal replay never falls through to a later active generation.
+        if path_exists(active)? {
+            return Err(StoreError::ManagedDocumentsConflict(
+                request.materialization_id.clone(),
+            ));
+        }
+        if path_exists(&representation)? {
+            return Err(StoreError::RegistryCorrupt(
+                "terminal removal still has representation bytes".to_string(),
+            ));
+        }
+    } else {
+        if !path_exists(removing)? {
+            if !path_exists(active)? {
+                return Err(StoreError::ManagedDocumentsNotFound(
+                    request.materialization_id.clone(),
+                ));
+            }
+            let receipt = validate_active_materialization(store, active)?;
+            require_exact_removal_source(active, &receipt, request)?;
+            if receipt != journal.source_receipt {
+                return Err(StoreError::ManagedDocumentsIdentityMismatch);
+            }
+            create_private_dir(removing)?;
+            write_new_json(
+                &removing.join(REMOVAL_OWNER_FILE),
+                &request.operation_id,
+                "managed removal owner",
+            )?;
+        }
+        validate_removal_stage(removing, &request.operation_id, false)?;
+        sync_directory(removing)?;
+        sync_directory(&staging_root(store))?;
+        observe_removal_boundary(RemovalBoundary::IntentSynced)?;
+        if path_exists(active)? {
+            if path_exists(&representation)? {
+                return Err(StoreError::ManagedDocumentsConflict(
+                    request.materialization_id.clone(),
+                ));
+            }
+            let receipt = validate_active_materialization(store, active)?;
+            require_exact_removal_source(active, &receipt, request)?;
+            if receipt != journal.source_receipt {
+                return Err(StoreError::ManagedDocumentsIdentityMismatch);
+            }
+            make_materialization_directory_writable(active)?;
+            if let Err(source) = fs::rename(active, &representation) {
+                let _ = make_materialization_directory_immutable(active);
+                return Err(StoreError::io(
+                    "hide managed documents before removal",
+                    &representation,
+                    source,
+                ));
+            }
+            observe_removal_boundary(RemovalBoundary::Hidden)?;
+        }
+        sync_publication_roots(store)?;
+        sync_directory(removing)?;
+        observe_removal_boundary(RemovalBoundary::HideSynced)?;
+        if path_exists(&representation)? {
+            finish_removal(&representation, journal)?;
+            sync_directory(removing)?;
+        }
+        observe_removal_boundary(RemovalBoundary::RepresentationRemoved)?;
+    }
+
+    let receipt = if terminal_exists {
+        let receipt = read_removal_terminal(&terminal, request)?;
+        if pending_terminal_exists {
+            return Err(StoreError::RegistryCorrupt(
+                "managed removal has conflicting terminal records".to_string(),
+            ));
+        }
+        receipt
+    } else {
+        let receipt = if pending_terminal_exists {
+            read_removal_terminal(&pending_terminal, request)?
+        } else {
+            let receipt = ManagedDocumentsRemovalReceipt {
+                schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+                activation_id: request.activation_id.clone(),
+                operation_id: request.operation_id.clone(),
+                activated_at: request.activated_at,
+                manifest_sha256: request.manifest_sha256.clone(),
+                materialization_id: request.materialization_id.clone(),
+                content_sha256: request.content_sha256.clone(),
+                database_sha256: request.database_sha256.clone(),
+                removed_managed_bytes: request.observed_managed_bytes,
+                external_source_bytes_removed: false,
+                removed_at: Utc::now(),
+            };
+            receipt.validate()?;
+            write_new_json(
+                &pending_terminal,
+                &receipt,
+                "managed removal terminal receipt",
+            )?;
+            receipt
+        };
+        observe_removal_boundary(RemovalBoundary::TerminalFileSynced)?;
+        fs::rename(&pending_terminal, &terminal).map_err(|source| {
+            StoreError::io(
+                "publish managed removal terminal receipt",
+                &terminal,
+                source,
+            )
+        })?;
+        observe_removal_boundary(RemovalBoundary::TerminalRenamed)?;
+        receipt
+    };
+    // The terminal record becomes durable before the last staging identity
+    // disappears. It is retained, including original accounting and timestamp.
+    sync_directory(operation)?;
+    sync_directory(&removals_root(store))?;
+    observe_removal_boundary(RemovalBoundary::TerminalSynced)?;
+    if path_exists(removing)? {
+        validate_removal_stage(removing, &request.operation_id, true)?;
+        let owner = removing.join(REMOVAL_OWNER_FILE);
+        if path_exists(&owner)? {
+            fs::remove_file(&owner).map_err(|source| {
+                StoreError::io("remove settled managed removal owner", &owner, source)
+            })?;
+        }
+        observe_removal_boundary(RemovalBoundary::OwnerUnlinked)?;
+        fs::remove_dir(removing).map_err(|source| {
+            StoreError::io("remove settled managed removal directory", removing, source)
+        })?;
+    }
+    observe_removal_boundary(RemovalBoundary::DirectoryRemoved)?;
+    sync_directory(&staging_root(store))?;
+    observe_removal_boundary(RemovalBoundary::ParentSynced)?;
+    Ok(receipt)
+}
+
+fn read_removal_terminal(
+    path: &Path,
+    request: &ManagedDocumentsRemovalRequest,
+) -> Result<ManagedDocumentsRemovalReceipt, StoreError> {
+    let receipt: ManagedDocumentsRemovalReceipt = read_json_bounded(
+        path,
+        "managed removal terminal receipt",
+        MAX_RECEIPT_PROJECTION_BYTES,
+    )?;
+    receipt.validate()?;
+    if receipt.activation_id != request.activation_id
+        || receipt.operation_id != request.operation_id
+        || receipt.activated_at != request.activated_at
+        || receipt.materialization_id != request.materialization_id
+        || !digest_equal(&receipt.manifest_sha256, &request.manifest_sha256)
+        || !digest_equal(&receipt.content_sha256, &request.content_sha256)
+        || !digest_equal(&receipt.database_sha256, &request.database_sha256)
+        || receipt.removed_managed_bytes != request.observed_managed_bytes
+    {
+        return Err(StoreError::ManagedDocumentsIdentityMismatch);
+    }
+    Ok(receipt)
+}
+
+fn validate_removal_stage(
+    path: &Path,
+    operation_id: &ManagedRemovalId,
+    terminal: bool,
+) -> Result<(), StoreError> {
+    reject_symlink(path)?;
+    enforce_private_directory(path)?;
+    for entry in fs::read_dir(path)
+        .map_err(|source| StoreError::io("read managed removal stage", path, source))?
+    {
+        let entry = entry
+            .map_err(|source| StoreError::io("read managed removal stage entry", path, source))?;
+        let kind = entry.file_type().map_err(|source| {
+            StoreError::io("inspect managed removal stage entry", &entry.path(), source)
+        })?;
+        if (entry.file_name() == REMOVAL_OWNER_FILE && kind.is_file())
+            || (!terminal && entry.file_name() == REMOVAL_REPRESENTATION_DIRECTORY && kind.is_dir())
+        {
+            continue;
+        }
+        return Err(StoreError::UnsafePath {
+            path: entry.path(),
+            reason: "unexpected or nonregular managed removal stage entry",
+        });
+    }
+    let owner_path = path.join(REMOVAL_OWNER_FILE);
+    if path_exists(&owner_path)? {
+        let owner: ManagedRemovalId =
+            read_json_bounded(&owner_path, "managed removal owner", 1024)?;
+        if owner != *operation_id {
             return Err(StoreError::ManagedDocumentsIdentityMismatch);
         }
-        fs::remove_file(&database).map_err(|error| StoreError::Io {
-            operation: "remove managed documents database",
-            path: database,
-            source: error,
-        })?;
-        sync_directory(path)?;
+    } else if !terminal {
+        return Err(StoreError::RegistryCorrupt(
+            "managed removal stage lacks exact operation owner".to_string(),
+        ));
     }
-    for (name, operation) in [
-        (MANIFEST_FILE, "remove managed documents manifest"),
-        (RECEIPT_FILE, "remove managed documents receipt"),
+    Ok(())
+}
+
+fn finish_removal(path: &Path, journal: &RemovalJournal) -> Result<(), StoreError> {
+    validate_materialization_directory(path, false)?;
+    // Revalidate every surviving owned object before mutating any of it. Missing
+    // objects are legitimate only under this exact retained removal operation.
+    let receipt_path = path.join(RECEIPT_FILE);
+    if path_exists(&receipt_path)? {
+        let receipt: ManagedDocumentsReceipt = read_json_bounded(
+            &receipt_path,
+            "managed documents removal source receipt",
+            MAX_RECEIPT_PROJECTION_BYTES,
+        )?;
+        if receipt != journal.source_receipt {
+            return Err(StoreError::ManagedDocumentsIdentityMismatch);
+        }
+    }
+    for (name, expected) in [
+        (DATABASE_FILE, &journal.request.database_sha256),
+        (MANIFEST_FILE, &journal.request.manifest_sha256),
     ] {
         let target = path.join(name);
         if path_exists(&target)? {
-            fs::remove_file(&target).map_err(|error| StoreError::Io {
-                operation,
-                path: target,
-                source: error,
-            })?;
+            let (_, observed, _) = hash_file(&target)?;
+            if !digest_equal(expected, &observed) {
+                return Err(StoreError::ManagedDocumentsIdentityMismatch);
+            }
         }
     }
-    fs::remove_dir(path).map_err(|error| StoreError::Io {
-        operation: "remove empty managed documents representation",
-        path: path.to_path_buf(),
-        source: error,
-    })
+    make_materialization_writable(path)?;
+    for (name, boundary) in [
+        (DATABASE_FILE, RemovalBoundary::DatabaseUnlinked),
+        (MANIFEST_FILE, RemovalBoundary::ManifestUnlinked),
+        (RECEIPT_FILE, RemovalBoundary::ReceiptUnlinked),
+    ] {
+        let target = path.join(name);
+        if path_exists(&target)? {
+            fs::remove_file(&target).map_err(|source| {
+                StoreError::io("remove exact managed representation file", &target, source)
+            })?;
+        }
+        observe_removal_boundary(boundary)?;
+        sync_directory(path)?;
+    }
+    fs::remove_dir(path)
+        .map_err(|source| StoreError::io("remove empty managed representation", path, source))
 }
 
 fn remove_build_stage(path: &Path) -> Result<(), StoreError> {
@@ -1109,7 +1479,13 @@ fn ensure_layout(store: &ManagedStore) -> Result<(), StoreError> {
     create_private_dir_all(&root)?;
     create_private_dir_all(&active_root(store))?;
     create_private_dir_all(&staging_root(store))?;
-    for directory in [root, active_root(store), staging_root(store)] {
+    create_private_dir_all(&removals_root(store))?;
+    for directory in [
+        root,
+        active_root(store),
+        staging_root(store),
+        removals_root(store),
+    ] {
         reject_symlink(&directory)?;
         enforce_private_directory(&directory)?;
     }
@@ -1126,6 +1502,24 @@ fn active_root(store: &ManagedStore) -> PathBuf {
 
 fn staging_root(store: &ManagedStore) -> PathBuf {
     documents_root(store).join(STAGING_DIRECTORY)
+}
+
+fn removals_root(store: &ManagedStore) -> PathBuf {
+    documents_root(store).join(REMOVALS_DIRECTORY)
+}
+
+fn removing_path(store: &ManagedStore, materialization_id: &ManagedMaterializationId) -> PathBuf {
+    staging_root(store).join(format!(
+        "removing-{}",
+        materialization_key(materialization_id)
+    ))
+}
+
+fn removal_operation_path(store: &ManagedStore, operation_id: &ManagedRemovalId) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(b"managed.documents.removal.v1.operation-key\0");
+    hasher.update(operation_id.as_str().as_bytes());
+    removals_root(store).join(hex::encode(hasher.finalize()))
 }
 
 fn active_path(store: &ManagedStore, materialization_id: &ManagedMaterializationId) -> PathBuf {
@@ -1443,23 +1837,317 @@ mod tests {
         let store = ManagedStore::open(temp.path().join("managed"))?;
         let materialization = fixture_materialization()?;
         let receipt = store.materialize_documents(&materialization)?;
-        let request = ManagedDocumentsRemovalRequest {
-            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-            materialization_id: receipt.materialization_id.clone(),
-            content_sha256: receipt.content_sha256,
-            database_sha256: receipt.database_sha256,
-        };
+        let request = store
+            .plan_managed_documents_removal(&receipt.materialization_id)?
+            .confirmed_request(ManagedRemovalId::new());
         MANAGED_SYNC_FAULT.with(|fault| fault.replace(Some(active_root(&store))));
         let result = store.remove_managed_documents(&request);
         assert!(
             matches!(
                 result,
-                Err(StoreError::ManagedDocumentsCommitted { visible: false, .. })
+                Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
             ),
             "{result:?}"
         );
         assert!(!active_path(&store, &request.materialization_id).exists());
         store.remove_managed_documents(&request)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_removal_boundary_reopens_and_replays_one_exact_terminal_result()
+    -> Result<(), Box<dyn Error>> {
+        let boundaries = [
+            RemovalBoundary::IntentSynced,
+            RemovalBoundary::Hidden,
+            RemovalBoundary::HideSynced,
+            RemovalBoundary::DatabaseUnlinked,
+            RemovalBoundary::ManifestUnlinked,
+            RemovalBoundary::ReceiptUnlinked,
+            RemovalBoundary::RepresentationRemoved,
+            RemovalBoundary::TerminalFileSynced,
+            RemovalBoundary::TerminalRenamed,
+            RemovalBoundary::TerminalSynced,
+            RemovalBoundary::OwnerUnlinked,
+            RemovalBoundary::DirectoryRemoved,
+            RemovalBoundary::ParentSynced,
+        ];
+        for boundary in boundaries {
+            let temporary = tempdir()?;
+            let source = temporary.path().join("original-source.txt");
+            let source_bytes = b"irreplaceable original attachment source";
+            fs::write(&source, source_bytes)?;
+            let root = temporary.path().join("managed");
+            let store = ManagedStore::open(&root)?;
+            let materialization = fixture_materialization()?;
+            let original = store.materialize_documents(&materialization)?;
+            let plan = store.plan_managed_documents_removal(&original.materialization_id)?;
+            let request = plan.confirmed_request(ManagedRemovalId::new());
+            REMOVAL_FAULT.with(|fault| fault.set(Some(boundary)));
+            let failure = store.remove_managed_documents(&request);
+            assert!(
+                matches!(failure,
+                    Err(StoreError::ManagedDocumentsRemovalIncomplete { request: ref admitted, .. })
+                        if admitted.as_ref() == &request
+                ),
+                "{boundary:?}: {failure:?}"
+            );
+            let operation = removal_operation_path(&store, &request.operation_id);
+            let intent_before = fs::read(operation.join(REMOVAL_INTENT_FILE))?;
+            let original_terminal = if path_exists(&operation.join(REMOVAL_TERMINAL_FILE))? {
+                Some(read_removal_terminal(
+                    &operation.join(REMOVAL_TERMINAL_FILE),
+                    &request,
+                )?)
+            } else if path_exists(&operation.join(REMOVAL_TERMINAL_PENDING_FILE))? {
+                Some(read_removal_terminal(
+                    &operation.join(REMOVAL_TERMINAL_PENDING_FILE),
+                    &request,
+                )?)
+            } else {
+                None
+            };
+            let pending = removing_path(&store, &request.materialization_id);
+            if path_exists(&pending)? {
+                assert!(matches!(
+                    store.materialize_documents(&materialization),
+                    Err(StoreError::ManagedDocumentsConflict(_))
+                ));
+            }
+            if boundary != RemovalBoundary::IntentSynced {
+                assert!(matches!(
+                    store.active_managed_document(&request.materialization_id),
+                    Err(StoreError::ManagedDocumentsNotFound(_))
+                ));
+            }
+            drop(store);
+            let reopened = ManagedStore::open(&root)?;
+            let completed = reopened.remove_managed_documents(&request)?;
+            assert_eq!(completed.operation_id, request.operation_id);
+            assert_eq!(completed.activation_id, original.activation_id);
+            assert_eq!(completed.activated_at, original.activated_at);
+            assert_eq!(completed.manifest_sha256, plan.manifest_sha256);
+            assert_eq!(completed.removed_managed_bytes, plan.observed_managed_bytes);
+            assert!(!completed.external_source_bytes_removed);
+            if let Some(retained) = original_terminal {
+                assert_eq!(
+                    completed, retained,
+                    "{boundary:?}: terminal replay changed identity/accounting/time"
+                );
+            }
+            assert_eq!(
+                reopened.remove_managed_documents(&request)?,
+                completed,
+                "{boundary:?}: lost response must replay the retained terminal receipt"
+            );
+            assert_eq!(
+                fs::read(operation.join(REMOVAL_INTENT_FILE))?,
+                intent_before
+            );
+            assert!(!path_exists(&pending)?);
+            assert_eq!(fs::read(&source)?, source_bytes);
+            assert!(reopened.list_active_managed_documents(1)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_rejects_unknown_operations_wrong_identity_and_new_activation()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        let materialization = fixture_materialization()?;
+        let original = store.materialize_documents(&materialization)?;
+        let request = store
+            .plan_managed_documents_removal(&original.materialization_id)?
+            .confirmed_request(ManagedRemovalId::new());
+        let active = active_path(&store, &request.materialization_id);
+        let before = fs::read(active.join(DATABASE_FILE))?;
+        for field in 0..5 {
+            let mut wrong = request.clone();
+            match field {
+                0 => wrong.database_sha256 = "f".repeat(64),
+                1 => wrong.manifest_sha256 = "f".repeat(64),
+                2 => wrong.activated_at += chrono::Duration::seconds(1),
+                3 => wrong.activation_id = ManagedActivationId::new(),
+                _ => wrong.observed_managed_bytes += 1,
+            }
+            assert!(matches!(
+                store.remove_managed_documents(&wrong),
+                Err(StoreError::ManagedDocumentsIdentityMismatch)
+            ));
+            assert_eq!(fs::read(active.join(DATABASE_FILE))?, before);
+            assert!(!path_exists(&removal_operation_path(
+                &store,
+                &wrong.operation_id
+            ))?);
+        }
+        REMOVAL_FAULT.with(|fault| fault.set(Some(RemovalBoundary::Hidden)));
+        assert!(matches!(
+            store.remove_managed_documents(&request),
+            Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
+        ));
+        let hidden = removing_path(&store, &request.materialization_id)
+            .join(REMOVAL_REPRESENTATION_DIRECTORY);
+        let hidden_before = fs::read(hidden.join(DATABASE_FILE))?;
+        let mut unrelated = request.clone();
+        unrelated.operation_id = ManagedRemovalId::new();
+        assert!(matches!(
+            store.remove_managed_documents(&unrelated),
+            Err(StoreError::ManagedDocumentsConflict(_))
+        ));
+        assert!(!path_exists(&removal_operation_path(
+            &store,
+            &unrelated.operation_id
+        ))?);
+        assert_eq!(fs::read(hidden.join(DATABASE_FILE))?, hidden_before);
+        let mut wrong_target = request.clone();
+        wrong_target.materialization_id = ManagedMaterializationId::new();
+        assert!(matches!(
+            store.remove_managed_documents(&wrong_target),
+            Err(StoreError::ManagedDocumentsIdentityMismatch)
+        ));
+        assert_eq!(fs::read(hidden.join(DATABASE_FILE))?, hidden_before);
+        let completed = store.remove_managed_documents(&request)?;
+        let replacement = store.materialize_documents(&materialization)?;
+        assert_ne!(replacement.activation_id, original.activation_id);
+        assert!(matches!(store.remove_managed_documents(&request),
+            Err(StoreError::ManagedDocumentsRemovalIncomplete { source, .. })
+                if matches!(*source, StoreError::ManagedDocumentsConflict(_))));
+        assert_eq!(
+            store
+                .active_managed_document(&replacement.materialization_id)?
+                .activated_at,
+            replacement.activated_at
+        );
+        assert_eq!(fs::read(active.join(DATABASE_FILE))?, before);
+        let fresh = store
+            .plan_managed_documents_removal(&replacement.materialization_id)?
+            .confirmed_request(ManagedRemovalId::new());
+        assert_ne!(
+            store.remove_managed_documents(&fresh)?.operation_id,
+            completed.operation_id
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_preserves_unexpected_entries_symlinks_and_incompatible_intent()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+        for obstruction in 0..3 {
+            let temporary = tempdir()?;
+            let store = ManagedStore::open(temporary.path().join("managed"))?;
+            let source = temporary.path().join("source.txt");
+            fs::write(&source, b"preserved external source")?;
+            let materialization = fixture_materialization()?;
+            let original = store.materialize_documents(&materialization)?;
+            let request = store
+                .plan_managed_documents_removal(&original.materialization_id)?
+                .confirmed_request(ManagedRemovalId::new());
+            REMOVAL_FAULT.with(|fault| fault.set(Some(RemovalBoundary::Hidden)));
+            assert!(matches!(
+                store.remove_managed_documents(&request),
+                Err(StoreError::ManagedDocumentsRemovalIncomplete { .. })
+            ));
+            let hidden = removing_path(&store, &request.materialization_id)
+                .join(REMOVAL_REPRESENTATION_DIRECTORY);
+            let database_before = fs::read(hidden.join(DATABASE_FILE))?;
+            match obstruction {
+                0 => {
+                    fs::write(hidden.join("unexpected.txt"), b"preserve me")?;
+                }
+                1 => {
+                    symlink(&source, hidden.join("unexpected-link"))?;
+                }
+                _ => {
+                    let intent = removal_operation_path(&store, &request.operation_id)
+                        .join(REMOVAL_INTENT_FILE);
+                    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&intent)?)?;
+                    value["schema"] = "incompatible.schema".into();
+                    fs::write(&intent, serde_json::to_vec(&value)?)?;
+                }
+            }
+            assert!(store.remove_managed_documents(&request).is_err());
+            assert_eq!(fs::read(hidden.join(DATABASE_FILE))?, database_before);
+            assert_eq!(fs::read(&source)?, b"preserved external source");
+            if obstruction == 0 {
+                assert_eq!(fs::read(hidden.join("unexpected.txt"))?, b"preserve me");
+            } else if obstruction == 1 {
+                assert_eq!(fs::read_link(hidden.join("unexpected-link"))?, source);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incompatible_activation_receipt_is_rejected_without_rewriting_owned_data()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let root = temporary.path().join("managed");
+        let store = ManagedStore::open(&root)?;
+        let materialization = fixture_materialization()?;
+        let receipt = store.materialize_documents(&materialization)?;
+        let active = active_path(&store, &receipt.materialization_id);
+        let database_before = fs::read(active.join(DATABASE_FILE))?;
+        let path = active.join(RECEIPT_FILE);
+        let mut value = serde_json::to_value(&receipt)?;
+        value
+            .as_object_mut()
+            .ok_or("receipt is not an object")?
+            .remove("activation_id");
+        let incompatible = serde_json::to_vec(&value)?;
+        make_materialization_writable(&active)?;
+        fs::write(&path, &incompatible)?;
+        make_materialization_directory_immutable(&active)?;
+        drop(store);
+        let reopened = ManagedStore::open(&root)?;
+        assert!(reopened.list_active_managed_documents(1).is_err());
+        assert!(
+            reopened
+                .plan_managed_documents_removal(&receipt.materialization_id)
+                .is_err()
+        );
+        assert_eq!(fs::read(path)?, incompatible);
+        assert_eq!(fs::read(active.join(DATABASE_FILE))?, database_before);
+        Ok(())
+    }
+
+    #[test]
+    fn removal_codec_requires_current_operation_generation_and_manifest_identity()
+    -> Result<(), Box<dyn Error>> {
+        let request = ManagedDocumentsRemovalRequest {
+            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+            activation_id: ManagedActivationId::new(),
+            operation_id: ManagedRemovalId::new(),
+            activated_at: Utc::now(),
+            manifest_sha256: "3".repeat(64),
+            observed_managed_bytes: 123,
+            materialization_id: ManagedMaterializationId::new(),
+            content_sha256: "1".repeat(64),
+            database_sha256: "2".repeat(64),
+        };
+        for field in [
+            "activation_id",
+            "operation_id",
+            "activated_at",
+            "manifest_sha256",
+            "observed_managed_bytes",
+        ] {
+            let mut value = serde_json::to_value(&request)?;
+            value
+                .as_object_mut()
+                .ok_or("request is not an object")?
+                .remove(field);
+            assert!(
+                serde_json::from_value::<ManagedDocumentsRemovalRequest>(value).is_err(),
+                "{field} cannot be defaulted from an older ambiguous request"
+            );
+        }
         Ok(())
     }
 
@@ -1496,12 +2184,8 @@ mod tests {
         let plan = store.plan_managed_documents_removal(&materialization.materialization_id)?;
         assert!(!plan.external_source_bytes_removed);
         assert!(plan.requires_exact_confirmation);
-        let removal = store.remove_managed_documents(&ManagedDocumentsRemovalRequest {
-            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-            materialization_id: materialization.materialization_id.clone(),
-            content_sha256: plan.content_sha256,
-            database_sha256: plan.database_sha256,
-        })?;
+        let removal =
+            store.remove_managed_documents(&plan.confirmed_request(ManagedRemovalId::new()))?;
         assert!(!removal.external_source_bytes_removed);
         assert!(removal.removed_managed_bytes > 0);
         assert!(matches!(
@@ -1513,11 +2197,113 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn generic_local_search_filters_actual_purpose_before_the_hit_limit()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let source = temporary.path().join("original.txt");
+        fs::write(&source, b"preserve the canonical source")?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        let mut materialization = fixture_materialization()?;
+        let original = materialization.documents[0].clone();
+        materialization.documents.clear();
+        for (id, local_search) in [
+            ("a-denied", UsePermission::Forbidden),
+            ("b-unknown", UsePermission::Unknown),
+            ("c-allowed", UsePermission::Allowed),
+        ] {
+            let mut document = original.clone();
+            document.document_id = ManagedDocumentId::parse(id)?;
+            document.segments[0].segment_id = ManagedSegmentId::parse(format!("{id}-segment"))?;
+            document.use_policy.local_search = local_search;
+            materialization.documents.push(document);
+        }
+        materialization.refresh_content_sha256()?;
+        materialization.validate()?; // producer policy may legitimately deny local search
+        let receipt = store.materialize_documents(&materialization)?;
+        let database = store
+            .root
+            .join(&receipt.managed_relative_path)
+            .join(DATABASE_FILE);
+        let bytes_before = fs::read(&database)?;
+        let connection = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let matching: i64 = connection.query_row(
+            "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'contemplative'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            matching, 3,
+            "denied source evidence remains stored and indexed"
+        );
+        drop(connection);
+        let request = ManagedDocumentsSearchRequest {
+            schema: MANAGED_DOCUMENTS_SEARCH_SCHEMA.to_string(),
+            materialization_id: receipt.materialization_id,
+            content_sha256: receipt.content_sha256,
+            query: "contemplative".to_string(),
+            max_hits: 1,
+            max_snippet_chars: 256,
+        };
+        let result = store.search_managed_documents(&request)?;
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "filtering must precede LIMIT; a denied hit cannot crowd out allowed evidence"
+        );
+        assert_eq!(result.hits[0].document_id.as_str(), "c-allowed");
+        assert_eq!(
+            result.hits[0]
+                .use_policy
+                .permission_for(RetrievalPurpose::LocalUi),
+            UsePermission::Allowed
+        );
+        assert_eq!(
+            result.hits[0].use_policy.model_context,
+            UsePermission::Unknown
+        );
+        assert_eq!(
+            result.hits[0].use_policy.excerpt_export,
+            UsePermission::Forbidden
+        );
+        for denied in [UsePermission::Forbidden, UsePermission::Unknown] {
+            let mut invalid = result.clone();
+            invalid.hits[0].use_policy.local_search = denied;
+            assert!(
+                invalid.validate(&request).is_err(),
+                "the typed result contract also rejects {denied:?}"
+            );
+        }
+        assert_eq!(fs::read(&database)?, bytes_before);
+        assert_eq!(fs::read(&source)?, b"preserve the canonical source");
+        let mut denied_materialization = materialization.clone();
+        denied_materialization.materialization_id = ManagedMaterializationId::new();
+        denied_materialization.documents.pop();
+        denied_materialization.refresh_content_sha256()?;
+        let denied = store.materialize_documents(&denied_materialization)?;
+        let denied_request = ManagedDocumentsSearchRequest {
+            materialization_id: denied.materialization_id,
+            content_sha256: denied.content_sha256,
+            ..request
+        };
+        assert!(
+            store
+                .search_managed_documents(&denied_request)?
+                .hits
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn active_receipt_enumeration_rejects_overflow_before_opening_entries()
     -> Result<(), Box<dyn Error>> {
         let temporary = tempdir()?;
         let store = ManagedStore::open(temporary.path().join("managed"))?;
-        assert!(store.list_active_managed_documents(1)?.entries.is_empty());
+        assert!(store.list_active_managed_documents(1)?.is_empty());
         let root = active_root(&store);
         fs::create_dir(root.join("first"))?;
         fs::create_dir(root.join("second"))?;
@@ -1585,7 +2371,7 @@ mod tests {
         fs::write(&database, b"corrupted after activation")?;
 
         let listed = store.list_active_managed_documents(8)?;
-        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.len(), 1);
         assert!(
             store
                 .active_managed_document(&materialization.materialization_id)
@@ -1613,12 +2399,10 @@ mod tests {
             Err(StoreError::ManagedDocumentsConflict(_))
         ));
 
-        let stale = ManagedDocumentsRemovalRequest {
-            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
-            materialization_id: materialization.materialization_id,
-            content_sha256: receipt.content_sha256,
-            database_sha256: "f".repeat(64),
-        };
+        let mut stale = store
+            .plan_managed_documents_removal(&receipt.materialization_id)?
+            .confirmed_request(ManagedRemovalId::new());
+        stale.database_sha256 = "f".repeat(64);
         assert!(matches!(
             store.remove_managed_documents(&stale),
             Err(StoreError::ManagedDocumentsIdentityMismatch)
@@ -1671,14 +2455,13 @@ mod tests {
             }
 
             let immediately_visible = store.list_active_managed_documents(8)?;
-            assert!(immediately_visible.complete);
             let expected_visible = usize::from(matches!(
                 boundary,
                 PublishBoundary::ActivationRenamed
                     | PublishBoundary::ActivationHardened
                     | PublishBoundary::ActivationSynced
             ));
-            assert_eq!(immediately_visible.entries.len(), expected_visible);
+            assert_eq!(immediately_visible.len(), expected_visible);
 
             let receipt = store.materialize_documents(&materialization)?;
             assert_eq!(receipt.content_sha256, materialization.content_sha256);
@@ -1694,14 +2477,14 @@ mod tests {
             assert_eq!(store.search_managed_documents(&request)?.hits.len(), 1);
             let reopened = ManagedStore::open(temporary.path().join("managed"))?;
             let listed = reopened.list_active_managed_documents(8)?;
-            assert_eq!(listed.entries.len(), 1);
+            assert_eq!(listed.len(), 1);
             assert_eq!(
-                listed.entries[0].materialization_id,
+                listed[0].materialization_id,
                 materialization.materialization_id
             );
             let projected = reopened.project_active_managed_document(
                 &materialization.materialization_id,
-                MAX_MANIFEST_PROJECTION_BYTES,
+                MAX_MANAGED_MANIFEST_PROJECTION_BYTES,
             )?;
             assert_eq!(projected.content_sha256, materialization.content_sha256);
             assert_eq!(projected.documents[0].title, "Fixture Document");

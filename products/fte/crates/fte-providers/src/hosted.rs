@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use fte_store::SecretResolver;
+use fte_types::SecretResolver;
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendReadiness, BackendRequest, CancelTarget,
     CompletionPrompt, ErrorClass, FinishReason, GatewayBackend, GatewayError, GatewayEvent,
@@ -403,8 +403,10 @@ impl HostedProviderBackend {
     }
 
     fn prepare(&self, request: &BackendRequest) -> Result<PreparedHostedRequest, GatewayError> {
-        if request.request.storage.previous_response_id.is_some()
-            && self.config.protocol != HostedProtocol::OpenAi
+        if (request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some())
+            && (self.config.protocol != HostedProtocol::OpenAi
+                || !matches!(request.request.input, GenerationInput::Chat { .. }))
         {
             return Err(capability_error(
                 &request.request.request_id,
@@ -927,8 +929,22 @@ fn openai_responses_body(request: &BackendRequest) -> Result<Value, GatewayError
         "store".to_string(),
         json!(request.request.storage.store_response),
     );
-    if let Some(previous) = &request.request.storage.previous_response_id {
-        body.insert("previous_response_id".to_string(), json!(previous));
+    match (
+        &request.request.storage.previous_response_id,
+        &request.provider_previous_response_id,
+    ) {
+        (Some(_), Some(previous)) if !previous.is_empty() => {
+            body.insert("previous_response_id".to_string(), json!(previous));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(capability_error(
+                &request.request.request_id,
+                &request.route.backend_id,
+                "provider_continuation_unresolved",
+                "continuation requires the router-resolved upstream response handle",
+            ));
+        }
     }
     insert_openai_responses_sampling(&mut body, request)?;
     insert_openai_responses_tools(&mut body, request)?;
@@ -1102,6 +1118,7 @@ fn completion_prompt_json(
 }
 
 fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     let GenerationInput::Chat { items } = &request.request.input else {
         return Err(capability_error(
             &request.request.request_id,
@@ -1139,20 +1156,32 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                     .collect::<Vec<_>>()
             ),
         );
-        let choice = match request.request.tool_policy.execution {
-            fte_types::ToolExecutionPolicy::Deny => json!({"type":"none"}),
-            fte_types::ToolExecutionPolicy::ClientOnly | fte_types::ToolExecutionPolicy::Ask => {
-                json!({"type":"auto"})
-            }
-            fte_types::ToolExecutionPolicy::AllowGateway => {
+        let mut choice = match &request.request.tool_policy.selection {
+            fte_types::ToolSelection::None => json!({"type":"none"}),
+            fte_types::ToolSelection::Auto => json!({"type":"auto"}),
+            fte_types::ToolSelection::Required => json!({"type":"any"}),
+            fte_types::ToolSelection::Named { name } => json!({"type":"tool","name":name}),
+        };
+        if let Some(disable_parallel) = request
+            .request
+            .provider_extensions
+            .get("anthropic.disable_parallel_tool_use")
+        {
+            if !disable_parallel.is_boolean()
+                || matches!(
+                    request.request.tool_policy.selection,
+                    fte_types::ToolSelection::None
+                )
+            {
                 return Err(capability_error(
                     &request.request.request_id,
                     &request.route.backend_id,
-                    "gateway_tool_execution_not_bound",
-                    "hosted tool execution requires an explicit gateway-owned tool adapter",
+                    "anthropic_parallel_tool_policy_invalid",
+                    "disable_parallel_tool_use needs a boolean and an enabled tool choice",
                 ));
             }
-        };
+            choice["disable_parallel_tool_use"] = disable_parallel.clone();
+        }
         body.insert("tool_choice".to_string(), choice);
     }
     apply_anthropic_cache_breakpoints(
@@ -1167,6 +1196,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             "anthropic.metadata",
             "anthropic.service_tier",
             "anthropic.beta",
+            "anthropic.disable_parallel_tool_use",
         ],
     )?;
     for name in ["thinking", "metadata", "service_tier"] {
@@ -1182,6 +1212,7 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
 }
 
 fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     validate_provider_extensions(
         request,
         &[
@@ -1189,6 +1220,7 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
             "anthropic.metadata",
             "anthropic.service_tier",
             "anthropic.beta",
+            "anthropic.disable_parallel_tool_use",
         ],
     )?;
     let GenerationInput::Chat { items } = &request.request.input else {
@@ -1221,6 +1253,7 @@ fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError>
 }
 
 fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    reject_unbound_tool_execution(request)?;
     let GenerationInput::Chat { items } = &request.request.input else {
         return Err(capability_error(
             &request.request.request_id,
@@ -1261,7 +1294,10 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 }
             }
             fte_types::InputItem::FunctionResult {
-                call_id, output, ..
+                call_id,
+                output,
+                is_error,
+                ..
             } => {
                 let Some(name) = call_names.get(call_id) else {
                     return Err(capability_error(
@@ -1273,7 +1309,7 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 };
                 contents.push(json!({
                     "role":"user",
-                    "parts":[{"functionResponse":{"id":call_id,"name":name,"response":{"content":content_text(output)}}}]
+                    "parts":[{"functionResponse":{"id":call_id,"name":name,"response":{"content":text_only_tool_result(output, *is_error, &request.request.request_id, &request.route.backend_id)?}}}]
                 }));
             }
             fte_types::InputItem::Reasoning {
@@ -1385,24 +1421,30 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             json!([{"functionDeclarations":declarations}]),
         );
         if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
+            if !matches!(
+                request.request.tool_policy.selection,
+                fte_types::ToolSelection::Auto
+            ) {
+                return Err(capability_error(
+                    &request.request.request_id,
+                    &request.route.backend_id,
+                    "tool_policy_ambiguous",
+                    "an explicit provider tool configuration cannot override canonical tool selection",
+                ));
+            }
             body.insert("toolConfig".to_string(), tool_config.clone());
         } else {
-            let mode = match request.request.tool_policy.execution {
-                fte_types::ToolExecutionPolicy::Deny => "NONE",
-                fte_types::ToolExecutionPolicy::ClientOnly
-                | fte_types::ToolExecutionPolicy::Ask => "AUTO",
-                fte_types::ToolExecutionPolicy::AllowGateway => {
-                    return Err(capability_error(
-                        &request.request.request_id,
-                        &request.route.backend_id,
-                        "gateway_tool_execution_not_bound",
-                        "hosted tool execution requires an explicit gateway-owned tool adapter",
-                    ));
+            let config = match &request.request.tool_policy.selection {
+                fte_types::ToolSelection::None => json!({"mode":"NONE"}),
+                fte_types::ToolSelection::Auto => json!({"mode":"AUTO"}),
+                fte_types::ToolSelection::Required => json!({"mode":"ANY"}),
+                fte_types::ToolSelection::Named { name } => {
+                    json!({"mode":"ANY","allowedFunctionNames":[name]})
                 }
             };
             body.insert(
                 "toolConfig".to_string(),
-                json!({"functionCallingConfig":{"mode":mode}}),
+                json!({"functionCallingConfig":config}),
             );
         }
     } else if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
@@ -1490,12 +1532,12 @@ fn openai_input_item(item: &fte_types::InputItem) -> Result<Value, GatewayError>
             id,
             call_id,
             output,
-            ..
+            is_error,
         } => Ok(json!({
             "id":id,
             "type":"function_call_output",
             "call_id":call_id,
-            "output":content_text(output),
+            "output":text_only_tool_result(output, *is_error, &request_id, "openai")?,
         })),
         fte_types::InputItem::Reasoning {
             id,
@@ -1593,9 +1635,9 @@ fn openai_chat_messages(
                 }
             }
             fte_types::InputItem::FunctionResult {
-                call_id, output, ..
+                call_id, output, is_error, ..
             } => messages.push(json!({
-                "role":"tool","tool_call_id":call_id,"content":content_text(output),
+                "role":"tool","tool_call_id":call_id,"content":text_only_tool_result(output, *is_error, request_id, "openai-compatible")?,
             })),
             fte_types::InputItem::Reasoning { .. }
             | fte_types::InputItem::ProviderOpaque { .. } => {
@@ -1644,36 +1686,53 @@ fn anthropic_messages_from_items(
                     .map(anthropic_content)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            fte_types::InputItem::Message { role, content, .. } => messages.push(json!({
-                "role":role_name(*role),
-                "content":content.iter().map(anthropic_content).collect::<Result<Vec<_>,_>>()?
-            })),
+            fte_types::InputItem::Message { role, content, .. } => {
+                append_anthropic_content(
+                    &mut messages,
+                    role_name(*role),
+                    content
+                        .iter()
+                        .map(anthropic_content)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
             fte_types::InputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
                 ..
             } => {
-                let block =
-                    json!({"type":"tool_use","id":call_id,"name":name,"input":arguments});
-                if !append_to_last_role(
-                    &mut messages,
-                    "assistant",
-                    "content",
-                    block.clone(),
-                ) {
-                    messages.push(json!({"role":"assistant","content":[block]}));
-                }
+                let block = json!({"type":"tool_use","id":call_id,"name":name,"input":arguments});
+                append_anthropic_content(&mut messages, "assistant", vec![block]);
             }
             fte_types::InputItem::FunctionResult {
                 call_id,
                 output,
                 is_error,
                 ..
-            } => messages.push(json!({
-                "role":"user",
-                "content":[{"type":"tool_result","tool_use_id":call_id,"content":content_text(output),"is_error":is_error}]
-            })),
+            } => {
+                let content = output
+                    .iter()
+                    .map(|block| match block {
+                        fte_types::ContentBlock::Text { .. }
+                        | fte_types::ContentBlock::Image { .. }
+                        | fte_types::ContentBlock::Document { .. } => anthropic_content(block),
+                        _ => Err(capability_error(
+                            request_id,
+                            "anthropic",
+                            "anthropic_tool_result_content_unsupported",
+                            "Anthropic tool results cannot preserve this canonical content block",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                append_anthropic_content(
+                    &mut messages,
+                    "user",
+                    vec![
+                        json!({"type":"tool_result","tool_use_id":call_id,"content":content,"is_error":is_error}),
+                    ],
+                );
+            }
             fte_types::InputItem::Reasoning {
                 summary,
                 opaque_continuation,
@@ -1683,10 +1742,11 @@ fn anthropic_messages_from_items(
                     && let (Some(Value::String(thinking)), Some(Value::String(signature))) =
                         (opaque.get("thinking"), opaque.get("signature"))
                 {
-                    messages.push(json!({
-                        "role":"assistant",
-                        "content":[{"type":"thinking","thinking":thinking,"signature":signature}]
-                    }));
+                    append_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        vec![json!({"type":"thinking","thinking":thinking,"signature":signature})],
+                    );
                 } else if !summary.is_empty() {
                     return Err(capability_error(
                         request_id,
@@ -1696,8 +1756,9 @@ fn anthropic_messages_from_items(
                     ));
                 }
             }
-            fte_types::InputItem::ProviderOpaque { provider, item }
-                if provider == "anthropic" => messages.push(item.clone()),
+            fte_types::InputItem::ProviderOpaque { provider, item } if provider == "anthropic" => {
+                messages.push(item.clone())
+            }
             fte_types::InputItem::ProviderOpaque { .. } => {
                 return Err(capability_error(
                     request_id,
@@ -1709,6 +1770,14 @@ fn anthropic_messages_from_items(
         }
     }
     Ok((system, messages))
+}
+
+fn append_anthropic_content(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+    for block in content {
+        if !append_to_last_role(messages, role, "content", block.clone()) {
+            messages.push(json!({"role":role,"content":[block]}));
+        }
+    }
 }
 
 fn anthropic_content(block: &fte_types::ContentBlock) -> Result<Value, GatewayError> {
@@ -1867,7 +1936,7 @@ fn insert_openai_responses_tools(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
 ) -> Result<(), GatewayError> {
-    insert_tool_policy(body, request)?;
+    insert_tool_policy(body, request, WireProtocol::OpenAiResponses)?;
     if !request.request.tools.is_empty() {
         body.insert(
             "tools".to_string(),
@@ -1894,7 +1963,7 @@ fn insert_openai_chat_tools(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
 ) -> Result<(), GatewayError> {
-    insert_tool_policy(body, request)?;
+    insert_tool_policy(body, request, WireProtocol::OpenAiChat)?;
     if !request.request.tools.is_empty() {
         body.insert(
             "tools".to_string(),
@@ -1922,26 +1991,40 @@ fn insert_openai_chat_tools(
 fn insert_tool_policy(
     body: &mut Map<String, Value>,
     request: &BackendRequest,
+    protocol: WireProtocol,
 ) -> Result<(), GatewayError> {
+    reject_unbound_tool_execution(request)?;
     if request.request.tools.is_empty() {
         return Ok(());
     }
-    let choice = match request.request.tool_policy.execution {
-        fte_types::ToolExecutionPolicy::Deny => json!("none"),
-        fte_types::ToolExecutionPolicy::ClientOnly | fte_types::ToolExecutionPolicy::Ask => {
-            json!("auto")
+    let choice = match &request.request.tool_policy.selection {
+        fte_types::ToolSelection::None => json!("none"),
+        fte_types::ToolSelection::Auto => json!("auto"),
+        fte_types::ToolSelection::Required => json!("required"),
+        fte_types::ToolSelection::Named { name }
+            if matches!(protocol, WireProtocol::OpenAiChat) =>
+        {
+            json!({"type":"function","function":{"name":name}})
         }
-        fte_types::ToolExecutionPolicy::AllowGateway => {
-            return Err(capability_error(
-                &request.request.request_id,
-                &request.route.backend_id,
-                "gateway_tool_execution_not_bound",
-                "hosted tool execution requires an explicit gateway-owned tool adapter",
-            ));
-        }
+        fte_types::ToolSelection::Named { name } => json!({"type":"function","name":name}),
     };
     body.insert("tool_choice".to_string(), choice);
     Ok(())
+}
+
+fn reject_unbound_tool_execution(request: &BackendRequest) -> Result<(), GatewayError> {
+    if request.request.tool_policy.execution == fte_types::ToolExecutionPolicy::AllowGateway {
+        return Err(capability_error(
+            &request.request.request_id,
+            &request.route.backend_id,
+            "gateway_tool_execution_not_bound",
+            "hosted tool execution requires an explicit gateway-owned tool adapter",
+        ));
+    }
+    request
+        .request
+        .tool_policy
+        .validate_tools(&request.request.tools, &request.request.request_id)
 }
 
 fn anthropic_tools_value(tools: &[fte_types::ToolDefinition]) -> Value {
@@ -2019,6 +2102,14 @@ fn apply_anthropic_cache_breakpoints(
         let root_index = path.next().and_then(|value| value.parse::<usize>().ok());
         let content_marker = path.next();
         let content_index = path.next().and_then(|value| value.parse::<usize>().ok());
+        if path.next().is_some() {
+            return Err(capability_error(
+                request_id,
+                "anthropic",
+                "anthropic_cache_breakpoint_unmappable",
+                "a cache breakpoint path contains trailing coordinates",
+            ));
+        }
         let target = match (root, root_index, content_marker, content_index) {
             ("system", Some(index), None, None) => body
                 .get_mut("system")
@@ -2119,6 +2210,27 @@ fn content_text(content: &[fte_types::ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn text_only_tool_result(
+    content: &[fte_types::ContentBlock],
+    is_error: bool,
+    request_id: &RequestId,
+    provider: &str,
+) -> Result<String, GatewayError> {
+    if is_error
+        || content
+            .iter()
+            .any(|block| !matches!(block, fte_types::ContentBlock::Text { .. }))
+    {
+        return Err(capability_error(
+            request_id,
+            provider,
+            "tool_result_content_unsupported",
+            "this provider tool-result field cannot preserve multimodal content or an explicit error flag",
+        ));
+    }
+    Ok(content_text(content))
 }
 
 struct ProviderJsonRequest {
@@ -3301,6 +3413,7 @@ impl ProviderStreamState {
         let status = groups_status(&output_groups);
         let response = GatewayResponse {
             id: self.response_id,
+            provider_response_id: None,
             request_id: self.request_id.clone(),
             model: self.route.model_id.clone(),
             route: self.route,
@@ -3499,6 +3612,17 @@ fn parse_openai_responses(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
+    let provider_response_id = match value.get("id") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        None => None,
+        _ => {
+            return Err(provider_response_error(
+                request_id,
+                &route.backend_id,
+                "Responses result has an invalid upstream ID",
+            ));
+        }
+    };
     validate_responses_tool_arguments(value)?;
     let output = value
         .get("output")
@@ -3565,6 +3689,7 @@ fn parse_openai_responses(
     }];
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3729,6 +3854,7 @@ fn hosted_response(
 ) -> GatewayResponse {
     GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3783,6 +3909,7 @@ fn parse_anthropic(
     let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: value
             .get("model")
@@ -3903,6 +4030,7 @@ fn parse_gemini(
     let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: route.model_id.clone(),
         route: route.clone(),
@@ -4862,6 +4990,7 @@ mod tests {
 
     fn request(input: GenerationInput) -> BackendRequest {
         BackendRequest {
+            provider_previous_response_id: None,
             request: fte_types::GatewayRequest {
                 request_id: RequestId::new(),
                 client_id: "test".to_string(),
@@ -5018,10 +5147,68 @@ mod tests {
                 arguments: json!({"city":"Boston"}),
             }],
         });
-        request.request.storage.previous_response_id = Some("resp_previous".to_string());
+        request.request.storage.previous_response_id = Some("resp_local_previous".to_string());
+        request.provider_previous_response_id = Some("upstream_previous".to_string());
         let body = openai_responses_body(&request).expect("body");
-        assert_eq!(body["previous_response_id"], "resp_previous");
+        assert_eq!(body["previous_response_id"], "upstream_previous");
         assert_eq!(body["input"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn responses_continuation_requires_resolved_handle_and_preserves_local_identity() {
+        let mut request = request(GenerationInput::Chat { items: vec![] });
+        request.request.storage.previous_response_id = Some("local_B".into());
+        assert_eq!(
+            openai_responses_body(&request)
+                .expect_err("no literal public ID forwarding")
+                .code,
+            "provider_continuation_unresolved"
+        );
+        request.provider_previous_response_id = Some("upstream_A".into());
+        assert_eq!(
+            openai_responses_body(&request).expect("resolved body")["previous_response_id"],
+            "upstream_A"
+        );
+        let response = parse_openai_responses(
+            &json!({"id":"upstream_C","status":"completed","output":[]}),
+            &request.request.request_id,
+            "local_D",
+            request.route.clone(),
+            Some("local_B".into()),
+        )
+        .expect("actual response identity");
+        assert_eq!(response.id, "local_D");
+        assert_eq!(response.provider_response_id.as_deref(), Some("upstream_C"));
+        assert_eq!(response.previous_response_id.as_deref(), Some("local_B"));
+        assert_eq!(response.route, request.route);
+        for id in [json!(null), json!(""), json!(42)] {
+            assert!(
+                parse_openai_responses(
+                    &json!({"id":id,"status":"completed","output":[]}),
+                    &request.request.request_id,
+                    "local_D",
+                    request.route.clone(),
+                    None
+                )
+                .is_err()
+            );
+        }
+        let absent = parse_openai_responses(
+            &json!({"status":"completed","output":[]}),
+            &request.request.request_id,
+            "local_D",
+            request.route.clone(),
+            None,
+        )
+        .expect("generation without continuation");
+        assert!(absent.provider_response_id.is_none());
+        request.request.storage.previous_response_id = None;
+        assert_eq!(
+            openai_responses_body(&request)
+                .expect_err("handle without public lineage")
+                .code,
+            "provider_continuation_unresolved"
+        );
     }
 
     #[test]
@@ -5223,6 +5410,157 @@ mod tests {
             .insert("gemini.cachedContent".to_string(), json!("foreign"));
         let error = anthropic_body(&request).expect_err("foreign extension must fail");
         assert_eq!(error.code, "hosted_provider_extension_unsupported");
+    }
+
+    #[test]
+    fn gemini_tool_selection_and_execution_authority_are_independent() {
+        let mut request = request(GenerationInput::Chat {
+            items: vec![fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::User,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+        });
+        request.request.tools.push(fte_types::ToolDefinition {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: json!({}),
+            strict: false,
+            owner: fte_types::ToolOwner::Client,
+        });
+        for (selection, expected) in [
+            (fte_types::ToolSelection::None, json!({"mode":"NONE"})),
+            (fte_types::ToolSelection::Auto, json!({"mode":"AUTO"})),
+            (fte_types::ToolSelection::Required, json!({"mode":"ANY"})),
+            (
+                fte_types::ToolSelection::Named {
+                    name: "lookup".to_string(),
+                },
+                json!({"mode":"ANY","allowedFunctionNames":["lookup"]}),
+            ),
+        ] {
+            request.request.tool_policy.selection = selection;
+            assert_eq!(
+                gemini_body(&request).expect("Gemini choice")["toolConfig"]["functionCallingConfig"],
+                expected
+            );
+        }
+        request.request.tool_policy.execution = fte_types::ToolExecutionPolicy::AllowGateway;
+        request.request.provider_extensions.insert(
+            "gemini.toolConfig".to_string(),
+            json!({"functionCallingConfig":{"mode":"AUTO"}}),
+        );
+        for result in [
+            gemini_body(&request),
+            anthropic_body(&request),
+            openai_responses_body(&request),
+        ] {
+            assert_eq!(
+                result
+                    .expect_err("provider configuration cannot grant gateway tool execution")
+                    .code,
+                "gateway_tool_execution_not_bound"
+            );
+        }
+    }
+
+    #[test]
+    fn text_only_tool_result_adapters_refuse_media_or_error_flags() {
+        for (output, is_error) in [
+            (
+                vec![fte_types::ContentBlock::Image {
+                    source: fte_types::MediaSource::Bytes {
+                        mime_type: "image/png".to_string(),
+                        data_base64: "AQ==".to_string(),
+                    },
+                    detail: None,
+                }],
+                false,
+            ),
+            (
+                vec![fte_types::ContentBlock::Text {
+                    text: "error".to_string(),
+                }],
+                true,
+            ),
+        ] {
+            let request = request(GenerationInput::Chat {
+                items: vec![
+                    fte_types::InputItem::FunctionCall {
+                        id: None,
+                        call_id: "call_1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: json!({}),
+                    },
+                    fte_types::InputItem::FunctionResult {
+                        id: None,
+                        call_id: "call_1".to_string(),
+                        output,
+                        is_error,
+                    },
+                ],
+            });
+            for result in [
+                openai_responses_body(&request),
+                gemini_body(&request),
+                openai_chat_messages(
+                    match &request.request.input {
+                        GenerationInput::Chat { items } => items,
+                        _ => unreachable!(),
+                    },
+                    &request.request.request_id,
+                )
+                .map(Value::Array),
+            ] {
+                assert_eq!(
+                    result
+                        .expect_err("unsupported tool result must not be projected to text")
+                        .code,
+                    "tool_result_content_unsupported"
+                );
+            }
+            let body =
+                anthropic_body(&request).expect("Anthropic preserves image and error results");
+            assert_eq!(body["messages"][1]["content"][0]["is_error"], is_error);
+            if !is_error {
+                assert_eq!(
+                    body["messages"][1]["content"][0]["content"][0]["source"]["data"],
+                    "AQ=="
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dangling_or_trailing_anthropic_cache_paths_fail_before_dispatch() {
+        for path in ["messages.0.content.99", "messages.0.content.0.trailing"] {
+            let mut request = request(GenerationInput::Chat {
+                items: vec![fte_types::InputItem::Message {
+                    id: None,
+                    role: fte_types::MessageRole::User,
+                    content: vec![fte_types::ContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                }],
+            });
+            request
+                .request
+                .cache
+                .provider_breakpoints
+                .push(fte_types::ProviderCacheBreakpoint {
+                    path: path.to_string(),
+                    ttl: None,
+                });
+            for body in [anthropic_body(&request), anthropic_count_body(&request)] {
+                assert_eq!(
+                    body.expect_err("invalid marker must not be silently ignored")
+                        .code,
+                    "anthropic_cache_breakpoint_unmappable"
+                );
+            }
+        }
     }
 
     #[test]

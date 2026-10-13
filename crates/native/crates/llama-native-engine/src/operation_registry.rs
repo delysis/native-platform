@@ -162,6 +162,14 @@ impl ActiveRequest {
         self.identity.clone()
     }
 
+    pub(crate) fn is_released(&self) -> bool {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            == RequestPhase::Released
+    }
+
     #[must_use]
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RequestSnapshot {
@@ -704,6 +712,10 @@ impl RequestLease {
     }
 
     pub(crate) fn cancel_queued(&self) -> NativeResult<()> {
+        self.reject_queued(RequestTerminalClass::Cancelled)
+    }
+
+    pub(crate) fn reject_queued(&self, class: RequestTerminalClass) -> NativeResult<()> {
         self.registry.require_current(self)?;
         {
             let mut lifecycle = self
@@ -711,11 +723,14 @@ impl RequestLease {
                 .lifecycle
                 .lock()
                 .map_err(|_| registry_error("native request lifecycle is poisoned"))?;
-            if lifecycle.phase != RequestPhase::Queued || lifecycle.terminal.is_some() {
+            if lifecycle.phase != RequestPhase::Queued
+                || lifecycle.terminal.is_some()
+                || class == RequestTerminalClass::Completed
+            {
                 return Err(invalid_transition());
             }
             lifecycle.terminal = Some(RequestTerminal {
-                class: RequestTerminalClass::Cancelled,
+                class,
                 sequence: self.entry.reservation_nonce,
             });
             lifecycle.phase = RequestPhase::Terminal;
@@ -735,6 +750,61 @@ mod tests {
             cancellations: vec![("case".to_owned(), Arc::new(AtomicBool::new(false)))],
             reasoning_forces: vec![("case".to_owned(), Arc::new(AtomicBool::new(false)))],
         }
+    }
+
+    #[test]
+    fn queued_rejection_cannot_complete_or_replace_a_selected_terminal() {
+        let registry = Arc::new(RequestRegistry::new());
+        let (control, lease) = registry
+            .reserve("queued-rejection", RequestClass::Generation, controls())
+            .expect("actual reservation");
+        assert!(lease.reject_queued(RequestTerminalClass::Failed).is_err());
+        assert_eq!(control.snapshot().phase, RequestPhase::Reserved);
+        assert!(control.snapshot().authoritative_terminal.is_none());
+        lease.queued().expect("queued admission");
+        assert!(
+            lease
+                .reject_queued(RequestTerminalClass::Completed)
+                .is_err()
+        );
+        assert_eq!(control.snapshot().phase, RequestPhase::Queued);
+        assert!(control.snapshot().authoritative_terminal.is_none());
+        lease
+            .reject_queued(RequestTerminalClass::Failed)
+            .expect("selected queued failure");
+        assert_eq!(control.cancel_all(), 1);
+        assert!(
+            lease
+                .reject_queued(RequestTerminalClass::Cancelled)
+                .is_err()
+        );
+        assert!(lease.finished(RequestTerminalClass::Completed).is_err());
+        assert!(lease.running().is_err());
+        assert_eq!(control.snapshot().phase, RequestPhase::Terminal);
+        assert_eq!(registry.active_count(), 1);
+        drop(lease);
+        assert_eq!(registry.active_count(), 0);
+        let released = control.snapshot();
+        assert_eq!(released.phase, RequestPhase::Released);
+        assert_eq!(
+            released.authoritative_terminal.expect("terminal").class,
+            RequestTerminalClass::Failed
+        );
+
+        let (running, lease) = registry
+            .reserve("running-rejection", RequestClass::Generation, controls())
+            .expect("independent reservation");
+        lease.queued().expect("queued");
+        lease.running().expect("running");
+        assert!(lease.reject_queued(RequestTerminalClass::Failed).is_err());
+        assert_eq!(running.snapshot().phase, RequestPhase::Running);
+        assert!(running.snapshot().authoritative_terminal.is_none());
+        lease
+            .finished(RequestTerminalClass::Failed)
+            .expect("running owner selects");
+        drop(lease);
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.release_count(), 2);
     }
 
     #[test]

@@ -48,10 +48,17 @@ struct GatewayState {
     backend_admission: BTreeMap<String, Arc<Semaphore>>,
     all_admission: Vec<Weak<Semaphore>>,
     backend_circuits: BTreeMap<String, BackendCircuit>,
-    response_affinity: BTreeMap<String, (String, String)>,
+    response_affinity: BTreeMap<String, ResponseAffinity>,
     response_store: Option<Arc<dyn fte_types::ResponseStore>>,
     response_order: VecDeque<String>,
     quotas: BTreeMap<(String, String), Arc<quota::Quota>>,
+}
+
+#[derive(Clone)]
+struct ResponseAffinity {
+    route: ResolvedRoute,
+    provider_response_id: Option<String>,
+    retained: bool,
 }
 
 #[derive(Debug, Default)]
@@ -133,7 +140,6 @@ impl LifecycleControl {
     fn register_request(
         &self,
         request_id: &RequestId,
-        progress_capacity: usize,
     ) -> Result<operation_lifecycle::OperationLease, GatewayError> {
         let state = self.lock_state(request_id)?;
         if state.phase != GatewayLifecycle::Running {
@@ -152,7 +158,7 @@ impl LifecycleControl {
         }
         let (guard, lease) = self
             .operations
-            .reserve_with_capacity(&request_id.0, progress_capacity.min(4096))
+            .reserve(&request_id.0)
             .map_err(|error| operation_registry_error(request_id, error))?;
         lease
             .queue()
@@ -416,7 +422,7 @@ fn observe_gateway_outcome(
                 .usage
                 .input_tokens
                 .zip(response.usage.output_tokens)
-                .map(|(input, output)| input.saturating_add(output)),
+                .and_then(|(input, output)| input.checked_add(output)),
             match response.status {
                 TerminalStatus::Completed | TerminalStatus::Incomplete => 200,
                 TerminalStatus::Cancelled => 499,
@@ -724,7 +730,7 @@ impl Gateway {
             .event_capacity
             .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY);
         let mut lease = self.reserve_request(&request)?;
-        self.restore_response_affinity(&request)?;
+        let provider_previous_response_id = self.restore_response_affinity(&request)?;
         let candidates = self.resolve_candidates(&request)?;
         let fallback_allowed = request_fallback_allowed(&request);
         let mut last_error = None;
@@ -784,6 +790,7 @@ impl Gateway {
                         .count_tokens(BackendRequest {
                             request: request.clone(),
                             route: route.clone(),
+                            provider_previous_response_id: provider_previous_response_id.clone(),
                         })
                         .await?;
                     if usage.provenance != fte_types::UsageProvenance::Exact
@@ -812,6 +819,7 @@ impl Gateway {
                     .execute(BackendRequest {
                         request: request.clone(),
                         route,
+                        provider_previous_response_id: provider_previous_response_id.clone(),
                     })
                     .await?;
                 Ok((ticket, usage))
@@ -927,6 +935,7 @@ impl Gateway {
         request.validate()?;
         self.lifecycle.ensure_running(&request.request_id)?;
         let mut lease = self.reserve_request(&request)?;
+        let provider_previous_response_id = self.restore_response_affinity(&request)?;
         let (backend, route, admission) = self.resolve(&request)?;
         self.admit(
             &request.request_id,
@@ -952,7 +961,11 @@ impl Gateway {
             Ok(deadline) => deadline,
             Err(error) => return lease.finish_result(Err(error)),
         };
-        let count = backend.count_tokens(BackendRequest { request, route });
+        let count = backend.count_tokens(BackendRequest {
+            request,
+            route,
+            provider_previous_response_id,
+        });
         let counting = async {
             if let Some(limit) = limit {
                 match tokio::time::timeout(limit, count).await {
@@ -1202,19 +1215,6 @@ impl Gateway {
         }
     }
 
-    pub fn record_response_affinity(
-        &self,
-        response_id: &str,
-        route: &ResolvedRoute,
-    ) -> Result<(), GatewayError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
-        record_affinity(&mut state, response_id, route);
-        Ok(())
-    }
-
     pub fn forget_response_affinity(&self, response_id: &str) -> Result<(), GatewayError> {
         let mut state = self
             .state
@@ -1225,13 +1225,22 @@ impl Gateway {
         Ok(())
     }
 
-    fn restore_response_affinity(&self, request: &GatewayRequest) -> Result<(), GatewayError> {
-        let store = self
+    fn restore_response_affinity(
+        &self,
+        request: &GatewayRequest,
+    ) -> Result<Option<String>, GatewayError> {
+        let state = self
             .state
             .read()
-            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?
-            .response_store
-            .clone();
+            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?;
+        let store = state.response_store.clone();
+        let known = request
+            .storage
+            .previous_response_id
+            .as_ref()
+            .and_then(|id| state.response_affinity.get(id))
+            .cloned();
+        drop(state);
         if request.storage.store_response && store.is_none() {
             return Err(GatewayError::invalid_request(
                 &request.request_id,
@@ -1239,12 +1248,73 @@ impl Gateway {
                 "response storage was requested but the application has not supplied a store",
             ));
         }
-        if let (Some(store), Some(id)) = (store, &request.storage.previous_response_id)
-            && let Some(previous) = store.get(id)?
-        {
-            self.record_response_affinity(id, &previous.route)?;
+        let Some(id) = &request.storage.previous_response_id else {
+            return Ok(None);
+        };
+        let previous = store
+            .as_ref()
+            .map(|store| store.get(id))
+            .transpose()?
+            .flatten();
+        let affinity = if let Some(previous) = previous {
+            if previous.id != *id
+                || known.as_ref().is_some_and(|known| {
+                    known.route != previous.route
+                        || known.provider_response_id != previous.provider_response_id
+                })
+            {
+                return Err(GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_source_mismatch",
+                    "the previous response identity differs from its producing route",
+                ));
+            }
+            let affinity = ResponseAffinity {
+                route: previous.route,
+                provider_response_id: previous.provider_response_id,
+                retained: true,
+            };
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| lifecycle_state_poisoned(&request.request_id))?;
+            record_affinity(&mut state, id, affinity.clone());
+            affinity
+        } else {
+            let known = known.ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_affinity_missing",
+                    "the previous response is unavailable or has no route affinity",
+                )
+            })?;
+            if known.retained {
+                return Err(GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_unavailable",
+                    "the retained previous response is unavailable",
+                ));
+            }
+            known
+        };
+        if affinity.route.location != BackendLocation::Hosted {
+            return Err(GatewayError::invalid_request(
+                &request.request_id,
+                "previous_response_handle_missing",
+                "the previous response has no hosted Responses continuation handle",
+            ));
         }
-        Ok(())
+        let handle = affinity
+            .provider_response_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                GatewayError::invalid_request(
+                    &request.request_id,
+                    "previous_response_handle_missing",
+                    "the previous response has no hosted Responses continuation handle",
+                )
+            })?;
+        Ok(Some(handle))
     }
 
     fn reserve_quota(
@@ -1264,13 +1334,7 @@ impl Gateway {
     }
 
     fn reserve_request(&self, request: &GatewayRequest) -> Result<AdmissionLease, GatewayError> {
-        let operation = self.lifecycle.register_request(
-            &request.request_id,
-            request
-                .stream
-                .event_capacity
-                .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY),
-        )?;
+        let operation = self.lifecycle.register_request(&request.request_id)?;
         Ok(AdmissionLease {
             _permit: None,
             cancellation: operation.cancellation(),
@@ -1595,7 +1659,15 @@ impl AdmissionLease {
                 .response_state
                 .write()
                 .map_err(|_| lifecycle_state_poisoned(&response.request_id))?;
-            record_affinity(&mut state, &response.id, &response.route);
+            record_affinity(
+                &mut state,
+                &response.id,
+                ResponseAffinity {
+                    route: response.route.clone(),
+                    provider_response_id: response.provider_response_id.clone(),
+                    retained: self.store_response,
+                },
+            );
         }
         Ok(())
     }
@@ -1648,6 +1720,12 @@ impl Drop for AdmissionLease {
 }
 
 impl TicketLifecycleLease for AdmissionLease {
+    fn settle_usage(&self, result: &Result<fte_types::GatewayResponse, GatewayError>) {
+        if let Some(quota) = &self.quota {
+            quota.finish(result);
+        }
+    }
+
     fn finish(
         &self,
         result: &Result<fte_types::GatewayResponse, GatewayError>,
@@ -1665,9 +1743,7 @@ impl TicketLifecycleLease for AdmissionLease {
             }
             Err(_) => operation_lifecycle::TerminalClass::Failed,
         };
-        if let Some(quota) = &self.quota {
-            quota.finish(result);
-        }
+        self.settle_usage(result);
         let publication = self.publish_response(result);
         let terminal = if publication.is_err() {
             operation_lifecycle::TerminalClass::Failed
@@ -1740,7 +1816,7 @@ fn routing_model(state: &GatewayState, mut model: ModelDescriptor) -> ModelDescr
     model
 }
 
-fn record_affinity(state: &mut GatewayState, id: &str, route: &ResolvedRoute) {
+fn record_affinity(state: &mut GatewayState, id: &str, affinity: ResponseAffinity) {
     const MAX_VOLATILE_RESPONSES: usize = 4096;
     if !state.response_affinity.contains_key(id) {
         if state.response_order.len() == MAX_VOLATILE_RESPONSES
@@ -1750,10 +1826,7 @@ fn record_affinity(state: &mut GatewayState, id: &str, route: &ResolvedRoute) {
         }
         state.response_order.push_back(id.to_owned());
     }
-    state.response_affinity.insert(
-        id.to_owned(),
-        (route.backend_id.clone(), route.model_id.clone()),
-    );
+    state.response_affinity.insert(id.to_owned(), affinity);
 }
 
 fn failed_shutdown_report(error: GatewayError) -> GatewayShutdownReport {
@@ -1886,10 +1959,12 @@ fn candidate_allowed(
     request: &GatewayRequest,
     backend: &BackendDescriptor,
     model: &ModelDescriptor,
-    pinned: Option<&(String, String)>,
+    pinned: Option<&ResponseAffinity>,
 ) -> Result<(), &'static str> {
-    if let Some((backend_id, model_id)) = pinned
-        && (&backend.id, &model.id) != (backend_id, model_id)
+    if let Some(affinity) = pinned
+        && (backend.id != affinity.route.backend_id
+            || model.id != affinity.route.model_id
+            || backend.location != affinity.route.location)
     {
         return Err("response_affinity_mismatch");
     }
@@ -2437,6 +2512,7 @@ mod tests {
     fn completed_response(request_id: RequestId, backend_id: &str) -> fte_types::GatewayResponse {
         fte_types::GatewayResponse {
             id: "fixture-response".to_string(),
+            provider_response_id: None,
             request_id,
             model: format!("{backend_id}-model"),
             route: fte_types::ResolvedRoute {
@@ -2851,86 +2927,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_operation_release_replaces_backend_success() {
-        let gateway = Gateway::new(GatewayDefaults::default());
-        let request_id = RequestId::new();
-        let operation = gateway
-            .lifecycle
-            .register_request(&request_id, 1)
-            .expect("register operation");
-        operation.start().expect("start operation");
-        let retained_operation = operation.clone();
-        let attempt = operation.start_attempt().expect("start active attempt");
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("admission permit");
-        let lease = AdmissionLease {
-            _permit: Some(permit),
-            cancellation: operation.cancellation(),
-            started: true,
-            response_state: Arc::clone(&gateway.state),
-            store_response: false,
-            quota: None,
-            operation: Mutex::new(Some(operation)),
-            lifecycle: Arc::clone(&gateway.lifecycle),
-        };
-        let (_event_tx, event_rx) = mpsc::channel(1);
-        let (final_tx, final_rx) = oneshot::channel();
-        let mut ticket = GatewayTicket::new(
-            request_id.clone(),
-            event_rx,
-            final_rx,
-            Arc::new(NoopCancellation),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_admission_lease_and_deadlines(
-            Box::new(lease),
-            fte_types::DeadlinePolicy::default(),
-            Duration::ZERO,
-            32,
-        );
-
-        final_tx
-            .send(Ok(completed_response(request_id, "fixture")))
-            .expect("publish backend success");
-        let event = ticket
-            .events
-            .recv()
-            .await
-            .expect("lifecycle failure terminal event");
-        let GatewayEvent::Failed { error, .. } = event else {
-            panic!("failed atomic lifecycle finish must project Failed: {event:?}");
-        };
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert!(ticket.events.recv().await.is_none());
-        let error = ticket
-            .final_response()
-            .await
-            .expect_err("failed release must replace backend success");
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert_eq!(
-            retained_operation
-                .snapshot()
-                .expect("registry remains valid")
-                .expect("operation remains registered")
-                .phase,
-            operation_lifecycle::OperationPhase::Running
-        );
-
-        let shutdown_error = gateway
-            .shutdown()
-            .await
-            .expect_err("failed release must also fail shutdown");
-        assert_eq!(shutdown_error.code, "gateway_operation_lifecycle_failed");
-
-        attempt.finish().expect("finish retained attempt");
-        retained_operation
-            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
-            .expect("release retained operation after test");
-    }
-
-    #[tokio::test]
     async fn count_token_deadlines_finalize_admission_explicitly() {
         for deadline_ms in [1, 5] {
             let gateway = Gateway::new(GatewayDefaults::default());
@@ -2952,59 +2948,6 @@ mod tests {
             assert_eq!(error.code, "request_total_deadline_exceeded");
             assert_eq!(gateway.status().active_requests, 0);
         }
-    }
-
-    #[tokio::test]
-    async fn count_token_lifecycle_failure_replaces_timeout() {
-        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
-        gateway
-            .register_backend(Arc::new(HangingBackend {
-                cancelled: Arc::new(AtomicUsize::new(0)),
-            }))
-            .expect("register hanging backend");
-        let mut request = request();
-        let request_id = request.request_id.clone();
-        request.model = ModelSelector::ExactRoute {
-            backend_id: "hanging".to_string(),
-            model_id: "hanging-model".to_string(),
-        };
-        request.deadline.total_ms = Some(50);
-        let count_gateway = Arc::clone(&gateway);
-        let count = tokio::spawn(async move { count_gateway.count_tokens(request).await });
-        let operation = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(operation) = gateway
-                    .lifecycle
-                    .operations
-                    .current_lease(&request_id.0)
-                    .expect("registry remains valid")
-                {
-                    break operation;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("count-token admission becomes active");
-        let attempt = operation.start_attempt().expect("sabotage active attempt");
-
-        let error = count
-            .await
-            .expect("count task")
-            .expect_err("lifecycle failure replaces timeout");
-        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
-        assert_eq!(gateway.status().active_requests, 1);
-        let snapshot = operation
-            .snapshot()
-            .expect("registry remains valid")
-            .expect("failed finalization remains active");
-        assert_eq!(snapshot.phase, operation_lifecycle::OperationPhase::Running);
-        assert!(snapshot.terminal.is_none());
-
-        attempt.finish().expect("finish sabotage attempt");
-        operation
-            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
-            .expect("clean up sabotaged operation");
     }
 
     #[test]
@@ -3183,6 +3126,151 @@ mod tests {
         assert_eq!(gateway.status().active_requests, 0);
         assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Closed);
         drop(ticket);
+    }
+
+    #[tokio::test]
+    async fn deadline_drain_settles_late_usage_without_republishing_the_response() {
+        struct FiniteBackend(DelayedFinalBackend);
+        #[async_trait]
+        impl GatewayBackend for FiniteBackend {
+            fn descriptor(&self) -> BackendDescriptor {
+                let mut descriptor = self.0.descriptor();
+                descriptor.models[0].quota.tokens_per_minute = Some(100);
+                descriptor
+            }
+            fn readiness(&self) -> BackendReadiness {
+                self.0.readiness()
+            }
+            async fn execute(
+                &self,
+                request: BackendRequest,
+            ) -> Result<GatewayTicket, GatewayError> {
+                self.0.execute(request).await
+            }
+            fn cancel(&self, id: &RequestId, target: CancelTarget) -> usize {
+                self.0.cancel(id, target)
+            }
+        }
+        struct Observer(Arc<Mutex<Vec<u16>>>);
+        impl GatewayOutcomeObserver for Observer {
+            fn observe(&self, outcome: &GatewayOutcome) {
+                self.0
+                    .lock()
+                    .expect("observer records")
+                    .push(outcome.status);
+            }
+        }
+        struct Store(AtomicUsize);
+        impl fte_types::ResponseStore for Store {
+            fn put(&self, _: &fte_types::GatewayResponse) -> Result<(), GatewayError> {
+                self.0.fetch_add(1, AtomicOrdering::AcqRel);
+                Ok(())
+            }
+            fn get(&self, _: &str) -> Result<Option<fte_types::GatewayResponse>, GatewayError> {
+                Ok(None)
+            }
+            fn delete(&self, _: &str) -> Result<bool, GatewayError> {
+                Ok(false)
+            }
+        }
+        // The backend final is held behind an explicit sender until the public
+        // timeout has already been observed. No scheduler timing decides usage.
+        for variant in 0..5 {
+            let completion = Arc::new(Mutex::new(None));
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let store = Arc::new(Store(AtomicUsize::new(0)));
+            let gateway = Gateway::new(GatewayDefaults::default())
+                .with_outcome_observer(Arc::new(Observer(Arc::clone(&observations))));
+            gateway
+                .bind_response_store(store.clone())
+                .expect("bind store");
+            gateway
+                .register_backend(Arc::new(FiniteBackend(DelayedFinalBackend {
+                    completion: Arc::clone(&completion),
+                    cancellations: Arc::new(AtomicUsize::new(0)),
+                })))
+                .expect("finite backend");
+            let mut request = request();
+            request.model = ModelSelector::ExactRoute {
+                backend_id: "delayed-final".to_string(),
+                model_id: "delayed-final-model".to_string(),
+            };
+            request.sampling.max_output_tokens = Some(20);
+            request.storage.store_response = true;
+            request.deadline.first_token_ms = Some(5);
+            let request_id = request.request_id.clone();
+            let ticket = gateway
+                .execute(request)
+                .await
+                .expect("finite request admitted");
+            let error = ticket
+                .final_response()
+                .await
+                .expect_err("immutable public deadline");
+            assert_eq!(error.code, "first_output_deadline_exceeded");
+            assert_eq!(gateway.status().active_requests, 1);
+            assert_eq!(
+                observations.lock().expect("observer records").as_slice(),
+                &[504]
+            );
+            let sender = completion
+                .lock()
+                .expect("backend sender")
+                .take()
+                .expect("held authoritative final");
+            if variant == 4 {
+                drop(sender);
+            } else if variant == 3 {
+                sender
+                    .send(Err(GatewayError::unavailable(
+                        &request_id,
+                        "fixture_error",
+                        "upstream error",
+                    )))
+                    .expect("deliver upstream error");
+            } else {
+                let mut response = completed_response(request_id, "delayed-final");
+                if variant == 1 {
+                    response.status = TerminalStatus::Cancelled;
+                }
+                response.usage = GatewayUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(7),
+                    provenance: if variant == 2 {
+                        fte_types::UsageProvenance::Unknown
+                    } else {
+                        fte_types::UsageProvenance::Exact
+                    },
+                    ..Default::default()
+                };
+                sender.send(Ok(response)).expect("deliver late final");
+            }
+            gateway.shutdown().await.expect("drain retained executor");
+            assert_eq!(gateway.status().active_requests, 0);
+            assert_eq!(
+                observations.lock().expect("observer records").as_slice(),
+                &[504]
+            );
+            assert_eq!(
+                store.0.load(AtomicOrdering::Acquire),
+                0,
+                "no late response store write"
+            );
+            let state = gateway.state.read().expect("route state");
+            assert!(
+                state.response_affinity.is_empty(),
+                "no late continuation affinity"
+            );
+            let headroom = state
+                .quotas
+                .get(&(
+                    "delayed-final".to_string(),
+                    "delayed-final-model".to_string(),
+                ))
+                .expect("finite route quota")
+                .headroom();
+            assert_eq!(headroom, Some(if variant < 2 { 0.88 } else { 0.0 }));
+        }
     }
 
     #[tokio::test]

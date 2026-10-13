@@ -44,7 +44,7 @@ fte-providers = { path = "../crates/fte-providers" }
 fte-backend-llama = { path = "../crates/fte-backend-llama" }
 llama-native-host.workspace = true
 llama-native-types.workspace = true
-tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
+tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy" }
 
 [dev-dependencies]
 fte-loopback = { path = "../crates/fte-loopback" }

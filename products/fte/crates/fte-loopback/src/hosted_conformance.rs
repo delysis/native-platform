@@ -19,6 +19,18 @@ async fn hosted_exchange(
     path: &str,
     body: Value,
 ) -> (StatusCode, String) {
+    let (status, text, _) =
+        hosted_exchange_captured(protocol, content_type, bytes, path, body).await;
+    (status, text)
+}
+
+async fn hosted_exchange_captured(
+    protocol: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    path: &str,
+    body: Value,
+) -> (StatusCode, String, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("provider listener");
@@ -27,20 +39,33 @@ async fn hosted_exchange(
         listener.local_addr().expect("hosted conformance fixture")
     );
     let content_type = content_type.to_owned();
-    let provider = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-        let bytes = bytes.clone();
-        let content_type = content_type.clone();
-        async move {
-            if uri.path().ends_with(":countTokens") {
-                (
-                    [(header::CONTENT_TYPE, "application/json".to_string())],
-                    br#"{"totalTokens":4}"#.to_vec(),
-                )
-            } else {
-                ([(header::CONTENT_TYPE, content_type)], bytes)
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_for_provider = Arc::clone(&captured);
+    let provider =
+        axum::Router::new().fallback(move |uri: axum::http::Uri, Json(body): Json<Value>| {
+            let bytes = bytes.clone();
+            let content_type = content_type.clone();
+            let captured = Arc::clone(&captured_for_provider);
+            async move {
+                captured
+                    .lock()
+                    .expect("captured provider requests")
+                    .push(body);
+                if uri.path().ends_with("/count_tokens") {
+                    (
+                        [(header::CONTENT_TYPE, "application/json".to_string())],
+                        br#"{"input_tokens":4}"#.to_vec(),
+                    )
+                } else if uri.path().ends_with(":countTokens") {
+                    (
+                        [(header::CONTENT_TYPE, "application/json".to_string())],
+                        br#"{"totalTokens":4}"#.to_vec(),
+                    )
+                } else {
+                    ([(header::CONTENT_TYPE, content_type)], bytes)
+                }
             }
-        }
-    });
+        });
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         axum::serve(listener, provider)
@@ -58,10 +83,11 @@ async fn hosted_exchange(
         backend_id: "fixture".into(),
         location: BackendLocation::Hosted,
         capabilities: ModelCapabilities {
-            modalities: vec![fte_types::Modality::Text],
+            modalities: vec![fte_types::Modality::Text, fte_types::Modality::Image],
             prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
             streaming: true,
             tools: true,
+            provider_cache: true,
             ..Default::default()
         },
         context_tokens: None,
@@ -77,7 +103,7 @@ async fn hosted_exchange(
     };
     config.endpoints.messages = Some(url.clone());
     config.endpoints.responses = Some(url.clone());
-    config.endpoints.count_tokens = Some(url.clone());
+    config.endpoints.count_tokens = Some(format!("{url}/count_tokens"));
     config.endpoints.completions = Some(url);
     gateway
         .register_backend(Arc::new(
@@ -103,7 +129,8 @@ async fn hosted_exchange(
         .expect("hosted conformance fixture");
     stop.send(()).expect("hosted conformance fixture");
     server.await.expect("hosted conformance fixture");
-    (status, text)
+    let captured = captured.lock().expect("captured provider requests").clone();
+    (status, text, captured)
 }
 
 fn chat_request(stream: bool) -> Value {
@@ -117,6 +144,303 @@ fn sse(values: &[Value]) -> Vec<u8> {
         .collect::<String>();
     text.push_str("data: [DONE]\n\n");
     text.into_bytes()
+}
+
+#[tokio::test]
+async fn public_tool_selection_survives_without_gateway_execution_authority() {
+    for (protocol, path) in [
+        ("chat", "/v1/chat/completions"),
+        ("responses", "/v1/responses"),
+        ("anthropic", "/v1/messages"),
+    ] {
+        for choice in ["omitted", "none", "auto", "required", "named"] {
+            let (mut body, provider) = match protocol {
+                "chat" => (
+                    json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}]}),
+                    json!({"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}),
+                ),
+                "responses" => (
+                    json!({"model":"fixture-model","input":"hello","store":false,"tools":[{"type":"function","name":"lookup","parameters":{}}]}),
+                    json!({"status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":1}}),
+                ),
+                _ => (
+                    json!({"model":"fixture-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"lookup","input_schema":{}}]}),
+                    json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":1}}),
+                ),
+            };
+            let expected = match (protocol, choice) {
+                ("anthropic", "omitted" | "auto") => json!({"type":"auto"}),
+                ("anthropic", "none") => json!({"type":"none"}),
+                ("anthropic", "required") => json!({"type":"any","disable_parallel_tool_use":true}),
+                ("anthropic", "named") => {
+                    json!({"type":"tool","name":"lookup","disable_parallel_tool_use":false})
+                }
+                ("chat", "named") => json!({"type":"function","function":{"name":"lookup"}}),
+                ("responses", "named") => json!({"type":"function","name":"lookup"}),
+                (_, "omitted") => json!("auto"),
+                (_, choice) => json!(choice),
+            };
+            if choice != "omitted" {
+                body["tool_choice"] = expected.clone();
+            }
+            let (status, text, captured) = hosted_exchange_captured(
+                protocol,
+                "application/json",
+                provider.to_string().into_bytes(),
+                path,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{protocol}/{choice}: {text}");
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0]["tool_choice"], expected, "{protocol}/{choice}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_undeclared_tool_choices_fail_before_hosted_dispatch() {
+    for choice in [
+        json!({"anything":"ignored"}),
+        json!({"type":"function","function":{"name":"missing"}}),
+        json!({"type":"function","function":{"name":"lookup","extra":true}}),
+    ] {
+        let (status, text, captured) = hosted_exchange_captured("chat", "application/json", b"{}".to_vec(), "/v1/chat/completions", json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}}],"tool_choice":choice})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(captured.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn anthropic_mixed_history_keeps_order_media_and_cache_targets_in_both_bodies() {
+    let provider = json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":1}});
+    let (status, text, captured) = hosted_exchange_captured(
+        "anthropic", "application/json", provider.to_string().into_bytes(), "/v1/messages",
+        json!({
+            "model":"fixture-model", "max_tokens":16, "stream":true,
+            "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"text","text":"A"},
+                    {"type":"tool_use","id":"call_1","name":"lookup","input":{"n":1}},
+                    {"type":"text","text":"B","cache_control":{"type":"ephemeral","ttl":"1h"}}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"C","cache_control":{"type":"ephemeral"}},
+                    {"type":"tool_use","id":"call_2","name":"lookup","input":{"n":2}},
+                    {"type":"text","text":"D"}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","is_error":true,"cache_control":{"type":"ephemeral"},"content":[
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQ=="}},
+                        {"type":"text","text":"result"}
+                    ]},
+                    {"type":"tool_result","tool_use_id":"call_2","content":"second"},
+                    {"type":"text","text":"E"}
+                ]}
+            ]
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        captured.len(),
+        2,
+        "one count request and one generation request"
+    );
+    assert_eq!(captured[0]["messages"], captured[1]["messages"]);
+    assert_eq!(captured[0]["system"], captured[1]["system"]);
+    for body in &captured {
+        let assistant = body["messages"][0]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(assistant.len(), 6);
+        assert_eq!(assistant[0]["text"], "A");
+        assert_eq!(assistant[1]["id"], "call_1");
+        assert_eq!(assistant[2]["text"], "B");
+        assert_eq!(assistant[2]["cache_control"]["ttl"], "1h");
+        assert_eq!(assistant[3]["text"], "C");
+        assert_eq!(assistant[3]["cache_control"]["ttl"], "5m");
+        assert_eq!(assistant[4]["id"], "call_2");
+        assert_eq!(assistant[5]["text"], "D");
+        let user = body["messages"][1]["content"]
+            .as_array()
+            .expect("user blocks");
+        assert_eq!(user.len(), 3);
+        assert_eq!(user[0]["tool_use_id"], "call_1");
+        assert_eq!(user[0]["is_error"], true);
+        assert_eq!(user[0]["cache_control"]["ttl"], "5m");
+        assert_eq!(user[0]["content"][0]["source"]["data"], "AQ==");
+        assert_eq!(user[0]["content"][1]["text"], "result");
+        assert_eq!(user[1]["tool_use_id"], "call_2");
+        assert_eq!(user[2]["text"], "E");
+    }
+}
+
+#[tokio::test]
+async fn unsupported_known_fields_fail_before_hosted_dispatch() {
+    for (path, body, code) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[{"role":"user","content":"hello","name":"participant"}]}),
+            "chat_participant_name_unsupported",
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"fixture-model","messages":[],"tools":[{"type":"other","function":{"name":"lookup","parameters":{}}}]}),
+            "chat_tool_definition_type_unsupported",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"hello","text":{"verbosity":"high"}}),
+            "responses_text_verbosity_unsupported",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"hello","text":{"format":{"type":"json_schema","name":"answer","description":"must not vanish","schema":{}}}}),
+            "json_schema_description_unsupported",
+        ),
+    ] {
+        let (status, text, captured) =
+            hosted_exchange_captured("responses", "application/json", b"{}".to_vec(), path, body)
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        let error: Value = serde_json::from_str(&text).expect("typed public field error");
+        assert_eq!(error["error"]["code"], code);
+        assert!(
+            captured.is_empty(),
+            "unsupported field reached provider: {captured:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_json_anthropic_stream_never_emits_a_delta_after_block_stop() {
+    let provider = json!({
+        "content":[
+            {"type":"text","text":"answer"},
+            {"type":"thinking","thinking":"check","signature":"sig_exact"},
+            {"type":"tool_use","id":"call_1","name":"lookup","input":{"term":"日本語"}}
+        ],
+        "stop_reason":"tool_use",
+        "usage":{"input_tokens":4,"output_tokens":3}
+    });
+    let (status, text) = hosted_exchange(
+        "anthropic", "application/json", provider.to_string().into_bytes(), "/v1/messages",
+        json!({"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":true}),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let values = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str::<Value>(line).expect("Anthropic SSE JSON"))
+        .collect::<Vec<_>>();
+    let mut stopped = std::collections::BTreeSet::new();
+    let mut deltas = Vec::new();
+    for value in &values {
+        match value["type"].as_str() {
+            Some("content_block_delta") => {
+                let index = value["index"].as_u64().expect("block index");
+                assert!(
+                    !stopped.contains(&index),
+                    "delta after stopped block: {text}"
+                );
+                deltas.push(value["delta"].clone());
+            }
+            Some("content_block_stop") => {
+                assert!(
+                    stopped.insert(value["index"].as_u64().expect("block index")),
+                    "duplicate block stop: {text}"
+                );
+            }
+            Some("error") => panic!("unexpected stream failure: {text}"),
+            _ => {}
+        }
+    }
+    assert_eq!(stopped.len(), 3);
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| delta["text"] == "answer")
+            .count(),
+        1
+    );
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| delta["signature"] == "sig_exact")
+            .count(),
+        1
+    );
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| delta["partial_json"] == "{\"term\":\"日本語\"}"),
+        "{text}"
+    );
+    assert_eq!(
+        values.last().expect("terminal message")["type"],
+        "message_stop"
+    );
+}
+
+#[tokio::test]
+async fn hosted_usage_overflow_has_an_unavailable_public_total() {
+    let provider = json!({"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":u64::MAX,"completion_tokens":1}});
+    for stream in [false, true] {
+        let (status, text) = hosted_exchange(
+            "chat",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/chat/completions",
+            chat_request(stream),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        if stream {
+            let terminal = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value["choices"][0]["finish_reason"] == "stop")
+                .expect("terminal completion frame");
+            assert!(terminal.get("usage").is_none(), "{text}");
+        } else {
+            let value: Value = serde_json::from_str(&text).expect("public JSON response");
+            assert!(value.get("usage").is_none(), "{text}");
+        }
+    }
+    let provider = json!({"status":"completed","output":[],"usage":{"input_tokens":u64::MAX,"output_tokens":1}});
+    let (status, text) = hosted_exchange(
+        "responses",
+        "application/json",
+        provider.to_string().into_bytes(),
+        "/v1/responses",
+        json!({"model":"fixture-model","input":"hello","store":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let response: Value = serde_json::from_str(&text).expect("public response");
+    assert_eq!(response["usage"], Value::Null);
+}
+
+#[tokio::test]
+async fn hosted_responses_reasoning_replay_keeps_the_wire_string() {
+    for encrypted in ["", "opaque_日本語🔒"] {
+        let provider = json!({"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}]});
+        let (status, text, captured) = hosted_exchange_captured(
+            "responses",
+            "application/json",
+            provider.to_string().into_bytes(),
+            "/v1/responses",
+            json!({"model":"fixture-model","input":[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":encrypted}],"store":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["input"][0]["encrypted_content"], encrypted);
+        let value: Value = serde_json::from_str(&text).expect("public reasoning response");
+        assert_eq!(value["output"][0]["encrypted_content"], encrypted);
+    }
 }
 
 #[tokio::test]
@@ -897,4 +1221,342 @@ async fn hosted_anthropic_stream_rejects_alternative_candidates() {
         "{text}"
     );
     assert!(!text.contains("event: message_stop"), "{text}");
+}
+
+// A new Gateway and store binding for each turn; the provider listener remains real HTTP.
+fn continuation_state(
+    url: &str,
+    protocol: &str,
+    store: Arc<dyn fte_types::ResponseStore>,
+) -> AppState {
+    let mut state = tests::regression_state(store);
+    let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+    gateway
+        .bind_response_store(Arc::clone(&state.store))
+        .expect("owned response store");
+    let models = ["fixture-model", "other-model"]
+        .into_iter()
+        .map(|id| ModelDescriptor {
+            id: id.into(),
+            aliases: vec![],
+            display_name: id.into(),
+            backend_id: "fixture".into(),
+            location: BackendLocation::Hosted,
+            capabilities: ModelCapabilities {
+                modalities: vec![fte_types::Modality::Text],
+                prompt_forms: vec![PromptForm::Chat],
+                streaming: true,
+                ..Default::default()
+            },
+            context_tokens: None,
+            max_output_tokens: None,
+            quota: Default::default(),
+            observed: Default::default(),
+        })
+        .collect();
+    let mut config = if protocol == "responses" {
+        HostedProviderConfig::openai("fixture", "Fixture", "fixture", models)
+    } else {
+        HostedProviderConfig::openai_compatible("fixture", "Fixture", "fixture", url, models)
+    };
+    config.endpoints.messages = Some(url.into());
+    config.endpoints.responses = Some(url.into());
+    gateway
+        .register_backend(Arc::new(
+            HostedProviderBackend::new(config, Arc::new(Secrets)).expect("real hosted adapter"),
+        ))
+        .expect("configured route");
+    state.gateway = gateway;
+    state.edge_defaults.privacy = fte_types::PrivacyPolicy::HostedAllowed;
+    state.edge_defaults.profile = fte_types::RouteProfile::Auto;
+    state
+}
+
+fn public_response_value(text: &str, streaming: bool) -> Value {
+    if !streaming {
+        return serde_json::from_str(text).expect("public JSON response");
+    }
+    let events = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect::<Vec<_>>();
+    let completed = events
+        .iter()
+        .filter(|value| value["type"] == "response.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{text}");
+    let response = completed[0]["response"].clone();
+    let created = events
+        .iter()
+        .find(|value| value["type"] == "response.created")
+        .expect("local created identity");
+    assert_eq!(created["response"]["id"], response["id"]);
+    response
+}
+
+async fn continuation_round_trip(streaming: bool, reopen: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("provider listener");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("provider address")
+    );
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let provider_capture = Arc::clone(&captured);
+    let provider = axum::Router::new().fallback(move |Json(body): Json<Value>| {
+        let captured = Arc::clone(&provider_capture);
+        async move {
+            let turn = {
+                let mut requests = captured.lock().expect("actual provider requests");
+                requests.push(body.clone()); requests.len()
+            };
+            let response = json!({"id":format!("upstream_{turn}"),"model":"fixture-model","status":"completed","output":[{"type":"message","id":format!("msg_{turn}"),"role":"assistant","content":[{"type":"output_text","text":format!("turn {turn}")}]}],"usage":{"input_tokens":4,"output_tokens":2}});
+            if body["stream"] == true {
+                ([(header::CONTENT_TYPE,"text/event-stream")], sse(&[json!({"type":"response.completed","response":response})]))
+            } else {
+                ([(header::CONTENT_TYPE,"application/json")], response.to_string().into_bytes())
+            }
+        }
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, provider)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .expect("provider fixture");
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "fte-continuation-{}",
+        fte_types::RequestId::new().0
+    ));
+    std::fs::create_dir(&directory).expect("owned store directory");
+    let path = directory.join("responses.sqlite");
+    let store = Arc::new(SqliteStore::open(&path).expect("fresh response store"));
+    let state = continuation_state(&url, "responses", store);
+    let first = router(state.clone(), 8192)
+        .oneshot(tests::http_request(
+            "/v1/responses",
+            json!({"model":"fixture-model","input":"first","store":true,"stream":streaming}),
+        ))
+        .await
+        .expect("first public response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = public_response_value(&tests::response_body(first).await, streaming);
+    let local_id = first["id"].as_str().expect("local public ID").to_owned();
+    assert_ne!(local_id, "upstream_1");
+    assert!(first.get("provider_response_id").is_none());
+    let state = if reopen {
+        state
+            .gateway
+            .shutdown()
+            .await
+            .expect("first gateway drained");
+        drop(state);
+        // Reusing the same route IDs with a Chat adapter does not authorize
+        // forwarding an existing Responses handle to that protocol.
+        let chat = continuation_state(
+            &url,
+            "chat",
+            Arc::new(SqliteStore::open(&path).expect("store for changed adapter")),
+        );
+        let rejected = router(chat.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"changed adapter","store":false,"previous_response_id":local_id}))).await.expect("changed adapter refusal");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_str(&tests::response_body(rejected).await).expect("adapter error");
+        assert_eq!(error["error"]["code"], "provider_continuation_unsupported");
+        assert_eq!(
+            captured.lock().expect("no changed adapter dispatch").len(),
+            1
+        );
+        chat.gateway
+            .shutdown()
+            .await
+            .expect("changed adapter drained");
+        drop(chat);
+        continuation_state(
+            &url,
+            "responses",
+            Arc::new(SqliteStore::open(&path).expect("current response store reopened")),
+        )
+    } else {
+        state
+    };
+    let second = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"second","store":true,"previous_response_id":local_id,"stream":streaming}))).await.expect("second public response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = public_response_value(&tests::response_body(second).await, streaming);
+    assert_eq!(second["previous_response_id"], local_id);
+    assert_ne!(second["id"], "upstream_2");
+    assert!(second.get("provider_response_id").is_none());
+    {
+        let requests = captured.lock().expect("captured two turns");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["previous_response_id"], "upstream_1");
+        assert_eq!(requests[1]["model"], "fixture-model");
+    }
+    // IDs from provider traffic are never local continuation authority.
+    for body in [
+        json!({"model":"fixture-model","input":"unknown","store":false,"previous_response_id":"upstream_1"}),
+        json!({"model":"other-model","input":"route drift","store":false,"previous_response_id":local_id}),
+        json!({"model":"fixture-model","input":"forged","store":false,"provider_previous_response_id":"upstream_1"}),
+    ] {
+        let result = router(state.clone(), 8192)
+            .oneshot(tests::http_request("/v1/responses", body))
+            .await
+            .expect("rejected public continuation");
+        assert!(!result.status().is_success());
+        let _ = tests::response_body(result).await;
+        assert_eq!(captured.lock().expect("no rejected dispatch").len(), 2);
+    }
+    // Even if another current stored record carries the same local ID,
+    // its route cannot replace the already witnessed producing owner.
+    let original = state
+        .store
+        .get(&local_id)
+        .expect("stored owner")
+        .expect("retained response");
+    for backend in [false, true] {
+        let mut wrong = original.clone();
+        if backend {
+            wrong.route.backend_id = "wrong-backend".into();
+        } else {
+            wrong.route.model_id = "other-model".into();
+        }
+        state.store.put(&wrong).expect("wrong-owner fixture");
+        let response = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"auto","input":"changed owner","store":false,"previous_response_id":local_id}))).await.expect("source identity refusal");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value =
+            serde_json::from_str(&tests::response_body(response).await).expect("source error");
+        assert_eq!(value["error"]["code"], "previous_response_source_mismatch");
+        assert_eq!(captured.lock().expect("no wrong-owner dispatch").len(), 2);
+    }
+    state
+        .store
+        .put(&original)
+        .expect("restore exact fixture owner");
+    // Retained storage deletion must invalidate the still-cached handle.
+    assert!(
+        state
+            .store
+            .delete(&local_id)
+            .expect("delete retained fixture")
+    );
+    let deleted = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"deleted","store":false,"previous_response_id":local_id}))).await.expect("deleted continuation refusal");
+    assert_eq!(deleted.status(), StatusCode::BAD_REQUEST);
+    let value: Value =
+        serde_json::from_str(&tests::response_body(deleted).await).expect("deleted error");
+    assert_eq!(value["error"]["code"], "previous_response_unavailable");
+    assert_eq!(captured.lock().expect("no deleted dispatch").len(), 2);
+    state.gateway.shutdown().await.expect("gateway drained");
+    drop(state);
+    stop.send(()).expect("stop fixture");
+    server.await.expect("fixture joined");
+    std::fs::remove_dir_all(directory).expect("remove owned store files");
+}
+
+#[tokio::test]
+async fn hosted_continuation_json_in_process() {
+    continuation_round_trip(false, false).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_json_after_reopen() {
+    continuation_round_trip(false, true).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_stream_in_process() {
+    continuation_round_trip(true, false).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_stream_after_reopen() {
+    continuation_round_trip(true, true).await;
+}
+
+#[tokio::test]
+async fn hosted_continuation_refuses_missing_and_chat_handles_before_dispatch() {
+    for protocol in ["responses", "chat"] {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("provider address")
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&calls);
+        let provider = axum::Router::new().fallback(move || {
+            let calls = Arc::clone(&provider_calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                // A Chat completion ID must never become a Responses handle.
+                Json(if protocol == "chat" {
+                    json!({"id":"chatcmpl_upstream","choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2}})
+                } else {
+                    json!({"status":"completed","output":[],"usage":{"input_tokens":4,"output_tokens":2}})
+                })
+            }
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("provider fixture");
+        });
+        let state = continuation_state(
+            &url,
+            protocol,
+            Arc::new(SqliteStore::in_memory().expect("store")),
+        );
+        let first = router(state.clone(), 8192)
+            .oneshot(tests::http_request(
+                "/v1/responses",
+                json!({"model":"fixture-model","input":"first","store":true}),
+            ))
+            .await
+            .expect("first public response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = public_response_value(&tests::response_body(first).await, false);
+        let result = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"fixture-model","input":"second","store":false,"previous_response_id":first["id"]}))).await.expect("missing handle refusal");
+        assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+        let result: Value =
+            serde_json::from_str(&tests::response_body(result).await).expect("error response");
+        assert_eq!(result["error"]["code"], "previous_response_handle_missing");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        state.gateway.shutdown().await.expect("gateway drained");
+        stop.send(()).expect("stop fixture");
+        server.await.expect("fixture joined");
+    }
+}
+
+#[tokio::test]
+async fn native_continuation_requires_explicit_items_without_a_provider_handle() {
+    let state = tests::regression_state(Arc::new(SqliteStore::in_memory().expect("native store")));
+    let first = router(state.clone(), 8192)
+        .oneshot(tests::http_request(
+            "/v1/responses",
+            json!({"model":"test-model","input":"first","store":true}),
+        ))
+        .await
+        .expect("native first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = public_response_value(&tests::response_body(first).await, false);
+    let result = router(state.clone(), 8192).oneshot(tests::http_request("/v1/responses", json!({"model":"test-model","input":"second","store":false,"previous_response_id":first["id"]}))).await.expect("native continuation refusal");
+    assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+    let result: Value =
+        serde_json::from_str(&tests::response_body(result).await).expect("native error");
+    assert_eq!(result["error"]["code"], "previous_response_handle_missing");
+    state
+        .gateway
+        .shutdown()
+        .await
+        .expect("native gateway drained");
 }

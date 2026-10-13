@@ -75,15 +75,6 @@ impl LlamaNativeBackend {
         }
     }
 
-    /// Compatibility spelling for [`Self::new_borrowed`].
-    ///
-    /// The supplied host is borrowed; this adapter never owns native-host
-    /// process shutdown authority.
-    #[must_use]
-    pub fn new(host: Arc<NativeHost>) -> Self {
-        Self::new_borrowed(host)
-    }
-
     /// Rebinds the gateway to a product-owned host and its complete configured
     /// model set. Requests already admitted keep their previous host alive;
     /// later requests see the host and model registry as one atomic snapshot.
@@ -594,7 +585,9 @@ impl GatewayBackend for LlamaNativeBackend {
 
     async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
         let request_id = request.request.request_id.clone();
-        if request.request.storage.previous_response_id.is_some() {
+        if request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some()
+        {
             return Err(GatewayError::invalid_request(
                 &request_id,
                 "native_continuation_unsupported",
@@ -936,6 +929,15 @@ impl GatewayBackend for LlamaNativeBackend {
 
     async fn count_tokens(&self, request: BackendRequest) -> Result<GatewayUsage, GatewayError> {
         let request_id = request.request.request_id.clone();
+        if request.request.storage.previous_response_id.is_some()
+            || request.provider_previous_response_id.is_some()
+        {
+            return Err(GatewayError::invalid_request(
+                &request_id,
+                "native_continuation_unsupported",
+                "local conversation continuation requires explicit message items",
+            ));
+        }
         let input = translate_input(&request.request.input, &request_id)?;
         let (host, config, operation) =
             self.admit_request_configuration(&request.route.model_id, &request_id)?;
@@ -1246,6 +1248,7 @@ fn build_response(
     };
     Ok(GatewayResponse {
         id: response_id.to_string(),
+        provider_response_id: None,
         request_id: request_id.clone(),
         model: route.model_id.clone(),
         route,
@@ -1811,7 +1814,7 @@ mod tests {
     #[test]
     fn product_host_reconfiguration_replaces_host_and_models_atomically() {
         let first_host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let backend = LlamaNativeBackend::new(Arc::clone(&first_host));
+        let backend = LlamaNativeBackend::new_borrowed(Arc::clone(&first_host));
         backend
             .replace_configuration(
                 Arc::clone(&first_host),

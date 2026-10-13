@@ -9,7 +9,6 @@ pub mod configuration;
 mod documents;
 pub mod lifecycle;
 pub mod persistence;
-pub mod reconciliation;
 pub mod worker;
 pub mod workspace;
 #[cfg(test)]
