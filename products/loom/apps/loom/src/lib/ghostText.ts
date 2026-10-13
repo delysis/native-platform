@@ -192,6 +192,36 @@ export function ghostRollbackTextIsExactAtSelection(
     state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') === plan.unconsumeText;
 }
 
+export function dispatchGhostRollback(
+  view: EditorView,
+  plan: GhostTextPlan,
+  rollbackStart: number,
+  rollbackEnd: number
+): void {
+  const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
+  const anchorByteOffset = plan.anchorByteOffset - removedBytes;
+  if (rollbackStart < 0 || anchorByteOffset < 0) return;
+  view.dispatch(view.state.tr
+    .delete(rollbackStart, rollbackEnd)
+    .setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: {
+        active: true,
+        candidateId: plan.candidateId,
+        presentationKey: `${plan.presentationKey}:rollback:${removedBytes}`,
+        surfaceKey: plan.surfaceKey,
+        anchorByteOffset,
+        text: `${plan.unconsumeText}${plan.text}`,
+        insertsOnAccept: true,
+        alternatives: plan.alternatives,
+        hidden: plan.hidden,
+        unconsumeText: '',
+        fanVisible: plan.fanVisible,
+        fanPinned: plan.fanPinned
+      }
+    } satisfies GhostTextMeta));
+}
+
 interface FlattenedTextCaret {
   text: string;
   offset: number;
@@ -920,28 +950,7 @@ export function createGhostTextPlugin(
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
-            const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
-            const anchorByteOffset = plan.anchorByteOffset - removedBytes;
-            if (anchorByteOffset < 0) return false;
-            view.dispatch(view.state.tr
-              .delete(rollbackStart, rollbackEnd)
-              .setMeta(ghostTextPluginKey, {
-                kind: 'set',
-                presentation: {
-                  active: true,
-                  candidateId: plan.candidateId,
-                  presentationKey: `${plan.presentationKey}:rollback:${removedBytes}`,
-                  surfaceKey: plan.surfaceKey,
-                  anchorByteOffset,
-                  text: `${plan.unconsumeText}${plan.text}`,
-                  insertsOnAccept: true,
-                  alternatives: plan.alternatives,
-                  hidden: plan.hidden,
-                  unconsumeText: '',
-                  fanVisible: plan.fanVisible,
-                  fanPinned: plan.fanPinned
-                }
-              } satisfies GhostTextMeta));
+            dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
             return true;
           }
         }

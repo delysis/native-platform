@@ -25,6 +25,7 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
+    dispatchGhostRollback,
     ghostRollbackTextIsExactAtSelection,
     setGhostFanPinned,
     setGhostText,
@@ -1223,6 +1224,35 @@
       !event.metaKey &&
       !event.ctrlKey
     );
+    if (
+      event.key === 'ArrowLeft' &&
+      event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      view
+    ) {
+      const plan = currentGhostTextPlan(view.state);
+      const rollbackEnd = view.state.selection.from;
+      const rollbackStart = plan?.unconsumeText
+        ? rollbackEnd - plan.unconsumeText.length
+        : -1;
+      if (
+        plan?.unconsumeText &&
+        exactCompletionRollback(
+          plan.candidateId,
+          plan.presentationKey,
+          plan.anchorByteOffset,
+          plan.unconsumeText,
+          rollbackStart,
+          rollbackEnd
+        ) &&
+        authorizeCompletionReversal(plan.candidateId, plan.presentationKey, plan.unconsumeText)
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        dispatchGhostRollback(view, plan, rollbackStart, rollbackEnd);
+      }
+    }
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
