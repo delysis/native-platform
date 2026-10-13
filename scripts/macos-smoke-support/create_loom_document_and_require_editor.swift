@@ -196,6 +196,17 @@ guard let afterDocumentId, let editor = manuscriptEditor() else {
     exit(1)
 }
 
+// The new identity is published before the async menu handler completes its
+// final editor-focus handoff. Wait for that bounded handoff rather than racing
+// the first system key against an otherwise valid navigation.
+Thread.sleep(forTimeInterval: 3)
+runningApplication.activate(options: [.activateAllWindows])
+_ = AXUIElementSetAttributeValue(
+    application,
+    kAXFrontmostAttribute as CFString,
+    kCFBooleanTrue
+)
+
 // WebKit can retain the contenteditable keyboard target while AX continues to
 // name the containing web area until the first edit. Probe that real target
 // without relying on a focus-attribute echo, then restore the untouched new
