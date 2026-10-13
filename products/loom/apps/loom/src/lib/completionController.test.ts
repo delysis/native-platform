@@ -81,7 +81,7 @@ describe('pure completion controller', () => {
     expect(view.unconsumeText).toBe(' one ');
     expect(state.session?.candidates).toBe(first.state.session?.candidates);
     const undo = authorizeCompletionUnconsume(state, {
-      eligible: view.selected, candidateId: view.selected!.candidateId,
+      contextKey, eligible: view.selected, candidateId: view.selected!.candidateId,
       presentationKey: view.selected!.presentationKey, text: view.unconsumeText,
       manuscriptText: 'Hello one '
     });
@@ -216,7 +216,7 @@ describe('pure completion controller', () => {
     expect(rollback.selected).toMatchObject({ runId: 'run-a', text: '' });
     expect(rollback.unconsumeText).toBe(' one ');
     const undo = authorizeCompletionUnconsume(rejected, {
-      eligible: rollback.selected, candidateId: rollback.selected!.candidateId,
+      contextKey, eligible: rollback.selected, candidateId: rollback.selected!.candidateId,
       presentationKey: rollback.selected!.presentationKey, text: rollback.unconsumeText,
       manuscriptText: 'Hello one '
     });
@@ -301,6 +301,7 @@ describe('pure completion controller', () => {
     expect(view.selected).toMatchObject({ text: 'two', targetByte: 10 });
     expect(view.unconsumeText).toBe(' one ');
     const reversed = authorizeCompletionUnconsume(projected.state, {
+      contextKey,
       eligible: view.selected,
       candidateId: view.selected!.candidateId,
       presentationKey: view.selected!.presentationKey,
@@ -373,12 +374,30 @@ describe('pure completion controller', () => {
     });
     expect(view.unconsumeText).toBe(family[0].text);
     const reversed = authorizeCompletionUnconsume(state, {
-      eligible: view.selected, candidateId: view.selected!.candidateId,
+      contextKey, eligible: view.selected, candidateId: view.selected!.candidateId,
       presentationKey: view.selected!.presentationKey, text: view.unconsumeText,
       manuscriptText: accepted
     });
     expect(reversed.authorized).toBe(true);
     expect(reversed.state.pendingText).toBe(manuscript);
+    const laggedProjection = authorizeCompletionUnconsume(state, {
+      contextKey,
+      eligible: null,
+      candidateId: view.selected!.candidateId,
+      presentationKey: view.selected!.presentationKey,
+      text: view.unconsumeText,
+      manuscriptText: accepted
+    });
+    expect(laggedProjection.authorized).toBe(true);
+    expect(laggedProjection.state.pendingText).toBe(manuscript);
+    expect(authorizeCompletionUnconsume(state, {
+      contextKey: 'another-context',
+      eligible: null,
+      candidateId: view.selected!.candidateId,
+      presentationKey: view.selected!.presentationKey,
+      text: view.unconsumeText,
+      manuscriptText: accepted
+    }).authorized).toBe(false);
     expect(completionControllerView(reversed.state, contextKey, []).selected).toBeNull();
     expect(completionControllerView(state, 'another-context', []).selected).toBeNull();
     const restored = observeTextMutation(reversed.state, manuscript, accepted, false).state;

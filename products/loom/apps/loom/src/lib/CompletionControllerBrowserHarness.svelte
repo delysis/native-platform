@@ -100,7 +100,7 @@
 
   function unconsume(candidateId: string, presentationKey: string, text: string): boolean {
     const authorization = authorizeCompletionUnconsume(controller, {
-      eligible: selected, candidateId, presentationKey, text, manuscriptText: markdown
+      contextKey, eligible: selected, candidateId, presentationKey, text, manuscriptText: markdown
     });
     controller = authorization.state;
     return authorization.authorized;

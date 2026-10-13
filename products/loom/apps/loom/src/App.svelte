@@ -8468,6 +8468,7 @@
     text: string
   ): boolean {
     const authorization = authorizeCompletionUnconsume(completionController, {
+      contextKey: completionContextKey,
       eligible: eligibleGhostForCurrentMode(),
       candidateId,
       presentationKey,

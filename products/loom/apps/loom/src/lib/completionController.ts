@@ -490,6 +490,7 @@ export function authorizeCompletionInsertion(
 }
 
 export interface CompletionUnconsumeInput {
+  contextKey: string;
   eligible: InlineGhostSuggestion | null;
   candidateId: string;
   presentationKey: string;
@@ -501,9 +502,20 @@ export function authorizeCompletionUnconsume(
   state: CompletionControllerState,
   input: CompletionUnconsumeInput
 ): CompletionAuthorization {
-  const eligible = input.eligible;
+  const sessionPresentation = state.session?.contextKey === input.contextKey
+    ? completionPresentation(state.session)
+    : null;
+  const projected = input.eligible;
+  const eligible = projected?.candidateId === input.candidateId &&
+    projected.presentationKey === input.presentationKey
+    ? projected
+    : sessionPresentation?.candidateId === input.candidateId &&
+        sessionPresentation.presentationKey === input.presentationKey
+      ? sessionPresentation
+      : null;
   if (
     !state.session ||
+    state.session.contextKey !== input.contextKey ||
     !eligible ||
     eligible.candidateId !== input.candidateId ||
     eligible.presentationKey !== input.presentationKey ||

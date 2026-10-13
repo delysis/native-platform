@@ -52,7 +52,7 @@ it('continues the same Ghost stream after accepting a word without changing acce
   const view = completionControllerView(next, contextKey, []);
   assert(view.selected);
   const reverse = authorizeCompletionUnconsume(next, {
-    eligible: view.selected, candidateId: view.selected.candidateId,
+    contextKey, eligible: view.selected, candidateId: view.selected.candidateId,
     presentationKey: view.selected.presentationKey, text: ' one', manuscriptText: 'Hello one'
   });
   assert.equal(reverse.authorized, true);
