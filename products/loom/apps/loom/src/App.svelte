@@ -8509,7 +8509,10 @@
       session_context_matches: completionController.session?.contextKey === completionContextKey,
       promotion_ready: branchPromotionReady, family_count: activeSuggestionFamily.length
     } });
-    if (authorization.authorized) setNativeCompletionReversalArm(true);
+    if (authorization.authorized) {
+      setNativeCompletionReversalArm(true);
+      if (desktop) void getCurrentWindow().setFocus().catch(recordFailure);
+    }
     completionController = authorization.state;
     return authorization.authorized;
   }

@@ -20,7 +20,8 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, handler: 
 } }));
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({
   onFocusChanged: async () => () => {}, onDragDropEvent: async () => () => {},
-  onResized: async () => () => {}, isFullscreen: async () => false, setTitle: async () => {}
+  onResized: async () => () => {}, isFullscreen: async () => false, setTitle: async () => {},
+  setFocus: async () => {}
 }) }));
 import App from '../App.svelte';
 import { getPreferences } from './ipc';
