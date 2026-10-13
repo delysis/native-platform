@@ -331,8 +331,8 @@
     from: number,
     to: number
   ): boolean {
-    if (!view || from < 0 || to !== view.state.selection.from ||
-        selectionBoundary(view.state) !== anchorByteOffset) return false;
+    if (!view || from < 0 || !view.state.selection.empty ||
+        to !== view.state.selection.from) return false;
     const expected = removeBeforeUtf8Boundary(lastEmitted, anchorByteOffset, text);
     if (expected === null) return false;
     try {
