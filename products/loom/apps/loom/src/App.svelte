@@ -7413,24 +7413,20 @@
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
           showMainPane();
           await tick();
-          await waitForWritingSurfacePaint();
-          if (
-            applicationClosePhase === 'running' &&
-            requestSerial === navigationSerial &&
-            projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
-            document?.summary.document_id === target.documentId
-          ) {
-            // A native menu action can leave the NSWindow active while WebKit
-            // still refuses DOM focus. Reassert the native window before
-            // handing focus to the newly mounted editor.
+          // A native menu action and the document-identity remount can each
+          // reclaim focus on adjacent run-loop turns. Rebind the exact window
+          // and editor together across those bounded turns.
+          for (let focusAttempt = 0; focusAttempt < 3; focusAttempt += 1) {
+            if (
+              applicationClosePhase !== 'running' ||
+              requestSerial !== navigationSerial ||
+              !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) ||
+              document?.summary.document_id !== target.documentId
+            ) break;
             if (desktop) {
               try { await getCurrentWindow().setFocus(); }
-              catch (error) { recordFailure(error); }
+              catch (error) { recordFailure(error); break; }
             }
-            focusCurrentWritingSurfaceAtEnd();
-            // A document identity swap can remount the active editor after
-            // the first painted frame. Restore the caret once more after that
-            // remount instead of leaving focus on the menu command.
             await waitForWritingSurfacePaint();
             if (
               applicationClosePhase === 'running' &&
