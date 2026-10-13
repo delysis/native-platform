@@ -7351,12 +7351,25 @@
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
           showMainPane();
           await tick();
+          await waitForWritingSurfacePaint();
           if (
             applicationClosePhase === 'running' &&
             requestSerial === navigationSerial &&
             projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
             document?.summary.document_id === target.documentId
-          ) focusCurrentWritingSurfaceAtEnd();
+          ) {
+            focusCurrentWritingSurfaceAtEnd();
+            // A document identity swap can remount the active editor after
+            // the first painted frame. Restore the caret once more after that
+            // remount instead of leaving focus on the menu command.
+            await waitForWritingSurfacePaint();
+            if (
+              applicationClosePhase === 'running' &&
+              requestSerial === navigationSerial &&
+              projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
+              document?.summary.document_id === target.documentId
+            ) focusCurrentWritingSurfaceAtEnd();
+          }
         }
       }
     }
