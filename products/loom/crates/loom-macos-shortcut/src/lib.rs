@@ -23,9 +23,9 @@ pub fn set_candidate_active(active: bool) {
     CANDIDATE_ACTIVE.store(active, Ordering::Release);
 }
 
-/// Install Loom's process-local Option-Left observation before WebKit handles
+/// Install Loom's process-local Option-Left observation before `WebKit` handles
 /// the event. An armed reversal consumes exactly one matching key; ordinary
-/// Option-Left events continue through AppKit.
+/// Option-Left events continue through `AppKit`.
 pub fn install(notify: impl Fn() + Send + Sync + 'static) {
     let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit supplies a valid NSEvent for the duration of this
