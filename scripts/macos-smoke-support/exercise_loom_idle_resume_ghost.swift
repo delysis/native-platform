@@ -7,6 +7,22 @@ func serviceMainRunLoop(for seconds: TimeInterval = 0.05) {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
 }
 
+func canonicalIdentityBytes(_ value: [String: Any]) -> Data? {
+    var canonical = value
+    // Candidate order is a presentation concern: the cached family may be
+    // re-ranked while preserving the same selected candidate, visible glyph,
+    // and immutable terminal authority. Compare the family as a set so a
+    // harmless reordering cannot masquerade as lost native resume state.
+    if let candidates = canonical["candidates"] as? [[String: Any]] {
+        canonical["candidates"] = candidates.sorted {
+            let left = ($0["run_id"] as? String ?? "", $0["candidate_id"] as? String ?? "")
+            let right = ($1["run_id"] as? String ?? "", $1["candidate_id"] as? String ?? "")
+            return left < right
+        }
+    }
+    return try? JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys])
+}
+
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
     var timerFired = false
     let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { _ in
@@ -24,6 +40,18 @@ if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test"
     timer.invalidate()
     guard timerFired else {
         fputs("run-loop wait did not deliver its default-mode timer\n", stderr)
+        exit(1)
+    }
+    let first: [String: Any] = [
+        "selected_run_id": "run-b",
+        "candidates": [["run_id": "run-b", "candidate_id": "b"], ["run_id": "run-a", "candidate_id": "a"]]
+    ]
+    let reordered: [String: Any] = [
+        "candidates": [["candidate_id": "a", "run_id": "run-a"], ["candidate_id": "b", "run_id": "run-b"]],
+        "selected_run_id": "run-b"
+    ]
+    guard canonicalIdentityBytes(first) == canonicalIdentityBytes(reordered) else {
+        fputs("candidate-set identity changed after presentation reordering\n", stderr)
         exit(1)
     }
     print("idle/resume run-loop contract passed")
@@ -148,7 +176,7 @@ func snapshot() -> [String: Any]? {
 }
 func identityBytes(_ observation: [String: Any]) -> Data? {
     guard let value = observation["identity"] as? [String: Any] else { return nil }
-    return try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    return canonicalIdentityBytes(value)
 }
 func waitSnapshot(matching expected: Data? = nil) -> [String: Any]? {
     let deadline = ProcessInfo.processInfo.systemUptime + 15
