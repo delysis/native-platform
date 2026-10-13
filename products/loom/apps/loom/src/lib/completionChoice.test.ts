@@ -68,7 +68,7 @@ it('retains writer choice through empty refusal and exact same-run re-admission'
   expect(completionControllerView(absent, context, [], true, true).selected).toBeNull();
   expect(authorizeCompletionInsertion(absent, {
     contextKey: context, family: [], eligible: null, candidateId: 'candidate-b',
-    presentationKey: 'presentation-b-1', text: ' ', action: 'word',
+    presentationKey: 'presentation-b-1', text: ' ', action: 'option_word',
     manuscriptText: 'Hello', promotionReady: true
   }).authorized).toBe(false);
   const choices = refreshed();
