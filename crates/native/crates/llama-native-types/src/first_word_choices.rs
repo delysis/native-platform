@@ -27,6 +27,9 @@ pub enum FirstWordChoicePolicy {
     DistinctPlainTextV3,
     /// Visual openings retain exact prose bytes but exclude leading line breaks.
     DistinctVisualProseV4,
+    /// Visual openings retain inline Markdown while every sampled token is
+    /// masked if its decoded piece contains a control byte.
+    DistinctVisualProseV5,
 }
 
 impl FirstWordChoicePolicy {
@@ -34,13 +37,26 @@ impl FirstWordChoicePolicy {
     pub const fn rejects_leading_markup(self) -> bool {
         matches!(
             self,
-            Self::DistinctPlainTextV3 | Self::DistinctVisualProseV4
+            Self::DistinctPlainTextV3 | Self::DistinctVisualProseV4 | Self::DistinctVisualProseV5
         )
     }
 
     #[must_use]
     pub const fn rejects_leading_line_breaks(self) -> bool {
-        matches!(self, Self::DistinctVisualProseV4)
+        matches!(
+            self,
+            Self::DistinctVisualProseV4 | Self::DistinctVisualProseV5
+        )
+    }
+
+    #[must_use]
+    pub const fn rejects_visual_control_tokens(self) -> bool {
+        matches!(self, Self::DistinctVisualProseV5)
+    }
+
+    #[must_use]
+    pub const fn rejects_leading_visual_blocks(self) -> bool {
+        matches!(self, Self::DistinctVisualProseV5)
     }
 
     /// Attempt zero preserves the explicit caller seed. Later seeds are the
@@ -55,6 +71,9 @@ impl FirstWordChoicePolicy {
         digest.update(match self {
             Self::DistinctVisualProseV4 => {
                 b"llama-native:first-word-distinct-visual-prose-v4\0".as_slice()
+            }
+            Self::DistinctVisualProseV5 => {
+                b"llama-native:first-word-distinct-visual-prose-v5\0".as_slice()
             }
             Self::DistinctV2 => b"llama-native:first-word-distinct-v2\0".as_slice(),
             Self::DistinctPlainTextV3 => {
@@ -139,6 +158,57 @@ pub fn leading_markup_status(text: &str) -> LeadingMarkupStatus {
     }
 }
 
+/// Classify syntax that would turn an inline Visual continuation into a block
+/// when it begins at a Markdown block boundary. Inline marks such as `**bold**`
+/// remain ordinary eligible output.
+#[must_use]
+pub fn leading_visual_block_status(text: &str) -> LeadingMarkupStatus {
+    let prefix = text.trim_start_matches(' ');
+    let leading_spaces = text.len() - prefix.len();
+    if leading_spaces >= 4 {
+        return LeadingMarkupStatus::Complete;
+    }
+    let html = leading_markup_status(text);
+    if html != LeadingMarkupStatus::NotMarkup {
+        return html;
+    }
+    let bytes = prefix.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_digit) {
+        let digits = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits <= 9 && matches!(bytes.get(digits), Some(b'.' | b')')) {
+            return match bytes.get(digits + 1) {
+                None => LeadingMarkupStatus::Pending,
+                Some(byte) if byte.is_ascii_whitespace() => LeadingMarkupStatus::Complete,
+                Some(_) => LeadingMarkupStatus::NotMarkup,
+            };
+        }
+    }
+    if bytes.first() == Some(&b'#') {
+        let hashes = bytes.iter().take_while(|byte| **byte == b'#').count();
+        if hashes <= 6 {
+            return match bytes.get(hashes) {
+                None => LeadingMarkupStatus::Pending,
+                Some(byte) if byte.is_ascii_whitespace() => LeadingMarkupStatus::Complete,
+                Some(_) => LeadingMarkupStatus::NotMarkup,
+            };
+        }
+    }
+    if matches!(bytes.first(), Some(b'-' | b'+' | b'>' | b'*')) {
+        return match bytes.get(1) {
+            None => LeadingMarkupStatus::Pending,
+            Some(byte) if byte.is_ascii_whitespace() => LeadingMarkupStatus::Complete,
+            Some(_) => LeadingMarkupStatus::NotMarkup,
+        };
+    }
+    if prefix.starts_with("```") || prefix.starts_with("~~~") {
+        return LeadingMarkupStatus::Complete;
+    }
+    LeadingMarkupStatus::NotMarkup
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstWordChoiceAttempt {
     pub seed: u32,
@@ -155,6 +225,9 @@ pub struct FirstWordChoiceAttempt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstWordChoiceEvidence {
     pub policy: FirstWordChoicePolicy,
+    /// Sorted token IDs masked on every draw for this surface policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_token_ids: Vec<i32>,
     pub attempts: Vec<FirstWordChoiceAttempt>,
     /// Zero-based admitted attempt, if any.
     pub selected_attempt: Option<u32>,
@@ -281,6 +354,43 @@ mod tests {
     }
 
     #[test]
+    fn visual_block_classifier_keeps_inline_marks_and_rejects_block_openings() {
+        for inline in [
+            "**boldly** continues",
+            "*emphasis*",
+            "123.5 meters",
+            "<3 forever",
+        ] {
+            assert_eq!(
+                leading_visual_block_status(inline),
+                LeadingMarkupStatus::NotMarkup,
+                "{inline:?}"
+            );
+        }
+        for pending in ["1.", "23)", "#", "-"] {
+            assert_eq!(
+                leading_visual_block_status(pending),
+                LeadingMarkupStatus::Pending,
+                "{pending:?}"
+            );
+        }
+        for block in [
+            "1. item",
+            "23) item",
+            "# heading",
+            "- item",
+            "> quote",
+            "    code",
+        ] {
+            assert_eq!(
+                leading_visual_block_status(block),
+                LeadingMarkupStatus::Complete,
+                "{block:?}"
+            );
+        }
+    }
+
+    #[test]
     fn policy_and_attempt_outcome_have_stable_versioned_wire_names() {
         assert_eq!(
             serde_json::to_string(&FirstWordChoicePolicy::DistinctV2).expect("serialize v2"),
@@ -290,6 +400,11 @@ mod tests {
             serde_json::to_string(&FirstWordChoicePolicy::DistinctPlainTextV3)
                 .expect("serialize v3"),
             r#""distinct_plain_text_v3""#
+        );
+        assert_eq!(
+            serde_json::to_string(&FirstWordChoicePolicy::DistinctVisualProseV5)
+                .expect("serialize visual v5"),
+            r#""distinct_visual_prose_v5""#
         );
         assert_eq!(
             serde_json::to_string(&FirstWordChoiceAttemptOutcome::DisallowedPrefix)

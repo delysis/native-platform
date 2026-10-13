@@ -1,10 +1,6 @@
 import type { BranchCard } from './types';
 import type { VerifiedBranchBody } from './branchBodyProof';
 import { verifiedBodyMatchesBranch } from './branchBodyProof';
-import {
-  candidateSurfaceDecision,
-  type CandidateSurfaceDecision
-} from './candidateSurface';
 
 export interface VerifiedGhostSuggestion {
   candidateId: string;
@@ -18,18 +14,10 @@ export interface GhostSuggestionSelection {
   branches: readonly BranchCard[];
   verifiedBodyByRun: Readonly<Record<string, VerifiedBranchBody>>;
   dismissedCandidateIds: readonly string[];
-  /**
-   * Immutable presentation identities rejected by the active editor surface.
-   * Candidate selection must skip them so a contextually unfaithful first
-   * branch cannot starve later exact alternatives.
-   */
-  unpresentablePresentationKeys: readonly string[];
   targetByte: number | null;
-  presentationCompatible?: (text: string) => boolean;
 }
 
 export type AutocompleteExhaustionReason =
-  | Exclude<CandidateSurfaceDecision, { surface: true }>['reason']
   | 'invalid'
   | 'unpresentable';
 
@@ -142,7 +130,6 @@ export function autocompleteDisposition(
   ) return { kind: 'inactive' };
 
   const dismissed = new Set(selection.dismissedCandidateIds);
-  const unpresentable = new Set(selection.unpresentablePresentationKeys);
   const exactBranches = selection.branches.filter((branch) =>
     Boolean(
       branch.candidate_id &&
@@ -177,22 +164,7 @@ export function autocompleteDisposition(
       exhausted.push({ candidateId, reason: 'invalid' });
       continue;
     }
-    if (unpresentable.has(verified.presentationKey)) {
-      exhausted.push({ candidateId, reason: 'unpresentable' });
-      continue;
-    }
-    const surface = candidateSurfaceDecision(verified.text);
-    if (surface.surface) {
-      if (
-        selection.presentationCompatible &&
-        !selection.presentationCompatible(verified.text)
-      ) {
-        exhausted.push({ candidateId, reason: 'unpresentable' });
-        continue;
-      }
-      return { kind: 'available', suggestion: verified };
-    }
-    exhausted.push({ candidateId, reason: surface.reason });
+    return { kind: 'available', suggestion: verified };
   }
   if (awaitingHydration.length > 0) {
     return { kind: 'awaiting_hydration', runIds: awaitingHydration };

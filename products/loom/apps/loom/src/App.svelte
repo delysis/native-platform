@@ -150,17 +150,8 @@
   import { sourceCaretByte } from './lib/sourceCaret';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
-    verifiedGhostSuggestion,
-    type AutocompleteDisposition
+    verifiedGhostSuggestion
   } from './lib/ghostSuggestion';
-  import {
-    emptyAutocompleteRetryLedger,
-    planAutocompleteRetry,
-    type AutocompleteRetryLedger
-  } from './lib/autocompleteRetry';
-  import {
-    candidateTextIsSurfaceable
-  } from './lib/candidateSurface';
   import {
     evaluateInlineSuggestionFamily,
     inlineSuggestionFamily,
@@ -304,7 +295,6 @@
     cancelCompletionSchedule,
     clearCompletionSession as clearCompletionControllerSession,
     clearWriterCompletionChoice,
-    clearUnpresentableVisualKeys,
     completionActivityExists as controllerHasCompletionActivity,
     completionControllerView,
     completionExhausted,
@@ -317,7 +307,6 @@
     reconcileCompletionController,
     refreshCompletionCandidate,
     refreshCompatibleCompletionFamily,
-    rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
     retireCompletionCandidates,
@@ -325,7 +314,6 @@
     setDismissedCompletionCandidates,
     settleCompletionNavigation,
     shuttleScheduleKey as completionShuttleScheduleKey,
-    type AutocompleteRetryTicket,
     type CompletionControllerEffect,
     type CompletionSchedule
   } from './lib/completionController';
@@ -902,7 +890,6 @@
   let requireExplicitCompletionFamily = false;
   let suggestionsIdleTimer: number | undefined;
   let suggestionWakeQueued = false;
-  let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let announcedGhostPresentationKey = '';
   let timedVisualGhostPresentationKey = '';
   let modelDownloadUrl = '';
@@ -1281,9 +1268,6 @@
   const modelDownloadPollBaseMs = 750;
   const modelDownloadPollMaxMs = 5_000;
   const suggestionsIdleDelayMs = 1_800;
-  const suggestionsRetryDelayMs = 350;
-  const maximumAutomaticSuggestionRetries = 1;
-  const maximumAutocompleteRetryWaits = 50;
   $: completionSurfaceVisible = mainPaneOpen && !customMain && !activeMaterial && !materialsOpen;
   $: completionAutomationActive = completionSurfaceVisible && completionEngineEnabled({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   function completionAutomationEnabled(
@@ -1297,7 +1281,6 @@
   $: pendingCompletionText = completionController.pendingText;
   $: completionGenerationIntent = completionController.generationIntent;
   $: dismissedCandidateIds = completionController.dismissedCandidateIds;
-  $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
   $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
@@ -1411,7 +1394,6 @@
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
-    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
     manuscriptText: documentText,
     sourceNewline: sourceGhostNewline
   });
@@ -1429,7 +1411,6 @@
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
-    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
     manuscriptText: sourceDisplayText,
     sourceNewline: sourceGhostNewline
   });
@@ -1449,8 +1430,7 @@
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    true,
-    mode === 'visual'
+    true
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {
@@ -1476,7 +1456,7 @@
           sourceGhostNewline
         )
       : null;
-    if (selected && text && candidateTextIsSurfaceable(text)) {
+    if (selected && text) {
       const rawPresentationKey = verified?.presentationKey ??
         (hasLiveProjection
           ? `stream:${selected.runId}:${liveSequence}`
@@ -1509,7 +1489,7 @@
         verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
         liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel: currentWriter,
         document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
-        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        dismissedCandidateIds,
         manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
       });
       refreshVisibleCompletionFamily(boundCompletionSession, originals);
@@ -1635,8 +1615,6 @@
       ? `${boundCompletionSession.contextKey}:${boundCompletionSession.selectedRunId}:${acceptedCompletionText(boundCompletionSession).length}`
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
-  $: visualAutocompleteDisposition = visualFamilyEvaluation.disposition;
-  $: sourceAutocompleteDisposition = sourceFamilyEvaluation.disposition;
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -1744,20 +1722,6 @@
     ? `${completionContextKey}:${editVersion}:${completionLifecycle.phase}:${completionLifecycle.reason ?? 'ready'}`
     : '';
   $: resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
-  $: retryEvaluationSnapshot = {
-    enabled: desktop &&
-      branchPromotionReady &&
-      completionAutomationActive &&
-      Boolean(currentWriter) &&
-      activeBranchCount === 0 &&
-      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
-    disposition: mode === 'visual'
-      ? visualAutocompleteDisposition
-      : sourceAutocompleteDisposition
-  };
-  $: if (retryEvaluationSnapshot.enabled) {
-    maybeRetryExhaustedAutocomplete(retryEvaluationSnapshot.disposition);
-  }
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
@@ -2874,7 +2838,6 @@
     stopBranchPolling();
     for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
     weaveStatusPollTimers.clear();
-    completionController = clearUnpresentableVisualKeys(completionController);
     branchRefreshSerial += 1;
     branchRefreshQueued = false;
     branchNextCursor = null;
@@ -4225,59 +4188,6 @@
       !branches.some((branch) => branch.candidate_id === promotionArmedCandidateId)
     ) {
       promotionArmedCandidateId = null;
-    }
-  }
-
-  function maybeRetryExhaustedAutocomplete(
-    disposition: AutocompleteDisposition
-  ): void {
-    if (
-      !desktop ||
-      !project ||
-      !document ||
-      !currentWriter ||
-      !completionAutomationActive ||
-      !branchPromotionReady
-    ) return;
-    const sourceRevisionId = document.summary.revision_id;
-    if (!sourceRevisionId) return;
-    const retryMode = mode === 'visual' || mode === 'source' ? mode : null;
-    if (!retryMode) return;
-    const targetByte = retryMode === 'visual'
-      ? visualGhostTargetByte
-      : sourceGhostTargetByte;
-    if (targetByte === null) return;
-    const budgetKey = [
-      project.project_id,
-      project.session_id,
-      document.summary.document_id,
-      sourceRevisionId,
-      editVersion
-    ].join(':');
-    const decision = planAutocompleteRetry(autocompleteRetryLedger, {
-      disposition,
-      budgetKey,
-      activeBranchCount: branches.filter(isBranchActive).length,
-      weaveStarting,
-      maximumRetries: maximumAutomaticSuggestionRetries
-    });
-    autocompleteRetryLedger = decision.ledger;
-    if (decision.kind === 'schedule') {
-      scheduleAutocompleteRetry({
-        projectId: project.project_id,
-        sessionId: project.session_id,
-        documentId: document.summary.document_id,
-        sourceRevisionId,
-        visibleBlobId: document.visible_blob_id,
-        documentEpoch,
-        editVersion,
-        intentEpoch: completionController.intentEpoch,
-        mode: retryMode,
-        targetByte,
-        modelId: currentWriter.model_id,
-        sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
-        waitsRemaining: maximumAutocompleteRetryWaits
-      });
     }
   }
 
@@ -7754,18 +7664,6 @@
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
-  function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
-    if (!completionGenerationIsArmed(
-      completionController.generationIntent,
-      completionContextKey,
-      ticket.editVersion
-    )) return;
-    armSuggestionSchedule(
-      { kind: 'exhausted_retry', ticket },
-      suggestionsRetryDelayMs
-    );
-  }
-
   function armSuggestionSchedule(schedule: CompletionSchedule, delay: number): void {
     clearSuggestionTimerHandle();
     completionController = setCompletionSchedule(completionController, null);
@@ -7814,81 +7712,12 @@
     });
   }
 
-  function rearmBoundedSuggestionSchedule(
-    schedule: CompletionSchedule,
-    delay: number
-  ): boolean {
-    if (schedule.kind === 'edit_pause') {
-      completionController = setCompletionSchedule(completionController, schedule);
-      queueScheduledSuggestionAttempt(schedule, delay);
-      return true;
-    }
-    if (schedule.ticket.waitsRemaining <= 0) {
-      completionController = setCompletionSchedule(completionController, null);
-      return false;
-    }
-    armSuggestionSchedule({
-      kind: 'exhausted_retry',
-      ticket: {
-        ...schedule.ticket,
-        waitsRemaining: schedule.ticket.waitsRemaining - 1
-      }
-    }, delay);
-    return true;
-  }
-
-  function retryTicketDisposition(
-    ticket: AutocompleteRetryTicket
-  ): AutocompleteDisposition | null {
-    if (
-      !project ||
-      !document ||
-      !currentWriter ||
-      !completionAutomationActive ||
-      project.project_id !== ticket.projectId ||
-      project.session_id !== ticket.sessionId ||
-      document.summary.document_id !== ticket.documentId ||
-      document.summary.revision_id !== ticket.sourceRevisionId ||
-      document.visible_blob_id !== ticket.visibleBlobId ||
-      documentEpoch !== ticket.documentEpoch ||
-      editVersion !== ticket.editVersion ||
-      completionController.intentEpoch !== ticket.intentEpoch ||
-      mode !== ticket.mode ||
-      currentWriter.model_id !== ticket.modelId ||
-      sourceGhostNewline !== ticket.sourceNewline ||
-      !branchPromotionReady
-    ) return null;
-    const targetByte = mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte;
-    if (targetByte !== ticket.targetByte) return null;
-    return evaluateInlineSuggestionFamily(targetByte, mode, {
-      branches,
-      authoritativeFamilyId: authoritativeCompletionFamilyId,
-      authoritativeFamilyIds: loompadFamilyIds,
-      requireExplicitFamily: requireExplicitCompletionFamily,
-      verifiedBodyByRun: verifiedBranchBodyByRun,
-      liveTextByRun: liveBranchTextByRun,
-      liveTextSequenceByRun: liveBranchTextSequenceByRun,
-      currentModel: currentWriter,
-      document,
-      suggestionsEnabled: true,
-      promotionReady: true,
-      dismissedCandidateIds,
-      unpresentableVisualKeys: mode === 'visual'
-        ? unpresentableVisualGhostPresentationKeys
-        : [],
-      manuscriptText: mode === 'visual' ? documentText : sourceDisplayText,
-      sourceNewline: ticket.sourceNewline
-    }).disposition;
-  }
-
   function loompadBackgroundPaused(): boolean {
     return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
   }
 
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
-    const targetEditVersion = schedule.kind === 'edit_pause'
-      ? schedule.editVersion
-      : schedule.ticket.editVersion;
+    const targetEditVersion = schedule.editVersion;
     if (
       terminalIsBusy() ||
       completionController.scheduled !== schedule ||
@@ -7912,24 +7741,6 @@
         completionController = setCompletionSchedule(completionController, null);
       }
       return;
-    }
-    if (schedule.kind === 'exhausted_retry') {
-      const disposition = retryTicketDisposition(schedule.ticket);
-      if (!disposition) {
-        completionController = setCompletionSchedule(completionController, null);
-        return;
-      }
-      if (disposition.kind === 'available' || disposition.kind === 'inactive') {
-        completionController = setCompletionSchedule(completionController, null);
-        return;
-      }
-      if (
-        disposition.kind === 'awaiting_candidates' ||
-        disposition.kind === 'awaiting_hydration'
-      ) {
-        rearmBoundedSuggestionSchedule(schedule, 200);
-        return;
-      }
     }
     const attempted = await startAutomaticWeave();
     if (completionController.scheduled !== schedule) return;
@@ -8352,16 +8163,18 @@
     anchorByteOffset: number,
     selectionPinned = false
   ): void {
-    completionController = rejectVisualPresentation(completionController, {
-      mode,
-      eligible: ghostSuggestion,
-      candidateId,
-      presentationKey,
-      surfaceKey,
-      currentSurfaceKey: visualGhostSurfaceKey,
-      anchorByte: anchorByteOffset,
-      selectionPinned
-    });
+    if (
+      mode !== 'visual' ||
+      ghostSuggestion?.candidateId !== candidateId ||
+      ghostSuggestion.presentationKey !== presentationKey ||
+      ghostSuggestion.targetByte !== anchorByteOffset ||
+      surfaceKey !== visualGhostSurfaceKey
+    ) return;
+    completionController = resetCompletionDiscovery(completionController);
+    recordLocalFailure(
+      'completion_projection_invariant',
+      `A sampler-authorized Visual completion could not be represented exactly${selectionPinned ? ' while pinned' : ''}.`
+    );
   }
 
   async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
@@ -9072,7 +8885,7 @@
     if (!weaveCaptureStillCurrent(captured)) return false;
     if (captured.speculation) {
       const batch = started.speculation;
-      if (!batch || batch.admission_policy !== (captured.mode === 'visual' ? 'distinct_visual_prose_v4' : 'distinct_v2') ||
+      if (!batch || batch.admission_policy !== (captured.mode === 'visual' ? 'distinct_visual_prose_v5' : 'distinct_v2') ||
           !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
           batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
         throw new Error('The desktop returned choices for a different sampling boundary.');
@@ -9321,8 +9134,8 @@
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
         policy: captured.speculation
-          ? { kind: captured.mode === 'visual' ? 'loompad_visual_v3' : 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
-          : { kind: captured.mode === 'visual' ? 'automatic_visual_v4' : 'automatic_v2' }
+          ? { kind: captured.mode === 'visual' ? 'loompad_visual_v4' : 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          : { kind: captured.mode === 'visual' ? 'automatic_visual_v5' : 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;

@@ -1,12 +1,11 @@
 import { verifiedBodyMatchesBranch, type VerifiedBranchBody } from './branchBodyProof';
-import { candidateTextIsSurfaceable } from './candidateSurface';
 import { completionTextAtBoundary } from './completionSession';
 import {
   verifiedGhostSuggestion,
   type AutocompleteDisposition,
   type AutocompleteExhaustionReason
 } from './ghostSuggestion';
-import { visualGhostTextMayBePlainProse, visualGhostTextSafePrefix } from './ghostText';
+import { visualGhostTextInlineCandidate, visualGhostTextMayBeInlineMarkdown } from './ghostText';
 import { sourceGhostPresentationCompatible } from './sourceGhostText';
 import type { SuggestionAlternative } from './suggestionInteraction';
 import type {
@@ -39,7 +38,6 @@ export interface InlineSuggestionState {
   suggestionsEnabled: boolean;
   promotionReady: boolean;
   dismissedCandidateIds: string[];
-  unpresentableVisualKeys: string[];
   manuscriptText: string;
   sourceNewline: VerseNewlineKind | null;
 }
@@ -129,14 +127,14 @@ export function projectInlineCandidateText(
   sourceNewline: VerseNewlineKind | null
 ): string | null {
   const candidateText = editorMode === 'visual'
-    ? visualGhostTextSafePrefix(rawText)
+    ? visualGhostTextInlineCandidate(rawText)
     : rawText;
   const text = candidateText === null
     ? null
     : completionTextAtBoundary(manuscriptText, targetByte, candidateText);
-  if (!text || !candidateTextIsSurfaceable(text)) return null;
+  if (!text || !/\S/u.test(text)) return null;
   if (editorMode === 'visual') {
-    return visualGhostTextMayBePlainProse(text) ? text : null;
+    return visualGhostTextMayBeInlineMarkdown(text) ? text : null;
   }
   return sourceGhostPresentationCompatible(manuscriptText, text, sourceNewline)
     ? text
@@ -268,19 +266,6 @@ export function evaluateInlineSuggestionFamily(
       const rawPresentationKey = verified?.presentationKey ??
         (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
       const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
-      if (editorMode === 'visual') {
-        if (
-          state.unpresentableVisualKeys.includes(presentationKey)
-        ) {
-          if (branch.status === 'queued' || branch.status === 'generating') {
-            pending.add(branch.run_id);
-          } else {
-            terminalShortfall.push({ candidateId, reason: 'unpresentable' });
-          }
-          continue;
-        }
-      }
-
       batch.push({
         candidateId,
         presentationKey,

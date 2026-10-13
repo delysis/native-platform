@@ -123,7 +123,6 @@ describe('W1 model-free suggestion vertical', () => {
       branches,
       verifiedBodyByRun,
       dismissedCandidateIds: [],
-      unpresentablePresentationKeys: [],
       targetByte: fixture.source.caret_byte
     });
     expect(disposition.kind).toBe('available');

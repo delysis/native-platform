@@ -26,8 +26,10 @@ impl Engine {
                 ValidatedWeavePolicy::AutomaticV2
                     | ValidatedWeavePolicy::AutomaticV3
                     | ValidatedWeavePolicy::AutomaticVisualV4
+                    | ValidatedWeavePolicy::AutomaticVisualV5
                     | ValidatedWeavePolicy::LoompadV2 { .. }
                     | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV4 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {
@@ -633,8 +635,10 @@ mod tests {
             policy,
             WeavePolicySnapshot::AutomaticV3 {}
                 | WeavePolicySnapshot::AutomaticVisualV4 {}
+                | WeavePolicySnapshot::AutomaticVisualV5 {}
                 | WeavePolicySnapshot::LoompadV2 { .. }
                 | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                | WeavePolicySnapshot::LoompadVisualV4 { .. }
         ) {
             assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
             assert!(calls.lock().unwrap().is_empty());
@@ -667,7 +671,9 @@ mod tests {
             started.speculation.is_some(),
             matches!(
                 policy,
-                WeavePolicySnapshot::LoompadV2 { .. } | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                WeavePolicySnapshot::LoompadV2 { .. }
+                    | WeavePolicySnapshot::LoompadVisualV3 { .. }
+                    | WeavePolicySnapshot::LoompadVisualV4 { .. }
             )
         );
         if cancel {
@@ -722,6 +728,7 @@ mod tests {
             for changed in [
                 WeavePolicySnapshot::AutomaticV3 {},
                 WeavePolicySnapshot::AutomaticVisualV4 {},
+                WeavePolicySnapshot::AutomaticVisualV5 {},
             ] {
                 assert_eq!(
                     start_with(command, changed)
@@ -793,6 +800,7 @@ mod tests {
     #[test]
     fn visual_v4_never_falls_back_to_a_server_without_native_admission_evidence() {
         exercise(false, WeavePolicySnapshot::AutomaticVisualV4 {});
+        exercise(false, WeavePolicySnapshot::AutomaticVisualV5 {});
     }
 
     #[test]
@@ -811,6 +819,13 @@ mod tests {
         exercise(
             false,
             WeavePolicySnapshot::LoompadVisualV3 {
+                sample_target: 4,
+                batch_offset: 0,
+            },
+        );
+        exercise(
+            false,
+            WeavePolicySnapshot::LoompadVisualV4 {
                 sample_target: 4,
                 batch_offset: 0,
             },

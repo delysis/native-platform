@@ -352,7 +352,6 @@ function suggestionFamily(
     suggestionsEnabled: true,
     promotionReady: true,
     dismissedCandidateIds: [],
-    unpresentableVisualKeys: [],
     manuscriptText: currentDocument.text,
     sourceNewline: null
   });

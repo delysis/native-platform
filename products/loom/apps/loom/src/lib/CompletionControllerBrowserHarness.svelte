@@ -12,9 +12,9 @@
     cycleCompletion,
     initialCompletionControllerState,
     observeTextMutation,
-    rejectVisualPresentation,
     reconcileCompletionController,
-    refreshCompletionCandidate
+    refreshCompletionCandidate,
+    resetCompletionDiscovery
   } from './completionController';
   import { completionPresentation } from './completionSession';
   import type { InlineGhostSuggestion } from './inlineSuggestionFamily';
@@ -72,8 +72,7 @@
     controller,
     contextKey,
     family,
-    true,
-    mode === 'visual'
+    true
   );
   $: selected = ready ? controllerView.selected : null;
 
@@ -123,34 +122,8 @@
     return applied;
   }
 
-  function rejectVisualGhostPresentation(
-    candidateId: string,
-    presentationKey: string,
-    surfaceKey: string,
-    anchorByteOffset: number,
-    selectionPinned = false
-  ): void {
-    controller = rejectVisualPresentation(controller, {
-      mode,
-      eligible: selected,
-      candidateId,
-      presentationKey,
-      surfaceKey,
-      currentSurfaceKey: contextKey,
-      anchorByte: anchorByteOffset,
-      selectionPinned
-    });
-  }
-
-  /** Drives the same production callback after a mounted editor has observed a rejected ghost. */
-  export function rejectVisibleVisualPresentation(): void {
-    if (!selected || mode !== 'visual') return;
-    rejectVisualGhostPresentation(
-      selected.candidateId,
-      selected.presentationKey,
-      contextKey,
-      selected.targetByte
-    );
+  function rejectVisualGhostPresentation(): void {
+    controller = resetCompletionDiscovery(controller);
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {

@@ -43,15 +43,13 @@ describe('App ghost reactivity wiring', () => {
     const sourceGhost = dependencyThunkFor(compiled, '$.set(sourceAutocompleteDisposition');
     expect(sourceGhost).toContain('sourceFamilyEvaluation');
 
-    const retry = dependencyThunkFor(compiled, '$.set(retryEvaluationSnapshot');
-    expect(retry).toContain('visualAutocompleteDisposition');
-    expect(retry).toContain('sourceAutocompleteDisposition');
-
     const visualFamily = dependencyThunkFor(compiled, '$.set(visualSuggestionFamily');
     expect(visualFamily).toContain('visualFamilyEvaluation');
 
     const sourceFamily = dependencyThunkFor(compiled, '$.set(sourceSuggestionFamily');
     expect(sourceFamily).toContain('sourceFamilyEvaluation');
+    expect(source).not.toContain('retryEvaluationSnapshot');
+    expect(source).not.toContain('maybeRetryExhaustedAutocomplete');
     expect(source).not.toContain('A private strand is ready');
   });
 
@@ -286,7 +284,7 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('Opening your writing…');
   });
 
-  it('rebinds completion after an incompatible caret navigation settles', () => {
+  it('rebinds completion after caret navigation settles without replacement retries', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
     const controller = readFileSync(new URL('./completionController.ts', import.meta.url), 'utf8');
@@ -314,7 +312,8 @@ describe('App ghost reactivity wiring', () => {
     expect(visualSelection).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation')");
     expect(source).toContain('onCaretNavigation={invalidateCompletionForCaretNavigation}');
     expect(visual).toContain('onCaretNavigation();');
-    expect(source).toContain('completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion)');
+    expect(source).not.toContain('exhausted_retry');
+    expect(source).not.toContain('maybeRetryExhaustedAutocomplete');
   });
 
   it('keeps completion state and transition authority in one private pure controller', () => {

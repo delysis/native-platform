@@ -905,8 +905,10 @@ mod automatic_writer_authority {
                 ValidatedWeavePolicy::AutomaticV2
                 | ValidatedWeavePolicy::AutomaticV3
                 | ValidatedWeavePolicy::AutomaticVisualV4
+                | ValidatedWeavePolicy::AutomaticVisualV5
                 | ValidatedWeavePolicy::LoompadV2 { .. }
-                | ValidatedWeavePolicy::LoompadVisualV3 { .. } => {
+                | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                | ValidatedWeavePolicy::LoompadVisualV4 { .. } => {
                     AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
                         loaded,
                         build_policy,
@@ -3034,11 +3036,16 @@ enum WeavePolicySnapshot {
     AutomaticV2 {},
     AutomaticV3 {},
     AutomaticVisualV4 {},
+    AutomaticVisualV5 {},
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
     LoompadVisualV3 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
+    LoompadVisualV4 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -3070,11 +3077,16 @@ enum ValidatedWeavePolicy {
     AutomaticV2,
     AutomaticV3,
     AutomaticVisualV4,
+    AutomaticVisualV5,
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
     LoompadVisualV3 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
+    LoompadVisualV4 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -8504,6 +8516,7 @@ fn replay_weave_if_recorded(
                 policy,
                 ValidatedWeavePolicy::LoompadV2 { .. }
                     | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                    | ValidatedWeavePolicy::LoompadVisualV4 { .. }
             );
             for started in &family.generations {
                 if recorded_weave_first_word_choices(
@@ -8830,12 +8843,17 @@ fn weave_start_inner<R: Runtime>(
         | ValidatedWeavePolicy::LoompadVisualV3 {
             sample_target,
             batch_offset,
+        }
+        | ValidatedWeavePolicy::LoompadVisualV4 {
+            sample_target,
+            batch_offset,
         } => {
             ensure_no_active_generations(state, "extending idle choices")?;
             Some((
                 *sample_target,
                 *batch_offset,
                 match &policy {
+                    ValidatedWeavePolicy::LoompadVisualV4 { .. } => "loompad_visual_v4",
                     ValidatedWeavePolicy::LoompadVisualV3 { .. } => "loompad_visual_v3",
                     _ => "loompad_v2",
                 },
@@ -9591,11 +9609,16 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
         WeavePolicySnapshot::AutomaticV3 {} => ValidatedWeavePolicy::AutomaticV3,
         WeavePolicySnapshot::AutomaticVisualV4 {} => ValidatedWeavePolicy::AutomaticVisualV4,
+        WeavePolicySnapshot::AutomaticVisualV5 {} => ValidatedWeavePolicy::AutomaticVisualV5,
         WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
         }
         | WeavePolicySnapshot::LoompadVisualV3 {
+            sample_target,
+            batch_offset,
+        }
+        | WeavePolicySnapshot::LoompadVisualV4 {
             sample_target,
             batch_offset,
         } => {
@@ -9609,7 +9632,12 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
                     false,
                 ));
             }
-            if matches!(policy, WeavePolicySnapshot::LoompadVisualV3 { .. }) {
+            if matches!(policy, WeavePolicySnapshot::LoompadVisualV4 { .. }) {
+                ValidatedWeavePolicy::LoompadVisualV4 {
+                    sample_target,
+                    batch_offset,
+                }
+            } else if matches!(policy, WeavePolicySnapshot::LoompadVisualV3 { .. }) {
                 ValidatedWeavePolicy::LoompadVisualV3 {
                     sample_target,
                     batch_offset,
@@ -9665,6 +9693,10 @@ impl ValidatedWeavePolicy {
             | Self::LoompadVisualV3 {
                 sample_target,
                 batch_offset,
+            }
+            | Self::LoompadVisualV4 {
+                sample_target,
+                batch_offset,
             } => {
                 *sample_target == batch.sample_target
                     && *batch_offset == batch.batch_offset
@@ -9680,6 +9712,9 @@ impl ValidatedWeavePolicy {
             Self::AutomaticVisualV4 | Self::LoompadVisualV3 { .. } => {
                 Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
             }
+            Self::AutomaticVisualV5 | Self::LoompadVisualV4 { .. } => {
+                Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5)
+            }
             Self::AutomaticV3 => {
                 Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
             }
@@ -9692,18 +9727,23 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5
             | Self::LoompadV2 { .. }
-            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
 
     const fn max_tokens(&self) -> u32 {
         match self {
-            Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4 => {
-                AUTOMATIC_WEAVE_MAX_TOKENS_V2
-            }
-            Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. } => 128,
+            Self::AutomaticV2
+            | Self::AutomaticV3
+            | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::LoompadV2 { .. }
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
@@ -9713,8 +9753,10 @@ impl ValidatedWeavePolicy {
             Self::AutomaticV2
             | Self::AutomaticV3
             | Self::AutomaticVisualV4
+            | Self::AutomaticVisualV5
             | Self::LoompadV2 { .. }
-            | Self::LoompadVisualV3 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            | Self::LoompadVisualV3 { .. }
+            | Self::LoompadVisualV4 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
@@ -9722,15 +9764,24 @@ impl ValidatedWeavePolicy {
     fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
         let preset = match (self, kind) {
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Prose,
             ) => WeavePreset::AutomaticProseV2,
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Verse,
             ) => WeavePreset::AutomaticVerseV2,
             (
-                Self::AutomaticV2 | Self::AutomaticV3 | Self::AutomaticVisualV4,
+                Self::AutomaticV2
+                | Self::AutomaticV3
+                | Self::AutomaticVisualV4
+                | Self::AutomaticVisualV5,
                 DocumentKind::Hybrid,
             ) => {
                 return Err(IpcFailure::new(
@@ -9739,7 +9790,12 @@ impl ValidatedWeavePolicy {
                     false,
                 ));
             }
-            (Self::LoompadV2 { .. } | Self::LoompadVisualV3 { .. }, _) => WeavePreset::LoompadV2,
+            (
+                Self::LoompadV2 { .. }
+                | Self::LoompadVisualV3 { .. }
+                | Self::LoompadVisualV4 { .. },
+                _,
+            ) => WeavePreset::LoompadV2,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
@@ -14279,6 +14335,10 @@ mod tests {
                 "loompad_visual_v3",
                 llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4,
             ),
+            (
+                "loompad_visual_v4",
+                llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5,
+            ),
         ] {
             for target in [4, 16, 64, 256] {
                 let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
@@ -14451,6 +14511,10 @@ mod tests {
                 "automatic_visual_v4",
                 ValidatedWeavePolicy::AutomaticVisualV4,
             ),
+            (
+                "automatic_visual_v5",
+                ValidatedWeavePolicy::AutomaticVisualV5,
+            ),
         ] {
             let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
                 "kind": kind
@@ -14473,6 +14537,10 @@ mod tests {
             Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV4)
         );
         assert_eq!(
+            ValidatedWeavePolicy::AutomaticVisualV5.first_word_choices(),
+            Some(llama_native_types::FirstWordChoicePolicy::DistinctVisualProseV5)
+        );
+        assert_eq!(
             ValidatedWeavePolicy::AutomaticV3.first_word_choices(),
             Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
         );
@@ -14484,6 +14552,7 @@ mod tests {
             ValidatedWeavePolicy::AutomaticV2,
             ValidatedWeavePolicy::AutomaticV3,
             ValidatedWeavePolicy::AutomaticVisualV4,
+            ValidatedWeavePolicy::AutomaticVisualV5,
         ] {
             assert_eq!(
                 policy

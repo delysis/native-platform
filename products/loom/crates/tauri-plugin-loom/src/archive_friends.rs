@@ -216,7 +216,9 @@ pub(super) async fn prepare(
         }
         if matches!(
             validated,
-            ValidatedWeavePolicy::LoompadV2 { .. } | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+            ValidatedWeavePolicy::LoompadV2 { .. }
+                | ValidatedWeavePolicy::LoompadVisualV3 { .. }
+                | ValidatedWeavePolicy::LoompadVisualV4 { .. }
         ) {
             ensure_no_active_generations(state, "extending idle choices")?;
         }

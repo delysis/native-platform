@@ -465,7 +465,7 @@ it.each([
         expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
         expect(args.expectedVisibleBlobId).toBe(sourceBlob);
         expect(args.cursorByte).toBe(sourceBytes);
-        expect(args.policy.kind).toBe('automatic_visual_v4');
+        expect(args.policy.kind).toBe('automatic_visual_v5');
         admission = {
           command_id: args.commandId, request_id: `weave-${args.commandId}`, project_id: project.project_id,
           session_id: project.session_id, document_id: opened.summary.document_id, source_revision_id: 'revision-1',
@@ -800,7 +800,7 @@ it.each([
   }
 }, 20_000);
 
-it('keeps the actual writer choice through rejection, four-slot absence and re-admission', async () => {
+it('keeps the actual writer choice while its exact sampler output grows', async () => {
   restoreStorage = Object.entries(localStorage); localStorage.clear();
   restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
   Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
@@ -833,7 +833,7 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
   }
   let populated = false;
   let sequence = 1;
-  const texts = ['ordinary default prose ', '123.', 'unchosen alternative prose ', 'fourth ordinary prose '];
+  const texts = ['ordinary default prose ', '**boldly**', 'unchosen alternative prose ', 'fourth ordinary prose '];
   let snapshotReads = 0;
   const writes: string[] = [];
   const unexpected: string[] = [];
@@ -898,7 +898,7 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
           commandId: expect.stringMatching(/^[0-9A-HJKMNP-TV-Z]{26}$/u),
           documentId: opened.summary.document_id, relativePath: opened.summary.relative_path,
           sourceRevisionId: opened.summary.revision_id, expectedVisibleBlobId: sourceBlob,
-          cursorByte: 7, policy: { kind: 'automatic_visual_v4' } });
+          cursorByte: 7, policy: { kind: 'automatic_visual_v5' } });
         admission = { command_id: args.commandId, request_id: `weave-${args.commandId}`,
           project_id: args.projectId, session_id: args.sessionId, document_id: args.documentId,
           source_revision_id: args.sourceRevisionId, exact_prompt_blob_id: exactPromptBlob, speculation: null,
@@ -943,8 +943,7 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
     await getCompletionSnapshot(project.project_id, project.session_id, opened.summary.document_id, []);
     await Promise.allSettled([...pending]);
     await tick();
-    // Join the renderer's real rejection-frame boundary, not an elapsed-time
-    // guess. Assertions below use actual published phase/DOM output.
+    // Join the renderer's publication boundary, not an elapsed-time guess.
     await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
     await tick();
   }
@@ -992,7 +991,7 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
     expect(nativePolicyEnabled).toBe(true);
     expect(completionWitness().writer_id).toBe(model.model_id);
     expect(writes).toEqual([]);
-    stage = 'admitted defaultA, real writerB, refusal and re-admission oracles';
+    stage = 'admitted defaultA and exact growing writerB';
     populated = true; wake();
     await expect.poll(() => ({
       glyph: glyph(), witness: completionWitness(), snapshotReads,
@@ -1000,18 +999,20 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
     })).toMatchObject({ glyph: texts[0] });
     await keyboard.keyboard('{Alt>}{ArrowDown}{/Alt}');
     await expect.poll(() => completionWitness().selected_run_id).toBe('intent-run-b');
-    await expect.poll(glyph).toBe('123.');
-    expect(glyph(), 'initial exact writer B glyph is required before any causal assertion').toBe('123.');
+    await expect.poll(glyph).toBe('boldly');
+    expect(glyph(), 'initial exact writer B glyph is required before any causal assertion').toBe('boldly');
     expect(authorDomText(editor)).toBe('IntroSuffix');
     expect(writes).toEqual([]);
-    texts[1] = '123. 5-meter-long desk. The office was empty.'; sequence = 2;
+    texts[1] = '**boldly** continues through the office.'; sequence = 2;
     const before = snapshotReads; wake();
     await expect.poll(() => snapshotReads).toBeGreaterThan(before);
-    await expect.poll(() => completionWitness().family_phase?.kind).toBe('pending');
-    expect(glyph()).toBeNull(); // Absence alone is not the INTENT cause oracle.
+    await expect.poll(() => completionWitness().family_phase?.kind).toBe('ready');
+    await expect.poll(glyph).toBe('boldly continues through the office.');
+    expect(completionWitness().selected_run_id).toBe('intent-run-b');
     texts[1] += ' Another sentence follows.'; sequence = 3;
     wake(); await barrier();
-    await expect.poll(() => glyph() === texts[2] || completionWitness().family_phase?.kind === 'pending').toBe(true);
+    await expect.poll(glyph).toBe('boldly continues through the office. Another sentence follows.');
+    expect(completionWitness().selected_run_id).toBe('intent-run-b');
     observed = { glyph: glyph(), witness: completionWitness(), author: authorDomText(editor),
       writes: [...writes], unexpected: [...unexpected] };
   } catch (error) {
@@ -1039,10 +1040,11 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
     await Promise.allSettled([...pending]);
   }
   expect(pending.size).toBe(0);
-  expect(observed, 'all ordinary glyph/caret/refusal prerequisites must finish').not.toBeNull();
+  expect(observed, 'all ordinary glyph/caret prerequisites must finish').not.toBeNull();
   expect(observed!.writes).toEqual([]);
   expect(observed!.unexpected).toEqual([]);
   expect(observed!.author).toBe('IntroSuffix');
-  expect(observed!.glyph, `writer B must not become visible unchosen C after re-admission: ${JSON.stringify(observed!.witness)}`).toBeNull();
-  expect(observed!.witness.family_phase.kind).toBe('pending');
+  expect(observed!.glyph).toBe('boldly continues through the office. Another sentence follows.');
+  expect(observed!.witness.selected_run_id).toBe('intent-run-b');
+  expect(observed!.witness.family_phase.kind).toBe('ready');
 }, 20_000);

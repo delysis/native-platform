@@ -31,28 +31,9 @@ import {
   type CompletionInsertionAction,
   type SuggestionAlternative
 } from './suggestionInteraction';
-import type { VerseNewlineKind } from './verseCodec';
 import { loompadWordKey } from './loompad';
 
-export interface AutocompleteRetryTicket {
-  projectId: string;
-  sessionId: string;
-  documentId: string;
-  sourceRevisionId: string;
-  visibleBlobId: string;
-  documentEpoch: number;
-  editVersion: number;
-  intentEpoch: number;
-  mode: 'visual' | 'source';
-  targetByte: number;
-  modelId: string;
-  sourceNewline: VerseNewlineKind | null;
-  waitsRemaining: number;
-}
-
-export type CompletionSchedule =
-  | { kind: 'edit_pause'; editVersion: number }
-  | { kind: 'exhausted_retry'; ticket: AutocompleteRetryTicket };
+export type CompletionSchedule = { kind: 'edit_pause'; editVersion: number };
 
 export interface CompletionActionWitness {
   sequence: number;
@@ -113,10 +94,8 @@ export interface CompletionControllerState {
   generationIntent: CompletionGenerationIntent | null;
   navigationPending: boolean;
   intentEpoch: number;
-  /** A visual rejection may advance only an untouched default selection. */
   selectionIntent: CompletionSelectionIntent;
   dismissedCandidateIds: string[];
-  unpresentableVisualKeys: string[];
   scheduled: CompletionSchedule | null;
 }
 
@@ -157,7 +136,6 @@ export function initialCompletionControllerState(): CompletionControllerState {
     intentEpoch: 0,
     selectionIntent: { contextKey: '', writerChoice: null },
     dismissedCandidateIds: [],
-    unpresentableVisualKeys: [],
     scheduled: null
   };
 }
@@ -206,13 +184,11 @@ export function resetCompletionSurface(
 ): CompletionControllerState {
   const cleared = clearCompletionSession(state);
   if (
-    cleared.lastAction === null &&
-    cleared.unpresentableVisualKeys.length === 0
+    cleared.lastAction === null
   ) return cleared;
   return {
     ...cleared,
-    lastAction: null,
-    unpresentableVisualKeys: []
+    lastAction: null
   };
 }
 
@@ -223,7 +199,6 @@ export function resetCompletionDiscovery(
     state.session === null &&
     state.pendingText === null &&
     state.dismissedCandidateIds.length === 0 &&
-    state.unpresentableVisualKeys.length === 0 &&
     state.selectionIntent.writerChoice === null
   ) return state;
   return {
@@ -231,17 +206,8 @@ export function resetCompletionDiscovery(
     selectionIntent: { ...state.selectionIntent, writerChoice: null },
     session: null,
     pendingText: null,
-    dismissedCandidateIds: [],
-    unpresentableVisualKeys: []
+    dismissedCandidateIds: []
   };
-}
-
-export function clearUnpresentableVisualKeys(
-  state: CompletionControllerState
-): CompletionControllerState {
-  return state.unpresentableVisualKeys.length === 0
-    ? state
-    : { ...state, unpresentableVisualKeys: [] };
 }
 
 export function setDismissedCompletionCandidates(
@@ -312,37 +278,29 @@ export function completionControllerView(
   state: CompletionControllerState,
   contextKey: string,
   baseFamily: readonly InlineGhostSuggestion[],
-  sharedPrefixAlternatives = true,
-  visualSurface = false
+  sharedPrefixAlternatives = true
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
-  const unfilteredFamily = completionActiveFamily(
+  const activeFamily = completionActiveFamily(
     boundSession,
     state.pendingText,
     baseFamily,
     sharedPrefixAlternatives
   );
-  const activeFamily = visualSurface
-    ? unfilteredFamily.filter((candidate) => !state.unpresentableVisualKeys.includes(candidate.presentationKey))
-    : unfilteredFamily;
   const unconsumeText = boundSession ? completionRollbackText(boundSession) : '';
   const presentation = boundSession && state.pendingText === null
     ? completionPresentation(boundSession) : null;
-  const selectedPresentationRejected = Boolean(visualSurface && presentation &&
-    state.unpresentableVisualKeys.includes(presentation.presentationKey));
   // Exhaustion hides the fan, but the accepted chunk still needs its exact
   // candidate identity and end offset for reversal at the editor boundary.
   const rollback = presentation && (boundSession?.presentationsRetired ||
-    (presentation.text === '' && unconsumeText !== '') ||
-    (selectedPresentationRejected && unconsumeText !== '')) ? presentation : null;
+    (presentation.text === '' && unconsumeText !== '')) ? presentation : null;
   const selectedByActiveRun = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ?? null;
   const fallback = activeFamily.length === 0
     ? (rollback ? { ...rollback, text: '' } : null)
-    : state.activeRunId === null || !visualSurface
+    : state.activeRunId === null
       ? activeFamily[0]
       : null;
-  const selected = selectedByActiveRun ??
-    (selectedPresentationRejected && rollback ? { ...rollback, text: '' } : fallback);
+  const selected = selectedByActiveRun ?? fallback;
   const witnessSelected = selected && boundSession
     ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
     : null;
@@ -631,60 +589,6 @@ export function dismissCompletion(
   };
 }
 
-export interface RejectVisualPresentationInput {
-  mode: 'visual' | 'source';
-  eligible: InlineGhostSuggestion | null;
-  candidateId: string;
-  presentationKey: string;
-  surfaceKey: string;
-  currentSurfaceKey: string;
-  anchorByte: number;
-  selectionPinned?: boolean;
-}
-
-export function rejectVisualPresentation(
-  state: CompletionControllerState,
-  input: RejectVisualPresentationInput
-): CompletionControllerState {
-  if (
-    input.mode !== 'visual' ||
-    input.eligible?.candidateId !== input.candidateId ||
-    input.eligible.presentationKey !== input.presentationKey ||
-    input.eligible.targetByte !== input.anchorByte ||
-    input.surfaceKey !== input.currentSurfaceKey ||
-    state.unpresentableVisualKeys.includes(input.presentationKey)
-  ) return state;
-  const unpresentableVisualKeys = [
-    ...state.unpresentableVisualKeys,
-    input.presentationKey
-  ].slice(-64);
-  const session = state.session;
-  if (
-    (state.activeRunId === input.eligible.runId && session &&
-      writerChoiceMatches(state.selectionIntent, session.contextKey, input.eligible)) ||
-    input.selectionPinned ||
-    !session ||
-    session.acceptedChunks.length > 0 ||
-    session.selectedRunId !== input.eligible.runId ||
-    state.activeRunId !== input.eligible.runId
-  ) {
-    return { ...state, unpresentableVisualKeys };
-  }
-
-  const current = session.candidates.findIndex((candidate) => candidate.runId === input.eligible!.runId);
-  const next = session.candidates.slice(current + 1)
-    .concat(session.candidates.slice(0, Math.max(current, 0)))
-    .find((candidate) => !unpresentableVisualKeys.includes(candidate.presentationKey));
-  const defaultState = clearWriterCompletionChoice(state);
-  if (!next) return { ...defaultState, unpresentableVisualKeys, activeRunId: null };
-  return {
-    ...defaultState,
-    session: { ...session, selectedRunId: next.runId },
-    activeRunId: next.runId,
-    unpresentableVisualKeys
-  };
-}
-
 export interface TextMutationDecision {
   state: CompletionControllerState;
   completionOwned: boolean;
@@ -710,8 +614,7 @@ export function observeTextMutation(
       ...next,
       selectionIntent: { ...next.selectionIntent, writerChoice: null },
       session: null,
-      dismissedCandidateIds: [],
-      unpresentableVisualKeys: []
+      dismissedCandidateIds: []
     };
   }
   return { state: next, completionOwned, cancelActiveBranches: !completionOwned };
@@ -726,8 +629,7 @@ export function invalidateVisualMutation(
       selectionIntent: { ...state.selectionIntent, writerChoice: null },
       session: null,
       intentEpoch: state.intentEpoch + 1,
-      dismissedCandidateIds: [],
-      unpresentableVisualKeys: []
+      dismissedCandidateIds: []
     },
     effects: [{ kind: 'cancel_active_branches' }]
   };
@@ -772,7 +674,6 @@ export function invalidateCompletionNavigation(
       session: null,
       pendingText: null,
       dismissedCandidateIds: [],
-      unpresentableVisualKeys: [],
       generationIntent: disarmCompletionGeneration(),
       scheduled: null,
       navigationPending,

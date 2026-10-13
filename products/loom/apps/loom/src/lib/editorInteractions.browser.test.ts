@@ -653,6 +653,36 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('0');
   });
 
+  it('renders and accepts inline Markdown through ProseMirror marks', async () => {
+    render('Something ', [
+      {
+        candidateId: 'formatted',
+        presentationKey: 'formatted:1',
+        text: '**boldly** continues',
+        runId: 'run-formatted',
+        targetByte: 10,
+        insertsOnAccept: true
+      }
+    ]);
+    await expect.poll(
+      () => document.querySelector('.loom-visual-ghost')?.textContent
+    ).toBe('boldly continues');
+    await expect.poll(
+      () => document.querySelector('.loom-visual-ghost strong')?.textContent
+    ).toBe('boldly');
+
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+
+    await expect.poll(serializedMarkdown).toBe('Something **boldly**');
+    await expect.poll(
+      () => page.getByRole('textbox', { name: 'Manuscript editor' })
+        .element().querySelector('strong')?.textContent
+    ).toBe('boldly');
+    await expect.poll(
+      () => document.querySelector('.loom-visual-ghost')?.textContent
+    ).toBe(' continues');
+  });
+
   it('gives a visible list-item completion priority over Tab indentation', async () => {
     render('1. one\n2. two', [
       {

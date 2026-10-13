@@ -1556,7 +1556,18 @@ fn validate_word_choice_output(
         _ => return Err(invalid()),
     };
     let seed = u32::try_from(generation.seed).map_err(|_| invalid())?;
-    if evidence.attempts.len() > FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize {
+    if evidence.attempts.len() > FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize
+        || evidence.forbidden_token_ids.iter().any(|token| *token < 0)
+        || evidence
+            .forbidden_token_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || policy.rejects_visual_control_tokens() == evidence.forbidden_token_ids.is_empty()
+        || output
+            .generated_token_ids
+            .iter()
+            .any(|token| evidence.forbidden_token_ids.binary_search(token).is_ok())
+    {
         return Err(invalid());
     }
     let selected = evidence.selected_attempt.map(|index| index as usize);
@@ -1586,6 +1597,13 @@ fn validate_word_choice_output(
                         .binary_search(token)
                         .is_ok()
                 })
+            || attempt
+                .token_ids
+                .iter()
+                .any(|token| evidence.forbidden_token_ids.binary_search(token).is_ok())
+            || attempt
+                .terminal_token_id
+                .is_some_and(|token| evidence.forbidden_token_ids.binary_search(&token).is_ok())
             || (attempt.outcome == Outcome::Accepted) != (selected == Some(index))
         {
             return Err(invalid());
@@ -2568,6 +2586,7 @@ mod tests {
         output.text = "river bends.".to_string();
         output.first_word_choice = Some(FirstWordChoiceEvidence {
             policy,
+            forbidden_token_ids: Vec::new(),
             attempts: vec![
                 FirstWordChoiceAttempt {
                     seed: 41,
@@ -2609,6 +2628,51 @@ mod tests {
                 "altered first-word evidence {change} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn visual_v5_receipt_binds_the_all_draw_control_mask() {
+        use llama_native_types::{
+            FirstWordChoiceAttempt, FirstWordChoiceAttemptOutcome as Outcome,
+            FirstWordChoiceEvidence, FirstWordChoicePolicy,
+        };
+        let request = request_with_two_cases();
+        let generation = &request.cases[0].generation;
+        let policy = FirstWordChoicePolicy::DistinctVisualProseV5;
+        let mut output = native_output(&request, 0, GenerationState::Completed, true);
+        output.text = "**river** bends.".to_string();
+        output.first_word_choice = Some(FirstWordChoiceEvidence {
+            policy,
+            forbidden_token_ids: vec![7, 8, 9],
+            attempts: vec![FirstWordChoiceAttempt {
+                seed: 41,
+                initial_token_exclusions: vec![99],
+                token_ids: vec![101],
+                terminal_token_id: None,
+                word_key: Some("river".to_string()),
+                outcome: Outcome::Accepted,
+            }],
+            selected_attempt: Some(0),
+            total_attempted_tokens: 2,
+            exhausted: false,
+        });
+        validate_word_choice_output(Some(policy), generation, &output).expect("bound mask");
+
+        let mut used = output.clone();
+        used.first_word_choice
+            .as_mut()
+            .expect("evidence")
+            .forbidden_token_ids
+            .push(101);
+        assert!(validate_word_choice_output(Some(policy), generation, &used).is_err());
+
+        let mut unsorted = output.clone();
+        unsorted
+            .first_word_choice
+            .as_mut()
+            .expect("evidence")
+            .forbidden_token_ids = vec![9, 7];
+        assert!(validate_word_choice_output(Some(policy), generation, &unsorted).is_err());
     }
 
     fn native_events(request: &ExactContinuationRequest) -> Vec<NativeEvent> {

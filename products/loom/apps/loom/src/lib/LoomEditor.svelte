@@ -35,6 +35,7 @@
     type GhostTextPresentation,
     type GhostTextPlan,
     type VisualCaretBoundaryFailure,
+    visualGhostTextInsertionTransaction,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
   import {
@@ -902,13 +903,19 @@
     if (selectionBoundary(view.state) !== plan.anchorByteOffset) return result('caret_mismatch');
     const word = nextVisualSuggestionWord(plan.text);
     if (!word) return result('word_unavailable');
+    const insertion = visualGhostTextInsertionTransaction(
+      view.state,
+      plan.anchorByteOffset,
+      word
+    );
+    if (!insertion) return result('projection_failed');
     if (!authorizeCompletionInsertion(
       plan.candidateId,
       plan.presentationKey,
       word,
       'shuttle_word'
     )) return result('controller_rejected');
-    view.dispatch(view.state.tr.insertText(word));
+    view.dispatch(insertion);
     return result('inserted');
   }
 
@@ -917,8 +924,14 @@
     const plan = currentGhostTextPlan(view.state);
     if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
         !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    const insertion = visualGhostTextInsertionTransaction(
+      view.state,
+      plan.anchorByteOffset,
+      text
+    );
+    if (!insertion) return false;
     if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
-    view.dispatch(view.state.tr.insertText(text));
+    view.dispatch(insertion);
     return true;
   }
 

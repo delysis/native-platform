@@ -12,7 +12,6 @@ import {
   startCompletionSession,
   updateCompletionCandidate
 } from './completionSession';
-import { emptyAutocompleteRetryLedger, planAutocompleteRetry } from './autocompleteRetry';
 import type { BranchCard, ModelCapabilitySummary, OpenDocument } from './types';
 
 const FAMILY_ONE = '01K00000000000000000000001';
@@ -92,14 +91,13 @@ function state(manuscriptText: string): InlineSuggestionState {
     suggestionsEnabled: true,
     promotionReady: true,
     dismissedCandidateIds: [],
-    unpresentableVisualKeys: [],
     manuscriptText,
     sourceNewline: null
   };
 }
 
 describe('inline suggestion family', () => {
-  it('uses one evaluation for atomic rendering and terminal recovery', () => {
+  it('reports a terminal invariant failure without selecting a replacement', () => {
     const selection = state('hello');
     selection.branches = selection.branches.map((branch) => ({ ...branch, status: 'ready' }));
     selection.liveTextByRun['run-4'] = '\n\nA heading cannot be an inline visual ghost.';
@@ -114,13 +112,6 @@ describe('inline suggestion family', () => {
       kind: 'exhausted',
       candidates: [{ candidateId: 'run:run-4', reason: 'unpresentable' }]
     });
-    expect(planAutocompleteRetry(emptyAutocompleteRetryLedger(), {
-      disposition: evaluation.disposition,
-      budgetKey: 'document:revision:model',
-      activeBranchCount: 0,
-      weaveStarting: false,
-      maximumRetries: 1
-    }).kind).toBe('schedule');
   });
 
   it('does not regenerate a family merely because its published choices were dismissed', () => {
@@ -184,14 +175,14 @@ describe('inline suggestion family', () => {
     expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
   });
 
-  it('projects multiline model output to one structurally faithful visual text block', () => {
+  it('never salvages a visual prefix from multiline sampler output', () => {
     expect(projectInlineCandidateText(
       5,
       'visual',
       'hello',
       ' world.\n\nA new paragraph.',
       null
-    )).toBe(' world.');
+    )).toBeNull();
     expect(projectInlineCandidateText(
       5,
       'source',

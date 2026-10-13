@@ -17,9 +17,10 @@ import {
   setGhostText,
   VISUAL_TAB_INDENT,
   visualGhostInsertionIsVisible,
+  visualGhostTextInsertionTransaction,
   visualGhostTextIsFaithfulAtSelection,
-  visualGhostTextMayBePlainProse,
-  visualGhostTextSafePrefix,
+  visualGhostTextMayBeInlineMarkdown,
+  visualGhostTextInlineCandidate,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -425,6 +426,7 @@ describe('visual ghost widget', () => {
       kind: 'set',
       presentation: {
         ...suggestion,
+        anchorByteOffset: 7,
         text: ' for rain.',
         fanVisible: true,
         alternatives: [
@@ -675,7 +677,7 @@ describe('faithful visual ghost projection', () => {
     const markdown = 'The rain waits.';
     const state = stateAt(markdown, Selection.atEnd(defaultMarkdownParser.parse(markdown)).from);
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBePlainProse(' for morning.')).toBe(true);
+    expect(visualGhostTextMayBeInlineMarkdown(' for morning.')).toBe(true);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -698,15 +700,15 @@ describe('faithful visual ghost projection', () => {
     )).toBe(true);
   });
 
-  it('rejects multiline block structure, Markdown controls, and the wrong anchor', () => {
+  it('admits inline Markdown, rejects block structure, and rejects the wrong anchor', () => {
     const markdown = 'The rain waits.';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
     const anchor = new TextEncoder().encode(markdown).byteLength;
-    expect(visualGhostTextMayBePlainProse(' **boldly**')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\nMorning came.\n\nThe bells answered.')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\n# Morning came.')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\n- Morning came.')).toBe(false);
+    expect(visualGhostTextMayBeInlineMarkdown(' **boldly**')).toBe(true);
+    expect(visualGhostTextMayBeInlineMarkdown('\n\nMorning came.\n\nThe bells answered.')).toBe(false);
+    expect(visualGhostTextMayBeInlineMarkdown('\n\n# Morning came.')).toBe(false);
+    expect(visualGhostTextMayBeInlineMarkdown('\n\n- Morning came.')).toBe(false);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -718,7 +720,11 @@ describe('faithful visual ghost projection', () => {
       markdown,
       anchor,
       ' **boldly**'
-    )).toBe(false);
+    )).toBe(true);
+    const insertion = visualGhostTextInsertionTransaction(state, anchor, ' **boldly**');
+    expect(insertion).not.toBeNull();
+    expect(defaultMarkdownSerializer.serialize(insertion!.doc)).toBe(`${markdown} **boldly**`);
+    expect(insertion!.doc.lastChild?.lastChild?.marks.map(mark => mark.type.name)).toContain('strong');
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -727,13 +733,12 @@ describe('faithful visual ghost projection', () => {
     )).toBe(false);
   });
 
-  it('surfaces the useful prose prefix when a completion later wanders into markup', () => {
-    expect(visualGhostTextSafePrefix(' The door opened.\n# Notes')).toBe(' The door opened.');
-    expect(visualGhostTextSafePrefix(' The door opened.\n\nMorning came.'))
-      .toBe(' The door opened.');
-    expect(visualGhostTextSafePrefix(' She waited **boldly**')).toBe(' She waited');
-    expect(visualGhostTextSafePrefix(' **boldly**')).toBeNull();
-    expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');
+  it('keeps the complete sampler output or rejects the complete candidate', () => {
+    expect(visualGhostTextInlineCandidate(' The door opened.\n# Notes')).toBeNull();
+    expect(visualGhostTextInlineCandidate(' The door opened.\n\nMorning came.')).toBeNull();
+    expect(visualGhostTextInlineCandidate(' She waited **boldly**')).toBe(' She waited **boldly**');
+    expect(visualGhostTextInlineCandidate(' **boldly**')).toBe(' **boldly**');
+    expect(visualGhostTextInlineCandidate(' ordinary prose')).toBe(' ordinary prose');
   });
 
   it('keeps numeric punctuation literal at a proven prose caret without admitting a list at block start', () => {
@@ -741,7 +746,7 @@ describe('faithful visual ghost projection', () => {
     const markdown = 'The lantern lit the ';
     const doc = parseVisualMarkdown(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
-    expect(visualGhostTextSafePrefix(text)).toBe(text);
+    expect(visualGhostTextInlineCandidate(text)).toBe(text);
     expect(visualGhostTextIsFaithfulAtSelection(state, markdown, markdown.length, text)).toBe(true);
     const empty = parseVisualMarkdown('');
     expect(visualGhostTextIsFaithfulAtSelection(
@@ -759,11 +764,11 @@ describe('faithful visual ghost projection', () => {
       '<!DOCTYPE html>',
       '<?xml version="1.0"?>'
     ]) {
-      expect(visualGhostTextMayBePlainProse(observed), observed).toBe(false);
-      expect(visualGhostTextSafePrefix(observed), observed).toBeNull();
+      expect(visualGhostTextMayBeInlineMarkdown(observed), observed).toBe(false);
+      expect(visualGhostTextInlineCandidate(observed), observed).toBeNull();
     }
-    expect(visualGhostTextSafePrefix('<3 forever')).toBe('<3 forever');
-    expect(visualGhostTextSafePrefix('< word')).toBe('< word');
+    expect(visualGhostTextInlineCandidate('<3 forever')).toBe('<3 forever');
+    expect(visualGhostTextInlineCandidate('< word')).toBe('< word');
   });
 
   it('rejects candidate edges that join a human grapheme', () => {
@@ -776,7 +781,7 @@ describe('faithful visual ghost projection', () => {
       const doc = defaultMarkdownParser.parse(markdown);
       const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
       const anchor = new TextEncoder().encode(markdown).byteLength;
-      expect(visualGhostTextMayBePlainProse(text)).toBe(true);
+      expect(visualGhostTextMayBeInlineMarkdown(text)).toBe(true);
       expect(visualGhostTextIsFaithfulAtSelection(
         state,
         markdown,
@@ -792,7 +797,7 @@ describe('faithful visual ghost projection', () => {
     const state = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
     const anchor = new TextEncoder().encode('A ').byteLength;
     const text = '🇺';
-    expect(visualGhostTextMayBePlainProse(text)).toBe(true);
+    expect(visualGhostTextMayBeInlineMarkdown(text)).toBe(true);
     expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(false);
   });
 });
