@@ -35,6 +35,11 @@ func manuscriptEndCaret(original: Data, expected: Data) -> Int? {
     return text.utf16.count
 }
 
+func hasRemainderAfterOneWord(_ candidate: Data) -> Bool {
+    guard let text = String(data: candidate, encoding: .utf8) else { return false }
+    return text.split(whereSeparator: { $0.isWhitespace }).count >= 2
+}
+
 func insertionContractTests() {
     let original = Data("hello ".utf8), candidate = Data("world again".utf8)
     var checks = 0
@@ -77,6 +82,9 @@ func insertionContractTests() {
     check(manuscriptEndCaret(original: original, expected: Data("hello 🜁".utf8)) == 8, "caret uses UTF-16 rather than bytes")
     check(manuscriptEndCaret(original: original, expected: Data("Hello one".utf8)) == nil, "reject changed original at refocus")
     check(manuscriptEndCaret(original: Data(), expected: Data([0xff])) == nil, "reject invalid manuscript encoding")
+    check(hasRemainderAfterOneWord(Data("one two".utf8)), "multiword candidate retains a remainder")
+    check(!hasRemainderAfterOneWord(Data("one".utf8)), "one-word candidate is exhausted")
+    check(!hasRemainderAfterOneWord(Data([0xff])), "reject invalid candidate encoding")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -732,6 +740,39 @@ guard let rolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
 }
 let rolledBack = rolledBackEvidence.witness
 
+// Shuttle must have a cached remainder after its first timed word. Otherwise
+// exhausting a legitimate one-word candidate immediately authorizes a new
+// generation family, which would make the later no-regeneration assertion
+// test a false premise. Choose the longest independently verified multiword
+// candidate and move the native fan to it while Option is still held.
+guard let shuttleRunId = runIds
+    .filter({ expectedCandidates[$0].map(hasRemainderAfterOneWord) == true })
+    .max(by: { expectedCandidates[$0]!.count < expectedCandidates[$1]!.count }),
+      let initialIndex = runIds.firstIndex(of: initialRunId),
+      let shuttleIndex = runIds.firstIndex(of: shuttleRunId) else {
+    releaseOptionAndFail("the verified completion family had no multiword candidate for Shuttle")
+}
+var shuttleSelected = rolledBack
+let shuttleSelectionSteps = (shuttleIndex - initialIndex + runIds.count) % runIds.count
+if shuttleSelectionSteps > 0 {
+    for step in 1...shuttleSelectionSteps {
+        guard postKey(125, down: true, flags: [.maskAlternate]),
+              postKey(125, down: false, flags: [.maskAlternate]) else {
+            releaseOptionAndFail("could not select Shuttle's verified multiword candidate")
+        }
+        let expectedRunId = runIds[(initialIndex + step) % runIds.count]
+        guard let selectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
+            let rendered = visual(witness)
+            return sameFamily(witness, context: context, runIds: runIds) &&
+                string(witness, "selected_run_id") == expectedRunId &&
+                bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+        }) else {
+            releaseOptionAndFail("the native fan did not reach Shuttle's verified multiword candidate")
+        }
+        shuttleSelected = selectedEvidence.witness
+    }
+}
+
 postKey(58, down: false, flags: [])
 guard let optionReleased = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
@@ -773,7 +814,7 @@ guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeou
               integer(witness, "accepted_utf8_bytes") > 0 &&
               bool(witness, "authority_frozen") &&
               string(action, "kind") == "shuttle_word" &&
-              string(action, "run_id") == initialRunId &&
+              string(action, "run_id") == shuttleRunId &&
               integer(action, "accepted_utf8_bytes") == integer(witness, "accepted_utf8_bytes") &&
               integer(action, "sequence") > integer(lastAction(wordAccepted), "sequence")
       }) else {
@@ -843,7 +884,7 @@ guard postKey(58, down: true, flags: [.maskAlternate]),
       let returnSelectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
-              string(witness, "selected_run_id") != initialRunId &&
+              string(witness, "selected_run_id") != shuttleRunId &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
       }) else {
     releaseOptionAndFail("could not select a non-default cached run for fan Return")
@@ -1001,6 +1042,8 @@ let evidence: [String: Any] = [
     "cycled_up_witness": cycledUp,
     "word_accepted_witness": wordAccepted,
     "rolled_back_witness": rolledBack,
+    "shuttle_selected_run_id": shuttleRunId,
+    "shuttle_selected_witness": shuttleSelected,
     "option_released_witness": optionReleased,
     "shuttle_enabled_witness": shuttleEnabled,
     "shuttle_accepted_witness": shuttleAccepted,
