@@ -74,16 +74,22 @@ describe('retained output pane', () => {
     let resolve: ((document: { text: string }) => void) | undefined;
     ipc.open.mockImplementation(() => new Promise((done) => { resolve = done; }));
     render(true, [{ document_id: 'document-1', relative_path: 'Results/Try 1.md', title: 'Take', kind: 'prose', revision_id: 'revision', active_blob_id: 'blob', word_count: 3, externally_modified: false }], 'Earlier line\n'.repeat(100));
-    const viewport = document.querySelector('.terminal-scroll')!;
-    await expect.poll(() => viewport.scrollTop).toBeGreaterThan(0);
-    await expect.element(page.getByRole('textbox', { name: 'Command' })).toHaveFocus();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-    viewport.scrollTop = 0;
-    viewport.dispatchEvent(new Event('scroll'));
-    await tick();
-    resolve!({ text: 'Earlier line\n'.repeat(200) });
-    await expect.poll(() => document.querySelector('pre')?.textContent).toBe('Earlier line\n'.repeat(200));
-    expect(viewport.scrollTop).toBe(0);
+    try {
+      const viewport = document.querySelector('.terminal-scroll')!;
+      await expect.poll(() => viewport.scrollTop).toBeGreaterThan(0);
+      await expect.element(page.getByRole('textbox', { name: 'Command' })).toHaveFocus();
+      await new Promise<void>((done) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => done()))
+      );
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event('scroll'));
+      await tick();
+      resolve!({ text: 'Earlier line\n'.repeat(200) });
+      await expect.poll(() => document.querySelector('pre')?.textContent).toBe('Earlier line\n'.repeat(200));
+      expect(viewport.scrollTop).toBe(0);
+    } finally {
+      resolve?.({ text: 'Earlier line\n'.repeat(200) });
+    }
   });
 
 });

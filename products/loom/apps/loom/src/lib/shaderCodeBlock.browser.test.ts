@@ -92,14 +92,18 @@ describe('inline shader code block', () => {
       return { fragment: checkerFragment };
     });
     render(source + '\n```\n\n```wgsl\n' + source, compiler);
-    await expect.poll(() => compiler.mock.calls.length).toBe(1);
-    release!();
-    await expect.poll(() => document.querySelectorAll('canvas:not([hidden])').length).toBe(2);
-    expect(compiler).toHaveBeenCalledTimes(2);
-    expect(peak).toBe(1);
-    for (const canvas of document.querySelectorAll('canvas')) {
-      expect(canvas.getContext('webgl2')).toBeNull();
-      expect(pixel(canvas, 16, 239)).toEqual([0, 0, 255, 255]);
+    try {
+      await expect.poll(() => compiler.mock.calls.length).toBe(1);
+      release!();
+      await expect.poll(() => document.querySelectorAll('canvas:not([hidden])').length).toBe(2);
+      expect(compiler).toHaveBeenCalledTimes(2);
+      expect(peak).toBe(1);
+      for (const canvas of document.querySelectorAll('canvas')) {
+        expect(canvas.getContext('webgl2')).toBeNull();
+        expect(pixel(canvas, 16, 239)).toEqual([0, 0, 255, 255]);
+      }
+    } finally {
+      release?.();
     }
   });
 
@@ -108,12 +112,16 @@ describe('inline shader code block', () => {
     const compiler = vi.fn(() => new Promise<{ fragment: string }>((done) => { resolve = done; }));
     const editor = render(source, compiler);
     const canvas = document.querySelector('canvas')!;
-    await expect.poll(() => compiler.mock.calls.length).toBe(1);
-    editor.dispatch(editor.state.tr.setNodeMarkup(0, undefined, { params: 'text' }));
-    resolve!({ fragment: checkerFragment });
-    await Promise.resolve();
-    expect(canvas.hidden).toBe(true);
-    expect(document.querySelector('canvas')).toBeNull();
-    expect(serializeVisualMarkdown(editor.state.doc)).toBe('```text\n' + source + '\n```');
+    try {
+      await expect.poll(() => compiler.mock.calls.length).toBe(1);
+      editor.dispatch(editor.state.tr.setNodeMarkup(0, undefined, { params: 'text' }));
+      resolve!({ fragment: checkerFragment });
+      await Promise.resolve();
+      expect(canvas.hidden).toBe(true);
+      expect(document.querySelector('canvas')).toBeNull();
+      expect(serializeVisualMarkdown(editor.state.doc)).toBe('```text\n' + source + '\n```');
+    } finally {
+      resolve?.({ fragment: checkerFragment });
+    }
   });
 });

@@ -12,9 +12,9 @@ use std::sync::{Mutex, OnceLock};
 use atomic_write_file::AtomicWriteFile;
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    ArtifactPayload, AttachmentBundle, AttachmentReceipt, AudioPreparationPolicy, Coverage,
-    DetectedFormat, MediaFamily, PreparationPlan, PreparationPolicy, PreparedPart, SegmentKind,
-    TargetCapabilities,
+    ArtifactPayload, AttachmentBundle, AttachmentJobId, AttachmentReceipt, AudioPreparationPolicy,
+    Coverage, DetectedFormat, MediaFamily, PreparationPlan, PreparationPolicy, PreparedPart,
+    SegmentKind, TargetCapabilities,
 };
 use image::{ImageDecoder as _, ImageEncoder as _};
 use llama_native_types::{MediaInput, MediaKind};
@@ -38,7 +38,7 @@ const PROMPT_OVERHEAD_TOKENS: u32 = 1_024;
 const RETRIEVAL_REBALANCE_BYTES: usize = 16 * 1024;
 const PREAMBLE_CACHE_ENTRIES: usize = 8;
 const PREAMBLE_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const MANIFEST_SCHEMA: &str = "loom.context-attachment.v3";
+const MANIFEST_SCHEMA: &str = "loom.context-attachment.v4";
 const CONTEXT_SCHEMA: &str = "loom.document-context.v4";
 const RETRIEVAL_SCHEMA: &str = "loom.context-retrieval.v4";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +155,25 @@ struct ImageConversion {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparationProvenance {
+    target_id: String,
+    target_fingerprint: String,
+    source_job_id: AttachmentJobId,
+}
+
+impl From<&PreparationPlan> for PreparationProvenance {
+    fn from(plan: &PreparationPlan) -> Self {
+        Self {
+            target_id: plan.target_id.clone(),
+            target_fingerprint: plan.target_fingerprint.clone(),
+            source_job_id: plan.source_job_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AttachmentManifest {
     schema: String,
     attachment: StoredAttachment,
@@ -165,7 +184,7 @@ struct AttachmentManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pdf_pages: Vec<PdfPageLocation>,
     media: Vec<StoredMedia>,
-    preparation_plan: PreparationPlan,
+    preparation: PreparationProvenance,
     processing_receipt: AttachmentReceipt,
 }
 
@@ -728,6 +747,7 @@ fn prepare_provided_using(
     if !valid_pdf_pages(&pdf_pages, &attachment) {
         return Err(ContextAttachmentError::ContextInvalid);
     }
+    let preparation = PreparationProvenance::from(&prepared.plan);
     let manifest = AttachmentManifest {
         schema: MANIFEST_SCHEMA.to_owned(),
         attachment: attachment.clone(),
@@ -735,7 +755,7 @@ fn prepare_provided_using(
         canonical_text_sha256,
         pdf_pages,
         media: stored_media,
-        preparation_plan: prepared.plan,
+        preparation,
         processing_receipt: prepared.receipt,
     };
     if let Some(existing) = read_manifest_if_present(project_root, &id)? {
@@ -2394,7 +2414,7 @@ fn read_manifest_if_present(
         _ => false,
     };
     let target_fingerprint_is_valid =
-        manifest.preparation_plan.target_fingerprint == gemma_target().fingerprint;
+        manifest.preparation.target_fingerprint == gemma_target().fingerprint;
     if !text_representation_is_valid
         || !valid_pdf_pages(&manifest.pdf_pages, &manifest.attachment)
         || manifest.attachment.id != id
@@ -2423,8 +2443,8 @@ fn read_manifest_if_present(
         || manifest.processing_receipt.network_used
         || manifest.processing_receipt.process_used
         || manifest.processing_receipt.model_invoked
-        || manifest.preparation_plan.source_job_id != manifest.processing_receipt.job_id
-        || manifest.preparation_plan.target_id != gemma_target().target_id
+        || manifest.preparation.source_job_id != manifest.processing_receipt.job_id
+        || manifest.preparation.target_id != gemma_target().target_id
         || !target_fingerprint_is_valid
     {
         return Err(ContextAttachmentError::ContextInvalid);
@@ -3116,6 +3136,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn manifest_retains_compact_preparation_provenance_and_rejects_the_old_schema() {
+        let project = tempfile::tempdir().expect("project");
+        let path = project.path().join("compact.md");
+        let source = "Unique canonical attachment prose.\n".repeat(512);
+        fs::write(&path, &source).expect("source");
+        let attachment = import_path(project.path(), &path).expect("import");
+        let mut manifest = read_manifest(project.path(), &attachment.id).expect("manifest");
+        let encoded = serde_json::to_vec(&manifest).expect("serialize manifest");
+        assert_eq!(manifest.schema, MANIFEST_SCHEMA);
+        assert!(
+            !encoded
+                .windows(source.len())
+                .any(|window| window == source.as_bytes())
+        );
+        assert!(
+            !encoded
+                .windows(b"\"parts\"".len())
+                .any(|window| window == b"\"parts\"")
+        );
+        assert_eq!(manifest.preparation.target_id, gemma_target().target_id);
+
+        manifest.schema = "loom.context-attachment.v3".to_owned();
+        let manifest_path = attachment_root(project.path())
+            .expect("root")
+            .join("manifests")
+            .join(format!("{}.json", attachment.id));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("old manifest"),
+        )
+        .expect("write old manifest");
+        assert!(read_manifest(project.path(), &attachment.id).is_err());
     }
 
     #[test]

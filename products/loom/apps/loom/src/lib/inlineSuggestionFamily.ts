@@ -1,10 +1,6 @@
 import { verifiedBodyMatchesBranch, type VerifiedBranchBody } from './branchBodyProof';
 import { completionTextAtBoundary } from './completionSession';
-import {
-  verifiedGhostSuggestion,
-  type AutocompleteDisposition,
-  type AutocompleteExhaustionReason
-} from './ghostSuggestion';
+import { verifiedGhostSuggestion } from './ghostSuggestion';
 import type { SuggestionAlternative } from './suggestionInteraction';
 import type {
   BranchCard,
@@ -18,6 +14,21 @@ export interface InlineGhostSuggestion extends SuggestionAlternative {
   targetByte: number;
   insertsOnAccept: boolean;
 }
+
+type AutocompleteExhaustionReason = 'invalid';
+
+type AutocompleteDisposition =
+  | { kind: 'inactive' }
+  | { kind: 'awaiting_candidates' }
+  | { kind: 'awaiting_hydration'; runIds: readonly string[] }
+  | { kind: 'available'; suggestion: InlineGhostSuggestion }
+  | {
+      kind: 'exhausted';
+      candidates: readonly {
+        candidateId: string;
+        reason: AutocompleteExhaustionReason;
+      }[];
+    };
 
 export interface InlineSuggestionState {
   branches: BranchCard[];

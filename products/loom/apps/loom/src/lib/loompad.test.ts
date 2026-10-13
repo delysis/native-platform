@@ -30,17 +30,11 @@ describe('Loompad input authority', () => {
     }
     expect(loompadKey(emptyLoompadChord(), 'KeyD', true, false, true)).toMatchObject({ choice: 3, accept: true });
   });
-  it('preserves exact Unicode and CRLF prefixes at each length', () => {
+  it('preserves the exact Unicode word prefix', () => {
     const text = ' 👩🏽‍🚀 Hello, café! Next sentence.\r\n\r\nSecond paragraph.';
-    for (const length of ['word','phrase','sentence','paragraph'] as const) {
-      const prefix = loompadPrefix(text, length)!;
-      expect(text.startsWith(prefix)).toBe(true);
-      expect(prefix).not.toMatch(/[\ud800-\udbff]$/u);
-    }
-    expect(loompadPrefix(' One two three four five', 'phrase')).toBe(' One two three four ');
-    expect(loompadPrefix(' One two three four five', 'phrase', true)).toBe(' One two three four');
-    expect(loompadPrefix(' First. Second.', 'sentence')).toBe(' First. ');
-    expect(loompadPrefix(' First\r\n\r\nSecond', 'paragraph')).toBe(' First');
+    const prefix = loompadPrefix(text, 'word')!;
+    expect(text.startsWith(prefix)).toBe(true);
+    expect(prefix).not.toMatch(/[\ud800-\udbff]$/u);
     expect(loompadPrefix('  ', 'word')).toBeNull();
   });
 });

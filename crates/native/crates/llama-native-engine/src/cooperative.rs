@@ -274,40 +274,31 @@ fn cancelled() -> NativeError {
     NativeError::new(NativeErrorCode::Cancelled, "cooperative request cancelled")
 }
 
-/// Every stream has fixed native capacity and exactly one live request owner.
-/// Removing one owner cannot change another stream's physical cell layout.
+/// Fixed native stream geometry. `Pool::live` is the sole occupancy authority.
 #[derive(Debug)]
-struct Reservations {
+struct StreamLayout {
     cells: usize,
     slots: usize,
-    held: std::collections::BTreeSet<usize>,
 }
-impl Reservations {
+impl StreamLayout {
     fn new(cells: usize, sequences: usize, batch: usize) -> Self {
         Self {
             cells,
             slots: sequences.min(batch).min(MAX_LIVE),
-            held: std::collections::BTreeSet::new(),
         }
     }
-    fn reserve(&mut self, cells: usize) -> NativeResult<Option<usize>> {
+    fn vacant_slot(
+        &self,
+        cells: usize,
+        occupied: impl Fn(usize) -> bool,
+    ) -> NativeResult<Option<usize>> {
         if cells == 0 || cells > self.cells || self.slots == 0 {
             return Err(NativeError::new(
                 NativeErrorCode::PromptTooLarge,
                 "cooperative request exceeds its independent stream capacity",
             ));
         }
-        let Some(slot) = (0..self.slots).find(|slot| !self.held.contains(slot)) else {
-            return Ok(None);
-        };
-        self.held.insert(slot);
-        Ok(Some(slot))
-    }
-    fn release(&mut self, slot: usize) -> NativeResult<()> {
-        if !self.held.remove(&slot) {
-            return Err(internal("cooperative reservation released twice"));
-        }
-        Ok(())
+        Ok((0..self.slots).find(|slot| !occupied(*slot)))
     }
 }
 
@@ -710,7 +701,7 @@ pub(super) struct Runtime<'a, 'model> {
 }
 
 struct Pool {
-    reservations: Reservations,
+    layout: StreamLayout,
     live: BTreeMap<usize, Sequence>,
     pending: Option<Pending>,
     prefill_cursor: usize,
@@ -718,7 +709,7 @@ struct Pool {
 
 pub(super) fn run(first: WorkerCommand, mut runtime: Runtime<'_, '_>) {
     let mut pool = Pool {
-        reservations: Reservations::new(
+        layout: StreamLayout::new(
             (runtime.context.n_ctx() / runtime.fingerprint.max_sequences) as usize,
             runtime.fingerprint.max_sequences as usize,
             runtime.context.n_batch() as usize,
@@ -785,7 +776,7 @@ fn run_inner(
                     if job.cancel.load(Ordering::Acquire) {
                         job.reject(cancelled());
                     } else {
-                        match Pending::prepare(job, runtime.model, pool.reservations.cells) {
+                        match Pending::prepare(job, runtime.model, pool.layout.cells) {
                             Ok(pending) => pool.pending = Some(pending),
                             Err((job, error)) => (*job).reject(error),
                         }
@@ -805,13 +796,23 @@ fn run_inner(
         if let Some(pending) = pool.pending.take() {
             if pending.job.cancel.load(Ordering::Acquire) {
                 pending.job.reject(cancelled());
-            } else if let Some(slot) = pool.reservations.reserve(pending.cells)? {
+            } else if let Some(slot) = pool
+                .layout
+                .vacant_slot(pending.cells, |slot| pool.live.contains_key(&slot))?
+            {
                 match Sequence::start(pending, runtime) {
                     Ok(sequence) => {
-                        pool.live.insert(slot, sequence);
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            pool.live.entry(slot)
+                        {
+                            entry.insert(sequence);
+                        } else {
+                            let error = internal("cooperative slot was occupied during admission");
+                            sequence.fail(copy_error(&error));
+                            return Err(error);
+                        }
                     }
                     Err((job, error)) => {
-                        pool.reservations.release(slot)?;
                         (*job).reject(error);
                     }
                 }
@@ -867,7 +868,6 @@ fn settle(runtime: &mut Runtime<'_, '_>, pool: &mut Pool) -> NativeResult<()> {
             sequence.fail(copy_error(&error));
             return Err(error);
         }
-        pool.reservations.release(slot)?;
         if sequence.job.reasoning_force.load(Ordering::Acquire) {
             sequence.fail(unsupported(
                 "reasoning intervention is unsupported for an independently scheduled request",
@@ -1559,28 +1559,44 @@ mod tests {
     }
 
     #[test]
-    fn reservations_bound_each_stream_and_reuse_only_released_slots() -> NativeResult<()> {
-        let mut budget = Reservations::new(100, 2, 4);
-        let first = budget.reserve(100)?.expect("free independent stream");
-        let second = budget.reserve(100)?.expect("free independent stream");
+    fn live_occupancy_bounds_each_stream_and_reuses_only_vacant_slots() -> NativeResult<()> {
+        let layout = StreamLayout::new(100, 2, 4);
+        let mut occupied = std::collections::BTreeSet::new();
+        let first = layout
+            .vacant_slot(100, |slot| occupied.contains(&slot))?
+            .expect("free independent stream");
+        occupied.insert(first);
+        let second = layout
+            .vacant_slot(100, |slot| occupied.contains(&slot))?
+            .expect("free independent stream");
+        occupied.insert(second);
         assert_ne!(first, second);
-        assert!(budget.reserve(1)?.is_none());
-        budget.release(first)?;
-        assert_eq!(budget.reserve(100)?, Some(first));
-        assert!(budget.reserve(101).is_err());
-        assert!(budget.reserve(usize::MAX).is_err());
-        budget.release(second)?;
-        assert!(budget.release(second).is_err());
+        assert!(
+            layout
+                .vacant_slot(1, |slot| occupied.contains(&slot))?
+                .is_none()
+        );
+        occupied.remove(&first);
+        assert_eq!(
+            layout.vacant_slot(100, |slot| occupied.contains(&slot))?,
+            Some(first)
+        );
+        assert!(layout.vacant_slot(101, |_| false).is_err());
+        assert!(layout.vacant_slot(usize::MAX, |_| false).is_err());
         Ok(())
     }
 
     #[test]
     fn batch_width_and_sequence_limits_are_both_admission_limits() -> NativeResult<()> {
-        let mut budget = Reservations::new(100, 8, 2);
-        assert_eq!(budget.reserve(1)?, Some(0));
-        assert_eq!(budget.reserve(1)?, Some(1));
-        assert!(budget.reserve(1)?.is_none());
-        assert!(Reservations::new(100, 0, 2).reserve(1).is_err());
+        let layout = StreamLayout::new(100, 8, 2);
+        assert_eq!(layout.vacant_slot(1, |_| false)?, Some(0));
+        assert_eq!(layout.vacant_slot(1, |slot| slot == 0)?, Some(1));
+        assert!(layout.vacant_slot(1, |_| true)?.is_none());
+        assert!(
+            StreamLayout::new(100, 0, 2)
+                .vacant_slot(1, |_| false)
+                .is_err()
+        );
         Ok(())
     }
 

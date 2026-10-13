@@ -247,11 +247,15 @@ describe('Markdown-safe visual formatting', () => {
 
   it('rejects unsafe or selection-free links', () => {
     const doc = defaultMarkdownParser.parse('Words\n');
-    let state = EditorState.create({ doc, selection: TextSelection.create(doc, 1) });
-    expect(applyVisualFormat(state, 'link', 'https://example.com', (transaction) => {
-      state = state.apply(transaction);
+    let empty = EditorState.create({ doc, selection: TextSelection.create(doc, 1) });
+    expect(applyVisualFormat(empty, 'link', 'https://example.com', (transaction) => {
+      empty = empty.apply(transaction);
     })).toBe(false);
-    expect(applyVisualFormat(state, 'link', 'bad url', () => {})).toBe(false);
+    const selected = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, 1, doc.content.size - 1)
+    });
+    expect(applyVisualFormat(selected, 'link', 'bad url', () => {})).toBe(false);
   });
 
   it('removes an existing link without changing its text', () => {

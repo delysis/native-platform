@@ -1,7 +1,7 @@
 import { nextSuggestionWord } from './suggestionInteraction';
 
 export const LOOMPAD_KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD'] as const;
-export type LoompadLength = 'word' | 'phrase' | 'sentence' | 'paragraph';
+export type LoompadLength = 'word';
 export interface LoompadChord { choices: string[] }
 export const emptyLoompadChord = (): LoompadChord => ({ choices: [] });
 
@@ -26,23 +26,8 @@ export function loompadKey(state: LoompadChord, code: string, down: boolean, rep
 }
 
 /** Prefixes are taken from the visible candidate, never re-tokenized or normalized. */
-export function loompadPrefix(text: string, length: LoompadLength, visual = false): string | null {
-  let prefix = '';
-  if (length === 'word' || length === 'phrase') {
-    let remainder = text;
-    for (let count = 0; count < (length === 'word' ? 1 : 4); count++) {
-      const word = nextSuggestionWord(remainder);
-      if (!word) break;
-      prefix += word;
-      remainder = remainder.slice(word.length);
-    }
-  } else if (length === 'sentence') {
-    const segmenter = new Intl.Segmenter(undefined, { granularity: 'sentence' });
-    prefix = [...segmenter.segment(text)][0]?.segment ?? text;
-  } else {
-    const boundary = text.search(/\r?\n[\t ]*\r?\n/u);
-    prefix = boundary < 0 ? text : text.slice(0, boundary);
-  }
+export function loompadPrefix(text: string, _length: LoompadLength, visual = false): string | null {
+  let prefix = nextSuggestionWord(text) ?? '';
   // Visual Markdown does not preserve terminal paragraph whitespace.
   if (visual) prefix = prefix.replace(/\s+$/u, '');
   return /\S/u.test(prefix) ? prefix : null;

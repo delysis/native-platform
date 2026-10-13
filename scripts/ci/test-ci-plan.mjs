@@ -8,6 +8,14 @@ import path from "node:path";
 import test from "node:test";
 
 const planner = path.resolve(import.meta.dirname, "ci-plan.mjs");
+const fixtureRepos = new Set();
+
+test.afterEach(() => {
+  for (const repo of fixtureRepos) {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+  fixtureRepos.clear();
+});
 
 const metadataPackages = [
   ["llama-native-types", "crates/native/crates/llama-native-types", []],
@@ -82,6 +90,7 @@ function commit(repo, message) {
 
 function makeRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "native-platform-ci-plan-"));
+  fixtureRepos.add(repo);
   git(repo, "init", "-q");
   git(repo, "config", "user.email", "ci-plan@example.invalid");
   git(repo, "config", "user.name", "CI planner tests");
