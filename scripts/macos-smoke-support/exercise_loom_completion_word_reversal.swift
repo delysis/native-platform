@@ -925,10 +925,15 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
       let returnAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
+          let renderedKey = string(witness, "rendered_presentation_key")
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
+              !renderedKey.isEmpty &&
+              string(rendered, "selectedPresentationKey") == renderedKey &&
+              bool(rendered, "inlineHidden") &&
+              stringArray(rendered, "alternativeRunIds").isEmpty &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_return" &&
               string(action, "run_id") == returnRunId &&
@@ -998,10 +1003,15 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
       let tabAccepted = waitForWitness(timeout: 10, { witness in
           let rendered = visual(witness)
           let action = lastAction(witness)
+          let renderedKey = string(witness, "rendered_presentation_key")
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 1 &&
               bool(witness, "authority_frozen") &&
+              !renderedKey.isEmpty &&
+              string(rendered, "selectedPresentationKey") == renderedKey &&
+              bool(rendered, "inlineHidden") &&
+              stringArray(rendered, "alternativeRunIds").isEmpty &&
               !bool(rendered, "fanVisible") &&
               string(action, "kind") == "fan_tab" &&
               string(action, "run_id") == tabRunId &&
