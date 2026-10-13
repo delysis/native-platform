@@ -6689,6 +6689,16 @@
       : visualEditor?.focusAtDocumentEnd() ?? false;
   }
 
+  function currentWritingSurfaceHasExactFocus(): boolean {
+    return mode === 'source'
+      ? sourceEditor?.hasExactFocus() ?? false
+      : visualEditor?.hasExactFocus() ?? false;
+  }
+
+  function waitForNativeMenuFocusRelease(): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+
   async function restoreCompletionAutomation(
     captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
@@ -7415,13 +7425,22 @@
           await tick();
           // A native menu action and the document-identity remount can each
           // reclaim focus on adjacent run-loop turns. Rebind the exact window
-          // and editor together across those bounded turns.
-          for (let focusAttempt = 0; focusAttempt < 3; focusAttempt += 1) {
+          // and editor together until focus remains stable for one native menu
+          // turn. A different DOM target ends the lease immediately.
+          const nativeMenuFocusOwner = window.document.activeElement;
+          for (let focusAttempt = 0; focusAttempt < 10; focusAttempt += 1) {
             if (
               applicationClosePhase !== 'running' ||
               requestSerial !== navigationSerial ||
               !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) ||
               document?.summary.document_id !== target.documentId
+            ) break;
+            const activeElement = window.document.activeElement;
+            if (
+              focusAttempt > 0 &&
+              !currentWritingSurfaceHasExactFocus() &&
+              activeElement !== nativeMenuFocusOwner &&
+              activeElement !== window.document.body
             ) break;
             if (desktop) {
               try { await getCurrentWindow().setFocus(); }
@@ -7434,6 +7453,8 @@
               projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
               document?.summary.document_id === target.documentId
             ) focusCurrentWritingSurfaceAtEnd();
+            await waitForNativeMenuFocusRelease();
+            if (currentWritingSurfaceHasExactFocus()) break;
           }
         }
       }
