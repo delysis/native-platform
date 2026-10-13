@@ -983,15 +983,24 @@ export function listenForReverseCompletion(handler: () => void): Promise<Unliste
   return listen('loom://reverse-completion', handler);
 }
 
-let completionReversalArmTail: Promise<void> = Promise.resolve();
+let completionReversalArmDesired = false;
+let completionReversalArmInFlight: Promise<void> | null = null;
+
+async function flushCompletionReversalArm(): Promise<void> {
+  while (true) {
+    const armed = completionReversalArmDesired;
+    await invoke('completion_reversal_arm', { armed });
+    if (armed === completionReversalArmDesired) return;
+  }
+}
 
 export function armCompletionReversal(armed: boolean): Promise<void> {
   if (!isDesktopRuntime()) return Promise.resolve();
-  completionReversalArmTail = completionReversalArmTail.then(
-    () => invoke('completion_reversal_arm', { armed }),
-    () => invoke('completion_reversal_arm', { armed })
-  );
-  return completionReversalArmTail;
+  completionReversalArmDesired = armed;
+  completionReversalArmInFlight ??= flushCompletionReversalArm().finally(() => {
+    completionReversalArmInFlight = null;
+  });
+  return completionReversalArmInFlight;
 }
 
 export function setFocusMode(

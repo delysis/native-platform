@@ -68,6 +68,7 @@ it('explicit Mom chat sends from the original pane without a manuscript writer a
       case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
+      case 'completion_reversal_arm': return null;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
@@ -144,6 +145,7 @@ it.each(['saved', 'failed'] as const)('waits for shared preferences (%s) before 
       case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return preferences;
       case 'plugin:loom|application_close_pending': return false;
+      case 'completion_reversal_arm': return null;
       case 'plugin:loom|workspace_chat_route': return 'mom_experimental';
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
@@ -239,6 +241,7 @@ it.each([
       case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
+      case 'completion_reversal_arm': return null;
       case 'plugin:loom|workspace_chat_route': return 'loom';
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
@@ -386,6 +389,7 @@ it.each([
       case 'plugin:loom|cabal_snapshot': return null;
       case 'plugin:loom|preferences_get': return { revision: '0', last_local_model: null, project_suggestions: {} };
       case 'plugin:loom|application_close_pending': return false;
+      case 'completion_reversal_arm': return null;
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
       case 'plugin:loom|document_open': return opened;
@@ -853,6 +857,7 @@ it('keeps the actual writer choice through rejection, four-slot absence and re-a
           project_suggestions: { [project.project_id]: true } };
         return preferences;
       case 'plugin:loom|application_close_pending': return false;
+      case 'completion_reversal_arm': return null;
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id,
         workspace_session_id: 'intent-workspace-session', roots: [{ id: 'owner', name: project.title,

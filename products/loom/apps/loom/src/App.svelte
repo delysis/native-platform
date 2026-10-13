@@ -1525,7 +1525,7 @@
     const editorFocused = mode === 'source'
       ? Boolean(sourceEditor?.hasExactFocus())
       : Boolean(visualEditor?.hasExactFocus());
-    void armCompletionReversal(Boolean(ghostUnconsumeText && editorFocused));
+    setNativeCompletionReversalArm(Boolean(ghostUnconsumeText && editorFocused));
   }
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
@@ -2736,7 +2736,7 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
-      void armCompletionReversal(false);
+      setNativeCompletionReversalArm(false);
       documentEpoch += 1;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);
@@ -6971,6 +6971,12 @@
     }, 0);
   }
 
+  function setNativeCompletionReversalArm(armed: boolean): void {
+    void armCompletionReversal(armed).catch((error) => {
+      if (componentMounted) recordFailure(error);
+    });
+  }
+
   async function finishOpeningProject(
     opened: ProjectSnapshot,
     restoreSerial: number,
@@ -8498,6 +8504,7 @@
       session_context_matches: completionController.session?.contextKey === completionContextKey,
       promotion_ready: branchPromotionReady, family_count: activeSuggestionFamily.length
     } });
+    if (authorization.authorized) setNativeCompletionReversalArm(true);
     completionController = authorization.state;
     return authorization.authorized;
   }
