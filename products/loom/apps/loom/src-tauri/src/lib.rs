@@ -217,6 +217,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
         Some(APPLICATION_QUIT_ACCELERATOR),
     )?;
     let file = build_file_menu(app, &quit)?;
+    let edit = build_edit_menu(app)?;
     let window = Submenu::with_id_and_items(
         app,
         WINDOW_SUBMENU_ID,
@@ -268,28 +269,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                 ],
             )?,
             &file,
-            &Submenu::with_items(
-                app,
-                "Edit",
-                true,
-                &[
-                    &PredefinedMenuItem::undo(app, None)?,
-                    &PredefinedMenuItem::redo(app, None)?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::cut(app, None)?,
-                    &PredefinedMenuItem::copy(app, None)?,
-                    &PredefinedMenuItem::paste(app, None)?,
-                    &PredefinedMenuItem::select_all(app, None)?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &MenuItem::with_id(
-                        app,
-                        tauri_plugin_loom::REVERSE_COMPLETION_MENU_ID,
-                        "Reverse Completion",
-                        true,
-                        None::<&str>,
-                    )?,
-                ],
-            )?,
+            &edit,
             #[cfg(target_os = "macos")]
             &Submenu::with_items(
                 app,
@@ -299,6 +279,31 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
             )?,
             &window,
             &help,
+        ],
+    )
+}
+
+fn build_edit_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Submenu<R>> {
+    Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                tauri_plugin_loom::REVERSE_COMPLETION_MENU_ID,
+                "Reverse Completion",
+                true,
+                None::<&str>,
+            )?,
         ],
     )
 }
