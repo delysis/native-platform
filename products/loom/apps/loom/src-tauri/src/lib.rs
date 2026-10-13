@@ -33,6 +33,14 @@ fn completion_reversal_arm(armed: bool) {
     let _ = armed;
 }
 
+#[tauri::command]
+fn completion_candidate_arm(active: bool) {
+    #[cfg(target_os = "macos")]
+    loom_macos_shortcut::set_candidate_active(active);
+    #[cfg(not(target_os = "macos"))]
+    let _ = active;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let Ok(build_model_policy) = embedded_build_model_policy() else {
@@ -77,7 +85,10 @@ pub fn run() {
         // so every graceful quit enters the joined-worker close coordinator.
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
-        .invoke_handler(tauri::generate_handler![completion_reversal_arm])
+        .invoke_handler(tauri::generate_handler![
+            completion_reversal_arm,
+            completion_candidate_arm
+        ])
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
         .setup(move |app| {

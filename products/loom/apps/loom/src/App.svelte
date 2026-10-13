@@ -101,6 +101,7 @@
     listenForFileCommands,
     listenForReverseCompletion,
     armCompletionReversal,
+    armCompletionCandidate,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadCatalogModelCandidate,
@@ -1526,6 +1527,9 @@
       ? Boolean(sourceEditor?.hasExactFocus())
       : Boolean(visualEditor?.hasExactFocus());
     setNativeCompletionReversalArm(Boolean(ghostUnconsumeText && editorFocused));
+    void armCompletionCandidate(Boolean(selectedInlineSuggestion?.text && editorFocused)).catch((error) => {
+      if (componentMounted) recordFailure(error);
+    });
   }
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
@@ -2737,6 +2741,7 @@
     return () => {
       componentMounted = false;
       setNativeCompletionReversalArm(false);
+      void armCompletionCandidate(false);
       documentEpoch += 1;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);

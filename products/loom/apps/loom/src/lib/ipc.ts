@@ -1003,6 +1003,11 @@ export function armCompletionReversal(armed: boolean): Promise<void> {
   return completionReversalArmInFlight;
 }
 
+export function armCompletionCandidate(active: boolean): Promise<void> {
+  if (!isDesktopRuntime()) return Promise.resolve();
+  return invoke('completion_candidate_arm', { active });
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,

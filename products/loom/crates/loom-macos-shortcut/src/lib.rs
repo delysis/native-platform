@@ -7,10 +7,19 @@ use block2::RcBlock;
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
 
 const LEFT_ARROW_KEY_CODE: u16 = 123;
+const RIGHT_ARROW_KEY_CODE: u16 = 124;
+const RETURN_KEY_CODE: u16 = 36;
+const KEYPAD_ENTER_KEY_CODE: u16 = 76;
+const TAB_KEY_CODE: u16 = 48;
 static REVERSAL_ARMED: AtomicBool = AtomicBool::new(false);
+static CANDIDATE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_armed(armed: bool) {
     REVERSAL_ARMED.store(armed, Ordering::Release);
+}
+
+pub fn set_candidate_active(active: bool) {
+    CANDIDATE_ACTIVE.store(active, Ordering::Release);
 }
 
 /// Install Loom's process-local Option-Left observation before WebKit handles
@@ -23,13 +32,23 @@ pub fn install(notify: impl Fn() + Send + Sync + 'static) {
         // returned so ordinary AppKit/WebKit dispatch continues.
         let event_ref = unsafe { event.as_ref() };
         let modifiers = event_ref.modifierFlags();
+        let unmodified = !modifiers.intersects(
+            NSEventModifierFlags::Command
+                | NSEventModifierFlags::Control
+                | NSEventModifierFlags::Shift,
+        );
+        if CANDIDATE_ACTIVE.load(Ordering::Acquire)
+            && unmodified
+            && matches!(
+                event_ref.keyCode(),
+                RETURN_KEY_CODE | KEYPAD_ENTER_KEY_CODE | TAB_KEY_CODE | RIGHT_ARROW_KEY_CODE
+            )
+        {
+            REVERSAL_ARMED.store(true, Ordering::Release);
+        }
         if event_ref.keyCode() == LEFT_ARROW_KEY_CODE
             && modifiers.contains(NSEventModifierFlags::Option)
-            && !modifiers.intersects(
-                NSEventModifierFlags::Command
-                    | NSEventModifierFlags::Control
-                    | NSEventModifierFlags::Shift,
-            )
+            && unmodified
             && REVERSAL_ARMED.swap(false, Ordering::AcqRel)
         {
             notify();
