@@ -82,7 +82,11 @@ func documentIds() -> Set<String> {
     })
 }
 
-NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+guard let runningApplication = NSRunningApplication(processIdentifier: pid) else {
+    fputs("could not bind the new-document check to Loom's exact application\n", stderr)
+    exit(1)
+}
+runningApplication.activate(options: [.activateAllWindows])
 let windowDeadline = Date().addingTimeInterval(5)
 var initialWindow: AXUIElement?
 repeat {
@@ -140,6 +144,15 @@ var afterTitle = beforeTitle
 var afterDocumentId: String?
 var focusedEditor = false
 repeat {
+    // AXPress is an external accessibility action rather than a physical menu
+    // selection. Restore the exact app's key status before judging the DOM
+    // focus that the product assigned to its new editor.
+    runningApplication.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(
+        application,
+        kAXFrontmostAttribute as CFString,
+        kCFBooleanTrue
+    )
     // Creating a document may replace WebKit's native accessibility window.
     // Rebind through the exact application PID instead of reading a detached
     // pre-command object whose title can never advance.

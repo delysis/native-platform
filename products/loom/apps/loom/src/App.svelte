@@ -6689,42 +6689,6 @@
       : visualEditor?.focusAtDocumentEnd() ?? false;
   }
 
-  function currentWritingSurfaceHasExactFocus(): boolean {
-    return mode === 'source'
-      ? sourceEditor?.hasExactFocus() ?? false
-      : visualEditor?.hasExactFocus() ?? false;
-  }
-
-  function waitForNativeMenuFocusRelease(): Promise<void> {
-    return new Promise((resolve) => window.setTimeout(resolve, 100));
-  }
-
-  async function retainWritingFocusAfterNativeNavigation(
-    navigationIsCurrent: () => boolean
-  ): Promise<void> {
-    showMainPane();
-    await tick();
-    const nativeMenuFocusOwner = window.document.activeElement;
-    for (let focusAttempt = 0; focusAttempt < 10; focusAttempt += 1) {
-      if (!navigationIsCurrent()) break;
-      const activeElement = window.document.activeElement;
-      if (
-        focusAttempt > 0 &&
-        !currentWritingSurfaceHasExactFocus() &&
-        activeElement !== nativeMenuFocusOwner &&
-        activeElement !== window.document.body
-      ) break;
-      if (desktop) {
-        try { await getCurrentWindow().setFocus(); }
-        catch (error) { recordFailure(error); break; }
-      }
-      await waitForWritingSurfacePaint();
-      if (navigationIsCurrent()) focusCurrentWritingSurfaceAtEnd();
-      await waitForNativeMenuFocusRelease();
-      if (currentWritingSurfaceHasExactFocus()) break;
-    }
-  }
-
   async function restoreCompletionAutomation(
     captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
@@ -6910,9 +6874,6 @@
   async function newDocument(): Promise<void> {
     if (!project || fileCommandInFlight || editorReadonly) return;
     if (!flushEditors()) return;
-    let createdDocumentId: string | null = null;
-    const expectedProjectId = project.project_id;
-    const expectedSessionId = project.session_id;
     fileCommandInFlight = true;
     try {
       await saveNow();
@@ -6929,26 +6890,12 @@
       );
       if (!created) throw new Error('The desktop did not expose the newly created document.');
       project = refreshed;
-      await selectDocument(created, false);
-      if (document?.summary.document_id === created.document_id) {
-        createdDocumentId = created.document_id;
-      }
+      await selectDocument(created, true);
       announce(`Created ${created.title}. Changes autosave as you write.`);
     } catch (error) {
       recordFailure(error);
     } finally {
       fileCommandInFlight = false;
-    }
-    if (createdDocumentId) {
-      await retainWritingFocusAfterNativeNavigation(() => Boolean(
-        componentMounted &&
-        applicationClosePhase === 'running' &&
-        !fileCommandInFlight &&
-        transition === 'idle' &&
-        project?.project_id === expectedProjectId &&
-        project.session_id === expectedSessionId &&
-        document?.summary.document_id === createdDocumentId
-      ));
     }
   }
 
@@ -7464,12 +7411,27 @@
         transition = 'idle';
         wakePreferredWriterEnsure();
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
-          await retainWritingFocusAfterNativeNavigation(() => Boolean(
+          showMainPane();
+          await tick();
+          await waitForWritingSurfacePaint();
+          if (
+            applicationClosePhase === 'running' &&
+            requestSerial === navigationSerial &&
+            projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
+            document?.summary.document_id === target.documentId
+          ) {
+            focusCurrentWritingSurfaceAtEnd();
+            // A document identity swap can remount the active editor after
+            // the first painted frame. Restore the caret once more after that
+            // remount instead of leaving focus on the menu command.
+            await waitForWritingSurfacePaint();
+            if (
               applicationClosePhase === 'running' &&
               requestSerial === navigationSerial &&
               projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
               document?.summary.document_id === target.documentId
-          ));
+            ) focusCurrentWritingSurfaceAtEnd();
+          }
         }
       }
     }
