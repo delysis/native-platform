@@ -928,7 +928,22 @@
     action: CompletionInsertionAction
   ): boolean {
     const authorized = onGhostInsert(candidateId, presentationKey, text, action);
-    if (authorized) completionMutationAuthorized = true;
+    if (authorized) {
+      completionMutationAuthorized = true;
+      // WKWebView can publish a focused AX editor while its first responder is
+      // still settling after a fan Return/Tab transaction. Reassert the same
+      // editor after the controller projection and decoration teardown have
+      // each had a paint; this keeps the immediately following native editing
+      // chord on the writing surface without taking focus from a real control.
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        if (!view || view.isDestroyed) return;
+        const active = document.activeElement;
+        const interactive = active instanceof Element && active.closest(
+          'button, input, textarea, select, a[href], [contenteditable="true"]'
+        );
+        if (!interactive || view.dom.contains(active)) view.focus();
+      }));
+    }
     return authorized;
   }
 
@@ -1291,6 +1306,19 @@
       // rollback text, so admit them only through the ordinary exact document
       // postimage and controller authorization checks below.
       const plan = livePlan ?? retainedRollbackPlan ?? projectedRollbackPlan();
+      observeVisualBoundary('visual_rollback_attempt', view.state.doc, view.state.doc, {
+        event_type: event.type,
+        trusted: event.isTrusted,
+        editor_focused: view.hasFocus(),
+        live_plan: livePlan !== null,
+        retained_plan: retainedRollbackPlan !== null,
+        projected_plan: projectedRollbackPlan() !== null,
+        plan_present: plan !== null,
+        candidate_matches: plan?.candidateId === ghostCandidateId,
+        presentation_matches: plan?.presentationKey === ghostPresentationKey,
+        surface_matches: plan?.surfaceKey === surfaceKey,
+        rollback_text_matches: plan?.unconsumeText === ghostUnconsumeText
+      });
       const rollbackEnd = view.state.selection.from;
       const rollbackStart = plan?.unconsumeText
         ? rollbackEnd - plan.unconsumeText.length
