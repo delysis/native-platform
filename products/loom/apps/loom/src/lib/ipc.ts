@@ -983,6 +983,17 @@ export function listenForReverseCompletion(handler: () => void): Promise<Unliste
   return listen('loom://reverse-completion', handler);
 }
 
+let completionReversalArmTail: Promise<void> = Promise.resolve();
+
+export function armCompletionReversal(armed: boolean): Promise<void> {
+  if (!isDesktopRuntime()) return Promise.resolve();
+  completionReversalArmTail = completionReversalArmTail.then(
+    () => invoke('completion_reversal_arm', { armed }),
+    () => invoke('completion_reversal_arm', { armed })
+  );
+  return completionReversalArmTail;
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,

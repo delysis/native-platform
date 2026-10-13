@@ -1,14 +1,21 @@
 #![cfg(target_os = "macos")]
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use block2::RcBlock;
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
 
 const LEFT_ARROW_KEY_CODE: u16 = 123;
+static REVERSAL_ARMED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_armed(armed: bool) {
+    REVERSAL_ARMED.store(armed, Ordering::Release);
+}
 
 /// Install Loom's process-local Option-Left observation before WebKit handles
-/// the event. The original event always continues through AppKit.
+/// the event. An armed reversal consumes exactly one matching key; ordinary
+/// Option-Left events continue through AppKit.
 pub fn install(notify: impl Fn() + Send + Sync + 'static) {
     let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit supplies a valid NSEvent for the duration of this
@@ -18,9 +25,15 @@ pub fn install(notify: impl Fn() + Send + Sync + 'static) {
         let modifiers = event_ref.modifierFlags();
         if event_ref.keyCode() == LEFT_ARROW_KEY_CODE
             && modifiers.contains(NSEventModifierFlags::Option)
-            && !modifiers.intersects(NSEventModifierFlags::Command | NSEventModifierFlags::Control)
+            && !modifiers.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Shift,
+            )
+            && REVERSAL_ARMED.swap(false, Ordering::AcqRel)
         {
             notify();
+            return std::ptr::null_mut();
         }
         event.as_ptr()
     });

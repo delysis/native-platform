@@ -763,6 +763,10 @@
     if (document.activeElement === element) readSelection(true, true);
   }
 
+  export function hasExactFocus(): boolean {
+    return document.activeElement === element;
+  }
+
   export function reverseCompletion(): boolean {
     if (performance.now() - lastExactRollbackAt < 100) return true;
     const before = element?.value;

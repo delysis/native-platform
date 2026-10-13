@@ -100,6 +100,7 @@
     listenForDocumentFilesystemHints,
     listenForFileCommands,
     listenForReverseCompletion,
+    armCompletionReversal,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadCatalogModelCandidate,
@@ -1018,6 +1019,7 @@
   } | null = null;
   let sourceEditor: {
     applyRemoteValue: (text: string) => void;
+    hasExactFocus: () => boolean;
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
@@ -1029,6 +1031,7 @@
     insertTextAtAnchor: (anchor: SourceTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let componentMounted = false;
+  let editorFocusEpoch = 0;
   let nativeFullscreen = false;
   let stopNativeFullscreenObservation: (() => void) | undefined;
   let desktopWorkspaceStarted = false;
@@ -1517,6 +1520,13 @@
   $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
   $: ghostAlternatives = completionView.alternatives;
   $: ghostUnconsumeText = completionView.unconsumeText;
+  $: if (componentMounted && desktop) {
+    void editorFocusEpoch;
+    const editorFocused = mode === 'source'
+      ? Boolean(sourceEditor?.hasExactFocus())
+      : Boolean(visualEditor?.hasExactFocus());
+    void armCompletionReversal(Boolean(ghostUnconsumeText && editorFocused));
+  }
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
       ? ghostSuggestion
@@ -2726,6 +2736,7 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      void armCompletionReversal(false);
       documentEpoch += 1;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);
@@ -6952,6 +6963,12 @@
     } catch (error) {
       if (componentMounted) recordFailure(error);
     }
+  }
+
+  function synchronizeEditorFocusAfterDispatch(): void {
+    window.setTimeout(() => {
+      if (componentMounted) editorFocusEpoch += 1;
+    }, 0);
   }
 
   async function finishOpeningProject(
@@ -11232,7 +11249,9 @@
             </div>
           {/if}
 
-          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={() => { materialOriginPane = null; }}>
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface"
+            on:focusin={() => { materialOriginPane = null; editorFocusEpoch += 1; }}
+            on:focusout={synchronizeEditorFocusAfterDispatch}>
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}

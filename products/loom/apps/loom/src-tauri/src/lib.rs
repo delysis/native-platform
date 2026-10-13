@@ -25,6 +25,14 @@ const FILE_SAVE_ACCELERATOR: &str = "CmdOrCtrl+S";
 const FILE_EXPORT_COPY_ACCELERATOR: &str = "CmdOrCtrl+Shift+S";
 const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
 
+#[tauri::command]
+fn completion_reversal_arm(armed: bool) {
+    #[cfg(target_os = "macos")]
+    loom_macos_shortcut::set_armed(armed);
+    #[cfg(not(target_os = "macos"))]
+    let _ = armed;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let Ok(build_model_policy) = embedded_build_model_policy() else {
@@ -69,6 +77,7 @@ pub fn run() {
         // so every graceful quit enters the joined-worker close coordinator.
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
+        .invoke_handler(tauri::generate_handler![completion_reversal_arm])
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
         .setup(move |app| {
