@@ -30,8 +30,6 @@
   let configuring = false;
   let authorizing = false;
   let source: ImportSource = 'gmail';
-  let clientId = '';
-  let clientSecret = '';
   let query = '';
   let collectionName = '';
   let busy = false;
@@ -66,16 +64,17 @@
   }
   onMount(() => { void refresh(); });
 
-  async function connect(): Promise<void> {
+  async function connect(requestedService: 'gmail' | 'drive'): Promise<void> {
     operationId = newUlid();
     busy = true; authorizing = true; message = 'Authorizing';
     try {
-      const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret, operationId);
+      const result = await connectImportAccount(projectId, sessionId, requestedService, operationId);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
+      source = requestedService;
       chosenEmail = result.email ?? ''; configuring = false; report = null;
       message = `Connected ${result.email}`;
     } catch (error) { message = errorText(error); }
-    finally { clientSecret = ''; busy = false; authorizing = false; operationId = ''; }
+    finally { busy = false; authorizing = false; operationId = ''; }
   }
   async function disconnect(): Promise<void> {
     busy = true;
@@ -178,8 +177,10 @@
     <label title="Optional separator between sources">Separator <input aria-label="Separator between sources (optional)" bind:value={separator} disabled={busy} maxlength="128" /></label>
     <button disabled={busy || !pasted.trim()} aria-label="Import pasted text" title="Import pasted text" on:click={() => void paste()}>Import</button>
   </details>
-  <label>URL <input aria-label="Public document URL" type="url" bind:value={webUrl} disabled={busy} placeholder="https://…" maxlength="4096" /></label>
-  <button disabled={busy || !webUrl.trim()} aria-label="Import URL" title="Import URL" on:click={() => void web()}>Import</button>
+  <details><summary title="Import a public document URL">Web</summary>
+    <label>URL <input aria-label="Public document URL" type="url" bind:value={webUrl} disabled={busy} placeholder="https://…" maxlength="4096" /></label>
+    <button disabled={busy || !webUrl.trim()} aria-label="Import URL" title="Import URL" on:click={() => void web()}>Import</button>
+  </details>
   {#if collection}
     <div class="connected-collection">
       <button class="source-link" disabled={busy} on:click={() => void openCollection()}>{collection.name}</button>
@@ -206,10 +207,11 @@
     </label>
     <button disabled={busy || !canAddCollection} aria-label="Add collection" title="Add collection" on:click={() => void addConnectedCollection()}>Add</button>
   {:else}
-    <label title="Google Desktop app OAuth client ID">Client <input aria-label="Client ID" bind:value={clientId} disabled={busy} autocomplete="off" maxlength="512" /></label>
-    <label>Secret <input aria-label="Client secret" type="password" bind:value={clientSecret} disabled={busy} autocomplete="off" maxlength="1024" /></label>
     {#if configuring}<button disabled={busy} aria-label="Back to accounts" title="Back to accounts" on:click={() => configuring = false}>Back</button>{/if}
-    <button disabled={busy || !clientId.trim()} aria-label={`Connect ${service === 'drive' ? 'Drive' : 'Gmail'}`} title="Connect a Google Desktop app OAuth client with read-only access; credentials stay in the system credential store. Finish authorization in your browser within three minutes." on:click={() => void connect()}>Connect</button>
+    <div class="actions">
+      <button disabled={busy} aria-label="Connect Gmail" title="Sign in to Gmail" on:click={() => void connect('gmail')}>Gmail</button>
+      <button disabled={busy} aria-label="Connect Drive" title="Sign in to Google Drive" on:click={() => void connect('drive')}>Drive</button>
+    </div>
   {/if}
   {/if}
   {#if busy && operationId}<button aria-label={authorizing ? 'Cancel connection' : 'Stop import'} title={authorizing ? 'Cancel browser authorization' : 'Stop import; completed sources remain available'} on:click={() => { void cancelWorkspaceSourceImport(projectId, sessionId, operationId).then(() => { message = 'Stopping'; }).catch((error) => message = errorText(error)); }}>{authorizing ? 'Cancel' : 'Stop'}</button>{/if}

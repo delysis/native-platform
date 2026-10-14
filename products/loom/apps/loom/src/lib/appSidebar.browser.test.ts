@@ -88,7 +88,12 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|workspace_roots_get': return { workspace_id: project.project_id, workspace_session_id: 'workspace-session', roots: [{ id: 'owner', name: project.title, owner: true, available: true, path: project.root, project_id: project.project_id }] };
       case 'plugin:loom|workspace_pane_list': return [];
-      case 'plugin:loom|document_open': return opened;
+      case 'plugin:loom|document_open': {
+        const summary = project.documents.find(item => item.document_id === args.documentId) ?? opened.summary;
+        return summary.document_id === opened.summary.document_id ? opened : {
+          summary, text: '', visible_blob_id: summary.active_blob_id, transient_draft: null
+        };
+      }
       case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
       case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: null, revision_id: null, error: null,
         config: { panes: { chat: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: [] } } } };
@@ -113,6 +118,12 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
       case 'plugin:loom|completion_snapshot': return { project_id: project.project_id, session_id: project.session_id,
         document_id: opened.summary.document_id, branches: [], active_operations: [], next_cursor: null, has_more: false };
       case 'plugin:loom|suggestions_set': case 'plugin:loom|focus_mode_set': return;
+      case 'plugin:loom|document_create': {
+        const summary = { ...opened.summary, document_id: 'document-2', relative_path: 'Untitled 2.md', title: 'Untitled 2',
+          revision_id: 'revision-2', active_blob_id: '0'.repeat(64), word_count: 0 };
+        project.documents.push(summary);
+        return { ...project, documents: [...project.documents] };
+      }
       case 'plugin:loom|project_prepare_open_path': throw { code: 'selected_folder_unavailable', message: 'Selected folder is unavailable' };
       // Existing dirty-editor cases keep timer-driven persistence pending. Only
       // the exact authorized edit below receives a mock transport receipt.
@@ -147,7 +158,7 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
   return { calls, project, opened, materials, heldDrafts, retireFixture: () => { fixtureClosed = true; } };
 }
 
-it('plus click and context-menu share the Loom add surface and never expose the WebKit menu', async () => {
+it('plus creates a manuscript while right-click exposes only the Loom add surface', async () => {
   await setup();
   const add = page.getByRole('button', { name: 'Add', exact: true }).element() as HTMLButtonElement;
   const opened = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
@@ -166,7 +177,8 @@ it('plus click and context-menu share the Loom add surface and never expose the 
   expect(page.getByRole('menu').query()).toBeNull();
 
   add.click();
-  await expect.element(page.getByRole('menuitem', { name: 'Sources…', exact: true })).toBeVisible();
+  await expect.poll(() => document.querySelector('[data-document-row="document-2"]')?.textContent).toContain('Untitled 2');
+  expect(page.getByRole('menu').query()).toBeNull();
 });
 
 it('missing bookmark has readable disambiguated names, exact path tooltip and a handled remove menu without native calls', async () => {

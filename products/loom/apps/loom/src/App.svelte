@@ -3164,6 +3164,7 @@
           resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
           resumeCompletionObservation();
           scheduleProjectFilesystemRefresh();
+          scheduleWorkspaceRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
           // focus nor visibilitychange on native resume. Rebuild the exact
           // cached visual decoration from the native window focus edge.
@@ -3190,13 +3191,14 @@
     resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
     resumeCompletionObservation();
     scheduleProjectFilesystemRefresh();
+    scheduleWorkspaceRefresh();
   }
 
   async function installDocumentFilesystemHintListener(): Promise<void> {
     try {
       const unlisten = await listenForDocumentFilesystemHints((hint) => {
         routeDocumentFilesystemHint(hint, project, scheduleProjectFilesystemRefresh);
-        if (workspaceRoots && hint.project_id === workspaceRoots.workspace_id && hint.session_id === workspaceRoots.workspace_session_id) {
+        if (workspaceRoots && hint.project_id === workspaceRoots.workspace_id) {
           scheduleWorkspaceRefresh();
           if (workspaceOwnerActive) scheduleProjectFilesystemRefresh();
         }
@@ -10612,7 +10614,7 @@
             aria-label="Add" aria-expanded={addMenuOpen} aria-haspopup="menu"
             title="Add"
             disabled={fileCommandInFlight || editorReadonly}
-            on:click={() => addMenuOpen ? closeAddMenu() : void openAddMenu()}
+            on:click={() => { closeAddMenu(); closeMaterial(); void newDocument(); }}
             on:contextmenu={handleAddMenuContext}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
           {#if addMenuOpen}

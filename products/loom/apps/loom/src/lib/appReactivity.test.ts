@@ -100,6 +100,7 @@ describe('App ghost reactivity wiring', () => {
     expect(focus).toContain("if (mode === 'visual') visualEditor?.refreshGhostPresentation()");
     expect(focus).toContain('resumeCompletionObservation()');
     expect(focus).toContain('scheduleProjectFilesystemRefresh()');
+    expect(focus).toContain('scheduleWorkspaceRefresh()');
     expect(source).toContain('function refreshProjectFilesystemState()');
     expect(source).toContain('const refreshed = await currentProjectSession()');
     expect(recovery).toContain('installGenerationEventListener()');
@@ -123,6 +124,9 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('unlistenDocumentFilesystemHints?.()');
     expect(install).toContain('routeDocumentFilesystemHint(');
     expect(install).toContain('scheduleProjectFilesystemRefresh');
+    expect(install).toContain("hint.project_id === workspaceRoots.workspace_id");
+    expect(install).not.toContain("hint.session_id === workspaceRoots.workspace_session_id");
+    expect(install).toContain('scheduleWorkspaceRefresh()');
     expect(install).not.toContain('refreshProjectFilesystemState(');
     expect(schedule).toContain('window.clearTimeout(projectFilesystemRefreshTimer)');
     expect(schedule).toContain('window.setTimeout(() =>');

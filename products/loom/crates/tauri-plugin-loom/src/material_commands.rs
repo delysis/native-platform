@@ -226,22 +226,41 @@ pub(super) async fn material_bind_attachment(
     retention: Option<MaterialRetention>,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
-    with_store(&state, &project_id, &session_id, |store| {
+    bind_attachment_for_session(
+        &state,
+        &project_id,
+        &session_id,
+        document_id.as_deref(),
+        &attachment_id,
+        name.as_deref(),
+        retention,
+    )
+}
+
+fn bind_attachment_for_session(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    document_id: Option<&str>,
+    attachment_id: &str,
+    name: Option<&str>,
+    retention: Option<MaterialRetention>,
+) -> Result<MaterialEntry, IpcFailure> {
+    // Inline drops are imported into the exact document root that received the
+    // drop. That root can be the workspace owner or a mounted writing folder.
+    with_read_store(state, project_id, session_id, |store| {
         let retention = retention.unwrap_or_default();
-        let item = match document_id.as_deref() {
+        let item = match document_id {
             Some(document_id) => materials::bind_document_attachment(
                 store,
                 document_id,
-                &attachment_id,
-                name.as_deref(),
+                attachment_id,
+                name,
                 retention,
             ),
-            None => materials::bind_attachment_with_retention(
-                store,
-                &attachment_id,
-                name.as_deref(),
-                retention,
-            ),
+            None => {
+                materials::bind_attachment_with_retention(store, attachment_id, name, retention)
+            }
         };
         observe_entry(store, item)
     })
@@ -366,6 +385,84 @@ mod rename_tests {
             session.workspace = None;
         }
         install_session(state, ProjectStore::open(root).unwrap(), CommandId::new());
+    }
+
+    #[test]
+    fn source_store_accepts_distinct_live_document_and_workspace_leases() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let project = store.manifest().project_id.to_string();
+        let document_session = CommandId::new();
+        let workspace_session = CommandId::new();
+        let mut session = Session {
+            phase: SessionPhase::Open,
+            ..Session::default()
+        };
+        workspace_owner::establish(&mut session, &store);
+        session.workspace.as_mut().unwrap().session_id = workspace_session;
+        session.active_session_id = Some(document_session);
+        session.store = Some(store);
+
+        assert!(
+            require_source_store(&mut session, &project, &document_session.to_string()).is_ok()
+        );
+        assert!(
+            require_source_store(&mut session, &project, &workspace_session.to_string()).is_ok()
+        );
+        assert!(
+            require_source_store(&mut session, &project, &CommandId::new().to_string()).is_err()
+        );
+    }
+
+    #[test]
+    fn inline_attachment_bind_uses_the_document_lease_that_imported_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let root = store.root().to_owned();
+        let source = root.join("picture.png");
+        std::fs::write(&source, b"retained-image-bytes").unwrap();
+        let attachment = crate::context_attachments::import_path(&root, &source).unwrap();
+        let project = store.manifest().project_id.to_string();
+        let document_session = CommandId::new();
+        let workspace_session = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().unwrap();
+            session.phase = SessionPhase::Open;
+            workspace_owner::establish(&mut session, &store);
+            session.workspace.as_mut().unwrap().session_id = workspace_session;
+            session.active_session_id = Some(document_session);
+            session.store = Some(store);
+        }
+
+        let material = bind_attachment_for_session(
+            &state,
+            &project,
+            &document_session.to_string(),
+            None,
+            &attachment.id,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            material.attachment_id.as_deref(),
+            Some(attachment.id.as_str())
+        );
+        assert!(
+            bind_attachment_for_session(
+                &state,
+                &project,
+                &CommandId::new().to_string(),
+                None,
+                &attachment.id,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

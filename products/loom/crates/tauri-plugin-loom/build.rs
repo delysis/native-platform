@@ -154,6 +154,12 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=LOOM_GOOGLE_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=LOOM_GOOGLE_CLIENT_SECRET");
+    println!("cargo:rerun-if-env-changed=GMAIL_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=GMAIL_CLIENT_SECRET");
+    println!("cargo:rerun-if-env-changed=DRIVE_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=DRIVE_CLIENT_SECRET");
     println!(
         "cargo:rustc-env=LOOM_BUILD_TARGET={}",
         std::env::var("TARGET").expect("Cargo sets TARGET")

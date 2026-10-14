@@ -1134,8 +1134,8 @@ export interface ImportBatch { imported: ContextAttachment[]; references?: strin
 export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
   return call('import_accounts', { projectId, sessionId });
 }
-export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string, operationId: string = newUlid()): Promise<ImportAccount> {
-  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret, operationId });
+export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', operationId: string = newUlid()): Promise<ImportAccount> {
+  return call('import_account_connect', { projectId, sessionId, service, operationId });
 }
 export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
   return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });

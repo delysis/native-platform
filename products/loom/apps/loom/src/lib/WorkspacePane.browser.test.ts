@@ -8,11 +8,11 @@ import { WorkspacePaneDrafts, type WorkspacePaneDraftStore } from './workspacePa
 import '../app.css';
 
 vi.mock('@tauri-apps/api/core', async (original) => ({ ...await original<typeof import('@tauri-apps/api/core')>(), convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}` }));
-const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn(), resolve: vi.fn(), import: vi.fn(), bind: vi.fn() }));
+const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn(), resolve: vi.fn(), import: vi.fn(), bind: vi.fn(), addContexts: vi.fn() }));
 vi.mock('./ipc', async (original) => ({
   ...await original<typeof import('./ipc')>(),
   listWorkspacePaneRuns: ipc.list, runWorkspacePane: ipc.run, cancelWorkspacePaneRun: ipc.cancel, readWorkspacePaneOutput: ipc.open, resolveWorkspaceDocument: ipc.resolve,
-  importAttachmentPaths: ipc.import, bindAttachmentMaterial: ipc.bind,
+  importAttachmentPaths: ipc.import, bindAttachmentMaterial: ipc.bind, addDocumentContexts: ipc.addContexts,
   normalizeFailure: (error: unknown) => ({ message: error instanceof Error ? error.message : String(error) })
 }));
 let mounted: ReturnType<typeof mount> | undefined;
@@ -72,6 +72,27 @@ describe('workspace panes', () => {
     await expect.element(input).toHaveValue('New thought');
     expect(ipc.bind).not.toHaveBeenCalled();
     expect(ipc.run).not.toHaveBeenCalled();
+  });
+
+  it('keeps a dropped chat attachment document-scoped instead of promoting it to a workspace source', async () => {
+    const onContextChanged = vi.fn();
+    await render({}, source.text, { onContextChanged } as never);
+    const attachment = {
+      id: 'attachment-1', file_name: 'photo.png', byte_count: 12, detected_format: 'png',
+      coverage_complete: true, text_bytes: 0, media_kinds: ['image'], warnings: [],
+      inline_markdown: '[Attachment: photo.png](loom-attachment:attachment-1)',
+      media_markdown: '![Image: photo.png](loom-attachment:attachment-1)'
+    };
+    const snapshot = { document_id: 'draft', text: '', attachments: [] };
+    ipc.import.mockResolvedValue({ imported: [attachment], references: [], failures: [], next_page_token: null });
+    ipc.addContexts.mockResolvedValue(snapshot);
+
+    await (mounted as unknown as WorkspacePane).importDroppedPaths(['/outside/photo.png'], { x: 0, y: 0 });
+
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue(attachment.media_markdown);
+    expect(ipc.bind).not.toHaveBeenCalled();
+    expect(ipc.addContexts).toHaveBeenCalledWith('project', 'session', 'draft', ['attachment-1']);
+    expect(onContextChanged).toHaveBeenCalledWith(snapshot, 'project', 'session', 'draft');
   });
 
   it('restores only this pane history and submits one retained raw prompt with explicit context and full prior output', async () => {
