@@ -2113,23 +2113,31 @@
     ))
   );
 
+  const composerHasSendableDraft = (form) => {
+    const message = formField(form, "message")?.value.trim() || "";
+    return Boolean(message || draftAttachmentIds(form).length);
+  };
+
   const renderChatBusyState = () => {
     const busy = chatBusyLeases.size > 0;
     const cancellable = chatRequestIsCancellable(chatBusyLeases, activeDispatchStreamLeases);
     const form = document.getElementById("chat-form");
     if (!form) return;
-    const send = form.querySelector("button[type='submit']");
-    const stop = form.querySelector(".stop-button");
-    const skipReasoning = form.querySelector(".skip-reasoning-button");
+    const send = form.querySelector?.("button[type='submit']");
+    const stop = form.querySelector?.(".stop-button");
+    const skipReasoning = form.querySelector?.(".skip-reasoning-button");
     const message = formField(form, "message");
-    const attachmentImport = form.querySelector("[data-action='attachment-import']");
-    const attachmentRemovers = form.querySelectorAll("[data-action='draft-attachment-remove']");
+    const attachmentImport = form.querySelector?.("[data-action='attachment-import']");
+    const attachmentRemovers = form.querySelectorAll?.("[data-action='draft-attachment-remove']") || [];
     if (message) message.readOnly = busy;
     if (attachmentImport) attachmentImport.disabled = busy;
     attachmentRemovers.forEach((button) => { button.disabled = busy; });
     if (send) {
-      send.disabled = busy;
-      send.classList.toggle("is-hidden", busy);
+      const disabled = busy
+        || send.dataset.modelReady !== "true"
+        || !composerHasSendableDraft(form);
+      send.disabled = disabled;
+      send.setAttribute("aria-disabled", String(disabled));
     }
     if (stop) {
       stop.disabled = !cancellable;
@@ -3624,6 +3632,7 @@
     }
     if (event.target.matches("#chat-form textarea[name='message']")) {
       sizeComposer();
+      renderChatBusyState();
       if (autocompleteAccepting) return;
       if (event.isComposing || composerState.kind === "composing") return;
       const committedAutocomplete = event.target.dataset.autocompleteCommittedDraft;

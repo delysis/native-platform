@@ -209,6 +209,19 @@ test("consult replies preserve visible persona identity in the Messages presenta
   assert.ok(styles.includes('.recipients-header[data-unsent="false"]'));
 });
 
+test("the composer keeps a glass send affordance anchored while its readiness changes", () => {
+  assert.ok(viewProduction.includes('class="send-button"'));
+  assert.ok(viewProduction.includes('data-model-ready=(readiness.enabled)'));
+  assert.ok(bridge.includes("const composerHasSendableDraft"));
+  assert.ok(bridge.includes('send.dataset.modelReady !== "true"'));
+  assert.ok(bridge.includes("!composerHasSendableDraft(form)"));
+  assert.ok(!bridge.includes('send.classList.toggle("is-hidden", busy)'));
+  assert.ok(styles.includes("radial-gradient(circle at 28% 18%"));
+  assert.ok(styles.includes("backdrop-filter: blur(22px) saturate(1.8) brightness(1.08)"));
+  assert.ok(styles.includes(".composer .send-button:disabled"));
+  assert.ok(styles.includes('.composer .send-button[type="submit"]:not(:disabled)'));
+});
+
 test("the native presentation contains no Skills, cache, engine, or resident-slot panels", () => {
   for (const marker of [
     'data-settings-card="skills"',

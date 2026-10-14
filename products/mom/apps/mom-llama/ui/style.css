@@ -1265,9 +1265,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .llama-ui-shell {
   --message-blue: #0a84ff;
   --message-blue-deep: #0877e6;
-  --glass-fill: color-mix(in srgb, var(--surface-raised) 68%, transparent);
-  --glass-edge: color-mix(in srgb, var(--text) 14%, transparent);
-  --glass-shadow: 0 7px 24px rgba(0, 0, 0, .14), inset 0 1px 0 rgba(255, 255, 255, .12);
+  --glass-fill: color-mix(in srgb, var(--surface-raised) 58%, transparent);
+  --glass-edge: color-mix(in srgb, white 38%, var(--border));
+  --glass-shadow: 0 9px 28px rgba(0, 0, 0, .16), 0 2px 6px rgba(0, 0, 0, .08), inset 0 1px 0 rgba(255, 255, 255, .46), inset 0 -1px 0 rgba(255, 255, 255, .08);
 }
 
 .llama-ui-shell[data-theme="light"] {
@@ -1277,9 +1277,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
   --surface-raised: rgba(255, 255, 255, .82);
   --surface-active: rgba(210, 210, 216, .74);
   --border: rgba(60, 60, 67, .16);
-  --glass-fill: rgba(255, 255, 255, .62);
-  --glass-edge: rgba(255, 255, 255, .86);
-  --glass-shadow: 0 8px 26px rgba(55, 55, 65, .12), inset 0 1px 0 rgba(255, 255, 255, .95);
+  --glass-fill: rgba(255, 255, 255, .48);
+  --glass-edge: rgba(255, 255, 255, .94);
+  --glass-shadow: 0 10px 30px rgba(55, 55, 65, .14), 0 2px 7px rgba(55, 55, 65, .08), inset 0 1px 0 rgba(255, 255, 255, 1), inset 0 -1px 0 rgba(255, 255, 255, .38);
 }
 @media (prefers-color-scheme: light) {
   .llama-ui-shell[data-theme="system"] {
@@ -1289,9 +1289,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
     --surface-raised: rgba(255, 255, 255, .82);
     --surface-active: rgba(210, 210, 216, .74);
     --border: rgba(60, 60, 67, .16);
-    --glass-fill: rgba(255, 255, 255, .62);
-    --glass-edge: rgba(255, 255, 255, .86);
-    --glass-shadow: 0 8px 26px rgba(55, 55, 65, .12), inset 0 1px 0 rgba(255, 255, 255, .95);
+    --glass-fill: rgba(255, 255, 255, .48);
+    --glass-edge: rgba(255, 255, 255, .94);
+    --glass-shadow: 0 10px 30px rgba(55, 55, 65, .14), 0 2px 7px rgba(55, 55, 65, .08), inset 0 1px 0 rgba(255, 255, 255, 1), inset 0 -1px 0 rgba(255, 255, 255, .38);
   }
 }
 
@@ -1319,19 +1319,32 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer .round-button,
 .composer .send-button {
   border: 1px solid var(--glass-edge);
-  background: linear-gradient(145deg,
-    color-mix(in srgb, var(--glass-fill) 88%, white 12%),
-    color-mix(in srgb, var(--glass-fill) 92%, transparent));
+  background:
+    radial-gradient(circle at 28% 18%, rgba(255, 255, 255, .72), transparent 34%),
+    linear-gradient(150deg,
+      color-mix(in srgb, var(--glass-fill) 72%, white 28%),
+      color-mix(in srgb, var(--glass-fill) 88%, transparent) 58%,
+      color-mix(in srgb, var(--glass-fill) 74%, var(--text) 5%));
   box-shadow: var(--glass-shadow);
-  -webkit-backdrop-filter: blur(18px) saturate(1.6);
-  backdrop-filter: blur(18px) saturate(1.6);
+  -webkit-backdrop-filter: blur(22px) saturate(1.8) brightness(1.08);
+  backdrop-filter: blur(22px) saturate(1.8) brightness(1.08);
 }
 
 .chrome .icon-button:hover,
 .composer .round-button:hover,
 .composer .send-button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--glass-fill) 74%, var(--text) 10%);
+  background:
+    radial-gradient(circle at 28% 18%, rgba(255, 255, 255, .82), transparent 36%),
+    linear-gradient(150deg,
+      color-mix(in srgb, var(--glass-fill) 66%, white 34%),
+      color-mix(in srgb, var(--glass-fill) 76%, var(--text) 8%));
   transform: translateY(-1px);
+}
+
+.composer .send-button:disabled {
+  color: color-mix(in srgb, var(--muted) 76%, transparent);
+  opacity: .82;
+  cursor: default;
 }
 
 .chrome .icon-button,
@@ -1481,8 +1494,10 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer .send-button[type="submit"]:not(:disabled) {
   color: white;
   border-color: rgba(255, 255, 255, .2);
-  background: linear-gradient(145deg, #2498ff, var(--message-blue-deep));
-  box-shadow: 0 6px 16px rgba(10, 132, 255, .24), inset 0 1px 0 rgba(255, 255, 255, .28);
+  background:
+    radial-gradient(circle at 30% 18%, rgba(255, 255, 255, .68), transparent 32%),
+    linear-gradient(145deg, #36a5ff, var(--message-blue-deep) 68%, #006bd6);
+  box-shadow: 0 8px 22px rgba(10, 132, 255, .32), 0 2px 6px rgba(0, 73, 145, .18), inset 0 1px 0 rgba(255, 255, 255, .56), inset 0 -1px 0 rgba(0, 64, 128, .24);
 }
 
 @media (max-width: 700px) {
