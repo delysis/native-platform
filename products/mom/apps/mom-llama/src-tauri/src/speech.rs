@@ -301,7 +301,7 @@ impl MomSpeech {
                 voice: VoiceSelector::Exact {
                     voice_id: selection.voice_id.clone(),
                 },
-                language: None,
+                language: Some(READ_ALOUD_LANGUAGE.to_string()),
                 rate: 1.0,
                 pitch: 1.0,
                 volume: 1.0,
@@ -954,11 +954,23 @@ fn select_apple(
     let Some(voice) = descriptor
         .voices
         .iter()
-        .filter(|voice| voice.installed && voice.network == NetworkBehavior::Never)
-        .min_by(|left, right| left.id.cmp(&right.id))
+        .filter(|voice| {
+            voice.installed
+                && voice.network == NetworkBehavior::Never
+                && language_matches(&voice.language, READ_ALOUD_LANGUAGE)
+        })
+        .max_by(|left, right| {
+            voice_language_rank(&left.language, READ_ALOUD_LANGUAGE)
+                .cmp(&voice_language_rank(&right.language, READ_ALOUD_LANGUAGE))
+                .then_with(|| {
+                    standard_apple_voice_rank(&left.id).cmp(&standard_apple_voice_rank(&right.id))
+                })
+                .then_with(|| left.quality.cmp(&right.quality))
+                .then_with(|| right.id.cmp(&left.id))
+        })
     else {
         return Err(speech_unavailable(
-            "No installed never-network Apple voice is available.",
+            "No installed never-network English Apple voice is available.",
         ));
     };
     Ok(AppleSelection {
@@ -966,6 +978,42 @@ fn select_apple(
         descriptor: descriptor.clone(),
         voice_id: voice.id.clone(),
     })
+}
+
+const READ_ALOUD_LANGUAGE: &str = "en-US";
+
+fn language_matches(candidate: &str, requested: &str) -> bool {
+    let normalized_candidate = candidate.replace('_', "-");
+    let normalized_requested = requested.replace('_', "-");
+    normalized_candidate.eq_ignore_ascii_case(&normalized_requested)
+        || normalized_candidate
+            .split_once('-')
+            .zip(normalized_requested.split_once('-'))
+            .is_some_and(|((candidate_base, _), (requested_base, _))| {
+                candidate_base.eq_ignore_ascii_case(requested_base)
+            })
+}
+
+fn voice_language_rank(candidate: &str, requested: &str) -> u8 {
+    let normalized_candidate = candidate.replace('_', "-");
+    let normalized_requested = requested.replace('_', "-");
+    if normalized_candidate.eq_ignore_ascii_case(&normalized_requested) {
+        2
+    } else if language_matches(candidate, requested) {
+        1
+    } else {
+        0
+    }
+}
+
+fn standard_apple_voice_rank(identifier: &str) -> u8 {
+    if identifier.contains(".voice.compact.") {
+        2
+    } else if identifier.contains(".voice.super-compact.") {
+        1
+    } else {
+        0
+    }
 }
 
 fn select_parakeet(descriptors: &[SpeechBackendDescriptor]) -> Result<ParakeetSelection, Blocker> {
@@ -1223,7 +1271,7 @@ mod tests {
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,
-        SynthesisCapabilities, TranscriptionCapabilities, VoiceDescriptor,
+        SynthesisCapabilities, TranscriptionCapabilities, VoiceDescriptor, VoiceQuality,
     };
 
     fn runtime_evidence() -> Vec<CapabilityEvidence> {
@@ -1368,6 +1416,58 @@ mod tests {
         assert_eq!(context.routing.privacy, SpeechPrivacyPolicy::LocalOnly);
         assert!(!context.routing.allow_asset_download);
         assert!(!context.routing.allow_fallback_before_output);
+    }
+
+    #[test]
+    fn read_aloud_selects_the_best_local_english_voice() {
+        let mut descriptor = apple_descriptor();
+        descriptor.voices = vec![
+            VoiceDescriptor {
+                id: "aaa.non-english".to_string(),
+                name: "Non-English".to_string(),
+                language: "ar-SA".to_string(),
+                gender: None,
+                quality: Some(VoiceQuality::Premium),
+                expected_latency: None,
+                network: NetworkBehavior::Never,
+                installed: true,
+            },
+            VoiceDescriptor {
+                id: "com.apple.speech.synthesis.voice.Zarvox".to_string(),
+                name: "Zarvox".to_string(),
+                language: "en-US".to_string(),
+                gender: None,
+                quality: Some(VoiceQuality::Premium),
+                expected_latency: None,
+                network: NetworkBehavior::Never,
+                installed: true,
+            },
+            VoiceDescriptor {
+                id: "com.apple.voice.super-compact.en-GB.Daniel".to_string(),
+                name: "Basic English".to_string(),
+                language: "en_GB".to_string(),
+                gender: None,
+                quality: Some(VoiceQuality::Normal),
+                expected_latency: None,
+                network: NetworkBehavior::Never,
+                installed: true,
+            },
+            VoiceDescriptor {
+                id: "com.apple.voice.compact.en-US.Samantha".to_string(),
+                name: "Samantha".to_string(),
+                language: "en-US".to_string(),
+                gender: None,
+                quality: Some(VoiceQuality::Normal),
+                expected_latency: None,
+                network: NetworkBehavior::Never,
+                installed: true,
+            },
+        ];
+
+        let selected = select_apple(&[descriptor], 12).expect("English Apple route");
+        assert_eq!(selected.voice_id, "com.apple.voice.compact.en-US.Samantha");
+        assert!(language_matches("en_US", READ_ALOUD_LANGUAGE));
+        assert!(!language_matches("ar-SA", READ_ALOUD_LANGUAGE));
     }
 
     #[tokio::test]

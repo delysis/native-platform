@@ -2122,6 +2122,7 @@ fn composer(
                     button type="submit"
                         class="send-button"
                         title=(readiness.label.clone())
+                        data-model-ready=(readiness.enabled)
                         data-affordance="chat.composer.send"
                         data-command="mom_llama.chat_dispatch"
                         data-tauri-command="mom_llama_chat_dispatch"
