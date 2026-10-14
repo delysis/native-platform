@@ -154,7 +154,7 @@ const speechLifetimeHarness = () => {
   };
   speechVm.runInNewContext(
     block(ui, "  const commandMetadata =", "  const DYNAMIC_CONTROL_SPECS =")
-    + block(ui, "  const rawAttachmentBytes =", "  const speechOperationToken =")
+    + block(ui, "  const ipcBinaryBytes =", "  const speechOperationToken =")
     + "\nconst attachmentTranscripts = new WeakMap();\n"
     + block(ui, "  let activeSpeechPlayback =", "  const appendAttachmentTranscriptionControl =")
     + block(ui, "  const renderAttachmentTranscript =", "  const attachmentPreviewResult =")
@@ -194,9 +194,9 @@ const speechLifetimeHarness = () => {
     const read = await take("mom_llama_speech_read_aloud");
     return { task, read };
   };
-  const finishPlayback = async () => {
+  const finishPlayback = async (audioBytes = new Uint8Array([1, 2])) => {
     const started = await start(); started.read.reply.resolve(result());
-    (await take("mom_llama_speech_audio")).reply.resolve(new Uint8Array([1, 2]));
+    (await take("mom_llama_speech_audio")).reply.resolve(audioBytes);
     (await hash()).resolve("fixture-wav"); await started.task;
     assert.equal(media.length, 1); assert.equal(media[0].plays, 1);
     return started;
@@ -227,6 +227,26 @@ test("current Read Aloud reaches real render and Stop releases its media and exa
     stop.reply.resolve({ status: "passed" }); await stopping;
     assert.equal(h.button.dataset.operation, undefined); assert.equal(h.button.dataset.playback, undefined);
   } finally { h.settle(); }
+});
+
+test("Read Aloud accepts the byte array representation delivered by packaged macOS IPC", async () => {
+  const h = speechLifetimeHarness();
+  try {
+    await h.finishPlayback([1, 2]);
+    assert.equal(h.media.length, 1);
+    assert.equal(h.media[0].plays, 1);
+  } finally { h.settle(); }
+});
+
+test("IPC byte arrays reject invalid values and payloads beyond their native ceiling", () => {
+  const context = { ArrayBuffer, Uint8Array };
+  speechVm.runInNewContext(
+    block(ui, "  const ipcBinaryBytes =", "  const speechOperationToken =")
+      + "\nglobalThis.decode = ipcBinaryBytes;",
+    context,
+  );
+  assert.throws(() => context.decode([0, 256], 2, "Fixture"), /invalid IPC byte array/);
+  assert.throws(() => context.decode([0, 1, 2], 2, "Fixture"), /exceeded its 2-byte IPC limit/);
 });
 
 for (const interruption of ["operation Stop", "quiesce", "navigation"]) {

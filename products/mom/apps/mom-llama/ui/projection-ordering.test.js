@@ -17,7 +17,7 @@ test("late native projections cannot replace the latest pane", async () => {
   };
   vm.createContext(context);
   const start = source.indexOf("  const projectionRevisions =");
-  const end = source.indexOf("  const rawAttachmentBytes =", start);
+  const end = source.indexOf("  const ipcBinaryBytes =", start);
   vm.runInContext(`${source.slice(start, end)}\nthis.swap = swap;`, context);
   const first = context.swap("#chat", "render");
   const second = context.swap("#chat", "render");
