@@ -5,6 +5,22 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(`${__dirname}/coop-hx.js`, "utf8");
 
+test("Stop appears only for a registered live chat request", () => {
+  const definition = source.match(/const chatRequestIsCancellable = \(busyLeases, streamLeases\) => \([\s\S]*?\n  \);/);
+  assert.ok(definition, "production cancellable-request policy must remain directly testable");
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(`${definition[0]}; this.chatRequestIsCancellable = chatRequestIsCancellable;`, context);
+
+  const preparing = "chat-dispatch:1";
+  const chat = "chat-request:native-1";
+  const mention = "mention-request:persona-1:ad";
+  assert.equal(context.chatRequestIsCancellable(new Set([preparing]), new Set()), false);
+  assert.equal(context.chatRequestIsCancellable(new Set([mention]), new Set([mention])), false);
+  assert.equal(context.chatRequestIsCancellable(new Set([preparing, chat]), new Set([chat])), true);
+  assert.equal(context.chatRequestIsCancellable(new Set([preparing]), new Set([chat])), false);
+});
+
 for (const switchAt of ["persistence", "dispatch"]) {
   for (const outcome of ["throw", "blocked"]) {
     test(`pending A dispatch ${outcome} preserves B draft and Stop after selection during ${switchAt}`, async () => {
