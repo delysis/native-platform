@@ -49,6 +49,13 @@ func hasRemainderAfterOneWord(_ candidate: Data) -> Bool {
     return text.split(whereSeparator: { $0.isWhitespace }).count >= 2
 }
 
+func containsCapabilityTransportFailure(_ strings: [String]) -> Bool {
+    strings.contains { value in
+        value.localizedCaseInsensitiveContains("not allowed by ACL") ||
+            (value.contains("command_transport_failed") && value.contains("plugin:"))
+    }
+}
+
 func insertionContractTests() {
     let original = Data("hello ".utf8), candidate = Data("world again".utf8)
     var checks = 0
@@ -94,6 +101,10 @@ func insertionContractTests() {
     check(hasRemainderAfterOneWord(Data("one two".utf8)), "multiword candidate retains a remainder")
     check(!hasRemainderAfterOneWord(Data("one".utf8)), "one-word candidate is exhausted")
     check(!hasRemainderAfterOneWord(Data([0xff])), "reject invalid candidate encoding")
+    check(containsCapabilityTransportFailure([
+        "Command plugin: window|set_focus not allowed by ACL command_transport_failed retryable"
+    ]), "recognize capability transport failure")
+    check(!containsCapabilityTransportFailure(["ordinary editing notice"]), "ignore ordinary notice")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -200,6 +211,10 @@ func descendants() -> [AXUIElement] {
         }
     }
     return queue
+}
+
+func capabilityTransportFailure() -> String? {
+    descendants().lazy.flatMap(strings).first(where: { containsCapabilityTransportFailure([$0]) })
 }
 
 func editor() -> AXUIElement? {
@@ -794,6 +809,10 @@ guard let wordAccepted = waitForWitness(timeout: 10, { witness in
 }) else {
     releaseOptionAndFail("Option-Right did not retain physical Option and exact cached-session authority")
 }
+Thread.sleep(forTimeInterval: 0.25)
+if let failure = capabilityTransportFailure() {
+    releaseOptionAndFail("Option-Right exposed a packaged Tauri capability failure: \(failure)")
+}
 
 guard exactInsertion(accepted, witness: wordAccepted),
       postKey(123, down: true, flags: [.maskAlternate]),
@@ -1153,6 +1172,7 @@ let evidence: [String: Any] = [
     "accepted_sha256": sha256(accepted),
     "rollback_sha256": sha256(readManuscript()!),
     "accepted_then_exactly_reversed": true,
+    "no_option_right_capability_transport_failure": true,
     "insertions_match_immutable_candidate_bytes": true,
     "context_key": context,
     "family_run_ids": runIds,

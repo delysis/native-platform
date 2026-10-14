@@ -9,5 +9,8 @@
     "loom:test": "pnpm --filter @delysis/loom test",
     "loom:check": "pnpm --filter @delysis/loom check",
     "loom:build": "pnpm --filter @delysis/loom build"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
   }
 }

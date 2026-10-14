@@ -9,6 +9,7 @@
     "core:window:allow-set-title",
     "core:window:allow-is-fullscreen",
     "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
     "core:menu:allow-new",
     "core:menu:allow-popup",
     "core:resources:allow-close",
