@@ -165,6 +165,10 @@ describe('real WebKit editor interactions', () => {
     expect(audio?.controls).toBe(true);
     expect(document.querySelectorAll('.audio-waveform i')).toHaveLength(4);
     expect(document.querySelector('.inline-audio-card')?.textContent).not.toContain('📎');
+    const context = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    document.querySelector('.loom-media-object')?.dispatchEvent(context);
+    expect(page.getByRole('menuitem', { name: 'Edit', exact: true }).query()).toBeNull();
+    expect(document.querySelector('.loom-object-source')).toBeNull();
   });
 
   it('makes the full visual writing body an editable hit target', async () => {

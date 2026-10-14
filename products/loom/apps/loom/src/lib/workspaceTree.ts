@@ -43,5 +43,11 @@ export function workspaceRows(documents: DocumentSummary[], collapsed: Set<strin
     }
   };
   walk('', 0, selected);
-  return rows;
+  // These are storage implementation details, not user-managed folders.
+  // Attachments and retained sources have their own UI, while manuscript is
+  // the root of the document outline. Keep every physical path on the row so
+  // native actions still address the exact object.
+  return rows
+    .filter(row => !row.path.startsWith('assets/') && !row.path.startsWith('sources/') && row.path !== 'manuscript/')
+    .map(row => row.path.startsWith('manuscript/') ? { ...row, depth: Math.max(0, row.depth - 1) } : row);
 }

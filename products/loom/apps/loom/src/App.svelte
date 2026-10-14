@@ -4952,11 +4952,9 @@
   function selectSidebarRow(event: MouseEvent, target: CapturedSidebarTarget): void {
     if (!sidebarTargetIsCurrent(target, sidebarLiveState())) return;
     sidebarSelection = target.key;
-    // A label click selects; only the disclosure or a double click opens.
-    // In particular a click on the current document is not an implicit rename.
-    if (event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]')) {
-      void activateSidebarRow(target, event.currentTarget as HTMLButtonElement);
-    }
+    // The sidebar has one selection: the object shown by the main pane. A
+    // single click opens documents/materials and toggles folders immediately.
+    void activateSidebarRow(target, event.currentTarget as HTMLButtonElement);
   }
 
   function handleSidebarContextPointer(event: MouseEvent, target: CapturedSidebarTarget): void {
@@ -10621,13 +10619,13 @@
         {/if}
         {#if document && !activeMaterial && !materialsOpen}
           <button
-            class:recording={Boolean(speechRecording) && !speechError}
+            class:recording={Boolean(speechRecording || speechStarting) && !speechError}
             class:needs-attention={Boolean(speechError)}
             class="titlebar-button microphone-toggle"
             type="button"
             aria-label={speechRecording
               ? speechError ? 'Retry saving recording' : 'Stop recording'
-              : 'Record audio'}
+              : speechStarting ? 'Starting recording' : 'Record audio'}
             aria-describedby="speech-input-help"
             aria-pressed={Boolean(speechRecording)}
             title={speechError || (speechRecording
@@ -10711,7 +10709,6 @@
                   tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
                   on:focus={() => sidebarSelection = target.key}
                   on:click={(event) => selectSidebarRow(event, target)}
-                  on:dblclick={(event) => { if (!(event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]'))) void activateSidebarRow(target, event.currentTarget); }}
                   on:contextmenu={(event) => handleSidebarContextPointer(event, target)}
                   on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
                   <span data-sidebar-disclosure aria-hidden="true"></span><span>{workspaceLabels.get(folder.root) ?? target.title}</span>
@@ -10730,7 +10727,6 @@
                 aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
                 on:focus={() => sidebarSelection = target.key}
                 on:click={(event) => selectSidebarRow(event, target)}
-                on:dblclick={(event) => { if (!(event.target instanceof Element && event.target.closest('[data-sidebar-disclosure]'))) void activateSidebarRow(target, event.currentTarget); }}
                 on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
                 <span data-sidebar-disclosure aria-hidden="true"></span><span>{row.title}</span>
               </button>
@@ -10751,7 +10747,7 @@
                 aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined}
                 tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
                 style={`padding-left: ${8 + row.depth * 14}px`} on:focus={() => sidebarSelection = target.key}
-                on:click={(event) => selectSidebarRow(event, target)} on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
+                on:click={(event) => selectSidebarRow(event, target)}
                 on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
                 <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
@@ -10771,12 +10767,12 @@
             {:else}
             <div class="document-row-group" class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
               style={`padding-left: ${row.depth * 14}px`} class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}>
-              <button class="document-row" class:selected={sidebarSelection === target.key}
+              <button class="document-row"
                 data-document-row={candidate.document_id} data-sidebar-row={target.key} data-sidebar-kind="document" data-sidebar-parent={sidebarParentKey(row.path)}
                 type="button" title={target.displayPath ?? undefined} aria-haspopup="menu" aria-expanded={sidebarContextTarget?.key === target.key}
-                aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
+                aria-current={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id) ? 'page' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
                 on:focus={() => sidebarSelection = target.key}
-                on:click={(event) => handleDocumentRowClick(event, target)} on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
+                on:click={(event) => handleDocumentRowClick(event, target)}
                 on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}
                 on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)} on:pointermove={updateDocumentContextLongPress}
                 on:pointerup={finishDocumentContextLongPress} on:pointercancel={finishDocumentContextLongPress}>
@@ -10810,7 +10806,6 @@
               type="button" title={target.displayPath ?? item.reference} data-sidebar-row={target.key} data-sidebar-kind="material" data-sidebar-parent={sidebarParentKey()}
               aria-haspopup="menu" aria-current={sidebarSelection === target.key ? 'true' : undefined} tabindex={sidebarSelection === null || sidebarSelection === target.key ? 0 : -1}
               on:focus={() => sidebarSelection = target.key} on:click={(event) => selectSidebarRow(event, target)}
-              on:dblclick={(event) => void activateSidebarRow(target, event.currentTarget)}
               on:contextmenu={(event) => handleSidebarContextPointer(event, target)} on:keydown={(event) => handleSidebarRowKeydown(event, target)}>
               <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library' || item.kind === 'collection'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}

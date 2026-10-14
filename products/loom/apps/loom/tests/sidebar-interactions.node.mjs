@@ -361,11 +361,12 @@ test('real App delayed focus restoration never steals focus in a new workspace o
   a.closeDocumentContextMenu(); a.state.project = { ...a.state.project, session_id: 'other' };
   gate.resolve(); await pause(); assert.equal(trigger.focused, 0); assert.deepEqual(a.calls, []);
 });
-test('real App selection never implicitly opens/renames; ContextMenu and Shift-F10 do not invoke native menus', () => {
+test('real App single-click opens while ContextMenu and Shift-F10 do not rename or invoke native menus', () => {
   for (const event of [key('ContextMenu'), key('F10', { shiftKey: true })]) {
     const a = app(), target = selectTarget(a), button = new Control(); event.currentTarget = button;
     a.selectSidebarRow({ target: button, currentTarget: button }, target);
-    assert.equal(a.state.sidebarSelection, target.key); assert.equal(a.state.renamingWorkspaceRoot, null); assert.deepEqual(a.calls, []);
+    assert.equal(a.state.sidebarSelection, target.key); assert.equal(a.state.renamingWorkspaceRoot, null);
+    assert.equal(a.calls.length, 1); assert.equal(a.calls[0][0], 'prepare-path');
     a.handleSidebarRowKeydown(event, target); assert(event.defaultPrevented && event.stopped); assert.equal(a.state.sidebarContextTarget, target);
   }
 });

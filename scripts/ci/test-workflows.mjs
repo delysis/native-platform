@@ -15,6 +15,7 @@ const fullPath = path.join(root, ".github/workflows/ci-full.yml");
 const fullRootPath = path.join(root, ".github/workflows/ci-full-root.yml");
 const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
+const momKeychainRepairPath = path.join(root, "scripts/repair-mom-keychain.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
 const embeddedModelScriptPath = path.join(root, "scripts/find-embedded-model.mjs");
 const workflowSnapshotPath = path.join(root, "ci/ci-workflow-snapshot.json");
@@ -30,6 +31,17 @@ const momWindowsIconPath = path.join(
 function read(file) {
   return fs.readFileSync(file, "utf8");
 }
+
+test("macOS human testing cannot regress to ad-hoc Mom credentials", () => {
+  const release = read(releaseScriptPath);
+  const repair = read(momKeychainRepairPath);
+  assert.match(release, /candidate\|human-test\|stable/);
+  assert.match(release, /human-test packages require DELYSIS_SIGNING_IDENTITY/);
+  assert.match(release, /Apple Development:\|Developer ID Application:/);
+  assert.match(release, /SIGNING_MODE=human-test/);
+  assert.match(repair, /com\.delysis\.llama-native-kit\.mom-llama\|app\.delysis\.loom/);
+  assert.match(repair, /set-generic-password-partition-list/);
+});
 
 test("native relaunch waits for its owned registration and propagates lookup failures", {
   skip: process.platform === "win32",
@@ -564,7 +576,7 @@ test("native macOS lane runs all native tests, separate doctests, and strict Cli
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
   const smoke = read(smokeScriptPath);
-  assert.match(release, /candidate\|stable/);
+  assert.match(release, /candidate\|human-test\|stable/);
   assert.match(release, /stable releases require the exact annotated tag/);
   assert.match(release, /git cat-file -t "refs\/tags\/\$RELEASE_TAG"/);
   assert.match(release, /Developer ID Application:/);

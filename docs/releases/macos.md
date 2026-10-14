@@ -17,6 +17,19 @@ identity and signature; and writes the ZIP and `release-receipt.json` under
 `dist/macos/`. Run the exact ZIP smoke command printed at the end. It launches,
 quits, and relaunches the extracted app against isolated product state.
 
+Do not use an ad-hoc candidate against a person's existing secure Mom store.
+For interactive Mom or Loom testing, use a stable local signing identity:
+
+```sh
+export DELYSIS_SIGNING_IDENTITY='Apple Development: Your Name (TEAMID)'
+scripts/release-macos.sh {mom|loom} human-test
+```
+
+`human-test` refuses ad-hoc signing. Loom embeds the Mom runtime and opens the
+same encrypted store, so this rule applies to both applications. Launch the
+exact bundle path printed by the command; do not select a same-identifier app
+through Launch Services.
+
 Before tagging a stable release, use that candidate to exercise an active local
 operation and the applicable backup/restore rollback. These are product checks,
 not fields to rubber-stamp in a manifest.
@@ -51,6 +64,9 @@ For that confirmed case, repair only the existing credential's signer partition:
 scripts/repair-mom-keychain.sh /absolute/path/to/Mom\ Llama.app /exact/data/directory --check
 scripts/repair-mom-keychain.sh /absolute/path/to/Mom\ Llama.app /exact/data/directory
 ```
+
+The signed bundle may instead be Loom. Both applications use the same Mom
+credential, and the script accepts only those two bundle identifiers.
 
 The script validates the bundle identity and stable TeamIdentifier, hashes the
 exact data-directory spelling used by the runtime, and addresses one generic

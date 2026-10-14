@@ -208,6 +208,7 @@ async fn interrupted_pipeline_with_source(
         context_references: None,
         function_recipe: Some(function_recipe),
         media: media_evidence,
+        omitted_media: Vec::new(),
         model: None,
         bindings,
         evidence: Vec::new(),

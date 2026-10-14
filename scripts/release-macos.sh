@@ -10,9 +10,9 @@ COMPONENT=${1:-}
 RELEASE_KIND=${2:-candidate}
 
 case "$RELEASE_KIND" in
-  candidate|stable) ;;
+  candidate|human-test|stable) ;;
   *)
-    echo "usage: $0 {mom|loom|fte} [candidate|stable]" >&2
+    echo "usage: $0 {mom|loom|fte} [candidate|human-test|stable]" >&2
     exit 2
     ;;
 esac
@@ -48,7 +48,7 @@ case "$COMPONENT" in
     TAG_PREFIX=fte-desktop
     ;;
   *)
-    echo "usage: $0 {mom|loom|fte} [candidate|stable]" >&2
+    echo "usage: $0 {mom|loom|fte} [candidate|human-test|stable]" >&2
     exit 2
     ;;
 esac
@@ -175,6 +175,20 @@ fi
 
 SIGNING_IDENTITY=${DELYSIS_SIGNING_IDENTITY:--}
 NOTARY_PROFILE=${DELYSIS_NOTARY_PROFILE:-}
+if [ "$RELEASE_KIND" = human-test ]; then
+  if [ -z "$SIGNING_IDENTITY" ] || [ "$SIGNING_IDENTITY" = "-" ]; then
+    echo "human-test packages require DELYSIS_SIGNING_IDENTITY; ad-hoc signatures can trigger duplicate Keychain authorization dialogs" >&2
+    exit 1
+  fi
+  MATCHING_IDENTITY=$(security find-identity -v -p codesigning |
+    grep -F "$SIGNING_IDENTITY" |
+    grep -E 'Apple Development:|Developer ID Application:' |
+    head -n 1 || true)
+  if [ -z "$MATCHING_IDENTITY" ]; then
+    echo "DELYSIS_SIGNING_IDENTITY is not an available Apple Development or Developer ID Application identity" >&2
+    exit 1
+  fi
+fi
 if [ "$RELEASE_KIND" = stable ]; then
   if [ -z "$SIGNING_IDENTITY" ] || [ "$SIGNING_IDENTITY" = "-" ]; then
     echo "stable releases require DELYSIS_SIGNING_IDENTITY for a Developer ID Application identity" >&2
@@ -295,6 +309,8 @@ else
   run codesign --force --deep --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$BUNDLE"
   if [ "$RELEASE_KIND" = stable ]; then
     SIGNING_MODE=developer-id
+  elif [ "$RELEASE_KIND" = human-test ]; then
+    SIGNING_MODE=human-test
   else
     SIGNING_MODE=custom-identity
   fi
