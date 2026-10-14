@@ -4847,10 +4847,12 @@ mod tests {
             "transcription may become only one explicit ordinary composer edit, never a send"
         );
         assert!(
-            js.contains("Stop suppresses playback immediately")
-                && js.contains("Apple’s inner synthesis call is non-preemptive")
-                && js.contains("mom_llama_speech_quiescing"),
-            "playback Stop and Quit must state and enforce Apple's non-preemptive join boundary"
+            !js.contains("Stop suppresses playback immediately")
+                && !js.contains("Apple’s inner synthesis call is non-preemptive")
+                && js.contains("mom_llama_speech_stop")
+                && js.contains("mom_llama_speech_quiescing")
+                && js.contains("Stop reading"),
+            "playback must keep Stop and Quit enforcement without exposing implementation prose in chrome"
         );
     }
 
