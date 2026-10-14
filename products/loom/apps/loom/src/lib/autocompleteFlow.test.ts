@@ -2,7 +2,7 @@ import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-ma
 import { EditorState, Selection } from 'prosemirror-state';
 import type { EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
-import { autocompleteDisposition } from './ghostSuggestion';
+import { verifiedGhostSuggestion } from './ghostSuggestion';
 import { createGhostTextPlugin, setGhostText } from './ghostText';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
 import type { BranchCard } from './types';
@@ -72,21 +72,11 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
       'candidate-repeated',
       ` ${'rain '.repeat(32)}`
     );
-    const disposition = autocompleteDisposition({
-      active: true,
-      branches: [repeated.branch],
-      verifiedBodyByRun: { 'run-repeated': repeated.body },
-      dismissedCandidateIds: [],
-      targetByte: 61
-    });
-    expect(disposition).toEqual({
-      kind: 'available',
-      suggestion: {
-        candidateId: 'candidate-repeated',
-        presentationKey: `candidate-repeated:${repeated.body.blobId}`,
-        targetByte: 61,
-        text: repeated.body.text
-      }
+    expect(verifiedGhostSuggestion(repeated.branch, repeated.body)).toEqual({
+      candidateId: 'candidate-repeated',
+      presentationKey: `candidate-repeated:${repeated.body.blobId}`,
+      targetByte: 61,
+      text: repeated.body.text
     });
   });
 
@@ -96,15 +86,8 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
       'candidate-clean',
       ', while somewhere beyond the rain a signal clicked from red to green.'
     );
-    const available = autocompleteDisposition({
-      active: true,
-      branches: [clean.branch],
-      verifiedBodyByRun: { 'run-clean': clean.body },
-      dismissedCandidateIds: [],
-      targetByte: 61
-    });
-    expect(available.kind).toBe('available');
-    if (available.kind !== 'available') throw new Error('expected verified candidate');
+    const available = verifiedGhostSuggestion(clean.branch, clean.body);
+    if (!available) throw new Error('expected verified candidate');
 
     let accepted: { candidateId: string; presentationKey: string; text: string } | null = null;
     const plugin = createGhostTextPlugin({
@@ -134,11 +117,11 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
     } as unknown as EditorView;
     setGhostText(view, {
       active: true,
-      candidateId: available.suggestion.candidateId,
-      presentationKey: available.suggestion.presentationKey,
+      candidateId: available.candidateId,
+      presentationKey: available.presentationKey,
       surfaceKey: 'project:document:revision:visual',
-      anchorByteOffset: available.suggestion.targetByte,
-      text: available.suggestion.text,
+      anchorByteOffset: available.targetByte,
+      text: available.text,
       insertsOnAccept: true
     });
 

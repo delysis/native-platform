@@ -4,14 +4,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct BuiltinPersona {
     pub id: String,
     pub label: String,
-    pub description: String,
     pub perspective_prompt: String,
-    #[serde(default)]
-    pub public_figure: Option<String>,
-    #[serde(default)]
-    pub expertise: Option<String>,
-    #[serde(default)]
-    pub model_slot: Option<usize>,
 }
 
 pub(crate) const LIBRARY_REVISION: &str =
@@ -21,7 +14,6 @@ pub(crate) const LIBRARY_REVISION: &str =
 struct SourcePersona {
     id: String,
     name: String,
-    modality: String,
     system_prompt: String,
 }
 
@@ -37,12 +29,8 @@ pub(crate) fn builtin_personas() -> Vec<BuiltinPersona> {
         .into_iter()
         .map(|source| BuiltinPersona {
             id: source.id,
-            label: source.name.clone(),
-            description: source.modality.clone(),
+            label: source.name,
             perspective_prompt: source.system_prompt,
-            public_figure: Some(source.name),
-            expertise: Some(source.modality),
-            model_slot: None,
         })
         .collect()
 }

@@ -124,11 +124,11 @@ enum BuiltinPersonaOwnership {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct BuiltinPersonaProvenance {
     persona_id: String,
     ownership: BuiltinPersonaOwnership,
     catalog_revision: String,
-    catalog_entry_sha256: String,
     #[serde(default)]
     last_applied_persona_sha256: Option<String>,
     observed_persona_sha256: String,
@@ -1673,7 +1673,6 @@ fn reconcile_builtin_personas(
     for source in catalog {
         let desired_handle = handles[&source.id].clone();
         let id = format!("persona-{}", source.id);
-        let catalog_entry_sha256 = sha256_json(&source)?;
         let prior = groups
             .builtin_persona_provenance
             .iter()
@@ -1735,7 +1734,6 @@ fn reconcile_builtin_personas(
                     persona_id: id,
                     ownership,
                     catalog_revision: catalog_revision.to_string(),
-                    catalog_entry_sha256,
                     last_applied_persona_sha256,
                     observed_persona_sha256,
                 },
@@ -1753,7 +1751,6 @@ fn reconcile_builtin_personas(
                     persona_id: id,
                     ownership: BuiltinPersonaOwnership::UserModified,
                     catalog_revision: catalog_revision.to_string(),
-                    catalog_entry_sha256,
                     last_applied_persona_sha256: prior.last_applied_persona_sha256,
                     observed_persona_sha256: "deleted".to_string(),
                 },
@@ -1792,7 +1789,6 @@ fn reconcile_builtin_personas(
                 persona_id: id.clone(),
                 ownership: BuiltinPersonaOwnership::CatalogManaged,
                 catalog_revision: catalog_revision.to_string(),
-                catalog_entry_sha256,
                 last_applied_persona_sha256: Some(applied_persona_sha256.clone()),
                 observed_persona_sha256: applied_persona_sha256,
             },
@@ -2200,11 +2196,7 @@ mod tests {
         BuiltinPersona {
             id: "careful_guide".to_string(),
             label: label.to_string(),
-            description: "A deterministic catalog fixture.".to_string(),
             perspective_prompt: prompt.to_string(),
-            public_figure: None,
-            expertise: Some("Testing".to_string()),
-            model_slot: None,
         }
     }
 
@@ -2388,6 +2380,23 @@ mod tests {
             .code,
             "mention_handle_taken"
         );
+    }
+
+    #[test]
+    fn obsolete_catalog_entry_digest_is_rejected_instead_of_silently_loaded() {
+        let obsolete = serde_json::json!({
+            "groups": [],
+            "catalog_revision": "catalog-v1",
+            "builtin_persona_provenance": [{
+                "persona_id": "persona-careful_guide",
+                "ownership": "catalog_managed",
+                "catalog_revision": "catalog-v1",
+                "catalog_entry_sha256": "0".repeat(64),
+                "last_applied_persona_sha256": null,
+                "observed_persona_sha256": "deleted"
+            }]
+        });
+        assert!(serde_json::from_value::<PersonaGroupDb>(obsolete).is_err());
     }
 
     #[test]

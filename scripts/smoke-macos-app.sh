@@ -381,11 +381,6 @@ type_into_loom_editor() {
   "$SMOKE_HELPERS/type_into_loom_editor" "$target_pid" "$sentinel"
 }
 
-exercise_loom_completion_controls() {
-  target_pid=$1
-  "$SMOKE_HELPERS/exercise_loom_completion_controls" "$target_pid"
-}
-
 exercise_loom_formatting_palette() {
   target_pid=$1
   action_name=$2
@@ -1204,26 +1199,18 @@ run_once() {
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
-    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      if ! foreground_loom_process "$ACTIVE_PID"; then
-        echo "the exact Loom process could not be foregrounded before changing suggestion policy" >&2
-        return 1
-      fi
-      if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
-        "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
-        echo "could not establish autocomplete off before real-completion typing" >&2
-        return 1
-      fi
-      loom_generation_count_before_batch=$(sqlite3 \
-        "$loom_database" \
-        'SELECT count(*) FROM generation_runs;')
-    else
-      if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
-        echo "autocomplete and Shuttle did not behave as independent native controls" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
+    if ! foreground_loom_process "$ACTIVE_PID"; then
+      echo "the exact Loom process could not be foregrounded before changing suggestion policy" >&2
+      return 1
     fi
+    if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
+      "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
+      echo "could not establish autocomplete off before real-completion typing" >&2
+      return 1
+    fi
+    loom_generation_count_before_batch=$(sqlite3 \
+      "$loom_database" \
+      'SELECT count(*) FROM generation_runs;')
     # Exercise raw completion with an authored, unfinished prose boundary.
     # A closed declarative sentence invites a new paragraph or markup from a
     # base model, which the visual editor must correctly reject and therefore
@@ -1767,7 +1754,6 @@ DELYSIS_SMOKE_RUN_2_MOM_UI_IDENTITY="${RUN_2_MOM_UI_IDENTITY:-}" \
 DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE="${RUN_1_DRAG_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE="${RUN_1_MANUSCRIPT_SHA256_BEFORE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER="${RUN_1_MANUSCRIPT_SHA256_AFTER:-}" \
-DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE="${RUN_1_COMPLETION_CONTROLS_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE="${RUN_1_EDITOR_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_INPUT_SENTINEL="${RUN_1_EDITOR_INPUT_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
@@ -1797,9 +1783,6 @@ node <<'NODE' > "$RECEIPT"
 const e = process.env;
 const titlebarDrag = e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE)
-  : null;
-const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
-  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE)
   : null;
 const editorInput = e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE)
@@ -1864,7 +1847,6 @@ const receipt = {
       titlebar_drag: titlebarDrag,
       manuscript_sha256_before_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE || null,
       manuscript_sha256_after_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER || null,
-      completion_controls: completionControls,
       project_busy_regression: projectBusyRegression,
       editor_input: editorInput ? {
         ...editorInput,

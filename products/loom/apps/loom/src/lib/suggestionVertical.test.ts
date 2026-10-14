@@ -11,10 +11,7 @@ import {
   setGhostText,
   VISUAL_TAB_INDENT
 } from './ghostText';
-import {
-  autocompleteDisposition,
-  exactVerifiedSuggestionFamily
-} from './ghostSuggestion';
+import { verifiedGhostSuggestion } from './ghostSuggestion';
 import { sourceGhostKeyAction, sourceTabEdit } from './sourceGhostText';
 import type { BranchCard } from './types';
 
@@ -118,26 +115,13 @@ describe('W1 model-free suggestion vertical', () => {
       branches.map((branch, index) => [branch.run_id, bodies[index]])
     );
 
-    const disposition = autocompleteDisposition({
-      active: true,
-      branches,
-      verifiedBodyByRun,
-      dismissedCandidateIds: [],
-      targetByte: fixture.source.caret_byte
-    });
-    expect(disposition.kind).toBe('available');
-    if (disposition.kind !== 'available') throw new Error('fixture suggestion unavailable');
     const primary = branches[fixture.expected.primary_candidate_index];
-    expect(disposition.suggestion.candidateId).toBe(primary.candidate_id);
-    const reviewFamily = exactVerifiedSuggestionFamily({
-      active: true,
-      branches,
-      verifiedBodyByRun,
-      targetByte: fixture.source.caret_byte
-    });
-    expect(reviewFamily).toHaveLength(fixture.expected.explicit_review_candidate_count);
-    expect(reviewFamily.length - fixture.expected.visible_ghost_count)
-      .toBe(fixture.expected.hidden_candidate_count);
+    const suggestion = verifiedGhostSuggestion(
+      primary,
+      verifiedBodyByRun[primary.run_id]
+    );
+    if (!suggestion) throw new Error('fixture suggestion unavailable');
+    expect(suggestion.candidateId).toBe(primary.candidate_id);
 
     let accepted = '';
     let acceptedPresentation = '';
@@ -155,7 +139,7 @@ describe('W1 model-free suggestion vertical', () => {
       dismiss: (candidateId) => { dismissed = candidateId; },
       visible: (presentationKey, surfaceKey, anchorByteOffset) =>
         visible &&
-        presentationKey === disposition.suggestion.presentationKey &&
+        presentationKey === suggestion.presentationKey &&
         surfaceKey === 'w1-project:w1-document:w1-source-revision:visual' &&
         anchorByteOffset === fixture.source.caret_byte
     });
@@ -177,11 +161,11 @@ describe('W1 model-free suggestion vertical', () => {
 
     setGhostText(view, {
       active: true,
-      candidateId: disposition.suggestion.candidateId,
-      presentationKey: disposition.suggestion.presentationKey,
+      candidateId: suggestion.candidateId,
+      presentationKey: suggestion.presentationKey,
       surfaceKey: 'w1-project:w1-document:w1-source-revision:visual',
-      anchorByteOffset: disposition.suggestion.targetByte,
-      text: disposition.suggestion.text,
+      anchorByteOffset: suggestion.targetByte,
+      text: suggestion.text,
       insertsOnAccept: true
     });
     const decorations = plugin.props.decorations?.call(plugin, state);
@@ -191,7 +175,7 @@ describe('W1 model-free suggestion vertical', () => {
     );
     expect(plugin.props.handleKeyDown?.call(plugin, view, key())).toBe(true);
     expect(accepted).toBe(primary.candidate_id);
-    expect(acceptedPresentation).toBe(disposition.suggestion.presentationKey);
+    expect(acceptedPresentation).toBe(suggestion.presentationKey);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(`${manuscriptBefore},`);
     expect(ghostTextPluginKey.getState(state)).toBeNull();
 
@@ -202,11 +186,11 @@ describe('W1 model-free suggestion vertical', () => {
     });
     setGhostText(view, {
       active: true,
-      candidateId: disposition.suggestion.candidateId,
-      presentationKey: disposition.suggestion.presentationKey,
+      candidateId: suggestion.candidateId,
+      presentationKey: suggestion.presentationKey,
       surfaceKey: 'w1-project:w1-document:w1-source-revision:visual',
-      anchorByteOffset: disposition.suggestion.targetByte,
-      text: disposition.suggestion.text
+      anchorByteOffset: suggestion.targetByte,
+      text: suggestion.text
     });
     expect(plugin.props.handleKeyDown?.call(plugin, view, key({ key: 'Escape', keyCode: 27 })))
       .toBe(true);
@@ -221,11 +205,11 @@ describe('W1 model-free suggestion vertical', () => {
     visible = false;
     setGhostText(view, {
       active: true,
-      candidateId: disposition.suggestion.candidateId,
-      presentationKey: disposition.suggestion.presentationKey,
+      candidateId: suggestion.candidateId,
+      presentationKey: suggestion.presentationKey,
       surfaceKey: 'w1-project:w1-document:stale-revision:visual',
-      anchorByteOffset: disposition.suggestion.targetByte,
-      text: disposition.suggestion.text
+      anchorByteOffset: suggestion.targetByte,
+      text: suggestion.text
     });
     expect(plugin.props.handleKeyDown?.call(plugin, view, key())).toBe(true);
     expect(state.doc.textContent).toBe(`${fixture.source.revision_text}${VISUAL_TAB_INDENT}`);

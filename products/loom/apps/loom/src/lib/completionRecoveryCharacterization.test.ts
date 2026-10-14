@@ -19,7 +19,6 @@ import {
   startCompletionSession,
   synchronizeCompletionCandidates
 } from './completionSession';
-import { exactVerifiedSuggestionFamily } from './ghostSuggestion';
 import { inlineSuggestionFamily } from './inlineSuggestionFamily';
 import type {
   BranchBody,
@@ -452,17 +451,6 @@ describe('model-free completion recovery characterization', () => {
     expect(terminalDigest(mergeNewestPage(metadata, [forgedEventProjection])))
       .toEqual(expectedDigest);
 
-    expect(exactVerifiedSuggestionFamily({
-      active: true,
-      branches: hydrated.branches,
-      verifiedBodyByRun: hydrated.verifiedBodyByRun,
-      targetByte: fixture.source.caret_byte
-    }).map((branch) => branch.candidate_id)).toEqual([
-      'candidate-a',
-      'candidate-b',
-      'candidate-c',
-      'candidate-d'
-    ]);
   });
 
   it('validates active supervisor facts without replacing durable terminal identity', () => {

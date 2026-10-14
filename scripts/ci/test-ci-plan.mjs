@@ -80,8 +80,9 @@ function commit(repo, message) {
   return git(repo, "rev-parse", "HEAD");
 }
 
-function makeRepo() {
+function makeRepo(t) {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "native-platform-ci-plan-"));
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
   git(repo, "init", "-q");
   git(repo, "config", "user.email", "ci-plan@example.invalid");
   git(repo, "config", "user.name", "CI planner tests");
@@ -117,8 +118,8 @@ function plan(repo, base, head, outputPath, metadataPath = writeMetadataFixture(
   return parsed;
 }
 
-function fixture(relativePath, { contents = "changed\n", present = [] } = {}) {
-  const { repo, base } = makeRepo();
+function fixture(t, relativePath, { contents = "changed\n", present = [] } = {}) {
+  const { repo, base } = makeRepo(t);
   for (const presentPath of present) write(repo, presentPath, "[workspace]\n");
   const fixtureBase = present.length > 0 ? commit(repo, "fixture presence") : base;
   write(repo, relativePath, contents);
@@ -126,8 +127,8 @@ function fixture(relativePath, { contents = "changed\n", present = [] } = {}) {
   return { repo, result: plan(repo, fixtureBase, head) };
 }
 
-function fixtureMany(relativePaths, { present = [] } = {}) {
-  const { repo, base } = makeRepo();
+function fixtureMany(t, relativePaths, { present = [] } = {}) {
+  const { repo, base } = makeRepo(t);
   for (const presentPath of present) write(repo, presentPath, "[workspace]\n");
   const fixtureBase = present.length > 0 ? commit(repo, "fixture presence") : base;
   for (const relativePath of relativePaths) write(repo, relativePath);
@@ -135,15 +136,15 @@ function fixtureMany(relativePaths, { present = [] } = {}) {
   return { repo, result: plan(repo, fixtureBase, head) };
 }
 
-test("docs-only changes require policy and nothing else", () => {
-  const { result } = fixture("docs/architecture.md");
+test("docs-only changes require policy and nothing else", (t) => {
+  const { result } = fixture(t, "docs/architecture.md");
   assert.equal(result.risk, "docs");
   assert.deepEqual(result.jobs, ["policy"]);
   assert.deepEqual(result.macos_matrix, []);
 });
 
-test("full push selection preserves code changes since the last qualified revision", () => {
-  const { repo, base } = makeRepo();
+test("full push selection preserves code changes since the last qualified revision", (t) => {
+  const { repo, base } = makeRepo(t);
   fs.writeFileSync(path.join(repo, ".git/info/exclude"), ".ci-cargo-metadata.json\n");
   write(repo, "new-unknown-input", "code input\n");
   const code = commit(repo, "code awaiting qualification");
@@ -168,12 +169,11 @@ test("full push selection preserves code changes since the last qualified revisi
   write(repo, "docs/architecture.md");
   const mixed = commit(repo, "delete code and edit docs");
   assert.equal(full(deletedDocs, mixed).full_required, true);
-  fs.rmSync(repo, { recursive: true, force: true });
 });
 
-test("Linux inventory moves only to a selected complete workspace build", () => {
+test("Linux inventory moves only to a selected complete workspace build", (t) => {
   for (const input of ["Cargo.toml", "crates/native/crates/llama-native-types/src/lib.rs", "products/loom/crates/loom-types/src/lib.rs"]) {
-    const { result } = fixture(input);
+    const { result } = fixture(t, input);
     const inRoot = result.flags.root || result.flags.full;
     assert.deepEqual(result.ignored_matrix,
       inRoot ? ["macos-latest", "windows-latest"] : ["ubuntu-latest", "macos-latest", "windows-latest"]);
@@ -182,8 +182,8 @@ test("Linux inventory moves only to a selected complete workspace build", () => 
   }
 });
 
-test("CI policy changes use root Linux and macOS without expanding to full", () => {
-  const { result } = fixture("scripts/ci/ci-plan.mjs");
+test("CI policy changes use root Linux and macOS without expanding to full", (t) => {
+  const { result } = fixture(t, "scripts/ci/ci-plan.mjs");
   assert.equal(result.risk, "behavior");
   assert.equal(result.flags.root, true);
   assert.equal(result.flags.platform_macos, true);
@@ -197,8 +197,8 @@ test("CI policy changes use root Linux and macOS without expanding to full", () 
   assert.deepEqual(result.macos_matrix, ["release", "root"]);
 });
 
-test("release workflow changes select the exact macOS release lane", () => {
-  const { result } = fixture(".github/workflows/release-macos.yml");
+test("release workflow changes select the exact macOS release lane", (t) => {
+  const { result } = fixture(t, ".github/workflows/release-macos.yml");
   assert.equal(result.risk, "release");
   assert.equal(result.flags.platform_macos, true);
   assert.equal(result.flags.full, false);
@@ -206,14 +206,14 @@ test("release workflow changes select the exact macOS release lane", () => {
   assert.deepEqual(result.macos_matrix, ["release"]);
 });
 
-test("macOS release tooling selects only policy and the macOS syntax lane", () => {
+test("macOS release tooling selects only policy and the macOS syntax lane", (t) => {
   for (const relativePath of [
     "scripts/release-macos.sh",
     "scripts/smoke-macos-app.sh",
     "scripts/find-embedded-model.mjs",
     "scripts/product-state-backup.mjs",
   ]) {
-    const { result } = fixture(relativePath);
+    const { result } = fixture(t, relativePath);
     assert.equal(result.risk, "release");
     assert.equal(result.flags.root, false);
     assert.equal(result.flags.platform_macos, true);
@@ -223,8 +223,8 @@ test("macOS release tooling selects only policy and the macOS syntax lane", () =
   }
 });
 
-test("Native changes require root, Native, and macOS product coverage", () => {
-  const { result } = fixture("crates/native/crates/llama-native-engine/src/lib.rs");
+test("Native changes require root, Native, and macOS product coverage", (t) => {
+  const { result } = fixture(t, "crates/native/crates/llama-native-engine/src/lib.rs");
   assert.equal(result.risk, "behavior");
   assert.equal(result.flags.root, true);
   assert.equal(result.flags.native, true);
@@ -235,8 +235,8 @@ test("Native changes require root, Native, and macOS product coverage", () => {
   assert.deepEqual(result.macos_matrix, ["release", "native", "root"]);
 });
 
-test("Attachment inspection changes select Attachment and fuzz only", () => {
-  const { result } = fixture(
+test("Attachment inspection changes select Attachment and fuzz only", (t) => {
+  const { result } = fixture(t,
     "crates/services/attachment/crates/attachment-native-inspect/src/lib.rs",
   );
   assert.equal(result.flags.attachment, true);
@@ -246,8 +246,8 @@ test("Attachment inspection changes select Attachment and fuzz only", () => {
   assert.ok(result.jobs.includes("fuzz-build"));
 });
 
-test("Information changes select Information", () => {
-  const { result } = fixture(
+test("Information changes select Information", (t) => {
+  const { result } = fixture(t,
     "crates/services/information/crates/information-native-store/src/lib.rs",
   );
   assert.equal(result.flags.information, true);
@@ -256,8 +256,8 @@ test("Information changes select Information", () => {
   assert.ok(result.jobs.includes("information-windows"));
 });
 
-test("Speech Apple changes select Speech and platform coverage", () => {
-  const { result } = fixture(
+test("Speech Apple changes select Speech and platform coverage", (t) => {
+  const { result } = fixture(t,
     "crates/services/speech/crates/speech-native-platform/src/apple.rs",
   );
   assert.equal(result.flags.speech, true);
@@ -266,7 +266,7 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.deepEqual(result.macos_matrix, ["release", "speech"]);
 });
 
-test("contract-family changes select their actual metadata consumers", () => {
+test("contract-family changes select their actual metadata consumers", (t) => {
   const contractPaths = [
     "crates/native/crates/llama-native-types/src/lib.rs",
     "crates/services/attachment/crates/attachment-native-types/src/lib.rs",
@@ -274,7 +274,7 @@ test("contract-family changes select their actual metadata consumers", () => {
     "products/fte/crates/fte-types/src/lib.rs",
   ];
   for (const contractPath of contractPaths) {
-    const { result } = fixture(contractPath, {
+    const { result } = fixture(t, contractPath, {
       present: ["products/mom/Cargo.toml"],
     });
     assert.equal(result.flags.mom, true, contractPath);
@@ -285,16 +285,16 @@ test("contract-family changes select their actual metadata consumers", () => {
   }
 });
 
-test("service documentation does not select an unrelated product", () => {
-  const { result } = fixture("crates/services/speech/docs/ARCHITECTURE.md", {
+test("service documentation does not select an unrelated product", (t) => {
+  const { result } = fixture(t, "crates/services/speech/docs/ARCHITECTURE.md", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.flags.speech, true);
   assert.equal(result.flags.mom, false);
 });
 
-test("an unrelated product is not selected without a dependency edge", () => {
-  const { result } = fixture(
+test("an unrelated product is not selected without a dependency edge", (t) => {
+  const { result } = fixture(t,
     "crates/services/information/crates/information-native-types/src/lib.rs",
     { present: ["products/mom/Cargo.toml"] },
   );
@@ -305,8 +305,8 @@ test("an unrelated product is not selected without a dependency edge", () => {
   assert.ok(!result.jobs.includes("mom-linux"));
 });
 
-test("an explicit documentation rule selects policy only", () => {
-  const { result } = fixture("products/mom/docs/PRODUCT.md", {
+test("an explicit documentation rule selects policy only", (t) => {
+  const { result } = fixture(t, "products/mom/docs/PRODUCT.md", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.flags.full, false);
@@ -314,8 +314,8 @@ test("an explicit documentation rule selects policy only", () => {
   assert.equal(result.dependency_selection.file_classifications[0].rule, "products/mom/docs");
 });
 
-test("Mom native source selects its product and macOS parity without root duplication", () => {
-  const { result } = fixture("products/mom/apps/mom-llama/src-tauri/src/commands.rs", {
+test("Mom native source selects its product and macOS parity without root duplication", (t) => {
+  const { result } = fixture(t, "products/mom/apps/mom-llama/src-tauri/src/commands.rs", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.presence.mom, true);
@@ -332,8 +332,8 @@ test("Mom native source selects its product and macOS parity without root duplic
   assert.deepEqual(result.macos_matrix, ["release", "mom"]);
 });
 
-test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () => {
-  const { result } = fixtureMany(
+test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", (t) => {
+  const { result } = fixtureMany(t,
     [
       "products/mom/apps/mom-llama/src-tauri/src/commands.rs",
       "products/mom/apps/mom-llama/src-tauri/src/view.rs",
@@ -359,13 +359,13 @@ test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () 
   ]);
 });
 
-test("ignored-test sources, targets, and registry changes select authoritative reconciliation", () => {
+test("ignored-test sources, targets, and registry changes select authoritative reconciliation", (t) => {
   for (const relativePath of [
     "ci/ignored-tests.json",
     "crates/services/information/crates/information-native-backend-sqlite/src/lib.rs",
     "products/mom/crates/mom-llama-runtime/Cargo.toml",
   ]) {
-    const { result } = fixture(relativePath, {
+    const { result } = fixture(t, relativePath, {
       present: ["products/mom/Cargo.toml"],
     });
     assert.equal(result.flags.ignored_tests, true, relativePath);
@@ -373,8 +373,8 @@ test("ignored-test sources, targets, and registry changes select authoritative r
   }
 });
 
-test("new and deleted Rust sources select authoritative reconciliation", () => {
-  const added = fixture(
+test("new and deleted Rust sources select authoritative reconciliation", (t) => {
+  const added = fixture(t,
     "crates/native/crates/llama-native-types/src/new_ignored.rs",
     { contents: "#[test]\n#[ignore]\nfn newly_ignored() {}\n" },
   ).result;
@@ -382,7 +382,7 @@ test("new and deleted Rust sources select authoritative reconciliation", () => {
   assert.equal(added.flags.ignored_tests, true);
   assert.ok(added.jobs.includes("ignored-tests"));
 
-  const { repo } = makeRepo();
+  const { repo } = makeRepo(t);
   const source = "crates/services/attachment/crates/attachment-native-types/src/removed.rs";
   write(repo, source, "#[test]\n#[ignore]\nfn removed_ignored() {}\n");
   const withIgnored = commit(repo, "add ignored test");
@@ -394,7 +394,7 @@ test("new and deleted Rust sources select authoritative reconciliation", () => {
   assert.ok(removed.jobs.includes("ignored-tests"));
 });
 
-test("all Rust syntax shapes select ignored-test reconciliation fail closed", () => {
+test("all Rust syntax shapes select ignored-test reconciliation fail closed", (t) => {
   for (const [name, contents] of [
     ["ordinary", "pub fn ordinary() {}\n"],
     ["comment-decoy", "// #[ignore]\npub fn comment_decoy() {}\n"],
@@ -402,7 +402,7 @@ test("all Rust syntax shapes select ignored-test reconciliation fail closed", ()
     ["macro", "macro_rules! tests { () => { #[ignore] fn made() {} } }\n"],
     ["public", "#[ignore]\npub fn public_test() {}\n"],
   ]) {
-    const { result } = fixture(
+    const { result } = fixture(t,
       `crates/native/crates/llama-native-types/src/${name}.rs`,
       { contents },
     );
@@ -412,7 +412,7 @@ test("all Rust syntax shapes select ignored-test reconciliation fail closed", ()
   }
 });
 
-test("Cargo, build-script, proc-macro, and toolchain inputs select reconciliation", () => {
+test("Cargo, build-script, proc-macro, and toolchain inputs select reconciliation", (t) => {
   for (const relativePath of [
     "crates/native/crates/llama-native-engine/Cargo.toml",
     "crates/native/crates/llama-native-engine/build.rs",
@@ -422,27 +422,27 @@ test("Cargo, build-script, proc-macro, and toolchain inputs select reconciliatio
     "ci/package-groups.json",
     "rust-toolchain.toml",
   ]) {
-    const { result } = fixture(relativePath);
+    const { result } = fixture(t, relativePath);
     assert.equal(result.flags.ignored_tests, true, relativePath);
     assert.ok(result.jobs.includes("ignored-tests"), relativePath);
   }
 });
 
-test("product package scripts select their owned frontend checks", () => {
-  const mom = fixture("products/mom/apps/mom-llama/package.json", {
+test("product package scripts select their owned frontend checks", (t) => {
+  const mom = fixture(t, "products/mom/apps/mom-llama/package.json", {
     contents: '{"scripts":{"check:frontend":"node --check ui/coop-hx.js"}}\n',
     present: ["products/mom/Cargo.toml"],
   }).result;
   assert.equal(mom.flags.frontend_mom, true);
   assert.deepEqual(mom.jobs, ["policy", "mom-linux", "mom-windows", "frontend", "platform-macos"]);
 
-  const fte = fixture("products/fte/package.json").result;
+  const fte = fixture(t, "products/fte/package.json").result;
   assert.equal(fte.flags.frontend_fte, true);
   assert.ok(fte.jobs.includes("frontend"));
 });
 
-test("Mom dependency metadata remains conservative", () => {
-  const { result } = fixture("products/mom/crates/mom-llama-runtime/Cargo.toml", {
+test("Mom dependency metadata remains conservative", (t) => {
+  const { result } = fixture(t, "products/mom/crates/mom-llama-runtime/Cargo.toml", {
     contents: "[package]\nname = \"mom-llama-runtime\"\n",
     present: ["products/mom/Cargo.toml"],
   });
@@ -462,8 +462,8 @@ test("Mom dependency metadata remains conservative", () => {
   assert.deepEqual(result.macos_matrix, ["release", "root", "mom"]);
 });
 
-test("Loom Svelte source selects the frontend and required macOS WebKit lane", () => {
-  const { result } = fixture("products/loom/apps/loom/src/App.svelte", {
+test("Loom Svelte source selects the frontend and required macOS WebKit lane", (t) => {
+  const { result } = fixture(t, "products/loom/apps/loom/src/App.svelte", {
     present: ["products/loom/apps/loom/src-tauri/Cargo.toml"],
   });
   assert.equal(result.presence.loom, true);
@@ -478,9 +478,9 @@ test("Loom Svelte source selects the frontend and required macOS WebKit lane", (
   assert.deepEqual(result.macos_matrix, ["release", "loom"]);
 });
 
-test("root pnpm metadata cannot select Loom frontend without its WebKit lane", () => {
+test("root pnpm metadata cannot select Loom frontend without its WebKit lane", (t) => {
   for (const relativePath of ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]) {
-    const { result } = fixture(relativePath, {
+    const { result } = fixture(t, relativePath, {
       present: ["products/loom/apps/loom/src-tauri/Cargo.toml"],
     });
     assert.equal(result.presence.loom, true, relativePath);
@@ -492,8 +492,8 @@ test("root pnpm metadata cannot select Loom frontend without its WebKit lane", (
   }
 });
 
-test("root Cargo metadata forces the complete present graph", () => {
-  const { result } = fixture("Cargo.toml", {
+test("root Cargo metadata forces the complete present graph", (t) => {
+  const { result } = fixture(t, "Cargo.toml", {
     contents: "[workspace]\n",
     present: [
       "products/mom/Cargo.toml",
@@ -521,17 +521,17 @@ test("root Cargo metadata forces the complete present graph", () => {
   ]);
 });
 
-test("migration maps retain policy verification without history replay", () => {
-  const { result } = fixture("migration/example.commit-map");
+test("migration maps retain policy verification without history replay", (t) => {
+  const { result } = fixture(t, "migration/example.commit-map");
   assert.equal(result.risk, "import");
   assert.deepEqual(result.jobs, ["policy"]);
 });
 
-test("unknown additions and deletions fail closed to full", () => {
-  const added = fixture("unexpected/new-input.bin").result;
+test("unknown additions and deletions fail closed to full", (t) => {
+  const added = fixture(t, "unexpected/new-input.bin").result;
   assert.equal(added.flags.full, true);
 
-  const { repo, base } = makeRepo();
+  const { repo, base } = makeRepo(t);
   write(repo, "unexpected/old-input.bin");
   const withUnknown = commit(repo, "add unknown");
   fs.rmSync(path.join(repo, "unexpected/old-input.bin"));
@@ -540,8 +540,8 @@ test("unknown additions and deletions fail closed to full", () => {
   assert.notEqual(base, withUnknown);
 });
 
-test("metadata unavailability forces the unchanged complete job and macOS matrices", () => {
-  const { repo, base } = makeRepo();
+test("metadata unavailability forces the unchanged complete job and macOS matrices", (t) => {
+  const { repo, base } = makeRepo(t);
   write(repo, "docs/note.md");
   const head = commit(repo, "docs");
   const result = plan(
@@ -579,8 +579,8 @@ test("metadata unavailability forces the unchanged complete job and macOS matric
   ]);
 });
 
-test("planner applies metadata reverse consumers", () => {
-  const { result } = fixture(
+test("planner applies metadata reverse consumers", (t) => {
+  const { result } = fixture(t,
     "crates/native/crates/llama-native-types/src/lib.rs",
     {
       present: [
@@ -612,8 +612,8 @@ test("planner applies metadata reverse consumers", () => {
   assert.equal(result.flags.loom, true);
 });
 
-test("renaming runtime source into docs retains the source-side coverage", () => {
-  const { repo } = makeRepo();
+test("renaming runtime source into docs retains the source-side coverage", (t) => {
+  const { repo } = makeRepo(t);
   write(repo, "crates/native/crates/llama-native-types/src/old.rs");
   const sourceHead = commit(repo, "add native source");
   fs.mkdirSync(path.join(repo, "docs"), { recursive: true });
@@ -629,8 +629,8 @@ test("renaming runtime source into docs retains the source-side coverage", () =>
   assert.equal(result.flags.root, true);
 });
 
-test("GitHub output carries the compact plan and every declared flag", () => {
-  const { repo, base } = makeRepo();
+test("GitHub output carries the compact plan and every declared flag", (t) => {
+  const { repo, base } = makeRepo(t);
   write(repo, "docs/note.md");
   const head = commit(repo, "docs");
   const outputPath = path.join(repo, "github-output.txt");

@@ -4502,11 +4502,45 @@ fn ingest_image_attachment_for_session(
     media_type: &str,
     encoded: &str,
 ) -> Result<StoredImageAsset, IpcFailure> {
+    ingest_image_attachment_for_session_with(
+        state,
+        project_id,
+        session_id,
+        media_type,
+        encoded,
+        store_image_asset,
+    )
+}
+
+fn ingest_image_attachment_for_session_with(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    media_type: &str,
+    encoded: &str,
+    store: impl FnOnce(&Path, &str, &str) -> Result<StoredImageAsset, AttachmentStoreError>,
+) -> Result<StoredImageAsset, IpcFailure> {
+    // Closing must wait for the synchronous storage operation, but ordinary
+    // document/session commands need not wait for bounded decode and I/O.
     let _application_admission = lock_application_admission(state, "an image attachment")?;
+    let project_root = {
+        let mut session = lock_session(state)?;
+        require_bound_store(&mut session, project_id, session_id)?
+            .root()
+            .to_path_buf()
+    };
+    let stored = store(&project_root, media_type, encoded)
+        .map_err(|error| IpcFailure::attachment(&error))?;
     let mut session = lock_session(state)?;
-    let store = require_bound_store(&mut session, project_id, session_id)?;
-    store_image_asset(store.root(), media_type, encoded)
-        .map_err(|error| IpcFailure::attachment(&error))
+    let rebound = require_bound_store(&mut session, project_id, session_id)?;
+    if rebound.root() != project_root {
+        return Err(IpcFailure::new(
+            "project_identity_mismatch",
+            "the image attachment target changed while its bytes were being stored",
+            true,
+        ));
+    }
+    Ok(stored)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15606,6 +15640,55 @@ mod tests {
         )
         .expect_err("foreign project must fail");
         assert_eq!(foreign.code, "project_identity_mismatch");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attachment_ingest_releases_session_lock_during_bounded_storage_and_revalidates() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Attachment Contention");
+        let store =
+            initialize_project(&root, "Attachment Contention".to_owned()).expect("initialize");
+        let expected_root = store.root().to_path_buf();
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+
+        let failure = ingest_image_attachment_for_session_with(
+            &state,
+            &project_id,
+            &session_id.to_string(),
+            "image/png",
+            "fixture",
+            |observed_root, _, _| {
+                assert_eq!(observed_root, expected_root);
+                let mut session = state
+                    .session
+                    .try_lock()
+                    .expect("bounded image storage must not hold the session lock");
+                session.active_session_id = Some(CommandId::new());
+                drop(session);
+                assert!(
+                    state.application.try_lock().is_err(),
+                    "application lifecycle admission remains reserved until storage settles"
+                );
+                Ok(StoredImageAsset {
+                    relative_path: format!("assets/{}.png", "a".repeat(64)),
+                    markdown_path: format!("../assets/{}.png", "a".repeat(64)),
+                    media_type: "image/png".to_owned(),
+                    byte_count: 1,
+                    sha256: "a".repeat(64),
+                })
+            },
+        )
+        .expect_err("revoked session cannot receive the stored asset");
+        assert_eq!(failure.code, "stale_project_session");
     }
 
     #[test]
