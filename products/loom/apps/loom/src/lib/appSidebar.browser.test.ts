@@ -154,10 +154,11 @@ it('plus click and context-menu share the Loom add surface and never expose the 
   add.dispatchEvent(opened);
   await tick();
   expect(opened.defaultPrevented).toBe(true);
-  for (const label of ['Manuscript', 'Folder…', 'Files…', 'Library…', 'Sources…']) {
+  for (const label of ['New document', 'Folder…', 'Files…', 'Library…', 'Sources…']) {
     await expect.element(page.getByRole('menuitem', { name: label, exact: true })).toBeVisible();
   }
-  await expect.element(page.getByRole('menuitem', { name: 'Manuscript', exact: true })).toHaveFocus();
+  expect(page.getByRole('menuitem', { name: 'New document', exact: true }).element().textContent).toContain('Manuscript');
+  await expect.element(page.getByRole('menuitem', { name: 'New document', exact: true })).toHaveFocus();
   key(page.getByRole('menu').element() as HTMLElement, 'ArrowDown');
   await expect.element(page.getByRole('menuitem', { name: 'Folder…', exact: true })).toHaveFocus();
   key(page.getByRole('menu').element() as HTMLElement, 'Escape');
