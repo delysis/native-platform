@@ -158,11 +158,9 @@ it('missing bookmark has readable disambiguated names, exact path tooltip and a 
   expect(calls.slice(before)).toEqual([]);
 });
 
-it('single-click selects without opening; a failed double-click open retains editor and bookmark, which remains removable', async () => {
+it('single-click opens a sidebar item; a failed open retains editor and bookmark, which remains removable', async () => {
   const { calls } = await setup(); const row = rootRow(missingRoot)!; const editor = document.querySelector('.ProseMirror');
   const before = calls.length; row.click(); await tick();
-  expect(row.getAttribute('aria-current')).toBe('true'); expect(calls.slice(before)).toEqual([]);
-  row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
   await expect.poll(() => document.body.textContent).toContain('Selected folder is unavailable');
   expect(document.querySelector('.ProseMirror')).toBe(editor); expect(rootRow(missingRoot)).toBe(row);
   expect(calls.slice(before).map(call => call.command)).toEqual(['plugin:loom|project_prepare_open_path']);
@@ -447,6 +445,7 @@ async function setupAudioRecording() {
   let closed = false, serial = 0, checkpointSerial = 0;
   let revision = fixture.opened.summary.revision_id!, visibleBlob = fixture.opened.visible_blob_id;
   let recording: SpeechRecordingSnapshot | null = null;
+  let heldStart: { promise: Promise<void>; release: () => void } | null = null;
   let stopFailure = false, contextFailure = false;
   const captures: AudioRecording[] = [], attachments: ContextAttachmentPresentation[] = [];
   const operations: Array<{ command: string; args: Record<string, unknown> }> = [];
@@ -468,6 +467,7 @@ async function setupAudioRecording() {
     switch (command) {
       case 'plugin:loom|audio_record_start':
         expect(recording).toBeNull();
+        if (heldStart) await heldStart.promise;
         recording = { recording_id: `fixture-recording-${++serial}`, project_id: fixture.project.project_id,
           session_id: fixture.project.session_id, document_id: fixture.opened.summary.document_id, target: 'context', phase: 'recording' };
         return recording;
@@ -520,8 +520,26 @@ async function setupAudioRecording() {
     await originalDispose();
   };
   return { ...fixture, captures, attachments, operations,
-    failNextStop: () => { stopFailure = true; }, failNextContext: () => { contextFailure = true; } };
+    failNextStop: () => { stopFailure = true; }, failNextContext: () => { contextFailure = true; },
+    holdNextStart: () => {
+      let release = () => {};
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      heldStart = { promise, release: () => { heldStart = null; release(); } };
+    },
+    releaseStart: () => heldStart?.release()
+  };
 }
+
+it('shows an immediate recording indicator while native microphone startup is pending', async () => {
+  const fixture = await setupAudioRecording();
+  fixture.holdNextStart();
+  await page.getByRole('button', { name: 'Record audio', exact: true }).click();
+  const starting = page.getByRole('button', { name: 'Starting recording', exact: true });
+  await expect.element(starting).toHaveClass(/recording/);
+  await expect.element(starting).toBeDisabled();
+  fixture.releaseStart();
+  await expect.element(page.getByRole('button', { name: 'Stop recording', exact: true })).toBeVisible();
+});
 
 it.each(['visual', 'source'] as const)('actual %s audio insertion retains capture, same-ID retries, mode guard and Escape cancellation', async surface => {
   const fixture = await setupAudioRecording();

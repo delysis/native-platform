@@ -2069,6 +2069,12 @@ struct PolicyWriterExpectation {
     maximum_context_tokens: Option<u32>,
 }
 
+// Automatic completion needs enough history for a manuscript prefix, not the
+// model's entire trained window. Keeping this bound explicit also prevents a
+// high-memory Mac from selecting a context whose native attention metadata
+// exceeds the host admission budget.
+const AUTOMATIC_WRITER_MAXIMUM_CONTEXT_TOKENS: u32 = 32_768;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PolicyFileStamp {
     len: u64,
@@ -6552,7 +6558,7 @@ fn policy_writer_expectation(
         projector_name: None,
         projector_sha256: None,
         projector_file_bytes: None,
-        maximum_context_tokens: None,
+        maximum_context_tokens: Some(AUTOMATIC_WRITER_MAXIMUM_CONTEXT_TOKENS),
     })
 }
 
@@ -12978,6 +12984,11 @@ mod tests {
         assert_eq!(expected.rank, 0);
         assert_eq!(candidate.rank, expected.rank);
         assert_eq!(candidate.profile_id, expected.profile_id);
+        assert_eq!(
+            expected.maximum_context_tokens,
+            Some(AUTOMATIC_WRITER_MAXIMUM_CONTEXT_TOKENS),
+            "automatic ghost text must never request the model's full 262K window"
+        );
     }
 
     #[test]

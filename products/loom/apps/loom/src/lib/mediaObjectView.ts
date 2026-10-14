@@ -13,7 +13,11 @@ export function flushMediaObjectDrafts(editor: EditorView): boolean {
 
 /** An atom's draft is local until Enter validates and replaces exactly that atom. */
 export function mediaObjectView(
-  node: ProseMirrorNode, editor: EditorView, getPos: () => number | undefined, media: HTMLElement
+  node: ProseMirrorNode,
+  editor: EditorView,
+  getPos: () => number | undefined,
+  media: HTMLElement,
+  sourceEditing = true
 ): NodeView {
   const dom = document.createElement('span');
   dom.className = 'loom-media-object';
@@ -87,17 +91,30 @@ export function mediaObjectView(
     input.select();
   }
   dom.addEventListener('mousedown', (event) => { if (!input && event.button === 0) select(); });
-  const disposeMenu = objectMenu(dom, () => input ? 'Apply' : 'Edit', edit, () => input ? input.focus() : editor.focus());
+  // Binary media is represented by Markdown in storage, but that serialization
+  // is not a useful or safe text-editing surface. Keep object-source editing for
+  // ordinary images and omit the action entirely for recorded audio.
+  const disposeMenu = sourceEditing
+    ? objectMenu(dom, () => input ? 'Apply' : 'Edit', edit, () => input ? input.focus() : editor.focus())
+    : () => {};
   const flush = () => apply(false);
   const editorDrafts = drafts.get(editor) ?? new Set<() => boolean>();
-  drafts.set(editor, editorDrafts);
-  editorDrafts.add(flush);
+  if (sourceEditing) {
+    drafts.set(editor, editorDrafts);
+    editorDrafts.add(flush);
+  }
   return {
     dom,
     selectNode() { dom.classList.add('ProseMirror-selectednode'); },
     deselectNode() { dom.classList.remove('ProseMirror-selectednode'); },
     stopEvent(event) { return event.type === 'contextmenu' || Boolean(input) || event.target instanceof HTMLAudioElement; },
     ignoreMutation() { return true; },
-    destroy() { disposeMenu(); editorDrafts.delete(flush); if (!editorDrafts.size) drafts.delete(editor); }
+    destroy() {
+      disposeMenu();
+      if (sourceEditing) {
+        editorDrafts.delete(flush);
+        if (!editorDrafts.size) drafts.delete(editor);
+      }
+    }
   };
 }

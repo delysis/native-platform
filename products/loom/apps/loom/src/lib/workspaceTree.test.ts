@@ -11,6 +11,16 @@ const photo = material('photo', 'Notes/Photo.png', 'Photograph');
 const external = material('external', null, 'Private external library');
 
 describe('workspace physical material navigation', () => {
+  it('keeps internal storage folders out of the outline and presents manuscript contents at its root', () => {
+    const rows = workspaceRows(
+      [document('manuscript/Draft.md'), document('manuscript/Part/Chapter.md')],
+      new Set(), '', [], ['assets', 'sources', 'manuscript', 'manuscript/Part']
+    );
+    expect(rows.map(row => [row.path, row.depth])).toEqual([
+      ['manuscript/Part/', 0], ['manuscript/Part/Chapter.md', 1], ['manuscript/Draft.md', 0]
+    ]);
+  });
+
   it('shows empty physical directories and merges them with populated paths without duplicate rows', () => {
     const directories = ['Empty', 'Empty/Nested', 'Notes', 'Notes/Clippings'];
     expect(workspaceRows(documents, new Set(), '', [paper], directories).map(row => row.path)).toEqual([

@@ -1116,7 +1116,7 @@
       }
     };
     load();
-    const object = mediaObjectView(node, editor, getPos, dom);
+    const object = mediaObjectView(node, editor, getPos, dom, !isAudio);
     return { ...object, destroy: () => { object.destroy?.(); media.onerror = null; window.clearTimeout(retry); } };
   }
 

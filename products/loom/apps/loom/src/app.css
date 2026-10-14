@@ -79,7 +79,10 @@ button:disabled { cursor: default; opacity: .45; }
 .suggestions-toggle svg { stroke-width: 1.2; }
 .suggestions-toggle svg path { fill: currentColor; stroke: none; }
 .shuttle-toggle svg { stroke-width: 1.5; }
-.microphone-toggle.recording { color: var(--danger); background: color-mix(in srgb, var(--danger) 11%, transparent); }
+.microphone-toggle { position: relative; }
+.microphone-toggle.recording { color: var(--danger); background: color-mix(in srgb, var(--danger) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 45%, transparent); }
+.microphone-toggle.recording::after { content: ""; position: absolute; right: 2px; top: 2px; width: 5px; height: 5px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 2px var(--chrome); animation: recording-pulse 1.25s ease-in-out infinite; }
+@keyframes recording-pulse { 50% { opacity: .35; transform: scale(.75); } }
 .microphone-toggle.needs-attention { color: var(--danger); }
 .outline-toggle:hover, .outline-toggle[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); }
 .more-button, .icon-button, .bare-button {
@@ -190,7 +193,7 @@ button:disabled { cursor: default; opacity: .45; }
 .search-field:focus-within { border-color: var(--line); background: var(--paper); }
 .search-field input { min-width: 0; width: 100%; height: 26px; padding: 4px 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; }
 .search-field input::placeholder { color: var(--muted); opacity: 1; }
-.document-list { flex: 1; min-height: 0; overflow: auto; padding: 0 6px 6px; scrollbar-width: thin; }
+.document-list { flex: 1; min-height: 0; overflow: auto; padding: 0 6px 6px; scrollbar-width: thin; user-select: none; -webkit-user-select: none; }
 .document-row-group { position: relative; width: 100%; border-radius: 4px; }
 .document-row-group:hover { background: var(--chrome-hover); }
 .document-row-group.active { color: var(--ink); background: var(--selection-bg); }
