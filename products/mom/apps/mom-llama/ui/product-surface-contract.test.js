@@ -212,6 +212,9 @@ test("consult replies preserve visible persona identity in the Messages presenta
 test("the composer keeps a glass send affordance anchored while its readiness changes", () => {
   assert.ok(viewProduction.includes('class="send-button"'));
   assert.ok(viewProduction.includes('data-model-ready=(readiness.enabled)'));
+  assert.ok(viewProduction.includes("let send_enabled ="));
+  assert.ok(viewProduction.includes("readiness.enabled &&"));
+  assert.ok(viewProduction.includes("disabled[!send_enabled]"));
   assert.ok(bridge.includes("const composerHasSendableDraft"));
   assert.ok(bridge.includes('send.dataset.modelReady !== "true"'));
   assert.ok(bridge.includes("!composerHasSendableDraft(form)"));

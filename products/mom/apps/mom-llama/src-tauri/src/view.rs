@@ -1999,6 +1999,8 @@ fn composer(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let send_enabled =
+        readiness.enabled && (!draft_message.trim().is_empty() || !staged_attachments.is_empty());
     let draft_control = control("conversation.draft_update");
     html! {
         form id="chat-form" class="composer"
@@ -2128,7 +2130,7 @@ fn composer(
                         data-tauri-command="mom_llama_chat_dispatch"
                         data-cli="mom-llama chat dispatch --conversation <id> --message <text> --json"
                         data-effect="mom_llama.effects.chat_send.v1"
-                        disabled[!readiness.enabled] {
+                        disabled[!send_enabled] {
                         "↑"
                     }
                 }
@@ -5078,7 +5080,8 @@ mod tests {
         .into_string();
         assert!(!html.contains("runtime-dot"));
         assert!(html.contains("Send; the selected model will load first"));
-        assert!(!html.contains(r#"type="submit" class="send-button" disabled"#));
+        assert!(html.contains(r#"disabled>↑</button>"#));
+        assert!(html.contains(r#"data-model-ready="true""#));
 
         conversation.execution_profile.model_path =
             Some(directory.join("missing-conversation.gguf"));
