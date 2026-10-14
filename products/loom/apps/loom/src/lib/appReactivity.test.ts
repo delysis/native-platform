@@ -141,7 +141,7 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('Autosave is always on');
     expect(source).not.toContain('class="save-status');
     expect(source).not.toContain('autosaveLabel');
-    expect(source).toContain('New document (⌘N)');
+    expect(source).toContain('New manuscript (⌘N)');
   });
 
 
@@ -274,7 +274,8 @@ describe('App ghost reactivity wiring', () => {
     expect(background).toContain('await restoreCompletionAutomation(captured)');
     expect(source).toContain('void refreshBranchesFor(\n        source.projectId');
     expect(source).not.toContain('await refreshBranchesFor(\n        source.projectId');
-    expect(source).toContain("{#if transition === 'idle'}\n          <button\n            class=\"titlebar-button new-document-button\"");
+    expect(source).toContain("{#if transition === 'idle'}\n          <button");
+    expect(source).toContain('class="titlebar-button new-document-button"');
     expect(source).toContain('Opening your writing…');
   });
 

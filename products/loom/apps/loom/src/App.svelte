@@ -558,6 +558,8 @@
   let contextPaneOpen = false;
   let materialsOpen = false;
   let addMenuOpen = false;
+  let addMenuTrigger: HTMLButtonElement | undefined;
+  let addMenuElement: HTMLDivElement | undefined;
   let materialEntries: MaterialEntry[] = [];
   let materialRefreshSerial = 0;
   type MaterialScope = { projectId: string; sessionId: string };
@@ -732,6 +734,42 @@
   function openMaterialConnections(): void {
     showMainPane();
     captureMaterialOrigin(); activeMaterial = null; materialsOpen = true; addMenuOpen = false;
+  }
+
+  async function openAddMenu(focusFirst = false): Promise<void> {
+    if (fileCommandInFlight || editorReadonly) return;
+    addMenuOpen = true;
+    if (!focusFirst) return;
+    await tick();
+    addMenuElement?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus();
+  }
+
+  function closeAddMenu(restoreFocus = false): void {
+    addMenuOpen = false;
+    if (restoreFocus) void tick().then(() => addMenuTrigger?.focus());
+  }
+
+  function handleAddMenuContext(event: MouseEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    void openAddMenu(true);
+  }
+
+  function handleAddMenuKeydown(event: KeyboardEvent): void {
+    if (!addMenuElement) return;
+    const items = [...addMenuElement.querySelectorAll<HTMLButtonElement>('button:not([disabled])')];
+    const current = items.indexOf(window.document.activeElement as HTMLButtonElement);
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeAddMenu(true);
+      return;
+    }
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Home' && event.key !== 'End') return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+      : event.key === 'ArrowDown' ? (current + 1 + items.length) % items.length
+      : (current - 1 + items.length) % items.length;
+    items[next]?.focus();
   }
 
   let contextPaneElement: HTMLDivElement | undefined;
@@ -10568,19 +10606,33 @@
         {/if}
         {#if transition === 'idle'}
           <button
+            bind:this={addMenuTrigger}
             class="titlebar-button new-document-button"
             type="button"
             aria-label="Add" aria-expanded={addMenuOpen} aria-haspopup="menu"
             title="Add"
             disabled={fileCommandInFlight || editorReadonly}
-            on:click={() => addMenuOpen = !addMenuOpen}
+            on:click={() => addMenuOpen ? closeAddMenu() : void openAddMenu()}
+            on:contextmenu={handleAddMenuContext}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
           {#if addMenuOpen}
-            <div class="material-add-menu" role="menu" aria-label="Add">
-              <button role="menuitem" title="New document (⌘N)" on:click={() => { addMenuOpen = false; closeMaterial(); void newDocument(); }}>New document</button>
-              <button role="menuitem" on:click={() => void chooseMaterialFiles()}>Add files…</button>
-              <button role="menuitem" on:click={() => void chooseMaterialLibrary()}>Open library…</button>
-              <button role="menuitem" on:click={openMaterialConnections}>Connect sources…</button>
+            <div bind:this={addMenuElement} class="material-add-menu" role="menu" aria-label="Add" tabindex="-1" on:keydown={handleAddMenuKeydown}>
+              <button role="menuitem" title="New manuscript (⌘N)" on:click={() => { closeAddMenu(); closeMaterial(); void newDocument(); }}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2.5h6l4 4v7H3zM9 2.5v4h4"/></svg><span>Manuscript</span>
+              </button>
+              <button role="menuitem" on:click={() => { closeAddMenu(); void doOpenProject(); }}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4.5h5l1.5 2H14l-1.5 6H3z"/></svg><span>Folder…</span>
+              </button>
+              <div class="material-add-menu-separator" role="separator"></div>
+              <button role="menuitem" on:click={() => void chooseMaterialFiles()}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2.5h6l4 4v7H3zM9 2.5v4h4M8 8v4M6 10h4"/></svg><span>Files…</span>
+              </button>
+              <button role="menuitem" on:click={() => void chooseMaterialLibrary()}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4h11v9h-11zM4 2.5h8M5 7h6M5 9.5h6"/></svg><span>Library…</span>
+              </button>
+              <button role="menuitem" on:click={openMaterialConnections}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="5" cy="8" r="2.5"/><circle cx="11" cy="8" r="2.5"/><path d="M7.5 8h1"/></svg><span>Sources…</span>
+              </button>
             </div>
           {/if}
         {/if}
