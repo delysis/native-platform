@@ -262,12 +262,27 @@
     return replacement;
   };
 
-  const rawAttachmentBytes = (response) => {
-    if (response instanceof ArrayBuffer) return new Uint8Array(response);
-    if (ArrayBuffer.isView(response)) {
-      return new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+  const ipcBinaryBytes = (response, maxBytes, label) => {
+    let bytes;
+    if (response instanceof ArrayBuffer) {
+      bytes = new Uint8Array(response);
+    } else if (ArrayBuffer.isView(response)) {
+      bytes = new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+    } else if (Array.isArray(response)) {
+      if (response.length > maxBytes) {
+        throw new Error(`${label} exceeded its ${maxBytes}-byte IPC limit.`);
+      }
+      if (!response.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+        throw new Error(`${label} returned an invalid IPC byte array.`);
+      }
+      bytes = Uint8Array.from(response);
+    } else {
+      throw new Error(`${label} returned an unsupported IPC byte representation.`);
     }
-    throw new Error("Attachment preview returned serialized JSON instead of raw IPC bytes.");
+    if (bytes.byteLength > maxBytes) {
+      throw new Error(`${label} exceeded its ${maxBytes}-byte IPC limit.`);
+    }
+    return bytes;
   };
 
   const speechOperationToken = () => {
@@ -570,7 +585,7 @@
       }
       const response = await invoke("mom_llama_attachment_preview_bytes", anchor);
       if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
-      const bytes = rawAttachmentBytes(response);
+      const bytes = ipcBinaryBytes(response, 16 * 1024 * 1024, "Attachment preview");
       const url = URL.createObjectURL(new Blob([bytes], { type: primary.media_type }));
       const media = primary.kind === "image"
         ? document.createElement("img")
@@ -2753,12 +2768,12 @@
           retainedPlayback = null;
           return;
         }
-        const bytes = rawAttachmentBytes(await invoke("mom_llama_speech_audio", {
+        const bytes = ipcBinaryBytes(await invoke("mom_llama_speech_audio", {
           playback: result.playback_id,
           message: result.binding.message_id,
           textSha256: result.binding.text_sha256,
           backendDescriptorSha256: result.binding.backend_descriptor_sha256,
-        }));
+        }), 64 * 1024 * 1024, "Read aloud audio");
         if (button.dataset.playback !== result.playback_id) return;
         await renderSpeechPlayback(button, result, bytes);
         if (activeSpeechPlayback?.id === result.playback_id) retainedPlayback = null;

@@ -4379,10 +4379,11 @@ mod tests {
                 && js.contains("artifact: artifact.artifact_id")
                 && js.contains("policyFingerprint: catalog.policy_fingerprint")
                 && js.contains("response instanceof ArrayBuffer")
-                && js.contains(
-                    "Attachment preview returned serialized JSON instead of raw IPC bytes."
-                ),
-            "attachment preview hydration must re-present exact artifact authority and keep media bytes out of JSON"
+                && js.contains("Array.isArray(response)")
+                && js.contains("Number.isInteger(byte)")
+                && js.contains("16 * 1024 * 1024")
+                && js.contains("64 * 1024 * 1024"),
+            "binary IPC must accept every packaged transport representation while validating bytes and preserving native size ceilings"
         );
         assert!(
             js.contains("const ATTACHMENT_PREVIEW_CONCURRENCY = 2;")
