@@ -18,6 +18,14 @@ Production credentials are stored only through an injected operating-system cred
 - Windows Credential Manager/DPAPI-backed credential storage;
 - Linux Secret Service through a supported locked-session provider.
 
+Interactive macOS testing of Mom or Loom must use a stable Apple signing
+identity. Loom embeds the Mom runtime and shares its encrypted-store credential.
+An ad-hoc rebuild changes its code identity and can make macOS request ordinary
+item authorization and signer-partition authorization as two separate dialogs.
+Human-test packaging therefore fails closed when no stable identity is supplied.
+An existing credential with an obsolete ad-hoc partition is repaired narrowly;
+its key bytes and trusted-application ACL are retained.
+
 The application database retains only nonsecret provider identity, configuration, capability, usage, and a stable credential reference. Secret resolution occurs at the trusted host/backend boundary and returns a scoped, zeroizable value that is neither serializable nor cloneable by default. Renderers, loopback clients, diagnostics, and receipts may observe presence/status but never the secret.
 
 Legacy migration is transactional in outcome:

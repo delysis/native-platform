@@ -3,7 +3,7 @@
 # trusted-application ACL and encrypted key bytes are never read or replaced.
 set -eu
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "usage: $0 SIGNED_MOM_APP EXACT_DATA_DIRECTORY [--check]" >&2
+  echo "usage: $0 SIGNED_MOM_OR_LOOM_APP EXACT_DATA_DIRECTORY [--check]" >&2
   exit 2
 fi
 bundle=$1
@@ -14,7 +14,10 @@ case "$mode" in repair|--check) ;; *) echo 'Unknown mode.' >&2; exit 2;; esac
 [ -f "$data_dir/runtime.sqlite3" ] || { echo 'The existing Mom database is missing.' >&2; exit 1; }
 /usr/bin/codesign --verify --deep --strict "$bundle"
 bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist")
-[ "$bundle_id" = com.delysis.llama-native-kit.mom-llama ] || { echo 'Expected a Mom Llama app.' >&2; exit 1; }
+case "$bundle_id" in
+  com.delysis.llama-native-kit.mom-llama|app.delysis.loom) ;;
+  *) echo 'Expected Mom Llama or Loom, which embeds the Mom runtime.' >&2; exit 1 ;;
+esac
 team=$(/usr/bin/codesign -dv --verbose=4 "$bundle" 2>&1 | /usr/bin/sed -n 's/^TeamIdentifier=//p')
 case "$team" in ''|'not set'|*[!A-Z0-9]*) echo 'Use an Apple-signed build with a stable TeamIdentifier.' >&2; exit 1;; esac
 [ "${#team}" -eq 10 ] || { echo 'Invalid TeamIdentifier.' >&2; exit 1; }
