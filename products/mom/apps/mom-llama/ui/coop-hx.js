@@ -357,12 +357,7 @@
     audio.preload = "auto";
     const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
     audio.src = url;
-    const progress = document.createElement("output");
-    progress.className = "speech-playback-progress";
-    progress.textContent = "Ready";
-    const notice = document.createElement("small");
-    notice.textContent = "Stop suppresses playback immediately. Apple’s inner synthesis call is non-preemptive and Quit joins it before exit.";
-    panel.append(audio, progress, notice);
+    panel.append(audio);
     row.querySelector(".message-card")?.append(panel);
     commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
     button.title = "Stop reading";
@@ -375,11 +370,6 @@
       panel,
       button,
     };
-    audio.addEventListener("timeupdate", () => {
-      const current = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-      const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
-      progress.textContent = `${current.toFixed(1)} / ${duration.toFixed(1)} seconds`;
-    });
     audio.addEventListener("ended", () => {
       if (activeSpeechPlayback?.audio === audio) void stopSpeechPlayback();
     });

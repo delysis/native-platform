@@ -219,10 +219,26 @@ test("the composer keeps a glass send affordance anchored while its readiness ch
   assert.ok(bridge.includes('send.dataset.modelReady !== "true"'));
   assert.ok(bridge.includes("!composerHasSendableDraft(form)"));
   assert.ok(!bridge.includes('send.classList.toggle("is-hidden", busy)'));
-  assert.ok(styles.includes("radial-gradient(circle at 28% 18%"));
-  assert.ok(styles.includes("backdrop-filter: blur(22px) saturate(1.8) brightness(1.08)"));
+  assert.ok(styles.includes("radial-gradient(circle at 27% 16%"));
+  assert.ok(styles.includes("backdrop-filter: blur(24px) saturate(1.65) brightness(1.06)"));
   assert.ok(styles.includes(".composer .send-button:disabled"));
   assert.ok(styles.includes('.composer .send-button[type="submit"]:not(:disabled)'));
+  assert.ok(styles.includes("color: #086dbb"));
+  assert.ok(!styles.includes("linear-gradient(145deg, #36a5ff"));
+});
+
+test("read aloud keeps lifecycle controls accessible without implementation prose", () => {
+  const playbackStart = bridge.indexOf("const renderSpeechPlayback =");
+  const playbackEnd = bridge.indexOf("const appendAttachmentTranscriptionControl", playbackStart);
+  const playback = bridge.slice(playbackStart, playbackEnd);
+
+  assert.ok(playback.includes('createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop)'));
+  assert.ok(playback.includes('button.title = "Stop reading"'));
+  assert.ok(playback.includes('invoke("mom_llama_speech_stop"'));
+  assert.ok(!playback.includes("Stop suppresses playback immediately"));
+  assert.ok(!playback.includes("Apple’s inner synthesis call is non-preemptive"));
+  assert.ok(!playback.includes('document.createElement("small")'));
+  assert.ok(!playback.includes('document.createElement("output")'));
 });
 
 test("the native presentation contains no Skills, cache, engine, or resident-slot panels", () => {
