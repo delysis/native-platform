@@ -10617,7 +10617,7 @@
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
           {#if addMenuOpen}
             <div bind:this={addMenuElement} class="material-add-menu" role="menu" aria-label="Add" tabindex="-1" on:keydown={handleAddMenuKeydown}>
-              <button role="menuitem" title="New manuscript (⌘N)" on:click={() => { closeAddMenu(); closeMaterial(); void newDocument(); }}>
+              <button role="menuitem" aria-label="New document" title="New manuscript (⌘N)" on:click={() => { closeAddMenu(); closeMaterial(); void newDocument(); }}>
                 <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 2.5h6l4 4v7H3zM9 2.5v4h4"/></svg><span>Manuscript</span>
               </button>
               <button role="menuitem" on:click={() => { closeAddMenu(); void doOpenProject(); }}>
