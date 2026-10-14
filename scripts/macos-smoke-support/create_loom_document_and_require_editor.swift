@@ -136,30 +136,12 @@ repeat {
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < addDeadline
 if let add {
-    let expanded = (attribute(add, kAXExpandedAttribute as CFString) as? Bool) == true
-    if !expanded {
-        guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else {
-            fputs("could not open Loom's Add menu\n", stderr)
-            exit(1)
-        }
+    guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else {
+        fputs("could not press Loom's new-document control\n", stderr)
+        exit(1)
     }
 } else {
-    fputs("could not bind Loom's Add menu control\n", stderr)
-    exit(1)
-}
-let createDeadline = Date().addingTimeInterval(5)
-var create: AXUIElement?
-repeat {
-    create = uniqueControl(named: "New document")
-    if create != nil { break }
-    Thread.sleep(forTimeInterval: 0.05)
-} while Date() < createDeadline
-guard let create else {
-    fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
-    exit(1)
-}
-guard AXUIElementPerformAction(create, kAXPressAction as CFString) == .success else {
-    fputs("could not press Loom's new-document control\n", stderr)
+    fputs("could not bind Loom's Add control\n", stderr)
     exit(1)
 }
 

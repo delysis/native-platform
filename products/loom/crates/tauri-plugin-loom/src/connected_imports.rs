@@ -41,6 +41,42 @@ fn validate_session(
     Ok(())
 }
 
+fn configured_google_client(service: GoogleService) -> Result<(String, String), IpcFailure> {
+    let (service_prefix, compiled_id, compiled_secret) = match service {
+        GoogleService::Gmail => (
+            "GMAIL",
+            option_env!("GMAIL_CLIENT_ID"),
+            option_env!("GMAIL_CLIENT_SECRET"),
+        ),
+        GoogleService::Drive => (
+            "DRIVE",
+            option_env!("DRIVE_CLIENT_ID"),
+            option_env!("DRIVE_CLIENT_SECRET"),
+        ),
+    };
+    let runtime = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let client_id = runtime("LOOM_GOOGLE_CLIENT_ID")
+        .or_else(|| runtime(&format!("{service_prefix}_CLIENT_ID")))
+        .or_else(|| option_env!("LOOM_GOOGLE_CLIENT_ID").map(str::to_owned))
+        .or_else(|| compiled_id.map(str::to_owned));
+    let client_secret = runtime("LOOM_GOOGLE_CLIENT_SECRET")
+        .or_else(|| runtime(&format!("{service_prefix}_CLIENT_SECRET")))
+        .or_else(|| option_env!("LOOM_GOOGLE_CLIENT_SECRET").map(str::to_owned))
+        .or_else(|| compiled_secret.map(str::to_owned));
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret))
+            if !client_id.trim().is_empty() && !client_secret.trim().is_empty() =>
+        {
+            Ok((client_id, client_secret))
+        }
+        _ => Err(failure("Google sign-in is unavailable in this build.")),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn import_accounts(
     project_id: String,
@@ -66,8 +102,6 @@ pub(crate) async fn import_account_connect(
     session_id: String,
     operation_id: String,
     service: GoogleService,
-    client_id: String,
-    client_secret: String,
     state: State<'_, PluginState>,
 ) -> Result<AccountStatus, IpcFailure> {
     let _operation = ACCOUNT_OPERATION
@@ -75,6 +109,7 @@ pub(crate) async fn import_account_connect(
         .map_err(|_| failure("Another account import is running."))?;
     let operation =
         ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
+    let (client_id, client_secret) = configured_google_client(service)?;
     let credential = operation
         .network(async move {
             let pending = google_import::begin_authorization(client_id, client_secret, service)

@@ -164,9 +164,14 @@
       error = report.failures.map((item) => `${item.name}: ${item.message}`).join("\n");
       if (!imported.length && !libraries.length && !report.references?.length) return;
       if (!current()) throw new Error('The pane changed during import. The files are retained; drop them again at the intended location.');
-      const materials = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
-      if (!current()) throw new Error('The pane changed. Your sources are retained in this workspace.');
-      const markdown = [...libraries.map(materialReferenceMarkdown), ...(report.references ?? []), ...imported.map((item, index) => importedMaterialMarkdown(item, materials[index]))].join('\n\n');
+      const materials = captured.kind === 'editor'
+        ? await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)))
+        : [];
+      if (!current()) throw new Error('The pane changed. Your attachments are retained with their original document.');
+      const attachmentMarkdown = captured.kind === 'editor'
+        ? imported.map((item, index) => importedMaterialMarkdown(item, materials[index]))
+        : imported.map(item => item.media_markdown || item.inline_markdown);
+      const markdown = [...libraries.map(materialReferenceMarkdown), ...(report.references ?? []), ...attachmentMarkdown].join('\n\n');
       if (captured.kind === 'editor') {
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
@@ -181,10 +186,9 @@
         if (new TextEncoder().encode(next).length > MAX_PROMPT_BYTES) throw new Error('The imported text exceeds the 64 KiB input limit. The original files are retained.');
         // Terminal media comes from registered document context, not arbitrary
         // links pasted into a prompt. Bind exact retained identities first.
-        const cards = imported.filter((item) => item.media_kinds.length > 0 || item.text_bytes === 0);
-        if (cards.length) {
+        if (imported.length) {
           const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId,
-            captured.documentId, cards.map((item) => item.id));
+            captured.documentId, imported.map((item) => item.id));
           onContextChanged(snapshot, captured.projectId, captured.sessionId, captured.documentId);
         }
         if (!current()) throw new Error('The pane changed during import. The files remain attached to their original document.');

@@ -17,6 +17,38 @@ function deferred<T>() {
 }
 
 describe('source import cancellation', () => {
+  it('offers direct Google sign-in without asking the writer for OAuth plumbing', async () => {
+    const target = document.createElement('div');
+    document.body.append(target);
+    const previousRuntime = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+    native.invoke.mockReset();
+    native.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'plugin:loom|import_accounts') return [];
+      if (command === 'plugin:loom|import_account_connect') {
+        expect(args).toMatchObject({ projectId: 'project-a', sessionId: 'session-a', service: 'gmail' });
+        expect(args).not.toHaveProperty('clientId');
+        expect(args).not.toHaveProperty('clientSecret');
+        return { service: 'gmail', email: 'writer@example.test' };
+      }
+      throw new Error(`Unexpected native command: ${command}`);
+    });
+    const component = mount(ImportSources, { target, props: {
+      projectId: 'project-a', sessionId: 'session-a', onOpen: vi.fn(), onImported: vi.fn()
+    } });
+    try {
+      expect(page.getByRole('textbox', { name: 'Client ID' }).query()).toBeNull();
+      expect(page.getByLabelText('Client secret').query()).toBeNull();
+      await expect.element(page.getByRole('button', { name: 'Connect Drive', exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'Connect Gmail', exact: true }).click();
+      await expect.element(page.getByRole('status')).toHaveTextContent('Connected writer@example.test');
+    } finally {
+      await unmount(component); target.remove();
+      if (previousRuntime) Object.defineProperty(window, '__TAURI_INTERNALS__', previousRuntime);
+      else Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
+    }
+  });
+
   it('sends Stop through the real IPC lane before completion and preserves partial results', async () => {
     const batch = deferred<WorkspaceSourceImportReport>();
     const opened = deferred<void>();
