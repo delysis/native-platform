@@ -194,6 +194,21 @@ test("the sidebar exposes only the compact authoritative Persona menu", () => {
   assert.ok(styles.includes(".sidebar-persona-copy"));
 });
 
+test("consult replies preserve visible persona identity in the Messages presentation", () => {
+  const messageStart = viewProduction.indexOf("fn message_row(");
+  const messageEnd = viewProduction.indexOf("\nfn attachment_preview_card(", messageStart);
+  const message = viewProduction.slice(messageStart, messageEnd);
+
+  assert.ok(message.includes('class="message-speaker-avatar"'));
+  assert.ok(message.includes("contact_avatar(contact_id)"));
+  assert.ok(bridge.includes('speakerAvatar.className = "message-speaker-avatar"'));
+  assert.ok(bridge.includes("recipientAvatar.cloneNode(true)"));
+  assert.ok(styles.includes("--message-blue: #0a84ff"));
+  assert.ok(styles.includes(".message-row.assistant"));
+  assert.ok(styles.includes(".message-speaker-avatar"));
+  assert.ok(styles.includes('.recipients-header[data-unsent="false"]'));
+});
+
 test("the native presentation contains no Skills, cache, engine, or resident-slot panels", () => {
   for (const marker of [
     'data-settings-card="skills"',

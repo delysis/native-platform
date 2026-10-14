@@ -2043,6 +2043,17 @@
     const article = document.createElement("article");
     article.id = id;
     article.className = `message-row ${role}`;
+    if (role === "assistant") {
+      const recipientAvatar = document.querySelector(
+        ".recipients-header .recipient-chip .contact-avatar, .persona-context .contact-avatar",
+      );
+      if (recipientAvatar) {
+        const speakerAvatar = document.createElement("span");
+        speakerAvatar.className = "message-speaker-avatar";
+        speakerAvatar.appendChild(recipientAvatar.cloneNode(true));
+        article.appendChild(speakerAvatar);
+      }
+    }
     const card = document.createElement("div");
     card.className = "message-card";
     if (role === "assistant") {

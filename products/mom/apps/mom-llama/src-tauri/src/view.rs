@@ -1560,6 +1560,9 @@ fn chat_view_with_draft(
         .unwrap_or(true);
     let is_persona =
         active.is_some_and(|conversation| conversation.kind == ConversationKind::PersonaTemplate);
+    let assistant_contact_id = active.and_then(|conversation| {
+        (conversation.recipient_ids.len() == 1).then(|| conversation.recipient_ids[0].as_str())
+    });
     let conversation_kind = if is_persona {
         "persona_template"
     } else {
@@ -1680,6 +1683,7 @@ fn chat_view_with_draft(
                                         && message.role == MessageRole::Assistant
                                         && message.attribution.is_none()
                                 }),
+                                assistant_contact_id,
                             ))
                         }
                     }
@@ -2139,6 +2143,7 @@ fn message_row(
     attachments: &[&AttachmentRecord],
     allow_freeze: bool,
     allow_generation_actions: bool,
+    assistant_contact_id: Option<&str>,
 ) -> Markup {
     let role = role_label(&message.role);
     let show_stats = upstream_settings_bool(settings, "showMessageStats");
@@ -2148,11 +2153,24 @@ fn message_row(
     let expand_tool_content = upstream_settings_bool(settings, "alwaysShowToolCallContent");
     let show_agentic_stats = show_stats && upstream_settings_bool(settings, "showAgenticTurnStats");
     let show_raw_output_switch = upstream_settings_bool(settings, "showRawOutputSwitch");
+    let speaker_contact_id = message
+        .attribution
+        .as_ref()
+        .filter(|attribution| attribution.kind == mom_llama_runtime::MessageSpeakerKind::Persona)
+        .map(|attribution| attribution.source_id.as_str())
+        .or(assistant_contact_id);
     html! {
         article id=(format!("message-{}", message.id))
             class=(format!("message-row {role}"))
             data-message-id=(message.id.clone())
             aria-label=(format!("{role} message")) {
+            @if message.role == MessageRole::Assistant {
+                @if let Some(contact_id) = speaker_contact_id {
+                    span class="message-speaker-avatar" {
+                        (contact_avatar(contact_id))
+                    }
+                }
+            }
             div class="message-card" {
                 @if let Some(attribution) = &message.attribution {
                     p class="message-attribution"
@@ -4669,7 +4687,17 @@ mod tests {
             attribution: None,
             attachment_ids: Vec::new(),
         };
-        let html = message_row(&message, &settings, &[], true, true).into_string();
+        let html = message_row(
+            &message,
+            &settings,
+            &[],
+            true,
+            true,
+            Some("persona-ad_de_jongh"),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="message-speaker-avatar""#));
+        assert!(html.contains(r#"class="contact-avatar illustrated""#));
         assert!(html.contains(r#"<section class="message-reasoning">"#));
         assert!(html.contains(r#"class="message-reasoning-label""#));
         assert!(!html.contains("<details"));
@@ -4863,7 +4891,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["second", "first"]
         );
-        let html = message_row(&message, &settings, &records, true, false).into_string();
+        let html = message_row(&message, &settings, &records, true, false, None).into_string();
         let second_position = html.find("photo.png").expect("second attachment");
         let first_position = html.find("notes.md").expect("first attachment");
         assert!(second_position < first_position);
@@ -5109,18 +5137,18 @@ mod tests {
         message.prompt_tokens = Some(7);
         message.completion_tokens = Some(11);
 
-        let html = message_row(&message, &settings, &[], true, true).into_string();
+        let html = message_row(&message, &settings, &[], true, true, None).into_string();
         assert!(!html.contains("frozen-conversation-Q4_K_M"));
         assert!(!html.contains("global-default-Q8_0"));
         assert!(html.contains("7 prompt · 11 generated"));
 
         message.model = None;
-        let legacy_html = message_row(&message, &settings, &[], true, true).into_string();
+        let legacy_html = message_row(&message, &settings, &[], true, true, None).into_string();
         assert!(!legacy_html.contains("Unknown model"));
         assert!(!legacy_html.contains("global-default-Q8_0"));
 
         message.model = Some("  ".to_string());
-        let blank_html = message_row(&message, &settings, &[], true, true).into_string();
+        let blank_html = message_row(&message, &settings, &[], true, true, None).into_string();
         assert!(!blank_html.contains("Unknown model"));
     }
 
