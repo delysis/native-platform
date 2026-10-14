@@ -10,6 +10,7 @@ use std::sync::Arc;
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
 };
+use speech_native_backend_qwen::{QwenBackendConfig, QwenSpeechBackend};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
     AudioOutputFormat, NetworkBehavior, SpeechBackendKind, SpeechRequestId, SynthesisOutput,
@@ -27,10 +28,14 @@ pub async fn discover_local_host(
     let host = Arc::new(SpeechHost::default());
     let parakeet = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
         model_dir: None,
-        managed_model_root,
+        managed_model_root: managed_model_root.clone(),
     })
     .await;
     host.register_backend(Arc::new(parakeet))?;
+    #[cfg(target_os = "macos")]
+    host.register_backend(Arc::new(QwenSpeechBackend::discover(
+        QwenBackendConfig::discover(managed_model_root.as_deref()),
+    )))?;
     #[cfg(target_os = "macos")]
     if let Ok(apple) = speech_native_platform::apple_backend::AppleSpeechBackend::discover().await {
         host.register_backend(Arc::new(apple))?;
@@ -89,6 +94,38 @@ pub fn complete_apple_wav(
         || voice_id.is_some_and(|voice| response.route.voice_id.as_deref() != Some(voice))
         || response.route.backend_kind != SpeechBackendKind::PlatformOnDevice
         || response.route.network != NetworkBehavior::Never
+    {
+        return Err(CompleteWavError::RouteMismatch);
+    }
+    let SynthesisOutput::Complete { audio, format } = response.output else {
+        return Err(CompleteWavError::OutputKind);
+    };
+    if format != AudioOutputFormat::Wav {
+        return Err(CompleteWavError::OutputFormat);
+    }
+    if audio.is_empty() || audio.len() > max_bytes {
+        return Err(CompleteWavError::ByteLimit);
+    }
+    Ok((audio, response.duration_ms))
+}
+
+/// Validates one complete local embedded-model WAV response and returns the
+/// original bytes unchanged.
+pub fn complete_embedded_wav(
+    response: SynthesisResponse,
+    request_id: &SpeechRequestId,
+    backend_id: &str,
+    model_id: &str,
+    voice_id: &str,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, Option<u64>), CompleteWavError> {
+    if response.request_id != *request_id
+        || response.route.backend_id != backend_id
+        || response.route.model_id.as_deref() != Some(model_id)
+        || response.route.voice_id.as_deref() != Some(voice_id)
+        || response.route.backend_kind != SpeechBackendKind::EmbeddedModel
+        || response.route.network != NetworkBehavior::Never
+        || !response.usage.real_local_inference
     {
         return Err(CompleteWavError::RouteMismatch);
     }

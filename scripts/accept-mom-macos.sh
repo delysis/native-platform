@@ -60,6 +60,8 @@ echo "+ isolated target: $TARGET_DIR"
 echo "+ acceptance product: $PRODUCT_NAME"
 echo "+ acceptance bundle ID: $BUNDLE_ID"
 
+"$ROOT/scripts/build-qwen3-tts-helper.sh"
+
 env \
   CARGO_TARGET_DIR="$TARGET_DIR" \
   MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" \

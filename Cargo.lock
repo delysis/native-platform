@@ -2066,6 +2066,7 @@ name = "desktop-speech"
 version = "0.0.0"
 dependencies = [
  "speech-native-backend-parakeet",
+ "speech-native-backend-qwen",
  "speech-native-host",
  "speech-native-platform",
  "speech-native-types",
@@ -5385,6 +5386,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "speech-native-backend-parakeet",
+ "speech-native-backend-qwen",
  "speech-native-host",
  "speech-native-platform",
  "speech-native-types",
@@ -8433,6 +8435,16 @@ dependencies = [
  "sha2 0.10.9",
  "speech-native-host",
  "speech-native-types",
+ "tokio",
+]
+
+[[package]]
+name = "speech-native-backend-qwen"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "speech-native-types",
+ "tempfile",
  "tokio",
 ]
 

@@ -10,6 +10,7 @@ publish = false
 speech-native-host.workspace = true
 speech-native-types.workspace = true
 speech-native-backend-parakeet.workspace = true
+speech-native-backend-qwen.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
