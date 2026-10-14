@@ -2081,8 +2081,15 @@
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
+  const chatRequestIsCancellable = (busyLeases, streamLeases) => (
+    [...streamLeases].some((lease) => (
+      lease.startsWith("chat-request:") && busyLeases.has(lease)
+    ))
+  );
+
   const renderChatBusyState = () => {
     const busy = chatBusyLeases.size > 0;
+    const cancellable = chatRequestIsCancellable(chatBusyLeases, activeDispatchStreamLeases);
     const form = document.getElementById("chat-form");
     if (!form) return;
     const send = form.querySelector("button[type='submit']");
@@ -2099,8 +2106,8 @@
       send.classList.toggle("is-hidden", busy);
     }
     if (stop) {
-      stop.disabled = !busy;
-      stop.classList.toggle("is-hidden", !busy);
+      stop.disabled = !cancellable;
+      stop.classList.toggle("is-hidden", !cancellable);
     }
     if (skipReasoning && !busy) {
       skipReasoning.disabled = true;
