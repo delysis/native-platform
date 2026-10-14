@@ -9088,6 +9088,10 @@ fn weave_start_inner<R: Runtime>(
             attachment_context.media,
             source_context.native_media(material_plan.bindings.values())?,
         )?;
+        let selected_media =
+            authorized_model.select_media(std::mem::take(&mut attachment_context.media))?;
+        attachment_context.media = selected_media.accepted;
+        let omitted_media = selected_media.omitted;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
         let retained_media = terminal_media::retain(store, &attachment_context.media)?;
         let document_context = &material_plan.text;
@@ -9123,9 +9127,6 @@ fn weave_start_inner<R: Runtime>(
                 "write manuscript text or add completion context before weaving",
                 false,
             ));
-        }
-        if !attachment_context.media.is_empty() {
-            authorized_model.validate_media(&attachment_context.media)?;
         }
         let speculation = loompad_request.map(|(sample_target, batch_offset, policy_name, admission_policy)| {
             let context = continuation_context_binding(&attachment_context.context_preamble, &attachment_context.media)
@@ -9183,10 +9184,10 @@ fn weave_start_inner<R: Runtime>(
         let retrieval_evidence_blob_id = {
             let mut evidence = match &speculation {
                 Some(batch) => {
-                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "loompad": batch })
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "omitted_media": omitted_media, "loompad": batch })
                 }
                 None => {
-                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media })
+                    serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "omitted_media": omitted_media })
                 }
             };
             evidence["first_word_choices"] = serde_json::json!(first_word_choices);
@@ -9918,6 +9919,68 @@ fn resident_context_tokens(model: &LoadedModel) -> u32 {
     // clamping to the model's trained limit, and is therefore authoritative
     // for prompt packing and provenance.
     model.descriptor.context_tokens
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OmittedMediaInput {
+    id: String,
+    kind: llama_native_types::MediaKind,
+    mime: String,
+    sha256: String,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct SelectedMediaInputs {
+    accepted: Vec<llama_native_types::MediaInput>,
+    omitted: Vec<OmittedMediaInput>,
+}
+
+fn select_media_for_resident_model(
+    media: Vec<llama_native_types::MediaInput>,
+    descriptor: &VerifiedModelDescriptor,
+) -> Result<SelectedMediaInputs, IpcFailure> {
+    let mut selected = SelectedMediaInputs::default();
+    for item in media {
+        let kind = match item.kind {
+            llama_native_types::MediaKind::Image => loom_backend_llama::VerifiedMediaKind::Image,
+            llama_native_types::MediaKind::Audio => loom_backend_llama::VerifiedMediaKind::Audio,
+        };
+        let capability = descriptor
+            .capabilities
+            .media
+            .iter()
+            .find(|capability| capability.kind == kind);
+        let reason = match capability {
+            None => Some("unsupported_modality"),
+            Some(capability)
+                if capability
+                    .accepted_mime_types
+                    .as_ref()
+                    .is_some_and(|accepted| {
+                        !accepted
+                            .iter()
+                            .any(|mime| mime.eq_ignore_ascii_case(&item.mime))
+                    }) =>
+            {
+                Some("unsupported_mime")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            selected.omitted.push(OmittedMediaInput {
+                id: item.id,
+                kind: item.kind,
+                mime: item.mime,
+                sha256: item.sha256,
+                reason: reason.to_owned(),
+            });
+        } else {
+            selected.accepted.push(item);
+        }
+    }
+    validate_media_against_resident_model(&selected.accepted, descriptor)?;
+    Ok(selected)
 }
 
 fn validate_media_against_resident_model(
@@ -12871,6 +12934,47 @@ mod tests {
         let error = validate_media_against_resident_model(&[oversized], &loaded.descriptor)
             .expect_err("per-object byte limit must be enforced");
         assert_eq!(error.code, "attachment_model_limit_exceeded");
+    }
+
+    #[test]
+    fn unsupported_document_media_is_omitted_without_hiding_supported_media() {
+        let mut loaded = test_loaded_model(Path::new("/tmp/media.gguf"), "media-model");
+        loaded
+            .descriptor
+            .capabilities
+            .media
+            .push(loom_backend_llama::VerifiedMediaCapability {
+                kind: loom_backend_llama::VerifiedMediaKind::Image,
+                projector_required: true,
+                accepted_mime_types: Some(vec!["image/png".to_owned()]),
+                max_objects_per_request: Some(1),
+                max_bytes_per_object: Some(4),
+                max_total_bytes_per_request: Some(4),
+            });
+        let image = llama_native_types::MediaInput {
+            id: "image:one".to_owned(),
+            kind: llama_native_types::MediaKind::Image,
+            mime: "image/png".to_owned(),
+            sha256: BlobId::digest(b"png!").to_string(),
+            bytes: b"png!".to_vec(),
+        };
+        let audio = llama_native_types::MediaInput {
+            id: "audio:one".to_owned(),
+            kind: llama_native_types::MediaKind::Audio,
+            mime: "audio/wav".to_owned(),
+            sha256: BlobId::digest(b"wave").to_string(),
+            bytes: b"wave".to_vec(),
+        };
+
+        let selected =
+            select_media_for_resident_model(vec![image.clone(), audio.clone()], &loaded.descriptor)
+                .expect("unsupported modalities should not abort text generation");
+
+        assert_eq!(selected.accepted, vec![image]);
+        assert_eq!(selected.omitted.len(), 1);
+        assert_eq!(selected.omitted[0].id, audio.id);
+        assert_eq!(selected.omitted[0].sha256, audio.sha256);
+        assert_eq!(selected.omitted[0].reason, "unsupported_modality");
     }
 
     #[test]

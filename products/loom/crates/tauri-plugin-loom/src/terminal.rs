@@ -242,6 +242,8 @@ struct RunReceipt {
     context_references: Option<Vec<String>>,
     #[serde(default)]
     media: Vec<crate::terminal_media::RetainedMedia>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    omitted_media: Vec<OmittedMediaInput>,
     model: Option<VerifiedModelDescriptor>,
     bindings: BTreeMap<String, Value>,
     #[serde(default)]
@@ -926,6 +928,7 @@ fn start_run<R: Runtime>(
             }
         }
     }
+    let mut omitted_media = Vec::new();
     let media = if !literal && (model.is_some() || remote_target.is_some()) {
         let media = if scope == RunScope::Document {
             crate::terminal_media::resolve(read_context.documents, &source, &sources)?
@@ -934,7 +937,7 @@ fn start_run<R: Runtime>(
         } else {
             Vec::new()
         };
-        let media = crate::terminal_media::merge(
+        let mut media = crate::terminal_media::merge(
             media,
             read_context.native_media(
                 bindings
@@ -946,7 +949,9 @@ fn start_run<R: Runtime>(
             )?,
         )?;
         if let Some(model) = &model {
-            validate_media_against_resident_model(&media, &model.descriptor)?;
+            let selected = select_media_for_resident_model(media, &model.descriptor)?;
+            omitted_media = selected.omitted;
+            media = selected.accepted;
         }
         if let Some(target) = &remote_target {
             crate::peer_media::encode(&media, &target.grant.model)?;
@@ -1007,6 +1012,7 @@ fn start_run<R: Runtime>(
         function_recipe,
         context_references,
         media: media_evidence,
+        omitted_media,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
         function_contexts,

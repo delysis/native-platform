@@ -104,19 +104,27 @@ impl Engine {
             Self::Server { scope, .. } => Ok(scope.environment()),
         }
     }
-    pub fn validate_media(
+    pub fn select_media(
         &self,
-        media: &[llama_native_types::MediaInput],
-    ) -> Result<(), IpcFailure> {
+        media: Vec<llama_native_types::MediaInput>,
+    ) -> Result<SelectedMediaInputs, IpcFailure> {
         match self {
             Self::Native(model) => {
-                validate_media_against_resident_model(media, &model.loaded().descriptor)
+                select_media_for_resident_model(media, &model.loaded().descriptor)
             }
-            Self::Server { .. } => Err(IpcFailure::new(
-                "inference_media_unsupported",
-                "configured raw-completion servers accept text context; image and audio context require a native multimodal model",
-                false,
-            )),
+            Self::Server { .. } => Ok(SelectedMediaInputs {
+                accepted: Vec::new(),
+                omitted: media
+                    .into_iter()
+                    .map(|item| OmittedMediaInput {
+                        id: item.id,
+                        kind: item.kind,
+                        mime: item.mime,
+                        sha256: item.sha256,
+                        reason: "unsupported_modality".to_owned(),
+                    })
+                    .collect(),
+            }),
         }
     }
 }
