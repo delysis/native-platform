@@ -58,6 +58,13 @@ run() {
   "$@"
 }
 
+# Execute the package manager version pinned by the workspace. A different
+# globally installed pnpm can have different offline metadata requirements and
+# must not decide whether an otherwise identical release tree is buildable.
+run_pnpm() {
+  run npx --offline --yes=false pnpm@11.16.0 "$@"
+}
+
 NOTARY_TEMP_ROOT=
 cleanup() {
   if [ -n "$NOTARY_TEMP_ROOT" ] && [ -d "$NOTARY_TEMP_ROOT" ]; then
@@ -128,9 +135,9 @@ run_mom_preservation_checks() {
   run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten
   run_exact_test mom-llama-runtime lib unused kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen
   run_exact_test mom-llama-app lib unused app_runtime::tests::direct_native_operation_drains_before_final_join
-  run pnpm --dir "$ROOT/products/mom/apps/mom-llama" run check:frontend
+  run_pnpm --dir "$ROOT/products/mom/apps/mom-llama" run check:frontend
   record_check "@delysis/mom-llama::frontend-check"
-  run pnpm --dir "$ROOT/products/mom/apps/mom-llama" run test:frontend
+  run_pnpm --dir "$ROOT/products/mom/apps/mom-llama" run test:frontend
   record_check "@delysis/mom-llama::frontend-tests"
 }
 
@@ -210,7 +217,7 @@ fi
 
 pin_rust_toolchain
 
-run pnpm install --frozen-lockfile --offline
+run_pnpm install --frozen-lockfile --offline
 
 case "$COMPONENT" in
   mom)
@@ -218,9 +225,11 @@ case "$COMPONENT" in
     ;;
   loom)
     run_mom_preservation_checks
+    run node "$ROOT/scripts/check-tauri-capabilities.mjs" "$PRODUCT_DIR"
+    record_check "@delysis/loom::tauri-capability-contract"
     run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test tauri-plugin-loom lib unused tests::close_cancels_active_family_waits_for_terminal_release_and_replays
-    run pnpm --dir "$PRODUCT_DIR" test
+    run_pnpm --dir "$PRODUCT_DIR" test
     record_check "@delysis/loom::frontend-tests"
     ;;
   fte)
@@ -228,7 +237,7 @@ case "$COMPONENT" in
     run_exact_test free-token-energy lib unused db::tests::fresh_database_is_versioned_and_reopens_only_as_the_current_schema
     run_exact_test free-token-energy lib unused gateway_runtime::tests::runtime_shutdown_reports_every_owned_worker_and_native_join
     run_exact_test fte-router lib unused tests::shutdown_cancels_active_work_and_waits_for_authoritative_completion
-    run pnpm --dir "$PRODUCT_DIR" run test:frontend
+    run_pnpm --dir "$PRODUCT_DIR" run test:frontend
     record_check "free-token-energy::frontend-tests"
     ;;
 esac
@@ -248,7 +257,7 @@ if [ "$COMPONENT" = loom ]; then
   LOOM_POLICY_FILE_SHA256=$(shasum -a 256 "$LOOM_POLICY_FILE" | awk '{print $1}')
 fi
 
-run env MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" CMAKE_OSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" LOOM_BUILD_MODEL_POLICY="$LOOM_POLICY_NAME" pnpm --dir "$PRODUCT_DIR" exec tauri build --bundles app -- --locked
+run env MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" CMAKE_OSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" LOOM_BUILD_MODEL_POLICY="$LOOM_POLICY_NAME" npx --offline --yes=false pnpm@11.16.0 --dir "$PRODUCT_DIR" exec tauri build --bundles app -- --locked
 if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   echo "the Tauri build changed checked-in source; regenerate and commit build metadata before releasing" >&2
   git status --short >&2

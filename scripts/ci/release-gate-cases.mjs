@@ -135,7 +135,8 @@ test("release pins tools inherited by nested pnpm/Tauri invocations", (t) => {
   assert.equal(result.stdout, "pinned-cargo\npinned-rustc\npinned-rustdoc\npinned-cargo\npinned-rustc\npinned-rustdoc\n1.95.0\n");
   const source = fs.readFileSync(releasePath, "utf8");
   const selection = source.indexOf("\npin_rust_toolchain\n");
-  assert.ok(selection > 0 && selection < source.indexOf("run pnpm install"), "selection must execute before nested package commands");
+  assert.match(source, /run npx --offline --yes=false pnpm@11\.16\.0/);
+  assert.ok(selection > 0 && selection < source.indexOf("run_pnpm install"), "selection must execute before nested package commands");
 });
 
 test("release fails before nested execution when the pinned toolchain is missing", (t) => {
