@@ -147,6 +147,27 @@ async function setup(emptyProject = false, placement: string | null = 'Notes/Pap
   return { calls, project, opened, materials, heldDrafts, retireFixture: () => { fixtureClosed = true; } };
 }
 
+it('plus click and context-menu share the Loom add surface and never expose the WebKit menu', async () => {
+  await setup();
+  const add = page.getByRole('button', { name: 'Add', exact: true }).element() as HTMLButtonElement;
+  const opened = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+  add.dispatchEvent(opened);
+  await tick();
+  expect(opened.defaultPrevented).toBe(true);
+  for (const label of ['Manuscript', 'Folder…', 'Files…', 'Library…', 'Sources…']) {
+    await expect.element(page.getByRole('menuitem', { name: label, exact: true })).toBeVisible();
+  }
+  await expect.element(page.getByRole('menuitem', { name: 'Manuscript', exact: true })).toHaveFocus();
+  key(page.getByRole('menu').element() as HTMLElement, 'ArrowDown');
+  await expect.element(page.getByRole('menuitem', { name: 'Folder…', exact: true })).toHaveFocus();
+  key(page.getByRole('menu').element() as HTMLElement, 'Escape');
+  await expect.element(page.getByRole('button', { name: 'Add', exact: true })).toHaveFocus();
+  expect(page.getByRole('menu').query()).toBeNull();
+
+  add.click();
+  await expect.element(page.getByRole('menuitem', { name: 'Sources…', exact: true })).toBeVisible();
+});
+
 it('missing bookmark has readable disambiguated names, exact path tooltip and a handled remove menu without native calls', async () => {
   const { calls } = await setup(); const row = rootRow(missingRoot)!;
   expect(row.textContent).toContain('writing — unavailable'); expect(row.textContent).not.toContain('/private/var/folders');
