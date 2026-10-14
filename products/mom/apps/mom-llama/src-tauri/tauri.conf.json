@@ -29,9 +29,10 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "externalBin": ["binaries/qwen3-tts-helper", "binaries/mlx.metallib"],
     "icon": ["icons/icon.png"],
     "macOS": {
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "14.0"
     }
   }
 }

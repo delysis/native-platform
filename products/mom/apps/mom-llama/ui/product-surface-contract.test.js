@@ -225,6 +225,8 @@ test("the composer keeps a glass send affordance anchored while its readiness ch
   assert.ok(styles.includes('.composer .send-button[type="submit"]:not(:disabled)'));
   assert.ok(styles.includes("color: #086dbb"));
   assert.ok(!styles.includes("linear-gradient(145deg, #36a5ff"));
+  assert.ok(styles.includes("background-clip: border-box"));
+  assert.ok(!styles.includes("border-color: rgba(255, 255, 255, .9)"));
 });
 
 test("read aloud keeps lifecycle controls accessible without implementation prose", () => {

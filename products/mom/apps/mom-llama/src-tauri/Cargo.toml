@@ -31,6 +31,7 @@ speech-native-host.workspace = true
 speech-native-types.workspace = true
 speech-native-platform.workspace = true
 speech-native-backend-parakeet.workspace = true
+speech-native-backend-qwen.workspace = true
 information-native-host.workspace = true
 information-native-store.workspace = true
 information-native-types.workspace = true

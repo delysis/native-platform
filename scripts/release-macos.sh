@@ -222,6 +222,8 @@ run_pnpm install --frozen-lockfile --offline
 case "$COMPONENT" in
   mom)
     run_mom_preservation_checks
+    run "$ROOT/scripts/build-qwen3-tts-helper.sh"
+    record_check "mom-qwen3-tts-helper::release-build"
     ;;
   loom)
     run_mom_preservation_checks

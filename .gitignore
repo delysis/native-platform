@@ -9,3 +9,8 @@ products/loom/apps/loom/.vitest-attachments/
 products/loom/apps/loom/src/lib/__screenshots__/
 products/loom/apps/loom/src-tauri/binaries/
 products/loom/signal/target/
+
+# Generated native speech helper and Swift build products.
+products/mom/apps/mom-llama/qwen3-tts-helper/.build/
+products/mom/apps/mom-llama/src-tauri/binaries/qwen3-tts-helper-*
+products/mom/apps/mom-llama/src-tauri/binaries/mlx.metallib-*

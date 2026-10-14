@@ -59,6 +59,7 @@ for dependency in \
   'speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }' \
   'speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }' \
   'speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }' \
+  'speech-native-backend-qwen = { path = "crates/services/speech/crates/speech-native-backend-qwen" }' \
   'information-native-host = { path = "crates/services/information/crates/information-native-host" }' \
   'information-native-store = { path = "crates/services/information/crates/information-native-store" }' \
   'information-native-types = { path = "crates/services/information/crates/information-native-types" }' \
@@ -108,7 +109,8 @@ for speech_package in \
   speech-native-host \
   speech-native-types \
   speech-native-platform \
-  speech-native-backend-parakeet
+  speech-native-backend-parakeet \
+  speech-native-backend-qwen
 do
   if ! cargo tree --locked -p mom-llama-app -i "$speech_package@0.1.0" >/dev/null
   then
@@ -147,6 +149,12 @@ done
 if ! rg -q 'std::process' crates/mom-llama-runtime/src/mcp.rs
 then
   echo "the explicit MCP adapter no longer declares its process boundary" >&2
+  exit 1
+fi
+
+if ! rg -q 'std::process::Command' ../../crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs
+then
+  echo "the Qwen speech backend no longer declares its exact managed-helper process boundary" >&2
   exit 1
 fi
 

@@ -35,6 +35,7 @@ members = [
     "crates/services/information/crates/information-native-store",
     "crates/services/information/crates/information-native-types",
     "crates/services/speech/crates/speech-native-backend-parakeet",
+    "crates/services/speech/crates/speech-native-backend-qwen",
     "crates/services/speech/crates/speech-native-host",
     "crates/services/speech/crates/speech-native-platform",
     "crates/services/speech/crates/speech-native-router",
@@ -173,6 +174,7 @@ speech-native-host = { path = "crates/services/speech/crates/speech-native-host"
 speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }
 speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }
 speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }
+speech-native-backend-qwen = { path = "crates/services/speech/crates/speech-native-backend-qwen" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
 
 [workspace.lints.rust]

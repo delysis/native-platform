@@ -1337,13 +1337,14 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer .round-button,
 .composer .send-button {
   color: var(--glass-glyph);
-  border: 1px solid var(--glass-edge);
+  border: 0;
   background:
-    radial-gradient(circle at 27% 16%, rgba(255, 255, 255, .9), transparent 31%),
+    radial-gradient(circle at 27% 16%, rgba(255, 255, 255, .72), transparent 34%),
     linear-gradient(145deg,
-      color-mix(in srgb, var(--glass-fill) 70%, white 30%),
-      color-mix(in srgb, var(--glass-fill) 78%, transparent) 55%,
-      color-mix(in srgb, var(--glass-fill) 82%, #8bbde0 18%));
+      color-mix(in srgb, var(--glass-fill) 48%, #bfe5fb 52%),
+      color-mix(in srgb, var(--glass-fill) 66%, #91c7e8 34%) 58%,
+      color-mix(in srgb, var(--glass-fill) 72%, #699bc0 28%));
+  background-clip: border-box;
   box-shadow: var(--glass-shadow);
   -webkit-backdrop-filter: blur(24px) saturate(1.65) brightness(1.06);
   backdrop-filter: blur(24px) saturate(1.65) brightness(1.06);
@@ -1522,10 +1523,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer-right .send-button { flex-basis: 40px; }
 .composer .send-button[type="submit"]:not(:disabled) {
   color: #086dbb;
-  border-color: rgba(255, 255, 255, .9);
   background:
-    radial-gradient(circle at 28% 16%, rgba(255, 255, 255, .96), transparent 32%),
-    linear-gradient(145deg, rgba(162, 220, 255, .58), rgba(87, 169, 230, .34) 58%, rgba(70, 133, 205, .3));
+    radial-gradient(circle at 28% 16%, rgba(255, 255, 255, .7), transparent 34%),
+    linear-gradient(145deg, rgba(157, 218, 255, .82), rgba(83, 168, 231, .62) 58%, rgba(57, 126, 202, .56));
   box-shadow:
     0 10px 24px rgba(35, 105, 170, .18),
     0 2px 7px rgba(35, 105, 170, .1),

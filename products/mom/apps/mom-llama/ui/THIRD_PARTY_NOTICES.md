@@ -31,3 +31,16 @@ The complete pinned upstream `LICENSE`, including its Lucide ISC notice and
 Feather MIT terms, is appended verbatim to `LUCIDE-LICENSE.txt`. That license
 identifies `chevron-down` as Feather-derived. This bounded addition does not
 establish exact originating revisions for the older embedded glyphs.
+
+## Qwen3 TTS Swift adapter
+
+The local speech helper includes source from `hamptus/mlx-swift-qwen3-tts`
+revision `2118167c06dd93233128ccef3011188e32bebd14` (release 0.2.0), licensed
+under Apache-2.0. The complete notice is retained in
+`../qwen3-tts-helper/QWEN3_TTS_SWIFT_LICENSE`.
+
+## MLX Swift
+
+The local speech helper links `ml-explore/mlx-swift` 0.30.3 at revision
+`4dccaeda1d83cf8697f235d2786c2d72ad4bb925`, licensed under MIT. The complete
+notice is retained in `../qwen3-tts-helper/MLX_SWIFT_LICENSE`.
