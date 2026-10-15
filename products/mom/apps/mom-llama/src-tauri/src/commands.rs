@@ -1288,6 +1288,20 @@ pub async fn mom_llama_attachment_import(
 }
 
 #[tauri::command]
+pub async fn mom_llama_voice_message_import(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    bytes: Vec<u8>,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_voice_message_import"))?,
+        move || mom_llama_runtime::attachment_import_voice_message(&scope, &conversation, bytes),
+    )
+    .await
+}
+
+#[tauri::command]
 pub fn mom_llama_attachment_list(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: Option<String>,

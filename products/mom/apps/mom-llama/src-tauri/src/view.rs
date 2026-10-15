@@ -500,6 +500,22 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Voice call",
     },
     ControlSpec {
+        affordance: "voice.message.record",
+        command: "mom_llama.voice_message_import",
+        tauri_command: "mom_llama_voice_message_import",
+        cli: "app-only; records one explicit local microphone turn",
+        effect: "mom_llama.effects.voice_message.v1",
+        label: "Voice message",
+    },
+    ControlSpec {
+        affordance: "voice.message.local_control",
+        command: "mom_llama.voice_message_local_control",
+        tauri_command: "client_only",
+        cli: "app-only; controls the current microphone capture",
+        effect: "mom_llama.effects.voice_message.v1",
+        label: "Voice message control",
+    },
+    ControlSpec {
         affordance: "conversation.rename",
         command: "mom_llama.conversation_rename",
         tauri_command: "mom_llama_conversation_rename",
@@ -2030,9 +2046,9 @@ fn composer(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let send_enabled =
-        readiness.enabled && (!draft_message.trim().is_empty() || !staged_attachments.is_empty());
     let draft_control = control("conversation.draft_update");
+    let voice_control = control("voice.message.record");
+    let voice_local_control = control("voice.message.local_control");
     html! {
         form id="chat-form" class="composer"
             data-draft-submit-affordance="conversation.draft_submit"
@@ -2152,19 +2168,49 @@ fn composer(
                         true,
                     ))
                     (button("chat.composer.cancel", Some("chat-cancel"), "send-button stop-button is-hidden", true))
-                    button type="submit"
-                        class="send-button"
+                    button type="button" class="send-button voice-message-button"
+                        aria-label=(voice_control.label)
                         title=(readiness.label.clone())
+                        data-affordance=(voice_control.affordance)
+                        data-command=(voice_control.command)
+                        data-tauri-command=(voice_control.tauri_command)
+                        data-cli=(voice_control.cli)
+                        data-effect=(voice_control.effect)
+                        data-action="voice-message-start"
                         data-model-ready=(readiness.enabled)
-                        data-affordance="chat.composer.send"
-                        data-command="mom_llama.chat_dispatch"
-                        data-tauri-command="mom_llama_chat_dispatch"
-                        data-cli="mom-llama chat dispatch --conversation <id> --message <text> --json"
-                        data-effect="mom_llama.effects.chat_send.v1"
-                        disabled[!send_enabled] {
-                        "↑"
+                        disabled[!readiness.enabled] {
+                        (icon_markup("mic"))
+                        span class="sr-only" { (voice_control.label) }
                     }
                 }
+            }
+            div id="voice-message-recorder" class="voice-message-recorder is-hidden" hidden
+                aria-live="polite" aria-label="Listening" {
+                button type="button" class="round-button voice-message-cancel" aria-label="Cancel recording"
+                    data-affordance=(voice_local_control.affordance)
+                    data-command=(voice_local_control.command)
+                    data-tauri-command=(voice_local_control.tauri_command)
+                    data-cli=(voice_local_control.cli)
+                    data-effect=(voice_local_control.effect)
+                    data-action="voice-message-cancel" { (icon_markup("x")) }
+                button type="button" class="voice-listening-orb" aria-label="Send voice message"
+                    title="Send"
+                    data-affordance=(voice_control.affordance)
+                    data-command=(voice_control.command)
+                    data-tauri-command=(voice_control.tauri_command)
+                    data-cli=(voice_control.cli)
+                    data-effect=(voice_control.effect)
+                    data-action="voice-message-send" {
+                    span class="voice-listening-core" aria-hidden="true" {}
+                }
+                button type="button" class="round-button voice-message-keyboard" aria-label="Use keyboard"
+                    title="Keyboard"
+                    data-affordance=(voice_local_control.affordance)
+                    data-command=(voice_local_control.command)
+                    data-tauri-command=(voice_local_control.tauri_command)
+                    data-cli=(voice_local_control.cli)
+                    data-effect=(voice_local_control.effect)
+                    data-action="voice-message-cancel" { (icon_markup("keyboard")) }
             }
             output id="chat-events" class="stream-events" aria-live="polite" {}
         }
@@ -3764,6 +3810,7 @@ fn icon_for_affordance(affordance: &str) -> Option<&'static str> {
         "conversation.search" => Some("search"),
         "conversation.search.close" => Some("x"),
         "voice.call.open" => Some("phone"),
+        "voice.message.record" => Some("mic"),
         "conversation.import" => Some("database"),
         "conversation.export" => Some("download"),
         "mcp.status" | "mcp.configure" | "mcp.list_servers" | "mcp.list_tools"
@@ -3813,6 +3860,8 @@ fn icon_paths(name: &str) -> Markup {
         "square-pen" => r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>"#,
         "search" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
         "phone" => r#"<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.69 2.8a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.33 1.84.56 2.8.69A2 2 0 0 1 22 16.92z"/>"#,
+        "mic" => r#"<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>"#,
+        "keyboard" => r#"<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M6 12h.001M10 12h.001M14 12h.001M18 12h.001M7 16h10"/>"#,
         "x" => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
         "plus" => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
         "arrow-up" => r#"<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>"#,
@@ -5154,9 +5203,10 @@ mod tests {
         )
         .into_string();
         assert!(!html.contains("runtime-dot"));
+        assert!(html.contains(r#"class="send-button voice-message-button""#));
         assert!(html.contains("Send; the selected model will load first"));
-        assert!(html.contains(r#"disabled>↑</button>"#));
         assert!(html.contains(r#"data-model-ready="true""#));
+        assert!(!html.contains(r#"data-model-ready="true" disabled"#));
 
         conversation.execution_profile.model_path =
             Some(directory.join("missing-conversation.gguf"));
@@ -5488,6 +5538,7 @@ mod tests {
             "icon-button",
             "round-button",
             "send-button",
+            "voice-listening-orb",
             "nav-button",
             "section-tab",
             "conversation-item",

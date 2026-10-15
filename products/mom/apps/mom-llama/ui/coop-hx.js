@@ -371,7 +371,12 @@
       button,
     };
     audio.addEventListener("ended", () => {
-      if (activeSpeechPlayback?.audio === audio) void stopSpeechPlayback();
+      if (activeSpeechPlayback?.audio === audio) {
+        void stopSpeechPlayback().then(() => {
+          if (voiceCallActive) return beginVoiceCapture({ call: true });
+          return null;
+        }).catch(reportError);
+      }
     });
     await audio.play().catch(() => {});
   };
@@ -947,7 +952,7 @@
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
   };
 
-  const openVoiceCallSurface = () => {
+  const openVoiceCallSurface = async () => {
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
     if (!modal || !recipient) return;
@@ -965,6 +970,21 @@
     setText("voice-call-name", name);
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
+    try {
+      await beginVoiceCapture({ call: true });
+      voiceCallActive = true;
+    } catch (error) {
+      setModalVisibility("voice-call-modal", false);
+      throw error;
+    }
+  };
+
+  const closeVoiceCallSurface = async () => {
+    voiceCallActive = false;
+    voiceReplyConversation = null;
+    await stopVoiceCapture({ discard: true });
+    await stopSpeechPlayback();
+    setModalVisibility("voice-call-modal", false);
   };
 
   const setText = (id, value) => {
@@ -2142,6 +2162,9 @@
   };
 
   let activeDispatchConversation = null;
+  let voiceRecording = null;
+  let voiceReplyConversation = null;
+  let voiceCallActive = false;
   const activeDispatchStreamLeases = new Set();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
@@ -2152,17 +2175,12 @@
     ))
   );
 
-  const composerHasSendableDraft = (form) => {
-    const message = formField(form, "message")?.value.trim() || "";
-    return Boolean(message || draftAttachmentIds(form).length);
-  };
-
   const renderChatBusyState = () => {
     const busy = chatBusyLeases.size > 0;
     const cancellable = chatRequestIsCancellable(chatBusyLeases, activeDispatchStreamLeases);
     const form = document.getElementById("chat-form");
     if (!form) return;
-    const send = form.querySelector?.("button[type='submit']");
+    const voice = form.querySelector?.(".voice-message-button");
     const stop = form.querySelector?.(".stop-button");
     const skipReasoning = form.querySelector?.(".skip-reasoning-button");
     const message = formField(form, "message");
@@ -2171,12 +2189,10 @@
     if (message) message.readOnly = busy;
     if (attachmentImport) attachmentImport.disabled = busy;
     attachmentRemovers.forEach((button) => { button.disabled = busy; });
-    if (send) {
-      const disabled = busy
-        || send.dataset.modelReady !== "true"
-        || !composerHasSendableDraft(form);
-      send.disabled = disabled;
-      send.setAttribute("aria-disabled", String(disabled));
+    if (voice) {
+      const disabled = busy || voice.dataset.modelReady === "false";
+      voice.disabled = disabled;
+      voice.setAttribute("aria-disabled", String(disabled));
     }
     if (stop) {
       stop.disabled = !cancellable;
@@ -2187,6 +2203,176 @@
       skipReasoning.classList.add("is-hidden");
     }
     form.dataset.busy = busy ? "true" : "false";
+  };
+
+  const setVoiceRecordingVisible = (visible) => {
+    const form = document.getElementById("chat-form");
+    const recorder = document.getElementById("voice-message-recorder");
+    form?.classList.toggle("voice-recording", visible);
+    if (recorder) {
+      recorder.hidden = !visible;
+      recorder.classList.toggle("is-hidden", !visible);
+    }
+  };
+
+  const mergeFloat32 = (chunks) => {
+    const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const merged = new Float32Array(length);
+    let offset = 0;
+    chunks.forEach((chunk) => { merged.set(chunk, offset); offset += chunk.length; });
+    return merged;
+  };
+
+  const resampleMono = (samples, sourceRate, targetRate = 16000) => {
+    if (sourceRate === targetRate) return samples;
+    const ratio = sourceRate / targetRate;
+    const output = new Float32Array(Math.max(1, Math.floor(samples.length / ratio)));
+    for (let index = 0; index < output.length; index += 1) {
+      const start = Math.floor(index * ratio);
+      const end = Math.min(samples.length, Math.max(start + 1, Math.floor((index + 1) * ratio)));
+      let sum = 0;
+      for (let source = start; source < end; source += 1) sum += samples[source];
+      output[index] = sum / (end - start);
+    }
+    return output;
+  };
+
+  const trimVoiceSilence = (samples, sampleRate = 16000) => {
+    const frame = Math.max(1, Math.round(sampleRate * .02));
+    const rms = [];
+    for (let start = 0; start < samples.length; start += frame) {
+      let power = 0;
+      const end = Math.min(samples.length, start + frame);
+      for (let index = start; index < end; index += 1) power += samples[index] * samples[index];
+      rms.push(Math.sqrt(power / Math.max(1, end - start)));
+    }
+    const sorted = [...rms].sort((a, b) => a - b);
+    const noiseFloor = sorted[Math.floor(sorted.length * .2)] || 0;
+    const threshold = Math.max(.008, noiseFloor * 3.2);
+    const active = rms.map((value) => value >= threshold);
+    const first = active.indexOf(true);
+    const last = active.lastIndexOf(true);
+    if (first < 0) return new Float32Array();
+    const marginFrames = 8;
+    const from = Math.max(0, first - marginFrames);
+    const to = Math.min(active.length - 1, last + marginFrames);
+    const kept = [];
+    let cursor = from;
+    while (cursor <= to) {
+      if (active[cursor]) {
+        kept.push(cursor);
+        cursor += 1;
+        continue;
+      }
+      let end = cursor;
+      while (end <= to && !active[end]) end += 1;
+      const run = end - cursor;
+      const edge = cursor === from || end > to;
+      const keep = edge || run <= 30 ? run : 16;
+      for (let offset = 0; offset < keep; offset += 1) {
+        const frameIndex = run <= keep ? cursor + offset : (offset < 8 ? cursor + offset : end - (keep - offset));
+        kept.push(frameIndex);
+      }
+      cursor = end;
+    }
+    const output = new Float32Array(kept.length * frame);
+    let write = 0;
+    kept.forEach((frameIndex) => {
+      const slice = samples.subarray(frameIndex * frame, Math.min(samples.length, (frameIndex + 1) * frame));
+      output.set(slice, write);
+      write += slice.length;
+    });
+    return output.subarray(0, write);
+  };
+
+  const encodePcmWav = (samples, sampleRate = 16000) => {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const text = (offset, value) => [...value].forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
+    text(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); text(8, "WAVE");
+    text(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    text(36, "data"); view.setUint32(40, samples.length * 2, true);
+    samples.forEach((sample, index) => view.setInt16(44 + index * 2, Math.round(Math.max(-1, Math.min(1, sample)) * 32767), true));
+    return new Uint8Array(buffer);
+  };
+
+  const stopVoiceCapture = async ({ discard = false } = {}) => {
+    const recording = voiceRecording;
+    voiceRecording = null;
+    if (!recording) return null;
+    clearTimeout(recording.limit);
+    recording.stream.getTracks().forEach((track) => track.stop());
+    recording.source.disconnect();
+    recording.processor.disconnect();
+    recording.silence.disconnect();
+    await recording.context.close().catch(() => {});
+    setVoiceRecordingVisible(false);
+    if (discard) return null;
+    return trimVoiceSilence(resampleMono(mergeFloat32(recording.chunks), recording.context.sampleRate));
+  };
+
+  const beginVoiceCapture = async ({ call = false } = {}) => {
+    if (voiceRecording || chatBusyLeases.size) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const context = new AudioContext();
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(4096, 1, 1);
+    const silence = context.createGain();
+    silence.gain.value = 0;
+    const chunks = [];
+    const recording = { stream, context, source, processor, silence, chunks, limit: null, call, heardVoice: false, silentMs: 0 };
+    processor.onaudioprocess = (event) => {
+      const chunk = new Float32Array(event.inputBuffer.getChannelData(0));
+      chunks.push(chunk);
+      if (!call) return;
+      let power = 0;
+      for (const sample of chunk) power += sample * sample;
+      const voiced = Math.sqrt(power / Math.max(1, chunk.length)) >= .012;
+      if (voiced) { recording.heardVoice = true; recording.silentMs = 0; }
+      else if (recording.heardVoice) recording.silentMs += (chunk.length / context.sampleRate) * 1000;
+      if (recording.heardVoice && recording.silentMs >= 900 && voiceRecording === recording) {
+        document.querySelector("[data-action='voice-message-send']")?.click();
+      }
+    };
+    source.connect(processor); processor.connect(silence); silence.connect(context.destination);
+    voiceRecording = recording;
+    voiceRecording.limit = window.setTimeout(() => {
+      document.querySelector("[data-action='voice-message-send']")?.click();
+    }, 29000);
+    if (!call) setVoiceRecordingVisible(true);
+  };
+
+  const sendVoiceCapture = async () => {
+    const samples = await stopVoiceCapture();
+    if (!samples?.length) {
+      report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
+      if (voiceCallActive) await beginVoiceCapture({ call: true });
+      return;
+    }
+    const form = document.getElementById("chat-form");
+    const sourceConversation = selectedConversation();
+    let conversation = sourceConversation;
+    if (sourceConversation !== "default" && selectedConversationKind() === "persona_template") {
+      const instantiated = await instantiatePersona(sourceConversation);
+      if (instantiated?.status === "blocked" || !instantiated?.result?.id) return;
+      conversation = instantiated.result.id;
+      chat().dataset.currentConversation = conversation;
+      chat().dataset.conversationKind = "chat";
+    }
+    const wav = encodePcmWav(samples);
+    const imported = await invoke("mom_llama_voice_message_import", { conversation, bytes: Array.from(wav) });
+    report(imported);
+    if (imported?.status === "blocked") {
+      if (voiceCallActive) await beginVoiceCapture({ call: true });
+      return;
+    }
+    voiceReplyConversation = conversation;
+    await refreshConversationProjection();
+    document.getElementById("chat-form")?.requestSubmit();
   };
 
   const acquireChatBusy = (scope) => {
@@ -2757,8 +2943,11 @@
     "conversation-list": async () => refreshConversationProjection(),
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
+    "voice-message-start": async () => beginVoiceCapture(),
+    "voice-message-cancel": async () => { await stopVoiceCapture({ discard: true }); focusComposer(); },
+    "voice-message-send": async () => sendVoiceCapture(),
     "voice-call-open": async () => openVoiceCallSurface(),
-    "voice-call-close": async () => setModalVisibility("voice-call-modal", false),
+    "voice-call-close": async () => closeVoiceCallSurface(),
     "conversation-select": async (button) => {
       if (button.dataset.conversation === selectedConversation()) {
         openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
@@ -3510,8 +3699,9 @@
     }
     if (event.key === "Escape" && event.target.closest("#voice-call-modal")) {
       event.preventDefault();
-      setModalVisibility("voice-call-modal", false);
-      document.querySelector('[data-action="voice-call-open"]')?.focus();
+      void closeVoiceCallSurface().then(() => {
+        document.querySelector('[data-action="voice-call-open"]')?.focus();
+      }).catch(reportError);
     }
     if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
       const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
@@ -3645,12 +3835,18 @@
             textarea.value = message;
           }
           await refreshConversationProjection();
+          if (voiceReplyConversation === conversation && result?.status !== "blocked") {
+            voiceReplyConversation = null;
+            const replies = document.querySelectorAll(".message-row.assistant [data-action='message-read-aloud']");
+            replies[replies.length - 1]?.click();
+          }
         } finally {
           // A rejected native batch can return without a terminal stream event
           // or an invocation result. Its started events must not strand Stop.
           activeDispatchStreamLeases.forEach(releaseChatBusy);
           activeDispatchStreamLeases.clear();
           activeDispatchConversation = null;
+          if (voiceReplyConversation === conversation) voiceReplyConversation = null;
           releaseChatBusy(dispatchLease);
         }
       }

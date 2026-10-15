@@ -116,7 +116,7 @@ for (const outcome of ["blocked", "throw"]) {
     vm.createContext(context);
     const start = source.indexOf('  document.addEventListener("submit"');
     const end = start + source.slice(start).indexOf('\n  });') + 7;
-    vm.runInContext(`let activeDispatchConversation = null;\n${source.slice(start, end)}`, context);
+    vm.runInContext(`let activeDispatchConversation = null;\nlet voiceReplyConversation = null;\n${source.slice(start, end)}`, context);
     await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
     assert.deepEqual(released, ["mention-request:failed:contact", "dispatch"]);
     assert.equal(leases.size, 0);

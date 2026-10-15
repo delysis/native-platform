@@ -171,6 +171,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_import_text", true, false),
     long("mom_llama_attachment_import_paste", true, false),
     long("mom_llama_attachment_import", true, false),
+    long("mom_llama_voice_message_import", true, false),
     read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", true, false),
     long("mom_llama_attachment_preview_content", true, false),
@@ -296,8 +297,8 @@ mod tests {
         let view = include_str!("view.rs");
         assert_eq!(
             view.matches("tauri_command: \"client_only\"").count(),
-            1,
-            "only one deliberately local UI command is admitted"
+            2,
+            "voice-call and voice-message controls are the deliberately local UI commands"
         );
         for line in view.lines() {
             let Some(value) = line.trim().strip_prefix("tauri_command: \"") else {

@@ -19,7 +19,8 @@
         "height": 860,
         "minWidth": 640,
         "minHeight": 480,
-        "resizable": true
+        "resizable": true,
+        "useHttpsScheme": true
       }
     ],
     "security": {
@@ -32,7 +33,9 @@
     "externalBin": ["binaries/qwen3-tts-helper", "binaries/mlx.metallib"],
     "icon": ["icons/icon.png"],
     "macOS": {
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "entitlements": "MomLlama.entitlements",
+      "infoPlist": "Info.plist"
     }
   }
 }

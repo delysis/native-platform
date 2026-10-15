@@ -236,16 +236,24 @@ test("voice reference screening measures signal quality without claiming identit
   assert.ok(voiceQc.includes("listening_review"));
 });
 
-test("the composer keeps a glass send affordance anchored while its readiness changes", () => {
-  assert.ok(viewProduction.includes('class="send-button"'));
-  assert.ok(viewProduction.includes('data-model-ready=(readiness.enabled)'));
-  assert.ok(viewProduction.includes("let send_enabled ="));
-  assert.ok(viewProduction.includes("readiness.enabled &&"));
-  assert.ok(viewProduction.includes("disabled[!send_enabled]"));
-  assert.ok(bridge.includes("const composerHasSendableDraft"));
-  assert.ok(bridge.includes('send.dataset.modelReady !== "true"'));
-  assert.ok(bridge.includes("!composerHasSendableDraft(form)"));
-  assert.ok(!bridge.includes('send.classList.toggle("is-hidden", busy)'));
+test("the composer uses a glass microphone affordance and keeps recording controls reachable", () => {
+  const composerStart = viewProduction.indexOf("fn composer(");
+  const composerEnd = viewProduction.indexOf("\nfn message_row(", composerStart);
+  const composer = viewProduction.slice(composerStart, composerEnd);
+  assert.ok(composer.includes('data-action="voice-message-start"'));
+  assert.ok(composer.includes('data-affordance=(voice_control.affordance)'));
+  assert.ok(composer.includes('data-model-ready=(readiness.enabled)'));
+  assert.ok(composer.includes('aria-label="Listening"'));
+  assert.ok(composer.includes('aria-label="Use keyboard"'));
+  assert.ok(composer.includes('data-action="voice-message-send"'));
+  assert.ok(!composer.includes('button type="submit"'));
+  assert.ok(bridge.includes('.voice-message-button'));
+  assert.ok(bridge.includes('voice.dataset.modelReady === "false"'));
+  assert.ok(bridge.includes('"voice-message-start": async () => beginVoiceCapture()'));
+  assert.ok(bridge.includes('"voice-message-send": async () => sendVoiceCapture()'));
+  assert.ok(bridge.includes('"voice-message-cancel": async () =>'));
+  assert.ok(!bridge.includes("const composerHasSendableDraft"));
+  assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
     styles.indexOf(".chrome .icon-button,\n.composer .round-button"),
     styles.indexOf(".sidebar-section-toggle", styles.indexOf(".chrome .icon-button,\n.composer .round-button")),
@@ -257,7 +265,7 @@ test("the composer keeps a glass send affordance anchored while its readiness ch
   assert.ok(!glassControls.includes("#699bc0"));
   assert.ok(styles.includes("backdrop-filter: blur(24px) saturate(1.65) brightness(1.06)"));
   assert.ok(styles.includes(".composer .send-button:disabled"));
-  assert.ok(styles.includes('.composer .send-button[type="submit"]:not(:disabled)'));
+  assert.ok(styles.includes(".voice-listening-orb"));
   assert.ok(styles.includes("color: var(--glass-glyph)"));
   assert.ok(!styles.includes("linear-gradient(145deg, #36a5ff"));
   assert.ok(styles.includes("background-clip: border-box"));
@@ -304,7 +312,7 @@ test("titlebar gives search to the sidebar and voice identity to the chat", () =
   assert.ok(viewProduction.includes('data-voice-persona=""'));
   assert.ok(viewProduction.includes('aria-label="End call"'));
   assert.ok(!viewProduction.includes('aria-label="Microphone"'));
-  assert.ok(bridge.includes("const openVoiceCallSurface = () =>"));
+  assert.ok(bridge.includes("const openVoiceCallSurface = async () =>"));
   assert.ok(bridge.includes("modal.dataset.voicePersona = recipientId"));
   assert.ok(bridge.includes('.sidebar-titlebar-zone")?.classList.toggle("searching", enabled)'));
   assert.ok(styles.includes(".chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }"));

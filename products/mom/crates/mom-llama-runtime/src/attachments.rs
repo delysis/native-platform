@@ -364,6 +364,37 @@ pub fn attachment_import(
     attachment_import_with_identity(scope, conversation_id, path, None)
 }
 
+pub fn attachment_import_voice_message(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    bytes: Vec<u8>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let host = attachment_host()?;
+    let provided = match ProvidedAttachment::read_bounded(
+        format!("voice-message-{}.wav", uuid::Uuid::new_v4().simple()),
+        Some("audio/wav".to_string()),
+        std::io::Cursor::new(bytes),
+        host_config().inspection.limits.max_root_bytes,
+    ) {
+        Ok(provided) => provided,
+        Err(error) => {
+            return Ok(attachment_error_result(
+                "mom_llama.voice_message_import",
+                error,
+            ));
+        }
+    };
+    canonicalize_and_stage(
+        scope,
+        conversation_id,
+        "microphone://voice-message".to_string(),
+        provided,
+        "mom_llama.voice_message_import",
+        &host,
+        None,
+    )
+}
+
 fn attachment_import_with_identity(
     scope: &crate::OperationScope,
     conversation_id: &str,

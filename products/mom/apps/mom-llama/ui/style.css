@@ -925,6 +925,45 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 .composer-left { grid-column: 1; grid-row: 2; }
 .composer-right { grid-column: 3; grid-row: 2; display: flex; align-items: center; gap: 4px; }
 .composer-right .send-button { flex: 0 0 36px; }
+.voice-message-recorder {
+  grid-column: 1 / -1;
+  grid-row: 1 / 3;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  align-items: end;
+  justify-items: center;
+  min-height: 108px;
+  padding: 6px 0 0;
+}
+.voice-message-recorder[hidden] { display: none; }
+.composer.voice-recording > :not(.voice-message-recorder):not(.stream-events) { visibility: hidden; }
+.voice-message-recorder .round-button { visibility: visible; }
+.voice-listening-orb {
+  position: relative;
+  display: grid;
+  width: 86px;
+  height: 86px;
+  place-items: center;
+  align-self: center;
+  border: 1px solid color-mix(in srgb, var(--glass-edge) 62%, #77b9ff 38%);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 48% 62%, rgba(244, 248, 255, .9) 0 20%, transparent 52%),
+    conic-gradient(from 205deg, #b8d8f7, #4d8fc7, #d9b37c, #23282d, #b8d8f7);
+  box-shadow: 0 12px 28px rgba(36, 83, 122, .2), inset 0 1px 1px rgba(255, 255, 255, .78);
+  animation: voice-listening-breathe 1.8s ease-in-out infinite;
+}
+.voice-listening-core {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 34%, #fff 0 8%, #b8d3eb 38%, #3d566b 78%, #17212a 100%);
+  box-shadow: inset 0 1px 5px rgba(255, 255, 255, .72), 0 2px 10px rgba(7, 22, 34, .22);
+}
+@keyframes voice-listening-breathe {
+  50% { transform: scale(1.055); box-shadow: 0 14px 34px rgba(49, 115, 168, .28), inset 0 1px 1px rgba(255, 255, 255, .84); }
+}
+@media (prefers-reduced-motion: reduce) { .voice-listening-orb { animation: none; } }
 .round-button { width: 36px; height: 36px; border-radius: 50%; background: #2b2b2b; }
 .model-picker-field { display: grid; min-width: 0; gap: 7px; }
 .model-picker-field-label { font-size: 13px; font-weight: 500; }
@@ -1631,15 +1670,6 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 .round-button,
 .send-button { width: 40px; height: 40px; }
 .composer-right .send-button { flex-basis: 40px; }
-.composer .send-button[type="submit"]:not(:disabled) {
-  color: var(--glass-glyph);
-  background:
-    linear-gradient(180deg,
-      color-mix(in srgb, var(--glass-fill) 72%, white 28%),
-      color-mix(in srgb, var(--glass-fill) 94%, transparent));
-  box-shadow: var(--glass-shadow);
-}
-
 .voice-call-dialog {
   width: min(390px, calc(100vw - 32px));
   height: min(520px, calc(100dvh - 24px));
