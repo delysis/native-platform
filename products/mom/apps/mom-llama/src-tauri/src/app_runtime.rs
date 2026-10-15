@@ -83,7 +83,7 @@ pub struct AppShutdownError {
 
 impl std::fmt::Display for AppShutdownError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Mom Llama shutdown did not fully succeed")?;
+        write!(formatter, "Blessenger shutdown did not fully succeed")?;
         if let Some(error) = &self.operation_error {
             write!(formatter, "; operation supervisor: {error}")?;
         }
@@ -317,7 +317,7 @@ impl Drop for PersonaApprovalRecoveryWorker {
     fn drop(&mut self) {
         let terminal = self.shutdown();
         if let Some(error) = terminal.error {
-            eprintln!("Mom Llama approval recovery teardown: {error}");
+            eprintln!("Blessenger approval recovery teardown: {error}");
         }
     }
 }
@@ -368,12 +368,12 @@ fn record_persona_approval_reconciliation(
     match result {
         Ok(()) => {
             if recorded_error.take().is_some() {
-                eprintln!("Mom Llama persona approval recovery resumed");
+                eprintln!("Blessenger persona approval recovery resumed");
             }
         }
         Err(error) => {
             if recorded_error.as_deref() != Some(error.as_str()) {
-                eprintln!("Mom Llama persona approval recovery: {error}");
+                eprintln!("Blessenger persona approval recovery: {error}");
                 *recorded_error = Some(error);
             }
         }
@@ -432,19 +432,18 @@ impl AppWorkLease {
         T: Send + 'static,
         F: FnOnce() -> Result<T, String> + Send + 'static,
     {
-        let reservation = self
-            .supervised
-            .take()
-            .ok_or_else(|| "Mom Llama's long operation has no supervisor reservation".to_owned())?;
+        let reservation = self.supervised.take().ok_or_else(|| {
+            "Blessenger's long operation has no supervisor reservation".to_owned()
+        })?;
         let supervisor = reservation
             .lease
             .supervisor()
-            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+            .ok_or_else(|| "Blessenger's operation supervisor is unavailable".to_owned())?;
         let task = supervisor
             .spawn(reservation, move |lease| {
                 if lease.cancellation_requested() {
                     return Err(
-                        "Mom Llama cancelled the operation during application shutdown".to_owned(),
+                        "Blessenger cancelled the operation during application shutdown".to_owned(),
                     );
                 }
                 let _app_lease = self;
@@ -462,19 +461,18 @@ impl AppWorkLease {
         T: Send + 'static,
         F: FnOnce() -> Result<(T, bool), String> + Send + 'static,
     {
-        let reservation = self
-            .supervised
-            .take()
-            .ok_or_else(|| "Mom Llama's long operation has no supervisor reservation".to_owned())?;
+        let reservation = self.supervised.take().ok_or_else(|| {
+            "Blessenger's long operation has no supervisor reservation".to_owned()
+        })?;
         let supervisor = reservation
             .lease
             .supervisor()
-            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+            .ok_or_else(|| "Blessenger's operation supervisor is unavailable".to_owned())?;
         let task = supervisor
             .spawn(reservation, move |lease| {
                 if lease.cancellation_requested() {
                     return Err(
-                        "Mom Llama cancelled the operation during application shutdown".to_owned(),
+                        "Blessenger cancelled the operation during application shutdown".to_owned(),
                     );
                 }
                 let _app_lease = self;
@@ -497,7 +495,7 @@ impl AppWorkLease {
         let supervisor = reservation
             .lease
             .supervisor()
-            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+            .ok_or_else(|| "Blessenger's operation supervisor is unavailable".to_owned())?;
         supervisor
             .queue(&reservation.lease)
             .and_then(|()| supervisor.start(&reservation.lease))
@@ -660,20 +658,20 @@ impl AppRuntimeHandle {
     pub fn admit(&self, command: &'static CommandSpec) -> Result<AppWorkLease, String> {
         if let Some(error) = self.0.persona_approval_recovery.current_error() {
             return Err(format!(
-                "Mom Llama's persona approval recovery worker is unavailable: {error}"
+                "Blessenger's persona approval recovery worker is unavailable: {error}"
             ));
         }
         let mut lifecycle = self
             .0
             .lifecycle
             .lock()
-            .map_err(|_| "Mom Llama application state is unavailable".to_string())?;
+            .map_err(|_| "Blessenger application state is unavailable".to_string())?;
         if lifecycle.phase != AppPhase::Running {
-            return Err("Mom Llama is shutting down; new work is not admitted".to_string());
+            return Err("Blessenger is shutting down; new work is not admitted".to_string());
         }
         if command.admission == AdmissionClass::Speculative && !lifecycle.active_work.is_empty() {
             return Err(
-                "Mom Llama is busy with foreground work; speculative autocomplete was not admitted"
+                "Blessenger is busy with foreground work; speculative autocomplete was not admitted"
                     .to_string(),
             );
         }
@@ -690,7 +688,7 @@ impl AppRuntimeHandle {
         let occurrence = lifecycle
             .next_occurrence
             .checked_add(1)
-            .ok_or_else(|| "Mom Llama has too many active operations".to_string())?;
+            .ok_or_else(|| "Blessenger has too many active operations".to_string())?;
         lifecycle.next_occurrence = occurrence;
         let native_request_id = (command.admission == AdmissionClass::Speculative)
             .then(|| format!("{}:{occurrence}", command.name));
@@ -754,7 +752,7 @@ impl AppRuntimeHandle {
             .0
             .lifecycle
             .lock()
-            .map_err(|_| "Mom Llama's operation registry is unavailable".to_string())?
+            .map_err(|_| "Blessenger's operation registry is unavailable".to_string())?
             .active_work
             .values()
             .filter(|work| work.admission == AdmissionClass::Speculative)
@@ -786,7 +784,7 @@ impl AppRuntimeHandle {
         self.0
             .persona_approval_authority
             .clone()
-            .ok_or_else(|| "Mom Llama's Persona approval authority is unavailable".to_string())
+            .ok_or_else(|| "Blessenger's Persona approval authority is unavailable".to_string())
     }
 
     /// Returns true only to the caller that closes application admission.

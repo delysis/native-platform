@@ -116,7 +116,7 @@ for (const outcome of ["blocked", "throw"]) {
     vm.createContext(context);
     const start = source.indexOf('  document.addEventListener("submit"');
     const end = start + source.slice(start).indexOf('\n  });') + 7;
-    vm.runInContext(`let activeDispatchConversation = null;\nlet voiceReplyConversation = null;\n${source.slice(start, end)}`, context);
+    vm.runInContext(`let activeDispatchConversation = null;\nlet voiceReplyConversation = null;\nlet callReplyConversation = null;\n${source.slice(start, end)}`, context);
     await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
     assert.deepEqual(released, ["mention-request:failed:contact", "dispatch"]);
     assert.equal(leases.size, 0);
@@ -128,6 +128,7 @@ test("voice replies keep assistant text and reasoning hidden through synthesis f
   const events = [];
   const context = {
     voiceReplyConversation: "conversation-a",
+    callReplyConversation: null,
     activeDispatchConversation: "conversation-a",
     chatRequestLease: ({ request_id }) => request_id,
     acquireStableChatBusy() {},
@@ -147,6 +148,37 @@ test("voice replies keep assistant text and reasoning hidden through synthesis f
   context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r1", delta: "hidden reasoning" } });
   context.testOnChatEvent({ payload: { event: "failed", request_id: "r1" } });
   assert.deepEqual(events, [["voice", "live-assistant-r1"]]);
+});
+
+test("call replies suppress live text but still own the chat request lease", () => {
+  const events = [];
+  const context = {
+    callReplyConversation: "conversation-a",
+    voiceReplyConversation: null,
+    activeDispatchConversation: "conversation-a",
+    chatRequestLease: ({ request_id }) => `chat-request:${request_id}`,
+    acquireStableChatBusy: (lease) => events.push(["acquire", lease]),
+    appendLiveVoiceReply: (id) => events.push(["voice", id]),
+    appendLiveMessage: (...args) => events.push(["text", ...args]),
+    appendLiveDelta: (...args) => events.push(["delta", ...args]),
+    document: { getElementById: () => null, querySelector: () => null },
+    finishLiveMessage: (message) => events.push(["finish", message]),
+    releaseChatBusy: (lease) => events.push(["release", lease]),
+    settingEnabled: () => true, keepLiveTailVisible() {},
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const chatRequestLease =");
+  const end = source.indexOf("\n  const mentionLiveId", start);
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  context.testOnChatEvent({ payload: { event: "started", request_id: "r-call" } });
+  context.testOnChatEvent({ payload: { event: "delta", request_id: "r-call", delta: "hidden reply" } });
+  context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r-call", delta: "hidden reasoning" } });
+  context.testOnChatEvent({ payload: { event: "completed", request_id: "r-call" } });
+  assert.deepEqual(events, [
+    ["acquire", "chat-request:r-call"],
+    ["finish", null],
+    ["release", "chat-request:r-call"],
+  ]);
 });
 
 test("voice mention replies start as waveform cards and never append streamed text", () => {
@@ -174,6 +206,7 @@ test("voice mention replies start as waveform cards and never append streamed te
   const mentionRow = { querySelector: () => null, setAttribute() {} };
   const dispatchContext = {
     voiceReplyConversation: "conversation-a",
+    callReplyConversation: null,
     activeDispatchConversation: "conversation-a",
     activeDispatchStreamLeases: new Set(),
     chatBusyLeases: new Set(),

@@ -198,7 +198,7 @@ pub struct SupervisedTask<T> {
 impl<T> SupervisedTask<T> {
     pub async fn wait(self) -> Result<T, String> {
         let result = self.result.await.map_err(|_| {
-            "Mom Llama's supervised worker stopped before returning a result".to_owned()
+            "Blessenger's supervised worker stopped before returning a result".to_owned()
         })?;
         if self.joined.get().is_none() {
             let reaped = self.supervisor.reap_worker(&self.worker_id);
@@ -697,7 +697,7 @@ impl OperationSupervisor {
                 let result = match (result, published) {
                     (_, Err(error)) => Err(error.to_string()),
                     (Ok(result), Ok(())) => result,
-                    (Err(_), Ok(())) => Err("Mom Llama's supervised worker panicked".to_owned()),
+                    (Err(_), Ok(())) => Err("Blessenger's supervised worker panicked".to_owned()),
                 };
                 #[cfg(test)]
                 if let Some(barriers) =

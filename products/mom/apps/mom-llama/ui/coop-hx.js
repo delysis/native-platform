@@ -129,7 +129,7 @@
         const state = document.createElement("section");
         state.className = "boot boot-error";
         const heading = document.createElement("h1");
-        heading.textContent = "Mom Llama could not open";
+        heading.textContent = "Blessenger could not open";
         const detail = document.createElement("p");
         detail.textContent = message;
         state.append(heading, detail);
@@ -300,11 +300,27 @@
   let activeSpeechPlayback = null;
   let speechPlaybackEpoch = null;
 
-  const waveform = () => {
+  const waveform = (bytes = null) => {
     const bars = document.createElement("span");
     bars.className = "voice-waveform";
     bars.setAttribute("aria-hidden", "true");
-    for (const height of [7, 13, 20, 11, 17, 8, 15, 10, 19, 12, 7]) {
+    let heights = [7, 13, 20, 11, 17, 8, 15, 10, 19, 12, 7];
+    if (bytes?.byteLength >= 46) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const samples = Math.floor((bytes.byteLength - 44) / 2);
+      if (samples > 0) {
+        heights = Array.from({ length: 18 }, (_, bar) => {
+          const start = Math.floor((bar * samples) / 18);
+          const end = Math.max(start + 1, Math.floor(((bar + 1) * samples) / 18));
+          let peak = 0;
+          for (let sample = start; sample < end; sample += Math.max(1, Math.floor((end - start) / 96))) {
+            peak = Math.max(peak, Math.abs(view.getInt16(44 + sample * 2, true)) / 32768);
+          }
+          return Math.round(6 + Math.min(1, peak * 2.4) * 16);
+        });
+      }
+    }
+    for (const height of heights) {
       const bar = document.createElement("i");
       bar.style.height = `${height}px`;
       bars.append(bar);
@@ -312,7 +328,7 @@
     return bars;
   };
 
-  const compactAudioPlayer = (audio) => {
+  const compactAudioPlayer = (audio, bytes = null) => {
     const player = document.createElement("div");
     player.className = "voice-message-player";
     const toggle = createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentPreview);
@@ -336,7 +352,7 @@
     audio.addEventListener("pause", stopped);
     audio.addEventListener("ended", stopped);
     audio.hidden = true;
-    player.append(toggle, waveform(), audio);
+    player.append(toggle, waveform(bytes), audio);
     return player;
   };
 
@@ -388,6 +404,8 @@
       await invoke("mom_llama_speech_stop", { playback: result.playback_id });
       return;
     }
+    const existingWaveform = row.querySelector(".voice-waveform");
+    if (existingWaveform) existingWaveform.replaceWith(waveform(bytes));
     const panel = document.createElement("section");
     panel.className = "speech-playback";
     panel.dataset.playback = result.playback_id;
@@ -424,6 +442,57 @@
       }
     });
     await audio.play().catch(() => {});
+  };
+
+  const playCallReply = async (conversation, message) => {
+    const operation = speechOperationToken();
+    let retainedPlayback = null;
+    try {
+      const response = await invoke("mom_llama_speech_read_aloud", {
+        conversation,
+        message,
+        operation,
+        requirePersonaVoice: true,
+      });
+      report(response);
+      if (response?.status === "blocked" || !response?.result) return false;
+      const result = response.result;
+      retainedPlayback = result.playback_id;
+      const bytes = ipcBinaryBytes(await invoke("mom_llama_speech_audio", {
+        playback: result.playback_id,
+        message: result.binding.message_id,
+        textSha256: result.binding.text_sha256,
+        backendDescriptorSha256: result.binding.backend_descriptor_sha256,
+      }), 64 * 1024 * 1024, "Call audio");
+      if (await sha256Hex(bytes) !== result.binding.wav_sha256 || !voiceCallActive) return false;
+      await stopSpeechPlayback();
+      const panel = document.createElement("section");
+      const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.readAloudStop);
+      const audio = createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+      audio.src = url;
+      audio.preload = "auto";
+      activeSpeechPlayback = { id: result.playback_id, audio, url, panel, button };
+      audio.addEventListener("ended", () => {
+        if (activeSpeechPlayback?.audio !== audio) return;
+        void stopSpeechPlayback().then(() => (
+          voiceCallActive ? beginVoiceCapture({ call: true }) : null
+        )).catch(reportError);
+      });
+      try {
+        await audio.play();
+      } catch (_) {
+        if (activeSpeechPlayback?.audio === audio) activeSpeechPlayback = null;
+        URL.revokeObjectURL(url);
+        return false;
+      }
+      retainedPlayback = null;
+      return true;
+    } finally {
+      if (retainedPlayback) {
+        await invoke("mom_llama_speech_stop", { playback: retainedPlayback }).catch(() => {});
+      }
+    }
   };
 
   const appendAttachmentTranscriptionControl = (preview, catalog, artifact) => {
@@ -1045,6 +1114,7 @@
   const closeVoiceCallSurface = async () => {
     voiceCallActive = false;
     voiceReplyConversation = null;
+    callReplyConversation = null;
     await stopVoiceCapture({ discard: true });
     await stopSpeechPlayback();
     setModalVisibility("voice-call-modal", false);
@@ -2229,7 +2299,7 @@
     audio.src = url;
     audio.preload = "auto";
     article.dataset.objectUrl = url;
-    card.append(compactAudioPlayer(audio));
+    card.append(compactAudioPlayer(audio, bytes));
     article.append(card);
     stream.append(article);
     stream.dataset.followTail = "true";
@@ -2260,6 +2330,7 @@
   let activeDispatchConversation = null;
   let voiceRecording = null;
   let voiceReplyConversation = null;
+  let callReplyConversation = null;
   let voiceCallActive = false;
   let pendingCallTranscript = null;
   const activeDispatchStreamLeases = new Set();
@@ -2484,7 +2555,8 @@
         })().catch(() => null),
       } : null;
     }
-    voiceReplyConversation = conversation;
+    if (call) callReplyConversation = conversation;
+    else voiceReplyConversation = conversation;
     await refreshConversationProjection();
     const currentForm = document.getElementById("chat-form");
     const textarea = formField(currentForm, "message");
@@ -2538,17 +2610,19 @@
   const onChatEvent = (event) => {
     const payload = event.payload || event;
     const voiceReply = voiceReplyConversation === activeDispatchConversation;
+    const callReply = callReplyConversation === activeDispatchConversation;
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
       document.getElementById("live-voice-reply-pending")?.remove();
+      if (callReply) return;
       if (voiceReply) appendLiveVoiceReply(`live-assistant-${payload.request_id}`);
       else appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
     }
-    if (payload.event === "delta" && !voiceReply) {
+    if (payload.event === "delta" && !voiceReply && !callReply) {
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "reasoning_delta" && !voiceReply) {
+    if (payload.event === "reasoning_delta" && !voiceReply && !callReply) {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
       const content = reasoning?.querySelector(".reasoning-content");
       if (settingEnabled("showThoughtInProgress")) reasoning?.classList.remove("is-hidden");
@@ -2602,16 +2676,17 @@
     }
     const payload = envelope.event || envelope;
     const voiceReply = voiceReplyConversation === activeDispatchConversation;
+    const callReply = callReplyConversation === activeDispatchConversation;
     const lease = payload.invocation_id && payload.target_id
       ? `mention-request:${payload.invocation_id}:${payload.target_id}`
       : null;
     if (payload.event === "started") {
       acquireStableChatBusy(lease);
       document.getElementById("live-voice-reply-pending")?.remove();
-      appendMentionMessage(payload, voiceReply);
+      if (!callReply) appendMentionMessage(payload, voiceReply);
     }
     const row = document.getElementById(mentionLiveId(payload));
-    if (payload.event === "delta" && !voiceReply) {
+    if (payload.event === "delta" && !voiceReply && !callReply) {
       const content = row?.querySelector(".live-content");
       appendLiveDelta(content, payload.delta);
     }
@@ -3993,6 +4068,14 @@
             row.remove();
           });
           await refreshConversationProjection();
+          if (callReplyConversation === conversation) {
+            callReplyConversation = null;
+            const reply = result?.result?.kind === "direct" ? result.result.output : null;
+            const played = result?.status !== "blocked" && reply?.assistant_message_id
+              ? await playCallReply(conversation, reply.assistant_message_id)
+              : false;
+            if (!played && voiceCallActive) await beginVoiceCapture({ call: true });
+          }
           if (voiceReplyConversation === conversation && result?.status !== "blocked") {
             voiceReplyConversation = null;
             const replies = document.querySelectorAll(".message-row.assistant [data-action='message-read-aloud']");
@@ -4005,6 +4088,7 @@
           activeDispatchStreamLeases.clear();
           activeDispatchConversation = null;
           if (voiceReplyConversation === conversation) voiceReplyConversation = null;
+          if (callReplyConversation === conversation) callReplyConversation = null;
           releaseChatBusy(dispatchLease);
         }
       }

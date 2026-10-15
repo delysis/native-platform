@@ -26,7 +26,6 @@ pub const QWEN_MODEL_ID: &str = "qwen3-tts-12hz-1.7b-voice-design-4bit";
 pub const QWEN_VOICE_ID: &str = "mom.warm-clinician-v1";
 pub const QWEN_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-voice-design-4bit";
 pub const QWEN_MODEL_REVISION: &str = "5c390979e4b93af5f2932f90742ca99c7dd04687";
-const MAX_INPUT_CHARACTERS: u64 = 4_000;
 const VOICE_DESCRIPTION: &str = "A warm, articulate, reassuring mature American woman with natural conversational rhythm and gentle humor. Speak like a trusted colleague, never like an announcer.";
 
 #[derive(Debug, Clone)]
@@ -46,16 +45,17 @@ impl QwenBackendConfig {
                     .and_then(|p| p.parent().map(|p| p.join("qwen3-tts-helper")))
             })
             .unwrap_or_else(|| PathBuf::from("qwen3-tts-helper"));
-        let model_dir = std::env::var_os("MOM_QWEN3_TTS_MODEL")
-            .map(PathBuf::from)
-            .or_else(|| managed_model_root.map(|root| root.join(QWEN_MODEL_DIRECTORY)))
-            .filter(|path| path.is_dir())
-            .or_else(|| {
-                std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-                    home.join("Library/Application Support/com.delysis.llama-native-kit.mom-llama/speech-models")
-                        .join(QWEN_MODEL_DIRECTORY)
-                })
-            })
+        let explicit_model = std::env::var_os("MOM_QWEN3_TTS_MODEL").map(PathBuf::from);
+        let managed_model = managed_model_root.map(|root| root.join(QWEN_MODEL_DIRECTORY));
+        let legacy_model = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join(
+                "Library/Application Support/com.delysis.llama-native-kit.mom-llama/speech-models",
+            )
+            .join(QWEN_MODEL_DIRECTORY)
+        });
+        let model_dir = explicit_model
+            .or_else(|| managed_model.filter(|path| model_admitted(path)))
+            .or_else(|| legacy_model.filter(|path| model_admitted(path)))
             .unwrap_or_else(|| PathBuf::from(QWEN_MODEL_DIRECTORY));
         Self { helper, model_dir }
     }
@@ -416,7 +416,10 @@ fn descriptor(ready: bool, config: &QwenBackendConfig) -> SpeechBackendDescripto
             network: NetworkBehavior::Never,
             languages: vec!["en-US".into()],
             limits: SpeechCapabilityLimits {
-                max_input_characters: Some(MAX_INPUT_CHARACTERS),
+                // The helper owns tokenization and can synthesize complete
+                // conversational replies. Do not reject otherwise valid
+                // persona speech at the UI routing layer by character count.
+                max_input_characters: None,
                 max_concurrent_requests: Some(1),
                 ..SpeechCapabilityLimits::default()
             },

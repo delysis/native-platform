@@ -1723,7 +1723,8 @@ fn chat_view_with_draft(
             } @else {
                 section class="message-stream" aria-label="Messages" {
                     @for message in active.map(|conversation| conversation.messages.as_slice()).unwrap_or(&[]) {
-                        @if message.role != MessageRole::System || upstream_settings_bool(settings, "showSystemMessage") {
+                        @if !active.is_some_and(|conversation| is_call_turn(conversation, message))
+                            && (message.role != MessageRole::System || upstream_settings_bool(settings, "showSystemMessage")) {
                             (message_row(
                                 message,
                                 settings,
@@ -1967,7 +1968,7 @@ fn sidebar(
                                         }
                                         div class="conversation-copy" {
                                             span { (conversation.title.clone()) }
-                                            @if let Some(message) = conversation.active_leaf_message_id.as_deref().and_then(|id| conversation.messages.iter().find(|message| message.id == id)) {
+                                            @if let Some(message) = conversation.messages.iter().rev().find(|message| !is_call_turn(conversation, message)) {
                                                 small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
                                             }
                                         }
@@ -2344,6 +2345,17 @@ fn message_row(
             ))
         }
     }
+}
+
+fn is_call_turn(conversation: &Conversation, message: &Message) -> bool {
+    message.content.starts_with("[Phone call]")
+        || message.parent_id.as_deref().is_some_and(|parent_id| {
+            conversation.messages.iter().any(|parent| {
+                parent.id == parent_id
+                    && parent.role == MessageRole::User
+                    && parent.content.starts_with("[Phone call]")
+            })
+        })
 }
 
 fn attachment_preview_card(attachment: &AttachmentRecord) -> Markup {

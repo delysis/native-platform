@@ -736,6 +736,7 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         let message_match = conversation
             .messages
             .iter()
+            .filter(|message| !is_private_call_turn(conversation, message))
             .find(|message| query.is_empty() || message.content.to_lowercase().contains(&query));
         if !title_matches && message_match.is_none() {
             continue;
@@ -749,7 +750,11 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
             active_leaf_message_id: conversation.active_leaf_message_id.clone(),
             title,
             snippet,
-            message_count: conversation.messages.len(),
+            message_count: conversation
+                .messages
+                .iter()
+                .filter(|message| !is_private_call_turn(conversation, message))
+                .count(),
             updated_at: conversation.updated_at.clone(),
         });
     }
@@ -762,6 +767,17 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         false,
         false,
     ))
+}
+
+fn is_private_call_turn(conversation: &Conversation, message: &Message) -> bool {
+    message.content.starts_with("[Phone call]")
+        || message.parent_id.as_deref().is_some_and(|parent_id| {
+            conversation.messages.iter().any(|parent| {
+                parent.id == parent_id
+                    && parent.role == MessageRole::User
+                    && parent.content.starts_with("[Phone call]")
+            })
+        })
 }
 
 pub fn conversation_rename(id: &str, title: String) -> Result<CommandResult<Conversation>> {

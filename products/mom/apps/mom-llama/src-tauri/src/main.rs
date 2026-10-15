@@ -95,17 +95,17 @@ impl StartupController {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "Mom Llama startup state is unavailable".to_string())?;
+            .map_err(|_| "Blessenger startup state is unavailable".to_string())?;
         match &*state {
             StartupState::Ready(_) => Ok(StartupAction::AlreadyReady),
             StartupState::Unlocking | StartupState::Building => {
-                Err("Mom Llama is already unlocking its encrypted local data".to_string())
+                Err("Blessenger is already unlocking its encrypted local data".to_string())
             }
             StartupState::QuiescingSafe(_)
             | StartupState::QuiescingDuringBuild
-            | StartupState::QuiescingBlocked(_) => Err("Mom Llama is shutting down".to_string()),
+            | StartupState::QuiescingBlocked(_) => Err("Blessenger is shutting down".to_string()),
             StartupState::RestartRequired => Err(
-                "Mom Llama must be restarted before local runtime startup can retry".to_string(),
+                "Blessenger must be restarted before local runtime startup can retry".to_string(),
             ),
             StartupState::Idle => {
                 *state = StartupState::Unlocking;
@@ -126,14 +126,14 @@ impl StartupController {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "Mom Llama startup state is unavailable".to_string())?;
+            .map_err(|_| "Blessenger startup state is unavailable".to_string())?;
         match &*state {
             StartupState::Unlocking => {
                 *state = StartupState::Building;
                 Ok(())
             }
-            StartupState::QuiescingSafe(_) => Err("Mom Llama is shutting down".to_string()),
-            _ => Err("Mom Llama startup changed phase unexpectedly".to_string()),
+            StartupState::QuiescingSafe(_) => Err("Blessenger is shutting down".to_string()),
+            _ => Err("Blessenger startup changed phase unexpectedly".to_string()),
         }
     }
 
@@ -316,7 +316,7 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         Ok(settings) => settings,
         Err(error) => {
             startup.record_failure();
-            return Err(format!("Mom Llama startup worker failed: {error}"));
+            return Err(format!("Blessenger startup worker failed: {error}"));
         }
     };
 
@@ -325,7 +325,7 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         Err(error) => {
             startup.record_failure();
             return Err(format!(
-                "Mom Llama could not unlock its encrypted local data: {error:#}"
+                "Blessenger could not unlock its encrypted local data: {error:#}"
             ));
         }
     };
@@ -343,7 +343,7 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             Ok(built) => built,
             Err(error) => {
                 startup.finish_failed_build();
-                return Err(format!("Mom Llama startup worker failed: {error}"));
+                return Err(format!("Blessenger startup worker failed: {error}"));
             }
         };
 
@@ -367,11 +367,11 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                 };
                 log_shutdown_result(&shutdown);
                 startup.finish_rejected_build(runtime, safe_to_exit);
-                Err("Mom Llama stopped before encrypted runtime startup completed".to_string())
+                Err("Blessenger stopped before encrypted runtime startup completed".to_string())
             }
         },
         Err(error) => {
-            let message = format!("Mom Llama could not initialize its local runtime: {error:#}");
+            let message = format!("Blessenger could not initialize its local runtime: {error:#}");
             startup.finish_failed_build();
             Err(message)
         }
@@ -707,14 +707,14 @@ pub fn run() {
                 let decision = decide_final_exit(&event_startup);
                 if decision == FinalExitDecision::AbortWithoutRustTeardown {
                     eprintln!(
-                        "Mom Llama aborts final exit because native shutdown lacks joined evidence"
+                        "Blessenger aborts final exit because native shutdown lacks joined evidence"
                     );
                     std::process::abort();
                 }
             }
         }),
         Err(error) => {
-            eprintln!("failed to build Mom Llama: {error}");
+            eprintln!("failed to build Blessenger: {error}");
             std::process::exit(1);
         }
     }
@@ -850,7 +850,7 @@ fn request_graceful_exit<R: Runtime>(
             exit_allowed.store(true, Ordering::Release);
             app_handle.exit(exit_code);
         } else if let Err(error) = result {
-            eprintln!("Mom Llama remains open because native shutdown failed: {error}");
+            eprintln!("Blessenger remains open because native shutdown failed: {error}");
         }
     });
 }
@@ -924,7 +924,7 @@ fn request_startup_aware_exit<R: Runtime>(
                     exit_allowed.store(true, Ordering::Release);
                     app_handle.exit(exit_code);
                 } else {
-                    eprintln!("Mom Llama remains open because startup native shutdown failed");
+                    eprintln!("Blessenger remains open because startup native shutdown failed");
                 }
             });
         }
@@ -942,7 +942,7 @@ fn log_shutdown_result(
 ) {
     match serde_json::to_string(result) {
         Ok(receipt) => eprintln!("mom-llama shutdown: {receipt}"),
-        Err(error) => eprintln!("Mom Llama could not encode its shutdown receipt: {error}"),
+        Err(error) => eprintln!("Blessenger could not encode its shutdown receipt: {error}"),
     }
 }
 

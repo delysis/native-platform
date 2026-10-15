@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Mom Llama uses the microphone for local voice messages and calls.</string>
+  <string>Blessenger uses the microphone for local voice messages and calls.</string>
 </dict>
 </plist>

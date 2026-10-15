@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Mom Llama",
+  "productName": "Blessenger",
   "version": "0.1.0",
   "identifier": "com.delysis.llama-native-kit.mom-llama",
   "build": {
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mom Llama",
+        "title": "Blessenger",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "decorations": true,
