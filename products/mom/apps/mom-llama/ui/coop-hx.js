@@ -386,16 +386,22 @@
     return player;
   };
 
-  const unavailableVoiceMessage = () => {
+  const pendingVoiceMessage = (label = "Loading voice message") => {
     const player = document.createElement("div");
-    player.className = "voice-message-player voice-message-unavailable";
+    player.className = "voice-message-player voice-message-pending";
     const play = createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentPreview);
     play.type = "button";
     play.className = "voice-message-play";
     play.disabled = true;
     play.textContent = "▶";
-    play.setAttribute("aria-label", "Voice message unavailable");
+    play.setAttribute("aria-label", label);
     player.append(play, waveform());
+    return player;
+  };
+
+  const unavailableVoiceMessage = () => {
+    const player = pendingVoiceMessage("Voice message unavailable");
+    player.classList.replace("voice-message-pending", "voice-message-unavailable");
     return player;
   };
 
@@ -832,6 +838,12 @@
     attachmentPreviewsWithin(root).forEach((preview) => {
       delete preview.dataset.previewReleased;
       rememberAttachmentPreviewFallback(preview);
+      if (preview.classList.contains("voice-message-bubble")) {
+        const body = preview.querySelector(".attachment-preview-body");
+        if (body && !body.querySelector(".voice-message-player")) {
+          body.replaceChildren(pendingVoiceMessage());
+        }
+      }
       if (attachmentPreviewObserver) {
         attachmentPreviewObserver.observe(preview);
       } else {
@@ -846,13 +858,15 @@
       const button = next.querySelector("[data-action='message-read-aloud']");
       const card = next.querySelector(".message-card");
       if (!button || !card) return;
+      const preparingLiveReply = voiceReplyConversation === selectedConversation();
       button.dataset.personaVoice = "true";
-      button.dataset.prepareOnly = "true";
+      if (preparingLiveReply) button.dataset.prepareOnly = "true";
+      else delete button.dataset.prepareOnly;
       button.classList.add("voice-reply-play");
       card.replaceChildren(button, waveform());
       next.querySelector(".message-actions")?.remove();
-      next.classList.add("voice-reply-pending");
-      next.hidden = true;
+      next.classList.toggle("voice-reply-pending", preparingLiveReply);
+      next.hidden = preparingLiveReply;
     });
   };
 
@@ -903,7 +917,14 @@
     cancelComposerAutocomplete({ native: true, announce: false });
     const viewport = captureChatViewport();
     const replacement = await swap("#chat", "mom_llama_render_chat_fragment");
-    if (replacement) await hydrateAttachmentPreviews(replacement);
+    if (replacement) {
+      // Hydration can issue attachment IPC and walk a large message tree. Let
+      // the new local conversation reach a completed paint before doing that
+      // background work, especially on machines without IntersectionObserver.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        void hydrateAttachmentPreviews(replacement).catch(reportError);
+      }));
+    }
     renderChatBusyState();
     restoreChatViewport(viewport, replacement);
     return replacement;
@@ -943,8 +964,7 @@
     return modal;
   };
 
-  const refreshConversationProjection = async () => {
-    await Promise.all([refreshChat(), refreshSidebar()]);
+  const refreshConversationSettingsProjection = async () => {
     const settings = document.getElementById("settings-sidebar");
     if (settings && settings.dataset.currentConversation !== selectedConversation()) {
       const projection = parseFragment(await invokeMarkup("mom_llama_render_settings_fragment"));
@@ -955,6 +975,21 @@
         settings.dataset.currentConversation = projection.dataset.currentConversation;
       }
     }
+  };
+
+  const refreshConversationProjection = async () => {
+    await Promise.all([refreshChat(), refreshSidebar()]);
+    await refreshConversationSettingsProjection();
+  };
+
+  let conversationSwitchTimingId = 0;
+  const recordConversationSwitchPaint = (startedAt, paintedAt, timing = performance) => {
+    const id = ++conversationSwitchTimingId;
+    timing.measure(`mom.conversation.switch-to-paint.${id}`, {
+      start: startedAt,
+      end: paintedAt,
+    });
+    return paintedAt - startedAt;
   };
 
   const formField = (form, name) =>
@@ -1583,10 +1618,20 @@
   };
 
   const selectConversation = async (conversation) => {
+    const startedAt = performance.now();
     await retainComposerDraft();
     const result = await invoke("mom_llama_conversation_select", { conversation });
     report(result);
-    await refreshConversationProjection();
+    const replacement = await refreshChat();
+    if (replacement?.dataset.currentConversation === conversation) {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        recordConversationSwitchPaint(startedAt, performance.now());
+      }));
+    }
+    // Sidebar and settings carry secondary state. Refresh them after the chat
+    // projection has been installed so neither can delay conversation paint.
+    void refreshSidebar().catch(reportError);
+    void refreshConversationSettingsProjection().catch(reportError);
     return result;
   };
 
@@ -2151,6 +2196,9 @@
     [...(form?.querySelectorAll("[data-staged-attachment-id]") || [])]
       .map((attachment) => attachment.dataset.stagedAttachmentId)
       .filter(Boolean);
+
+  const isInternalVoicePrompt = (message) =>
+    message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
 
   const persistDraftNow = async (
     message,
@@ -4240,7 +4288,7 @@
         }
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
-        const voiceDispatch = message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
+        const voiceDispatch = isInternalVoicePrompt(message);
         const attachmentIds = draftAttachmentIds(form);
         if (!message && !attachmentIds.length) return;
         if (voiceDispatch) {
@@ -4316,7 +4364,14 @@
           } catch (error) {
             // Rust retains the saved draft until commit. Recovery must never
             // write through the renderer's possibly changed selection.
-            if (selectedConversation() === conversation && textarea && !textarea.value) textarea.value = message;
+            if (!voiceDispatch && selectedConversation() === conversation && textarea && !textarea.value) textarea.value = message;
+            if (voiceDispatch) {
+              await invoke("mom_llama_draft_update", {
+                conversation,
+                message: "",
+                attachmentIds: [],
+              }).catch(reportError);
+            }
             await refreshChat().catch(reportError);
             throw error;
           }
@@ -4328,8 +4383,15 @@
           if (pendingApproval && mcpProcessUiSupported()) {
             openPersonaToolApproval(pendingApproval);
           }
-          if (result?.status === "blocked" && selectedConversation() === conversation && textarea && !textarea.value) {
+          if (!voiceDispatch && result?.status === "blocked" && selectedConversation() === conversation && textarea && !textarea.value) {
             textarea.value = message;
+          }
+          if (voiceDispatch) {
+            await invoke("mom_llama_draft_update", {
+              conversation,
+              message: "",
+              attachmentIds: [],
+            }).catch(reportError);
           }
           const callTranscript = message.startsWith("[Phone call]") ? pendingCallTranscript : null;
           pendingCallTranscript = null;
@@ -4735,9 +4797,10 @@
         await invoke("mom_llama_runtime_initialize");
         const root = document.getElementById("app");
         root.innerHTML = await invokeMarkup("mom_llama_render_app");
-        const interruptedCall = formField(document.getElementById("chat-form"), "message")
-          ?.value?.startsWith("[Phone call]");
-        if (interruptedCall) {
+        const bootComposer = document.getElementById("chat-form");
+        const interruptedVoiceDispatch = bootComposer?.dataset.internalVoiceDraft !== undefined
+          || isInternalVoicePrompt(formField(bootComposer, "message")?.value || "");
+        if (interruptedVoiceDispatch) {
           document.getElementById("chat-form")?.setAttribute("hidden", "");
           const cleared = await invoke("mom_llama_draft_update", {
             conversation: selectedConversation(),

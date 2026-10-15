@@ -67,10 +67,12 @@ test("native video never autoplays and every media URL has bounded lifetime", ()
   assert.match(runtime, /"video\/mp4" \| "video\/quicktime" \| "video\/webm" \| "video\/ogg"/);
 });
 
-test("legacy voice note with unavailable media exposes a disabled player", () => {
+test("voice note gets an immediate disabled shell and an enabled player after hydration", () => {
   const element = () => ({
     children: [], attributes: new Map(), append(...children) { this.children.push(...children); },
     setAttribute(name, value) { this.attributes.set(name, value); },
+    addEventListener() {},
+    classList: { replace(from, to) { this.replaced = [from, to]; } },
   });
   const context = {
     document: { createElement: element },
@@ -80,16 +82,31 @@ test("legacy voice note with unavailable media exposes a disabled player", () =>
   };
   speechVm.createContext(context);
   speechVm.runInContext(
-    block(ui, "  const unavailableVoiceMessage =", "  const restoreReadAloudButton =")
-      + "\nglobalThis.makeUnavailableVoiceMessage = unavailableVoiceMessage;",
+    block(ui, "  const compactAudioPlayer =", "  const pendingVoiceMessage =")
+      + block(ui, "  const pendingVoiceMessage =", "  const restoreReadAloudButton =")
+      + "\nglobalThis.makeVoicePlayers = { compactAudioPlayer, pendingVoiceMessage, unavailableVoiceMessage };",
     context,
   );
-  const player = context.makeUnavailableVoiceMessage();
-  assert.equal(player.className, "voice-message-player voice-message-unavailable");
-  assert.equal(player.children[0].disabled, true);
-  assert.equal(player.children[0].attributes.get("aria-label"), "Voice message unavailable");
-  assert.equal(player.children[1].kind, "waveform");
-  assert.match(ui, /preview\.classList\.contains\("voice-message-bubble"\)[\s\S]*?replaceChildren\(unavailableVoiceMessage\(\)\)/);
+  const pending = context.makeVoicePlayers.pendingVoiceMessage();
+  assert.equal(pending.className, "voice-message-player voice-message-pending");
+  assert.equal(pending.children[0].disabled, true);
+  assert.equal(pending.children[0].attributes.get("aria-label"), "Loading voice message");
+  assert.equal(pending.children[1].kind, "waveform");
+
+  const unavailable = context.makeVoicePlayers.unavailableVoiceMessage();
+  assert.deepEqual(Array.from(unavailable.classList.replaced), ["voice-message-pending", "voice-message-unavailable"]);
+  assert.equal(unavailable.children[0].attributes.get("aria-label"), "Voice message unavailable");
+
+  const audio = element(); audio.paused = true;
+  const ready = context.makeVoicePlayers.compactAudioPlayer(audio);
+  assert.equal(ready.className, "voice-message-player");
+  assert.equal(ready.children[0].disabled, undefined);
+  assert.equal(ready.children[0].attributes.get("aria-label"), "Play voice message");
+  const hydrate = block(ui, "  const hydrateAttachmentPreviews = async", "  window.addEventListener(\"beforeunload\"");
+  assert.ok(hydrate.indexOf("body.replaceChildren(pendingVoiceMessage())") < hydrate.indexOf("attachmentPreviewObserver.observe(preview)"));
+  const load = block(ui, "  const loadAttachmentPreview = async", "  const drainAttachmentPreviewQueue =");
+  assert.match(load, /body\.replaceChildren\(compactAudioPlayer\(media\)\)/);
+  assert.match(load, /replaceChildren\(unavailableVoiceMessage\(\)\)/);
 });
 
 // Component controls use actual browser action/render/stop bodies together.

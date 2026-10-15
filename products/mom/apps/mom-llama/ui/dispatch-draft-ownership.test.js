@@ -57,7 +57,9 @@ for (const switchAt of ["persistence", "dispatch"]) {
         },
       };
       vm.createContext(context);
-      vm.runInContext(`let activeDispatchConversation = null;\n${source.slice(source.indexOf('  document.addEventListener("submit"'), source.indexOf('  document.addEventListener("submit"') + source.slice(source.indexOf('  document.addEventListener("submit"')).indexOf('\n  });') + 7)}\nthis.cancel = ${source.match(/"chat-cancel": (async \(\) =>[^\n]+)/)[1].replace(/,$/, "")};`, context);
+      const start = source.indexOf('  document.addEventListener("submit"');
+      const end = start + source.slice(start).indexOf('\n  });') + 7;
+      vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nlet activeDispatchConversation = null;\n${source.slice(start, end)}\nthis.cancel = ${source.match(/"chat-cancel": (async \(\) =>[^\n]+)/)[1].replace(/,$/, "")};`, context);
       await submit({ preventDefault() {}, target: form });
       assert.equal(drafts.get("B"), "precious B");
       assert.equal(textarea.value, "precious B");
@@ -116,7 +118,7 @@ for (const outcome of ["blocked", "throw"]) {
     vm.createContext(context);
     const start = source.indexOf('  document.addEventListener("submit"');
     const end = start + source.slice(start).indexOf('\n  });') + 7;
-    vm.runInContext(`let activeDispatchConversation = null;\nlet voiceReplyConversation = null;\nlet callReplyConversation = null;\n${source.slice(start, end)}`, context);
+    vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nlet activeDispatchConversation = null;\nlet voiceReplyConversation = null;\nlet callReplyConversation = null;\n${source.slice(start, end)}`, context);
     await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
     assert.deepEqual(released, ["mention-request:failed:contact", "dispatch"]);
     assert.equal(leases.size, 0);
@@ -225,6 +227,49 @@ test("voice mention replies keep streamed text and cards hidden", () => {
   dispatchContext.dispatch({ kind: "mention", event: { event: "started", invocation_id: "i", target_id: "p" } });
   dispatchContext.dispatch({ kind: "mention", event: { event: "delta", invocation_id: "i", target_id: "p", delta: "hidden text" } });
   assert.deepEqual(calls, []);
+});
+
+test("voice and call prompts stay internal through dispatch recovery and clear staged state on success", () => {
+  const helperStart = source.indexOf("  const isInternalVoicePrompt =");
+  const helperEnd = source.indexOf("  const persistDraftNow =", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(helperStart, helperEnd)}\nthis.isInternalVoicePrompt = isInternalVoicePrompt;`, context);
+  assert.equal(context.isInternalVoicePrompt("[Voice note] private instructions"), true);
+  assert.equal(context.isInternalVoicePrompt("[Phone call] private instructions"), true);
+  assert.equal(context.isInternalVoicePrompt("Please summarize my recording"), false);
+
+  const submitStart = source.indexOf('  document.addEventListener("submit"');
+  const submitEnd = submitStart + source.slice(submitStart).indexOf('\n  });') + 7;
+  const submit = source.slice(submitStart, submitEnd);
+  assert.ok(submitStart >= 0 && submitEnd > submitStart);
+  assert.match(submit, /const voiceDispatch = isInternalVoicePrompt\(message\)/);
+  assert.match(submit, /if \(voiceDispatch\) \{\s*form\.querySelector\("#composer-attachments"\)\?\.remove\(\);/);
+  assert.match(submit, /if \(!voiceDispatch && selectedConversation\(\) === conversation && textarea && !textarea\.value\) textarea\.value = message/);
+  assert.equal(
+    (submit.match(/if \(voiceDispatch\) \{\s*await invoke\("mom_llama_draft_update", \{\s*conversation,\s*message: "",\s*attachmentIds: \[\],/g) || []).length,
+    2,
+    "successful or blocked results and exceptions both clear the internal voice draft",
+  );
+  assert.match(submit, /if \(!voiceDispatch && result\?\.status === "blocked"[\s\S]*?\n          if \(voiceDispatch\) \{\s*await invoke\("mom_llama_draft_update"/);
+
+  const bootStart = source.indexOf("  const boot = async () => {");
+  const bootEnd = source.indexOf("\n  boot();", bootStart);
+  const boot = source.slice(bootStart, bootEnd);
+  assert.ok(bootStart >= 0 && bootEnd > bootStart);
+  assert.match(boot, /dataset\.internalVoiceDraft !== undefined/);
+  assert.match(boot, /if \(interruptedVoiceDispatch\) \{\s*document\.getElementById\("chat-form"\)\?\.setAttribute\("hidden", ""\);[\s\S]*?message: "",\s*attachmentIds: \[\],[\s\S]*?invokeMarkup\("mom_llama_render_app"\)/);
+});
+
+test("chat switch projection skips model catalog discovery on the hot path", () => {
+  const view = fs.readFileSync(`${__dirname}/../src-tauri/src/view.rs`, "utf8");
+  const start = view.indexOf("pub fn render_chat_fragment(");
+  const end = view.indexOf("\npub fn ", start + 1);
+  const fragment = view.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(fragment, /mom_llama_runtime::model_list\(scope\)/);
+  assert.match(fragment, /"not_requested"[\s\S]*Vec::<ModelInfo>::new\(\)/);
 });
 
 test("runtime warm waits for paint and idle time before touching the model", () => {

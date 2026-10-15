@@ -1453,7 +1453,18 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
 pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status(scope)?;
-    let models = mom_llama_runtime::model_list(scope)?;
+    // The chat composer does not render the model catalog. Discovering models
+    // here walked the full Hugging Face cache on every conversation switch.
+    // Settings owns the model picker and refreshes independently after paint.
+    let models = CommandResult::passed(
+        "mom_llama.model_list",
+        "not_requested",
+        Vec::<ModelInfo>::new(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    );
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = project_active_conversation(&conversations, selected.as_deref())?;
@@ -2043,16 +2054,31 @@ fn composer(
 ) -> Markup {
     let readiness = conversation_model_readiness(engine, active, settings);
     let draft = draft.and_then(|draft| draft.result.as_ref());
-    let draft_message = draft
-        .map(|draft| draft.message.as_str())
-        .unwrap_or_default();
-    let staged_attachments = draft
-        .map(|draft| {
+    // Voice dispatch uses a transient stored draft to bind captured audio to
+    // the model turn.  It is protocol state, never user-authored composer
+    // content, and may still exist while generation is running or after an
+    // interrupted process.  Do not project it into the visible UI.
+    let internal_voice_draft = draft.is_some_and(|draft| {
+        draft.message.starts_with("[Voice note]") || draft.message.starts_with("[Phone call]")
+    });
+    let draft_message = (!internal_voice_draft)
+        .then(|| {
             draft
-                .attachment_ids
-                .iter()
-                .filter_map(|id| attachments.iter().find(|attachment| attachment.id == *id))
-                .collect::<Vec<_>>()
+                .map(|draft| draft.message.as_str())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let staged_attachments = (!internal_voice_draft)
+        .then(|| {
+            draft
+                .map(|draft| {
+                    draft
+                        .attachment_ids
+                        .iter()
+                        .filter_map(|id| attachments.iter().find(|attachment| attachment.id == *id))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
         })
         .unwrap_or_default();
     let draft_control = control("conversation.draft_update");
@@ -2060,6 +2086,7 @@ fn composer(
     let voice_local_control = control("voice.message.local_control");
     html! {
         form id="chat-form" class="composer"
+            data-internal-voice-draft[internal_voice_draft]
             data-draft-submit-affordance="conversation.draft_submit"
             data-draft-submit-command="mom_llama.conversation_draft_submit"
             data-draft-submit-tauri-command="mom_llama_conversation_draft_submit"
@@ -5144,6 +5171,107 @@ mod tests {
         assert!(html.contains(r#"data-command="mom_llama.draft_update""#));
         assert!(html.find("garden.png") < html.find("notes.md"));
         assert!(html.contains("Read these"));
+    }
+
+    #[test]
+    fn internal_voice_and_call_drafts_never_project_into_the_composer() {
+        let engine = CommandResult::passed(
+            "mom_llama.engine_check",
+            "host_integrated",
+            serde_json::json!({"ready": true}),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let models = empty_models();
+        let attachment = attachment_record(
+            "voice-clip",
+            "",
+            "private-voice-capture.wav",
+            AttachmentKind::Audio,
+        );
+
+        // Each call models a fresh Rust projection after a conversation switch
+        // or process reload, where a transient internal dispatch draft still
+        // exists for recovery and retains its staged audio authority.
+        for (conversation, prefix, transcript) in [
+            ("switch-chat", "[Voice note]", "private voice prompt"),
+            ("reloaded-chat", "[Phone call]", "private call prompt"),
+        ] {
+            let draft = CommandResult::passed(
+                "mom_llama.draft_get",
+                "contracted",
+                DraftMessage {
+                    conversation_id: Some(conversation.to_string()),
+                    message: format!("{prefix} {transcript}"),
+                    attachment_ids: vec!["voice-clip".to_string()],
+                    updated_at: "1".to_string(),
+                },
+                Vec::new(),
+                Vec::new(),
+                false,
+                false,
+            );
+            let html = composer(
+                &engine,
+                &settings,
+                &models,
+                None,
+                Some(&draft),
+                std::slice::from_ref(&attachment),
+            )
+            .into_string();
+            assert!(html.contains("data-internal-voice-draft"));
+            assert!(
+                !html.contains(prefix),
+                "internal marker leaked for {conversation}"
+            );
+            assert!(
+                !html.contains(transcript),
+                "internal prompt leaked for {conversation}"
+            );
+            assert!(!html.contains("data-staged-attachment-id"));
+            assert!(!html.contains("private-voice-capture.wav"));
+            assert!(!html.contains("voice-clip"));
+        }
+
+        let ordinary = CommandResult::passed(
+            "mom_llama.draft_get",
+            "contracted",
+            DraftMessage {
+                conversation_id: Some("ordinary-chat".to_string()),
+                message: "Please summarize this recording".to_string(),
+                attachment_ids: vec!["voice-clip".to_string()],
+                updated_at: "1".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let html = composer(
+            &engine,
+            &settings,
+            &models,
+            None,
+            Some(&ordinary),
+            &[attachment],
+        )
+        .into_string();
+        assert!(!html.contains("data-internal-voice-draft"));
+        assert!(html.contains("Please summarize this recording"));
+        assert!(html.contains(r#"data-staged-attachment-id="voice-clip""#));
+        assert!(html.contains("private-voice-capture.wav"));
     }
 
     #[test]
