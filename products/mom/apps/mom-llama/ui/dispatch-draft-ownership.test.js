@@ -245,9 +245,12 @@ test("a send rejection remains visible while the user repairs or retries it", ()
   const status = { classList: {
     add: (c) => classes.add(c), remove: (c) => classes.delete(c),
     toggle: (c, enabled) => enabled ? classes.add(c) : classes.delete(c),
-  } };
+  }, replaceChildren(...children) { this.children = children; } };
   const context = {
-    document: { getElementById: () => status }, recordCommandResult() {},
+    document: {
+      getElementById: () => status,
+      createElement: (tag) => ({ tag, className: "", textContent: "", setAttribute() {}, addEventListener() {} }),
+    }, recordCommandResult() {},
     window: { clearTimeout() {}, setTimeout: (callback) => { timers.push(callback); return timers.length; } },
   };
   vm.createContext(context);
@@ -255,8 +258,9 @@ test("a send rejection remains visible while the user repairs or retries it", ()
   const end = source.indexOf("\n  const reportError =", start);
   vm.runInContext(`${source.slice(start, end)}\nthis.report = report;`, context);
   context.report({ status: "blocked", blocker: { message: "The model rejected this request" } });
-  timers.forEach((timer) => timer());
-  assert.equal(status.textContent, "The model rejected this request");
+  assert.equal(status.children[0].textContent, "The model rejected this request");
   assert.equal(classes.has("is-hidden"), false);
-  assert.equal(classes.has("blocked"), true);
+  timers.forEach((timer) => timer());
+  assert.equal(status.children.length, 0);
+  assert.equal(classes.has("is-hidden"), true);
 });

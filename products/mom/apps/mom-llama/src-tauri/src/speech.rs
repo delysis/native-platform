@@ -8,7 +8,7 @@ use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
     PARAKEET_MODEL_ID,
 };
-use speech_native_backend_qwen::{QWEN_BACKEND_ID, QWEN_MODEL_ID};
+use speech_native_backend_qwen::{QWEN_BACKEND_ID, QWEN_ICL_MODEL_ID, QWEN_MODEL_ID};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
     AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
@@ -104,6 +104,7 @@ struct AppleSelection {
 struct QwenSelection {
     descriptor_sha256: String,
     descriptor: SpeechBackendDescriptor,
+    model_id: String,
     voice_id: String,
 }
 
@@ -130,7 +131,10 @@ impl ReadAloudSelection {
         &self.descriptor().id
     }
     fn model_id(&self) -> Option<String> {
-        matches!(self, Self::Qwen(_)).then(|| QWEN_MODEL_ID.to_string())
+        match self {
+            Self::Qwen(value) => Some(value.model_id.clone()),
+            Self::Apple(_) => None,
+        }
     }
     fn voice_id(&self) -> String {
         match self {
@@ -985,17 +989,27 @@ fn assistant_message_target(
         message_id: message_id.to_string(),
         text_sha256: sha256_hex(message.content.as_bytes()),
         text: message.content.clone(),
-        persona_voice_id: conversation
-            .recipient_ids
-            .first()
-            .filter(|_| conversation.recipient_ids.len() == 1)
-            .and_then(|persona| persona_voice_key(persona))
-            // The native Base-model ICL implementation is quarantined until
-            // its reference-code packing matches Qwen's implementation. Keep
-            // voice conversations on the already-qualified local VoiceDesign
-            // route in the meantime instead of publishing garbled audio.
-            .map(|_| speech_native_backend_qwen::QWEN_VOICE_ID.to_string()),
+        persona_voice_id: persona_voice_key_for_conversation(
+            &conversation.recipient_ids,
+            conversation.source_conversation_id.as_deref(),
+        )
+        // Persona voices use manifest-admitted local references with the
+        // Qwen Base ICL route; generic speech keeps the VoiceDesign route.
+        .map(|key| format!("mom.qwen.icl.{key}")),
     }))
+}
+
+fn persona_voice_key_for_conversation<'a>(
+    recipient_ids: &'a [String],
+    source_conversation_id: Option<&'a str>,
+) -> Option<&'a str> {
+    // Persona chats intentionally keep their visible recipient list empty.
+    // Their durable persona identity lives on the source conversation.
+    recipient_ids
+        .first()
+        .filter(|_| recipient_ids.len() == 1)
+        .and_then(|persona| persona_voice_key(persona))
+        .or_else(|| source_conversation_id.and_then(persona_voice_key))
 }
 
 fn persona_voice_key(persona_id: &str) -> Option<&str> {
@@ -1092,12 +1106,19 @@ fn select_read_aloud(
     persona_voice_id: Option<&str>,
     require_persona_voice: bool,
 ) -> Result<ReadAloudSelection, Blocker> {
+    let requested_model_id = persona_voice_id.map_or(QWEN_MODEL_ID, |voice_id| {
+        if voice_id.starts_with("mom.qwen.icl.") {
+            QWEN_ICL_MODEL_ID
+        } else {
+            QWEN_MODEL_ID
+        }
+    });
     if let Some(descriptor) = descriptors.iter().find(|descriptor| {
         descriptor.id == QWEN_BACKEND_ID
             && descriptor.readiness.is_ready()
             && descriptor.capabilities.iter().any(|capability| {
                 capability.eligible_for_local_only()
-                    && capability.model_id.as_deref() == Some(QWEN_MODEL_ID)
+                    && capability.model_id.as_deref() == Some(requested_model_id)
                     && capability.limits.max_input_characters.is_none_or(|limit| {
                         u64::try_from(input_characters).unwrap_or(u64::MAX) <= limit
                     })
@@ -1118,6 +1139,7 @@ fn select_read_aloud(
         return Ok(ReadAloudSelection::Qwen(QwenSelection {
             descriptor_sha256: descriptor_sha256(descriptor)?,
             descriptor: descriptor.clone(),
+            model_id: requested_model_id.to_string(),
             voice_id: voice_id.to_string(),
         }));
     }
@@ -1488,6 +1510,21 @@ mod tests {
         ] {
             assert_eq!(persona_voice_key(persona_id), Some(expected));
         }
+    }
+
+    #[test]
+    fn persona_voice_key_uses_persona_chat_source_when_recipients_are_empty() {
+        assert_eq!(
+            persona_voice_key_for_conversation(&[], Some("persona-gabor_mate")),
+            Some("gabor_mate")
+        );
+        assert_eq!(
+            persona_voice_key_for_conversation(
+                &["persona-bessel_van_der_kolk".to_string()],
+                Some("persona-gabor_mate")
+            ),
+            Some("bessel_van_der_kolk")
+        );
     }
     use speech_native_backend_qwen::QWEN_VOICE_ID;
     use speech_native_types::{

@@ -8444,6 +8444,9 @@ name = "speech-native-backend-qwen"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "speech-native-types",
  "tempfile",
  "tokio",

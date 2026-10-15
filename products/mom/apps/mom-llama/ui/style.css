@@ -743,8 +743,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   min-width: 0;
   flex: 1;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 3px;
+  overflow: hidden;
   color: color-mix(in srgb, currentColor 78%, transparent);
 }
 .voice-waveform i {
@@ -1380,8 +1381,26 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   background: #202820;
   box-shadow: 0 14px 44px rgba(0, 0, 0, .45);
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .command-status.blocked { color: #ffd6d2; background: #351916; border-color: #7d322b; }
+.command-status-dismiss {
+  width: 24px;
+  height: 24px;
+  margin: -4px -6px -4px auto;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: currentColor;
+  background: transparent;
+  font: inherit;
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+.command-status-dismiss:hover { background: color-mix(in srgb, currentColor 12%, transparent); }
 
 .markdown-content { max-width: 100%; }
 .plain-message-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1471,7 +1490,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 #recipient-group-name { width: 100%; }
 .recipient-options { position: absolute; z-index: 40; top: 100%; left: 0; width: min(360px, 100%); max-height: 260px; overflow-y: auto; padding: 6px; background: var(--surface-raised); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px #0005; }
 .recipient-option { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 13px; }
-.recipient-option:hover, .recipient-option:focus { background: var(--surface-active); }
+.recipient-option:hover, .recipient-option:focus, .recipient-option[aria-selected="true"] { background: var(--surface-active); }
 
 .chrome .icon-button, .composer .round-button, .composer .send-button { background: linear-gradient(#ffffff10, #ffffff05); border: 1px solid #ffffff18; border-radius: 50%; }
 

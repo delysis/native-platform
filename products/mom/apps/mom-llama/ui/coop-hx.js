@@ -103,20 +103,29 @@
     recordCommandResult(value);
     const status = document.getElementById("command-status");
     if (status) {
+      window.clearTimeout(status.hideTimer);
       const blocker = value?.blocker?.message;
       const label = blocker
         || value?.result?.message
         || (value?.status === "blocked" ? "That action could not be completed." : null);
       if (!label) {
         status.classList.add("is-hidden");
+        status.replaceChildren();
         return;
       }
-      status.textContent = String(label).replaceAll("_", " ");
+      const message = document.createElement("span");
+      message.textContent = String(label).replaceAll("_", " ");
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "command-status-dismiss";
+      dismiss.setAttribute("aria-label", "Dismiss");
+      dismiss.textContent = "×";
+      dismiss.addEventListener("click", () => report(null), { once: true });
+      status.replaceChildren(message, dismiss);
       const blocked = Boolean(blocker) || value?.status === "blocked";
       status.classList.toggle("blocked", blocked);
       status.classList.remove("is-hidden");
-      window.clearTimeout(status.hideTimer);
-      if (!blocked) status.hideTimer = window.setTimeout(() => status.classList.add("is-hidden"), 5000);
+      status.hideTimer = window.setTimeout(() => report(null), blocked ? 9000 : 5000);
     }
   };
 
@@ -309,9 +318,10 @@
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       const samples = Math.floor((bytes.byteLength - 44) / 2);
       if (samples > 0) {
-        heights = Array.from({ length: 18 }, (_, bar) => {
-          const start = Math.floor((bar * samples) / 18);
-          const end = Math.max(start + 1, Math.floor(((bar + 1) * samples) / 18));
+        const barCount = Math.min(33, Math.max(11, Math.ceil(bytes.byteLength / 24000) * 11));
+        heights = Array.from({ length: barCount }, (_, bar) => {
+          const start = Math.floor((bar * samples) / barCount);
+          const end = Math.max(start + 1, Math.floor(((bar + 1) * samples) / barCount));
           let peak = 0;
           for (let sample = start; sample < end; sample += Math.max(1, Math.floor((end - start) / 96))) {
             peak = Math.max(peak, Math.abs(view.getInt16(44 + sample * 2, true)) / 32768);
@@ -3022,6 +3032,21 @@
       || name.split(/\s+/).some((part) => part.startsWith(query))
       || handle.startsWith(query);
   };
+  const visibleRecipientOptions = () => Array.from(
+    document.querySelectorAll("#recipient-options .recipient-option:not([hidden])"),
+  );
+  const activeRecipientOption = () => visibleRecipientOptions().find((option) =>
+    option.getAttribute("aria-selected") === "true",
+  ) || visibleRecipientOptions()[0] || null;
+  const setActiveRecipientOption = (active) => {
+    const input = document.getElementById("recipient-query");
+    for (const [index, option] of visibleRecipientOptions().entries()) {
+      if (!option.id) option.id = `recipient-option-${index}`;
+      option.setAttribute("aria-selected", String(option === active));
+    }
+    if (active?.id) input?.setAttribute("aria-activedescendant", active.id);
+    else input?.removeAttribute("aria-activedescendant");
+  };
   const filterRecipientOptions = () => {
     const input = document.getElementById("recipient-query");
     const list = document.getElementById("recipient-options");
@@ -3034,7 +3059,11 @@
     list.hidden = !open;
     input.setAttribute("aria-expanded", String(open));
     input.removeAttribute("aria-invalid");
-    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !open || !recipientOptionMatches(option, query);
+    for (const option of list.querySelectorAll(".recipient-option")) {
+      option.hidden = !open || !recipientOptionMatches(option, query);
+      option.setAttribute("aria-selected", "false");
+    }
+    setActiveRecipientOption(visibleRecipientOptions()[0] || null);
   };
   document.addEventListener("input", (event) => {
     if (event.target.id === "recipient-query" && !event.isComposing) filterRecipientOptions();
@@ -3042,17 +3071,40 @@
   document.addEventListener("focusin", (event) => {
     if (event.target.id === "recipient-query") filterRecipientOptions();
   });
+  document.addEventListener("pointerdown", (event) => {
+    // Keep the combobox focused until the option's click commits it. Allowing
+    // pointerdown to move focus fires focusout first and hides the option before
+    // the click can select it.
+    if (event.target.closest?.("#recipient-options .recipient-option")) event.preventDefault();
+  });
   document.addEventListener("keydown", (event) => {
-    if (event.target.id !== "recipient-query" || event.isComposing) return;
+    if (event.isComposing) return;
+    if (event.target.matches?.("#recipient-options .recipient-option")) {
+      if (event.key === "Tab" || event.key === "Enter") {
+        event.preventDefault();
+        event.target.click();
+      }
+      return;
+    }
+    if (event.target.id !== "recipient-query") return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      document.querySelector('.recipient-option:not([hidden])')?.focus();
+      const options = visibleRecipientOptions();
+      const current = options.indexOf(activeRecipientOption());
+      setActiveRecipientOption(options[Math.min(options.length - 1, current + 1)] || options[0] || null);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const options = visibleRecipientOptions();
+      const current = options.indexOf(activeRecipientOption());
+      setActiveRecipientOption(options[Math.max(0, current - 1)] || options[0] || null);
     } else if (event.key === "Escape") {
       document.getElementById("recipient-options").hidden = true;
       event.target.setAttribute("aria-expanded", "false");
-    } else if (event.key === "Enter") {
+    } else if (event.key === "Enter" || event.key === "Tab") {
+      const option = event.target.value.trim() ? activeRecipientOption() : null;
+      if (!option) return;
       event.preventDefault();
-      if (event.target.value.trim()) document.querySelector('.recipient-option:not([hidden])')?.click();
+      option.click();
     }
   });
   document.addEventListener("focusout", (event) => {
@@ -3518,7 +3570,8 @@
         formField(form, "message")?.value || "",
         attachmentIds,
       );
-      report(result);
+      if (result?.status === "blocked") report(result);
+      else report(null);
       await refreshChat();
     },
     "attachment-library-open": async (button) => openAttachmentLibrary(button),
@@ -4453,6 +4506,18 @@
         await invoke("mom_llama_runtime_initialize");
         const root = document.getElementById("app");
         root.innerHTML = await invokeMarkup("mom_llama_render_app");
+        const interruptedCall = formField(document.getElementById("chat-form"), "message")
+          ?.value?.startsWith("[Phone call]");
+        if (interruptedCall) {
+          document.getElementById("chat-form")?.setAttribute("hidden", "");
+          const cleared = await invoke("mom_llama_draft_update", {
+            conversation: selectedConversation(),
+            message: "",
+            attachmentIds: [],
+          });
+          if (cleared?.status === "blocked") report(cleared);
+          root.innerHTML = await invokeMarkup("mom_llama_render_app");
+        }
         sizeComposer();
         await initializeWindowChrome();
         applyCustomCss(shell()?.dataset.customCss || "");

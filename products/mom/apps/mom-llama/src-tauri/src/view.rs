@@ -4890,6 +4890,24 @@ mod tests {
             r#"document.createElement("details")"#,
             r#"document.createElement("summary")"#,
         ] {
+            if unmanaged == r#"document.createElement("button")"# {
+                assert_eq!(
+                    js.matches(unmanaged).count(),
+                    1,
+                    "only the command-status dismissal may create a local button",
+                );
+                let dismiss_start = js
+                    .find(r#"const dismiss = document.createElement("button")"#)
+                    .expect("status dismissal button exists");
+                let dismiss_end = js[dismiss_start..]
+                    .find("status.replaceChildren(message, dismiss)")
+                    .map(|offset| dismiss_start + offset)
+                    .expect("status dismissal is mounted");
+                let dismiss = &js[dismiss_start..dismiss_end];
+                assert!(dismiss.contains(r#"aria-label", "Dismiss""#));
+                assert!(dismiss.contains(r#"addEventListener("click", () => report(null)"#));
+                continue;
+            }
             assert!(
                 !js.contains(unmanaged),
                 "dynamic interactive element bypasses createCommandElement: {unmanaged}"

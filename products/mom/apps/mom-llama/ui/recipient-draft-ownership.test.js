@@ -50,8 +50,13 @@ test("recipient filtering accepts the visible @handle form", () => {
     setAttribute(name, value) { this.attributes[name] = value; },
     removeAttribute(name) { delete this.attributes[name]; },
   };
-  const matching = { dataset: { search: "ad de jongh ad", recipientName: "ad de jongh", recipientHandle: "ad" }, hidden: true };
-  const other = { dataset: { search: "robert miller feeling-state addiction protocol robert", recipientName: "robert miller (feeling-state addiction protocol)", recipientHandle: "robert" }, hidden: true };
+  const makeOption = (dataset) => ({
+    dataset, hidden: true, attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+  });
+  const matching = makeOption({ search: "ad de jongh ad", recipientName: "ad de jongh", recipientHandle: "ad" });
+  const other = makeOption({ search: "robert miller feeling-state addiction protocol robert", recipientName: "robert miller (feeling-state addiction protocol)", recipientHandle: "robert" });
   const list = {
     hidden: true,
     querySelectorAll: () => [matching, other],
@@ -74,6 +79,59 @@ test("recipient filtering accepts the visible @handle form", () => {
   assert.equal(matching.hidden, false);
   assert.equal(other.hidden, true);
   assert.equal(input.attributes["aria-expanded"], "true");
+});
+
+test("recipient options expose a selected default and keyboard selection clicks it", () => {
+  const listeners = new Map();
+  const makeOption = (name, handle) => ({
+    id: "", hidden: false, attributes: new Map(), clicked: 0,
+    dataset: { recipientName: name, recipientHandle: handle },
+    setAttribute(key, value) { this.attributes.set(key, value); },
+    getAttribute(key) { return this.attributes.get(key) ?? null; },
+    click() { this.clicked += 1; },
+    closest(selector) { return selector === "#recipient-options .recipient-option" ? this : null; },
+  });
+  const options = [makeOption("ad de jongh", "ad"), makeOption("arnold popky", "arnold")];
+  const input = {
+    id: "recipient-query", value: "@a", attributes: new Map(),
+    setAttribute(key, value) { this.attributes.set(key, value); },
+    getAttribute(key) { return this.attributes.get(key) ?? null; },
+    removeAttribute(key) { this.attributes.delete(key); },
+    matches() { return false; },
+  };
+  const list = { hidden: true, querySelectorAll: () => options };
+  const context = {
+    document: {
+      addEventListener(name, handler) {
+        const handlers = listeners.get(name) || [];
+        handlers.push(handler);
+        listeners.set(name, handlers);
+      },
+      querySelectorAll: () => options,
+      getElementById: (id) => id === "recipient-query" ? input : id === "recipient-options" ? list : null,
+    },
+  };
+  const start = source.indexOf("  const normalizedRecipientQuery =");
+  const end = source.indexOf("  const actionHandlers =", start);
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}`, context);
+  const dispatch = (name, event) => listeners.get(name).forEach((handler) => handler(event));
+  dispatch("input", { target: input, isComposing: false });
+  assert.equal(list.hidden, false);
+  assert.equal(options[0].getAttribute("aria-selected"), "true");
+  assert.equal(options[1].getAttribute("aria-selected"), "false");
+
+  let prevented = false;
+  dispatch("keydown", { target: input, key: "ArrowDown", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(options[0].getAttribute("aria-selected"), "false");
+  assert.equal(options[1].getAttribute("aria-selected"), "true");
+  dispatch("keydown", { target: input, key: "Tab", preventDefault() { prevented = true; } });
+  assert.equal(options[1].clicked, 1);
+
+  prevented = false;
+  dispatch("pointerdown", { target: options[0], preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
 });
 
 test("a unique exact recipient name or handle can be committed by send", () => {
