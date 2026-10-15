@@ -165,6 +165,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_message_copy", true, false),
     long("mom_llama_speech_read_aloud", true, true),
     mutation("mom_llama_message_edit", true, false),
+    mutation("mom_llama_message_record_call_transcript", true, false),
     mutation("mom_llama_message_delete", true, false),
     read("mom_llama_message_branches", true, false),
     mutation("mom_llama_message_branch_select", true, false),

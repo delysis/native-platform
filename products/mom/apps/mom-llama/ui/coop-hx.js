@@ -300,6 +300,46 @@
   let activeSpeechPlayback = null;
   let speechPlaybackEpoch = null;
 
+  const waveform = () => {
+    const bars = document.createElement("span");
+    bars.className = "voice-waveform";
+    bars.setAttribute("aria-hidden", "true");
+    for (const height of [7, 13, 20, 11, 17, 8, 15, 10, 19, 12, 7]) {
+      const bar = document.createElement("i");
+      bar.style.height = `${height}px`;
+      bars.append(bar);
+    }
+    return bars;
+  };
+
+  const compactAudioPlayer = (audio) => {
+    const player = document.createElement("div");
+    player.className = "voice-message-player";
+    const toggle = createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentPreview);
+    toggle.type = "button";
+    toggle.className = "voice-message-play";
+    toggle.setAttribute("aria-label", "Play voice message");
+    toggle.textContent = "▶";
+    toggle.addEventListener("click", async () => {
+      if (audio.paused) await audio.play(); else audio.pause();
+    });
+    audio.addEventListener("play", () => {
+      toggle.textContent = "Ⅱ";
+      toggle.setAttribute("aria-label", "Pause voice message");
+      player.classList.add("is-playing");
+    });
+    const stopped = () => {
+      toggle.textContent = "▶";
+      toggle.setAttribute("aria-label", "Play voice message");
+      player.classList.remove("is-playing");
+    };
+    audio.addEventListener("pause", stopped);
+    audio.addEventListener("ended", stopped);
+    audio.hidden = true;
+    player.append(toggle, waveform(), audio);
+    return player;
+  };
+
   const restoreReadAloudButton = (button) => {
     if (!button) return;
     delete button.dataset.operation;
@@ -352,12 +392,17 @@
     panel.className = "speech-playback";
     panel.dataset.playback = result.playback_id;
     const audio = createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop);
-    audio.controls = true;
+    audio.controls = !button.closest(".voice-reply-row");
     audio.autoplay = false;
     audio.preload = "auto";
     const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
     audio.src = url;
-    panel.append(audio);
+    if (button.closest(".voice-reply-row")) {
+      audio.hidden = true;
+      panel.append(audio);
+    } else {
+      panel.append(audio);
+    }
     row.querySelector(".message-card")?.append(panel);
     commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
     button.title = "Stop reading";
@@ -590,14 +635,19 @@
       media.src = url;
       if (primary.kind === "image") {
         media.alt = preview.querySelector("figcaption strong")?.textContent || "Local attachment";
-      } else {
+      } else if (!preview.classList.contains("voice-message-bubble")) {
         media.controls = true;
         media.autoplay = false;
         media.preload = "metadata";
       }
-      body.replaceChildren(media);
-      appendAttachmentPreviewNotices(body, catalog.notices);
-      appendAttachmentTranscriptionControl(preview, catalog, primary);
+      if (preview.classList.contains("voice-message-bubble") && primary.kind === "audio") {
+        media.preload = "metadata";
+        body.replaceChildren(compactAudioPlayer(media));
+      } else {
+        body.replaceChildren(media);
+        appendAttachmentPreviewNotices(body, catalog.notices);
+        appendAttachmentTranscriptionControl(preview, catalog, primary);
+      }
       attachmentPreviewMedia.set(preview, media);
       attachmentObjectUrls.set(media, { preview, url });
       preview.dataset.previewHydrated = "true";
@@ -659,6 +709,19 @@
       } else {
         queueAttachmentPreview(preview);
       }
+    });
+    root?.querySelectorAll?.(".message-row.user").forEach((row) => {
+      const next = row.nextElementSibling;
+      if (row.classList.contains("call-turn")) next?.classList.add("call-turn");
+      if (!row.querySelector(".voice-message-bubble") || !next?.classList.contains("assistant")) return;
+      next.classList.add("voice-reply-row");
+      const button = next.querySelector("[data-action='message-read-aloud']");
+      const card = next.querySelector(".message-card");
+      if (!button || !card) return;
+      button.dataset.personaVoice = "true";
+      button.classList.add("voice-reply-play");
+      card.replaceChildren(button, waveform());
+      next.querySelector(".message-actions")?.remove();
     });
   };
 
@@ -2154,6 +2217,39 @@
     return card;
   };
 
+  const appendOptimisticVoiceMessage = (bytes) => {
+    const stream = ensureMessageStream();
+    if (!stream) return null;
+    const article = document.createElement("article");
+    article.className = "message-row user voice-message-row optimistic-voice-message";
+    const card = document.createElement("div");
+    card.className = "message-card";
+    const audio = createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloud);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+    audio.src = url;
+    audio.preload = "auto";
+    article.dataset.objectUrl = url;
+    card.append(compactAudioPlayer(audio));
+    article.append(card);
+    stream.append(article);
+    stream.dataset.followTail = "true";
+    stream.scrollTop = stream.scrollHeight;
+    return article;
+  };
+
+  const appendLiveVoiceReply = (id) => {
+    const card = appendLiveMessage("assistant", "", id);
+    const row = card?.closest(".message-row");
+    if (!card || !row) return;
+    row.classList.add("voice-reply-row", "voice-reply-pending");
+    const play = createCommandElement("button", DYNAMIC_CONTROL_SPECS.readAloud);
+    play.type = "button";
+    play.className = "voice-reply-play";
+    play.disabled = true;
+    play.setAttribute("aria-label", "Preparing voice reply");
+    card.replaceChildren(play, waveform());
+  };
+
   const keepLiveTailVisible = (element) => {
     if (settingEnabled("disableAutoScroll")) return;
     const stream = element?.closest(".message-stream");
@@ -2165,6 +2261,7 @@
   let voiceRecording = null;
   let voiceReplyConversation = null;
   let voiceCallActive = false;
+  let pendingCallTranscript = null;
   const activeDispatchStreamLeases = new Set();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
@@ -2347,6 +2444,7 @@
   };
 
   const sendVoiceCapture = async () => {
+    const call = Boolean(voiceRecording?.call);
     const samples = await stopVoiceCapture();
     if (!samples?.length) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
@@ -2370,9 +2468,34 @@
       if (voiceCallActive) await beginVoiceCapture({ call: true });
       return;
     }
+    if (call) {
+      const attachment = imported.result?.attachment?.id;
+      pendingCallTranscript = attachment ? {
+        conversation,
+        promise: (async () => {
+          const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", { attachment }));
+          const primary = catalog.primary;
+          if (!primary || primary.kind !== "audio") return null;
+          return invoke("mom_llama_speech_transcribe_attachment", {
+            conversation,
+            ...attachmentPreviewAnchor(catalog, primary),
+            operation: speechOperationToken(),
+          });
+        })().catch(() => null),
+      } : null;
+    }
     voiceReplyConversation = conversation;
     await refreshConversationProjection();
-    document.getElementById("chat-form")?.requestSubmit();
+    const currentForm = document.getElementById("chat-form");
+    const textarea = formField(currentForm, "message");
+    if (textarea) {
+      textarea.value = call
+        ? "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
+        : "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
+    }
+    cancelComposerAutocomplete({ native: true, announce: false });
+    if (!call) appendOptimisticVoiceMessage(wav);
+    currentForm?.requestSubmit();
   };
 
   const acquireChatBusy = (scope) => {
@@ -2411,15 +2534,17 @@
 
   const onChatEvent = (event) => {
     const payload = event.payload || event;
+    const voiceReply = voiceReplyConversation === activeDispatchConversation;
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
-      appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
+      if (voiceReply) appendLiveVoiceReply(`live-assistant-${payload.request_id}`);
+      else appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
     }
-    if (payload.event === "delta") {
+    if (payload.event === "delta" && !voiceReply) {
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "reasoning_delta") {
+    if (payload.event === "reasoning_delta" && !voiceReply) {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
       const content = reasoning?.querySelector(".reasoning-content");
       if (settingEnabled("showThoughtInProgress")) reasoning?.classList.remove("is-hidden");
@@ -3007,6 +3132,7 @@
           conversation,
           message,
           operation,
+          requirePersonaVoice: button.dataset.personaVoice === "true",
         });
         report(response);
         if (response?.status === "blocked" || !response?.result) return;
@@ -3759,6 +3885,9 @@
         const message = formValue(form, "message");
         const attachmentIds = draftAttachmentIds(form);
         if (!message && !attachmentIds.length) return;
+        if (message.startsWith("[Voice note]") || message.startsWith("[Phone call]")) {
+          form.querySelector("#composer-attachments")?.remove();
+        }
         // Acquire the UI-side dispatch gate before the first await. Without
         // this, rapid Enter presses can race persona instantiation or draft
         // persistence and dispatch the same turn more than once.
@@ -3810,7 +3939,9 @@
           if (selectedConversation() === conversation) {
             if (textarea) textarea.value = "";
             sizeComposer();
-            if (message) appendLiveMessage("user", message, `live-user-${Date.now()}`);
+            if (message && !message.startsWith("[Voice note]") && !message.startsWith("[Phone call]")) {
+              appendLiveMessage("user", message, `live-user-${Date.now()}`);
+            }
           }
           closeMentions();
           let result;
@@ -3834,6 +3965,24 @@
           if (result?.status === "blocked" && selectedConversation() === conversation && textarea && !textarea.value) {
             textarea.value = message;
           }
+          const callTranscript = message.startsWith("[Phone call]") ? pendingCallTranscript : null;
+          pendingCallTranscript = null;
+          if (callTranscript && result?.result?.kind === "direct") {
+            void callTranscript.promise.then((transcribed) => {
+              const transcript = transcribed?.result?.transcript?.trim();
+              const userMessage = result.result.output?.user_message_id;
+              if (!transcript || !userMessage) return null;
+              return invoke("mom_llama_message_record_call_transcript", {
+                conversation,
+                message: userMessage,
+                transcript,
+              });
+            }).catch(() => {});
+          }
+          document.querySelectorAll(".optimistic-voice-message").forEach((row) => {
+            if (row.dataset.objectUrl) URL.revokeObjectURL(row.dataset.objectUrl);
+            row.remove();
+          });
           await refreshConversationProjection();
           if (voiceReplyConversation === conversation && result?.status !== "blocked") {
             voiceReplyConversation = null;

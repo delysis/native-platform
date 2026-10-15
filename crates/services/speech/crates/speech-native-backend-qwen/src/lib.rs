@@ -9,8 +9,8 @@ use speech_native_types::{
     SpeechModelDescriptor, SpeechOperationCapability, SpeechRequestId, SpeechResolvedRoute,
     SpeechRouteSelector, SpeechUsage, SynthesisCapabilities, SynthesisEvent, SynthesisInput,
     SynthesisOutput, SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor,
-    TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceDescriptor, VoiceGender,
-    VoiceQuality, VoiceSelector,
+    TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceDescriptor, VoiceQuality,
+    VoiceSelector,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -22,17 +22,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 pub const QWEN_BACKEND_ID: &str = "qwen3-tts.mlx-swift";
-pub const QWEN_MODEL_ID: &str = "qwen3-tts-12hz-1.7b-voice-design-4bit";
-pub const QWEN_VOICE_ID: &str = "mom.warm-clinician-v1";
-pub const QWEN_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-voice-design-4bit";
-pub const QWEN_MODEL_REVISION: &str = "5c390979e4b93af5f2932f90742ca99c7dd04687";
+pub const QWEN_MODEL_ID: &str = "qwen3-tts-12hz-1.7b-base-bf16";
+pub const QWEN_VOICE_ID: &str = "mom.persona.default.v1";
+pub const QWEN_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-base-bf16";
+pub const QWEN_MODEL_REVISION: &str = "a6eb4f68e4b056f1215157bb696209bc82a6db48";
 const MAX_INPUT_CHARACTERS: u64 = 4_000;
-const VOICE_DESCRIPTION: &str = "A warm, articulate, reassuring mature American woman with natural conversational rhythm and gentle humor. Speak like a trusted colleague, never like an announcer.";
 
 #[derive(Debug, Clone)]
 pub struct QwenBackendConfig {
     pub helper: PathBuf,
     pub model_dir: PathBuf,
+    pub voice_dir: PathBuf,
 }
 
 impl QwenBackendConfig {
@@ -46,10 +46,28 @@ impl QwenBackendConfig {
                     .and_then(|p| p.parent().map(|p| p.join("qwen3-tts-helper")))
             })
             .unwrap_or_else(|| PathBuf::from("qwen3-tts-helper"));
-        let model_dir = managed_model_root
-            .map(|root| root.join(QWEN_MODEL_DIRECTORY))
+        let model_dir = std::env::var_os("MOM_QWEN3_TTS_MODEL")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+                    home.join("Library/Caches/delysis/voice-ab/models")
+                        .join(QWEN_MODEL_DIRECTORY)
+                })
+            })
+            .filter(|path| path.is_dir())
+            .or_else(|| managed_model_root.map(|root| root.join(QWEN_MODEL_DIRECTORY)))
             .unwrap_or_else(|| PathBuf::from(QWEN_MODEL_DIRECTORY));
-        Self { helper, model_dir }
+        let voice_dir = std::env::var_os("MOM_QWEN3_TTS_VOICE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                managed_model_root.and_then(|root| root.parent().map(|p| p.join("speech-voices")))
+            })
+            .unwrap_or_else(|| PathBuf::from("speech-voices"));
+        Self {
+            helper,
+            model_dir,
+            voice_dir,
+        }
     }
 }
 
@@ -64,7 +82,20 @@ pub struct QwenSpeechBackend {
 impl QwenSpeechBackend {
     #[must_use]
     pub fn discover(config: QwenBackendConfig) -> Self {
-        let ready = config.helper.is_file() && model_admitted(&config.model_dir);
+        let ready = config.helper.is_file()
+            && model_admitted(&config.model_dir)
+            && fs::read_dir(&config.voice_dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|persona| {
+                            voice_reference(&config.voice_dir, &format!("mom.persona.{persona}.v1"))
+                                .is_some()
+                        })
+                })
+            });
         Self {
             descriptor: descriptor(ready, &config),
             config,
@@ -72,6 +103,25 @@ impl QwenSpeechBackend {
             active: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+fn persona_from_voice_id(voice_id: &str) -> Option<&str> {
+    voice_id
+        .strip_prefix("mom.persona.")?
+        .strip_suffix(".v1")
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+}
+
+fn voice_reference(voice_dir: &Path, voice_id: &str) -> Option<(PathBuf, String)> {
+    let persona = persona_from_voice_id(voice_id)?;
+    let audio = voice_dir.join(format!("{persona}.wav"));
+    let transcript = fs::read_to_string(voice_dir.join(format!("{persona}.txt"))).ok()?;
+    (audio.is_file() && !transcript.trim().is_empty()).then_some((audio, transcript))
 }
 
 fn model_admitted(model_dir: &Path) -> bool {
@@ -140,9 +190,13 @@ impl SpeechBackend for QwenSpeechBackend {
     }
 
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisTicket, SpeechError> {
-        validate_request(&request, &self.descriptor)?;
+        validate_request(&request, &self.descriptor, &self.config)?;
         let request_id = request.context.request_id.clone();
-        let route = route();
+        let voice_id = match &request.voice {
+            VoiceSelector::Exact { voice_id } => voice_id.as_str(),
+            _ => unreachable!("validated Qwen synthesis requires an exact persona voice"),
+        };
+        let route = route(voice_id);
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_tx, final_rx) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -229,6 +283,7 @@ impl SpeechBackend for QwenSpeechBackend {
 fn validate_request(
     request: &SynthesisRequest,
     descriptor: &SpeechBackendDescriptor,
+    config: &QwenBackendConfig,
 ) -> Result<(), SpeechError> {
     request.validate()?;
     if !descriptor.readiness.is_ready() {
@@ -258,7 +313,10 @@ fn validate_request(
     } = &request.context.route
         && (backend_id != QWEN_BACKEND_ID
             || model_id.as_deref() != Some(QWEN_MODEL_ID)
-            || voice_id.as_deref() != Some(QWEN_VOICE_ID))
+            || voice_id
+                .as_deref()
+                .and_then(persona_from_voice_id)
+                .is_none())
     {
         return Err(error(
             &request.context.request_id,
@@ -268,11 +326,12 @@ fn validate_request(
             "Qwen3 TTS request selected a different route",
         ));
     }
-    if !matches!(&request.voice, VoiceSelector::Exact { voice_id } if voice_id == QWEN_VOICE_ID) {
+    if !matches!(&request.voice, VoiceSelector::Exact { voice_id } if voice_reference(&config.voice_dir, voice_id).is_some())
+    {
         return Err(SpeechError::invalid_request(
             &request.context.request_id,
             "qwen_voice_mismatch",
-            "Qwen3 TTS requires the admitted designed voice",
+            "Qwen3 TTS requires an installed persona voice reference",
         ));
     }
     Ok(())
@@ -305,10 +364,23 @@ fn synthesize_complete(
         SynthesisInput::Text { text } => text,
         SynthesisInput::Ssml { .. } => unreachable!(),
     };
+    let voice_id = match &request.voice {
+        VoiceSelector::Exact { voice_id } => voice_id,
+        _ => unreachable!(),
+    };
+    let (reference_audio, reference_transcript) = voice_reference(&config.voice_dir, voice_id)
+        .ok_or_else(|| {
+            unavailable(
+                request_id,
+                "qwen_voice_reference_unavailable",
+                "The selected persona voice reference is unavailable",
+            )
+        })?;
     let status = Command::new(&config.helper)
         .arg(&config.model_dir)
         .arg(output.path())
-        .arg(VOICE_DESCRIPTION)
+        .arg(reference_audio)
+        .arg(reference_transcript.trim())
         .arg(text)
         .status()
         .map_err(|e| unavailable(request_id, "qwen_helper_launch_failed", &e.to_string()))?;
@@ -366,11 +438,11 @@ fn wav_duration_ms(bytes: &[u8]) -> Option<u64> {
     Some(data_len.saturating_mul(1000) / (u64::from(rate) * 2))
 }
 
-fn route() -> SpeechResolvedRoute {
+fn route(voice_id: &str) -> SpeechResolvedRoute {
     SpeechResolvedRoute {
         backend_id: QWEN_BACKEND_ID.into(),
         model_id: Some(QWEN_MODEL_ID.into()),
-        voice_id: Some(QWEN_VOICE_ID.into()),
+        voice_id: Some(voice_id.into()),
         backend_kind: SpeechBackendKind::EmbeddedModel,
         network: NetworkBehavior::Never,
     }
@@ -430,23 +502,39 @@ fn descriptor(ready: bool, config: &QwenBackendConfig) -> SpeechBackendDescripto
         }],
         models: vec![SpeechModelDescriptor {
             id: QWEN_MODEL_ID.into(),
-            display_name: "Qwen3 TTS 1.7B VoiceDesign 4-bit".into(),
+            display_name: "Qwen3 TTS 1.7B Base BF16".into(),
             family: "qwen3-tts".into(),
             languages: vec!["en-US".into()],
             resident: false,
-            estimated_memory_bytes: Some(2_000_000_000),
+            estimated_memory_bytes: Some(5_000_000_000),
             content_hash: Some(QWEN_MODEL_REVISION.into()),
         }],
-        voices: vec![VoiceDescriptor {
-            id: QWEN_VOICE_ID.into(),
-            name: "Warm clinician".into(),
-            language: "en-US".into(),
-            gender: Some(VoiceGender::Female),
-            quality: Some(VoiceQuality::Premium),
-            expected_latency: Some(LatencyClass::High),
-            network: NetworkBehavior::Never,
-            installed: ready,
-        }],
+        voices: fs::read_dir(&config.voice_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("wav")
+            })
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+            })
+            .filter(|persona| config.voice_dir.join(format!("{persona}.txt")).is_file())
+            .map(|persona| VoiceDescriptor {
+                id: format!("mom.persona.{persona}.v1"),
+                name: persona.replace('_', " "),
+                language: "en-US".into(),
+                gender: None,
+                quality: Some(VoiceQuality::Premium),
+                expected_latency: Some(LatencyClass::High),
+                network: NetworkBehavior::Never,
+                installed: ready,
+            })
+            .collect(),
     }
 }
 fn now_ms() -> u64 {
@@ -503,7 +591,13 @@ mod tests {
     async fn real_local_qwen_synthesis_returns_bound_wav() {
         let helper = PathBuf::from(std::env::var_os("MOM_QWEN3_TTS_HELPER").expect("helper"));
         let model_dir = PathBuf::from(std::env::var_os("MOM_QWEN3_TTS_MODEL").expect("model"));
-        let backend = QwenSpeechBackend::discover(QwenBackendConfig { helper, model_dir });
+        let voice_dir =
+            PathBuf::from(std::env::var_os("MOM_QWEN3_TTS_VOICE_ROOT").expect("voices"));
+        let backend = QwenSpeechBackend::discover(QwenBackendConfig {
+            helper,
+            model_dir,
+            voice_dir,
+        });
         assert!(backend.readiness().is_ready());
         let request_id = SpeechRequestId("qwen-real-smoke".into());
         let ticket = backend
@@ -541,7 +635,7 @@ mod tests {
             .await
             .expect("ticket");
         let response = ticket.final_response().await.expect("response");
-        assert_eq!(response.route, route());
+        assert_eq!(response.route, route(QWEN_VOICE_ID));
         assert!(response.usage.real_local_inference);
         let SynthesisOutput::Complete { audio, format } = response.output else {
             panic!("complete output required");

@@ -8,7 +8,7 @@ use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
     PARAKEET_MODEL_ID,
 };
-use speech_native_backend_qwen::{QWEN_BACKEND_ID, QWEN_MODEL_ID, QWEN_VOICE_ID};
+use speech_native_backend_qwen::{QWEN_BACKEND_ID, QWEN_MODEL_ID};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
     AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
@@ -90,6 +90,7 @@ struct AssistantMessageTarget {
     message_id: String,
     text: String,
     text_sha256: String,
+    persona_voice_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,7 @@ struct AppleSelection {
 struct QwenSelection {
     descriptor_sha256: String,
     descriptor: SpeechBackendDescriptor,
+    voice_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +134,7 @@ impl ReadAloudSelection {
     }
     fn voice_id(&self) -> String {
         match self {
-            Self::Qwen(_) => QWEN_VOICE_ID.to_string(),
+            Self::Qwen(value) => value.voice_id.clone(),
             Self::Apple(value) => value.voice_id.clone(),
         }
     }
@@ -302,11 +304,23 @@ impl MomSpeech {
         })
     }
 
+    #[cfg(test)]
     pub async fn read_aloud(
         &self,
         conversation_id: &str,
         message_id: &str,
         operation: &str,
+    ) -> anyhow::Result<CommandResult<ReadAloudOutput>> {
+        self.read_aloud_with_mode(conversation_id, message_id, operation, false)
+            .await
+    }
+
+    pub async fn read_aloud_with_mode(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        operation: &str,
+        require_persona_voice: bool,
     ) -> anyhow::Result<CommandResult<ReadAloudOutput>> {
         validate_operation_token(operation)?;
         let target = match assistant_message_target(conversation_id, message_id)? {
@@ -314,7 +328,12 @@ impl MomSpeech {
             Err(blocker) => return Ok(blocked("mom_llama.speech_read_aloud", blocker)),
         };
         let descriptors = self.executor.descriptors()?;
-        let mut selection = match select_read_aloud(&descriptors, target.text.chars().count()) {
+        let mut selection = match select_read_aloud(
+            &descriptors,
+            target.text.chars().count(),
+            target.persona_voice_id.as_deref(),
+            require_persona_voice,
+        ) {
             Ok(selection) => selection,
             Err(blocker) => return Ok(blocked("mom_llama.speech_read_aloud", blocker)),
         };
@@ -328,7 +347,10 @@ impl MomSpeech {
             .executor
             .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
             .await;
-        if response.is_err() && matches!(selection, ReadAloudSelection::Qwen(_)) {
+        if !require_persona_voice
+            && response.is_err()
+            && matches!(selection, ReadAloudSelection::Qwen(_))
+        {
             selection = ReadAloudSelection::Apple(
                 match select_apple(&descriptors, target.text.chars().count()) {
                     Ok(value) => value,
@@ -381,7 +403,8 @@ impl MomSpeech {
             ));
         }
         let mut validated = validate_read_aloud_response(response, &request_id, &selection);
-        if validated.is_err()
+        if !require_persona_voice
+            && validated.is_err()
             && matches!(selection, ReadAloudSelection::Qwen(_))
             && let Ok(apple) = select_apple(&descriptors, target.text.chars().count())
         {
@@ -962,7 +985,31 @@ fn assistant_message_target(
         message_id: message_id.to_string(),
         text_sha256: sha256_hex(message.content.as_bytes()),
         text: message.content.clone(),
+        persona_voice_id: conversation
+            .recipient_ids
+            .first()
+            .filter(|_| conversation.recipient_ids.len() == 1)
+            .and_then(|persona| persona_voice_key(persona))
+            .map(|persona| format!("mom.persona.{persona}.v1")),
     }))
+}
+
+fn persona_voice_key(persona_id: &str) -> Option<&str> {
+    let persona = persona_id.strip_prefix("persona-").unwrap_or(persona_id);
+    match persona {
+        "robert_miller_fsap" => Some("robert_miller"),
+        "arnold_popky_detur" => Some("arnold_popky"),
+        "shirley_jean_schmidt_dnms" => Some("shirley_jean_schmidt"),
+        value
+            if !value.is_empty()
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                }) =>
+        {
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 fn select_apple(
@@ -1038,6 +1085,8 @@ fn select_apple(
 fn select_read_aloud(
     descriptors: &[SpeechBackendDescriptor],
     input_characters: usize,
+    persona_voice_id: Option<&str>,
+    require_persona_voice: bool,
 ) -> Result<ReadAloudSelection, Blocker> {
     if let Some(descriptor) = descriptors.iter().find(|descriptor| {
         descriptor.id == QWEN_BACKEND_ID
@@ -1056,11 +1105,22 @@ fn select_read_aloud(
                                 && synthesis.returned_audio == [AudioOutputKind::Wav]
                     )
             })
-    }) {
+    }) && let Some(voice_id) = persona_voice_id
+        && descriptor
+            .voices
+            .iter()
+            .any(|voice| voice.installed && voice.id == voice_id)
+    {
         return Ok(ReadAloudSelection::Qwen(QwenSelection {
             descriptor_sha256: descriptor_sha256(descriptor)?,
             descriptor: descriptor.clone(),
+            voice_id: voice_id.to_string(),
         }));
+    }
+    if require_persona_voice {
+        return Err(speech_unavailable(
+            "The selected consultant's local Qwen voice is unavailable.",
+        ));
     }
     select_apple(descriptors, input_characters).map(ReadAloudSelection::Apple)
 }
@@ -1258,12 +1318,12 @@ fn validate_read_aloud_response(
         ReadAloudSelection::Apple(apple) => {
             validate_apple_response(response, request_id, &apple.voice_id)
         }
-        ReadAloudSelection::Qwen(_) => desktop_speech::complete_embedded_wav(
+        ReadAloudSelection::Qwen(qwen) => desktop_speech::complete_embedded_wav(
             response,
             request_id,
             QWEN_BACKEND_ID,
             QWEN_MODEL_ID,
-            QWEN_VOICE_ID,
+            &qwen.voice_id,
             MAX_COMPLETE_WAV_BYTES,
         )
         .map_err(|error| match error {
@@ -1413,6 +1473,19 @@ fn speech_error_message(error: &SpeechError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persona_voice_keys_match_contact_ids_and_framework_aliases() {
+        for (persona_id, expected) in [
+            ("persona-gabor_mate", "gabor_mate"),
+            ("persona-robert_miller_fsap", "robert_miller"),
+            ("persona-arnold_popky_detur", "arnold_popky"),
+            ("persona-shirley_jean_schmidt_dnms", "shirley_jean_schmidt"),
+        ] {
+            assert_eq!(persona_voice_key(persona_id), Some(expected));
+        }
+    }
+    use speech_native_backend_qwen::QWEN_VOICE_ID;
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,
@@ -1571,10 +1644,16 @@ mod tests {
 
     #[test]
     fn routes_are_exact_never_network_and_complete_input_only() {
-        let qwen =
-            select_read_aloud(&[apple_descriptor(), qwen_descriptor()], 12).expect("Qwen route");
+        let qwen = select_read_aloud(
+            &[apple_descriptor(), qwen_descriptor()],
+            12,
+            Some(QWEN_VOICE_ID),
+            false,
+        )
+        .expect("Qwen route");
         assert!(matches!(qwen, ReadAloudSelection::Qwen(_)));
-        let fallback = select_read_aloud(&[apple_descriptor()], 12).expect("Apple fallback");
+        let fallback =
+            select_read_aloud(&[apple_descriptor()], 12, None, false).expect("Apple fallback");
         assert!(matches!(fallback, ReadAloudSelection::Apple(_)));
         let apple = select_apple(&[apple_descriptor()], 12).expect("Apple route");
         assert_eq!(apple.voice_id, "voice.local");

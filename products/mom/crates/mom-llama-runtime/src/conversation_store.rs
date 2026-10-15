@@ -1162,6 +1162,78 @@ pub fn message_edit(
     )
 }
 
+pub fn message_record_call_transcript(
+    conversation_id: &str,
+    message_id: &str,
+    transcript: String,
+) -> Result<CommandResult<Message>> {
+    let transcript = transcript.trim();
+    if transcript.is_empty() || transcript.len() > 32_768 {
+        return Ok(CommandResult::blocked(
+            "mom_llama.message_record_call_transcript",
+            "stub_blocked",
+            Blocker::new(
+                "call_transcript_invalid",
+                "The private call transcript is empty or too large.",
+                vec!["Record a bounded spoken turn and try again.".to_string()],
+            ),
+        ));
+    }
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            else {
+                return Ok(conversation_not_found(
+                    "mom_llama.message_record_call_transcript",
+                    conversation_id,
+                ));
+            };
+            let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+            else {
+                return Ok(message_not_found(
+                    "mom_llama.message_record_call_transcript",
+                    message_id,
+                ));
+            };
+            if message.role != MessageRole::User || !message.content.starts_with("[Phone call]") {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.message_record_call_transcript",
+                    "stub_blocked",
+                    Blocker::new(
+                        "call_transcript_target_invalid",
+                        "The transcript target is not a phone-call turn.",
+                        vec!["Keep the transcript attached to its exact call turn.".to_string()],
+                    ),
+                ));
+            }
+            message.content = format!(
+                "[Phone call]\n{transcript}\n\nReply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
+            );
+            let recorded = message.clone();
+            conversation.updated_at = now_ms().to_string();
+            Ok(CommandResult::passed(
+                "mom_llama.message_record_call_transcript",
+                "contracted",
+                recorded,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
+}
+
 pub fn message_delete(
     conversation_id: &str,
     message_id: &str,

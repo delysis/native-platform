@@ -22,7 +22,7 @@ nonisolated public class ELUActivation: Module, UnaryLayer {
 // MARK: - MimiConv1d (Causal Conv1d matching HuggingFace MimiConv1d)
 
 nonisolated public class MimiConv1d: Module {
-    let conv: Conv1d
+    @ModuleInfo var conv: Conv1d
     let paddingLeft: Int
     let paddingRight: Int
     let stride: Int
@@ -193,10 +193,10 @@ nonisolated public class EncoderAttention: Module {
     let numKVHeads: Int
     let scale: Float
 
-    let qProj: Linear
-    let kProj: Linear
-    let vProj: Linear
-    let oProj: Linear
+    @ModuleInfo var qProj: Linear
+    @ModuleInfo var kProj: Linear
+    @ModuleInfo var vProj: Linear
+    @ModuleInfo var oProj: Linear
 
     public init(config: Qwen3TTSTokenizerEncoderConfig, layerIdx: Int) {
         self.headDim = config.head_dim
@@ -243,8 +243,8 @@ nonisolated public class EncoderAttention: Module {
 // MARK: - Encoder MLP (fc1/fc2 with GELU, NOT gate/up/down SiLU)
 
 nonisolated public class EncoderMLP: Module {
-    let fc1: Linear
-    let fc2: Linear
+    @ModuleInfo var fc1: Linear
+    @ModuleInfo var fc2: Linear
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         let quantization = config.quantizationSettings
@@ -261,12 +261,12 @@ nonisolated public class EncoderMLP: Module {
 // MARK: - Encoder Transformer Layer
 
 nonisolated public class EncoderTransformerLayer: Module {
-    let inputLayernorm: LayerNorm
-    let postAttentionLayernorm: LayerNorm
-    let selfAttn: EncoderAttention
-    let mlp: EncoderMLP
-    let selfAttnLayerScale: LayerScale
-    let mlpLayerScale: LayerScale
+    @ModuleInfo var inputLayernorm: LayerNorm
+    @ModuleInfo var postAttentionLayernorm: LayerNorm
+    @ModuleInfo var selfAttn: EncoderAttention
+    @ModuleInfo var mlp: EncoderMLP
+    @ModuleInfo var selfAttnLayerScale: LayerScale
+    @ModuleInfo var mlpLayerScale: LayerScale
 
     public init(config: Qwen3TTSTokenizerEncoderConfig, layerIdx: Int) {
         self.inputLayernorm = LayerNorm(dimensions: config.hidden_size, eps: config.norm_eps)
@@ -302,7 +302,7 @@ nonisolated public class EncoderTransformerLayer: Module {
 
 nonisolated public class EncoderTransformer: Module {
     let layers: [EncoderTransformerLayer]
-    let rotaryEmb: DecoderRotaryEmbedding
+    @ModuleInfo var rotaryEmb: DecoderRotaryEmbedding
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         self.layers = (0..<config.num_hidden_layers).map { i in
@@ -338,7 +338,7 @@ nonisolated public class EncoderTransformer: Module {
 // MARK: - Encoder Downsample
 
 nonisolated public class EncoderDownsample: Module {
-    let conv: MimiConv1d
+    @ModuleInfo var conv: MimiConv1d
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         // Conv1d(512→512, kernel=2*compress, stride=compress) for 2× temporal compression
@@ -360,7 +360,7 @@ nonisolated public class EncoderDownsample: Module {
 // MARK: - Encoder Vector Quantization
 
 nonisolated public class EncoderVectorQuantization: Module {
-    let codebook: EuclideanCodebook
+    @ModuleInfo var codebook: EuclideanCodebook
 
     public init(dim: Int, codebookSize: Int) {
         self.codebook = EuclideanCodebook(dim: dim, codebookSize: codebookSize)
@@ -380,8 +380,8 @@ nonisolated public class EncoderVectorQuantization: Module {
 // MARK: - Encoder Residual Vector Quantizer
 
 nonisolated public class EncoderResidualVectorQuantizer: Module {
-    let inputProj: Conv1d
-    let outputProj: Conv1d
+    @ModuleInfo var inputProj: Conv1d
+    @ModuleInfo var outputProj: Conv1d
     let layers: [EncoderVectorQuantization]
 
     public init(numQuantizers: Int, dim: Int, inputDim: Int, codebookSize: Int) {
@@ -418,8 +418,8 @@ nonisolated public class EncoderResidualVectorQuantizer: Module {
 // MARK: - Encoder Split Residual Vector Quantizer
 
 nonisolated public class EncoderSplitResidualVectorQuantizer: Module {
-    let semanticResidualVectorQuantizer: EncoderResidualVectorQuantizer
-    let acousticResidualVectorQuantizer: EncoderResidualVectorQuantizer
+    @ModuleInfo var semanticResidualVectorQuantizer: EncoderResidualVectorQuantizer
+    @ModuleInfo var acousticResidualVectorQuantizer: EncoderResidualVectorQuantizer
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         let nQSemantic = config.num_semantic_quantizers
@@ -461,10 +461,10 @@ nonisolated public class EncoderSplitResidualVectorQuantizer: Module {
 /// Architecture: MimiModel encoder (SEANet pattern)
 /// Forward pass: audio [B, 1, L] -> CNN encoder -> transformer -> downsample -> quantizer -> codes [B, 16, T]
 nonisolated public class Qwen3TTSAudioEncoder: Module {
-    private var encoder: MimiSEANetEncoder?
-    private var encoderTransformer: EncoderTransformer?
-    private var downsample: EncoderDownsample?
-    private var quantizer: EncoderSplitResidualVectorQuantizer?
+    @ModuleInfo private var encoder: MimiSEANetEncoder?
+    @ModuleInfo private var encoderTransformer: EncoderTransformer?
+    @ModuleInfo private var downsample: EncoderDownsample?
+    @ModuleInfo private var quantizer: EncoderSplitResidualVectorQuantizer?
     private var validNumQuantizers: Int = 16
 
     public override init() {
@@ -504,10 +504,15 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
         let sanitized = Qwen3TTSAudioEncoder.sanitizeEncoderWeights(allWeights)
 
         // Load into a container module that holds all submodules
-        self.encoder = enc
-        self.encoderTransformer = transformer
-        self.downsample = ds
-        self.quantizer = quant
+        try self.update(
+            modules: ModuleChildren(values: [
+                "encoder": .value(enc),
+                "encoderTransformer": .value(transformer),
+                "downsample": .value(ds),
+                "quantizer": .value(quant),
+            ]),
+            verify: .none
+        )
 
         let parameters = ModuleParameters.unflattened(sanitized)
         try self.update(parameters: parameters, verify: .noUnusedKeys)
@@ -588,9 +593,13 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
 
             let workingKey = String(key.dropFirst("encoder.".count))
 
-            // Handle codebook data (cluster_usage + embedding_sum -> embed.weight)
-            if workingKey.contains("_codebook.cluster_usage") || workingKey.contains("_codebook.embedding_sum") {
-                let parts = workingKey.components(separatedBy: "._codebook.")
+            // The released checkpoint stores codebook.cluster_usage and
+            // codebook.embed_sum. Reconstruct embed.weight from those EMA
+            // accumulators; `initialized` is metadata, not a model parameter.
+            if workingKey.contains(".codebook.cluster_usage")
+                || workingKey.contains(".codebook.embed_sum")
+                || workingKey.contains(".codebook.initialized") {
+                let parts = workingKey.components(separatedBy: ".codebook.")
                 if parts.count == 2 {
                     let basePath = parts[0]
                     if codebookData[basePath] == nil {
@@ -598,7 +607,7 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
                     }
                     if workingKey.contains("cluster_usage") {
                         codebookData[basePath]?["cluster_usage"] = v
-                    } else {
+                    } else if workingKey.contains("embed_sum") {
                         codebookData[basePath]?["embedding_sum"] = v
                     }
                 }
@@ -606,7 +615,13 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
             }
 
             // Convert snake_case to camelCase
-            let components = workingKey.components(separatedBy: ".")
+            // The Hugging Face downsample stores its Conv1d directly at
+            // `downsample.conv`; our causal-padding wrapper adds one module
+            // level, so route those tensors to the wrapped Conv1d.
+            let parameterKey = workingKey.hasPrefix("downsample.conv.")
+                ? workingKey.replacingOccurrences(of: "downsample.conv.", with: "downsample.conv.conv.")
+                : workingKey
+            let components = parameterKey.components(separatedBy: ".")
             let camelComponents = components.map { component -> String in
                 if Int(component) != nil { return component }
                 return snakeToCamel(component)

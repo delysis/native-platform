@@ -97,7 +97,7 @@ for (const outcome of ["blocked", "throw"]) {
     const released = [];
     const textarea = { value: "Hello" };
     const context = {
-      document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null },
+      document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null, querySelectorAll: () => [] },
       recipientMutation: Promise.resolve(), activeDispatchStreamLeases: leases,
       autocompleteAccepting: false, cancelComposerAutocomplete() {},
       formValue: () => textarea.value, draftAttachmentIds: () => [],
@@ -123,6 +123,31 @@ for (const outcome of ["blocked", "throw"]) {
     assert.equal(textarea.value, "Hello");
   });
 }
+
+test("voice replies keep assistant text and reasoning hidden through synthesis failure", () => {
+  const events = [];
+  const context = {
+    voiceReplyConversation: "conversation-a",
+    activeDispatchConversation: "conversation-a",
+    chatRequestLease: ({ request_id }) => request_id,
+    acquireStableChatBusy() {},
+    appendLiveVoiceReply: (id) => events.push(["voice", id]),
+    appendLiveMessage: (...args) => events.push(["text", ...args]),
+    appendLiveDelta: (...args) => events.push(["delta", ...args]),
+    document: { getElementById: () => null },
+    finishLiveMessage() {}, releaseChatBusy() {},
+    settingEnabled: () => true, keepLiveTailVisible() {},
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const chatRequestLease =");
+  const end = source.indexOf("\n  const mentionLiveId", start);
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  context.testOnChatEvent({ payload: { event: "started", request_id: "r1" } });
+  context.testOnChatEvent({ payload: { event: "delta", request_id: "r1", delta: "hidden assistant text" } });
+  context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r1", delta: "hidden reasoning" } });
+  context.testOnChatEvent({ payload: { event: "failed", request_id: "r1" } });
+  assert.deepEqual(events, [["voice", "live-assistant-r1"]]);
+});
 
 test("a send rejection remains visible while the user repairs or retries it", () => {
   const classes = new Set(["is-hidden"]);

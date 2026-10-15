@@ -57,7 +57,7 @@ pub use conversation_store::{
     conversation_list, conversation_new, conversation_rename, conversation_search,
     conversation_select, conversation_siblings, conversation_system_message_update, draft_clear,
     draft_get, draft_update, message_branch_select, message_branches, message_copy, message_delete,
-    message_edit, text_attachment_import,
+    message_edit, message_record_call_transcript, text_attachment_import,
 };
 pub use engine::{EngineCheckOptions, engine_check, engine_status};
 pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_status};

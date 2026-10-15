@@ -652,6 +652,14 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Edit",
     },
     ControlSpec {
+        affordance: "message.record_call_transcript",
+        command: "mom_llama.message_record_call_transcript",
+        tauri_command: "mom_llama_message_record_call_transcript",
+        cli: "app-only; records a private transcript against its exact phone-call turn",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Remember call",
+    },
+    ControlSpec {
         affordance: "message.delete",
         command: "mom_llama.message_delete",
         tauri_command: "mom_llama_message_delete",
@@ -2226,6 +2234,12 @@ fn message_row(
     assistant_contact_id: Option<&str>,
 ) -> Markup {
     let role = role_label(&message.role);
+    let call_turn = message.content.starts_with("[Phone call]");
+    let voice_message = message.role == MessageRole::User
+        && attachments.iter().any(|attachment| {
+            attachment.kind == AttachmentKind::Audio
+                && attachment.file_name.starts_with("voice-message-")
+        });
     let show_stats = upstream_settings_bool(settings, "showMessageStats");
     let enable_continue = upstream_settings_bool(settings, "enableContinueGeneration");
     let user_markdown = upstream_settings_bool(settings, "renderUserContentAsMarkdown");
@@ -2241,7 +2255,11 @@ fn message_row(
         .or(assistant_contact_id);
     html! {
         article id=(format!("message-{}", message.id))
-            class=(format!("message-row {role}"))
+            class=(format!(
+                "message-row {role}{}{}",
+                if call_turn { " call-turn" } else { "" },
+                if voice_message { " voice-message-row" } else { "" },
+            ))
             data-message-id=(message.id.clone())
             aria-label=(format!("{role} message")) {
             @if message.role == MessageRole::Assistant {
@@ -2274,6 +2292,8 @@ fn message_row(
                 }
                 @if message.role == MessageRole::Tool {
                     (tool_message_content(message, expand_tool_content, show_agentic_stats))
+                } @else if message.role == MessageRole::User && voice_message {
+                    span class="sr-only" { "Voice message" }
                 } @else if message.role == MessageRole::User && !user_markdown {
                     p class="plain-message-content" { (message.content) }
                 } @else {
@@ -2328,8 +2348,14 @@ fn message_row(
 
 fn attachment_preview_card(attachment: &AttachmentRecord) -> Markup {
     let control = control("attachment.preview");
+    let voice_message = attachment.kind == AttachmentKind::Audio
+        && attachment.file_name.starts_with("voice-message-");
     html! {
-        figure class=(format!("attachment-preview {:?}", attachment.kind).to_lowercase())
+        figure class=(if voice_message {
+                "attachment-preview audio voice-message-bubble".to_string()
+            } else {
+                format!("attachment-preview {:?}", attachment.kind).to_lowercase()
+            })
             data-attachment-preview=(attachment.id.clone())
             data-attachment-kind=(format!("{:?}", attachment.kind).to_lowercase())
             data-attachment-mime=(attachment.mime.clone())
@@ -2341,9 +2367,11 @@ fn attachment_preview_card(attachment: &AttachmentRecord) -> Markup {
             div class="attachment-preview-body" aria-live="polite" {
                 (icon_markup(attachment_icon(&attachment.kind)))
             }
-            figcaption {
-                strong { (attachment.file_name.clone()) }
-                small { (attachment_summary(attachment)) }
+            @if !voice_message {
+                figcaption {
+                    strong { (attachment.file_name.clone()) }
+                    small { (attachment_summary(attachment)) }
+                }
             }
         }
     }
@@ -4452,7 +4480,10 @@ mod tests {
             .expect("composer must accept attachment-only sends");
         assert!(
             attachment_collection < empty_send_guard
-                && js.contains("if (message) appendLiveMessage(\"user\", message"),
+                && js.contains(
+                    "if (message && !message.startsWith(\"[Voice note]\") && !message.startsWith(\"[Phone call]\")) {"
+                )
+                && js.contains("appendLiveMessage(\"user\", message"),
             "attachment-only sends must dispatch without an empty optimistic message bubble"
         );
         let persist_draft_start = js

@@ -1182,6 +1182,21 @@ pub fn mom_llama_message_edit(
 }
 
 #[tauri::command]
+pub fn mom_llama_message_record_call_transcript(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+    transcript: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_record_call_transcript"))?;
+    command_value(mom_llama_runtime::message_record_call_transcript(
+        &conversation,
+        &message,
+        transcript,
+    ))
+}
+
+#[tauri::command]
 pub fn mom_llama_message_delete(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
@@ -1207,11 +1222,17 @@ pub async fn mom_llama_speech_read_aloud(
     conversation: String,
     message: String,
     operation: String,
+    require_persona_voice: Option<bool>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_speech_read_aloud"))?;
     let speech = runtime.speech();
     let result = speech
-        .read_aloud(&conversation, &message, &operation)
+        .read_aloud_with_mode(
+            &conversation,
+            &message,
+            &operation,
+            require_persona_voice.unwrap_or(false),
+        )
         .await
         .map_err(to_error)?;
     let terminal = speech_terminal(&result);

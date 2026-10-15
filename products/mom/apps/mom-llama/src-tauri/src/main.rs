@@ -453,6 +453,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_message_copy,
         commands::mom_llama_speech_read_aloud,
         commands::mom_llama_message_edit,
+        commands::mom_llama_message_record_call_transcript,
         commands::mom_llama_message_delete,
         commands::mom_llama_message_branches,
         commands::mom_llama_message_branch_select,

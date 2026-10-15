@@ -215,6 +215,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                 audioEncoder = encoder
             } catch {
                 // ICL mode unavailable
+                fputs("Qwen3 TTS reference encoder load failed: \(error)\n", stderr)
             }
 
             DeviceSelector.synchronizeIfNeeded(device: device)
@@ -676,6 +677,12 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
 
                     self.model.clearGenerationCache()
 
+                    // Qwen occasionally misses EOS in ICL mode. Bound each
+                    // phrase by its spoken length so a short conversational
+                    // reply cannot turn into a long stream of invented audio.
+                    let wordCount = textChunk.split(whereSeparator: { $0.isWhitespace }).count
+                    let maxTokens = min(600, max(48, wordCount * 10))
+
                     var codes: [[Int32]] = []
                     autoreleasepool {
                         codes = self.model.generateCodes(
@@ -687,7 +694,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             referenceAudioCodes: referenceAudioCodes,
                             tokenizer: self.tokenizer,
                             temperature: temp,
-                            maxTokens: 600
+                            maxTokens: maxTokens
                         )
                     }
 
