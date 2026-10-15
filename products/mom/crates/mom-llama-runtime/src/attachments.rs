@@ -945,10 +945,8 @@ pub fn attachment_transcription_input(
             "Initial local transcription accepts only a canonical WAV audio artifact.".to_string(),
         )));
     }
-    // Generic attachment inspection may completely decode WAV samples, but
-    // Mom's product policy remains transcription-first. The validation grade
-    // proves the retained source bytes; it does not grant direct-model audio
-    // authority here.
+    // Explicit transcription remains available even though validated audio can
+    // also be sent directly to an audio-capable selected model.
     if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
         return Ok(Err(preview_blocker(&problem.code, problem.message)));
     }
@@ -4827,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn structurally_valid_audio_requires_transcription_before_native_input() {
+    fn structurally_valid_audio_enters_native_model_input() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("structure-only-audio");
         let audio_path = resolve_settings()
@@ -4843,13 +4841,12 @@ mod tests {
         assert!(!imported.multimodal_ready);
         assert!(imported.multimodal_blocker.is_none());
 
-        let blocked = prepare_chat_attachments("chat", &[], None)
+        let prepared = prepare_chat_attachments("chat", &[], None)
             .expect("preparation must return a typed result")
-            .expect_err("structure-only audio must require transcription");
-        assert_eq!(
-            blocked.blocker.code,
-            "attachment_audio_transcription_required"
-        );
+            .expect("validated audio must enter native model input");
+        assert_eq!(prepared.media.len(), 1);
+        assert_eq!(prepared.media[0].kind, MediaKind::Audio);
+        assert_eq!(prepared.media[0].mime, "audio/wav");
     }
 
     #[test]
