@@ -72,7 +72,7 @@ impl QwenBackendConfig {
             .or_else(|| managed_model.filter(|path| model_admitted(path)))
             .or_else(|| legacy_model.filter(|path| model_admitted(path)))
             .unwrap_or_else(|| PathBuf::from(QWEN_MODEL_DIRECTORY));
-        let icl = discover_icl_config();
+        let icl = discover_icl_config(managed_model_root);
         Self {
             helper,
             model_dir,
@@ -133,7 +133,7 @@ fn model_admitted(model_dir: &Path) -> bool {
     })
 }
 
-fn discover_icl_config() -> Option<QwenIclConfig> {
+fn discover_icl_config(managed_model_root: Option<&Path>) -> Option<QwenIclConfig> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let default_python = home.join("Library/Caches/delysis/voice-ab/qwen/bin/python");
     let python = std::env::var_os("MOM_QWEN3_TTS_PYTHON")
@@ -151,7 +151,11 @@ fn discover_icl_config() -> Option<QwenIclConfig> {
     let model_dir = std::env::var_os("MOM_QWEN3_TTS_BASE_MODEL")
         .map(PathBuf::from)
         .unwrap_or(default_model);
-    let default_reference_root = if cfg!(debug_assertions) {
+    let installed_reference_root = managed_model_root
+        .and_then(Path::parent)
+        .map(|data_dir| data_dir.join("speech-voices/qwen-icl"))
+        .filter(|root| root.join("manifest.json").is_file());
+    let development_reference_root = if cfg!(debug_assertions) {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .find(|path| {
@@ -164,7 +168,8 @@ fn discover_icl_config() -> Option<QwenIclConfig> {
     };
     let reference_root = std::env::var_os("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")
         .map(PathBuf::from)
-        .or(default_reference_root)?;
+        .or(installed_reference_root)
+        .or(development_reference_root)?;
     Some(QwenIclConfig {
         python,
         cli,
@@ -791,7 +796,7 @@ fn descriptor(
     let icl_availability = if icl_voices.is_empty() {
         CapabilityAvailability::AssetInstallRequired
     } else {
-        CapabilityAvailability::Available
+        CapabilityAvailability::DeferredLoad
     };
     SpeechBackendDescriptor {
         id: QWEN_BACKEND_ID.into(),
@@ -867,9 +872,9 @@ fn descriptor(
                 source_id: "mom-qwen3-base-icl-local-reference".into(),
                 source_version: Some(env!("CARGO_PKG_VERSION").into()),
                 kind: EvidenceKind::SystemInventory,
-                outcome: EvidenceOutcome::Confirmed,
+                        outcome: EvidenceOutcome::Inconclusive,
                 observed_at_unix_ms: now_ms(),
-                detail: "Local-only evaluation references passed manifest transcript and SHA-256 checks".into(),
+                        detail: "Local-only evaluation references passed manifest transcript and SHA-256 inventory checks; model loads on demand".into(),
             }]
                 },
             },

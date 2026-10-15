@@ -1117,7 +1117,9 @@ fn select_read_aloud(
         descriptor.id == QWEN_BACKEND_ID
             && descriptor.readiness.is_ready()
             && descriptor.capabilities.iter().any(|capability| {
-                capability.eligible_for_local_only()
+                (capability.eligible_for_local_only()
+                    || (requested_model_id == QWEN_ICL_MODEL_ID
+                        && capability.deferred_load_admissible()))
                     && capability.model_id.as_deref() == Some(requested_model_id)
                     && capability.limits.max_input_characters.is_none_or(|limit| {
                         u64::try_from(input_characters).unwrap_or(u64::MAX) <= limit
@@ -1348,7 +1350,7 @@ fn validate_read_aloud_response(
             response,
             request_id,
             QWEN_BACKEND_ID,
-            QWEN_MODEL_ID,
+            &qwen.model_id,
             &qwen.voice_id,
             MAX_COMPLETE_WAV_BYTES,
         )
@@ -1525,6 +1527,49 @@ mod tests {
             ),
             Some("bessel_van_der_kolk")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "runs the exact app-discovered local Qwen Base ICL persona route"]
+    async fn real_local_app_persona_qwen_route_selects_synthesizes_and_validates() {
+        let data_dir = mom_llama_runtime::config::resolve_data_dir();
+        let qwen_config = speech_native_backend_qwen::QwenBackendConfig::discover(Some(
+            &data_dir.join("speech-models"),
+        ));
+        assert_eq!(
+            qwen_config.icl.expect("app ICL config").reference_root,
+            data_dir.join("speech-voices/qwen-icl")
+        );
+        let speech = MomSpeech::discover(&data_dir)
+            .await
+            .expect("app speech discovery");
+        let descriptors = speech.executor.descriptors().expect("speech descriptors");
+        let voice_id = "mom.qwen.icl.gabor_mate";
+        let selection = select_read_aloud(&descriptors, 62, Some(voice_id), true)
+            .expect("app must admit Gabor's local ICL voice");
+        assert_eq!(selection.model_id().as_deref(), Some(QWEN_ICL_MODEL_ID));
+        assert_eq!(selection.voice_id(), voice_id);
+
+        let request_id = SpeechRequestId("mom-app-qwen-icl-qualification".into());
+        let target = AssistantMessageTarget {
+            conversation_id: "persona-gabor_mate-chat".into(),
+            message_id: "qualification-message".into(),
+            text: "Good morning. What is happening for this person right now?".into(),
+            text_sha256: sha256_hex(b"Good morning. What is happening for this person right now?"),
+            persona_voice_id: Some(voice_id.into()),
+        };
+        let response = speech
+            .executor
+            .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
+            .await
+            .expect("app-route Qwen synthesis");
+        assert_eq!(response.route.model_id.as_deref(), Some(QWEN_ICL_MODEL_ID));
+        let (audio, duration_ms) = validate_read_aloud_response(response, &request_id, &selection)
+            .expect("app route must validate its selected ICL model");
+        assert!(!audio.is_empty());
+        assert!(duration_ms.is_some_and(|duration| duration > 500));
+        speech.shutdown().await.expect("speech host joined");
     }
     use speech_native_backend_qwen::QWEN_VOICE_ID;
     use speech_native_types::{
@@ -1734,6 +1779,66 @@ mod tests {
         assert_eq!(context.routing.privacy, SpeechPrivacyPolicy::LocalOnly);
         assert!(!context.routing.allow_asset_download);
         assert!(!context.routing.allow_fallback_before_output);
+    }
+
+    #[test]
+    fn local_qwen_icl_persona_route_accepts_exact_deferred_inventory() {
+        let voice_id = "mom.qwen.icl.gabor_mate";
+        let mut descriptor = qwen_descriptor();
+        let capability = &mut descriptor.capabilities[0];
+        capability.model_id = Some(QWEN_ICL_MODEL_ID.to_string());
+        capability.availability = CapabilityAvailability::DeferredLoad;
+        capability.evidence = vec![CapabilityEvidence {
+            source_id: "mom-qwen3-base-icl-local-reference".to_string(),
+            source_version: Some("1".to_string()),
+            kind: EvidenceKind::SystemInventory,
+            outcome: EvidenceOutcome::Inconclusive,
+            observed_at_unix_ms: 1,
+            detail: "validated local model and voice inventory".to_string(),
+        }];
+        descriptor.voices[0].id = voice_id.to_string();
+
+        let selected = select_read_aloud(&[descriptor], 62, Some(voice_id), true)
+            .expect("exact local ICL route is deferred-load admissible");
+        assert_eq!(selected.model_id().as_deref(), Some(QWEN_ICL_MODEL_ID));
+        assert_eq!(selected.voice_id(), voice_id);
+    }
+
+    #[test]
+    fn qwen_icl_response_validates_against_the_selected_model() {
+        let request_id = SpeechRequestId("qwen-icl-validation".to_string());
+        let voice_id = "mom.qwen.icl.gabor_mate";
+        let selection = ReadAloudSelection::Qwen(QwenSelection {
+            descriptor_sha256: "descriptor".to_string(),
+            descriptor: qwen_descriptor(),
+            model_id: QWEN_ICL_MODEL_ID.to_string(),
+            voice_id: voice_id.to_string(),
+        });
+        let response = SynthesisResponse {
+            request_id: request_id.clone(),
+            route: speech_native_types::SpeechResolvedRoute {
+                backend_id: QWEN_BACKEND_ID.to_string(),
+                model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
+                voice_id: Some(voice_id.to_string()),
+                backend_kind: SpeechBackendKind::EmbeddedModel,
+                network: NetworkBehavior::Never,
+            },
+            output: SynthesisOutput::Complete {
+                audio: vec![1, 2, 3],
+                format: AudioOutputFormat::Wav,
+            },
+            duration_ms: Some(800),
+            alignments: Vec::new(),
+            usage: speech_native_types::SpeechUsage {
+                real_local_inference: true,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(
+            validate_read_aloud_response(response, &request_id, &selection),
+            Ok((vec![1, 2, 3], Some(800)))
+        );
     }
 
     #[test]

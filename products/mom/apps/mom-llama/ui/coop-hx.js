@@ -309,6 +309,28 @@
   let activeSpeechPlayback = null;
   let speechPlaybackEpoch = null;
 
+  const waveformMotifs = new WeakMap();
+  const fillWaveform = (bars) => {
+    const motif = waveformMotifs.get(bars);
+    if (!motif) return;
+    const pitch = 6;
+    const visibleBars = bars.clientWidth > 0
+      ? Math.max(motif.length, Math.ceil((bars.clientWidth + 3) / pitch))
+      : motif.length;
+    const barCount = Math.ceil(visibleBars / motif.length) * motif.length;
+    if (bars.childElementCount === barCount) return;
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < barCount; index += 1) {
+      const bar = document.createElement("i");
+      bar.style.height = `${motif[index % motif.length]}px`;
+      fragment.append(bar);
+    }
+    bars.replaceChildren(fragment);
+  };
+  const waveformResizeObserver = typeof ResizeObserver === "function"
+    ? new ResizeObserver((entries) => entries.forEach(({ target }) => fillWaveform(target)))
+    : null;
+
   const waveform = (bytes = null) => {
     const bars = document.createElement("span");
     bars.className = "voice-waveform";
@@ -318,7 +340,7 @@
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       const samples = Math.floor((bytes.byteLength - 44) / 2);
       if (samples > 0) {
-        const barCount = Math.min(33, Math.max(11, Math.ceil(bytes.byteLength / 24000) * 11));
+        const barCount = 11;
         heights = Array.from({ length: barCount }, (_, bar) => {
           const start = Math.floor((bar * samples) / barCount);
           const end = Math.max(start + 1, Math.floor(((bar + 1) * samples) / barCount));
@@ -330,11 +352,9 @@
         });
       }
     }
-    for (const height of heights) {
-      const bar = document.createElement("i");
-      bar.style.height = `${height}px`;
-      bars.append(bar);
-    }
+    waveformMotifs.set(bars, heights);
+    fillWaveform(bars);
+    waveformResizeObserver?.observe(bars);
     return bars;
   };
 
