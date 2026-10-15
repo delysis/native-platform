@@ -324,6 +324,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         text: String,
         speaker: String = "",
         speakerEmbedding: [Float]? = nil,
+        referenceTranscript: String? = nil,
+        referenceAudioCodes: [[Int32]]? = nil,
         temperature: Float? = nil,
         maxTokens: Int? = nil,
         chunkSize: Int? = nil
@@ -333,6 +335,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             speaker: speaker,
             instruct: nil,
             speakerEmbedding: speakerEmbedding,
+            referenceTranscript: referenceTranscript,
+            referenceAudioCodes: referenceAudioCodes,
             temperature: temperature,
             maxTokens: maxTokens,
             chunkSize: chunkSize
@@ -401,6 +405,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             speaker: "",
             instruct: voiceDescription,
             speakerEmbedding: nil,
+            referenceTranscript: nil,
+            referenceAudioCodes: nil,
             temperature: temperature,
             maxTokens: maxTokens,
             chunkSize: chunkSize
@@ -473,6 +479,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             speaker: speaker,
             instruct: instruct,
             speakerEmbedding: nil,
+            referenceTranscript: nil,
+            referenceAudioCodes: nil,
             temperature: temperature,
             maxTokens: maxTokens,
             chunkSize: chunkSize
@@ -486,6 +494,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         speaker: String,
         instruct: String?,
         speakerEmbedding: [Float]?,
+        referenceTranscript: String?,
+        referenceAudioCodes: [[Int32]]?,
         temperature: Float?,
         maxTokens: Int?,
         chunkSize: Int?
@@ -510,6 +520,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             text: text,
                             instruct: instruct,
                             speakerEmbedding: speakerEmbed,
+                            referenceTranscript: referenceTranscript,
+                            referenceAudioCodes: referenceAudioCodes,
                             tokenizer: capturedTokenizer,
                             temperature: temp,
                             maxTokens: tokens,
@@ -517,7 +529,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                         )
                     }
 
-                    let DECODE_CHUNK_SIZE = 18
+                    let FIRST_DECODE_CHUNK_SIZE = 5
+                    let DECODE_CHUNK_SIZE = 12
                     let LEFT_CONTEXT_SIZE = 8
                     let SAMPLES_PER_FRAME = 1920
 
@@ -581,9 +594,11 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
 
                         codeBuffer.append(contentsOf: validCodes)
 
-                        while codeBuffer.count >= DECODE_CHUNK_SIZE {
-                            let batchChunk = Array(codeBuffer.prefix(DECODE_CHUNK_SIZE))
-                            codeBuffer = Array(codeBuffer.dropFirst(DECODE_CHUNK_SIZE))
+                        while true {
+                            let nextChunkSize = isFirstDecode ? FIRST_DECODE_CHUNK_SIZE : DECODE_CHUNK_SIZE
+                            guard codeBuffer.count >= nextChunkSize else { break }
+                            let batchChunk = Array(codeBuffer.prefix(nextChunkSize))
+                            codeBuffer = Array(codeBuffer.dropFirst(nextChunkSize))
 
                             let samples = decodeBatch(codes: batchChunk, isFinal: false)
                             totalCodesProcessed += batchChunk.count

@@ -67,6 +67,31 @@ test("native video never autoplays and every media URL has bounded lifetime", ()
   assert.match(runtime, /"video\/mp4" \| "video\/quicktime" \| "video\/webm" \| "video\/ogg"/);
 });
 
+test("legacy voice note with unavailable media exposes a disabled player", () => {
+  const element = () => ({
+    children: [], attributes: new Map(), append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+  });
+  const context = {
+    document: { createElement: element },
+    DYNAMIC_CONTROL_SPECS: { attachmentPreview: {} },
+    createCommandElement: () => element(),
+    waveform: () => ({ kind: "waveform" }),
+  };
+  speechVm.createContext(context);
+  speechVm.runInContext(
+    block(ui, "  const unavailableVoiceMessage =", "  const restoreReadAloudButton =")
+      + "\nglobalThis.makeUnavailableVoiceMessage = unavailableVoiceMessage;",
+    context,
+  );
+  const player = context.makeUnavailableVoiceMessage();
+  assert.equal(player.className, "voice-message-player voice-message-unavailable");
+  assert.equal(player.children[0].disabled, true);
+  assert.equal(player.children[0].attributes.get("aria-label"), "Voice message unavailable");
+  assert.equal(player.children[1].kind, "waveform");
+  assert.match(ui, /preview\.classList\.contains\("voice-message-bubble"\)[\s\S]*?replaceChildren\(unavailableVoiceMessage\(\)\)/);
+});
+
 // Component controls use actual browser action/render/stop bodies together.
 // Synthetic transport/media replies are not native synthesis evidence.
 const speechVm = require("node:vm");

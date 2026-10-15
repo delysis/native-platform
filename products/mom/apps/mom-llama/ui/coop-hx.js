@@ -386,6 +386,19 @@
     return player;
   };
 
+  const unavailableVoiceMessage = () => {
+    const player = document.createElement("div");
+    player.className = "voice-message-player voice-message-unavailable";
+    const play = createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentPreview);
+    play.type = "button";
+    play.className = "voice-message-play";
+    play.disabled = true;
+    play.textContent = "▶";
+    play.setAttribute("aria-label", "Voice message unavailable");
+    player.append(play, waveform());
+    return player;
+  };
+
   const restoreReadAloudButton = (button) => {
     if (!button) return;
     delete button.dataset.operation;
@@ -768,6 +781,9 @@
       if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
       preview.dataset.previewHydrated = "blocked";
       preview.title = errorMessage(error);
+      if (preview.classList.contains("voice-message-bubble")) {
+        preview.querySelector(".attachment-preview-body")?.replaceChildren(unavailableVoiceMessage());
+      }
       attachmentPreviewObserver?.unobserve(preview);
     }
   };

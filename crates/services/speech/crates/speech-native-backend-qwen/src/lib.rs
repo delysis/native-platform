@@ -47,8 +47,7 @@ pub struct QwenBackendConfig {
 
 #[derive(Debug, Clone)]
 pub struct QwenIclConfig {
-    pub python: PathBuf,
-    pub cli: PathBuf,
+    pub helper: PathBuf,
     pub model_dir: PathBuf,
     pub reference_root: PathBuf,
 }
@@ -76,7 +75,7 @@ impl QwenBackendConfig {
             .or_else(|| managed_model.filter(|path| model_admitted(path)))
             .or_else(|| legacy_model.filter(|path| model_admitted(path)))
             .unwrap_or_else(|| PathBuf::from(QWEN_MODEL_DIRECTORY));
-        let icl = discover_icl_config(managed_model_root);
+        let icl = discover_icl_config(managed_model_root, &helper);
         Self {
             helper,
             model_dir,
@@ -169,18 +168,8 @@ fn model_admitted(model_dir: &Path) -> bool {
     })
 }
 
-fn discover_icl_config(managed_model_root: Option<&Path>) -> Option<QwenIclConfig> {
+fn discover_icl_config(managed_model_root: Option<&Path>, helper: &Path) -> Option<QwenIclConfig> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let default_python = home.join("Library/Caches/delysis/voice-ab/qwen/bin/python");
-    let python = std::env::var_os("MOM_QWEN3_TTS_PYTHON")
-        .map(PathBuf::from)
-        .unwrap_or(default_python);
-    let default_cli = python
-        .parent()
-        .map(|bin| bin.join("mlx_audio.tts.generate"))?;
-    let cli = std::env::var_os("MOM_QWEN3_TTS_ICL_CLI")
-        .map(PathBuf::from)
-        .unwrap_or(default_cli);
     let default_model = home
         .join("Library/Caches/delysis/voice-ab/models")
         .join(QWEN_ICL_MODEL_DIRECTORY);
@@ -207,8 +196,7 @@ fn discover_icl_config(managed_model_root: Option<&Path>) -> Option<QwenIclConfi
         .or(installed_reference_root)
         .or(development_reference_root)?;
     Some(QwenIclConfig {
-        python,
-        cli,
+        helper: helper.to_path_buf(),
         model_dir,
         reference_root,
     })
@@ -255,8 +243,7 @@ fn manifest_entries(config: &QwenIclConfig) -> Vec<ReferenceEntry> {
 }
 
 fn admitted_icl_voices(config: &QwenIclConfig) -> Vec<VoiceDescriptor> {
-    if !config.python.is_file() || !config.cli.is_file() || !base_model_admitted(&config.model_dir)
-    {
+    if !config.helper.is_file() || !base_model_admitted(&config.model_dir) {
         return Vec::new();
     }
     manifest_entries(config)
@@ -619,48 +606,33 @@ fn synthesize_complete(
                 "The selected local reference failed manifest, transcript, or hash validation",
             )
         })?;
-        let output_dir = tempfile::Builder::new()
+        let output = tempfile::Builder::new()
             .prefix("mom-qwen-icl-")
-            .tempdir()
+            .suffix(".wav")
+            .tempfile()
             .map_err(|e| unavailable(request_id, "qwen_output_unavailable", &e.to_string()))?;
-        let output = Command::new(&icl.python)
-            .arg(&icl.cli)
-            .arg("--model")
+        let status = Command::new(&icl.helper)
+            .arg("--icl")
             .arg(&icl.model_dir)
-            .arg("--text")
-            .arg(text)
-            .arg("--ref_audio")
             .arg(clip)
-            .arg("--ref_text")
             .arg(&entry.reference_transcript)
-            .arg("--output_path")
-            .arg(output_dir.path())
-            .arg("--file_prefix")
-            .arg("mom-icl")
-            .arg("--audio_format")
-            .arg("wav")
+            .arg(output.path())
+            .arg(text)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|e| unavailable(request_id, "qwen_icl_launch_failed", &e.to_string()))?;
-        if !output.success() {
+        if !status.success() {
             return Err(unavailable(
                 request_id,
                 "qwen_icl_synthesis_failed",
-                "The local Qwen Base ICL CLI did not complete synthesis",
+                "The bundled Swift Qwen Base ICL helper did not complete synthesis",
             ));
         }
         if cancelled.load(Ordering::Acquire) {
             return Err(cancelled_error(request_id));
         }
-        let sequence = locate_sequenced_wav(output_dir.path(), "mom-icl").ok_or_else(|| {
-            unavailable(
-                request_id,
-                "qwen_icl_output_missing",
-                "The Qwen Base ICL CLI returned no unique sequenced WAV",
-            )
-        })?;
-        let metadata = fs::metadata(&sequence)
+        let metadata = fs::metadata(output.path())
             .map_err(|e| unavailable(request_id, "qwen_output_read_failed", &e.to_string()))?;
         if metadata.len() == 0 || metadata.len() > ICL_MAX_OUTPUT_BYTES {
             return Err(unavailable(
@@ -669,7 +641,7 @@ fn synthesize_complete(
                 "Qwen Base ICL WAV exceeded the local output size limit",
             ));
         }
-        fs::read(sequence)
+        fs::read(output.path())
             .map_err(|e| unavailable(request_id, "qwen_output_read_failed", &e.to_string()))?
     } else {
         let output = tempfile::Builder::new()
@@ -811,10 +783,8 @@ fn synthesize_streaming_icl(
 
 impl ResidentIclWorker {
     fn start(config: &QwenIclConfig, request_id: &SpeechRequestId) -> Result<Self, SpeechError> {
-        let mut child = Command::new(&config.python)
-            .arg("-u")
-            .arg("-c")
-            .arg(include_str!("qwen_icl_worker.py"))
+        let mut child = Command::new(&config.helper)
+            .arg("--resident")
             .arg(&config.model_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1126,27 +1096,6 @@ fn voice_id_from_selector(request: &SynthesisRequest) -> Option<&str> {
     }
 }
 
-fn locate_sequenced_wav(directory: &Path, prefix: &str) -> Option<PathBuf> {
-    let mut matches = fs::read_dir(directory)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().is_some_and(|extension| extension == "wav")
-                && path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| {
-                        stem.strip_prefix(&format!("{prefix}_"))
-                            .is_some_and(|sequence| {
-                                !sequence.is_empty() && sequence.bytes().all(|b| b.is_ascii_digit())
-                            })
-                    })
-        });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
-}
-
 fn descriptor(
     ready: bool,
     design_ready: bool,
@@ -1349,17 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn only_unique_cli_sequence_outputs_are_accepted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let first = dir.path().join("mom-icl_000.wav");
-        fs::write(&first, pcm_wav()).expect("wav");
-        assert_eq!(locate_sequenced_wav(dir.path(), "mom-icl"), Some(first));
-        fs::write(dir.path().join("mom-icl_001.wav"), pcm_wav()).expect("second wav");
-        assert_eq!(locate_sequenced_wav(dir.path(), "mom-icl"), None);
-        assert_eq!(locate_sequenced_wav(dir.path(), "other"), None);
-    }
-
-    #[test]
     fn reference_admission_checks_safe_path_and_exact_hash() {
         let root = tempfile::tempdir().expect("tempdir");
         fs::create_dir(root.path().join("clips")).expect("clips dir");
@@ -1377,8 +1315,7 @@ mod tests {
             },
         };
         let config = QwenIclConfig {
-            python: PathBuf::new(),
-            cli: PathBuf::new(),
+            helper: PathBuf::new(),
             model_dir: PathBuf::new(),
             reference_root: root.path().to_path_buf(),
         };

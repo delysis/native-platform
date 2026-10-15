@@ -638,6 +638,8 @@ nonisolated public class Qwen3Talker: Module {
         text: String,
         instruct: String? = nil,
         speakerEmbedding: MLXArray? = nil,
+        referenceTranscript: String? = nil,
+        referenceAudioCodes: [[Int32]]? = nil,
         tokenizer: Qwen3Tokenizer,
         temperature: Float = 0.9,
         maxTokens: Int = 1200,
@@ -694,6 +696,9 @@ nonisolated public class Qwen3Talker: Module {
                 var combinedEmbed = concatenated([padEmbeds, ttsBosEmbed], axis: 1)
                 combinedEmbed = combinedEmbed + codecEmbed[0..., 0..<(codecEmbed.shape[1]-1), 0...]
 
+                let useICL = referenceAudioCodes != nil
+                    && referenceTranscript != nil
+                    && !referenceTranscript!.isEmpty
                 var instructEmbed: MLXArray? = nil
                 if let instructText = instruct, !instructText.isEmpty {
                     // Explicit instruct text (VoiceDesign or CustomVoice mode)
@@ -701,6 +706,22 @@ nonisolated public class Qwen3Talker: Module {
                     let instructIdsArray: [Int32] = tokenizer.encode(text: formatted)
                     let instructIds = MLXArray(instructIdsArray).expandedDimensions(axis: 0)
                     instructEmbed = model.text_projection(model.text_embedding(instructIds))
+                } else if useICL,
+                          let refCodes = referenceAudioCodes,
+                          let refTranscript = referenceTranscript {
+                    let refText = "<|im_start|>user\n\(refTranscript)<|im_end|>\n"
+                    let refTextIds: [Int32] = tokenizer.encode(text: refText)
+                    let refTextEmbed = model.text_projection(
+                        model.text_embedding(MLXArray(refTextIds).expandedDimensions(axis: 0))
+                    )
+                    let numFrames = refCodes.first?.count ?? 0
+                    if numFrames > 0, !refCodes.isEmpty {
+                        let semanticCodes = MLXArray(refCodes[0]).expandedDimensions(axis: 0)
+                        let refAudioEmbed = model.codec_embedding(semanticCodes)
+                        instructEmbed = concatenated([refTextEmbed, refAudioEmbed], axis: 1)
+                    } else {
+                        instructEmbed = refTextEmbed
+                    }
                 } else if !prompt.isEmpty && speakerId == nil && speakerEmbedding == nil {
                     // Backward compat: treat prompt as instruct when no speaker resolved
                     let formatted = "<|im_start|>user\n\(prompt)<|im_end|>\n"
