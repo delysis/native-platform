@@ -149,6 +149,55 @@ test("voice replies keep assistant text and reasoning hidden through synthesis f
   assert.deepEqual(events, [["voice", "live-assistant-r1"]]);
 });
 
+test("voice mention replies start as waveform cards and never append streamed text", () => {
+  const rowClasses = [];
+  const waveformNode = { kind: "waveform" };
+  const playButton = { setAttribute() {} };
+  const card = { replaceChildren(...children) { this.children = children; }, closest: () => row };
+  const row = { classList: { add: (...classes) => rowClasses.push(...classes) } };
+  const voiceCardContext = {
+    DYNAMIC_CONTROL_SPECS: { readAloud: {} },
+    appendLiveMessage: () => card,
+    createCommandElement: () => playButton,
+    waveform: () => waveformNode,
+  };
+  vm.createContext(voiceCardContext);
+  const voiceStart = source.indexOf("  const appendLiveVoiceReply =");
+  const voiceEnd = source.indexOf("\n  const keepLiveTailVisible", voiceStart);
+  vm.runInContext(`${source.slice(voiceStart, voiceEnd)}\nthis.makeVoiceReply = appendLiveVoiceReply;`, voiceCardContext);
+  voiceCardContext.makeVoiceReply("live-mention-i-p");
+  assert.deepEqual(rowClasses, ["voice-reply-row", "voice-reply-pending"]);
+  assert.equal(card.children[1], waveformNode);
+  assert.equal(playButton.disabled, true);
+
+  const calls = [];
+  const mentionRow = { querySelector: () => null, setAttribute() {} };
+  const dispatchContext = {
+    voiceReplyConversation: "conversation-a",
+    activeDispatchConversation: "conversation-a",
+    activeDispatchStreamLeases: new Set(),
+    chatBusyLeases: new Set(),
+    chatRequestLease: () => null,
+    acquireStableChatBusy() {},
+    mentionLiveId: (payload) => `live-mention-${payload.invocation_id}-${payload.target_id}`,
+    appendMentionMessage: (payload, voiceReply) => calls.push(["mention", voiceReply]),
+    appendLiveDelta: (...args) => calls.push(["delta", ...args]),
+    document: { getElementById: (id) => id.startsWith("live-mention-") ? mentionRow : null },
+    finishLiveMessage() {}, releaseChatBusy() {},
+  };
+  vm.createContext(dispatchContext);
+  const dispatchStart = source.indexOf("  const onDispatchEvent =");
+  const dispatchEnd = source.indexOf("\n  let mentionSearchSerial", dispatchStart);
+  vm.runInContext(`${source.slice(dispatchStart, dispatchEnd)}\nthis.dispatch = onDispatchEvent;`, dispatchContext);
+  dispatchContext.dispatch({ kind: "mention", event: { event: "started", invocation_id: "i", target_id: "p" } });
+  dispatchContext.dispatch({ kind: "mention", event: { event: "delta", invocation_id: "i", target_id: "p", delta: "hidden text" } });
+  assert.deepEqual(calls, [["mention", true]]);
+});
+
+test("runtime warm is launched after listeners without delaying the interactive shell", () => {
+  assert.match(source, /await listen\(\);[\s\S]*?void invoke\("mom_llama_runtime_warm"\)\.catch\(\(\) => \{\}\);/);
+});
+
 test("a send rejection remains visible while the user repairs or retries it", () => {
   const classes = new Set(["is-hidden"]);
   const timers = [];

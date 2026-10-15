@@ -14,7 +14,7 @@ use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
 use crate::operation_scope::{ChatOperationLease, OperationScope};
 use crate::receipts::{Blocker, CommandResult};
-use crate::skill_store::applied_skill_prompt;
+use crate::skill_store::{applied_skill_prompt, persona_prefix_cache_owner_id};
 use anyhow::Result;
 use llama_native_engine::GenerationTicket;
 use llama_native_types::{
@@ -666,7 +666,22 @@ where
             return stream.finish_cancelled();
         }
         let (cached_prefix, cache_was_preexisting) = if media.is_empty() && default_template {
-            if let Some(owner_id) = skill_prompt.cache_owner_id.as_deref() {
+            let persona_owner = persona_prefix_cache_owner_id(
+                conversation.source_conversation_id.as_deref(),
+                &conversation.current_skill_ids,
+                skill_prompt.cache_owner_id.is_some(),
+            );
+            let (cache_owner_id, cache_label) = if conversation.source_conversation_id.is_some() {
+                (persona_owner, format!("Persona: {}", conversation.title))
+            } else if conversation.current_skill_ids.is_empty() {
+                (None, skill_prompt.cache_label.clone())
+            } else {
+                (
+                    skill_prompt.cache_owner_id.as_deref(),
+                    skill_prompt.cache_label.clone(),
+                )
+            };
+            if let Some(owner_id) = cache_owner_id {
                 let stable_messages = messages
                     .first()
                     .filter(|message| message.role == ChatRole::System)
@@ -676,7 +691,7 @@ where
                 let cache = ensure_persona_prefix(
                     &handle,
                     owner_id,
-                    &skill_prompt.cache_label,
+                    &cache_label,
                     &stable_messages,
                     &messages,
                 )?;
@@ -686,10 +701,14 @@ where
                         .map(|cache| (cache.cache_id.clone(), cache.sequence.clone())),
                     cache.is_some_and(|cache| cache.reused),
                 )
-            } else {
+            } else if conversation.source_conversation_id.is_none()
+                && conversation.current_skill_ids.is_empty()
+            {
                 let cache = compatible_conversation_prefix(&handle, &messages, &conversation.id)?;
                 let reused = cache.is_some();
                 (cache, reused)
+            } else {
+                (None, false)
             }
         } else {
             (None, false)

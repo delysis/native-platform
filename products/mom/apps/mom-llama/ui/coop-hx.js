@@ -2494,7 +2494,10 @@
         : "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
     }
     cancelComposerAutocomplete({ native: true, announce: false });
-    if (!call) appendOptimisticVoiceMessage(wav);
+    if (!call) {
+      appendOptimisticVoiceMessage(wav);
+      appendLiveVoiceReply("live-voice-reply-pending");
+    }
     currentForm?.requestSubmit();
   };
 
@@ -2537,6 +2540,7 @@
     const voiceReply = voiceReplyConversation === activeDispatchConversation;
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
+      document.getElementById("live-voice-reply-pending")?.remove();
       if (voiceReply) appendLiveVoiceReply(`live-assistant-${payload.request_id}`);
       else appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
     }
@@ -2565,8 +2569,11 @@
   };
 
   const mentionLiveId = (payload) => `live-mention-${payload.invocation_id}-${payload.target_id}`;
-  const appendMentionMessage = (payload) => {
-    const card = appendLiveMessage("assistant", "", mentionLiveId(payload));
+  const appendMentionMessage = (payload, voiceReply = false) => {
+    const id = mentionLiveId(payload);
+    const card = voiceReply
+      ? (appendLiveVoiceReply(id), document.querySelector(`#${CSS.escape(id)} .message-card`))
+      : appendLiveMessage("assistant", "", id);
     const row = card?.closest(".message-row");
     if (!card || !row) return card;
     const byline = document.createElement("p");
@@ -2594,15 +2601,17 @@
       return;
     }
     const payload = envelope.event || envelope;
+    const voiceReply = voiceReplyConversation === activeDispatchConversation;
     const lease = payload.invocation_id && payload.target_id
       ? `mention-request:${payload.invocation_id}:${payload.target_id}`
       : null;
     if (payload.event === "started") {
       acquireStableChatBusy(lease);
-      appendMentionMessage(payload);
+      document.getElementById("live-voice-reply-pending")?.remove();
+      appendMentionMessage(payload, voiceReply);
     }
     const row = document.getElementById(mentionLiveId(payload));
-    if (payload.event === "delta") {
+    if (payload.event === "delta" && !voiceReply) {
       const content = row?.querySelector(".live-content");
       appendLiveDelta(content, payload.delta);
     }
@@ -4368,6 +4377,9 @@
 
         sizeComposer();
         await listen();
+        // Keep startup interactive, then immediately make the actual resident
+        // model and stable persona prefixes ready before the first turn.
+        void invoke("mom_llama_runtime_warm").catch(() => {});
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");

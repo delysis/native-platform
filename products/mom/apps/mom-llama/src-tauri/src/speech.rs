@@ -990,7 +990,11 @@ fn assistant_message_target(
             .first()
             .filter(|_| conversation.recipient_ids.len() == 1)
             .and_then(|persona| persona_voice_key(persona))
-            .map(|persona| format!("mom.persona.{persona}.v1")),
+            // The native Base-model ICL implementation is quarantined until
+            // its reference-code packing matches Qwen's implementation. Keep
+            // voice conversations on the already-qualified local VoiceDesign
+            // route in the meantime instead of publishing garbled audio.
+            .map(|_| speech_native_backend_qwen::QWEN_VOICE_ID.to_string()),
     }))
 }
 

@@ -1,8 +1,13 @@
-use crate::config::{Settings, resolve_settings};
+use crate::config::{Settings, resolve_settings, upstream_setting_string};
+use crate::conversation_store::{ChatTemplatePolicy, ConversationKind};
+use crate::kv_cache::ensure_persona_prefix;
 use crate::native_runtime::{resident_model, resident_slots, resident_status};
+use crate::personas::persona_list;
 use crate::receipts::{Blocker, CommandResult};
+use crate::skill_store::{applied_skill_prompt, persona_prefix_cache_owner_id};
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
+use llama_native_types::{ChatMessage, ChatRole};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -20,6 +25,148 @@ pub struct EngineCheckOutput {
     pub transport: String,
     pub binding_version: String,
     pub backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWarmOutput {
+    pub model_loaded: bool,
+    pub persona_prefixes_ready: usize,
+    pub persona_prefixes_reused: usize,
+}
+
+struct PersonaPrefixPlan {
+    owner_id: String,
+    label: String,
+    stable_messages: Vec<ChatMessage>,
+}
+
+fn persona_prefix_plan(
+    persona_id: &str,
+    persona_title: &str,
+    skill_ids: &[String],
+    skills_cacheable: bool,
+    system: &str,
+    skill_prompt: &str,
+    skill_label: &str,
+) -> Option<PersonaPrefixPlan> {
+    let owner_id = persona_prefix_cache_owner_id(Some(persona_id), skill_ids, skills_cacheable)?;
+    let combined = [system.trim(), skill_prompt.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if combined.is_empty() {
+        return None;
+    }
+    let label = if skill_prompt.trim().is_empty() {
+        format!("Persona: {persona_title}")
+    } else {
+        format!("Persona: {persona_title} ({skill_label})")
+    };
+    Some(PersonaPrefixPlan {
+        owner_id: owner_id.to_string(),
+        label,
+        stable_messages: vec![ChatMessage {
+            role: ChatRole::System,
+            content: combined,
+        }],
+    })
+}
+
+/// Loads the configured model and materializes the stable system/persona
+/// prefixes while the shell is already usable. Conversation checkpoints remain
+/// content-addressed and are promoted by the normal chat path when selected.
+pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<RuntimeWarmOutput>> {
+    let settings = resolve_settings()?;
+    let handle = match resident_model(scope, &settings) {
+        Ok(handle) => handle,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.runtime_warm",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
+    let global_system = upstream_setting_string(&settings, "systemMessage").unwrap_or_default();
+    let personas = persona_list()?.result.unwrap_or_default();
+    let mut ready = 0usize;
+    let mut reused = 0usize;
+    for persona in personas {
+        if persona.kind != ConversationKind::PersonaTemplate
+            || !matches!(
+                persona.execution_profile.chat_template,
+                ChatTemplatePolicy::ModelDefault
+            )
+            || persona
+                .execution_profile
+                .model_path
+                .as_ref()
+                .is_some_and(|path| {
+                    settings
+                        .model_path
+                        .as_ref()
+                        .is_none_or(|default| default != path)
+                })
+            || persona
+                .execution_profile
+                .mmproj_path
+                .as_ref()
+                .is_some_and(|path| {
+                    settings
+                        .mmproj_path
+                        .as_ref()
+                        .is_none_or(|default| default != path)
+                })
+        {
+            continue;
+        }
+        let applied = applied_skill_prompt(&persona.current_skill_ids)?;
+        let system = persona
+            .execution_profile
+            .system_message
+            .as_deref()
+            .unwrap_or(&global_system);
+        let Some(plan) = persona_prefix_plan(
+            &persona.id,
+            &persona.title,
+            &persona.current_skill_ids,
+            applied.cache_owner_id.is_some(),
+            system,
+            &applied.prompt,
+            &applied.cache_label,
+        ) else {
+            continue;
+        };
+        let mut target = plan.stable_messages.clone();
+        target.push(ChatMessage {
+            role: ChatRole::User,
+            content: String::new(),
+        });
+        if let Some(prefix) = ensure_persona_prefix(
+            &handle,
+            &plan.owner_id,
+            &plan.label,
+            &plan.stable_messages,
+            &target,
+        )? {
+            ready += 1;
+            reused += usize::from(prefix.reused);
+        }
+    }
+    Ok(CommandResult::passed(
+        "mom_llama.runtime_warm",
+        "host_integrated",
+        RuntimeWarmOutput {
+            model_loaded: true,
+            persona_prefixes_ready: ready,
+            persona_prefixes_reused: reused,
+        },
+        Vec::new(),
+        Vec::new(),
+        true,
+        false,
+    ))
 }
 
 pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
@@ -217,8 +364,56 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::validate_model_path;
+    use super::{persona_prefix_plan, validate_model_path};
     use std::path::Path;
+
+    #[test]
+    fn built_in_personas_without_skills_get_distinct_system_prefix_owners() {
+        let first = persona_prefix_plan(
+            "persona-ad-de-jongh",
+            "Ad de Jongh",
+            &[],
+            false,
+            "System prompt for Ad",
+            "",
+            "Applied Skills",
+        )
+        .expect("built-in persona system prompt should be cacheable without skills");
+        let second = persona_prefix_plan(
+            "persona-janina-fisher",
+            "Janina Fisher",
+            &[],
+            false,
+            "System prompt for Janina",
+            "",
+            "Applied Skills",
+        )
+        .expect("second persona system prompt should be cacheable without skills");
+        assert_eq!(first.owner_id, "persona-ad-de-jongh");
+        assert_eq!(first.stable_messages[0].content, "System prompt for Ad");
+        assert_eq!(second.owner_id, "persona-janina-fisher");
+        assert_eq!(
+            second.stable_messages[0].content,
+            "System prompt for Janina"
+        );
+        assert_ne!(first.owner_id, second.owner_id);
+    }
+
+    #[test]
+    fn persona_warm_skips_explicitly_non_cacheable_skills() {
+        assert!(
+            persona_prefix_plan(
+                "persona-private-skill",
+                "Private Skill Persona",
+                &["private-skill".to_string()],
+                false,
+                "system prompt",
+                "sensitive skill prompt",
+                "Private Skill",
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn model_path_blockers_are_friendly_and_never_echo_raw_paths() {

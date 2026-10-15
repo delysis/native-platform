@@ -374,6 +374,16 @@ pub async fn mom_llama_engine_check(runtime: State<'_, AppRuntimeHandle>) -> Res
 }
 
 #[tauri::command]
+pub async fn mom_llama_runtime_warm(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_runtime_warm"))?,
+        move || mom_llama_runtime::runtime_warm(&scope),
+    )
+    .await
+}
+
+#[tauri::command]
 pub fn mom_llama_engine_configure(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,

@@ -402,6 +402,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_information_managed_removal_preview,
         commands::mom_llama_information_managed_removal_commit,
         commands::mom_llama_engine_check,
+        commands::mom_llama_runtime_warm,
         commands::mom_llama_engine_configure,
         commands::mom_llama_model_list,
         commands::mom_llama_model_select,

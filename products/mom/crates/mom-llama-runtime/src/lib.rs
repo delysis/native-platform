@@ -59,7 +59,9 @@ pub use conversation_store::{
     draft_get, draft_update, message_branch_select, message_branches, message_copy, message_delete,
     message_edit, message_record_call_transcript, text_attachment_import,
 };
-pub use engine::{EngineCheckOptions, engine_check, engine_status};
+pub use engine::{
+    EngineCheckOptions, RuntimeWarmOutput, engine_check, engine_status, runtime_warm,
+};
 pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_status};
 pub use mcp::{
     McpCallToolOutput, McpGetPromptOutput, McpPrompt, McpPromptArgument, McpReadResourceOutput,
