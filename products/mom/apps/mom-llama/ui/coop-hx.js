@@ -2563,16 +2563,38 @@
     });
     return recipientMutation;
   };
+  const normalizedRecipientQuery = (value) => value.trim().toLowerCase().replace(/^@+/, "");
+  const exactRecipientOption = (value) => {
+    const query = normalizedRecipientQuery(value);
+    if (!query) return null;
+    const matches = Array.from(document.querySelectorAll("#recipient-options .recipient-option")).filter((option) =>
+      option.dataset.recipientName === query || option.dataset.recipientHandle === query,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const recipientOptionMatches = (option, query) => {
+    // Parenthetical role/protocol qualifiers describe the contact but are not
+    // part of their addressable name. Excluding them prevents queries such as
+    // `@ad` from matching "Addiction Protocol".
+    const name = (option.dataset.recipientName || "").split(/\s+\(/, 1)[0];
+    const handle = option.dataset.recipientHandle || "";
+    return name.startsWith(query)
+      || name.split(/\s+/).some((part) => part.startsWith(query))
+      || handle.startsWith(query);
+  };
   const filterRecipientOptions = () => {
     const input = document.getElementById("recipient-query");
     const list = document.getElementById("recipient-options");
     if (!input || !list) return;
-    const query = input.value.trim().toLowerCase();
+    // The UI presents handles with a leading @, while the canonical stored
+    // handle deliberately omits it. Treat the display sigil as query syntax so
+    // typing the handle exactly as shown never empties the picker.
+    const query = normalizedRecipientQuery(input.value);
     const open = query.length > 0;
     list.hidden = !open;
     input.setAttribute("aria-expanded", String(open));
     input.removeAttribute("aria-invalid");
-    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !open || !option.dataset.search.includes(query);
+    for (const option of list.querySelectorAll(".recipient-option")) option.hidden = !open || !recipientOptionMatches(option, query);
   };
   document.addEventListener("input", (event) => {
     if (event.target.id === "recipient-query" && !event.isComposing) filterRecipientOptions();
@@ -3481,11 +3503,15 @@
         if (autocompleteAccepting) return;
         if (form.dataset.busy === "true") return;
         const recipientQuery = document.getElementById("recipient-query");
+        let exactRecipient = null;
         if (recipientQuery?.value.trim()) {
           filterRecipientOptions();
-          recipientQuery.focus();
-          recipientQuery.setAttribute("aria-invalid", "true");
-          return;
+          exactRecipient = exactRecipientOption(recipientQuery.value);
+          if (!exactRecipient) {
+            recipientQuery.focus();
+            recipientQuery.setAttribute("aria-invalid", "true");
+            return;
+          }
         }
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
@@ -3499,6 +3525,11 @@
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
         try {
+          if (exactRecipient) {
+            await updateRecipients((ids) => ids.includes(exactRecipient.dataset.recipient)
+              ? ids
+              : [...ids, exactRecipient.dataset.recipient]);
+          }
           await recipientMutation;
           if (sourceConversation === "default") {
             await persistDraftNow(message, attachmentIds, sourceConversation);
@@ -3859,10 +3890,44 @@
     });
   };
 
+  const RESIZE_EDGE_PX = 16;
+  const resizeHitForPoint = (clientX, clientY) => {
+    const west = clientX <= RESIZE_EDGE_PX;
+    const east = clientX >= window.innerWidth - RESIZE_EDGE_PX;
+    const north = clientY <= RESIZE_EDGE_PX;
+    const south = clientY >= window.innerHeight - RESIZE_EDGE_PX;
+    if (north && west) return { direction: "NorthWest", cursor: "nwseResize", css: "nwse-resize" };
+    if (north && east) return { direction: "NorthEast", cursor: "neswResize", css: "nesw-resize" };
+    if (south && west) return { direction: "SouthWest", cursor: "neswResize", css: "nesw-resize" };
+    if (south && east) return { direction: "SouthEast", cursor: "nwseResize", css: "nwse-resize" };
+    if (north) return { direction: "North", cursor: "nsResize", css: "ns-resize" };
+    if (south) return { direction: "South", cursor: "nsResize", css: "ns-resize" };
+    if (east) return { direction: "East", cursor: "ewResize", css: "ew-resize" };
+    if (west) return { direction: "West", cursor: "ewResize", css: "ew-resize" };
+    return null;
+  };
+  let activeResizeCursor = "default";
+  const presentResizeCursor = (hit) => {
+    const cursor = hit?.cursor || "default";
+    document.documentElement.style.cursor = hit?.css || "";
+    if (cursor === activeResizeCursor) return;
+    activeResizeCursor = cursor;
+    const nativeWindow = tauri()?.window?.getCurrentWindow();
+    if (nativeWindow) void nativeWindow.setCursorIcon(cursor).catch(reportError);
+  };
+
   document.addEventListener("mousedown", (event) => {
     if (event.button !== 0) return;
     const nativeWindow = tauri()?.window?.getCurrentWindow();
     if (!nativeWindow) return;
+    const resizeRegion = event.target.closest?.("[data-resize-direction]");
+    const resizeHit = resizeHitForPoint(event.clientX, event.clientY);
+    const resizeDirection = resizeHit?.direction || resizeRegion?.dataset.resizeDirection;
+    if (resizeDirection) {
+      event.preventDefault();
+      void nativeWindow.startResizeDragging(resizeDirection).catch(reportError);
+      return;
+    }
     const toolbar = event.target.closest?.(".chrome");
     const control = event.target.closest?.("button, input, textarea, select, a, [contenteditable], form");
     if (toolbar && !control) {
@@ -3870,6 +3935,11 @@
       void nativeWindow.startDragging().catch(reportError);
     }
   });
+
+  document.addEventListener("pointermove", (event) => {
+    presentResizeCursor(resizeHitForPoint(event.clientX, event.clientY));
+  });
+  document.addEventListener("pointerleave", () => presentResizeCursor(null));
 
   const boot = async () => {
     const status = document.getElementById("startup-status");

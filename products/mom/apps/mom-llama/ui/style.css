@@ -17,7 +17,7 @@
   --sidebar-width: 256px;
   --settings-width: clamp(320px, 30vw, 400px);
   --content-width: 780px;
-  --toolbar-height: 38px;
+  --toolbar-height: 64px;
   --titlebar-leading-inset: 6px;
   font-family: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -125,13 +125,26 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   user-select: none;
 }
 
-.chrome .icon-button { width: 30px; height: 30px; flex: 0 0 30px; }
+.chrome .icon-button { width: 40px; height: 40px; flex: 0 0 40px; }
 html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 76px; }
-/* AppKit centers its window buttons at 16pt; keep the 38pt toolbar's
-   controls on that axis while retaining the existing pane top edge. */
-html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bottom: 6px; }
-.chrome .icon { width: 18px; height: 18px; }
+.chrome .icon { width: 20px; height: 20px; }
 .titlebar-drag-surface { position: relative; flex: 1; height: 100%; min-width: 28px; }
+
+/* WebKit can win pointer hit testing at an overlay window's outermost pixels.
+   Explicit regions keep the native resize gesture and cursor discoverable. */
+.window-resize-region { position: fixed; z-index: 1000; }
+.window-resize-north, .window-resize-south { left: 18px; right: 18px; height: 12px; cursor: ns-resize; }
+.window-resize-east, .window-resize-west { top: 18px; bottom: 18px; width: 12px; cursor: ew-resize; }
+.window-resize-north { top: 0; }
+.window-resize-south { bottom: 0; }
+.window-resize-east { right: 0; }
+.window-resize-west { left: 0; }
+.window-resize-north-east, .window-resize-north-west,
+.window-resize-south-east, .window-resize-south-west { width: 20px; height: 20px; }
+.window-resize-north-east { top: 0; right: 0; cursor: nesw-resize; }
+.window-resize-north-west { top: 0; left: 0; cursor: nwse-resize; }
+.window-resize-south-east { right: 0; bottom: 0; cursor: nwse-resize; }
+.window-resize-south-west { left: 0; bottom: 0; cursor: nesw-resize; }
 
 .icon-button, .round-button, .send-button {
   display: inline-grid;
@@ -1262,16 +1275,13 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .llama-ui-shell {
   --message-blue: #0a84ff;
   --message-blue-deep: #0877e6;
-  --glass-fill: color-mix(in srgb, var(--surface-raised) 46%, transparent);
-  --glass-edge: color-mix(in srgb, white 48%, var(--border));
-  --glass-glyph: color-mix(in srgb, var(--text) 78%, #4e84a8 22%);
+  --glass-fill: color-mix(in srgb, var(--surface-raised) 72%, transparent);
+  --glass-edge: color-mix(in srgb, var(--text) 16%, transparent);
+  --glass-glyph: color-mix(in srgb, var(--text) 94%, transparent);
   --glass-shadow:
-    0 10px 26px rgba(0, 0, 0, .14),
-    0 2px 7px rgba(0, 0, 0, .08),
-    inset 0 1px 0 rgba(255, 255, 255, .72),
-    inset 1px 0 0 rgba(113, 201, 255, .22),
-    inset -1px 0 0 rgba(213, 163, 255, .13),
-    inset 0 -1px 0 rgba(20, 38, 58, .12);
+    0 4px 14px rgba(0, 0, 0, .07),
+    0 1px 3px rgba(0, 0, 0, .05),
+    inset 0 1px 0 rgba(255, 255, 255, .82);
 }
 
 .llama-ui-shell[data-theme="light"] {
@@ -1281,16 +1291,13 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
   --surface-raised: rgba(255, 255, 255, .82);
   --surface-active: rgba(210, 210, 216, .74);
   --border: rgba(60, 60, 67, .16);
-  --glass-fill: rgba(240, 247, 253, .38);
-  --glass-edge: rgba(255, 255, 255, .88);
-  --glass-glyph: #315f7d;
+  --glass-fill: rgba(255, 255, 255, .62);
+  --glass-edge: rgba(60, 60, 67, .18);
+  --glass-glyph: #1d1d1f;
   --glass-shadow:
-    0 10px 26px rgba(39, 58, 78, .13),
-    0 2px 7px rgba(39, 58, 78, .08),
-    inset 0 1px 0 rgba(255, 255, 255, .96),
-    inset 1px 0 0 rgba(101, 196, 255, .28),
-    inset -1px 0 0 rgba(207, 151, 255, .15),
-    inset 0 -1px 0 rgba(64, 86, 108, .13);
+    0 4px 14px rgba(0, 0, 0, .055),
+    0 1px 3px rgba(0, 0, 0, .04),
+    inset 0 1px 0 rgba(255, 255, 255, .98);
 }
 @media (prefers-color-scheme: light) {
   .llama-ui-shell[data-theme="system"] {
@@ -1300,16 +1307,13 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
     --surface-raised: rgba(255, 255, 255, .82);
     --surface-active: rgba(210, 210, 216, .74);
     --border: rgba(60, 60, 67, .16);
-    --glass-fill: rgba(240, 247, 253, .38);
-    --glass-edge: rgba(255, 255, 255, .88);
-    --glass-glyph: #315f7d;
+    --glass-fill: rgba(255, 255, 255, .62);
+    --glass-edge: rgba(60, 60, 67, .18);
+    --glass-glyph: #1d1d1f;
     --glass-shadow:
-      0 10px 26px rgba(39, 58, 78, .13),
-      0 2px 7px rgba(39, 58, 78, .08),
-      inset 0 1px 0 rgba(255, 255, 255, .96),
-      inset 1px 0 0 rgba(101, 196, 255, .28),
-      inset -1px 0 0 rgba(207, 151, 255, .15),
-      inset 0 -1px 0 rgba(64, 86, 108, .13);
+      0 4px 14px rgba(0, 0, 0, .055),
+      0 1px 3px rgba(0, 0, 0, .04),
+      inset 0 1px 0 rgba(255, 255, 255, .98);
   }
 }
 
@@ -1337,13 +1341,11 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer .round-button,
 .composer .send-button {
   color: var(--glass-glyph);
-  border: 0;
+  border: 1px solid var(--glass-edge);
   background:
-    radial-gradient(circle at 27% 16%, rgba(255, 255, 255, .72), transparent 34%),
-    linear-gradient(145deg,
-      color-mix(in srgb, var(--glass-fill) 48%, #bfe5fb 52%),
-      color-mix(in srgb, var(--glass-fill) 66%, #91c7e8 34%) 58%,
-      color-mix(in srgb, var(--glass-fill) 72%, #699bc0 28%));
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--glass-fill) 78%, white 22%),
+      color-mix(in srgb, var(--glass-fill) 94%, transparent));
   background-clip: border-box;
   box-shadow: var(--glass-shadow);
   -webkit-backdrop-filter: blur(24px) saturate(1.65) brightness(1.06);
@@ -1354,10 +1356,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .composer .round-button:hover,
 .composer .send-button:hover:not(:disabled) {
   background:
-    radial-gradient(circle at 27% 16%, rgba(255, 255, 255, .98), transparent 33%),
-    linear-gradient(145deg,
-      color-mix(in srgb, var(--glass-fill) 62%, white 38%),
-      color-mix(in srgb, var(--glass-fill) 70%, #86c9f5 30%));
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--glass-fill) 64%, white 36%),
+      color-mix(in srgb, var(--glass-fill) 90%, var(--surface) 10%));
   transform: translateY(-1px);
 }
 
@@ -1373,7 +1374,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 
 .composer .send-button:disabled {
   color: color-mix(in srgb, var(--muted) 76%, transparent);
-  opacity: .82;
+  opacity: .54;
   cursor: default;
 }
 
@@ -1522,17 +1523,12 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .send-button { width: 40px; height: 40px; }
 .composer-right .send-button { flex-basis: 40px; }
 .composer .send-button[type="submit"]:not(:disabled) {
-  color: #086dbb;
+  color: var(--glass-glyph);
   background:
-    radial-gradient(circle at 28% 16%, rgba(255, 255, 255, .7), transparent 34%),
-    linear-gradient(145deg, rgba(157, 218, 255, .82), rgba(83, 168, 231, .62) 58%, rgba(57, 126, 202, .56));
-  box-shadow:
-    0 10px 24px rgba(35, 105, 170, .18),
-    0 2px 7px rgba(35, 105, 170, .1),
-    inset 0 1px 0 rgba(255, 255, 255, .94),
-    inset 1px 0 0 rgba(113, 207, 255, .42),
-    inset -1px 0 0 rgba(191, 166, 255, .2),
-    inset 0 -1px 0 rgba(42, 98, 150, .16);
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--glass-fill) 72%, white 28%),
+      color-mix(in srgb, var(--glass-fill) 94%, transparent));
+  box-shadow: var(--glass-shadow);
 }
 
 @media (max-width: 700px) {

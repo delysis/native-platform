@@ -649,6 +649,15 @@ pub fn run() {
     let exit_allowed = Arc::new(AtomicBool::new(false));
     let event_exit_allowed = Arc::clone(&exit_allowed);
     let app = tauri::Builder::default()
+        // A second bundle path still has the same product identity. Stop it
+        // before it can independently ask Keychain to unlock Mom's store.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // can bypass `RunEvent::ExitRequested`. Mom owns a regular Cmd+Q menu
         // command so graceful quit always enters the composed shutdown path.
@@ -1206,6 +1215,21 @@ mod tests {
         assert!(index.contains("startup-status"));
         assert!(index.contains("startup-retry"));
         assert!(script.contains("await invoke(\"mom_llama_runtime_initialize\")"));
+    }
+
+    #[test]
+    fn a_second_bundle_path_cannot_open_the_secure_store_again() {
+        let main = include_str!("main.rs");
+        let plugin = main
+            .find(".plugin(tauri_plugin_single_instance::init")
+            .expect("single-instance plugin");
+        let builder = main
+            .find(".build(tauri::generate_context!())")
+            .expect("Tauri build");
+
+        assert!(plugin < builder);
+        assert!(main.contains("app.get_webview_window(\"main\")"));
+        assert!(main.contains("window.set_focus()"));
     }
 
     #[test]

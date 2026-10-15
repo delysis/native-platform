@@ -206,6 +206,8 @@ fn probe_on_device_recognition(observed_at_unix_ms: u64) -> SpeechBackendDescrip
                 long_form: false,
                 hotwords: true,
                 generative: false,
+                acoustic_turn_events: false,
+                semantic_end_of_utterance: false,
                 accepted_audio: vec![AcceptedAudio::Pcm],
             }),
             availability,

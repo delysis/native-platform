@@ -77,7 +77,7 @@ test("an unresolved To entry cannot create or dispatch a conversation", async ()
       getElementById: () => ({ value: "gab", focus: () => { focused = true; }, setAttribute: (key) => { invalid = key === "aria-invalid"; } }),
     },
     autocompleteAccepting: false,
-    filterRecipientOptions() {},
+    filterRecipientOptions() {}, exactRecipientOption: () => null,
     reportError(error) { throw error; },
     invoke: () => { throw new Error("Unselected contact must not reach native dispatch"); },
   };

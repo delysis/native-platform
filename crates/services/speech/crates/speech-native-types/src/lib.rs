@@ -625,6 +625,24 @@ pub struct SpeechAlignment {
     pub kind: AlignmentGranularity,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEventKind {
+    SpeechStarted,
+    SpeechStopped,
+    EndOfUtterance,
+    Backchannel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnEvent {
+    pub sequence: u64,
+    pub observed_ms: u64,
+    pub kind: TurnEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranscriptionEvent {
@@ -641,6 +659,10 @@ pub enum TranscriptionEvent {
         request_id: SpeechRequestId,
         sequence: u64,
         segment: TranscriptSegment,
+    },
+    Turn {
+        request_id: SpeechRequestId,
+        event: TurnEvent,
     },
     UsageUpdated {
         request_id: SpeechRequestId,
@@ -1022,6 +1044,10 @@ pub struct TranscriptionCapabilities {
     pub hotwords: bool,
     #[serde(default)]
     pub generative: bool,
+    #[serde(default)]
+    pub acoustic_turn_events: bool,
+    #[serde(default)]
+    pub semantic_end_of_utterance: bool,
     #[serde(default)]
     pub accepted_audio: Vec<AcceptedAudio>,
 }

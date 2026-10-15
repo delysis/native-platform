@@ -1539,7 +1539,30 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             }
             div id="command-status" class="command-status is-hidden" role="status" aria-live="polite" {}
             output id="command-output" class="sr-command-output" aria-hidden="true" tabindex="-1" {}
+            @for (direction, cursor) in [
+                ("North", "nsResize"), ("South", "nsResize"),
+                ("East", "ewResize"), ("West", "ewResize"),
+                ("NorthEast", "neswResize"), ("SouthWest", "neswResize"),
+                ("NorthWest", "nwseResize"), ("SouthEast", "nwseResize"),
+            ] {
+                div class=(format!("window-resize-region window-resize-{}", resize_direction_class(direction)))
+                    data-resize-direction=(direction) data-resize-cursor=(cursor) aria-hidden="true" {}
+            }
         }
+    }
+}
+
+fn resize_direction_class(direction: &str) -> &'static str {
+    match direction {
+        "North" => "north",
+        "South" => "south",
+        "East" => "east",
+        "West" => "west",
+        "NorthEast" => "north-east",
+        "NorthWest" => "north-west",
+        "SouthEast" => "south-east",
+        "SouthWest" => "south-west",
+        _ => unreachable!("fixed resize direction"),
     }
 }
 
@@ -1772,6 +1795,8 @@ fn recipients_header(
                                 data-cli="mom-llama conversation draft-recipients --recipient <id> --json"
                                 data-effect="mom_llama.effects.conversation_store.v1"
                                 data-action="recipient-add" data-recipient=(contact.id.clone())
+                                data-recipient-name=(contact.title.to_lowercase())
+                                data-recipient-handle=(contact.execution_profile.mention_handle.to_lowercase())
                                 data-search=(format!("{} {}", contact.title, contact.execution_profile.mention_handle).to_lowercase()) {
                                 (contact_avatar(&contact.id)) span { (contact.title.clone()) }
                             }
@@ -4131,6 +4156,8 @@ mod tests {
         assert!(html.contains(r#"data-persona-menu-target="true""#));
         assert!(html.contains(r#"aria-label="Collapse Contacts""#));
         assert!(html.contains(r#"data-action="persona-menu-open""#));
+        assert!(html.contains(r#"data-recipient-name="ad de jongh""#));
+        assert!(html.contains(r#"data-recipient-handle="ad""#));
         assert!(!html.contains(r#"data-sidebar-section="consult-groups""#));
         assert!(!html.contains(r#"id="sidebar-consult-group-list""#));
         assert!(html.contains("Bessel van der Kolk"));
