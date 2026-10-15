@@ -492,6 +492,14 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Close search",
     },
     ControlSpec {
+        affordance: "voice.call.open",
+        command: "mom_llama.voice_call_surface",
+        tauri_command: "client_only",
+        cli: "app-only; opens the local voice-call surface without starting an unqualified call",
+        effect: "mom_llama.effects.voice_call_surface.v1",
+        label: "Voice call",
+    },
+    ControlSpec {
         affordance: "conversation.rename",
         command: "mom_llama.conversation_rename",
         tauri_command: "mom_llama_conversation_rename",
@@ -1500,32 +1508,29 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             data-mcp-process-ui-supported=(mcp_process_ui_supported()) {
             (sidebar(conversations, personas, active.as_ref().map(|conversation| conversation.id.as_str())))
             header class="chrome" aria-label="Window toolbar" {
-                (button("conversation.new", Some("conversation-new"), "icon-button", false))
-                (button("conversation.search", Some("conversation-search-open"), "icon-button search-toggle", false))
-                form id="conversation-search-form" class="nav-search is-hidden"
-                    data-affordance="conversation.search"
-                    data-command="mom_llama.conversation_search"
-                    data-tauri-command="mom_llama_conversation_search"
-                    data-cli="mom-llama conversation search --query <text> --json"
-                    data-effect="mom_llama.effects.conversation_store.v1" {
-                    input name="query" placeholder="Search" aria-label="Search conversations"
-                        data-affordance="conversation.search.query"
-                        data-command="mom_llama.conversation_search"
-                        data-tauri-command="mom_llama_conversation_search"
-                        data-cli="mom-llama conversation search --query <text> --json"
-                        data-effect="mom_llama.effects.conversation_store.v1";
-                    button type="submit"
-                        class="icon-button search-submit"
+                div class="sidebar-titlebar-zone" {
+                    div class="titlebar-drag-surface" {}
+                    (button("conversation.search", Some("conversation-search-open"), "icon-button search-toggle", false))
+                    form id="conversation-search-form" class="nav-search is-hidden"
                         data-affordance="conversation.search"
                         data-command="mom_llama.conversation_search"
                         data-tauri-command="mom_llama_conversation_search"
                         data-cli="mom-llama conversation search --query <text> --json"
                         data-effect="mom_llama.effects.conversation_store.v1" {
-                        (icon_markup("search")) span class="sr-only" { "Search" }
+                        span class="search-field-icon" aria-hidden="true" { (icon_markup("search")) }
+                        input type="search" name="query" placeholder="Search" aria-label="Search conversations"
+                            data-affordance="conversation.search.query"
+                            data-command="mom_llama.conversation_search"
+                            data-tauri-command="mom_llama_conversation_search"
+                            data-cli="mom-llama conversation search --query <text> --json"
+                            data-effect="mom_llama.effects.conversation_store.v1";
                     }
-                    (button("conversation.search.close", Some("conversation-search-close"), "icon-button search-close", false))
                 }
-                div class="titlebar-drag-surface" {}
+                div class="chat-titlebar-zone" {
+                    (button("conversation.new", Some("conversation-new"), "icon-button", false))
+                    div class="titlebar-drag-surface" {}
+                    (button("voice.call.open", Some("voice-call-open"), "icon-button voice-call-toggle", false))
+                }
             }
             (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft), personas, recipients))
             (settings_sidebar(settings, models, personas, active.as_ref()))
@@ -1534,6 +1539,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (persona_context_menu())
             (persona_removal_modal())
             (attachment_library_modal())
+            (voice_call_modal())
             @if mcp_process_ui_supported() {
                 (tool_approval_modal())
             }
@@ -3146,6 +3152,44 @@ fn conversation_rename_modal() -> Markup {
     }
 }
 
+fn voice_call_modal() -> Markup {
+    let call = control("voice.call.open");
+    html! {
+        div id="voice-call-modal" class="modal-backdrop voice-call-backdrop is-hidden" hidden[true]
+            aria-hidden="true" {
+            section class="voice-call-dialog" role="dialog" aria-modal="true"
+                aria-labelledby="voice-call-title" data-voice-persona="" {
+                header class="voice-call-titlebar" {
+                    button type="button" class="icon-button" aria-label="Close" title="Close"
+                        data-affordance=(call.affordance) data-command=(call.command)
+                        data-tauri-command=(call.tauri_command) data-cli=(call.cli)
+                        data-effect=(call.effect) data-action="voice-call-close" {
+                        (icon_markup("x"))
+                    }
+                }
+                div class="voice-call-contact" {
+                    span id="voice-call-avatar" class="voice-call-avatar contact-avatar" aria-hidden="true" {
+                        (icon_markup("user-round"))
+                    }
+                    h2 id="voice-call-title" { "Call" }
+                    strong id="voice-call-name" { "Contact" }
+                    div class="voice-call-pulse" aria-hidden="true" {
+                        span {} span {} span {} span {} span {}
+                    }
+                }
+                footer class="voice-call-controls" {
+                    button type="button" class="icon-button voice-call-control call-end" title="End call"
+                        aria-label="End call" data-affordance=(call.affordance)
+                        data-command=(call.command) data-tauri-command=(call.tauri_command)
+                        data-cli=(call.cli) data-effect=(call.effect) data-action="voice-call-close" {
+                        (icon_markup("phone"))
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn persona_freeze_modal() -> Markup {
     let freeze = control("persona.freeze");
     html! {
@@ -3719,6 +3763,7 @@ fn icon_for_affordance(affordance: &str) -> Option<&'static str> {
         "conversation.new" => Some("square-pen"),
         "conversation.search" => Some("search"),
         "conversation.search.close" => Some("x"),
+        "voice.call.open" => Some("phone"),
         "conversation.import" => Some("database"),
         "conversation.export" => Some("download"),
         "mcp.status" | "mcp.configure" | "mcp.list_servers" | "mcp.list_tools"
@@ -3767,6 +3812,7 @@ fn icon_paths(name: &str) -> Markup {
         "settings" => r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#,
         "square-pen" => r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/>"#,
         "search" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
+        "phone" => r#"<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.69 2.8a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.33 1.84.56 2.8.69A2 2 0 0 1 22 16.92z"/>"#,
         "x" => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
         "plus" => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
         "arrow-up" => r#"<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>"#,

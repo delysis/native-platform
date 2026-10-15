@@ -294,11 +294,19 @@ mod tests {
         }
 
         let view = include_str!("view.rs");
+        assert_eq!(
+            view.matches("tauri_command: \"client_only\"").count(),
+            1,
+            "only one deliberately local UI command is admitted"
+        );
         for line in view.lines() {
             let Some(value) = line.trim().strip_prefix("tauri_command: \"") else {
                 continue;
             };
             let tauri_command = value.split_once('"').expect("quoted UI Tauri command").0;
+            if tauri_command == "client_only" {
+                continue;
+            }
             assert!(
                 classified.contains(tauri_command),
                 "UI command {tauri_command} must be classified"

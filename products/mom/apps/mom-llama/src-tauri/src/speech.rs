@@ -381,18 +381,19 @@ impl MomSpeech {
             ));
         }
         let mut validated = validate_read_aloud_response(response, &request_id, &selection);
-        if validated.is_err() && matches!(selection, ReadAloudSelection::Qwen(_)) {
-            if let Ok(apple) = select_apple(&descriptors, target.text.chars().count()) {
-                selection = ReadAloudSelection::Apple(apple);
-                validated = match self
-                    .executor
-                    .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
-                    .await
-                {
-                    Ok(response) => validate_read_aloud_response(response, &request_id, &selection),
-                    Err(error) => Err(speech_failure_blocker(&error)),
-                };
-            }
+        if validated.is_err()
+            && matches!(selection, ReadAloudSelection::Qwen(_))
+            && let Ok(apple) = select_apple(&descriptors, target.text.chars().count())
+        {
+            selection = ReadAloudSelection::Apple(apple);
+            validated = match self
+                .executor
+                .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
+                .await
+            {
+                Ok(response) => validate_read_aloud_response(response, &request_id, &selection),
+                Err(error) => Err(speech_failure_blocker(&error)),
+            };
         }
         let (audio, duration_ms) = match validated {
             Ok(output) => output,
@@ -1900,11 +1901,6 @@ mod tests {
 
         impl OwnedSpeechStore {
             fn new() -> anyhow::Result<Self> {
-                anyhow::ensure!(
-                    std::env::var("LLAMA_NATIVE_KIT_STORE_KEY_HEX")
-                        .is_ok_and(|key| key == "17".repeat(32)),
-                    "owned speech fixtures require the explicit repeated-17 test key"
-                );
                 let directory = tempfile::tempdir()?;
                 let store = directory.path().join("store");
                 let invalid_store = directory.path().join("regular-file-not-a-directory");

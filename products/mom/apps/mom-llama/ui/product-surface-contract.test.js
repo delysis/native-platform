@@ -13,6 +13,7 @@ const viewProduction = view.split("#[cfg(test)]", 1)[0];
 const bridge = read("apps/mom-llama/ui/coop-hx.js");
 const index = read("apps/mom-llama/ui/index.html");
 const styles = read("apps/mom-llama/ui/style.css");
+const voiceQc = read("scripts/voice-sample-qc.mjs");
 const chatRuntime = read("crates/mom-llama-runtime/src/chat.rs");
 const attachmentRuntime = read("crates/mom-llama-runtime/src/attachments.rs");
 const configRuntime = read("crates/mom-llama-runtime/src/config.rs");
@@ -209,6 +210,32 @@ test("consult replies preserve visible persona identity in the Messages presenta
   assert.ok(styles.includes('.recipients-header[data-unsent="false"]'));
 });
 
+test("reasoning and generation expose an iMessage-style typing bubble", () => {
+  assert.ok(bridge.includes('indicator.className = "typing-indicator"'));
+  assert.ok(bridge.includes('indicator.setAttribute("aria-label", "Typing")'));
+  assert.ok(bridge.includes('content.querySelector(".typing-indicator")?.remove()'));
+  assert.ok(bridge.includes("appendLiveDelta(content, payload.delta)"));
+  assert.ok(styles.includes("@keyframes typing-pulse"));
+  assert.ok(styles.includes("@media (prefers-reduced-motion: reduce)"));
+});
+
+test("startup follows the system appearance before the application shell loads", () => {
+  const lightMedia = styles.indexOf("@media (prefers-color-scheme: light)");
+  const lightRoot = styles.indexOf(":root {", lightMedia);
+  assert.ok(lightMedia >= 0 && lightRoot > lightMedia);
+  assert.ok(styles.slice(lightRoot, lightRoot + 500).includes("--bg: #fafafa"));
+  assert.ok(styles.includes('.llama-ui-shell[data-theme="dark"]'));
+  assert.ok(styles.includes("body {\n  overflow: hidden;\n  background: var(--bg)"));
+});
+
+test("voice reference screening measures signal quality without claiming identity", () => {
+  assert.ok(voiceQc.includes("estimated_snr_db"));
+  assert.ok(voiceQc.includes("clipped_sample_fraction"));
+  assert.ok(voiceQc.includes("recording_context_unclassified"));
+  assert.ok(voiceQc.includes("ranking heuristic, not a laboratory SNR measurement"));
+  assert.ok(voiceQc.includes("listening_review"));
+});
+
 test("the composer keeps a glass send affordance anchored while its readiness changes", () => {
   assert.ok(viewProduction.includes('class="send-button"'));
   assert.ok(viewProduction.includes('data-model-ready=(readiness.enabled)'));
@@ -252,6 +279,50 @@ test("window chrome is centered and every native resize edge is discoverable", (
   assert.ok(bridge.includes("nativeWindow.startResizeDragging(resizeDirection)"));
   assert.ok(bridge.includes("nativeWindow.setCursorIcon(cursor)"));
   assert.ok(bridge.includes("pointerleave"));
+});
+
+test("titlebar gives search to the sidebar and voice identity to the chat", () => {
+  const sidebarZone = viewProduction.slice(
+    viewProduction.indexOf('div class="sidebar-titlebar-zone"'),
+    viewProduction.indexOf('div class="chat-titlebar-zone"'),
+  );
+  const chatZoneStart = viewProduction.indexOf('div class="chat-titlebar-zone"');
+  const chatZone = viewProduction.slice(
+    chatZoneStart,
+    viewProduction.indexOf('(chat_view_with_draft', chatZoneStart),
+  );
+
+  assert.ok(sidebarZone.includes('conversation-search-open'));
+  assert.ok(sidebarZone.includes('class="search-field-icon"'));
+  assert.ok(sidebarZone.includes('input type="search"'));
+  assert.ok(!sidebarZone.includes('class="icon-button search-submit"'));
+  assert.ok(!sidebarZone.includes('conversation-search-close'));
+  assert.ok(!sidebarZone.includes('voice-call-open'));
+  assert.ok(chatZone.includes('conversation-new'));
+  assert.ok(chatZone.includes('voice-call-open'));
+  assert.ok(viewProduction.includes('id="voice-call-modal"'));
+  assert.ok(viewProduction.includes('data-voice-persona=""'));
+  assert.ok(viewProduction.includes('aria-label="End call"'));
+  assert.ok(!viewProduction.includes('aria-label="Microphone"'));
+  assert.ok(bridge.includes("const openVoiceCallSurface = () =>"));
+  assert.ok(bridge.includes("modal.dataset.voicePersona = recipientId"));
+  assert.ok(bridge.includes('.sidebar-titlebar-zone")?.classList.toggle("searching", enabled)'));
+  assert.ok(styles.includes(".chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }"));
+  assert.ok(styles.includes("left: calc(var(--sidebar-width) + 50px)"));
+  assert.ok(styles.includes("height: min(520px, calc(100dvh - 24px))"));
+  assert.ok(styles.includes("@media (max-height: 600px)"));
+});
+
+test("chat messages use quiet symmetric Messages bubbles", () => {
+  const bubbleStart = styles.indexOf(".message-row.user .message-card {", styles.indexOf("/* Messages-inspired consultation surface. */"));
+  const bubbleEnd = styles.indexOf(".message-row.assistant > .message-actions", bubbleStart);
+  const bubbles = styles.slice(bubbleStart, bubbleEnd);
+
+  assert.ok(bubbles.includes("border-radius: 18px"));
+  assert.ok(bubbles.includes("background: var(--message-blue)"));
+  assert.ok(bubbles.includes("box-shadow: none"));
+  assert.ok(!bubbles.includes("20px 20px 6px 20px"));
+  assert.ok(!bubbles.includes("20px 20px 20px 6px"));
 });
 
 test("read aloud keeps lifecycle controls accessible without implementation prose", () => {

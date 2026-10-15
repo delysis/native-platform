@@ -52,6 +52,7 @@
     ],
     "service-speech": [
       "speech-native-backend-parakeet",
+      "speech-native-backend-qwen",
       "speech-native-host",
       "speech-native-platform",
       "speech-native-router",
@@ -152,6 +153,7 @@
       "loom-macos-shortcut",
       "mom-llama-app",
       "speech-native-backend-parakeet",
+      "speech-native-backend-qwen",
       "speech-native-platform"
     ],
     "platform-windows": [
@@ -179,6 +181,7 @@
       "mom-llama-app",
       "mom-llama-runtime",
       "speech-native-backend-parakeet",
+      "speech-native-backend-qwen",
       "speech-native-platform"
     ],
     "release": [

@@ -979,7 +979,7 @@ pub fn resolve_data_dir() -> PathBuf {
             .join("share")
             .join("llama-native-kit")
             .join(if insecure_development_store_enabled() {
-                "mom-llama-development"
+                "mom-llama-development-mom1-v1"
             } else {
                 "mom-llama"
             });
@@ -987,7 +987,7 @@ pub fn resolve_data_dir() -> PathBuf {
     std::env::temp_dir()
         .join("llama-native-kit")
         .join(if insecure_development_store_enabled() {
-            "mom-llama-development"
+            "mom-llama-development-mom1-v1"
         } else {
             "mom-llama"
         })

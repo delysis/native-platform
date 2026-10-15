@@ -947,6 +947,26 @@
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
   };
 
+  const openVoiceCallSurface = () => {
+    const modal = document.getElementById("voice-call-modal");
+    const recipient = document.querySelector(".recipients-header .recipient-chip");
+    if (!modal || !recipient) return;
+    const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
+    const recipientId = recipient.dataset.recipientId || "";
+    const sourceAvatar = recipient.querySelector(".contact-avatar");
+    const targetAvatar = modal.querySelector("#voice-call-avatar");
+    if (sourceAvatar && targetAvatar) {
+      targetAvatar.className = sourceAvatar.className.replace(/\bcontact-avatar\b/g, "").trim();
+      targetAvatar.classList.add("contact-avatar", "voice-call-avatar");
+      targetAvatar.setAttribute("style", sourceAvatar.getAttribute("style") || "");
+      targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
+    }
+    modal.dataset.voicePersona = recipientId;
+    setText("voice-call-name", name);
+    setModalVisibility("voice-call-modal", true);
+    modal.querySelector('[data-action="voice-call-close"]')?.focus();
+  };
+
   const setText = (id, value) => {
     const element = document.getElementById(id);
     if (element) element.textContent = value == null ? "" : String(value);
@@ -1586,6 +1606,7 @@
     if (list) list.classList.toggle("is-hidden", enabled);
     if (results) results.classList.toggle("is-hidden", !enabled);
     document.querySelector(".search-toggle")?.classList.toggle("is-hidden", enabled);
+    document.querySelector(".sidebar-titlebar-zone")?.classList.toggle("searching", enabled);
     if (enabled) {
       shell()?.classList.add("sidebar-open");
       form?.querySelector("input[name='query']")?.focus();
@@ -2042,6 +2063,30 @@
     return stream;
   };
 
+  const createTypingIndicator = () => {
+    const indicator = document.createElement("span");
+    indicator.className = "typing-indicator";
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-label", "Typing");
+    indicator.append(
+      document.createElement("span"),
+      document.createElement("span"),
+      document.createElement("span"),
+    );
+    return indicator;
+  };
+
+  const appendLiveDelta = (content, delta) => {
+    if (!content) return;
+    content.querySelector(".typing-indicator")?.remove();
+    content.append(document.createTextNode(delta || ""));
+    keepLiveTailVisible(content);
+  };
+
+  const finishLiveMessage = (row) => {
+    row?.querySelector(".typing-indicator")?.remove();
+  };
+
   const appendLiveMessage = (role, content, id) => {
     const stream = ensureMessageStream();
     if (!stream) return null;
@@ -2074,7 +2119,11 @@
     }
     const visibleContent = document.createElement("div");
     visibleContent.className = "live-content";
-    visibleContent.textContent = content;
+    if (role === "assistant" && !content) {
+      visibleContent.appendChild(createTypingIndicator());
+    } else {
+      visibleContent.textContent = content;
+    }
     card.appendChild(visibleContent);
     article.appendChild(card);
     stream.appendChild(article);
@@ -2182,10 +2231,7 @@
     }
     if (payload.event === "delta") {
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
-      if (content) {
-        content.textContent += payload.delta || "";
-        keepLiveTailVisible(content);
-      }
+      appendLiveDelta(content, payload.delta);
     }
     if (payload.event === "reasoning_delta") {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
@@ -2202,6 +2248,7 @@
       }
     }
     if (["completed", "cancelled", "failed"].includes(payload.event)) {
+      finishLiveMessage(document.getElementById(`live-assistant-${payload.request_id}`));
       releaseChatBusy(chatRequestLease(payload));
     }
   };
@@ -2246,14 +2293,12 @@
     const row = document.getElementById(mentionLiveId(payload));
     if (payload.event === "delta") {
       const content = row?.querySelector(".live-content");
-      if (content) {
-        content.textContent += payload.delta || "";
-        keepLiveTailVisible(content);
-      }
+      appendLiveDelta(content, payload.delta);
     }
     const terminal = payload.state && ["completed", "cancelled", "failed"].includes(payload.state);
     if (["completed", "cancelled", "failed"].includes(payload.event) || terminal) {
       releaseChatBusy(lease);
+      finishLiveMessage(row);
       row?.querySelector(".mention-stop")?.remove();
       row?.setAttribute("data-state", payload.state || payload.event);
     }
@@ -2712,6 +2757,8 @@
     "conversation-list": async () => refreshConversationProjection(),
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
+    "voice-call-open": async () => openVoiceCallSurface(),
+    "voice-call-close": async () => setModalVisibility("voice-call-modal", false),
     "conversation-select": async (button) => {
       if (button.dataset.conversation === selectedConversation()) {
         openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
@@ -3460,6 +3507,11 @@
     if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
       event.preventDefault();
       setSearchMode(false);
+    }
+    if (event.key === "Escape" && event.target.closest("#voice-call-modal")) {
+      event.preventDefault();
+      setModalVisibility("voice-call-modal", false);
+      document.querySelector('[data-action="voice-call-open"]')?.focus();
     }
     if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
       const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
