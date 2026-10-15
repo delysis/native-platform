@@ -30,8 +30,10 @@ const MOM_SPEECH_CLIENT_ID: &str = "mom-llama";
 const MAX_ACTIVE_SPEECH_OPERATIONS: usize = 4;
 const MAX_PENDING_CANCELS: usize = 32;
 const MAX_PLAYBACKS: usize = 2;
+const MAX_PRECOMMIT_AUDIO: usize = 2;
 const MAX_COMPLETE_WAV_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARACTERS: usize = 200_000;
+const MAX_PRECOMMIT_CHARACTERS: usize = 3_000;
 
 /// Apple's wrapper produces a complete WAV in one synchronous native call.
 /// Stop suppresses publication and playback immediately, but cannot pre-empt
@@ -49,6 +51,7 @@ enum SpeechPhase {
 enum OperationKind {
     ReadAloud,
     Transcription,
+    PrecommitSynthesis,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +66,12 @@ struct PlaybackAudio {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct PrecommitAudio {
+    binding: PrecommitSpeechBinding,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct SpeechState {
     phase: SpeechPhase,
@@ -70,6 +79,7 @@ struct SpeechState {
     early_cancel: BTreeSet<String>,
     early_cancel_order: VecDeque<String>,
     playback: BTreeMap<String, PlaybackAudio>,
+    precommit_audio: BTreeMap<String, PrecommitAudio>,
 }
 
 impl Default for SpeechState {
@@ -80,6 +90,7 @@ impl Default for SpeechState {
             early_cancel: BTreeSet::new(),
             early_cancel_order: VecDeque::new(),
             playback: BTreeMap::new(),
+            precommit_audio: BTreeMap::new(),
         }
     }
 }
@@ -171,6 +182,30 @@ pub struct ReadAloudBinding {
 pub struct ReadAloudOutput {
     pub playback_id: String,
     pub binding: ReadAloudBinding,
+}
+
+/// Provenance for speech synthesized before a chat message exists. It has no
+/// message identifier by design; callers must bind and retrieve by operation,
+/// exact input text digest, and the admitted backend descriptor digest.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrecommitSpeechBinding {
+    pub operation: String,
+    pub conversation_id: String,
+    pub text_sha256: String,
+    pub backend_id: String,
+    pub backend_descriptor_sha256: String,
+    pub model_id: String,
+    pub voice_id: String,
+    pub request_id: String,
+    pub wav_sha256: String,
+    pub wav_bytes: u64,
+    pub duration_ms: Option<u64>,
+    pub network: NetworkBehavior,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrecommitSpeechOutput {
+    pub binding: PrecommitSpeechBinding,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -469,6 +504,172 @@ impl MomSpeech {
         ))
     }
 
+    /// Synthesizes a bounded reply for the exact persona represented by this
+    /// conversation, before a chat message is committed. The audio is retained
+    /// only in this runtime's opaque-operation registry.
+    pub async fn synthesize_precommit(
+        &self,
+        conversation_id: &str,
+        operation: &str,
+        text: &str,
+    ) -> anyhow::Result<CommandResult<PrecommitSpeechOutput>> {
+        validate_operation_token(operation)?;
+        let character_count = text.chars().count();
+        if text.trim().is_empty() || character_count > MAX_PRECOMMIT_CHARACTERS {
+            return Ok(blocked(
+                "mom_llama.speech_precommit_synthesize",
+                Blocker::new(
+                    "speech_precommit_text_invalid",
+                    "Pre-commit speech requires non-empty text within the local synthesis bound.",
+                    Vec::new(),
+                ),
+            ));
+        }
+        let voice_id = match conversation_persona_voice(conversation_id)? {
+            Ok(voice_id) => voice_id,
+            Err(blocker) => {
+                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+            }
+        };
+        let descriptors = self.executor.descriptors()?;
+        let selection = match select_read_aloud(
+            &descriptors,
+            character_count,
+            Some(&voice_id),
+            true,
+        ) {
+            Ok(ReadAloudSelection::Qwen(selection)) => ReadAloudSelection::Qwen(selection),
+            Ok(ReadAloudSelection::Apple(_)) => {
+                return Ok(blocked(
+                    "mom_llama.speech_precommit_synthesize",
+                    speech_unavailable(
+                        "Pre-commit voice synthesis requires the selected consultant's local Qwen voice.",
+                    ),
+                ));
+            }
+            Err(blocker) => {
+                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+            }
+        };
+        let ReadAloudSelection::Qwen(qwen) = &selection else {
+            unreachable!("pre-commit synthesis selected Qwen above")
+        };
+        let request_id = SpeechRequestId(format!("mom-precommit-{operation}"));
+        if let Err(blocker) = self.begin_operation(
+            operation,
+            request_id.clone(),
+            OperationKind::PrecommitSynthesis,
+        ) {
+            return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+        }
+        let response = match self
+            .executor
+            .synthesize(precommit_synthesis_request(
+                text,
+                &selection,
+                request_id.clone(),
+            ))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let cancelled = self.finish_operation(operation, &request_id);
+                return Ok(blocked(
+                    "mom_llama.speech_precommit_synthesize",
+                    if cancelled {
+                        speech_cancelled_blocker()
+                    } else {
+                        speech_failure_blocker(&error)
+                    },
+                ));
+            }
+        };
+        let current_voice = conversation_persona_voice(conversation_id).inspect_err(|_| {
+            self.finish_operation(operation, &request_id);
+        })?;
+        if !matches!(current_voice, Ok(ref current) if current == &qwen.voice_id) {
+            self.finish_operation(operation, &request_id);
+            return Ok(blocked(
+                "mom_llama.speech_precommit_synthesize",
+                Blocker::new(
+                    "speech_precommit_stale",
+                    "The conversation's selected persona changed before its audio was ready.",
+                    Vec::new(),
+                ),
+            ));
+        }
+        let (audio, duration_ms) =
+            match validate_read_aloud_response(response, &request_id, &selection) {
+                Ok(output) => output,
+                Err(blocker) => {
+                    self.finish_operation(operation, &request_id);
+                    return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+                }
+            };
+        let binding = PrecommitSpeechBinding {
+            operation: operation.to_string(),
+            conversation_id: conversation_id.to_string(),
+            text_sha256: sha256_hex(text.as_bytes()),
+            backend_id: qwen.descriptor.id.clone(),
+            backend_descriptor_sha256: qwen.descriptor_sha256.clone(),
+            model_id: qwen.model_id.clone(),
+            voice_id: qwen.voice_id.clone(),
+            request_id: request_id.0.clone(),
+            wav_sha256: sha256_hex(&audio),
+            wav_bytes: u64::try_from(audio.len()).unwrap_or(u64::MAX),
+            duration_ms,
+            network: NetworkBehavior::Never,
+        };
+        if let Err(blocker) =
+            self.publish_precommit_audio(operation, &request_id, binding.clone(), audio)
+        {
+            return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+        }
+        Ok(CommandResult::passed(
+            "mom_llama.speech_precommit_synthesize",
+            "host_integrated",
+            PrecommitSpeechOutput {
+                binding: binding.clone(),
+            },
+            Vec::new(),
+            vec![
+                format!("conversation:{}", binding.conversation_id),
+                format!("text-sha256:{}", binding.text_sha256),
+                format!("speech-backend:{}", binding.backend_id),
+                format!("voice:{}", binding.voice_id),
+            ],
+            true,
+            false,
+        ))
+    }
+
+    pub fn precommit_audio_bytes(
+        &self,
+        operation: &str,
+        text_sha256: &str,
+        backend_descriptor_sha256: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        validate_operation_token(operation)?;
+        validate_sha256(text_sha256)?;
+        validate_sha256(backend_descriptor_sha256)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mom speech playback state is unavailable"))?;
+        let prepared = state
+            .precommit_audio
+            .get(operation)
+            .ok_or_else(|| anyhow::anyhow!("Prepared speech operation is unavailable"))?;
+        if prepared.binding.text_sha256 != text_sha256
+            || prepared.binding.backend_descriptor_sha256 != backend_descriptor_sha256
+        {
+            anyhow::bail!(
+                "Prepared speech bytes do not match the requested text and descriptor binding"
+            );
+        }
+        Ok(prepared.bytes.clone())
+    }
+
     pub async fn transcribe_attachment(
         &self,
         conversation_id: &str,
@@ -707,6 +908,7 @@ impl MomSpeech {
                     active.cancelled = true;
                     active.request_id.clone()
                 });
+                playback_released |= state.precommit_audio.remove(operation).is_some();
                 if request_id.is_none() && state.phase == SpeechPhase::Running {
                     remember_early_cancel(&mut state, operation);
                 }
@@ -752,6 +954,7 @@ impl MomSpeech {
             }
             state.phase = SpeechPhase::Quiescing;
             state.playback.clear();
+            state.precommit_audio.clear();
             state
                 .active
                 .values_mut()
@@ -826,6 +1029,13 @@ impl MomSpeech {
             return Err(Blocker::new(
                 "speech_operation_duplicate",
                 "That opaque speech operation identifier is already active.",
+                Vec::new(),
+            ));
+        }
+        if state.precommit_audio.contains_key(operation) {
+            return Err(Blocker::new(
+                "speech_operation_duplicate",
+                "That opaque speech operation identifier already owns prepared audio.",
                 Vec::new(),
             ));
         }
@@ -940,6 +1150,57 @@ impl MomSpeech {
             .insert(playback_id.clone(), PlaybackAudio { binding, bytes });
         Ok(playback_id)
     }
+
+    fn publish_precommit_audio(
+        &self,
+        operation: &str,
+        request_id: &SpeechRequestId,
+        binding: PrecommitSpeechBinding,
+        bytes: Vec<u8>,
+    ) -> Result<(), Blocker> {
+        if binding.operation != operation
+            || binding.request_id != request_id.0
+            || binding.wav_sha256 != sha256_hex(&bytes)
+            || usize::try_from(binding.wav_bytes).ok() != Some(bytes.len())
+        {
+            self.finish_operation(operation, request_id);
+            return Err(speech_provenance_mismatch(
+                "Prepared speech bytes did not match their operation binding.",
+            ));
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            Blocker::new(
+                "speech_state_unavailable",
+                "Mom speech operation state is unavailable.",
+                Vec::new(),
+            )
+        })?;
+        let cancelled = state.phase != SpeechPhase::Running
+            || state
+                .active
+                .get(operation)
+                .is_none_or(|active| active.request_id != *request_id || active.cancelled);
+        if state
+            .active
+            .get(operation)
+            .is_some_and(|active| active.request_id == *request_id)
+        {
+            state.active.remove(operation);
+        }
+        if cancelled {
+            return Err(speech_cancelled_blocker());
+        }
+        while state.precommit_audio.len() >= MAX_PRECOMMIT_AUDIO {
+            let Some(oldest) = state.precommit_audio.keys().next().cloned() else {
+                break;
+            };
+            state.precommit_audio.remove(&oldest);
+        }
+        state
+            .precommit_audio
+            .insert(operation.to_string(), PrecommitAudio { binding, bytes });
+        Ok(())
+    }
 }
 
 fn assistant_message_target(
@@ -997,6 +1258,36 @@ fn assistant_message_target(
         // Qwen Base ICL route; generic speech keeps the VoiceDesign route.
         .map(|key| format!("mom.qwen.icl.{key}")),
     }))
+}
+
+fn conversation_persona_voice(conversation_id: &str) -> anyhow::Result<Result<String, Blocker>> {
+    let conversations = mom_llama_runtime::conversation_list()?;
+    let Some(conversation) = conversations
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .find(|conversation| conversation.id == conversation_id)
+    else {
+        return Ok(Err(Blocker::new(
+            "conversation_not_found",
+            "The requested conversation is unavailable.",
+            Vec::new(),
+        )));
+    };
+    let persona_key = persona_voice_key_for_conversation(
+        &conversation.recipient_ids,
+        conversation.source_conversation_id.as_deref(),
+    );
+    Ok(persona_key.map_or_else(
+        || {
+            Err(Blocker::new(
+                "speech_precommit_persona_required",
+                "Pre-commit audio requires a conversation with one exact consultant persona.",
+                Vec::new(),
+            ))
+        },
+        |key| Ok(format!("mom.qwen.icl.{key}")),
+    ))
 }
 
 fn persona_voice_key_for_conversation<'a>(
@@ -1171,6 +1462,36 @@ fn read_aloud_request(
         ),
         input: SynthesisInput::Text {
             text: target.text.clone(),
+        },
+        voice: VoiceSelector::Exact { voice_id },
+        language: Some(READ_ALOUD_LANGUAGE.to_string()),
+        rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
+        output: AudioOutputFormat::Wav,
+        alignment: AlignmentGranularity::None,
+        stream: false,
+    }
+}
+
+fn precommit_synthesis_request(
+    text: &str,
+    selection: &ReadAloudSelection,
+    request_id: SpeechRequestId,
+) -> SynthesisRequest {
+    let voice_id = selection.voice_id();
+    SynthesisRequest {
+        context: request_context(
+            request_id,
+            SpeechRouteSelector::ExactBackend {
+                backend_id: selection.backend_id().to_string(),
+                model_id: selection.model_id(),
+                voice_id: Some(voice_id.clone()),
+            },
+            240_000,
+        ),
+        input: SynthesisInput::Text {
+            text: text.to_string(),
         },
         voice: VoiceSelector::Exact { voice_id },
         language: Some(READ_ALOUD_LANGUAGE.to_string()),
@@ -1423,6 +1744,13 @@ fn validate_operation_token(operation: &str) -> anyhow::Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
         anyhow::bail!("speech operation token must be 8-64 opaque ASCII identifier bytes");
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> anyhow::Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("speech binding hash must be a 64-character hexadecimal SHA-256 value");
     }
     Ok(())
 }
@@ -2056,6 +2384,79 @@ mod tests {
                 )
                 .expect("unchanged exact message"),
             b"RIFF"
+        );
+    }
+
+    #[test]
+    fn precommit_audio_is_bound_to_opaque_operation_text_and_descriptor() {
+        let speech = MomSpeech::empty_for_tests();
+        let operation = "precommit-1234";
+        let request_id = SpeechRequestId("request-precommit-1234".to_string());
+        let audio = b"RIFFprecommit-audio".to_vec();
+        let text_sha256 = sha256_hex(b"Hello from this persona.");
+        let descriptor_sha256 = sha256_hex(b"exact qwen descriptor");
+        speech
+            .begin_operation(
+                operation,
+                request_id.clone(),
+                OperationKind::PrecommitSynthesis,
+            )
+            .expect("operation admitted");
+        speech
+            .publish_precommit_audio(
+                operation,
+                &request_id,
+                PrecommitSpeechBinding {
+                    operation: operation.to_string(),
+                    conversation_id: "persona-gabor_mate-chat".to_string(),
+                    text_sha256: text_sha256.clone(),
+                    backend_id: QWEN_BACKEND_ID.to_string(),
+                    backend_descriptor_sha256: descriptor_sha256.clone(),
+                    model_id: QWEN_ICL_MODEL_ID.to_string(),
+                    voice_id: "mom.qwen.icl.gabor_mate".to_string(),
+                    request_id: request_id.0.clone(),
+                    wav_sha256: sha256_hex(&audio),
+                    wav_bytes: u64::try_from(audio.len()).expect("audio length"),
+                    duration_ms: Some(700),
+                    network: NetworkBehavior::Never,
+                },
+                audio.clone(),
+            )
+            .expect("audio published");
+
+        assert_eq!(
+            speech
+                .precommit_audio_bytes(operation, &text_sha256, &descriptor_sha256)
+                .expect("exact retrieval"),
+            audio
+        );
+        assert!(
+            speech
+                .precommit_audio_bytes(
+                    operation,
+                    &sha256_hex(b"different text"),
+                    &descriptor_sha256
+                )
+                .is_err()
+        );
+        assert!(
+            speech
+                .precommit_audio_bytes(operation, &text_sha256, &sha256_hex(b"changed descriptor"))
+                .is_err()
+        );
+        assert!(
+            speech
+                .precommit_audio_bytes("precommit-5678", &text_sha256, &descriptor_sha256)
+                .is_err()
+        );
+        assert!(
+            speech
+                .begin_operation(
+                    operation,
+                    SpeechRequestId("request-precommit-replay".to_string()),
+                    OperationKind::PrecommitSynthesis,
+                )
+                .is_err()
         );
     }
 

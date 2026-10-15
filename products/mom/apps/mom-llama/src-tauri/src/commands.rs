@@ -1253,6 +1253,25 @@ pub async fn mom_llama_speech_read_aloud(
 }
 
 #[tauri::command]
+pub async fn mom_llama_speech_precommit_synthesize(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    operation: String,
+    text: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_precommit_synthesize"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .synthesize_precommit(&conversation, &operation, &text)
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
+
+#[tauri::command]
 pub fn mom_llama_message_branches(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
@@ -1448,6 +1467,24 @@ pub async fn mom_llama_speech_audio(
                 &text_sha256,
                 &backend_descriptor_sha256,
             )
+            .map(Response::new)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_speech_precommit_audio(
+    runtime: State<'_, AppRuntimeHandle>,
+    operation: String,
+    text_sha256: String,
+    backend_descriptor_sha256: String,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_precommit_audio"))?;
+    let speech = runtime.speech();
+    blocking_response(lease, move || {
+        speech
+            .precommit_audio_bytes(&operation, &text_sha256, &backend_descriptor_sha256)
+            .map_err(to_error)
             .map(Response::new)
     })
     .await

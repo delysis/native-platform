@@ -188,6 +188,8 @@ pub struct ChatSendOutput {
     pub reasoning_incomplete: bool,
     pub model_path: String,
     pub duration_ms: u128,
+    #[serde(default)]
+    pub first_token_ms: Option<u128>,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cache_id: Option<String>,
@@ -618,13 +620,16 @@ where
     }
     let started = Instant::now();
     let model_path = settings.model_path.clone().unwrap_or_default();
+    let phone_call = input.message.starts_with("[Phone call]");
+    let voice_note = input.message.starts_with("[Voice note]");
     let (
-        assistant_text,
+        mut assistant_text,
         reasoning_content,
         reasoning_incomplete,
         prompt_tokens,
         completion_tokens,
         duration_ms,
+        first_token_ms,
         cache_id,
         cache_reused,
     ) = if options.fake_fixture {
@@ -635,6 +640,7 @@ where
             messages.iter().map(|message| message.content.len()).sum(),
             3,
             started.elapsed().as_millis(),
+            None,
             None,
             false,
         )
@@ -713,8 +719,14 @@ where
         } else {
             (None, false)
         };
-        let sampling =
+        let mut sampling =
             settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
+        if phone_call || voice_note {
+            sampling.max_tokens = sampling.max_tokens.min(if phone_call { 64 } else { 96 });
+            if !sampling.stop.iter().any(|stop| stop == "\n\n") {
+                sampling.stop.push("\n\n".to_string());
+            }
+        }
         let build_request = |cached_prefix: Option<SequenceStateBlob>| GenerationRequest {
             request_id: request_id.clone(),
             model_id: status.model_id.clone(),
@@ -808,12 +820,21 @@ where
             output.metrics.prompt_tokens,
             output.metrics.completion_tokens,
             output.metrics.duration_ms,
+            output.metrics.first_token_ms,
             attempted_cache_id.filter(|_| cache_reused),
             cache_reused,
         )
     };
     if stream.arbitrate_terminal() {
         return stream.finish_cancelled();
+    }
+    if phone_call || voice_note {
+        assistant_text = assistant_text
+            .split("\n\n")
+            .next()
+            .unwrap_or(&assistant_text)
+            .trim()
+            .to_string();
     }
     if assistant_text.trim().is_empty() {
         return Ok(empty_native_response_result(
@@ -907,6 +928,7 @@ where
             model_path.display().to_string()
         },
         duration_ms,
+        first_token_ms,
         prompt_tokens,
         completion_tokens,
         cache_id,
@@ -1271,9 +1293,22 @@ where
                         .map_err(ChatTicketError::Callback)?;
                     }
                 }
-                // Native state is not a product terminal. The lifecycle owner emits
-                // exactly one terminal after the generation ticket has been joined.
-                GenerationEventKind::State { .. } => {}
+                // Native state is not a product terminal. Expose only latency
+                // milestones; the lifecycle owner still emits the sole terminal.
+                GenerationEventKind::State { state } => {
+                    let stage = match state {
+                        GenerationState::Prefilling => Some("prefill_started"),
+                        GenerationState::Generating => Some("decode_started"),
+                        _ => None,
+                    };
+                    if let Some(stage) = stage {
+                        emit(
+                            on_event,
+                            stream_event(request_id, conversation_id, stage, None, None, options),
+                        )
+                        .map_err(ChatTicketError::Callback)?;
+                    }
+                }
                 GenerationEventKind::Warning { code, message } => emit(
                     on_event,
                     stream_event(

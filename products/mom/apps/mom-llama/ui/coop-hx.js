@@ -463,6 +463,15 @@
       panel,
       button,
     };
+    await new Promise((resolve, reject) => {
+      if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return resolve();
+      audio.addEventListener("loadeddata", resolve, { once: true });
+      audio.addEventListener("error", reject, { once: true });
+      audio.load();
+    });
+    if (button.dataset.personaVoice === "true") markVoiceLatency("playable");
+    row.hidden = false;
+    row.classList.remove("voice-reply-pending");
     audio.addEventListener("ended", () => {
       if (activeSpeechPlayback?.audio === audio) {
         void stopSpeechPlayback().then(() => {
@@ -471,13 +480,15 @@
         }).catch(reportError);
       }
     });
-    await audio.play().catch(() => {});
+    if (button.dataset.prepareOnly !== "true") await audio.play().catch(() => {});
+    delete button.dataset.prepareOnly;
   };
 
   const playCallReply = async (conversation, message) => {
     const operation = speechOperationToken();
     let retainedPlayback = null;
     try {
+      markVoiceLatency("tts_started");
       const response = await invoke("mom_llama_speech_read_aloud", {
         conversation,
         message,
@@ -485,6 +496,7 @@
         requirePersonaVoice: true,
       });
       report(response);
+      markVoiceLatency("tts_finished");
       if (response?.status === "blocked" || !response?.result) return false;
       const result = response.result;
       retainedPlayback = result.playback_id;
@@ -511,6 +523,7 @@
       });
       try {
         await audio.play();
+        markVoiceLatency("playback_started");
       } catch (_) {
         if (activeSpeechPlayback?.audio === audio) activeSpeechPlayback = null;
         URL.revokeObjectURL(url);
@@ -818,9 +831,12 @@
       const card = next.querySelector(".message-card");
       if (!button || !card) return;
       button.dataset.personaVoice = "true";
+      button.dataset.prepareOnly = "true";
       button.classList.add("voice-reply-play");
       card.replaceChildren(button, waveform());
       next.querySelector(".message-actions")?.remove();
+      next.classList.add("voice-reply-pending");
+      next.hidden = true;
     });
   };
 
@@ -1114,6 +1130,117 @@
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
   };
 
+  const stopCallBed = async () => {
+    const bed = voiceCallAudio;
+    voiceCallAudio = null;
+    if (!bed) return;
+    window.clearInterval(bed.ringTimer);
+    for (const node of bed.nodes || []) {
+      try { node.stop?.(); } catch (_) {}
+      try { node.disconnect?.(); } catch (_) {}
+    }
+    await bed.context?.close?.().catch(() => {});
+  };
+
+  const startCallRinging = async (epoch) => {
+    await stopCallBed();
+    const context = new AudioContext();
+    await context.resume();
+    const gain = context.createGain();
+    gain.gain.value = 0.035;
+    gain.connect(context.destination);
+    const ring = () => {
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      const now = context.currentTime;
+      for (const frequency of [440, 480]) {
+        const oscillator = context.createOscillator();
+        const envelope = context.createGain();
+        oscillator.frequency.value = frequency;
+        envelope.gain.setValueAtTime(0, now);
+        envelope.gain.linearRampToValueAtTime(0.4, now + 0.025);
+        envelope.gain.setValueAtTime(0.4, now + 0.34);
+        envelope.gain.linearRampToValueAtTime(0, now + 0.42);
+        oscillator.connect(envelope).connect(gain);
+        oscillator.start(now);
+        oscillator.stop(now + 0.44);
+      }
+    };
+    ring();
+    voiceCallAudio = { context, ringTimer: window.setInterval(ring, 1250), nodes: [] };
+  };
+
+  const beginCallNoiseFloor = async (epoch) => {
+    await stopCallBed();
+    if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+    const context = new AudioContext();
+    await context.resume();
+    const frames = Math.max(1, Math.floor(context.sampleRate * 2));
+    const buffer = context.createBuffer(1, frames, context.sampleRate);
+    const samples = buffer.getChannelData(0);
+    let previous = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const white = Math.random() * 2 - 1;
+      previous = previous * 0.82 + white * 0.18;
+      samples[index] = previous;
+    }
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    const filter = context.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = 1800;
+    filter.Q.value = 0.42;
+    const gain = context.createGain();
+    gain.gain.value = 0.0045;
+    source.connect(filter).connect(gain).connect(context.destination);
+    source.start();
+    const pickup = context.createOscillator();
+    const pickupGain = context.createGain();
+    pickup.frequency.value = 190;
+    pickupGain.gain.setValueAtTime(0.045, context.currentTime);
+    pickupGain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.09);
+    pickup.connect(pickupGain).connect(context.destination);
+    pickup.start();
+    pickup.stop(context.currentTime + 0.1);
+    voiceCallAudio = { context, ringTimer: null, nodes: [source, filter, gain, pickup, pickupGain] };
+  };
+
+  const playPreparedCallSpeech = async (epoch, conversation, text) => {
+    const operation = speechOperationToken();
+    markVoiceLatency("tts_started", { purpose: "call_greeting" });
+    const response = await invoke("mom_llama_speech_precommit_synthesize", {
+      conversation,
+      operation,
+      text,
+    });
+    report(response);
+    markVoiceLatency("tts_finished", { purpose: "call_greeting" });
+    if (voiceCallEpoch !== epoch || !voiceCallActive || response?.status === "blocked" || !response?.result) return false;
+    await beginCallNoiseFloor(epoch);
+    const binding = response.result.binding;
+    const bytes = ipcBinaryBytes(await invoke("mom_llama_speech_precommit_audio", {
+      operation,
+      textSha256: binding.text_sha256,
+      backendDescriptorSha256: binding.backend_descriptor_sha256,
+    }), 64 * 1024 * 1024, "Call greeting audio");
+    if (voiceCallEpoch !== epoch || await sha256Hex(bytes) !== binding.wav_sha256) return false;
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+    const audio = new Audio(url);
+    audio.preload = "auto";
+    try {
+      await audio.play();
+      markVoiceLatency("playback_started", { purpose: "call_greeting" });
+      await new Promise((resolve, reject) => {
+        audio.addEventListener("ended", resolve, { once: true });
+        audio.addEventListener("error", reject, { once: true });
+      });
+      return voiceCallEpoch === epoch && voiceCallActive;
+    } finally {
+      URL.revokeObjectURL(url);
+      await invoke("mom_llama_speech_stop", { operation }).catch(() => {});
+    }
+  };
+
   const openVoiceCallSurface = async () => {
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
@@ -1132,21 +1259,39 @@
     setText("voice-call-name", name);
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
+    const epoch = {};
+    voiceCallEpoch = epoch;
+    voiceCallActive = true;
     try {
+      let conversation = selectedConversation();
+      if (conversation !== "default" && selectedConversationKind() === "persona_template") {
+        const instantiated = await instantiatePersona(conversation);
+        if (instantiated?.status === "blocked" || !instantiated?.result?.id) throw new Error("The call could not start.");
+        conversation = instantiated.result.id;
+        chat().dataset.currentConversation = conversation;
+        chat().dataset.conversationKind = "chat";
+      }
+      voiceCallConversation = conversation;
+      await startCallRinging(epoch);
+      const firstName = name.split(/\s+/u)[0] || name;
+      const answered = await playPreparedCallSpeech(epoch, conversation, `Hi Jan, it’s ${firstName}. What’s on your mind?`);
+      if (!answered || voiceCallEpoch !== epoch) throw new Error("The call was not answered.");
       await beginVoiceCapture({ call: true });
-      voiceCallActive = true;
     } catch (error) {
-      setModalVisibility("voice-call-modal", false);
+      if (voiceCallEpoch === epoch) await closeVoiceCallSurface();
       throw error;
     }
   };
 
   const closeVoiceCallSurface = async () => {
     voiceCallActive = false;
+    voiceCallEpoch = null;
+    voiceCallConversation = null;
     voiceReplyConversation = null;
     callReplyConversation = null;
     await stopVoiceCapture({ discard: true });
     await stopSpeechPlayback();
+    await stopCallBed();
     setModalVisibility("voice-call-modal", false);
   };
 
@@ -2362,10 +2507,29 @@
   let voiceReplyConversation = null;
   let callReplyConversation = null;
   let voiceCallActive = false;
+  let voiceCallEpoch = null;
+  let voiceCallAudio = null;
+  let voiceCallConversation = null;
   let pendingCallTranscript = null;
+  let voiceLatencyTrace = null;
   const activeDispatchStreamLeases = new Set();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
+
+  const markVoiceLatency = (stage, detail = {}) => {
+    if (!voiceLatencyTrace) voiceLatencyTrace = { id: crypto.randomUUID(), began_at: Date.now(), started: performance.now(), stages: [] };
+    voiceLatencyTrace.stages.push({ stage, elapsed_ms: Math.round(performance.now() - voiceLatencyTrace.started), ...detail });
+    if (["playable", "playback_started", "failed"].includes(stage)) {
+      const previous = JSON.parse(localStorage.getItem("mom-voice-latency-traces") || "[]");
+      localStorage.setItem("mom-voice-latency-traces", JSON.stringify([...previous.slice(-19), voiceLatencyTrace]));
+      console.info("voice-latency", voiceLatencyTrace);
+    }
+  };
+
+  const startVoiceLatency = (mode) => {
+    voiceLatencyTrace = { id: crypto.randomUUID(), mode, began_at: Date.now(), started: performance.now(), stages: [] };
+    markVoiceLatency("capture_started");
+  };
 
   const chatRequestIsCancellable = (busyLeases, streamLeases) => (
     [...streamLeases].some((lease) => (
@@ -2512,7 +2676,10 @@
   };
 
   const beginVoiceCapture = async ({ call = false } = {}) => {
-    if (voiceRecording || chatBusyLeases.size) return;
+    if (voiceRecording) throw new Error("Voice capture is already active.");
+    if (chatBusyLeases.size) throw new Error("Voice capture is waiting for the current reply.");
+    if (call && !voiceCallActive) throw new Error("The call has ended.");
+    startVoiceLatency(call ? "call" : "voice_note");
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
@@ -2522,7 +2689,7 @@
     const silence = context.createGain();
     silence.gain.value = 0;
     const chunks = [];
-    const recording = { stream, context, source, processor, silence, chunks, limit: null, call, heardVoice: false, silentMs: 0 };
+    const recording = { stream, context, source, processor, silence, chunks, limit: null, call, heardVoice: false, silentMs: 0, sending: false };
     processor.onaudioprocess = (event) => {
       const chunk = new Float32Array(event.inputBuffer.getChannelData(0));
       chunks.push(chunk);
@@ -2533,19 +2700,26 @@
       if (voiced) { recording.heardVoice = true; recording.silentMs = 0; }
       else if (recording.heardVoice) recording.silentMs += (chunk.length / context.sampleRate) * 1000;
       if (recording.heardVoice && recording.silentMs >= 900 && voiceRecording === recording) {
-        document.querySelector("[data-action='voice-message-send']")?.click();
+        recording.sending = true;
+        void sendVoiceCapture(recording).catch(reportError);
       }
     };
     source.connect(processor); processor.connect(silence); silence.connect(context.destination);
     voiceRecording = recording;
     voiceRecording.limit = window.setTimeout(() => {
-      document.querySelector("[data-action='voice-message-send']")?.click();
+      if (voiceRecording === recording && !recording.sending) {
+        recording.sending = true;
+        void sendVoiceCapture(recording).catch(reportError);
+      }
     }, 29000);
     if (!call) setVoiceRecordingVisible(true);
+    return recording;
   };
 
-  const sendVoiceCapture = async () => {
+  const sendVoiceCapture = async (expectedRecording = voiceRecording) => {
+    if (!expectedRecording || voiceRecording !== expectedRecording) return;
     const call = Boolean(voiceRecording?.call);
+    markVoiceLatency("capture_stopped");
     const samples = await stopVoiceCapture();
     if (!samples?.length) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
@@ -2553,7 +2727,7 @@
       return;
     }
     const form = document.getElementById("chat-form");
-    const sourceConversation = selectedConversation();
+    const sourceConversation = call && voiceCallConversation ? voiceCallConversation : selectedConversation();
     let conversation = sourceConversation;
     if (sourceConversation !== "default" && selectedConversationKind() === "persona_template") {
       const instantiated = await instantiatePersona(sourceConversation);
@@ -2563,7 +2737,9 @@
       chat().dataset.conversationKind = "chat";
     }
     const wav = encodePcmWav(samples);
+    markVoiceLatency("capture_encoded", { wav_bytes: wav.byteLength });
     const imported = await invoke("mom_llama_voice_message_import", { conversation, bytes: Array.from(wav) });
+    markVoiceLatency("import_finished");
     report(imported);
     if (imported?.status === "blocked") {
       if (voiceCallActive) await beginVoiceCapture({ call: true });
@@ -2598,7 +2774,6 @@
     cancelComposerAutocomplete({ native: true, announce: false });
     if (!call) {
       appendOptimisticVoiceMessage(wav);
-      appendLiveVoiceReply("live-voice-reply-pending");
     }
     currentForm?.requestSubmit();
   };
@@ -2641,16 +2816,23 @@
     const payload = event.payload || event;
     const voiceReply = voiceReplyConversation === activeDispatchConversation;
     const callReply = callReplyConversation === activeDispatchConversation;
+    if ((voiceReply || callReply) && ["prefill_started", "decode_started"].includes(payload.event)) {
+      markVoiceLatency(payload.event);
+    }
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
       document.getElementById("live-voice-reply-pending")?.remove();
-      if (callReply) return;
-      if (voiceReply) appendLiveVoiceReply(`live-assistant-${payload.request_id}`);
-      else appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
+      if (callReply || voiceReply) return;
+      appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
     }
     if (payload.event === "delta" && !voiceReply && !callReply) {
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
+    }
+    if (payload.event === "delta" && (voiceReply || callReply) && !voiceLatencyTrace?.firstDeltaSeen) {
+      if (!voiceLatencyTrace) startVoiceLatency(callReply ? "call" : "voice_note");
+      voiceLatencyTrace.firstDeltaSeen = true;
+      markVoiceLatency("first_content_delta");
     }
     if (payload.event === "reasoning_delta" && !voiceReply && !callReply) {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
@@ -2713,7 +2895,7 @@
     if (payload.event === "started") {
       acquireStableChatBusy(lease);
       document.getElementById("live-voice-reply-pending")?.remove();
-      if (!callReply) appendMentionMessage(payload, voiceReply);
+      if (!callReply && !voiceReply) appendMentionMessage(payload, false);
     }
     const row = document.getElementById(mentionLiveId(payload));
     if (payload.event === "delta" && !voiceReply && !callReply) {
@@ -3284,12 +3466,14 @@
       button.querySelector(".sr-only")?.replaceChildren("Stop reading");
       let retainedPlayback = null;
       try {
+        if (button.dataset.personaVoice === "true") markVoiceLatency("tts_started");
         const response = await invoke("mom_llama_speech_read_aloud", {
           conversation,
           message,
           operation,
           requirePersonaVoice: button.dataset.personaVoice === "true",
         });
+        if (button.dataset.personaVoice === "true") markVoiceLatency("tts_finished");
         report(response);
         if (response?.status === "blocked" || !response?.result) return;
         const result = response.result;
@@ -4040,9 +4224,10 @@
         }
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
+        const voiceDispatch = message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
         const attachmentIds = draftAttachmentIds(form);
         if (!message && !attachmentIds.length) return;
-        if (message.startsWith("[Voice note]") || message.startsWith("[Phone call]")) {
+        if (voiceDispatch) {
           form.querySelector("#composer-attachments")?.remove();
         }
         // Acquire the UI-side dispatch gate before the first await. Without
@@ -4103,7 +4288,15 @@
           closeMentions();
           let result;
           try {
+            if (voiceDispatch) markVoiceLatency("generation_dispatched");
             result = await invoke("mom_llama_chat_dispatch", { conversation, message });
+            if (voiceDispatch) {
+              const output = result?.result?.output;
+              markVoiceLatency("generation_finished", {
+                native_duration_ms: output?.duration_ms,
+                first_token_ms: output?.first_token_ms,
+              });
+            }
           } catch (error) {
             // Rust retains the saved draft until commit. Recovery must never
             // write through the renderer's possibly changed selection.

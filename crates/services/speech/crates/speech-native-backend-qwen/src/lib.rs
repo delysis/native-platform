@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use speech_native_types::{
     AudioOutputFormat, AudioOutputKind, CapabilityAvailability, CapabilityEvidence,
@@ -16,8 +17,9 @@ use speech_native_types::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +34,8 @@ pub const QWEN_ICL_MODEL_ID: &str = "qwen3-tts-1.7b-base-icl-mlx-audio";
 pub const QWEN_ICL_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-base-bf16";
 const ICL_VOICE_PREFIX: &str = "mom.qwen.icl.";
 const ICL_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const ICL_SAMPLE_RATE_HZ: u32 = 24_000;
+const ICL_MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const VOICE_DESCRIPTION: &str = "A warm, articulate, reassuring mature American woman with natural conversational rhythm and gentle humor. Speak like a trusted colleague, never like an announcer.";
 
 #[derive(Debug, Clone)]
@@ -87,6 +91,37 @@ pub struct QwenSpeechBackend {
     config: QwenBackendConfig,
     tasks: Arc<TaskSupervisor>,
     active: Arc<Mutex<HashMap<SpeechRequestId, Arc<AtomicBool>>>>,
+    icl_worker: Arc<Mutex<Option<ResidentIclWorker>>>,
+}
+
+struct ResidentIclWorker {
+    child: Child,
+    input: BufWriter<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    sample_rate_hz: u32,
+}
+
+#[derive(Serialize)]
+struct IclWorkerJob<'a> {
+    id: &'a str,
+    text: &'a str,
+    ref_audio: &'a str,
+    ref_text: &'a str,
+}
+
+#[derive(Deserialize)]
+struct IclWorkerMessage {
+    event: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    sample_rate: Option<u32>,
+    #[serde(default)]
+    samples: Option<u64>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 impl QwenSpeechBackend {
@@ -103,6 +138,7 @@ impl QwenSpeechBackend {
             config,
             tasks: Arc::new(TaskSupervisor::with_scope("qwen3-tts")),
             active: Arc::new(Mutex::new(HashMap::new())),
+            icl_worker: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -377,13 +413,24 @@ impl SpeechBackend for QwenSpeechBackend {
             })?
             .insert(request_id.clone(), Arc::clone(&cancelled));
         let active = Arc::clone(&self.active);
+        let icl_worker = Arc::clone(&self.icl_worker);
         let config = self.config.clone();
         let worker_id = request_id.clone();
         let cancellation = Arc::clone(&cancelled);
         self.tasks
             .spawn_blocking(format!("qwen-tts:{request_id}"), move || {
-                let result =
-                    synthesize_complete(&request, &config, &route, &cancellation, &events_tx);
+                let result = if request.stream {
+                    synthesize_streaming_icl(
+                        &request,
+                        &config,
+                        &route,
+                        &cancellation,
+                        &events_tx,
+                        &icl_worker,
+                    )
+                } else {
+                    synthesize_complete(&request, &config, &route, &cancellation, &events_tx)
+                };
                 let _ = match &result {
                     Ok(response) => events_tx.blocking_send(SynthesisEvent::Completed {
                         request_id: worker_id.clone(),
@@ -442,7 +489,11 @@ impl SpeechBackend for QwenSpeechBackend {
                 "qwen_shutdown_failed",
                 &e.to_string(),
             )
-        })
+        })?;
+        if let Ok(mut worker) = self.icl_worker.lock() {
+            worker.take();
+        }
+        Ok(())
     }
 }
 
@@ -474,8 +525,17 @@ fn validate_request(
             "Selected Qwen3 TTS route or its local assets are unavailable",
         ));
     }
-    if request.stream
-        || request.output != AudioOutputFormat::Wav
+    let valid_stream_output = request.output
+        == (AudioOutputFormat::Pcm {
+            format: speech_native_types::PcmFormat {
+                sample_rate_hz: ICL_SAMPLE_RATE_HZ,
+                channels: 1,
+                sample_format: speech_native_types::PcmSampleFormat::I16Le,
+                interleaved: true,
+            },
+        });
+    if (request.stream && (!is_icl_voice || !valid_stream_output))
+        || (!request.stream && request.output != AudioOutputFormat::Wav)
         || !matches!(request.input, SynthesisInput::Text { .. })
         || request.alignment != speech_native_types::AlignmentGranularity::None
     {
@@ -484,7 +544,7 @@ fn validate_request(
             "qwen_request_unsupported",
             SpeechErrorClass::Capability,
             false,
-            "Qwen3 TTS accepts plain text and returns one complete WAV",
+            "Qwen3 TTS accepts plain text; Base ICL streams 24 kHz mono PCM and other routes return WAV",
         ));
     }
     if let SpeechRouteSelector::ExactBackend {
@@ -663,6 +723,316 @@ fn synthesize_complete(
             ..SpeechUsage::default()
         },
     })
+}
+
+fn synthesize_streaming_icl(
+    request: &SynthesisRequest,
+    config: &QwenBackendConfig,
+    route: &SpeechResolvedRoute,
+    cancelled: &AtomicBool,
+    events: &mpsc::Sender<SynthesisEvent>,
+    worker_slot: &Mutex<Option<ResidentIclWorker>>,
+) -> Result<SynthesisResponse, SpeechError> {
+    let request_id = &request.context.request_id;
+    let voice_id = voice_id_from_selector(request).ok_or_else(|| {
+        SpeechError::invalid_request(
+            request_id,
+            "qwen_voice_mismatch",
+            "An exact persona voice is required",
+        )
+    })?;
+    let icl = config.icl.as_ref().ok_or_else(|| {
+        unavailable(
+            request_id,
+            "qwen_icl_unavailable",
+            "Local Qwen voice references are unavailable",
+        )
+    })?;
+    let (entry, clip) = resolve_icl_entry(icl, voice_id).ok_or_else(|| {
+        unavailable(
+            request_id,
+            "qwen_icl_reference_invalid",
+            "The selected local reference failed manifest, transcript, or hash validation",
+        )
+    })?;
+    let text = match &request.input {
+        SynthesisInput::Text { text } => text,
+        SynthesisInput::Ssml { .. } => unreachable!(),
+    };
+    events
+        .blocking_send(SynthesisEvent::Started {
+            request_id: request_id.clone(),
+            route: route.clone(),
+        })
+        .map_err(|_| cancelled_error(request_id))?;
+    let started = Instant::now();
+    let mut worker = worker_slot.lock().map_err(|_| {
+        unavailable(
+            request_id,
+            "qwen_icl_worker_state_unavailable",
+            "The resident Qwen worker is unavailable",
+        )
+    })?;
+    if worker.is_none() {
+        *worker = Some(ResidentIclWorker::start(icl, request_id)?);
+    }
+    let result = worker.as_mut().expect("worker initialized").synthesize(
+        request_id,
+        text,
+        &clip,
+        &entry.reference_transcript,
+        cancelled,
+        events,
+    );
+    if result.is_err() {
+        worker.take();
+    }
+    let sample_count = result?;
+    let duration_ms = sample_count.saturating_mul(1000) / u64::from(ICL_SAMPLE_RATE_HZ);
+    Ok(SynthesisResponse {
+        request_id: request_id.clone(),
+        route: route.clone(),
+        output: SynthesisOutput::Streamed {
+            format: request.output.clone(),
+            emitted_bytes: sample_count.saturating_mul(2),
+        },
+        duration_ms: Some(duration_ms),
+        alignments: Vec::new(),
+        usage: SpeechUsage {
+            output_audio_ms: Some(duration_ms),
+            input_characters: Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
+            total_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            provenance: UsageProvenance::Exact,
+            real_local_inference: true,
+            ..SpeechUsage::default()
+        },
+    })
+}
+
+impl ResidentIclWorker {
+    fn start(config: &QwenIclConfig, request_id: &SpeechRequestId) -> Result<Self, SpeechError> {
+        let mut child = Command::new(&config.python)
+            .arg("-u")
+            .arg("-c")
+            .arg(include_str!("qwen_icl_worker.py"))
+            .arg(&config.model_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| unavailable(request_id, "qwen_icl_launch_failed", &e.to_string()))?;
+        let input = child.stdin.take().ok_or_else(|| {
+            unavailable(
+                request_id,
+                "qwen_icl_launch_failed",
+                "Could not open resident worker input",
+            )
+        })?;
+        let output = child.stdout.take().ok_or_else(|| {
+            unavailable(
+                request_id,
+                "qwen_icl_launch_failed",
+                "Could not open resident worker output",
+            )
+        })?;
+        let mut worker = Self {
+            child,
+            input: BufWriter::new(input),
+            output: BufReader::new(output),
+            sample_rate_hz: 0,
+        };
+        let ready = worker.read_message(request_id)?;
+        if ready.event != "ready" || ready.sample_rate != Some(ICL_SAMPLE_RATE_HZ) {
+            return Err(unavailable(
+                request_id,
+                "qwen_icl_worker_protocol_error",
+                "The resident Qwen worker did not report the expected 24 kHz model",
+            ));
+        }
+        worker.sample_rate_hz = ICL_SAMPLE_RATE_HZ;
+        Ok(worker)
+    }
+
+    fn synthesize(
+        &mut self,
+        request_id: &SpeechRequestId,
+        text: &str,
+        clip: &Path,
+        transcript: &str,
+        cancelled: &AtomicBool,
+        events: &mpsc::Sender<SynthesisEvent>,
+    ) -> Result<u64, SpeechError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_error(request_id));
+        }
+        let clip_path = clip.to_string_lossy();
+        let job = IclWorkerJob {
+            id: request_id.0.as_str(),
+            text,
+            ref_audio: &clip_path,
+            ref_text: transcript,
+        };
+        serde_json::to_writer(&mut self.input, &job)
+            .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))?;
+        self.input
+            .write_all(b"\n")
+            .and_then(|()| self.input.flush())
+            .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))?;
+
+        let format = speech_native_types::PcmFormat {
+            sample_rate_hz: self.sample_rate_hz,
+            channels: 1,
+            sample_format: speech_native_types::PcmSampleFormat::I16Le,
+            interleaved: true,
+        };
+        let mut sequence = 0_u64;
+        let mut sample_offset = 0_u64;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(cancelled_error(request_id));
+            }
+            let message = self.read_message(request_id)?;
+            if message.id.as_deref().is_some_and(|id| id != request_id.0) {
+                return Err(unavailable(
+                    request_id,
+                    "qwen_icl_worker_protocol_error",
+                    "The resident Qwen worker returned audio for a different request",
+                ));
+            }
+            match message.event.as_str() {
+                "audio" => {
+                    if message.sample_rate != Some(self.sample_rate_hz) {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_audio_invalid",
+                            "Qwen returned an unexpected sample rate",
+                        ));
+                    }
+                    let encoded = message.data.as_deref().ok_or_else(|| {
+                        unavailable(
+                            request_id,
+                            "qwen_icl_audio_invalid",
+                            "Qwen returned an empty audio packet",
+                        )
+                    })?;
+                    let data = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|_| {
+                            unavailable(
+                                request_id,
+                                "qwen_icl_audio_invalid",
+                                "Qwen returned an invalid audio packet",
+                            )
+                        })?;
+                    if data.is_empty()
+                        || data.len() > ICL_MAX_CHUNK_BYTES
+                        || !data.len().is_multiple_of(2)
+                    {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_audio_invalid",
+                            "Qwen audio packet exceeded bounds or was misaligned",
+                        ));
+                    }
+                    let samples = u64::try_from(data.len() / 2).unwrap_or(u64::MAX);
+                    if message.samples != Some(samples) {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_audio_invalid",
+                            "Qwen audio packet sample count did not match its data",
+                        ));
+                    }
+                    let chunk = speech_native_types::AudioChunk {
+                        sequence,
+                        sample_offset,
+                        format: format.clone(),
+                        data,
+                        end_of_stream: false,
+                    };
+                    chunk.validate(request_id)?;
+                    events
+                        .blocking_send(SynthesisEvent::Audio {
+                            request_id: request_id.clone(),
+                            chunk,
+                        })
+                        .map_err(|_| cancelled_error(request_id))?;
+                    sequence = sequence.saturating_add(1);
+                    sample_offset = sample_offset.saturating_add(samples);
+                }
+                "done" => {
+                    if sample_offset == 0 {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_audio_empty",
+                            "Qwen returned no streaming audio",
+                        ));
+                    }
+                    events
+                        .blocking_send(SynthesisEvent::Audio {
+                            request_id: request_id.clone(),
+                            chunk: speech_native_types::AudioChunk {
+                                sequence,
+                                sample_offset,
+                                format,
+                                data: Vec::new(),
+                                end_of_stream: true,
+                            },
+                        })
+                        .map_err(|_| cancelled_error(request_id))?;
+                    return Ok(sample_offset);
+                }
+                "error" | "fatal" => {
+                    return Err(unavailable(
+                        request_id,
+                        "qwen_icl_synthesis_failed",
+                        message
+                            .detail
+                            .as_deref()
+                            .unwrap_or("The resident Qwen worker failed synthesis"),
+                    ));
+                }
+                _ => {
+                    return Err(unavailable(
+                        request_id,
+                        "qwen_icl_worker_protocol_error",
+                        "The resident Qwen worker returned an unknown event",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn read_message(
+        &mut self,
+        request_id: &SpeechRequestId,
+    ) -> Result<IclWorkerMessage, SpeechError> {
+        let mut line = String::new();
+        let bytes = self
+            .output
+            .read_line(&mut line)
+            .map_err(|e| unavailable(request_id, "qwen_icl_worker_read_failed", &e.to_string()))?;
+        if bytes == 0 || line.len() > ICL_MAX_CHUNK_BYTES * 2 {
+            return Err(unavailable(
+                request_id,
+                "qwen_icl_worker_protocol_error",
+                "The resident Qwen worker closed or exceeded protocol bounds",
+            ));
+        }
+        serde_json::from_str(&line).map_err(|_| {
+            unavailable(
+                request_id,
+                "qwen_icl_worker_protocol_error",
+                "The resident Qwen worker returned malformed protocol data",
+            )
+        })
+    }
+}
+
+impl Drop for ResidentIclWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn wav_duration_ms(bytes: &[u8]) -> Option<u64> {
@@ -849,13 +1219,13 @@ fn descriptor(
                 backend_id: QWEN_BACKEND_ID.into(),
                 model_id: Some(QWEN_ICL_MODEL_ID.into()),
                 operation: SpeechOperationCapability::Synthesis(SynthesisCapabilities {
-                    streaming_audio: false,
+                    streaming_audio: true,
                     ssml: false,
                     word_alignment: false,
                     phoneme_alignment: false,
                     pause_resume: false,
                     voice_selection: true,
-                    returned_audio: vec![AudioOutputKind::Wav],
+                    returned_audio: vec![AudioOutputKind::Wav, AudioOutputKind::Pcm],
                 }),
                 availability: icl_availability,
                 network: NetworkBehavior::Never,

@@ -86,15 +86,17 @@ const speechLifetimeHarness = () => {
   let automaticReplies = false;
   let automaticReadResult = null;
   const element = () => ({
-    dataset: {}, children: [], attributes: new Map(), isConnected: true,
+    dataset: {}, children: [], attributes: new Map(), isConnected: true, style: {}, clientWidth: 0,
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
+    replaceWith(replacement) { this.replacement = replacement; this.isConnected = false; },
     setAttribute(name, value) { this.attributes.set(name, value); },
     removeAttribute(name) { this.attributes.delete(name); },
     remove() { this.isConnected = false; },
   });
   const row = element();
   row.dataset.messageId = "fixture-message";
+  row.classList = { add() {}, remove() {} };
   const card = element();
   row.querySelector = () => card;
   const preview = element();
@@ -114,7 +116,11 @@ const speechLifetimeHarness = () => {
   transcribe.closest = () => preview;
   const context = {
     Blob, Uint8Array, ArrayBuffer,
-    document: { createElement: element },
+    HTMLMediaElement: { HAVE_CURRENT_DATA: 2 },
+    document: {
+      createElement: element,
+      createDocumentFragment: () => ({ children: [], append(child) { this.children.push(child); } }),
+    },
     selectedConversation: () => selected,
     speechOperationToken: () => `fixture-operation-${++serial}`,
     sha256Hex() { const reply = speechDeferred(); hashes.push(reply); if (automaticReplies) reply.resolve("fixture-wav"); return reply.promise; },
@@ -138,6 +144,9 @@ const speechLifetimeHarness = () => {
       const item = element();
       if (tag === "audio") {
         item.events = {};
+        // Production waits for decoded media before revealing/playable audio.
+        // The fixture represents bytes that are already ready to present.
+        item.readyState = 2;
         item.plays = 0;
         item.play = async () => { item.plays += 1; };
         item.pause = () => { item.paused = true; };
@@ -183,6 +192,7 @@ const speechLifetimeHarness = () => {
   } });
   const newReadButton = (message) => {
     const nextRow = element(); nextRow.dataset.messageId = message;
+    nextRow.classList = { add() {}, remove() {} };
     const nextCard = element(); nextRow.querySelector = () => nextCard;
     const nextButton = element(); nextButton.dataset.message = message;
     const nextLabel = element(); nextButton.querySelector = () => nextLabel;
@@ -197,7 +207,8 @@ const speechLifetimeHarness = () => {
   const finishPlayback = async (audioBytes = new Uint8Array([1, 2])) => {
     const started = await start(); started.read.reply.resolve(result());
     (await take("mom_llama_speech_audio")).reply.resolve(audioBytes);
-    (await hash()).resolve("fixture-wav"); await started.task;
+    (await hash()).resolve("fixture-wav");
+    await started.task;
     assert.equal(media.length, 1); assert.equal(media[0].plays, 1);
     return started;
   };

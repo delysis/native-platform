@@ -124,7 +124,7 @@ for (const outcome of ["blocked", "throw"]) {
   });
 }
 
-test("voice replies keep assistant text and reasoning hidden through synthesis failure", () => {
+test("voice replies do not create an incoming card or expose streamed text", () => {
   const events = [];
   const context = {
     voiceReplyConversation: "conversation-a",
@@ -142,12 +142,12 @@ test("voice replies keep assistant text and reasoning hidden through synthesis f
   vm.createContext(context);
   const start = source.indexOf("  const chatRequestLease =");
   const end = source.indexOf("\n  const mentionLiveId", start);
-  vm.runInContext(`${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r1" } });
   context.testOnChatEvent({ payload: { event: "delta", request_id: "r1", delta: "hidden assistant text" } });
   context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r1", delta: "hidden reasoning" } });
   context.testOnChatEvent({ payload: { event: "failed", request_id: "r1" } });
-  assert.deepEqual(events, [["voice", "live-assistant-r1"]]);
+  assert.deepEqual(events, []);
 });
 
 test("call replies suppress live text but still own the chat request lease", () => {
@@ -169,7 +169,7 @@ test("call replies suppress live text but still own the chat request lease", () 
   vm.createContext(context);
   const start = source.indexOf("  const chatRequestLease =");
   const end = source.indexOf("\n  const mentionLiveId", start);
-  vm.runInContext(`${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r-call" } });
   context.testOnChatEvent({ payload: { event: "delta", request_id: "r-call", delta: "hidden reply" } });
   context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r-call", delta: "hidden reasoning" } });
@@ -181,7 +181,7 @@ test("call replies suppress live text but still own the chat request lease", () 
   ]);
 });
 
-test("voice mention replies start as waveform cards and never append streamed text", () => {
+test("voice mention replies keep streamed text and cards hidden", () => {
   const rowClasses = [];
   const waveformNode = { kind: "waveform" };
   const playButton = { setAttribute() {} };
@@ -224,7 +224,7 @@ test("voice mention replies start as waveform cards and never append streamed te
   vm.runInContext(`${source.slice(dispatchStart, dispatchEnd)}\nthis.dispatch = onDispatchEvent;`, dispatchContext);
   dispatchContext.dispatch({ kind: "mention", event: { event: "started", invocation_id: "i", target_id: "p" } });
   dispatchContext.dispatch({ kind: "mention", event: { event: "delta", invocation_id: "i", target_id: "p", delta: "hidden text" } });
-  assert.deepEqual(calls, [["mention", true]]);
+  assert.deepEqual(calls, []);
 });
 
 test("runtime warm waits for paint and idle time before touching the model", () => {
