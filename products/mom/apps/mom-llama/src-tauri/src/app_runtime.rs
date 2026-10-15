@@ -693,7 +693,7 @@ impl AppRuntimeHandle {
             .ok_or_else(|| "Mom Llama has too many active operations".to_string())?;
         lifecycle.next_occurrence = occurrence;
         let native_request_id = (command.admission == AdmissionClass::Speculative)
-            .then(|| format!("mom-composer-autocomplete:{occurrence}"));
+            .then(|| format!("{}:{occurrence}", command.name));
         let cancellation = (command.class == CommandClass::LongOperation)
             .then(|| Arc::new(AtomicBool::new(false)));
         let supervised = if command.class == CommandClass::LongOperation {

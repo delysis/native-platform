@@ -376,10 +376,11 @@ pub async fn mom_llama_engine_check(runtime: State<'_, AppRuntimeHandle>) -> Res
 #[tauri::command]
 pub async fn mom_llama_runtime_warm(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
     let scope = runtime.operation_scope();
-    blocking_command(
-        runtime.admit(command_spec("mom_llama_runtime_warm"))?,
-        move || mom_llama_runtime::runtime_warm(&scope),
-    )
+    let lease = runtime.admit(command_spec("mom_llama_runtime_warm"))?;
+    let cancellation = lease.cancellation_control();
+    blocking_command(lease, move || {
+        mom_llama_runtime::runtime_warm_until_cancelled(&scope, cancellation.as_deref())
+    })
     .await
 }
 

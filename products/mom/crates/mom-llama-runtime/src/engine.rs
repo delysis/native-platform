@@ -10,6 +10,7 @@ use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
 use llama_native_types::{ChatMessage, ChatRole};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineCheckOptions {
@@ -73,10 +74,22 @@ fn persona_prefix_plan(
     })
 }
 
-/// Loads the configured model and materializes the stable system/persona
-/// prefixes while the shell is already usable. Conversation checkpoints remain
-/// content-addressed and are promoted by the normal chat path when selected.
+/// Restores the configured model and stable system/persona prefixes after the
+/// shell has painted. Both persona prefixes and conversation checkpoints are
+/// content-addressed on disk; existing entries are promoted instead of being
+/// recomputed, and recent conversations are promoted by the chat path when
+/// selected.
 pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<RuntimeWarmOutput>> {
+    runtime_warm_until_cancelled(scope, None)
+}
+
+pub fn runtime_warm_until_cancelled(
+    scope: &crate::OperationScope,
+    cancellation: Option<&AtomicBool>,
+) -> Result<CommandResult<RuntimeWarmOutput>> {
+    if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+        return Ok(runtime_warm_result(false, 0, 0));
+    }
     let settings = resolve_settings()?;
     let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
@@ -93,6 +106,9 @@ pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<Runti
     let mut ready = 0usize;
     let mut reused = 0usize;
     for persona in personas {
+        if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+            break;
+        }
         if persona.kind != ConversationKind::PersonaTemplate
             || !matches!(
                 persona.execution_profile.chat_template,
@@ -154,19 +170,27 @@ pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<Runti
             reused += usize::from(prefix.reused);
         }
     }
-    Ok(CommandResult::passed(
+    Ok(runtime_warm_result(true, ready, reused))
+}
+
+fn runtime_warm_result(
+    model_loaded: bool,
+    persona_prefixes_ready: usize,
+    persona_prefixes_reused: usize,
+) -> CommandResult<RuntimeWarmOutput> {
+    CommandResult::passed(
         "mom_llama.runtime_warm",
         "host_integrated",
         RuntimeWarmOutput {
-            model_loaded: true,
-            persona_prefixes_ready: ready,
-            persona_prefixes_reused: reused,
+            model_loaded,
+            persona_prefixes_ready,
+            persona_prefixes_reused,
         },
         Vec::new(),
         Vec::new(),
         true,
         false,
-    ))
+    )
 }
 
 pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
@@ -364,8 +388,9 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::{persona_prefix_plan, validate_model_path};
+    use super::{persona_prefix_plan, runtime_warm_until_cancelled, validate_model_path};
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn built_in_personas_without_skills_get_distinct_system_prefix_owners() {
@@ -413,6 +438,19 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn cancelled_background_warm_never_touches_the_model() {
+        let cancellation = AtomicBool::new(true);
+        let output =
+            runtime_warm_until_cancelled(&crate::OperationScope::detached(), Some(&cancellation))
+                .expect("cancelled warm should be a cheap successful no-op")
+                .result
+                .expect("cancelled warm output");
+        assert!(!output.model_loaded);
+        assert_eq!(output.persona_prefixes_ready, 0);
+        assert_eq!(output.persona_prefixes_reused, 0);
     }
 
     #[test]

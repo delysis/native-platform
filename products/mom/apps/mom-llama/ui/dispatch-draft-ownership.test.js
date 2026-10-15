@@ -194,8 +194,16 @@ test("voice mention replies start as waveform cards and never append streamed te
   assert.deepEqual(calls, [["mention", true]]);
 });
 
-test("runtime warm is launched after listeners without delaying the interactive shell", () => {
-  assert.match(source, /await listen\(\);[\s\S]*?void invoke\("mom_llama_runtime_warm"\)\.catch\(\(\) => \{\}\);/);
+test("runtime warm waits for paint and idle time before touching the model", () => {
+  const listen = source.indexOf("await listen();");
+  const firstPaint = source.indexOf("requestAnimationFrame", listen);
+  const secondPaint = source.indexOf("requestAnimationFrame", firstPaint + 1);
+  const idle = source.indexOf("requestIdleCallback", secondPaint);
+  const warm = source.indexOf('invoke("mom_llama_runtime_warm")', listen);
+  assert.ok(listen >= 0 && listen < firstPaint);
+  assert.ok(firstPaint < secondPaint && secondPaint < idle);
+  assert.ok(warm > listen);
+  assert.match(source.slice(listen, idle + 200), /setTimeout\([\s\S]*?, 1000\)/);
 });
 
 test("a send rejection remains visible while the user repairs or retries it", () => {

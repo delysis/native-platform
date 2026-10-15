@@ -80,6 +80,20 @@ const fn speculative(name: &'static str, uses_native: bool) -> CommandSpec {
     }
 }
 
+const fn speculative_mutation(name: &'static str, uses_native: bool) -> CommandSpec {
+    CommandSpec {
+        name,
+        class: CommandClass::LongOperation,
+        mutates_store: true,
+        starts_operation: true,
+        uses_gateway: false,
+        uses_native,
+        allowed_during_quiesce: false,
+        permission: "default",
+        admission: AdmissionClass::Speculative,
+    }
+}
+
 pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_app", false, true),
     read("mom_llama_render_chat_fragment", false, true),
@@ -110,7 +124,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     ),
     long("mom_llama_information_managed_removal_commit", true, false),
     long("mom_llama_engine_check", true, true),
-    long("mom_llama_runtime_warm", true, true),
+    speculative_mutation("mom_llama_runtime_warm", true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
     long("mom_llama_model_select", true, true),
@@ -394,6 +408,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_warm_is_preemptible_background_work() {
+        let warm = super::command_spec("mom_llama_runtime_warm");
+        assert_eq!(warm.admission, super::AdmissionClass::Speculative);
+        assert_eq!(warm.class, super::CommandClass::LongOperation);
+        assert!(warm.mutates_store);
+        assert!(warm.uses_native);
     }
 
     #[test]

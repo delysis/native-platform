@@ -61,6 +61,7 @@ pub use conversation_store::{
 };
 pub use engine::{
     EngineCheckOptions, RuntimeWarmOutput, engine_check, engine_status, runtime_warm,
+    runtime_warm_until_cancelled,
 };
 pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_status};
 pub use mcp::{

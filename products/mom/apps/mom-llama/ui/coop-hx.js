@@ -4377,9 +4377,20 @@
 
         sizeComposer();
         await listen();
-        // Keep startup interactive, then immediately make the actual resident
-        // model and stable persona prefixes ready before the first turn.
-        void invoke("mom_llama_runtime_warm").catch(() => {});
+        // Give WebKit two completed paints and an idle window before native
+        // model hydration competes for memory bandwidth. Prefixes and recent
+        // conversation checkpoints are persistent, so this normally restores
+        // prepared state instead of recomputing it.
+        const warm = () => void invoke("mom_llama_runtime_warm").catch(() => {});
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          window.setTimeout(() => {
+            if (typeof window.requestIdleCallback === "function") {
+              window.requestIdleCallback(warm, { timeout: 5000 });
+            } else {
+              warm();
+            }
+          }, 1000);
+        }));
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");
