@@ -24,7 +24,8 @@ use speech_native_types::{
     SpeechRouteSelector, SpeechUsage, SynthesisRequest, SynthesisTicket, TaskSupervisor,
     TaskSupervisorError, TimestampGranularity, TranscriptSegment, TranscriptionAudioSink,
     TranscriptionCapabilities, TranscriptionEvent, TranscriptionInput, TranscriptionRequest,
-    TranscriptionResponse, TranscriptionTask, TranscriptionTicket, UsageProvenance,
+    TranscriptionResponse, TranscriptionTask, TranscriptionTicket, TurnEvent, TurnEventKind,
+    UsageProvenance,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -1568,14 +1569,14 @@ fn append_delta(
     // parakeet-rs currently decodes one SentencePiece token at a time for EOU,
     // so its word-boundary marker can survive token decoding. It is model
     // metadata, not transcript text.
-    let clean = delta.replace("[EOU]", "").replace('▁', " ");
-    if clean.is_empty() {
-        return;
-    }
-    transcript.push_str(&clean);
     let observed = elapsed_ms(started_at);
-    first_result_ms.get_or_insert(observed);
-    if request.partial_results && event_sender.capacity() > 1 {
+    let end_of_utterance = delta.contains("[EOU]");
+    let clean = delta.replace("[EOU]", "").replace('▁', " ");
+    if !clean.is_empty() {
+        transcript.push_str(&clean);
+        first_result_ms.get_or_insert(observed);
+    }
+    if request.partial_results && !clean.is_empty() && event_sender.capacity() > 1 {
         // Partial text is cumulative and may be coalesced under pressure. Keep
         // one bounded slot reserved so a lifecycle terminal can never be
         // blocked behind unconsumed partials.
@@ -1583,6 +1584,20 @@ fn append_delta(
             request_id: request.context.request_id.clone(),
             sequence: *sequence,
             text: transcript.clone(),
+        });
+        if sent.is_ok() {
+            *sequence = sequence.saturating_add(1);
+        }
+    }
+    if end_of_utterance && event_sender.capacity() > 1 {
+        let sent = event_sender.try_send(TranscriptionEvent::Turn {
+            request_id: request.context.request_id.clone(),
+            event: TurnEvent {
+                sequence: *sequence,
+                observed_ms: observed,
+                kind: TurnEventKind::EndOfUtterance,
+                confidence: None,
+            },
         });
         if sent.is_ok() {
             *sequence = sequence.saturating_add(1);
@@ -1945,6 +1960,8 @@ fn descriptor(
                 long_form: true,
                 hotwords: false,
                 generative: false,
+                acoustic_turn_events: false,
+                semantic_end_of_utterance: true,
                 accepted_audio: vec![AcceptedAudio::Pcm, AcceptedAudio::Wav],
             }),
             availability,
@@ -2246,6 +2263,48 @@ mod tests {
             }
             changed.await;
         }
+    }
+
+    #[tokio::test]
+    async fn eou_is_a_typed_turn_event_and_never_transcript_text() {
+        let mut request = complete_pcm_request(Vec::new());
+        request.partial_results = true;
+        let (sender, mut receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+        let mut transcript = String::new();
+        let mut sequence = 0;
+        let mut first_result_ms = None;
+
+        append_delta(
+            &request,
+            "▁all done[EOU]",
+            &mut transcript,
+            &mut sequence,
+            &mut first_result_ms,
+            Instant::now(),
+            &sender,
+        );
+
+        assert_eq!(transcript, " all done");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TranscriptionEvent::Partial {
+                sequence: 0,
+                ref text,
+                ..
+            }) if text == " all done"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(TranscriptionEvent::Turn {
+                event: TurnEvent {
+                    sequence: 1,
+                    kind: TurnEventKind::EndOfUtterance,
+                    confidence: None,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

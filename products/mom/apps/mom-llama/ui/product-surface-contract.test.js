@@ -219,14 +219,39 @@ test("the composer keeps a glass send affordance anchored while its readiness ch
   assert.ok(bridge.includes('send.dataset.modelReady !== "true"'));
   assert.ok(bridge.includes("!composerHasSendableDraft(form)"));
   assert.ok(!bridge.includes('send.classList.toggle("is-hidden", busy)'));
-  assert.ok(styles.includes("radial-gradient(circle at 27% 16%"));
+  const glassControls = styles.slice(
+    styles.indexOf(".chrome .icon-button,\n.composer .round-button"),
+    styles.indexOf(".sidebar-section-toggle", styles.indexOf(".chrome .icon-button,\n.composer .round-button")),
+  );
+  assert.ok(glassControls.includes("border: 1px solid var(--glass-edge)"));
+  assert.ok(glassControls.includes("linear-gradient(180deg"));
+  assert.ok(!glassControls.includes("#bfe5fb"));
+  assert.ok(!glassControls.includes("#91c7e8"));
+  assert.ok(!glassControls.includes("#699bc0"));
   assert.ok(styles.includes("backdrop-filter: blur(24px) saturate(1.65) brightness(1.06)"));
   assert.ok(styles.includes(".composer .send-button:disabled"));
   assert.ok(styles.includes('.composer .send-button[type="submit"]:not(:disabled)'));
-  assert.ok(styles.includes("color: #086dbb"));
+  assert.ok(styles.includes("color: var(--glass-glyph)"));
   assert.ok(!styles.includes("linear-gradient(145deg, #36a5ff"));
   assert.ok(styles.includes("background-clip: border-box"));
   assert.ok(!styles.includes("border-color: rgba(255, 255, 255, .9)"));
+});
+
+test("window chrome is centered and every native resize edge is discoverable", () => {
+  assert.ok(styles.includes("--toolbar-height: 64px"));
+  assert.ok(!styles.includes(".chrome { padding-bottom:"));
+  assert.ok(styles.includes(".window-resize-north-east"));
+  assert.ok(styles.includes("cursor: ns-resize"));
+  assert.ok(styles.includes("cursor: ew-resize"));
+  assert.ok(styles.includes("cursor: nwse-resize"));
+  assert.ok(styles.includes("cursor: nesw-resize"));
+  assert.ok(viewProduction.includes('data-resize-direction=(direction)'));
+  assert.ok(viewProduction.includes('data-resize-cursor=(cursor)'));
+  assert.ok(bridge.includes("const resizeHitForPoint = (clientX, clientY)"));
+  assert.ok(bridge.includes("resizeHitForPoint(event.clientX, event.clientY)"));
+  assert.ok(bridge.includes("nativeWindow.startResizeDragging(resizeDirection)"));
+  assert.ok(bridge.includes("nativeWindow.setCursorIcon(cursor)"));
+  assert.ok(bridge.includes("pointerleave"));
 });
 
 test("read aloud keeps lifecycle controls accessible without implementation prose", () => {
