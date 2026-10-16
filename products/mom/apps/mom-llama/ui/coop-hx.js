@@ -3779,15 +3779,35 @@
       : !timedOutGeneration || completedGeneration.index > timedOutGeneration.index
         ? completedGeneration
         : timedOutGeneration;
-    const generationTerminal = generationTerminalIndexed?.entry || null;
+    const latestSpeculationStart = [...indexedStages].reverse().find(({ entry }) =>
+      entry.speculation && (entry.stage === "speculation_started"
+        || entry.stage === "generation_dispatched")) || null;
+    const attemptStartIndex = latestSpeculationStart
+      ? (latestIndexed("silence_onset", latestSpeculationStart.index)?.index
+        ?? latestSpeculationStart.index)
+      : 0;
+    const currentSpeculation = latestSpeculationStart?.entry?.speculation
+      || generationTerminalIndexed?.entry?.speculation || null;
+    const generationTerminal = generationTerminalIndexed
+      && (!latestSpeculationStart
+        || (generationTerminalIndexed.index >= latestSpeculationStart.index
+          && generationTerminalIndexed.entry.speculation === currentSpeculation))
+      ? generationTerminalIndexed.entry : null;
     const generation = generationTerminal?.stage === "generation_finished"
       ? generationTerminal : null;
-    const terminalSpeculation = generationTerminal?.speculation || null;
+    const latestSinceAttempt = (stage) => {
+      for (let index = indexedStages.length - 1; index >= attemptStartIndex; index -= 1) {
+        const entry = indexedStages[index].entry;
+        if (entry.stage === stage
+          && (!entry.speculation || entry.speculation === currentSpeculation)) return entry;
+      }
+      return null;
+    };
     const latestAttemptStage = (stage) => {
-      if (!terminalSpeculation) return latest(stage);
+      if (!currentSpeculation) return latest(stage);
       for (let index = indexedStages.length - 1; index >= 0; index -= 1) {
         const entry = indexedStages[index].entry;
-        if (entry.stage === stage && entry.speculation === terminalSpeculation) return entry;
+        if (entry.stage === stage && entry.speculation === currentSpeculation) return entry;
       }
       return null;
     };
@@ -3823,24 +3843,27 @@
     ));
     const begin = audio?.begin || initialPrefillReady?.entry?.begin || null;
     const capture = latest("capture_processing");
-    const silence = latest("silence_onset");
+    const silence = latestSinceAttempt("silence_onset");
     const silenceDecisionDelayMs = Number.isFinite(Number(silence?.silence_ms))
       ? Math.max(0, Number(silence.silence_ms)) : null;
-    const handoff = latest("speculation_handoff_ready");
-    const tts = latest("tts_segment_finished");
-    const ttsSegments = trace.stages.filter((stage) => stage.stage === "tts_segment_finished");
+    const handoff = latestSinceAttempt("speculation_handoff_ready");
+    const tts = latestSinceAttempt("tts_segment_finished");
+    const ttsSegments = indexedStages.slice(attemptStartIndex)
+      .map(({ entry }) => entry)
+      .filter((entry) => entry.stage === "tts_segment_finished");
     const ttsMetricValues = (name) => ttsSegments
       .map((stage) => Number(stage[name]))
       .filter(Number.isFinite);
-    const ttsComplete = latest("tts_all_segments_finished");
-    const semanticBackpressure = latest("semantic_backpressure_finished")
+    const ttsComplete = latestSinceAttempt("tts_all_segments_finished");
+    const semanticBackpressure = latestSinceAttempt("semantic_backpressure_finished")
       || ttsComplete?.semantic_backpressure || null;
-    const nextPrefillStarted = latest("next_turn_prefill_started");
-    const nextPrefillReady = latest("next_turn_prefill_ready");
-    const playbackRenderer = latest("playback_renderer");
-    const playbackUnderrun = latest("playback_underrun");
-    const playbackStarted = latest("playback_started");
-    const playbackRendered = latest("playback_render_started");
+    const nextPrefillStarted = latestSinceAttempt("next_turn_prefill_started");
+    const nextPrefillReady = latestSinceAttempt("next_turn_prefill_ready");
+    const playbackRenderer = latestSinceAttempt("playback_renderer");
+    const playbackUnderrun = latestSinceAttempt("playback_underrun");
+    const playbackStarted = latestSinceAttempt("playback_started");
+    const playbackRendered = latestSinceAttempt("playback_render_started");
+    const firstContentThisAttempt = latestSinceAttempt("first_content_delta");
     const microphoneReady = latest("call_microphone_ready");
     const runtimeWarm = latest("runtime_warm_completed") || latest("runtime_warm_state");
     const modelLoad = runtimeWarm?.model_load || null;
@@ -4235,10 +4258,12 @@
       silence_release_to_first_content_ms: absoluteDelta("silence_onset", "first_content_delta")
         ?? delta("silence_onset", "first_content_delta"),
       silence_to_first_content_ms: physicalSilenceDelta("first_content_delta"),
-      first_content_to_tts_pcm_ms: absoluteDelta("first_content_delta", "tts_first_pcm")
-        ?? delta("first_content_delta", "tts_first_pcm"),
-      first_content_to_tts_chunk_ms: absoluteDelta("first_content_delta", "tts_first_chunk_ready")
-        ?? delta("first_content_delta", "tts_first_chunk_ready"),
+      first_content_to_tts_pcm_ms: firstContentThisAttempt
+        ? absoluteDelta("first_content_delta", "tts_first_pcm")
+          ?? delta("first_content_delta", "tts_first_pcm") : null,
+      first_content_to_tts_chunk_ms: firstContentThisAttempt
+        ? absoluteDelta("first_content_delta", "tts_first_chunk_ready")
+          ?? delta("first_content_delta", "tts_first_chunk_ready") : null,
       tts_chunk_to_native_dispatch_ms: absoluteDelta("tts_first_chunk_ready", "tts_native_dispatched")
         ?? delta("tts_first_chunk_ready", "tts_native_dispatched"),
       tts_native_dispatch_to_pcm_ms: absoluteDelta("tts_native_dispatched", "tts_first_pcm")
@@ -5828,6 +5853,7 @@
       pushChain: Promise.resolve(), prefillFailed: false, prefillSession: null,
       prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
+      speculationReleaseMs: 180,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
       captureCallbacks: 0, captureCpuMs: 0, captureMaxCpuMs: 0,
@@ -5923,7 +5949,8 @@
         }
       }
       if (activity.heardVoice && !activity.voiced
-          && analysis.silenceOnsetSample !== null && voiceRecording === recording
+          && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
+          && voiceRecording === recording
           && !recording.sending && !recording.speculation && !recording.speculationStarting) {
         markVoiceLatency("silence_onset", {
           silence_ms: activity.silentMs,
@@ -6136,6 +6163,12 @@
     if (!speculation || speculation.confirmed || speculation.aborting) return;
     speculation.aborting = true;
     markVoiceLatency("speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
+    if (!recording.native && recording.call && restartPrefill) {
+      // A short intra-utterance pause can cross the first speculative edge.
+      // Repeated belays are direct evidence that this caller needs a longer
+      // endpoint; cap the added wait so a genuine reply remains responsive.
+      recording.speculationReleaseMs = Math.min(600, recording.speculationReleaseMs + 140);
+    }
 
     // Stop the speaker immediately, but never serialize microphone recovery
     // behind WebAudio/native TTS teardown. `stop()` closes local playback

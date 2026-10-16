@@ -28,6 +28,11 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
     this.underrunReported = false;
     this.finished = false;
     this.drained = false;
+    // A render quantum is submitted ahead of the device. Keep the node
+    // connected briefly after its last PCM frame so the output route can
+    // actually play that frame before the main thread tears the node down.
+    this.drainGraceFrames = Math.ceil(sampleRate / 10);
+    this.silentDrainFrames = 0;
     this.stopped = false;
     this.firstReceiveContextFrame = null;
     this.firstRenderContextFrame = null;
@@ -72,6 +77,7 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
     }
     this.write = (this.write + frames) % this.capacity;
     this.available += frames;
+    this.silentDrainFrames = 0;
     this.receivedFrames += frames;
     this.maxBufferedFrames = Math.max(this.maxBufferedFrames, this.available);
     if (this.firstReceiveContextFrame === null) this.firstReceiveContextFrame = currentFrame;
@@ -162,6 +168,8 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
       this.consumedSinceCredit = 0;
     }
     if (this.finished && this.available === 0 && !this.drained) {
+      this.silentDrainFrames += frames;
+      if (this.silentDrainFrames < this.drainGraceFrames) return true;
       if (this.consumedSinceCredit > 0) {
         this.port.postMessage({
           type: "consumed",

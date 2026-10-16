@@ -77,6 +77,19 @@ test("post-speech silence advances continuously through the send threshold", () 
   assert.ok(activity.silentMs >= 900);
 });
 
+test("brief noise after a spoken turn cannot cancel speculative speech", () => {
+  let activity = nextVoiceActivity(initialVoiceActivity(), .02, 120);
+  assert.equal(activity.voiced, true);
+  activity = nextVoiceActivity(activity, 0, 180);
+  assert.equal(activity.voiced, false);
+  activity = nextVoiceActivity(activity, .02, 8);
+  assert.equal(activity.voiced, false);
+  activity = nextVoiceActivity(activity, 0, 20);
+  assert.equal(activity.voiced, false);
+  activity = nextVoiceActivity(activity, .02, 40);
+  assert.equal(activity.voiced, true);
+});
+
 test("noise learning is bounded and does not absorb speech", () => {
   let activity = initialVoiceActivity();
   for (let frame = 0; frame < 20; frame += 1) {
