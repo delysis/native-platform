@@ -874,6 +874,10 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   assert.ok(bridge.includes("trace.checkpoint = (trace.checkpoint || 0) + 1"));
   assert.ok(bridge.includes('markVoiceLatency("audio_prefill_begin_failed"'));
   assert.ok(bridge.includes('markVoiceLatency("audio_prefill_push_failed"'));
+  for (const stage of ["audio_prefill_begin_requested", "audio_prefill_session_ready",
+    "audio_prefill_begin_failed", "next_turn_prefill_failed"]) {
+    assert.ok(bridge.includes(`      "${stage}",`), `${stage} must persist a diagnostic checkpoint`);
+  }
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_state", runtimeWarmState)'));
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_completed", runtimeWarmState)'));
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_failed", runtimeWarmState)'));
