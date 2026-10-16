@@ -1414,7 +1414,7 @@ where
         if stream.cancellation_requested() {
             return stream.finish_cancelled();
         }
-        let (cached_prefix, cache_was_preexisting) = if media.is_empty() && default_template {
+        let cached_prefix = if media.is_empty() && default_template {
             let owner_ids = reusable_prefix_owner_ids(
                 &conversation.id,
                 conversation.source_conversation_id.as_deref(),
@@ -1424,10 +1424,9 @@ where
             );
             let cache =
                 longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, false)?;
-            let found = cache.is_some();
-            (cache, found)
+            cache
         } else {
-            (None, false)
+            None
         };
         let mut sampling =
             settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
@@ -1471,10 +1470,13 @@ where
             parse_reasoning,
             stream.callback(),
         ) {
-            Ok(outputs) => (
-                outputs,
-                attempted_cache_id.is_some() && cache_was_preexisting,
-            ),
+            Ok(outputs) => {
+                let reused = attempted_cache_id.is_some()
+                    && outputs
+                        .iter()
+                        .any(|output| output.metrics.cache.restored_prefix_tokens > 0);
+                (outputs, reused)
+            }
             Err(ChatTicketError::Native(error))
                 if error.code == NativeErrorCode::CacheIncompatible
                     && attempted_cache_id.is_some() =>

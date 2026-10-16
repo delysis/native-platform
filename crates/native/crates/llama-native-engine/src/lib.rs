@@ -5137,6 +5137,10 @@ fn selected_cached_prefix<'a>(
     shared.or(branch.cached_prefix.as_ref())
 }
 
+fn resident_prefix_wins(resident_tokens: usize, supplied_tokens: usize) -> bool {
+    resident_tokens > 0 && resident_tokens >= supplied_tokens
+}
+
 fn generate_batch(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -5193,22 +5197,36 @@ fn generate_batch(
             .branches
             .iter()
             .any(|branch| branch.cached_prefix.is_some());
-    // Exact-token authority preflights describe the caller-visible request.
-    // Keep their accounting byte-for-byte conservative by declining implicit
-    // resident reuse on that path.
-    let resident_prefix =
-        if permits_resident_text_reuse(exact_cell_budget.is_some(), caller_supplied_cache) {
-            resident.as_ref().map_or(0, |(binding, cache)| {
-                cache.reusable_tokens(binding, &token_sets)
-            })
-        } else {
-            0
-        };
-    let cached_states = request
+    let mut cached_states = request
         .branches
         .iter()
         .map(|branch| selected_cached_prefix(request.cached_prefix.as_ref(), branch))
         .collect::<Vec<_>>();
+    // Exact-token authority preflights describe the caller-visible request.
+    // Keep their accounting byte-for-byte conservative. For an ordinary
+    // single-branch request, compare the supplied snapshot with the worker's
+    // token-exact resident state before deciding which one to retain.
+    let single_branch = token_sets.len() == 1 && exact_cell_budget.is_none();
+    let resident_candidate = if single_branch
+        || permits_resident_text_reuse(exact_cell_budget.is_some(), caller_supplied_cache)
+    {
+        resident.as_ref().map_or(0, |(binding, cache)| {
+            cache.reusable_tokens(binding, &token_sets)
+        })
+    } else {
+        0
+    };
+    let resident_prefix = if single_branch
+        && cached_states[0]
+            .is_some_and(|state| resident_prefix_wins(resident_candidate, state.token_count))
+    {
+        cached_states[0] = None;
+        resident_candidate
+    } else if cached_states[0].is_none() {
+        resident_candidate
+    } else {
+        0
+    };
     let mut prefix_lengths = vec![0_usize; request.branches.len()];
     let mut replayed_prefix_lengths = vec![0_usize; request.branches.len()];
     let uncached_indices = cached_states
@@ -7232,47 +7250,50 @@ fn generate_incremental_audio(
             "incremental audio prefix token accounting changed during validation",
         ));
     }
-    let cached_prefix = request.cached_prefix.as_ref();
-    if let Some(state) = cached_prefix {
-        validate_incremental_audio_prefix_tokens(state, &prefix_token_ids)?;
-        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
-    }
-
-    // Token and fingerprint validation above is read-only. Mutate resident KV
-    // state only after the supplied prefix is proven to match this audio turn.
+    // Validation and selection below are read-only. Mutate resident KV state
+    // only after the selected prefix is proven to match this audio turn.
     let binding_started = Instant::now();
     let request_sha256 = incremental_audio_request_sha256(request)?;
     let binding_us = binding_started
         .elapsed()
         .as_micros()
         .min(u128::from(u64::MAX)) as u64;
-    let prior_audio = resident_audio_checkpoint.take();
-    let checkpoint_available = prior_audio.is_some();
-    let resume_key_matched = prior_audio
+    let checkpoint_available = resident_audio_checkpoint.is_some();
+    let resume_key_matched = resident_audio_checkpoint
         .as_ref()
         .is_some_and(|checkpoint| resume_key == Some(checkpoint.resume_key.as_str()));
-    let request_matched = prior_audio
+    let request_matched = resident_audio_checkpoint
         .as_ref()
         .is_some_and(|checkpoint| checkpoint.request_sha256 == request_sha256);
-    tracking.token_counts.clear();
-    tracking.token_ids.clear();
-    let matched_audio = prior_audio.filter(|checkpoint| {
-        audio_checkpoint_supported
-            && resume_key == Some(checkpoint.resume_key.as_str())
-            && checkpoint.request_sha256 == request_sha256
-    });
+    let audio_checkpoint_matches =
+        audio_checkpoint_supported && resume_key_matched && request_matched;
     let resident_text_prefix_supported = audio_checkpoint_supported
         && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32;
-    if !resident_text_prefix_supported {
-        invalidate_resident_audio_text_prefix(context, resident_audio_text_prefix);
-    }
-    let resident_prefix_tokens = if matched_audio.is_none() && cached_prefix.is_none() {
+    let resident_prefix_tokens = if !audio_checkpoint_matches && resident_text_prefix_supported {
         resident_audio_text_prefix
             .as_ref()
             .map_or(0, |prefix| prefix.reusable_tokens(&prefix_token_ids))
     } else {
         0
     };
+    // The runtime's saved prefix may predate the resident text prefix. Use
+    // whichever covers more of this exact rendered prompt; importing a shorter
+    // saved state would discard useful KV already in the worker.
+    let cached_prefix = request
+        .cached_prefix
+        .as_ref()
+        .filter(|state| !resident_prefix_wins(resident_prefix_tokens, state.token_count));
+    if let Some(state) = cached_prefix {
+        validate_incremental_audio_prefix_tokens(state, &prefix_token_ids)?;
+        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+    }
+    let prior_audio = resident_audio_checkpoint.take();
+    tracking.token_counts.clear();
+    tracking.token_ids.clear();
+    let matched_audio = prior_audio.filter(|_| audio_checkpoint_matches);
+    if !resident_text_prefix_supported {
+        invalidate_resident_audio_text_prefix(context, resident_audio_text_prefix);
+    }
     let restore_started = Instant::now();
     let (
         active_sequence_id,
@@ -13938,7 +13959,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_prefix_never_weakens_exact_or_caller_cache_accounting() {
+    fn resident_prefix_preflight_excludes_exact_budget_and_multi_branch_saved_cache() {
         assert!(permits_resident_text_reuse(false, false));
         assert!(!permits_resident_text_reuse(true, false));
         assert!(!permits_resident_text_reuse(false, true));
