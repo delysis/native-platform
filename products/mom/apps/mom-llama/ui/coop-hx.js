@@ -2414,6 +2414,7 @@
     setModalVisibility("voice-call-modal", false);
     await Promise.allSettled(stops.filter(Boolean));
     releaseCallMicrophoneStream(microphoneStream);
+    void recoverPendingVoiceHistory().catch(() => {});
   };
 
   const setText = (id, value) => {
@@ -5946,7 +5947,7 @@
               || catalog.root_sha256 !== archivedWavSha256) {
             throw new Error("live_transcription_source_mismatch");
           }
-          transcribed = { status: "passed", result: { transcript: live.transcript } };
+          transcribed = { status: "contracted", result: { transcript: live.transcript } };
           markVoiceLatencyIn(trace, "voice_transcript_live_verified", {
             samples: source.samples,
             ...(source.metrics || {}),
@@ -5968,7 +5969,7 @@
         duration_ms: Math.round((performance.now() - inferenceStarted) * 100) / 100,
         ...(transcribed?.result?.timing || {}),
       });
-      if (transcribed?.status !== "passed") {
+      if (transcribed?.status === "blocked" || !transcribed?.result) {
         throw new Error(`${transcribed?.blocker?.code || "voice_transcript_blocked"}: ${transcribed?.blocker?.message || "The recorded voice could not be transcribed."}`);
       }
       const transcript = transcribed?.result?.transcript?.trim();
@@ -5983,7 +5984,7 @@
       markVoiceLatencyIn(trace, "voice_transcript_record_finished", {
         duration_ms: Math.round((performance.now() - recordStarted) * 100) / 100,
       });
-      if (recorded?.status !== "passed") {
+      if (recorded?.status === "blocked" || !recorded?.result) {
         throw new Error(`${recorded?.blocker?.code || "voice_transcript_record_failed"}: ${recorded?.blocker?.message || "The voice transcript could not be saved."}`);
       }
     })();
@@ -6002,6 +6003,64 @@
       reportError(error);
     });
     return task;
+  };
+
+  // Saved recordings are authoritative until a complete transcript replaces
+  // their model-context representation. A crashed/older client can leave more
+  // pending recordings than one Gemma request may admit, so resume that work
+  // from the active chain without ever dropping or truncating its history.
+  let voiceHistoryRecovery = null;
+  const recoverPendingVoiceHistory = () => {
+    if (voiceHistoryRecovery) return voiceHistoryRecovery;
+    voiceHistoryRecovery = (async () => {
+      const listed = await invoke("mom_llama_conversation_list");
+      if (listed?.status === "blocked" || !Array.isArray(listed?.result)) return;
+      const selected = selectedConversation();
+      for (const conversation of listed.result.filter((item) => item.id === selected)) {
+        const messages = new Map((conversation.messages || []).map((message) => [message.id, message]));
+        const active = [];
+        const seen = new Set();
+        let id = conversation.active_leaf_message_id;
+        while (id && !seen.has(id) && messages.has(id)) {
+          seen.add(id);
+          const message = messages.get(id);
+          active.push(message);
+          id = message.parent_id;
+        }
+        for (const message of active.reverse()) {
+          if (message.role !== "user"
+              || ![voiceModePrompt(true), voiceModePrompt(false)].includes(message.content)
+              || message.attachment_ids?.length !== 1) continue;
+          // Live turns take priority. Recovery only uses idle time and never
+          // holds generation or the microphone on Parakeet.
+          if (voiceCallActive || voiceRecording) return;
+          const attachment = message.attachment_ids[0];
+          try {
+            const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
+              attachment,
+            }));
+            if (catalog.primary?.kind !== "audio") continue;
+            const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+              conversation: conversation.id,
+              ...attachmentPreviewAnchor(catalog, catalog.primary),
+              operation: speechOperationToken(),
+            });
+            if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) continue;
+            const recorded = await invoke("mom_llama_message_record_voice_transcript", {
+              conversation: conversation.id,
+              message: message.id,
+              attachment,
+              transcript: transcribed.result.transcript.trim(),
+            });
+            if (recorded?.status === "blocked" || !recorded?.result) continue;
+          } catch (error) {
+            console.warn("Voice history recovery paused", errorMessage(error));
+            return;
+          }
+        }
+      }
+    })().finally(() => { voiceHistoryRecovery = null; });
+    return voiceHistoryRecovery;
   };
 
   const startVoicePrefill = async (conversation, call, trace) => {
@@ -9641,6 +9700,12 @@
 
         sizeComposer();
         await listen();
+        // Recovery is opportunistic and has no place on the call admission
+        // critical path. The installed CPU listener can work while Gemma is
+        // resident; a failed turn keeps its exact WAV for a later retry.
+        void runtimeWarmPromise.then(() => recoverPendingVoiceHistory()).catch((error) => {
+          console.warn("Voice history recovery unavailable", errorMessage(error));
+        });
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");

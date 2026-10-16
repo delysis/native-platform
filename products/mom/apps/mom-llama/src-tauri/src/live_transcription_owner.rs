@@ -14,7 +14,7 @@ use tauri::{Emitter, Window};
 struct Session {
     identity: TurnIdentity,
     producer: PcmProducer,
-    result: tokio::task::JoinHandle<Result<FinalTranscript, String>>,
+    result: tauri::async_runtime::JoinHandle<Result<FinalTranscript, String>>,
     started: Instant,
 }
 
@@ -60,7 +60,9 @@ impl LiveTranscriptionOwner {
         let trace = Arc::new(move |event| {
             let _ = window.emit("mom_llama_live_transcription_trace", event);
         });
-        let result = tokio::spawn(async move {
+        // This command is synchronous and runs on the macOS UI thread, where
+        // Tokio has no entered reactor. Use Tauri's owned runtime explicitly.
+        let result = tauri::async_runtime::spawn(async move {
             let result = speech.transcribe_live(&operation, reader, trace).await;
             let class = if lease.cancellation_requested() {
                 TerminalClass::Cancelled
@@ -101,7 +103,7 @@ impl LiveTranscriptionOwner {
         if session.identity.capture != capture {
             return Err("live_transcription_capture_mismatch".into());
         }
-        if session.result.is_finished() {
+        if session.result.inner().is_finished() {
             return Err("live_transcription_backend_unavailable".into());
         }
         session
