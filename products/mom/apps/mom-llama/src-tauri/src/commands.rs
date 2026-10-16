@@ -2230,7 +2230,7 @@ pub async fn mom_llama_voice_audio_speculation_abort(
 pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
     runtime: State<'_, AppRuntimeHandle>,
     capture_state: State<'_, NativeVoiceCapture>,
-    capture: String,
+    capture: Option<String>,
     speculation: String,
     conversation: String,
     message: String,
@@ -2266,6 +2266,10 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                     .map_err(to_error)?;
             let resume_wait_started = Instant::now();
             let resume = session.wait_for_resume().map_err(to_error)?;
+            if !resume.reused {
+                session.cancel();
+                return Err("voice_audio_checkpoint_unavailable: The live audio prefix could not be resumed".to_string());
+            }
             let resume_wait_us = resume_wait_started
                 .elapsed()
                 .as_micros()
@@ -2278,29 +2282,36 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
 
-            let sink = owner.voice_audio_session(&session_id)?;
-            let exact_cancellation = sink.cancellation_handle().ok_or_else(|| {
-                "The replacement voice session has no cancellation authority".to_string()
-            })?;
-            let target = CaptureTarget {
-                id: session_id.clone(),
-                sink,
-                cancel: Arc::new(move || {
-                    exact_cancellation.cancel();
-                }),
+            // Native capture can retarget its retained ring here. WebKit call
+            // capture has the same retained samples in the renderer and uses
+            // the returned checkpoint offset to replay only its suffix.
+            let (retarget_us, replay) = if let Some(capture) = capture {
+                let sink = owner.voice_audio_session(&session_id)?;
+                let exact_cancellation = sink.cancellation_handle().ok_or_else(|| {
+                    "The replacement voice session has no cancellation authority".to_string()
+                })?;
+                let target = CaptureTarget {
+                    id: session_id.clone(),
+                    sink,
+                    cancel: Arc::new(move || {
+                        exact_cancellation.cancel();
+                    }),
+                };
+                let retarget_started = Instant::now();
+                let replay = match controller.retarget(capture, target, resume.sample_offset) {
+                    Ok(metrics) => metrics,
+                    Err(error) => {
+                        let _ = owner.abort_voice_audio_session(&session_id);
+                        return Err(to_error(error));
+                    }
+                };
+                (
+                    retarget_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    serde_json::json!(replay),
+                )
+            } else {
+                (0, Value::Null)
             };
-            let retarget_started = Instant::now();
-            let replay = match controller.retarget(capture, target, resume.sample_offset) {
-                Ok(metrics) => metrics,
-                Err(error) => {
-                    let _ = owner.abort_voice_audio_session(&session_id);
-                    return Err(to_error(error));
-                }
-            };
-            let retarget_us = retarget_started
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
 
             Ok(serde_json::json!({
                 "aborted": aborted,

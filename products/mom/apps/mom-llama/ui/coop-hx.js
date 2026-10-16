@@ -5842,6 +5842,7 @@
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
+      capturedSamples: 0, prefillInputStartSample: null,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
       resampler: globalThis.MomVoiceCapturePolicy.createStreamingMonoResampler(context.sampleRate),
@@ -5914,17 +5915,27 @@
       recording.silentMs = activity.silentMs;
       if (analysis.hadVoiced && recording.speculation
           && !recording.speculation.confirmed && !recording.speculation.aborting) {
-        void abortCallSpeculation(recording, { restartPrefill: true }).catch(reportError);
+        void abortCallSpeculation(recording, { restartPrefill: true }).catch((error) => {
+          reportError(error);
+          if (recording.call && voiceCallActive) void closeVoiceCallSurface();
+        });
       }
       const resampleStarted = performance.now();
       const pcm = recording.resampler.process(chunk);
       recording.resampleCpuMs += performance.now() - resampleStarted;
-      if (pcm.length) recording.capturedPcm.push(pcm);
+      if (pcm.length) {
+        recording.capturedPcm.push(pcm);
+        recording.capturedSamples += pcm.length;
+      }
       // A speculative decode has consumed its native prefill session. Keep
-      // recording locally; if speech resumes, abort and replay the complete
-      // capture into a fresh session rather than pushing into a stale owner.
+      // recording locally; on resumed speech, restore its prepared turn and
+      // replay only the PCM beyond the native audio checkpoint.
       if (!recording.speculation && analysis.hadVoiced) {
         if (!previousActivity.heardVoice) {
+          if (recording.prefillInputStartSample === null) {
+            recording.prefillInputStartSample = Math.max(0,
+              recording.capturedSamples - recording.preRollSamples - pcm.length);
+          }
           interruptCallPlaybackForSpeech(recording, {
             producer: "browser_capture",
             onset_sample: analysis.voiceOnsetSample,
@@ -6106,38 +6117,20 @@
     }
   };
 
-  const restartVoicePrefill = async (recording) => {
+  const resumeBrowserVoicePrefill = (recording, replacement) => {
     if (voiceRecording !== recording || (recording.call && !voiceCallActive)) return;
-    recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
-    const epoch = recording.prefillEpoch;
-    if (recording.native) {
-      markVoiceLatency("speculation_restart_prefill_started");
-      recording.prefillFailed = false;
-      recording.prefillSession = startVoicePrefill(
-        recording.speculation?.conversation || voiceCallConversation || recording.sourceConversation,
-        recording.call,
-      ).catch(() => {
-        if (recording.prefillEpoch === epoch) recording.prefillFailed = true;
-        return null;
-      });
-      recording.targetChain = recording.prefillSession.then(async (live) => {
-        if (!live?.session) return null;
-        const targetedAt = performance.now();
-        const targeted = await invoke("mom_llama_voice_capture_retarget", {
-          capture: recording.capture,
-          session: live.session,
-        });
-        markVoiceLatency("speculation_restart_prefill_ready", {
-          round_trip_ms: Math.round((performance.now() - targetedAt) * 100) / 100,
-          native_elapsed_us: targeted?.native_elapsed_us || null,
-          begin: live?.begin_metrics || null,
-        });
-        return targeted;
-      });
-      await recording.targetChain;
-      return;
+    if (recording.native || !replacement?.session || replacement.resume_reused !== true) {
+      throw new Error("The live audio checkpoint could not be resumed.");
     }
-    const priorAudio = mergeFloat32(recording.capturedPcm);
+    recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
+    const captured = mergeFloat32(recording.capturedPcm);
+    const origin = recording.prefillInputStartSample ?? 0;
+    const resumeOffset = Number(replacement.resume_sample_offset || 0);
+    if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0
+        || origin + resumeOffset > captured.length) {
+      throw new Error("The voice checkpoint is outside the captured audio.");
+    }
+    const priorAudio = captured.subarray(origin + resumeOffset);
     recording.prefillParts = [];
     recording.prefillSamples = 0;
     recording.pushChain = Promise.resolve();
@@ -6148,14 +6141,18 @@
     recording.prefillHighWaterSamples = 0;
     recording.prefillIpcMs = 0;
     recording.prefillMaxIpcMs = 0;
-    recording.prefillSession = startVoicePrefill(
-      recording.speculation?.conversation || voiceCallConversation || recording.sourceConversation,
-      recording.call,
-    ).catch(() => {
-      if (recording.prefillEpoch === epoch) recording.prefillFailed = true;
-      return null;
+    recording.prefillSession = Promise.resolve({
+      session: replacement.session,
+      request_id: replacement.request_id,
+      conversation: replacement.conversation_id || voiceCallConversation || recording.sourceConversation,
+      begin_metrics: replacement.begin_metrics || null,
     });
     enqueueVoicePrefill(recording, priorAudio, true);
+    markVoiceLatency("speculation_handoff_replay_enqueued", {
+      checkpoint_samples: resumeOffset,
+      replay_samples: priorAudio.length,
+      captured_samples: captured.length,
+    });
   };
 
   const abortCallSpeculation = async (recording, { restartPrefill = false } = {}) => {
@@ -6184,11 +6181,13 @@
     let replacement = null;
     let replacementError = null;
     const nativeAbortAt = performance.now();
-    if (recording.native && restartPrefill) {
+    if (restartPrefill) {
       markVoiceLatency("speculation_handoff_started");
       try {
+        await withDeadline(speculation.admissionReady, 2_000,
+          "voice_speculation_admission_timeout: The call turn could not be prepared for interruption.");
         replacement = await invoke("mom_llama_voice_audio_speculation_abort_and_retarget", {
-          capture: recording.capture,
+          capture: recording.native ? recording.capture : null,
           speculation: speculation.id,
           conversation: speculation.conversation,
           message: voiceModePrompt(recording.call),
@@ -6245,6 +6244,21 @@
     if (activeDispatchConversation === speculation.conversation) activeDispatchConversation = null;
     if (callReplyConversation === speculation.conversation) callReplyConversation = null;
     if (voiceReplyConversation === speculation.conversation) voiceReplyConversation = null;
+    if (replacement && !recording.native && voiceRecording === recording) {
+      try {
+        resumeBrowserVoicePrefill(recording, replacement);
+      } catch (error) {
+        void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
+        replacementError = error;
+        recording.prefillFailed = true;
+        markVoiceLatency("speculation_handoff_failed", { message: errorMessage(error) });
+        replacement = null;
+      }
+    }
+    if (replacement && voiceRecording !== recording) {
+      void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
+      return;
+    }
     if (replacement && voiceRecording === recording && !recording.sending
         && (!recording.call || voiceCallActive)) {
       // Silence can begin while the replacement Gemma session is restoring.
@@ -6255,30 +6269,20 @@
       queueMicrotask(() => {
         if (voiceRecording === recording && !recording.sending && !recording.speculation
             && (!recording.call || voiceCallActive)) {
+          if (!recording.native && (recording.voiceActivity.voiced
+              || recording.silentMs < recording.speculationReleaseMs)) return;
           markVoiceLatency("speculation_handoff_rearmed", {
             silent_ms: recording.silentMs || 0,
           });
-          void startVoiceSpeculation(recording, { prearm: true }).catch(reportError);
+          void startVoiceSpeculation(recording,
+            { prearm: recording.native }).catch(reportError);
         }
       });
     }
-    if (restartPrefill && !replacement) {
-      const fallbackAt = performance.now();
-      try {
-        await restartVoicePrefill(recording);
-        markVoiceLatency("speculation_handoff_fallback_ready", {
-          duration_ms: Math.round((performance.now() - fallbackAt) * 100) / 100,
-          replaced_error: replacementError ? errorMessage(replacementError) : null,
-        });
-        return;
-      } catch (fallbackError) {
-        markVoiceLatency("speculation_handoff_fallback_failed", {
-          duration_ms: Math.round((performance.now() - fallbackAt) * 100) / 100,
-          message: errorMessage(fallbackError),
-        });
-        throw fallbackError;
-      }
-    }
+    // Never rebuild an utterance from its first sample after belaying a
+    // speculative reply. That would replay seconds of valid projector work
+    // and make each interruption progressively slower.
+    if (restartPrefill && !replacement) recording.prefillFailed = true;
     if (replacementError) throw replacementError;
   };
 
@@ -6381,7 +6385,12 @@
       aborting: false,
       generationReleased: null,
       releaseGeneration: null,
+      admissionReady: null,
+      releaseAdmission: null,
     };
+    speculation.admissionReady = new Promise((resolve) => {
+      speculation.releaseAdmission = resolve;
+    });
     speculation.generationReleased = new Promise((resolve) => {
       speculation.releaseGeneration = resolve;
     });
@@ -8947,7 +8956,13 @@
         event_delivery_ms: emittedAtMs > 0 ? Math.max(0, Math.round((Date.now() - emittedAtMs) * 100) / 100) : null,
         ...(payload.detail && typeof payload.detail === "object" ? payload.detail : {}),
       });
-      if (payload.stage === "native_silence_released") {
+      if (payload.stage === "native_cancellation_registered"
+          && speculation?.id === payload.speculation) {
+        speculation.releaseAdmission?.();
+        speculation.releaseAdmission = null;
+      }
+      if (payload.stage === "native_silence_released"
+          && speculation?.id === payload.speculation) {
         speculation.releaseGeneration?.();
         speculation.releaseGeneration = null;
         speculation.tts?.activate?.();

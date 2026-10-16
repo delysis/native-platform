@@ -346,7 +346,8 @@ test("a completed speech-resume handoff re-arms speculation after a missed silen
   const abort = source.slice(abortStart, abortEnd);
   assert.match(abort, /if \(replacement && voiceRecording === recording/);
   assert.match(abort, /speculation_handoff_rearmed/);
-  assert.match(abort, /startVoiceSpeculation\(recording, \{ prearm: true \}\)/);
+  assert.match(abort, /recording\.voiceActivity\.voiced[\s\S]*recording\.silentMs < recording\.speculationReleaseMs/);
+  assert.match(abort, /prearm: recording\.native/);
 });
 
 test("native prefill and retarget failures are retained in the latency trace", () => {

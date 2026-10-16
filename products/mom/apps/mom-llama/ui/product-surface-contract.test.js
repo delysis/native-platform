@@ -587,7 +587,7 @@ test("call and voice-note replies speculate on the first silence edge and commit
   const captureStart = bridge.indexOf("  const beginNativeVoiceCapture = async");
   const captureEnd = bridge.indexOf("\n  const sendVoiceCapture = async", captureStart);
   const capture = bridge.slice(captureStart, captureEnd);
-  const speculateStart = bridge.indexOf("  const restartVoicePrefill = async");
+  const speculateStart = bridge.indexOf("  const resumeBrowserVoicePrefill =");
   const speculateEnd = bridge.indexOf("\n  const sendVoiceCapture = async", speculateStart);
   const speculate = bridge.slice(speculateStart, speculateEnd);
 
