@@ -503,6 +503,22 @@ pub(crate) fn model_configuration_for_profile(
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<NativeModelConfig, ValidationBlocker> {
+    let config = unchecked_model_configuration_for_profile(settings, model_path, mmproj_path)?;
+    validate_model_path(model_path)?;
+    crate::memory_policy::validate_profile(settings, &config)?;
+    Ok(config)
+}
+
+/// Construct the exact resident key without touching model bytes. This is
+/// sufficient for an already-loaded worker because its immutable key and
+/// fingerprint were validated at admission. Cold acquisition still crosses
+/// `model_configuration_for_profile` below and repeats every filesystem and
+/// memory-plan check before loading.
+fn unchecked_model_configuration_for_profile(
+    settings: &Settings,
+    model_path: &Path,
+    mmproj_path: Option<&Path>,
+) -> Result<NativeModelConfig, ValidationBlocker> {
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
     desktop_generation_policy::ModelExecutionLimits {
@@ -519,14 +535,27 @@ pub(crate) fn model_configuration_for_profile(
             vec!["Correct the model execution limits.".into()],
         ),
     })?;
-    validate_model_path(model_path)?;
     // This boundary consumes an exact profile. In particular, a frozen/imported
     // `None` must remain `None` if a sibling projector appears later. Ordinary
     // model selection resolves and persists its pair before reaching the host.
     config.mmproj_path = mmproj_path
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf);
-    crate::memory_policy::validate_profile(settings, &config)?;
+    if let Some(verified) = settings.verified_model_artifacts.as_ref()
+        && verified.model.path == model_path
+        && verified
+            .projector
+            .as_ref()
+            .map(|artifact| artifact.path.as_path())
+            == mmproj_path
+    {
+        config.expected_model_sha256 = Some(verified.model.sha256.clone());
+        config.expected_model_file_identity = Some(verified.model.file_identity.clone());
+        if let Some(projector) = verified.projector.as_ref() {
+            config.expected_mmproj_sha256 = Some(projector.sha256.clone());
+            config.expected_mmproj_file_identity = Some(projector.file_identity.clone());
+        }
+    }
     Ok(config)
 }
 
@@ -543,8 +572,23 @@ pub fn resident_model_for_profile(
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
-    let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
-    resident_model_for_configuration(scope, settings, &config)
+    resident_model_for_profile_with_status(scope, settings, model_path, mmproj_path)
+        .map(|(handle, _)| handle)
+}
+
+pub(crate) fn resident_model_for_profile_with_status(
+    scope: &crate::OperationScope,
+    settings: &Settings,
+    model_path: &Path,
+    mmproj_path: Option<&Path>,
+) -> Result<(NativeModelHandle, bool), ValidationBlocker> {
+    let config = unchecked_model_configuration_for_profile(settings, model_path, mmproj_path)?;
+    if let Some(handle) = with_host(scope, settings, |host| host.resident(&config))? {
+        return Ok((handle, true));
+    }
+    validate_model_path(model_path)?;
+    crate::memory_policy::validate_profile(settings, &config)?;
+    with_host(scope, settings, |host| host.acquire(config)).map(|handle| (handle, false))
 }
 
 /// Resolves the exact profile only when its worker is already resident. This
@@ -556,8 +600,7 @@ pub(crate) fn resident_model_for_profile_if_loaded(
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<Option<NativeModelHandle>, ValidationBlocker> {
-    let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
-    validate_model_path(&config.model_path)?;
+    let config = unchecked_model_configuration_for_profile(settings, model_path, mmproj_path)?;
     with_host(scope, settings, |host| host.resident(&config))
 }
 
@@ -753,7 +796,7 @@ mod tests {
         ProductPrefixCacheStore, ProductRuntimeOwner, SystemClock, create_product_host,
         host_cache_policy,
     };
-    use crate::config::KvCachePolicy;
+    use crate::config::{KvCachePolicy, VerifiedArtifactDigest, VerifiedModelArtifacts};
     use llama_native_cache::{
         CacheFingerprint, CacheInsertOutcome, CacheTier, PrefixCacheMetadata, PrefixCacheValue,
         ValidatedPrefixCacheValue,
@@ -783,6 +826,47 @@ mod tests {
             "invalid limits reached model-path admission: {wrong:?}"
         );
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn unchanged_verified_artifacts_are_forwarded_to_native_admission() {
+        let directory = tempfile::tempdir().expect("isolated verification fixture");
+        let model = directory.path().join("model.gguf");
+        let projector = directory.path().join("mmproj.gguf");
+        let mut settings =
+            crate::config::Settings::defaults_for_data_dir(directory.path().to_path_buf());
+        settings.verified_model_artifacts = Some(VerifiedModelArtifacts {
+            model: VerifiedArtifactDigest {
+                path: model.clone(),
+                sha256: "a".repeat(64),
+                file_identity: "sha256:model-state".to_string(),
+            },
+            projector: Some(VerifiedArtifactDigest {
+                path: projector.clone(),
+                sha256: "b".repeat(64),
+                file_identity: "sha256:projector-state".to_string(),
+            }),
+        });
+
+        let config =
+            super::unchecked_model_configuration_for_profile(&settings, &model, Some(&projector))
+                .expect("construct cached configuration");
+        assert_eq!(
+            config.expected_model_sha256.as_deref(),
+            Some(&*"a".repeat(64))
+        );
+        assert_eq!(
+            config.expected_model_file_identity.as_deref(),
+            Some("sha256:model-state")
+        );
+        assert_eq!(
+            config.expected_mmproj_sha256.as_deref(),
+            Some(&*"b".repeat(64))
+        );
+        assert_eq!(
+            config.expected_mmproj_file_identity.as_deref(),
+            Some("sha256:projector-state")
+        );
     }
 
     fn cache_value() -> PrefixCacheValue {

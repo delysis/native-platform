@@ -58,7 +58,7 @@ test("conversation selection measures completed paint and does not await seconda
   };
   vm.createContext(context);
   vm.runInContext(
-    `let conversationSwitchTimingId = 0;\n${definition("recordConversationSwitchPaint", "formField")}${definition("selectConversation", "openPersonaFreeze")}\nthis.selectConversation = selectConversation;`,
+    `let conversationSwitchTimingId = 0;\n${definition("recordConversationSwitchPaint", "formField")}let conversationNavigationRevision = 0; let conversationMutation = Promise.resolve();\n${definition("mutateConversationSelection", "selectConversation")}${definition("selectConversation", "openPersonaFreeze")}\nthis.selectConversation = selectConversation;`,
     context,
   );
 
@@ -72,4 +72,42 @@ test("conversation selection measures completed paint and does not await seconda
   assert.equal(measures[0][0], "mom.conversation.switch-to-paint.1");
   assert.equal(measures[0][1].start, 100);
   assert.equal(measures[0][1].end, 125);
+});
+
+test("conversation selections serialize only their mutation and skip stale projection work", async () => {
+  const releases = [];
+  const selected = [];
+  const context = {
+    performance: { now: () => 0, measure() {} },
+    requestAnimationFrame() {},
+    retainComposerDraft: async () => {},
+    invoke: (_command, { conversation }) => new Promise((resolve) => {
+      selected.push(conversation);
+      releases.push(() => resolve({ status: "passed" }));
+    }),
+    report() {},
+    refreshChat: async () => ({ dataset: { currentConversation: selected.at(-1) } }),
+    refreshSidebar: async () => {},
+    refreshConversationSettingsProjection: async () => {},
+    reportError(error) { throw error; },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `let conversationSwitchTimingId = 0;\n${definition("recordConversationSwitchPaint", "formField")}let conversationNavigationRevision = 0; let conversationMutation = Promise.resolve();\n${definition("mutateConversationSelection", "selectConversation")}${definition("selectConversation", "openPersonaFreeze")}\nthis.selectConversation = selectConversation;`,
+    context,
+  );
+
+  const first = context.selectConversation("first");
+  const second = context.selectConversation("second");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(selected, ["first"]);
+  assert.equal(releases.length, 1);
+  releases.shift()();
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(selected, ["first", "second"]);
+  assert.equal(releases.length, 1);
+  releases.shift()();
+  await second;
+  assert.deepEqual(selected, ["first", "second"]);
 });

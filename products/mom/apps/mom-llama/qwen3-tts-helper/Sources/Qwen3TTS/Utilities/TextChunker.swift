@@ -10,6 +10,81 @@ public struct TextChunker {
     /// Minimum words to consider for a chunk (avoid tiny fragments)
     public static let minWords = 8
 
+    /// Prepare formatted assistant text for speech and split it into bounded
+    /// generations. Keeping each generation short prevents acoustic drift;
+    /// paragraph and heading boundaries provide natural places to reset the
+    /// model without changing the text shown in the conversation.
+    public static func spokenChunks(_ text: String, maxWords: Int = 24) -> [String] {
+        let normalizedLines = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { normalizeSpokenLine(String($0)) }
+
+        var blocks: [String] = []
+        var lines: [String] = []
+        func flush() {
+            let block = lines.joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !block.isEmpty { blocks.append(block) }
+            lines.removeAll(keepingCapacity: true)
+        }
+
+        for line in normalizedLines {
+            if line.isEmpty {
+                flush()
+            } else {
+                lines.append(line)
+            }
+        }
+        flush()
+
+        // A short heading is more natural when spoken with the paragraph it
+        // introduces, but it still starts a fresh model generation.
+        var mergedBlocks: [String] = []
+        var index = 0
+        while index < blocks.count {
+            let block = blocks[index]
+            if block.split(whereSeparator: { $0.isWhitespace }).count < 4,
+               index + 1 < blocks.count {
+                let separator = block.last.map { ".!?".contains($0) } == true ? " " : ". "
+                mergedBlocks.append(block + separator + blocks[index + 1])
+                index += 2
+            } else {
+                mergedBlocks.append(block)
+                index += 1
+            }
+        }
+
+        return mergedBlocks.flatMap { chunk($0, maxWords: maxWords) }
+    }
+
+    private static func normalizeSpokenLine(_ input: String) -> String {
+        var line = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return "" }
+
+        while line.first == "#" { line.removeFirst() }
+        line = line.trimmingCharacters(in: .whitespaces)
+
+        for marker in ["- ", "* ", "+ "] where line.hasPrefix(marker) {
+            line.removeFirst(marker.count)
+            break
+        }
+
+        let prefix = line.prefix { $0.isNumber }
+        if !prefix.isEmpty {
+            let suffix = line.dropFirst(prefix.count)
+            if let punctuation = suffix.first,
+               punctuation == "." || punctuation == ")" {
+                line = String(suffix.dropFirst()).trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        for marker in ["**", "__", "`"] {
+            line = line.replacingOccurrences(of: marker, with: "")
+        }
+        return line
+    }
+
     /// Conjunctions that indicate clause boundaries (split BEFORE these)
     private static let conjunctions = [
         " and then ", " and ", " but ", " or ", " so ", " because ",
@@ -150,6 +225,6 @@ public struct TextChunker {
     /// So roughly 5 tokens per word.
     public static func estimateTokens(for text: String) -> Int {
         let wordCount = text.split(separator: " ").count
-        return max(50, wordCount * 5)
+        return max(12, wordCount * 5)
     }
 }

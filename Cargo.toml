@@ -11,6 +11,7 @@ members = [
     "crates/workspace-document",
     "crates/desktop-model-defaults",
     "crates/native/crates/llama-native-cache",
+    "crates/native/crates/llama-cpp-2",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",

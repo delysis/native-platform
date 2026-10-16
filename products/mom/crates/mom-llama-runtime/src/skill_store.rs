@@ -236,6 +236,9 @@ pub fn load_skill_db() -> Result<SkillDb> {
 }
 
 pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> {
+    if skill_ids.is_empty() {
+        return Ok(applied_skill_prompt_from_db(skill_ids, &SkillDb::default()));
+    }
     let db = load_skill_db()?;
     Ok(applied_skill_prompt_from_db(skill_ids, &db))
 }

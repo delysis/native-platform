@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use mom_llama_runtime::{
-    AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult, MessageRole,
+    AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult,
+    ConversationPersonaIdentity, MessageRole, conversation_persona_identity,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -8,37 +9,178 @@ use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
     PARAKEET_MODEL_ID,
 };
-use speech_native_backend_qwen::{QWEN_BACKEND_ID, QWEN_ICL_MODEL_ID, QWEN_MODEL_ID};
+use speech_native_backend_qwen::{
+    IclWarmStatus, QWEN_BACKEND_ID, QWEN_ICL_MODEL_ID, QwenSpeechBackend,
+};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
     AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
-    DiarizationPolicy, EncodedAudioFormat, NetworkBehavior, SpeechBackendDescriptor,
-    SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechError, SpeechErrorClass,
-    SpeechOperationCapability, SpeechPrivacyPolicy, SpeechRequestContext, SpeechRequestId,
-    SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisInput, SynthesisRequest,
-    SynthesisResponse, TimestampGranularity, TranscriptionInput, TranscriptionRequest,
-    TranscriptionResponse, TranscriptionTask, VoiceSelector,
+    DiarizationPolicy, EncodedAudioFormat, NetworkBehavior, PcmFormat, PcmSampleFormat,
+    SpeechBackendDescriptor, SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechError,
+    SpeechErrorClass, SpeechOperationCapability, SpeechPrivacyPolicy, SpeechRequestContext,
+    SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisEvent,
+    SynthesisInput, SynthesisOutput, SynthesisRequest, SynthesisResponse, TimestampGranularity,
+    TranscriptionInput, TranscriptionRequest, TranscriptionResponse, TranscriptionTask,
+    VoiceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
-use desktop_speech::APPLE_BACKEND_ID;
 #[cfg(test)]
-use speech_native_types::{PlatformTarget, SynthesisOutput};
+use speech_native_types::PlatformTarget;
 const MOM_SPEECH_CLIENT_ID: &str = "mom-llama";
 const MAX_ACTIVE_SPEECH_OPERATIONS: usize = 4;
 const MAX_PENDING_CANCELS: usize = 32;
 const MAX_PLAYBACKS: usize = 2;
-const MAX_PRECOMMIT_AUDIO: usize = 2;
 const MAX_COMPLETE_WAV_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARACTERS: usize = 200_000;
 const MAX_PRECOMMIT_CHARACTERS: usize = 3_000;
 
-/// Apple's wrapper produces a complete WAV in one synchronous native call.
-/// Stop suppresses publication and playback immediately, but cannot pre-empt
-/// that inner call; shutdown therefore joins it before reporting completion.
-pub const APPLE_SYNTHESIS_IS_NON_PREEMPTIVE: bool = true;
+pub type PcmStreamSink =
+    Arc<dyn Fn(&speech_native_types::AudioChunk) -> Result<(), String> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RealtimeTtsComputeMetrics {
+    lease_acquisitions: u64,
+    lease_releases: u64,
+    generation_yields: u64,
+    generation_yield_us: u64,
+    generation_fair_passes: u64,
+    lease_held_us: u64,
+    lease_released_us: u64,
+    minimum_lead_ms: Option<i64>,
+    maximum_lead_ms: Option<i64>,
+    low_water_ms: u64,
+    high_water_ms: u64,
+}
+
+#[derive(Debug)]
+struct RealtimeTtsComputeArbiter {
+    lease: Option<mom_llama_runtime::RealtimeComputeLease>,
+    lease_acquired_at: Option<Instant>,
+    lease_released_at: Option<Instant>,
+    first_pcm: Option<Instant>,
+    previous_pcm: Option<Instant>,
+    audio_ms: f64,
+    maximum_gap_ms: f64,
+    metrics: RealtimeTtsComputeMetrics,
+}
+
+impl RealtimeTtsComputeArbiter {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            lease: Some(mom_llama_runtime::acquire_realtime_compute()),
+            lease_acquired_at: Some(now),
+            lease_released_at: None,
+            first_pcm: None,
+            previous_pcm: None,
+            audio_ms: 0.0,
+            maximum_gap_ms: 0.0,
+            metrics: RealtimeTtsComputeMetrics {
+                lease_acquisitions: 1,
+                low_water_ms: 120,
+                high_water_ms: 220,
+                ..RealtimeTtsComputeMetrics::default()
+            },
+        }
+    }
+
+    fn observe(&mut self, chunk: &speech_native_types::AudioChunk) {
+        let bytes_per_frame = chunk.format.bytes_per_frame();
+        if chunk.data.is_empty() || bytes_per_frame == 0 || chunk.format.sample_rate_hz == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(lease) = &self.lease {
+            lease.renew_priority();
+        }
+        let frames = chunk.data.len() / bytes_per_frame;
+        let packet_audio_ms = frames as f64 * 1_000.0 / f64::from(chunk.format.sample_rate_hz);
+        self.audio_ms += packet_audio_ms;
+        let first = *self.first_pcm.get_or_insert(now);
+        if let Some(previous) = self.previous_pcm.replace(now) {
+            self.maximum_gap_ms = self
+                .maximum_gap_ms
+                .max(now.duration_since(previous).as_secs_f64() * 1_000.0);
+        }
+        let lead_ms = self.audio_ms - now.duration_since(first).as_secs_f64() * 1_000.0;
+        let rounded_lead = lead_ms.round() as i64;
+        self.metrics.minimum_lead_ms = Some(
+            self.metrics
+                .minimum_lead_ms
+                .map_or(rounded_lead, |current| current.min(rounded_lead)),
+        );
+        self.metrics.maximum_lead_ms = Some(
+            self.metrics
+                .maximum_lead_ms
+                .map_or(rounded_lead, |current| current.max(rounded_lead)),
+        );
+        // One pathological packet gap must not make Gemma wait for an
+        // ever-growing PCM reservoir. Protect approximately one packet at the
+        // low watermark and release after roughly two packets, while allowing
+        // bounded adaptation to the measured producer cadence.
+        let low_water = 120.0_f64.max((self.maximum_gap_ms * 0.75).min(180.0));
+        let high_water = 220.0_f64
+            .max((self.maximum_gap_ms * 1.25).min(280.0))
+            .max(packet_audio_ms * 1.5);
+        self.metrics.low_water_ms = low_water.round() as u64;
+        self.metrics.high_water_ms = high_water.round() as u64;
+        if self.lease.is_some() && lead_ms >= high_water {
+            self.release();
+        } else if self.lease.is_none() && lead_ms <= low_water {
+            if let Some(released_at) = self.lease_released_at.take() {
+                self.metrics.lease_released_us = self
+                    .metrics
+                    .lease_released_us
+                    .saturating_add(elapsed_us(released_at));
+            }
+            self.lease = Some(mom_llama_runtime::acquire_realtime_compute());
+            self.lease_acquired_at = Some(Instant::now());
+            self.metrics.lease_acquisitions = self.metrics.lease_acquisitions.saturating_add(1);
+        }
+    }
+
+    fn release(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        if let Some(acquired_at) = self.lease_acquired_at.take() {
+            self.metrics.lease_held_us = self
+                .metrics
+                .lease_held_us
+                .saturating_add(elapsed_us(acquired_at));
+        }
+        self.lease_released_at = Some(Instant::now());
+        let yielded = lease.finish();
+        self.metrics.lease_releases = self.metrics.lease_releases.saturating_add(1);
+        self.metrics.generation_yields = self
+            .metrics
+            .generation_yields
+            .saturating_add(yielded.generation_yields);
+        self.metrics.generation_yield_us = self
+            .metrics
+            .generation_yield_us
+            .saturating_add(yielded.generation_yield_us);
+        self.metrics.generation_fair_passes = self
+            .metrics
+            .generation_fair_passes
+            .saturating_add(yielded.generation_fair_passes);
+    }
+
+    fn finish(&mut self) -> RealtimeTtsComputeMetrics {
+        self.release();
+        if let Some(released_at) = self.lease_released_at.take() {
+            self.metrics.lease_released_us = self
+                .metrics
+                .lease_released_us
+                .saturating_add(elapsed_us(released_at));
+        }
+        self.metrics
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeechPhase {
@@ -61,25 +203,15 @@ struct ActiveOperation {
 }
 
 #[derive(Debug, Clone)]
-struct PlaybackAudio {
-    binding: ReadAloudBinding,
-    bytes: Vec<u8>,
-}
+struct PlaybackAudio;
 
 #[derive(Debug, Clone)]
-struct PrecommitAudio {
-    binding: PrecommitSpeechBinding,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug)]
 struct SpeechState {
     phase: SpeechPhase,
     active: BTreeMap<String, ActiveOperation>,
     early_cancel: BTreeSet<String>,
     early_cancel_order: VecDeque<String>,
     playback: BTreeMap<String, PlaybackAudio>,
-    precommit_audio: BTreeMap<String, PrecommitAudio>,
 }
 
 impl Default for SpeechState {
@@ -90,7 +222,6 @@ impl Default for SpeechState {
             early_cancel: BTreeSet::new(),
             early_cancel_order: VecDeque::new(),
             playback: BTreeMap::new(),
-            precommit_audio: BTreeMap::new(),
         }
     }
 }
@@ -105,13 +236,6 @@ struct AssistantMessageTarget {
 }
 
 #[derive(Debug, Clone)]
-struct AppleSelection {
-    descriptor_sha256: String,
-    descriptor: SpeechBackendDescriptor,
-    voice_id: String,
-}
-
-#[derive(Debug, Clone)]
 struct QwenSelection {
     descriptor_sha256: String,
     descriptor: SpeechBackendDescriptor,
@@ -122,36 +246,29 @@ struct QwenSelection {
 #[derive(Debug, Clone)]
 enum ReadAloudSelection {
     Qwen(QwenSelection),
-    Apple(AppleSelection),
 }
 
 impl ReadAloudSelection {
     fn descriptor(&self) -> &SpeechBackendDescriptor {
         match self {
             Self::Qwen(value) => &value.descriptor,
-            Self::Apple(value) => &value.descriptor,
         }
     }
     fn descriptor_sha256(&self) -> &str {
         match self {
             Self::Qwen(value) => &value.descriptor_sha256,
-            Self::Apple(value) => &value.descriptor_sha256,
         }
     }
     fn backend_id(&self) -> &str {
         &self.descriptor().id
     }
     fn model_id(&self) -> Option<String> {
-        match self {
-            Self::Qwen(value) => Some(value.model_id.clone()),
-            Self::Apple(_) => None,
-        }
+        let Self::Qwen(value) = self;
+        Some(value.model_id.clone())
     }
     fn voice_id(&self) -> String {
-        match self {
-            Self::Qwen(value) => value.voice_id.clone(),
-            Self::Apple(value) => value.voice_id.clone(),
-        }
+        let Self::Qwen(value) = self;
+        value.voice_id.clone()
     }
 }
 
@@ -171,11 +288,10 @@ pub struct ReadAloudBinding {
     pub model_id: Option<String>,
     pub voice_id: String,
     pub request_id: String,
-    pub wav_sha256: String,
-    pub wav_bytes: u64,
     pub duration_ms: Option<u64>,
+    pub tts_time_to_first_audio_ms: Option<u64>,
+    pub tts_total_ms: Option<u64>,
     pub network: NetworkBehavior,
-    pub apple_inner_call_non_preemptive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -197,9 +313,50 @@ pub struct PrecommitSpeechBinding {
     pub model_id: String,
     pub voice_id: String,
     pub request_id: String,
-    pub wav_sha256: String,
-    pub wav_bytes: u64,
     pub duration_ms: Option<u64>,
+    pub tts_queue_ms: Option<u64>,
+    pub tts_queue_us: Option<u64>,
+    pub tts_host_route_us: Option<u64>,
+    pub tts_host_queue_us: Option<u64>,
+    pub tts_host_dispatch_us: Option<u64>,
+    pub tts_host_admission_us: Option<u64>,
+    pub tts_model_load_ms: Option<u64>,
+    pub tts_background_warm_active: Option<bool>,
+    pub tts_background_warm_completed: Option<u64>,
+    pub tts_background_warm_total: Option<u64>,
+    pub tts_reference_admission_us: Option<u64>,
+    pub tts_reference_cache: Option<String>,
+    pub tts_reference_us: Option<u64>,
+    pub tts_reference_identity_us: Option<u64>,
+    pub tts_reference_memory_lookup_us: Option<u64>,
+    pub tts_reference_disk_lookup_us: Option<u64>,
+    pub tts_reference_source_read_us: Option<u64>,
+    pub tts_reference_source_hash_us: Option<u64>,
+    pub tts_reference_compute_us: Option<u64>,
+    pub tts_reference_persist_us: Option<u64>,
+    pub tts_helper_first_pcm_us: Option<u64>,
+    pub tts_helper_text_chunk_us: Option<u64>,
+    pub tts_helper_code_generation_us: Option<u64>,
+    pub tts_helper_prepared_prefix_cache_hit: Option<bool>,
+    pub tts_helper_first_decode_us: Option<u64>,
+    pub tts_time_to_first_audio_ms: Option<u64>,
+    pub tts_total_ms: Option<u64>,
+    pub tts_voice_lookup_us: u64,
+    pub tts_descriptor_snapshot_us: u64,
+    pub tts_route_selection_us: u64,
+    pub tts_operation_admission_us: u64,
+    pub tts_postflight_voice_lookup_us: u64,
+    pub tts_compute_lease_acquisitions: u64,
+    pub tts_compute_lease_releases: u64,
+    pub tts_generation_yields: u64,
+    pub tts_generation_yield_us: u64,
+    pub tts_generation_fair_passes: u64,
+    pub tts_compute_lease_held_us: u64,
+    pub tts_compute_lease_released_us: u64,
+    pub tts_compute_minimum_lead_ms: Option<i64>,
+    pub tts_compute_maximum_lead_ms: Option<i64>,
+    pub tts_compute_low_water_ms: u64,
+    pub tts_compute_high_water_ms: u64,
     pub network: NetworkBehavior,
 }
 
@@ -255,13 +412,28 @@ pub struct SpeechShutdown {
     pub host_joined: bool,
     pub active_operation_count: usize,
     pub retained_playback_count: usize,
-    pub apple_inner_call_non_preemptive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GenerationBackpressureReceipt {
+    pub request_id: String,
+    pub active: bool,
+    pub generation_yields: u64,
+    pub generation_yield_us: u64,
 }
 
 #[async_trait]
 trait SpeechExecutor: Send + Sync {
-    fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError>;
+    fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError>;
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String>;
+    async fn synthesize_streaming(
+        &self,
+        request: SynthesisRequest,
+        sink: PcmStreamSink,
+    ) -> Result<SynthesisResponse, String> {
+        let _ = sink;
+        self.synthesize(request).await
+    }
     async fn transcribe(
         &self,
         request: TranscriptionRequest,
@@ -273,22 +445,25 @@ trait SpeechExecutor: Send + Sync {
 
 struct HostSpeechExecutor {
     host: Arc<SpeechHost>,
+    descriptors: Arc<[SpeechBackendDescriptor]>,
 }
 
 #[async_trait]
 impl SpeechExecutor for HostSpeechExecutor {
-    fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError> {
-        self.host.descriptors()
+    fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+        Ok(Arc::clone(&self.descriptors))
     }
 
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String> {
-        self.host
-            .synthesize(request)
-            .await
-            .map_err(|error| error.to_string())?
-            .final_response()
-            .await
-            .map_err(|error| speech_error_message(&error))
+        self.synthesize_validated(request, None).await
+    }
+
+    async fn synthesize_streaming(
+        &self,
+        request: SynthesisRequest,
+        sink: PcmStreamSink,
+    ) -> Result<SynthesisResponse, String> {
+        self.synthesize_validated(request, Some(sink)).await
     }
 
     async fn transcribe(
@@ -317,30 +492,286 @@ impl SpeechExecutor for HostSpeechExecutor {
     }
 }
 
-pub struct MomSpeech {
-    executor: Arc<dyn SpeechExecutor>,
-    state: Mutex<SpeechState>,
+impl HostSpeechExecutor {
+    fn new(host: Arc<SpeechHost>) -> Result<Self, SpeechHostError> {
+        // Local backend registration is complete before MomSpeech is exposed.
+        // Keep the immutable routing inventory behind an Arc so every short
+        // streamed TTS segment does not lock the host, query every backend,
+        // and deep-clone all model and voice descriptors before dispatch.
+        let descriptors = Arc::<[SpeechBackendDescriptor]>::from(host.descriptors()?);
+        Ok(Self { host, descriptors })
+    }
+
+    async fn synthesize_validated(
+        &self,
+        request: SynthesisRequest,
+        sink: Option<PcmStreamSink>,
+    ) -> Result<SynthesisResponse, String> {
+        let stream = request.stream;
+        let mut ticket = self
+            .host
+            .synthesize(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !stream {
+            return ticket
+                .final_response()
+                .await
+                .map_err(|error| speech_error_message(&error));
+        }
+        let mut emitted_bytes = 0_u64;
+        let mut format = None;
+        let mut expected_sequence = 0_u64;
+        let mut expected_sample_offset = 0_u64;
+        let mut saw_end = false;
+        while let Some(event) = ticket.events.recv().await {
+            if let SynthesisEvent::Audio { chunk, .. } = event {
+                if chunk.sequence != expected_sequence {
+                    return Err(
+                        "speech_stream_sequence_invalid: Qwen PCM chunks were not contiguous"
+                            .to_string(),
+                    );
+                }
+                expected_sequence = expected_sequence.saturating_add(1);
+                if chunk.sample_offset != expected_sample_offset {
+                    return Err(
+                        "speech_stream_offset_invalid: Qwen PCM chunks overlapped or skipped samples"
+                            .to_string(),
+                    );
+                }
+                let frame_bytes = chunk.format.bytes_per_frame();
+                let frames = u64::try_from(chunk.data.len() / frame_bytes).unwrap_or(u64::MAX);
+                expected_sample_offset =
+                    expected_sample_offset.checked_add(frames).ok_or_else(|| {
+                        "speech_stream_offset_invalid: Qwen PCM sample offset overflowed"
+                            .to_string()
+                    })?;
+                if let Some(expected) = &format {
+                    if expected != &chunk.format {
+                        return Err(
+                            "speech_stream_format_changed: Qwen PCM format changed mid-stream"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    format = Some(chunk.format.clone());
+                }
+                emitted_bytes = emitted_bytes
+                    .checked_add(u64::try_from(chunk.data.len()).unwrap_or(u64::MAX))
+                    .ok_or_else(|| {
+                        "speech_stream_too_large: PCM byte count overflowed".to_string()
+                    })?;
+                if emitted_bytes > u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) {
+                    return Err(
+                        "speech_stream_too_large: Qwen PCM exceeded the playback bound".to_string(),
+                    );
+                }
+                if let Some(sink) = &sink {
+                    sink(&chunk)?;
+                }
+                saw_end |= chunk.end_of_stream;
+            }
+        }
+        let response = ticket
+            .final_response()
+            .await
+            .map_err(|error| speech_error_message(&error))?;
+        let format =
+            format.ok_or_else(|| "speech_stream_empty: Qwen returned no PCM".to_string())?;
+        if !saw_end {
+            return Err("speech_stream_incomplete: Qwen closed without an end marker".to_string());
+        }
+        match &response.output {
+            SynthesisOutput::Streamed { format: output, emitted_bytes: output_bytes }
+                if output == &AudioOutputFormat::Pcm { format: format.clone() }
+                    && *output_bytes == emitted_bytes => {}
+            _ => return Err("speech_stream_receipt_invalid: Qwen's final streamed receipt did not match the emitted PCM".to_string()),
+        }
+        Ok(response)
+    }
 }
 
-impl MomSpeech {
-    pub async fn discover(data_dir: &Path) -> Result<Arc<Self>, String> {
-        let host = desktop_speech::discover_local_host(Some(data_dir.join("speech-models")))
-            .await
-            .map_err(|error| format!("Local speech registration failed: {error}"))?;
+pub struct MomSpeech {
+    executor: Arc<dyn SpeechExecutor>,
+    _qwen: Option<Arc<QwenSpeechBackend>>,
+    _qwen_startup_warm: Option<IclWarmStatus>,
+    state: Mutex<SpeechState>,
+    precommit_voices: RwLock<BTreeMap<String, String>>,
+    generation_backpressure:
+        Mutex<BTreeMap<String, mom_llama_runtime::GenerationBackpressureLease>>,
+}
 
+const MAX_GENERATION_BACKPRESSURE_REQUESTS: usize = 8;
+
+impl MomSpeech {
+    pub async fn discover(
+        data_dir: &Path,
+        installed_voice_root: &Path,
+    ) -> Result<Arc<Self>, String> {
+        Self::discover_with_prepared_qwen(data_dir, installed_voice_root, None).await
+    }
+
+    pub async fn discover_with_prepared_qwen(
+        data_dir: &Path,
+        installed_voice_root: &Path,
+        prepared_qwen: Option<Arc<QwenSpeechBackend>>,
+    ) -> Result<Arc<Self>, String> {
+        #[cfg(target_os = "macos")]
+        let (prepared_qwen, qwen_startup_warm) = {
+            let qwen = prepared_qwen.unwrap_or_else(|| {
+                desktop_speech::prepare_local_qwen(
+                    Some(data_dir.join("speech-models")),
+                    Some(installed_voice_root.to_path_buf()),
+                )
+            });
+            let warm = qwen
+                .wait_for_icl_background_warm()
+                .map_err(|error| format!("Local Qwen startup warm failed: {error}"))?;
+            if warm.total > 0 && warm.completed != warm.total {
+                return Err(format!(
+                    "Local Qwen startup warm completed only {} of {} compile probes",
+                    warm.completed, warm.total
+                ));
+            }
+            eprintln!(
+                "mom-llama qwen resident warm: resident={} ms, probe={} ms, total={} ms",
+                warm.resident_us / 1_000,
+                warm.probe_us / 1_000,
+                warm.total_us / 1_000
+            );
+            (Some(qwen), Some(warm))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (prepared_qwen, qwen_startup_warm) = (prepared_qwen, None);
+        let host = desktop_speech::discover_local_host_with_qwen(
+            Some(data_dir.join("speech-models")),
+            Some(installed_voice_root.to_path_buf()),
+            prepared_qwen.clone(),
+        )
+        .await
+        .map_err(|error| format!("Local speech registration failed: {error}"))?;
+
+        let executor = HostSpeechExecutor::new(host)
+            .map_err(|error| format!("Local speech inventory failed: {error}"))?;
         Ok(Arc::new(Self {
-            executor: Arc::new(HostSpeechExecutor { host }),
+            executor: Arc::new(executor),
+            _qwen: prepared_qwen,
+            _qwen_startup_warm: qwen_startup_warm,
             state: Mutex::new(SpeechState::default()),
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
         }))
     }
 
     #[cfg(test)]
     pub fn empty_for_tests() -> Arc<Self> {
         let host = Arc::new(SpeechHost::new(PlatformTarget::current()));
+        let executor = HostSpeechExecutor::new(host).expect("empty speech inventory");
         Arc::new(Self {
-            executor: Arc::new(HostSpeechExecutor { host }),
+            executor: Arc::new(executor),
+            _qwen: None,
+            _qwen_startup_warm: None,
             state: Mutex::new(SpeechState::default()),
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    pub fn set_generation_backpressure(
+        &self,
+        request_id: &str,
+        active: bool,
+    ) -> Result<GenerationBackpressureReceipt, String> {
+        let mut leases = self
+            .generation_backpressure
+            .lock()
+            .map_err(|_| "voice generation backpressure is unavailable".to_string())?;
+        if active {
+            if !leases.contains_key(request_id) {
+                if leases.len() >= MAX_GENERATION_BACKPRESSURE_REQUESTS {
+                    return Err(
+                        "voice generation backpressure has too many outstanding requests"
+                            .to_string(),
+                    );
+                }
+                let lease = mom_llama_runtime::acquire_generation_backpressure(request_id)
+                    .map_err(|error| error.to_string())?;
+                leases.insert(request_id.to_string(), lease);
+            }
+            return Ok(GenerationBackpressureReceipt {
+                request_id: request_id.to_string(),
+                active: true,
+                generation_yields: 0,
+                generation_yield_us: 0,
+            });
+        }
+        let metrics = leases
+            .remove(request_id)
+            .map(mom_llama_runtime::GenerationBackpressureLease::finish)
+            .unwrap_or_default();
+        Ok(GenerationBackpressureReceipt {
+            request_id: request_id.to_string(),
+            active: false,
+            generation_yields: metrics.generation_yields,
+            generation_yield_us: metrics.generation_yield_us,
+        })
+    }
+
+    /// Binds a conversation to the persona voice from the immutable turn
+    /// preparation that already loaded it. Conversation persona identity is
+    /// creation-time state; a conflicting second binding is therefore a hard
+    /// provenance error rather than an overwrite.
+    pub fn bind_precommit_voice(
+        &self,
+        conversation_id: &str,
+        identity: &ConversationPersonaIdentity,
+    ) -> Result<bool, String> {
+        let Some(voice) = persona_voice_key_for_conversation(
+            &identity.recipient_ids,
+            identity.source_conversation_id.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        let voice_id = format!("mom.qwen.icl.{voice}");
+        let mut bindings = self
+            .precommit_voices
+            .write()
+            .map_err(|_| "speech_precommit_voice_bindings_poisoned".to_string())?;
+        match bindings.get(conversation_id) {
+            Some(existing) if existing == &voice_id => Ok(true),
+            Some(_) => Err("speech_precommit_persona_binding_changed".to_string()),
+            None => {
+                bindings.insert(conversation_id.to_string(), voice_id);
+                Ok(true)
+            }
+        }
+    }
+
+    fn precommit_voice(&self, conversation_id: &str) -> Result<Option<String>, String> {
+        self.precommit_voices
+            .read()
+            .map_err(|_| "speech_precommit_voice_bindings_poisoned".to_string())
+            .map(|bindings| bindings.get(conversation_id).cloned())
+    }
+
+    /// Returns the immutable consultant voice for a prepared turn. Normal
+    /// microphone admission binds this while the model is being prepared. A
+    /// renderer restart or an older persisted conversation can legitimately
+    /// reach speech without that process-local cache entry, so recover it from
+    /// the durable conversation identity once instead of failing a valid turn.
+    fn resolve_precommit_voice(&self, conversation_id: &str) -> Result<Option<String>, String> {
+        if let Some(voice) = self.precommit_voice(conversation_id)? {
+            return Ok(Some(voice));
+        }
+        let Some(identity) = conversation_persona_identity(conversation_id)
+            .map_err(|error| format!("speech_precommit_identity_lookup_failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        if !self.bind_precommit_voice(conversation_id, &identity)? {
+            return Ok(None);
+        }
+        self.precommit_voice(conversation_id)
     }
 
     #[cfg(test)]
@@ -354,6 +785,7 @@ impl MomSpeech {
             .await
     }
 
+    #[cfg(test)]
     pub async fn read_aloud_with_mode(
         &self,
         conversation_id: &str,
@@ -361,13 +793,31 @@ impl MomSpeech {
         operation: &str,
         require_persona_voice: bool,
     ) -> anyhow::Result<CommandResult<ReadAloudOutput>> {
+        self.read_aloud_streaming_with_mode(
+            conversation_id,
+            message_id,
+            operation,
+            require_persona_voice,
+            None,
+        )
+        .await
+    }
+
+    pub async fn read_aloud_streaming_with_mode(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        operation: &str,
+        require_persona_voice: bool,
+        stream_sink: Option<PcmStreamSink>,
+    ) -> anyhow::Result<CommandResult<ReadAloudOutput>> {
         validate_operation_token(operation)?;
         let target = match assistant_message_target(conversation_id, message_id)? {
             Ok(target) => target,
             Err(blocker) => return Ok(blocked("mom_llama.speech_read_aloud", blocker)),
         };
         let descriptors = self.executor.descriptors()?;
-        let mut selection = match select_read_aloud(
+        let selection = match select_read_aloud(
             &descriptors,
             target.text.chars().count(),
             target.persona_voice_id.as_deref(),
@@ -382,34 +832,11 @@ impl MomSpeech {
         {
             return Ok(blocked("mom_llama.speech_read_aloud", blocker));
         }
-        let mut response = self
-            .executor
-            .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
-            .await;
-        if !require_persona_voice
-            && response.is_err()
-            && matches!(selection, ReadAloudSelection::Qwen(_))
-        {
-            selection = ReadAloudSelection::Apple(
-                match select_apple(&descriptors, target.text.chars().count()) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        let error = response
-                            .err()
-                            .unwrap_or_else(|| "Qwen3 TTS failed".to_string());
-                        self.finish_operation(operation, &request_id);
-                        return Ok(blocked(
-                            "mom_llama.speech_read_aloud",
-                            speech_failure_blocker(&error),
-                        ));
-                    }
-                },
-            );
-            response = self
-                .executor
-                .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
-                .await;
-        }
+        let request = read_aloud_request(&target, &selection, request_id.clone());
+        let response = match stream_sink.clone() {
+            Some(sink) => self.executor.synthesize_streaming(request, sink).await,
+            None => self.executor.synthesize(request).await,
+        };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -441,23 +868,10 @@ impl MomSpeech {
                 ),
             ));
         }
-        let mut validated = validate_read_aloud_response(response, &request_id, &selection);
-        if !require_persona_voice
-            && validated.is_err()
-            && matches!(selection, ReadAloudSelection::Qwen(_))
-            && let Ok(apple) = select_apple(&descriptors, target.text.chars().count())
-        {
-            selection = ReadAloudSelection::Apple(apple);
-            validated = match self
-                .executor
-                .synthesize(read_aloud_request(&target, &selection, request_id.clone()))
-                .await
-            {
-                Ok(response) => validate_read_aloud_response(response, &request_id, &selection),
-                Err(error) => Err(speech_failure_blocker(&error)),
-            };
-        }
-        let (audio, duration_ms) = match validated {
+        let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
+        let tts_total_ms = response.usage.total_ms;
+        let validated = validate_read_aloud_response(response, &request_id, &selection);
+        let duration_ms = match validated {
             Ok(output) => output,
             Err(blocker) => {
                 self.finish_operation(operation, &request_id);
@@ -473,18 +887,15 @@ impl MomSpeech {
             model_id: selection.model_id(),
             voice_id: selection.voice_id(),
             request_id: request_id.0.clone(),
-            wav_sha256: sha256_hex(&audio),
-            wav_bytes: u64::try_from(audio.len()).unwrap_or(u64::MAX),
             duration_ms,
+            tts_time_to_first_audio_ms,
+            tts_total_ms,
             network: NetworkBehavior::Never,
-            apple_inner_call_non_preemptive: matches!(selection, ReadAloudSelection::Apple(_))
-                && APPLE_SYNTHESIS_IS_NON_PREEMPTIVE,
         };
-        let playback_id =
-            match self.publish_playback(operation, &request_id, binding.clone(), audio) {
-                Ok(playback_id) => playback_id,
-                Err(blocker) => return Ok(blocked("mom_llama.speech_read_aloud", blocker)),
-            };
+        let playback_id = match self.publish_playback(operation, &request_id, binding.clone()) {
+            Ok(playback_id) => playback_id,
+            Err(blocker) => return Ok(blocked("mom_llama.speech_read_aloud", blocker)),
+        };
         Ok(CommandResult::passed(
             "mom_llama.speech_read_aloud",
             "host_integrated",
@@ -512,6 +923,7 @@ impl MomSpeech {
         conversation_id: &str,
         operation: &str,
         text: &str,
+        stream_sink: PcmStreamSink,
     ) -> anyhow::Result<CommandResult<PrecommitSpeechOutput>> {
         validate_operation_token(operation)?;
         let character_count = text.chars().count();
@@ -525,36 +937,45 @@ impl MomSpeech {
                 ),
             ));
         }
-        let voice_id = match conversation_persona_voice(conversation_id)? {
-            Ok(voice_id) => voice_id,
-            Err(blocker) => {
-                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
-            }
-        };
-        let descriptors = self.executor.descriptors()?;
-        let selection = match select_read_aloud(
-            &descriptors,
-            character_count,
-            Some(&voice_id),
-            true,
-        ) {
-            Ok(ReadAloudSelection::Qwen(selection)) => ReadAloudSelection::Qwen(selection),
-            Ok(ReadAloudSelection::Apple(_)) => {
+        // Claim the shared compute lane before voice lookup and routing. If
+        // Gemma starts another non-preemptible Metal decode while this command
+        // is being admitted, Qwen's first codec packet pays that entire token
+        // quantum. The lease is RAII-owned, so every blocked or failed return
+        // below still releases it without a separate cleanup branch.
+        let compute_arbiter = Arc::new(Mutex::new(RealtimeTtsComputeArbiter::new()));
+        let stage_started = Instant::now();
+        let voice_id = match self
+            .resolve_precommit_voice(conversation_id)
+            .map_err(anyhow::Error::msg)?
+        {
+            Some(voice_id) => voice_id,
+            None => {
                 return Ok(blocked(
                     "mom_llama.speech_precommit_synthesize",
-                    speech_unavailable(
-                        "Pre-commit voice synthesis requires the selected consultant's local Qwen voice.",
+                    Blocker::new(
+                        "speech_precommit_voice_unbound",
+                        "The prepared turn has no bound consultant voice.",
+                        Vec::new(),
                     ),
                 ));
             }
-            Err(blocker) => {
-                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
-            }
         };
-        let ReadAloudSelection::Qwen(qwen) = &selection else {
-            unreachable!("pre-commit synthesis selected Qwen above")
-        };
+        let tts_voice_lookup_us = elapsed_us(stage_started);
+        let stage_started = Instant::now();
+        let descriptors = self.executor.descriptors()?;
+        let tts_descriptor_snapshot_us = elapsed_us(stage_started);
+        let stage_started = Instant::now();
+        let selection =
+            match select_read_aloud(&descriptors, character_count, Some(&voice_id), true) {
+                Ok(selection) => selection,
+                Err(blocker) => {
+                    return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+                }
+            };
+        let tts_route_selection_us = elapsed_us(stage_started);
+        let ReadAloudSelection::Qwen(qwen) = &selection;
         let request_id = SpeechRequestId(format!("mom-precommit-{operation}"));
+        let stage_started = Instant::now();
         if let Err(blocker) = self.begin_operation(
             operation,
             request_id.clone(),
@@ -562,17 +983,28 @@ impl MomSpeech {
         ) {
             return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
         }
+        let tts_operation_admission_us = elapsed_us(stage_started);
+        let observed_compute = Arc::clone(&compute_arbiter);
+        let downstream_sink = Arc::clone(&stream_sink);
+        let scheduled_sink: PcmStreamSink = Arc::new(move |chunk| {
+            if let Ok(mut arbiter) = observed_compute.lock() {
+                arbiter.observe(chunk);
+            }
+            downstream_sink(chunk)
+        });
         let response = match self
             .executor
-            .synthesize(precommit_synthesis_request(
-                text,
-                &selection,
-                request_id.clone(),
-            ))
+            .synthesize_streaming(
+                precommit_synthesis_request(text, &selection, request_id.clone()),
+                scheduled_sink,
+            )
             .await
         {
             Ok(response) => response,
             Err(error) => {
+                if let Ok(mut arbiter) = compute_arbiter.lock() {
+                    arbiter.release();
+                }
                 let cancelled = self.finish_operation(operation, &request_id);
                 return Ok(blocked(
                     "mom_llama.speech_precommit_synthesize",
@@ -584,10 +1016,19 @@ impl MomSpeech {
                 ));
             }
         };
-        let current_voice = conversation_persona_voice(conversation_id).inspect_err(|_| {
-            self.finish_operation(operation, &request_id);
-        })?;
-        if !matches!(current_voice, Ok(ref current) if current == &qwen.voice_id) {
+        let compute_metrics = compute_arbiter
+            .lock()
+            .map(|mut arbiter| arbiter.finish())
+            .unwrap_or_default();
+        let stage_started = Instant::now();
+        let current_voice = self
+            .precommit_voice(conversation_id)
+            .inspect_err(|_| {
+                self.finish_operation(operation, &request_id);
+            })
+            .map_err(anyhow::Error::msg)?;
+        let tts_postflight_voice_lookup_us = elapsed_us(stage_started);
+        if current_voice.as_ref() != Some(&qwen.voice_id) {
             self.finish_operation(operation, &request_id);
             return Ok(blocked(
                 "mom_llama.speech_precommit_synthesize",
@@ -598,14 +1039,40 @@ impl MomSpeech {
                 ),
             ));
         }
-        let (audio, duration_ms) =
-            match validate_read_aloud_response(response, &request_id, &selection) {
-                Ok(output) => output,
-                Err(blocker) => {
-                    self.finish_operation(operation, &request_id);
-                    return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
-                }
-            };
+        let tts_queue_ms = response.usage.queue_ms;
+        let tts_queue_us = response.usage.queue_us;
+        let tts_host_route_us = response.usage.host_route_us;
+        let tts_host_queue_us = response.usage.host_queue_us;
+        let tts_host_dispatch_us = response.usage.host_dispatch_us;
+        let tts_host_admission_us = response.usage.host_admission_us;
+        let tts_model_load_ms = response.usage.model_load_ms;
+        let tts_background_warm_active = response.usage.background_warm_active;
+        let tts_background_warm_completed = response.usage.background_warm_completed;
+        let tts_background_warm_total = response.usage.background_warm_total;
+        let tts_reference_admission_us = response.usage.reference_admission_us;
+        let tts_reference_cache = response.usage.reference_cache.clone();
+        let tts_reference_us = response.usage.reference_us;
+        let tts_reference_identity_us = response.usage.reference_identity_us;
+        let tts_reference_memory_lookup_us = response.usage.reference_memory_lookup_us;
+        let tts_reference_disk_lookup_us = response.usage.reference_disk_lookup_us;
+        let tts_reference_source_read_us = response.usage.reference_source_read_us;
+        let tts_reference_source_hash_us = response.usage.reference_source_hash_us;
+        let tts_reference_compute_us = response.usage.reference_compute_us;
+        let tts_reference_persist_us = response.usage.reference_persist_us;
+        let tts_helper_first_pcm_us = response.usage.helper_first_pcm_us;
+        let tts_helper_text_chunk_us = response.usage.helper_text_chunk_us;
+        let tts_helper_code_generation_us = response.usage.helper_code_generation_us;
+        let tts_helper_prepared_prefix_cache_hit = response.usage.helper_prepared_prefix_cache_hit;
+        let tts_helper_first_decode_us = response.usage.helper_first_decode_us;
+        let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
+        let tts_total_ms = response.usage.total_ms;
+        let duration_ms = match validate_read_aloud_response(response, &request_id, &selection) {
+            Ok(output) => output,
+            Err(blocker) => {
+                self.finish_operation(operation, &request_id);
+                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+            }
+        };
         let binding = PrecommitSpeechBinding {
             operation: operation.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -615,14 +1082,53 @@ impl MomSpeech {
             model_id: qwen.model_id.clone(),
             voice_id: qwen.voice_id.clone(),
             request_id: request_id.0.clone(),
-            wav_sha256: sha256_hex(&audio),
-            wav_bytes: u64::try_from(audio.len()).unwrap_or(u64::MAX),
             duration_ms,
+            tts_queue_ms,
+            tts_queue_us,
+            tts_host_route_us,
+            tts_host_queue_us,
+            tts_host_dispatch_us,
+            tts_host_admission_us,
+            tts_model_load_ms,
+            tts_background_warm_active,
+            tts_background_warm_completed,
+            tts_background_warm_total,
+            tts_reference_admission_us,
+            tts_reference_cache,
+            tts_reference_us,
+            tts_reference_identity_us,
+            tts_reference_memory_lookup_us,
+            tts_reference_disk_lookup_us,
+            tts_reference_source_read_us,
+            tts_reference_source_hash_us,
+            tts_reference_compute_us,
+            tts_reference_persist_us,
+            tts_helper_first_pcm_us,
+            tts_helper_text_chunk_us,
+            tts_helper_code_generation_us,
+            tts_helper_prepared_prefix_cache_hit,
+            tts_helper_first_decode_us,
+            tts_time_to_first_audio_ms,
+            tts_total_ms,
+            tts_voice_lookup_us,
+            tts_descriptor_snapshot_us,
+            tts_route_selection_us,
+            tts_operation_admission_us,
+            tts_postflight_voice_lookup_us,
+            tts_compute_lease_acquisitions: compute_metrics.lease_acquisitions,
+            tts_compute_lease_releases: compute_metrics.lease_releases,
+            tts_generation_yields: compute_metrics.generation_yields,
+            tts_generation_yield_us: compute_metrics.generation_yield_us,
+            tts_generation_fair_passes: compute_metrics.generation_fair_passes,
+            tts_compute_lease_held_us: compute_metrics.lease_held_us,
+            tts_compute_lease_released_us: compute_metrics.lease_released_us,
+            tts_compute_minimum_lead_ms: compute_metrics.minimum_lead_ms,
+            tts_compute_maximum_lead_ms: compute_metrics.maximum_lead_ms,
+            tts_compute_low_water_ms: compute_metrics.low_water_ms,
+            tts_compute_high_water_ms: compute_metrics.high_water_ms,
             network: NetworkBehavior::Never,
         };
-        if let Err(blocker) =
-            self.publish_precommit_audio(operation, &request_id, binding.clone(), audio)
-        {
+        if let Err(blocker) = self.complete_operation(operation, &request_id) {
             return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
         }
         Ok(CommandResult::passed(
@@ -641,33 +1147,6 @@ impl MomSpeech {
             true,
             false,
         ))
-    }
-
-    pub fn precommit_audio_bytes(
-        &self,
-        operation: &str,
-        text_sha256: &str,
-        backend_descriptor_sha256: &str,
-    ) -> anyhow::Result<Vec<u8>> {
-        validate_operation_token(operation)?;
-        validate_sha256(text_sha256)?;
-        validate_sha256(backend_descriptor_sha256)?;
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Mom speech playback state is unavailable"))?;
-        let prepared = state
-            .precommit_audio
-            .get(operation)
-            .ok_or_else(|| anyhow::anyhow!("Prepared speech operation is unavailable"))?;
-        if prepared.binding.text_sha256 != text_sha256
-            || prepared.binding.backend_descriptor_sha256 != backend_descriptor_sha256
-        {
-            anyhow::bail!(
-                "Prepared speech bytes do not match the requested text and descriptor binding"
-            );
-        }
-        Ok(prepared.bytes.clone())
     }
 
     pub async fn transcribe_attachment(
@@ -803,83 +1282,6 @@ impl MomSpeech {
         ))
     }
 
-    pub fn playback_bytes(
-        &self,
-        playback_id: &str,
-        message_id: &str,
-        text_sha256: &str,
-        backend_descriptor_sha256: &str,
-    ) -> Result<Vec<u8>, String> {
-        self.playback_bytes_with_target(
-            playback_id,
-            message_id,
-            text_sha256,
-            backend_descriptor_sha256,
-            |conversation_id, message_id| {
-                assistant_message_target(conversation_id, message_id)
-                    .map_err(|error| error.to_string())?
-                    .map(|target| target.text_sha256)
-                    .map_err(|blocker| format!("{}: {}", blocker.code, blocker.message))
-            },
-        )
-    }
-
-    fn playback_bytes_with_target<F>(
-        &self,
-        playback_id: &str,
-        message_id: &str,
-        text_sha256: &str,
-        backend_descriptor_sha256: &str,
-        current_text_sha256: F,
-    ) -> Result<Vec<u8>, String>
-    where
-        F: FnOnce(&str, &str) -> Result<String, String>,
-    {
-        let binding = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| "Mom speech playback state is unavailable".to_string())?;
-            if state.phase != SpeechPhase::Running {
-                return Err("Mom speech playback is closing".to_string());
-            }
-            let playback = state.playback.get(playback_id).ok_or_else(|| {
-                "The requested speech playback is no longer available".to_string()
-            })?;
-            if playback.binding.message_id != message_id
-                || playback.binding.text_sha256 != text_sha256
-                || playback.binding.backend_descriptor_sha256 != backend_descriptor_sha256
-            {
-                return Err("Speech playback identity changed before byte publication".to_string());
-            }
-            playback.binding.clone()
-        };
-
-        let current_hash = current_text_sha256(&binding.conversation_id, &binding.message_id)?;
-        if current_hash != binding.text_sha256 {
-            return Err(
-                "speech_read_aloud_stale: The exact assistant message changed before WAV byte publication."
-                    .to_string(),
-            );
-        }
-
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "Mom speech playback state is unavailable".to_string())?;
-        if state.phase != SpeechPhase::Running {
-            return Err("Mom speech playback is closing".to_string());
-        }
-        let playback = state
-            .playback
-            .get(playback_id)
-            .ok_or_else(|| "The requested speech playback is no longer available".to_string())?;
-        if playback.binding != binding {
-            return Err("Speech playback identity changed before byte publication".to_string());
-        }
-        Ok(playback.bytes.clone())
-    }
-
     pub fn stop(
         &self,
         operation: Option<&str>,
@@ -908,7 +1310,6 @@ impl MomSpeech {
                     active.cancelled = true;
                     active.request_id.clone()
                 });
-                playback_released |= state.precommit_audio.remove(operation).is_some();
                 if request_id.is_none() && state.phase == SpeechPhase::Running {
                     remember_early_cancel(&mut state, operation);
                 }
@@ -945,6 +1346,9 @@ impl MomSpeech {
     }
 
     pub fn begin_quiesce(&self) {
+        if let Ok(mut backpressure) = self.generation_backpressure.lock() {
+            backpressure.clear();
+        }
         let active = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -954,7 +1358,6 @@ impl MomSpeech {
             }
             state.phase = SpeechPhase::Quiescing;
             state.playback.clear();
-            state.precommit_audio.clear();
             state
                 .active
                 .values_mut()
@@ -984,7 +1387,6 @@ impl MomSpeech {
             host_joined: joined.is_ok(),
             active_operation_count: state.active.len(),
             retained_playback_count: state.playback.len(),
-            apple_inner_call_non_preemptive: APPLE_SYNTHESIS_IS_NON_PREEMPTIVE,
         };
         joined.map_err(|error| error.to_string())?;
         Ok(receipt)
@@ -1029,13 +1431,6 @@ impl MomSpeech {
             return Err(Blocker::new(
                 "speech_operation_duplicate",
                 "That opaque speech operation identifier is already active.",
-                Vec::new(),
-            ));
-        }
-        if state.precommit_audio.contains_key(operation) {
-            return Err(Blocker::new(
-                "speech_operation_duplicate",
-                "That opaque speech operation identifier already owns prepared audio.",
                 Vec::new(),
             ));
         }
@@ -1108,12 +1503,11 @@ impl MomSpeech {
         operation: &str,
         request_id: &SpeechRequestId,
         binding: ReadAloudBinding,
-        bytes: Vec<u8>,
     ) -> Result<String, Blocker> {
         if binding.request_id != request_id.0 {
             self.finish_operation(operation, request_id);
             return Err(speech_provenance_mismatch(
-                "Apple playback binding did not match the admitted request.",
+                "Qwen playback binding did not match the admitted request and streamed audio.",
             ));
         }
         let mut state = self.state.lock().map_err(|_| {
@@ -1145,61 +1539,8 @@ impl MomSpeech {
             state.playback.remove(&oldest);
         }
         let playback_id = format!("mom-playback-{}", SpeechRequestId::new().0);
-        state
-            .playback
-            .insert(playback_id.clone(), PlaybackAudio { binding, bytes });
+        state.playback.insert(playback_id.clone(), PlaybackAudio);
         Ok(playback_id)
-    }
-
-    fn publish_precommit_audio(
-        &self,
-        operation: &str,
-        request_id: &SpeechRequestId,
-        binding: PrecommitSpeechBinding,
-        bytes: Vec<u8>,
-    ) -> Result<(), Blocker> {
-        if binding.operation != operation
-            || binding.request_id != request_id.0
-            || binding.wav_sha256 != sha256_hex(&bytes)
-            || usize::try_from(binding.wav_bytes).ok() != Some(bytes.len())
-        {
-            self.finish_operation(operation, request_id);
-            return Err(speech_provenance_mismatch(
-                "Prepared speech bytes did not match their operation binding.",
-            ));
-        }
-        let mut state = self.state.lock().map_err(|_| {
-            Blocker::new(
-                "speech_state_unavailable",
-                "Mom speech operation state is unavailable.",
-                Vec::new(),
-            )
-        })?;
-        let cancelled = state.phase != SpeechPhase::Running
-            || state
-                .active
-                .get(operation)
-                .is_none_or(|active| active.request_id != *request_id || active.cancelled);
-        if state
-            .active
-            .get(operation)
-            .is_some_and(|active| active.request_id == *request_id)
-        {
-            state.active.remove(operation);
-        }
-        if cancelled {
-            return Err(speech_cancelled_blocker());
-        }
-        while state.precommit_audio.len() >= MAX_PRECOMMIT_AUDIO {
-            let Some(oldest) = state.precommit_audio.keys().next().cloned() else {
-                break;
-            };
-            state.precommit_audio.remove(&oldest);
-        }
-        state
-            .precommit_audio
-            .insert(operation.to_string(), PrecommitAudio { binding, bytes });
-        Ok(())
     }
 }
 
@@ -1260,34 +1601,8 @@ fn assistant_message_target(
     }))
 }
 
-fn conversation_persona_voice(conversation_id: &str) -> anyhow::Result<Result<String, Blocker>> {
-    let conversations = mom_llama_runtime::conversation_list()?;
-    let Some(conversation) = conversations
-        .result
-        .unwrap_or_default()
-        .into_iter()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(Err(Blocker::new(
-            "conversation_not_found",
-            "The requested conversation is unavailable.",
-            Vec::new(),
-        )));
-    };
-    let persona_key = persona_voice_key_for_conversation(
-        &conversation.recipient_ids,
-        conversation.source_conversation_id.as_deref(),
-    );
-    Ok(persona_key.map_or_else(
-        || {
-            Err(Blocker::new(
-                "speech_precommit_persona_required",
-                "Pre-commit audio requires a conversation with one exact consultant persona.",
-                Vec::new(),
-            ))
-        },
-        |key| Ok(format!("mom.qwen.icl.{key}")),
-    ))
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn persona_voice_key_for_conversation<'a>(
@@ -1321,127 +1636,61 @@ fn persona_voice_key(persona_id: &str) -> Option<&str> {
     }
 }
 
-fn select_apple(
-    descriptors: &[SpeechBackendDescriptor],
-    input_characters: usize,
-) -> Result<AppleSelection, Blocker> {
-    let Some(descriptor) = descriptors
-        .iter()
-        .find(|descriptor| descriptor.id == APPLE_BACKEND_ID)
-    else {
-        return Err(speech_unavailable(
-            "Apple complete-WAV synthesis is unavailable.",
-        ));
-    };
-    if !matches!(descriptor.readiness, SpeechBackendReadiness::Ready) {
-        return Err(speech_unavailable("Apple speech synthesis is not ready."));
-    }
-    let capability = descriptor.capabilities.iter().find(|capability| {
-        capability.eligible_for_local_only()
-            && matches!(
-                &capability.operation,
-                SpeechOperationCapability::Synthesis(synthesis)
-                    if !synthesis.streaming_audio
-                        && synthesis.voice_selection
-                        && synthesis.returned_audio == [AudioOutputKind::Wav]
-            )
-    });
-    let Some(capability) = capability else {
-        return Err(speech_unavailable(
-            "Apple speech does not advertise executable local complete-WAV synthesis.",
-        ));
-    };
-    if capability
-        .limits
-        .max_input_characters
-        .is_some_and(|limit| u64::try_from(input_characters).unwrap_or(u64::MAX) > limit)
-    {
-        return Err(Blocker::new(
-            "speech_read_aloud_too_long",
-            "The exact assistant message exceeds the Apple synthesis input limit.",
-            Vec::new(),
-        ));
-    }
-    let Some(voice) = descriptor
-        .voices
-        .iter()
-        .filter(|voice| {
-            voice.installed
-                && voice.network == NetworkBehavior::Never
-                && language_matches(&voice.language, READ_ALOUD_LANGUAGE)
-        })
-        .max_by(|left, right| {
-            voice_language_rank(&left.language, READ_ALOUD_LANGUAGE)
-                .cmp(&voice_language_rank(&right.language, READ_ALOUD_LANGUAGE))
-                .then_with(|| {
-                    standard_apple_voice_rank(&left.id).cmp(&standard_apple_voice_rank(&right.id))
-                })
-                .then_with(|| left.quality.cmp(&right.quality))
-                .then_with(|| right.id.cmp(&left.id))
-        })
-    else {
-        return Err(speech_unavailable(
-            "No installed never-network English Apple voice is available.",
-        ));
-    };
-    Ok(AppleSelection {
-        descriptor_sha256: descriptor_sha256(descriptor)?,
-        descriptor: descriptor.clone(),
-        voice_id: voice.id.clone(),
-    })
-}
-
 fn select_read_aloud(
     descriptors: &[SpeechBackendDescriptor],
     input_characters: usize,
     persona_voice_id: Option<&str>,
-    require_persona_voice: bool,
+    _require_persona_voice: bool,
 ) -> Result<ReadAloudSelection, Blocker> {
-    let requested_model_id = persona_voice_id.map_or(QWEN_MODEL_ID, |voice_id| {
-        if voice_id.starts_with("mom.qwen.icl.") {
-            QWEN_ICL_MODEL_ID
-        } else {
-            QWEN_MODEL_ID
-        }
-    });
+    let Some(voice_id) = persona_voice_id.filter(|voice_id| voice_id.starts_with("mom.qwen.icl."))
+    else {
+        return Err(speech_unavailable(
+            "The selected consultant's streaming Qwen voice is unavailable.",
+        ));
+    };
     if let Some(descriptor) = descriptors.iter().find(|descriptor| {
         descriptor.id == QWEN_BACKEND_ID
             && descriptor.readiness.is_ready()
             && descriptor.capabilities.iter().any(|capability| {
-                (capability.eligible_for_local_only()
-                    || (requested_model_id == QWEN_ICL_MODEL_ID
-                        && capability.deferred_load_admissible()))
-                    && capability.model_id.as_deref() == Some(requested_model_id)
+                (capability.eligible_for_local_only() || capability.deferred_load_admissible())
+                    && capability.model_id.as_deref() == Some(QWEN_ICL_MODEL_ID)
                     && capability.limits.max_input_characters.is_none_or(|limit| {
                         u64::try_from(input_characters).unwrap_or(u64::MAX) <= limit
                     })
                     && matches!(
                         &capability.operation,
                         SpeechOperationCapability::Synthesis(synthesis)
-                            if !synthesis.streaming_audio
+                            if synthesis.streaming_audio
                                 && synthesis.voice_selection
-                                && synthesis.returned_audio == [AudioOutputKind::Wav]
+                                && synthesis.returned_audio.contains(&AudioOutputKind::Pcm)
                     )
             })
-    }) && let Some(voice_id) = persona_voice_id
-        && descriptor
-            .voices
-            .iter()
-            .any(|voice| voice.installed && voice.id == voice_id)
+    }) && descriptor
+        .voices
+        .iter()
+        .any(|voice| voice.installed && voice.id == voice_id)
     {
         return Ok(ReadAloudSelection::Qwen(QwenSelection {
             descriptor_sha256: descriptor_sha256(descriptor)?,
             descriptor: descriptor.clone(),
-            model_id: requested_model_id.to_string(),
+            model_id: QWEN_ICL_MODEL_ID.to_string(),
             voice_id: voice_id.to_string(),
         }));
     }
-    if require_persona_voice {
-        return Err(speech_unavailable(
-            "The selected consultant's local Qwen voice is unavailable.",
-        ));
+    Err(speech_unavailable(
+        "The selected consultant's streaming Qwen voice is unavailable.",
+    ))
+}
+
+fn qwen_stream_output() -> AudioOutputFormat {
+    AudioOutputFormat::Pcm {
+        format: PcmFormat {
+            sample_rate_hz: 24_000,
+            channels: 1,
+            sample_format: PcmSampleFormat::I16Le,
+            interleaved: true,
+        },
     }
-    select_apple(descriptors, input_characters).map(ReadAloudSelection::Apple)
 }
 
 fn read_aloud_request(
@@ -1468,9 +1717,9 @@ fn read_aloud_request(
         rate: 1.0,
         pitch: 1.0,
         volume: 1.0,
-        output: AudioOutputFormat::Wav,
+        output: qwen_stream_output(),
         alignment: AlignmentGranularity::None,
-        stream: false,
+        stream: true,
     }
 }
 
@@ -1498,47 +1747,13 @@ fn precommit_synthesis_request(
         rate: 1.0,
         pitch: 1.0,
         volume: 1.0,
-        output: AudioOutputFormat::Wav,
+        output: qwen_stream_output(),
         alignment: AlignmentGranularity::None,
-        stream: false,
+        stream: true,
     }
 }
 
 const READ_ALOUD_LANGUAGE: &str = "en-US";
-
-fn language_matches(candidate: &str, requested: &str) -> bool {
-    let normalized_candidate = candidate.replace('_', "-");
-    let normalized_requested = requested.replace('_', "-");
-    normalized_candidate.eq_ignore_ascii_case(&normalized_requested)
-        || normalized_candidate
-            .split_once('-')
-            .zip(normalized_requested.split_once('-'))
-            .is_some_and(|((candidate_base, _), (requested_base, _))| {
-                candidate_base.eq_ignore_ascii_case(requested_base)
-            })
-}
-
-fn voice_language_rank(candidate: &str, requested: &str) -> u8 {
-    let normalized_candidate = candidate.replace('_', "-");
-    let normalized_requested = requested.replace('_', "-");
-    if normalized_candidate.eq_ignore_ascii_case(&normalized_requested) {
-        2
-    } else if language_matches(candidate, requested) {
-        1
-    } else {
-        0
-    }
-}
-
-fn standard_apple_voice_rank(identifier: &str) -> u8 {
-    if identifier.contains(".voice.compact.") {
-        2
-    } else if identifier.contains(".voice.super-compact.") {
-        1
-    } else {
-        0
-    }
-}
 
 fn select_parakeet(descriptors: &[SpeechBackendDescriptor]) -> Result<ParakeetSelection, Blocker> {
     select_parakeet_with_residency(descriptors, true)
@@ -1636,55 +1851,38 @@ fn request_context(
     }
 }
 
-fn validate_apple_response(
-    response: SynthesisResponse,
-    request_id: &SpeechRequestId,
-    voice_id: &str,
-) -> Result<(Vec<u8>, Option<u64>), Blocker> {
-    desktop_speech::complete_apple_wav(response, request_id, Some(voice_id), MAX_COMPLETE_WAV_BYTES)
-        .map_err(|error| match error {
-            desktop_speech::CompleteWavError::RouteMismatch => speech_provenance_mismatch(
-                "Apple response route did not match the admitted message and voice binding.",
-            ),
-            desktop_speech::CompleteWavError::OutputKind => speech_provenance_mismatch(
-                "Apple synthesis returned streaming state instead of one complete WAV.",
-            ),
-            desktop_speech::CompleteWavError::OutputFormat
-            | desktop_speech::CompleteWavError::ByteLimit => Blocker::new(
-                "speech_wav_invalid",
-                "Apple synthesis did not return a non-empty bounded complete WAV.",
-                Vec::new(),
-            ),
-        })
-}
-
 fn validate_read_aloud_response(
     response: SynthesisResponse,
     request_id: &SpeechRequestId,
     selection: &ReadAloudSelection,
-) -> Result<(Vec<u8>, Option<u64>), Blocker> {
-    match selection {
-        ReadAloudSelection::Apple(apple) => {
-            validate_apple_response(response, request_id, &apple.voice_id)
+) -> Result<Option<u64>, Blocker> {
+    let ReadAloudSelection::Qwen(qwen) = selection;
+    if response.request_id != *request_id
+        || response.route.backend_id != QWEN_BACKEND_ID
+        || response.route.model_id.as_deref() != Some(&qwen.model_id)
+        || response.route.voice_id.as_deref() != Some(&qwen.voice_id)
+        || response.route.network != NetworkBehavior::Never
+        || !response.usage.real_local_inference
+    {
+        return Err(speech_provenance_mismatch(
+            "Qwen3 TTS response route did not match the admitted local model and voice.",
+        ));
+    }
+    match response.output {
+        SynthesisOutput::Streamed {
+            format,
+            emitted_bytes,
+        } if format == qwen_stream_output()
+            && emitted_bytes > 0
+            && emitted_bytes <= u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) =>
+        {
+            Ok(response.duration_ms)
         }
-        ReadAloudSelection::Qwen(qwen) => desktop_speech::complete_embedded_wav(
-            response,
-            request_id,
-            QWEN_BACKEND_ID,
-            &qwen.model_id,
-            &qwen.voice_id,
-            MAX_COMPLETE_WAV_BYTES,
-        )
-        .map_err(|error| match error {
-            desktop_speech::CompleteWavError::RouteMismatch => speech_provenance_mismatch(
-                "Qwen3 TTS response route did not match the admitted local model and voice.",
-            ),
-            _ => Blocker::new(
-                "speech_wav_invalid",
-                "Qwen3 TTS did not return a non-empty bounded complete WAV.",
-                Vec::new(),
-            ),
-        }),
+        _ => Err(Blocker::new(
+            "speech_stream_invalid",
+            "Qwen3 TTS did not complete the admitted PCM stream.",
+            Vec::new(),
+        )),
     }
 }
 
@@ -1744,13 +1942,6 @@ fn validate_operation_token(operation: &str) -> anyhow::Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
         anyhow::bail!("speech operation token must be 8-64 opaque ASCII identifier bytes");
-    }
-    Ok(())
-}
-
-fn validate_sha256(value: &str) -> anyhow::Result<()> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("speech binding hash must be a 64-character hexadecimal SHA-256 value");
     }
     Ok(())
 }
@@ -1830,6 +2021,710 @@ fn speech_error_message(error: &SpeechError) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn benchmark_pcm16_mono_16khz_wav(path: &Path) -> anyhow::Result<Vec<f32>> {
+        use anyhow::{Context, ensure};
+
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read benchmark WAV {}", path.display()))?;
+        ensure!(
+            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+            "benchmark audio must be a RIFF/WAVE file"
+        );
+        let mut cursor = 12usize;
+        let mut format = None;
+        let mut data = None;
+        while cursor.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+            let chunk_id = &bytes[cursor..cursor + 4];
+            let chunk_len = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into()?) as usize;
+            let chunk_start = cursor + 8;
+            let chunk_end = chunk_start
+                .checked_add(chunk_len)
+                .context("benchmark WAV chunk length overflow")?;
+            ensure!(chunk_end <= bytes.len(), "truncated benchmark WAV chunk");
+            match chunk_id {
+                b"fmt " if chunk_len >= 16 => {
+                    format = Some((
+                        u16::from_le_bytes(bytes[chunk_start..chunk_start + 2].try_into()?),
+                        u16::from_le_bytes(bytes[chunk_start + 2..chunk_start + 4].try_into()?),
+                        u32::from_le_bytes(bytes[chunk_start + 4..chunk_start + 8].try_into()?),
+                        u16::from_le_bytes(bytes[chunk_start + 14..chunk_start + 16].try_into()?),
+                    ));
+                }
+                b"data" => data = Some(&bytes[chunk_start..chunk_end]),
+                _ => {}
+            }
+            cursor = chunk_end + (chunk_len & 1);
+        }
+        let (encoding, channels, sample_rate, bits) =
+            format.context("benchmark WAV has no fmt chunk")?;
+        ensure!(
+            (encoding, channels, sample_rate, bits) == (1, 1, 16_000, 16),
+            "benchmark WAV must be PCM16 mono 16 kHz"
+        );
+        let data = data.context("benchmark WAV has no data chunk")?;
+        ensure!(data.len() % 2 == 0, "benchmark WAV has a partial sample");
+        Ok(data
+            .chunks_exact(2)
+            .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32_768.0)
+            .collect())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn benchmark_speech_chunk(
+        text: &str,
+        flush: bool,
+        first: bool,
+        word_limit: usize,
+    ) -> Option<(String, String)> {
+        let trimmed = text.trim_start();
+        let mut words = Vec::new();
+        let mut word_start = None;
+        for (index, character) in trimmed.char_indices() {
+            if character.is_whitespace() {
+                if let Some(start) = word_start.take() {
+                    words.push((start, index, true));
+                }
+            } else if word_start.is_none() {
+                word_start = Some(index);
+            }
+        }
+        if let Some(start) = word_start {
+            words.push((start, trimmed.len(), false));
+        }
+        if words.is_empty() {
+            return None;
+        }
+        let minimum = if first { 6 } else { 8 };
+        let maximum = word_limit.clamp(minimum, if first { 16 } else { 24 });
+        let sentence_boundary_minimum = if first { 2 } else { 3 };
+        let weak_boundary_minimum = if first { 3 } else { minimum.min(6) };
+        for (index, &(start, end, _)) in words.iter().enumerate().take(maximum) {
+            let word = &trimmed[start..end];
+            let strong = word
+                .trim_end_matches(['"', '\'', ')', ']'])
+                .ends_with(['.', '!', '?']);
+            let weak = word
+                .trim_end_matches(['"', '\'', ')', ']'])
+                .ends_with([';', ':', ',']);
+            let complete_sentence = strong && (flush || index + 1 >= sentence_boundary_minimum);
+            let weak_boundary = weak && index + 1 >= weak_boundary_minimum;
+            if complete_sentence || weak_boundary {
+                return Some((
+                    trimmed[..end].trim().to_string(),
+                    trimmed[end..].trim_start().to_string(),
+                ));
+            }
+        }
+        if !flush && words.len() < minimum {
+            return None;
+        }
+        let split_at = if flush {
+            words.get(words.len().min(maximum) - 1)?.1
+        } else {
+            let &(_, end, complete) = words.get(minimum - 1)?;
+            if !complete && words.len() == minimum {
+                return None;
+            }
+            end
+        };
+        Some((
+            trimmed[..split_at].trim().to_string(),
+            trimmed[split_at..].trim_start().to_string(),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_benchmark_uses_the_product_first_speech_boundary() {
+        assert_eq!(
+            benchmark_speech_chunk("One two three four five six", false, true, 6),
+            None
+        );
+        assert_eq!(
+            benchmark_speech_chunk("One two three four five six ", false, true, 6),
+            Some(("One two three four five six".into(), String::new()))
+        );
+        assert_eq!(
+            benchmark_speech_chunk("One two three four five six s", false, true, 6),
+            Some(("One two three four five six".into(), "s".into()))
+        );
+        assert_eq!(
+            benchmark_speech_chunk("One two three,", false, true, 6),
+            Some(("One two three,".into(), String::new()))
+        );
+        assert_eq!(
+            benchmark_speech_chunk("five six", true, false, 8),
+            Some(("five six".into(), String::new()))
+        );
+        assert_eq!(
+            benchmark_speech_chunk(
+                "one two three four five six seven eight nine ten",
+                true,
+                false,
+                8
+            ),
+            Some((
+                "one two three four five six seven eight".into(),
+                "nine ten".into()
+            ))
+        );
+    }
+
+    /// Runs Gemma audio prefill/decode and the app's Qwen precommit route in
+    /// one process. Unlike the external comparison harness, this exercises
+    /// the real process-local compute lease and proves whether Gemma actually
+    /// yields Metal while Qwen is filling the playback buffer.
+    #[test]
+    #[ignore = "requires the exact Gemma audio model/projector, Qwen helper/model/voice archive, and benchmark WAV"]
+    fn real_resident_audio_to_qwen_pipeline_exercises_compute_lease() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let model_path = PathBuf::from(
+            std::env::var_os("MOM_LLAMA_MULTIMODAL_MODEL_PATH")
+                .context("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?,
+        );
+        let projector_path = PathBuf::from(
+            std::env::var_os("MOM_LLAMA_MM_PROJ_PATH").context("MOM_LLAMA_MM_PROJ_PATH")?,
+        );
+        let wav_path = PathBuf::from(
+            std::env::var_os("MOM_LLAMA_TEST_VOICE_WAV").context("MOM_LLAMA_TEST_VOICE_WAV")?,
+        );
+        let reference_root = PathBuf::from(
+            std::env::var_os("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")
+                .context("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")?,
+        );
+        ensure!(model_path.is_file(), "Gemma model is missing");
+        ensure!(projector_path.is_file(), "audio projector is missing");
+        let samples = benchmark_pcm16_mono_16khz_wav(&wav_path)?;
+        ensure!(samples.len() >= 15_840, "benchmark WAV is too short");
+
+        let store = tempfile::tempdir()?;
+        set_data_dir_override_for_tests(Some(store.path().to_path_buf()));
+        struct ResetDataDir;
+        impl Drop for ResetDataDir {
+            fn drop(&mut self) {
+                mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+            }
+        }
+        let _reset = ResetDataDir;
+        mom_llama_runtime::settings_update(SettingsUpdate {
+            model_path: Some(Some(model_path)),
+            mmproj_path: Some(Some(projector_path)),
+            temperature: Some(1.0),
+            max_tokens: Some(64),
+            batch_tokens: Some(128),
+            max_parallel_sequences: Some(1),
+            native_device: Some(llama_native_types::NativeDevice::Metal),
+            upstream_settings: Some(BTreeMap::from([(
+                "customJson".into(),
+                json!(r#"{"seed":17}"#),
+            )])),
+            ..SettingsUpdate::default()
+        })?;
+        let settings = mom_llama_runtime::config::resolve_settings()?;
+        let native = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)?;
+        let scope = native.operation_scope();
+        let warm = mom_llama_runtime::runtime_warm(&scope)?;
+        let warm = warm.result.context("Gemma runtime warm was blocked")?;
+        ensure!(
+            warm.model_loaded && warm.audio_projector_warmed,
+            "Gemma did not warm"
+        );
+
+        let async_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let speech = async_runtime
+            .block_on(MomSpeech::discover(store.path(), &reference_root))
+            .map_err(anyhow::Error::msg)?;
+        let conversation =
+            mom_llama_runtime::conversation_new(Some("Voice pipeline benchmark".into()))?
+                .result
+                .context("benchmark conversation")?;
+        speech
+            .bind_precommit_voice(
+                &conversation.id,
+                &ConversationPersonaIdentity {
+                    recipient_ids: vec!["persona-christine_courtois".into()],
+                    source_conversation_id: Some("persona-christine_courtois".into()),
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+
+        let voice = mom_llama_runtime::voice_audio_begin_in_scope(
+            &scope,
+            &conversation.id,
+            "[Phone call] Reply naturally in exactly three short sentences to what you hear.",
+        )?;
+        voice.wait_for_resume()?;
+        let audio_started = Instant::now();
+        for (index, chunk) in samples[..samples.len().min(4 * 16_000)]
+            .chunks(160)
+            .enumerate()
+        {
+            voice.push_pcm(chunk)?;
+            // Pace from one monotonic audio clock. Repeated relative sleeps
+            // accumulate scheduler slop and falsely give prefill extra time;
+            // a microphone does not slow down when the consumer is busy.
+            let audio_deadline =
+                audio_started + Duration::from_millis(u64::try_from(index.saturating_add(1))? * 10);
+            std::thread::sleep(audio_deadline.saturating_duration_since(Instant::now()));
+        }
+        let silence = Instant::now();
+        voice.seal_input()?;
+
+        let (speech_tx, speech_rx) = mpsc::channel::<Option<String>>();
+        let (tts_tx, tts_rx) = mpsc::sync_channel(1);
+        let speech_worker = Arc::clone(&speech);
+        let conversation_id = conversation.id.clone();
+        let tts_worker = std::thread::Builder::new()
+            .name("resident-voice-pipeline-qwen".into())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    let first_pcm_ms = Arc::new(Mutex::new(None));
+                    // (segment index, wall-clock arrival from silence, PCM duration).
+                    // Keeping the segment identity prevents the deliberate reservoir
+                    // wait between requests from being misreported as a producer
+                    // packet stall.
+                    let packets = Arc::new(Mutex::new(Vec::<(usize, f64, f64)>::new()));
+                    let mut pending = String::new();
+                    let mut closed = false;
+                    let mut first = true;
+                    let mut first_dispatch_ms = None;
+                    let mut bindings = Vec::new();
+                    let mut segments = Vec::new();
+                    let mut scheduler_wait_ms = 0.0_f64;
+                    let mut target_runway_ms = 180.0_f64;
+                    loop {
+                        while let Ok(event) = speech_rx.try_recv() {
+                            match event {
+                                Some(delta) => pending.push_str(&delta),
+                                None => closed = true,
+                            }
+                        }
+                        let word_limit = if first { 6 } else { 8 };
+                        let Some((phrase, rest)) =
+                            benchmark_speech_chunk(&pending, closed, first, word_limit)
+                        else {
+                            if closed {
+                                break;
+                            }
+                            match speech_rx.recv()? {
+                                Some(delta) => pending.push_str(&delta),
+                                None => closed = true,
+                            }
+                            continue;
+                        };
+                        pending = rest;
+                        if !first {
+                            let wait_ms = packets
+                                .lock()
+                                .ok()
+                                .and_then(|packets| {
+                                    let first_arrival = packets.first()?.1;
+                                    let audio_ms =
+                                        packets.iter().map(|packet| packet.2).sum::<f64>();
+                                    let now_ms = silence.elapsed().as_secs_f64() * 1_000.0;
+                                    let consumed_ms = (now_ms - first_arrival - 16.0).max(0.0);
+                                    Some((audio_ms - consumed_ms - target_runway_ms).max(0.0))
+                                })
+                                .unwrap_or(0.0);
+                            if wait_ms > 0.0 {
+                                std::thread::sleep(Duration::from_secs_f64(wait_ms / 1_000.0));
+                                scheduler_wait_ms += wait_ms;
+                            }
+                        }
+                        let dispatch_ms = silence.elapsed().as_secs_f64() * 1_000.0;
+                        first_dispatch_ms.get_or_insert(dispatch_ms);
+                        let segment_index = segments.len();
+                        let observed_first_pcm = Arc::clone(&first_pcm_ms);
+                        let observed_packets = Arc::clone(&packets);
+                        let sink: PcmStreamSink = Arc::new(move |chunk| {
+                            let arrival_ms = silence.elapsed().as_secs_f64() * 1_000.0;
+                            if let Ok(mut first) = observed_first_pcm.lock() {
+                                first.get_or_insert(arrival_ms);
+                            }
+                            if !chunk.data.is_empty()
+                                && let Ok(mut packets) = observed_packets.lock()
+                            {
+                                let frames = chunk.data.len() / chunk.format.bytes_per_frame();
+                                let audio_ms = frames as f64 * 1_000.0
+                                    / f64::from(chunk.format.sample_rate_hz);
+                                packets.push((segment_index, arrival_ms, audio_ms));
+                            }
+                            Ok(())
+                        });
+                        let operation =
+                            format!("resident-pipeline-benchmark-{}", segments.len() + 1);
+                        let packet_start = packets.lock().map(|packets| packets.len()).unwrap_or(0);
+                        let result = runtime.block_on(speech_worker.synthesize_precommit(
+                            &conversation_id,
+                            &operation,
+                            &phrase,
+                            sink,
+                        ))?;
+                        let binding = result
+                            .result
+                            .with_context(|| {
+                                format!(
+                                    "Qwen segment was blocked: readiness={}, blocker={:?}",
+                                    result.readiness, result.blocker
+                                )
+                            })?
+                            .binding;
+                        let (
+                            segment_first_pcm_ms,
+                            first_packet_audio_ms,
+                            maximum_packet_gap_ms,
+                            boundary_gap_ms,
+                        ) = packets
+                            .lock()
+                            .map(|packets| {
+                                let segment_packets = &packets[packet_start.min(packets.len())..];
+                                let segment_first_pcm_ms =
+                                    segment_packets.first().map(|packet| packet.1);
+                                let first_audio =
+                                    segment_packets.first().map_or(139.0, |packet| packet.2);
+                                let maximum_gap = segment_packets
+                                    .windows(2)
+                                    .map(|pair| pair[1].1 - pair[0].1)
+                                    .fold(0.0_f64, f64::max);
+                                let boundary_gap = packet_start
+                                    .checked_sub(1)
+                                    .and_then(|previous| packets.get(previous))
+                                    .zip(segment_packets.first())
+                                    .map(|(previous, first)| first.1 - previous.1);
+                                (segment_first_pcm_ms, first_audio, maximum_gap, boundary_gap)
+                            })
+                            .unwrap_or((None, 139.0, 139.0, None));
+                        let first_audio_ms = binding
+                            .tts_time_to_first_audio_ms
+                            .map_or(140.0, |value| value as f64);
+                        let production_rtf = match (binding.tts_total_ms, binding.duration_ms) {
+                            (Some(synthesis), Some(audio)) if audio > 0 => {
+                                synthesis as f64 / audio as f64
+                            }
+                            _ => 0.7,
+                        };
+                        let uncovered_packet_gap_ms =
+                            (maximum_packet_gap_ms - first_packet_audio_ms).max(0.0);
+                        let refill_runway_ms = (first_audio_ms + uncovered_packet_gap_ms + 16.0)
+                            .max(first_packet_audio_ms * 1.25)
+                            .max(120.0);
+                        target_runway_ms = (refill_runway_ms
+                            + (production_rtf - 0.8).max(0.0) * 800.0)
+                            .clamp(180.0, 1_200.0);
+                        segments.push(serde_json::json!({
+                            "text": phrase,
+                            "dispatch_ms": dispatch_ms,
+                            "first_pcm_ms": segment_first_pcm_ms,
+                            "first_packet_audio_ms": first_packet_audio_ms,
+                            "maximum_internal_packet_gap_ms": maximum_packet_gap_ms,
+                            "preceding_segment_boundary_gap_ms": boundary_gap_ms,
+                            "tts_total_ms": binding.tts_total_ms,
+                            "duration_ms": binding.duration_ms,
+                            "generation_yield_us": binding.tts_generation_yield_us,
+                            "compute_lease_held_us": binding.tts_compute_lease_held_us,
+                            "next_target_runway_ms": target_runway_ms,
+                        }));
+                        bindings.push(binding);
+                        first = false;
+                    }
+                    let first_pcm_ms = first_pcm_ms.lock().ok().and_then(|value| *value);
+                    let packets = packets
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_default();
+                    anyhow::Ok((
+                        first_dispatch_ms,
+                        first_pcm_ms,
+                        packets,
+                        bindings,
+                        segments,
+                        scheduler_wait_ms,
+                    ))
+                })();
+                // Preserve the worker's original error for the accepting test
+                // thread. A dropped text receiver must not replace a Qwen
+                // failure with an unrelated channel-send error.
+                let _ = tts_tx.send(result);
+            })?;
+
+        let mut first_delta_ms = None;
+        let completed = mom_llama_runtime::voice_audio_finish_in_scope(
+            voice,
+            mom_llama_runtime::ChatSendOptions {
+                timeout_s: 600.0,
+                fake_fixture: false,
+            },
+            Some(|event: mom_llama_runtime::ChatStreamEvent| {
+                if matches!(event.event.as_str(), "delta" | "reasoning_delta")
+                    && let Some(delta) = event.delta
+                {
+                    first_delta_ms.get_or_insert_with(|| silence.elapsed().as_secs_f64() * 1_000.0);
+                    let _ = speech_tx.send(Some(delta));
+                }
+                Ok(())
+            }),
+        )?;
+        let output = completed.result.context("Gemma voice output")?;
+        let gemma_complete_ms = silence.elapsed().as_secs_f64() * 1_000.0;
+        println!(
+            "VOICE_RESIDENT_GEMMA_STREAMING_BENCHMARK {}",
+            serde_json::to_string(&serde_json::json!({
+                "silence_to_first_token_ms": first_delta_ms,
+                "engine_start_to_first_token_ms": output.first_token_ms,
+                "silence_to_gemma_complete_ms": gemma_complete_ms,
+                "gemma_completion_tokens": output.completion_tokens,
+                "audio": output.voice_audio_metrics,
+            }))?
+        );
+        // The Qwen worker can fail and close its text receiver before Gemma
+        // finishes. Preserve that original worker error instead of replacing
+        // it with an unrelated channel-send failure here.
+        let _ = speech_tx.send(None);
+        drop(speech_tx);
+        let (dispatch_ms, first_pcm_ms, packets, bindings, segments, scheduler_wait_ms) =
+            tts_rx.recv_timeout(Duration::from_secs(120))??;
+        let tts_pipeline_complete_ms = silence.elapsed().as_secs_f64() * 1_000.0;
+        tts_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Qwen worker panicked"))?;
+        ensure!(!bindings.is_empty(), "Gemma emitted no speakable phrase");
+        ensure!(
+            bindings
+                .first()
+                .and_then(|binding| binding.tts_helper_prepared_prefix_cache_hit)
+                .is_some(),
+            "foreground Qwen synthesis omitted its persona-prefix cache telemetry"
+        );
+        let generation_yields = bindings
+            .iter()
+            .map(|binding| binding.tts_generation_yields)
+            .sum::<u64>();
+        let generation_yield_us = bindings
+            .iter()
+            .map(|binding| binding.tts_generation_yield_us)
+            .sum::<u64>();
+        let generation_fair_passes = bindings
+            .iter()
+            .map(|binding| binding.tts_generation_fair_passes)
+            .sum::<u64>();
+        let compute_lease_held_us = bindings
+            .iter()
+            .map(|binding| binding.tts_compute_lease_held_us)
+            .sum::<u64>();
+        let compute_lease_released_us = bindings
+            .iter()
+            .map(|binding| binding.tts_compute_lease_released_us)
+            .sum::<u64>();
+        let tts_total_ms = bindings
+            .iter()
+            .filter_map(|binding| binding.tts_total_ms)
+            .sum::<u64>();
+        let tts_output_audio_ms = bindings
+            .iter()
+            .filter_map(|binding| binding.duration_ms)
+            .sum::<u64>();
+        let minimum_lead_ms = bindings
+            .iter()
+            .filter_map(|binding| binding.tts_compute_minimum_lead_ms)
+            .min();
+        let maximum_lead_ms = bindings
+            .iter()
+            .filter_map(|binding| binding.tts_compute_maximum_lead_ms)
+            .max();
+        let maximum_internal_packet_gap_ms = packets
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[1].1 - pair[0].1)
+            .fold(0.0_f64, f64::max);
+        let maximum_segment_boundary_gap_ms = packets
+            .windows(2)
+            .filter(|pair| pair[0].0 != pair[1].0)
+            .map(|pair| pair[1].1 - pair[0].1)
+            .fold(0.0_f64, f64::max);
+        let mut preceding_audio_ms = 0.0_f64;
+        let required_startup_delay_ms = packets.first().map_or(0.0, |first| {
+            let first_arrival_ms = first.1;
+            packets.iter().fold(0.0_f64, |required, packet| {
+                let deficit = packet.1 - first_arrival_ms - preceding_audio_ms;
+                preceding_audio_ms += packet.2;
+                required.max(deficit)
+            })
+        });
+        let audio = output.voice_audio_metrics.as_ref();
+        let audio_finish_to_last_projector_finish_us = audio.and_then(|metrics| {
+            metrics
+                .finish_us
+                .zip(metrics.last_projector_finish_us)
+                .map(|(finish, projector_finish)| projector_finish.saturating_sub(finish))
+        });
+        let audio_finish_to_decode_start_us = audio.and_then(|metrics| {
+            metrics
+                .finish_us
+                .zip(metrics.decode_start_us)
+                .map(|(finish, decode_start)| decode_start.saturating_sub(finish))
+        });
+        let audio_decode_start_to_first_token_ms = first_delta_ms
+            .zip(audio_finish_to_decode_start_us.map(|elapsed| elapsed as f64 / 1_000.0))
+            .map(|(first_token, finish_to_decode)| (first_token - finish_to_decode).max(0.0));
+        let audio_receipt = serde_json::json!({
+            "streamed_audio_ms": audio.map(|metrics| metrics.accepted_samples as f64 / 16.0),
+            "projected_blocks": audio.map(|metrics| metrics.projected_blocks),
+            "projected_samples": audio.map(|metrics| metrics.projected_samples),
+            "tail_samples": audio.map(|metrics| metrics.tail_samples),
+            "projector_us": audio.map(|metrics| metrics.projector_us),
+            "tail_projector_us": audio.map(|metrics| metrics.tail_projector_us),
+            "finish_us": audio.and_then(|metrics| metrics.finish_us),
+            "last_projector_finish_us": audio.and_then(|metrics| metrics.last_projector_finish_us),
+            "decode_start_us": audio.and_then(|metrics| metrics.decode_start_us),
+            "finish_to_last_projector_finish_us": audio_finish_to_last_projector_finish_us,
+            "finish_to_decode_start_us": audio_finish_to_decode_start_us,
+            "decode_start_to_first_token_ms": audio_decode_start_to_first_token_ms,
+        });
+        let qwen_startup_warm = speech._qwen_startup_warm.map(|warm| {
+            serde_json::json!({
+                "completed": warm.completed,
+                "total": warm.total,
+                "resident_us": warm.resident_us,
+                "probe_us": warm.probe_us,
+                "total_us": warm.total_us,
+            })
+        });
+        let receipt = serde_json::json!({
+            "runtime_warm": {
+                "audio_projector_warmed": warm.audio_projector_warmed,
+                "audio_projector_warm_us": warm.audio_projector_warm_us,
+                "model_acquire_us": warm.model_acquire_us,
+            },
+            "silence_to_first_token_ms": first_delta_ms,
+            "engine_start_to_first_token_ms": output.first_token_ms,
+            "audio": audio_receipt,
+            "silence_to_tts_dispatch_ms": dispatch_ms,
+            "silence_to_first_pcm_ms": first_pcm_ms,
+            "silence_to_gemma_complete_ms": gemma_complete_ms,
+            "gemma_completion_tokens": output.completion_tokens,
+            "tts_generation_yields": generation_yields,
+            "tts_generation_yield_us": generation_yield_us,
+            "tts_generation_fair_passes": generation_fair_passes,
+            "tts_compute_lease_held_us": compute_lease_held_us,
+            "tts_compute_lease_released_us": compute_lease_released_us,
+            "tts_reference_admission_us": bindings.first().and_then(|binding| binding.tts_reference_admission_us),
+            "tts_reference_cache": bindings.first().and_then(|binding| binding.tts_reference_cache.clone()),
+            "tts_reference_us": bindings.first().and_then(|binding| binding.tts_reference_us),
+            "tts_first_pcm_us": bindings.first().and_then(|binding| binding.tts_helper_first_pcm_us),
+            "tts_text_chunk_us": bindings.first().and_then(|binding| binding.tts_helper_text_chunk_us),
+            "tts_code_generation_us": bindings.first().and_then(|binding| binding.tts_helper_code_generation_us),
+            "tts_prepared_prefix_cache_hit": bindings.first().and_then(|binding| binding.tts_helper_prepared_prefix_cache_hit),
+            "qwen_startup_warm": qwen_startup_warm,
+            "tts_first_decode_us": bindings.first().and_then(|binding| binding.tts_helper_first_decode_us),
+            "tts_total_ms": tts_total_ms,
+            "tts_output_audio_ms": tts_output_audio_ms,
+            "tts_pipeline_complete_ms": tts_pipeline_complete_ms,
+            "tts_scheduler_wait_ms": scheduler_wait_ms,
+            "tts_segment_count": bindings.len(),
+            "tts_segments": segments,
+            "tts_minimum_lead_ms": minimum_lead_ms,
+            "tts_maximum_lead_ms": maximum_lead_ms,
+            "tts_packet_count": packets.len(),
+            "tts_first_packet_audio_ms": packets.first().map(|packet| packet.2),
+            "tts_maximum_internal_packet_gap_ms": maximum_internal_packet_gap_ms,
+            "tts_maximum_segment_boundary_gap_ms": maximum_segment_boundary_gap_ms,
+            "tts_required_startup_delay_ms": required_startup_delay_ms,
+            "silence_to_safe_playback_ms": first_pcm_ms.map(|first| first + required_startup_delay_ms),
+            "assistant_text": output.assistant_text,
+        });
+        println!("VOICE_RESIDENT_PIPELINE_BENCHMARK {receipt}");
+        let audio = audio.context("Gemma omitted incremental-audio metrics")?;
+        let projector_backlog_us = audio
+            .finish_us
+            .zip(audio.last_projector_finish_us)
+            .map_or(u64::MAX, |(finish, projector_finish)| {
+                projector_finish.saturating_sub(finish)
+            });
+        ensure!(
+            projector_backlog_us <= 80_000,
+            "streaming audio projector retained {:.1} ms after physical silence",
+            projector_backlog_us as f64 / 1_000.0
+        );
+        ensure!(
+            audio.high_water_samples <= 3_200,
+            "streaming audio ring accumulated {:.1} ms instead of consuming near real time",
+            audio.high_water_samples as f64 / 16.0
+        );
+        ensure!(
+            first_delta_ms.is_some_and(|elapsed| elapsed <= 500.0),
+            "Gemma first token missed the 500 ms conversational ceiling: {first_delta_ms:?}"
+        );
+        ensure!(
+            first_pcm_ms.is_some_and(|elapsed| elapsed <= 750.0),
+            "Qwen first PCM missed the 750 ms end-to-end ceiling: {first_pcm_ms:?}"
+        );
+        ensure!(
+            generation_yields > 0,
+            "Qwen acquired the compute lease but resident Gemma never yielded"
+        );
+        ensure!(first_pcm_ms.is_some(), "Qwen emitted no PCM");
+        async_runtime
+            .block_on(speech.shutdown())
+            .map_err(anyhow::Error::msg)?;
+        drop(native);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_backpressure_is_exact_idempotent_and_bounded() {
+        let speech = MomSpeech::empty_for_tests();
+        for index in 0..MAX_GENERATION_BACKPRESSURE_REQUESTS {
+            let request = format!("voice-request-{index}");
+            assert!(speech.set_generation_backpressure(&request, true).is_ok());
+            assert!(speech.set_generation_backpressure(&request, true).is_ok());
+        }
+        assert!(
+            speech
+                .set_generation_backpressure("one-request-too-many", true)
+                .is_err()
+        );
+        let released = speech
+            .set_generation_backpressure("voice-request-0", false)
+            .expect("release exact request");
+        assert!(!released.active);
+        assert!(
+            speech
+                .set_generation_backpressure("replacement-request", true)
+                .is_ok()
+        );
+        speech.begin_quiesce();
+        assert!(
+            speech
+                .generation_backpressure
+                .lock()
+                .expect("backpressure registry")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn production_executor_reuses_one_immutable_descriptor_snapshot() {
+        let host = Arc::new(SpeechHost::new(PlatformTarget::current()));
+        let executor = HostSpeechExecutor::new(host).expect("empty host inventory");
+        let first = executor.descriptors().expect("first inventory snapshot");
+        let second = executor.descriptors().expect("reused inventory snapshot");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     #[test]
     fn persona_voice_keys_match_contact_ids_and_framework_aliases() {
         for (persona_id, expected) in [
@@ -1865,11 +2760,14 @@ mod tests {
         let qwen_config = speech_native_backend_qwen::QwenBackendConfig::discover(Some(
             &data_dir.join("speech-models"),
         ));
+        let expected_reference_root = std::env::var_os("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("speech-voices/qwen-icl"));
         assert_eq!(
             qwen_config.icl.expect("app ICL config").reference_root,
-            data_dir.join("speech-voices/qwen-icl")
+            expected_reference_root
         );
-        let speech = MomSpeech::discover(&data_dir)
+        let speech = MomSpeech::discover(&data_dir, &data_dir.join("speech-voices/qwen-icl"))
             .await
             .expect("app speech discovery");
         let descriptors = speech.executor.descriptors().expect("speech descriptors");
@@ -1893,13 +2791,11 @@ mod tests {
             .await
             .expect("app-route Qwen synthesis");
         assert_eq!(response.route.model_id.as_deref(), Some(QWEN_ICL_MODEL_ID));
-        let (audio, duration_ms) = validate_read_aloud_response(response, &request_id, &selection)
+        let duration_ms = validate_read_aloud_response(response, &request_id, &selection)
             .expect("app route must validate its selected ICL model");
-        assert!(!audio.is_empty());
         assert!(duration_ms.is_some_and(|duration| duration > 500));
         speech.shutdown().await.expect("speech host joined");
     }
-    use speech_native_backend_qwen::QWEN_VOICE_ID;
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,
@@ -1915,46 +2811,6 @@ mod tests {
             observed_at_unix_ms: 1,
             detail: "fixture runtime evidence".to_string(),
         }]
-    }
-
-    fn apple_descriptor() -> SpeechBackendDescriptor {
-        SpeechBackendDescriptor {
-            id: APPLE_BACKEND_ID.to_string(),
-            display_name: "Apple".to_string(),
-            kind: SpeechBackendKind::PlatformOnDevice,
-            readiness: SpeechBackendReadiness::Ready,
-            capabilities: vec![SpeechCapability {
-                id: "apple.av-speech.synthesis".to_string(),
-                backend_id: APPLE_BACKEND_ID.to_string(),
-                model_id: None,
-                operation: SpeechOperationCapability::Synthesis(SynthesisCapabilities {
-                    streaming_audio: false,
-                    voice_selection: true,
-                    returned_audio: vec![AudioOutputKind::Wav],
-                    ..SynthesisCapabilities::default()
-                }),
-                availability: CapabilityAvailability::Available,
-                network: NetworkBehavior::Never,
-                languages: vec!["en-US".to_string()],
-                limits: SpeechCapabilityLimits {
-                    max_input_characters: Some(10_000),
-                    max_concurrent_requests: Some(1),
-                    ..SpeechCapabilityLimits::default()
-                },
-                evidence: runtime_evidence(),
-            }],
-            models: Vec::new(),
-            voices: vec![VoiceDescriptor {
-                id: "voice.local".to_string(),
-                name: "Local".to_string(),
-                language: "en-US".to_string(),
-                gender: None,
-                quality: None,
-                expected_latency: None,
-                network: NetworkBehavior::Never,
-                installed: true,
-            }],
-        }
     }
 
     fn parakeet_descriptor() -> SpeechBackendDescriptor {
@@ -2002,11 +2858,11 @@ mod tests {
             capabilities: vec![SpeechCapability {
                 id: "qwen3-tts.mlx-swift.synthesis".to_string(),
                 backend_id: QWEN_BACKEND_ID.to_string(),
-                model_id: Some(QWEN_MODEL_ID.to_string()),
+                model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
                 operation: SpeechOperationCapability::Synthesis(SynthesisCapabilities {
-                    streaming_audio: false,
+                    streaming_audio: true,
                     voice_selection: true,
-                    returned_audio: vec![AudioOutputKind::Wav],
+                    returned_audio: vec![AudioOutputKind::Pcm],
                     ..SynthesisCapabilities::default()
                 }),
                 availability: CapabilityAvailability::Available,
@@ -2020,8 +2876,8 @@ mod tests {
                 evidence: runtime_evidence(),
             }],
             models: vec![SpeechModelDescriptor {
-                id: QWEN_MODEL_ID.to_string(),
-                display_name: "Qwen3 TTS VoiceDesign".to_string(),
+                id: QWEN_ICL_MODEL_ID.to_string(),
+                display_name: "Qwen3 TTS Base ICL".to_string(),
                 family: "qwen3-tts".to_string(),
                 languages: vec!["en-US".to_string()],
                 resident: false,
@@ -2029,7 +2885,7 @@ mod tests {
                 content_hash: None,
             }],
             voices: vec![VoiceDescriptor {
-                id: QWEN_VOICE_ID.to_string(),
+                id: "mom.qwen.icl.gabor_mate".to_string(),
                 name: "Warm clinician".to_string(),
                 language: "en-US".to_string(),
                 gender: None,
@@ -2058,28 +2914,33 @@ mod tests {
 
     #[test]
     fn routes_are_exact_never_network_and_complete_input_only() {
-        let qwen = select_read_aloud(
-            &[apple_descriptor(), qwen_descriptor()],
-            12,
-            Some(QWEN_VOICE_ID),
-            false,
-        )
-        .expect("Qwen route");
+        let voice_id = "mom.qwen.icl.gabor_mate";
+        let qwen = select_read_aloud(&[qwen_descriptor()], 12, Some(voice_id), true)
+            .expect("Qwen streaming ICL route");
         assert!(matches!(qwen, ReadAloudSelection::Qwen(_)));
-        let fallback =
-            select_read_aloud(&[apple_descriptor()], 12, None, false).expect("Apple fallback");
-        assert!(matches!(fallback, ReadAloudSelection::Apple(_)));
-        let apple = select_apple(&[apple_descriptor()], 12).expect("Apple route");
-        assert_eq!(apple.voice_id, "voice.local");
-        assert!(apple.descriptor.capabilities.iter().all(|capability| {
+        let request = read_aloud_request(
+            &AssistantMessageTarget {
+                conversation_id: "chat".to_string(),
+                message_id: "message".to_string(),
+                text: "hello".to_string(),
+                text_sha256: sha256_hex(b"hello"),
+                persona_voice_id: Some(voice_id.to_string()),
+            },
+            &qwen,
+            SpeechRequestId("request".to_string()),
+        );
+        assert!(request.stream);
+        assert_eq!(request.output, qwen_stream_output());
+        assert!(qwen.descriptor().capabilities.iter().all(|capability| {
             capability.network == NetworkBehavior::Never
                 && matches!(
                     &capability.operation,
                     SpeechOperationCapability::Synthesis(synthesis)
-                        if !synthesis.streaming_audio
-                            && synthesis.returned_audio == [AudioOutputKind::Wav]
+                        if synthesis.streaming_audio
+                            && synthesis.returned_audio.contains(&AudioOutputKind::Pcm)
                 )
         }));
+        assert!(select_read_aloud(&[], 12, Some(voice_id), true).is_err());
         let parakeet = select_parakeet(&[parakeet_descriptor()]).expect("Parakeet route");
         assert_eq!(parakeet.descriptor.id, PARAKEET_BACKEND_ID);
         let deferred = select_parakeet(&[deferred_parakeet_descriptor()])
@@ -2116,6 +2977,11 @@ mod tests {
         let capability = &mut descriptor.capabilities[0];
         capability.model_id = Some(QWEN_ICL_MODEL_ID.to_string());
         capability.availability = CapabilityAvailability::DeferredLoad;
+        let SpeechOperationCapability::Synthesis(synthesis) = &mut capability.operation else {
+            panic!("Qwen ICL inventory must advertise synthesis");
+        };
+        synthesis.streaming_audio = true;
+        synthesis.returned_audio = vec![AudioOutputKind::Wav, AudioOutputKind::Pcm];
         capability.evidence = vec![CapabilityEvidence {
             source_id: "mom-qwen3-base-icl-local-reference".to_string(),
             source_version: Some("1".to_string()),
@@ -2128,8 +2994,47 @@ mod tests {
 
         let selected = select_read_aloud(&[descriptor], 62, Some(voice_id), true)
             .expect("exact local ICL route is deferred-load admissible");
+        assert!(matches!(selected, ReadAloudSelection::Qwen(_)));
         assert_eq!(selected.model_id().as_deref(), Some(QWEN_ICL_MODEL_ID));
         assert_eq!(selected.voice_id(), voice_id);
+    }
+
+    #[test]
+    fn prepared_turn_voice_binding_is_resident_and_immutable() {
+        let speech = MomSpeech::empty_for_tests();
+        let conversation = "conversation-resident-voice";
+        let gabor = ConversationPersonaIdentity {
+            recipient_ids: vec!["persona-gabor_mate".to_string()],
+            source_conversation_id: None,
+        };
+        assert!(
+            speech
+                .bind_precommit_voice(conversation, &gabor)
+                .expect("bind prepared voice")
+        );
+        assert_eq!(
+            speech
+                .precommit_voice(conversation)
+                .expect("resident lookup"),
+            Some("mom.qwen.icl.gabor_mate".to_string())
+        );
+
+        let janina = ConversationPersonaIdentity {
+            recipient_ids: vec!["persona-janina_fisher".to_string()],
+            source_conversation_id: None,
+        };
+        assert_eq!(
+            speech
+                .bind_precommit_voice(conversation, &janina)
+                .expect_err("a conversation cannot change persona voice"),
+            "speech_precommit_persona_binding_changed"
+        );
+        assert_eq!(
+            speech
+                .precommit_voice(conversation)
+                .expect("original binding"),
+            Some("mom.qwen.icl.gabor_mate".to_string())
+        );
     }
 
     #[test]
@@ -2151,9 +3056,9 @@ mod tests {
                 backend_kind: SpeechBackendKind::EmbeddedModel,
                 network: NetworkBehavior::Never,
             },
-            output: SynthesisOutput::Complete {
-                audio: vec![1, 2, 3],
-                format: AudioOutputFormat::Wav,
+            output: SynthesisOutput::Streamed {
+                format: qwen_stream_output(),
+                emitted_bytes: 3,
             },
             duration_ms: Some(800),
             alignments: Vec::new(),
@@ -2165,60 +3070,8 @@ mod tests {
 
         assert_eq!(
             validate_read_aloud_response(response, &request_id, &selection),
-            Ok((vec![1, 2, 3], Some(800)))
+            Ok(Some(800))
         );
-    }
-
-    #[test]
-    fn read_aloud_selects_the_best_local_english_voice() {
-        let mut descriptor = apple_descriptor();
-        descriptor.voices = vec![
-            VoiceDescriptor {
-                id: "aaa.non-english".to_string(),
-                name: "Non-English".to_string(),
-                language: "ar-SA".to_string(),
-                gender: None,
-                quality: Some(VoiceQuality::Premium),
-                expected_latency: None,
-                network: NetworkBehavior::Never,
-                installed: true,
-            },
-            VoiceDescriptor {
-                id: "com.apple.speech.synthesis.voice.Zarvox".to_string(),
-                name: "Zarvox".to_string(),
-                language: "en-US".to_string(),
-                gender: None,
-                quality: Some(VoiceQuality::Premium),
-                expected_latency: None,
-                network: NetworkBehavior::Never,
-                installed: true,
-            },
-            VoiceDescriptor {
-                id: "com.apple.voice.super-compact.en-GB.Daniel".to_string(),
-                name: "Basic English".to_string(),
-                language: "en_GB".to_string(),
-                gender: None,
-                quality: Some(VoiceQuality::Normal),
-                expected_latency: None,
-                network: NetworkBehavior::Never,
-                installed: true,
-            },
-            VoiceDescriptor {
-                id: "com.apple.voice.compact.en-US.Samantha".to_string(),
-                name: "Samantha".to_string(),
-                language: "en-US".to_string(),
-                gender: None,
-                quality: Some(VoiceQuality::Normal),
-                expected_latency: None,
-                network: NetworkBehavior::Never,
-                installed: true,
-            },
-        ];
-
-        let selected = select_apple(&[descriptor], 12).expect("English Apple route");
-        assert_eq!(selected.voice_id, "com.apple.voice.compact.en-US.Samantha");
-        assert!(language_matches("en_US", READ_ALOUD_LANGUAGE));
-        assert!(!language_matches("ar-SA", READ_ALOUD_LANGUAGE));
     }
 
     #[tokio::test]
@@ -2280,18 +3133,16 @@ mod tests {
                         conversation_id: "chat".to_string(),
                         message_id: "message".to_string(),
                         text_sha256: "text".to_string(),
-                        backend_id: APPLE_BACKEND_ID.to_string(),
+                        backend_id: QWEN_BACKEND_ID.to_string(),
                         backend_descriptor_sha256: "descriptor".to_string(),
-                        model_id: None,
-                        voice_id: "voice".to_string(),
+                        model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
+                        voice_id: "mom.qwen.icl.gabor_mate".to_string(),
                         request_id: closing_request.0.clone(),
-                        wav_sha256: "wav".to_string(),
-                        wav_bytes: 4,
                         duration_ms: None,
+                        tts_time_to_first_audio_ms: None,
+                        tts_total_ms: None,
                         network: NetworkBehavior::Never,
-                        apple_inner_call_non_preemptive: true,
                     },
-                    b"RIFF".to_vec(),
                 )
                 .is_err()
         );
@@ -2299,170 +3150,11 @@ mod tests {
         assert!(shutdown.host_joined);
         assert_eq!(shutdown.active_operation_count, 0);
         assert_eq!(shutdown.retained_playback_count, 0);
-        assert!(shutdown.apple_inner_call_non_preemptive);
-    }
-
-    #[test]
-    fn stale_and_provenance_checks_reject_mismatched_results() {
-        let request_id = SpeechRequestId("read".to_string());
-        let response = SynthesisResponse {
-            request_id: request_id.clone(),
-            route: speech_native_types::SpeechResolvedRoute {
-                backend_id: APPLE_BACKEND_ID.to_string(),
-                model_id: None,
-                voice_id: Some("other-voice".to_string()),
-                backend_kind: SpeechBackendKind::PlatformOnDevice,
-                network: NetworkBehavior::Never,
-            },
-            output: SynthesisOutput::Complete {
-                audio: b"RIFF".to_vec(),
-                format: AudioOutputFormat::Wav,
-            },
-            duration_ms: None,
-            alignments: Vec::new(),
-            usage: Default::default(),
-        };
-        assert_eq!(
-            validate_apple_response(response, &request_id, "voice.local")
-                .expect_err("voice mismatch")
-                .code,
-            "speech_provenance_mismatch"
-        );
-        assert_ne!(sha256_hex(b"before"), sha256_hex(b"after"));
-    }
-
-    #[test]
-    fn raw_wav_publication_revalidates_the_current_message_after_storage_lookup() {
-        let speech = MomSpeech::empty_for_tests();
-        let binding = ReadAloudBinding {
-            conversation_id: "chat-current".to_string(),
-            message_id: "message-current".to_string(),
-            text_sha256: sha256_hex(b"before"),
-            backend_id: APPLE_BACKEND_ID.to_string(),
-            backend_descriptor_sha256: "descriptor-current".to_string(),
-            model_id: None,
-            voice_id: "voice.local".to_string(),
-            request_id: "request-current".to_string(),
-            wav_sha256: sha256_hex(b"RIFF"),
-            wav_bytes: 4,
-            duration_ms: None,
-            network: NetworkBehavior::Never,
-            apple_inner_call_non_preemptive: true,
-        };
-        speech.state.lock().expect("state").playback.insert(
-            "playback-current".to_string(),
-            PlaybackAudio {
-                binding: binding.clone(),
-                bytes: b"RIFF".to_vec(),
-            },
-        );
-
-        let stale = speech.playback_bytes_with_target(
-            "playback-current",
-            &binding.message_id,
-            &binding.text_sha256,
-            &binding.backend_descriptor_sha256,
-            |conversation_id, message_id| {
-                assert_eq!(conversation_id, "chat-current");
-                assert_eq!(message_id, "message-current");
-                Ok(sha256_hex(b"after"))
-            },
-        );
-        assert!(
-            stale
-                .expect_err("edited message must suppress old WAV")
-                .contains("speech_read_aloud_stale")
-        );
-        assert_eq!(
-            speech
-                .playback_bytes_with_target(
-                    "playback-current",
-                    &binding.message_id,
-                    &binding.text_sha256,
-                    &binding.backend_descriptor_sha256,
-                    |_, _| Ok(binding.text_sha256.clone()),
-                )
-                .expect("unchanged exact message"),
-            b"RIFF"
-        );
-    }
-
-    #[test]
-    fn precommit_audio_is_bound_to_opaque_operation_text_and_descriptor() {
-        let speech = MomSpeech::empty_for_tests();
-        let operation = "precommit-1234";
-        let request_id = SpeechRequestId("request-precommit-1234".to_string());
-        let audio = b"RIFFprecommit-audio".to_vec();
-        let text_sha256 = sha256_hex(b"Hello from this persona.");
-        let descriptor_sha256 = sha256_hex(b"exact qwen descriptor");
-        speech
-            .begin_operation(
-                operation,
-                request_id.clone(),
-                OperationKind::PrecommitSynthesis,
-            )
-            .expect("operation admitted");
-        speech
-            .publish_precommit_audio(
-                operation,
-                &request_id,
-                PrecommitSpeechBinding {
-                    operation: operation.to_string(),
-                    conversation_id: "persona-gabor_mate-chat".to_string(),
-                    text_sha256: text_sha256.clone(),
-                    backend_id: QWEN_BACKEND_ID.to_string(),
-                    backend_descriptor_sha256: descriptor_sha256.clone(),
-                    model_id: QWEN_ICL_MODEL_ID.to_string(),
-                    voice_id: "mom.qwen.icl.gabor_mate".to_string(),
-                    request_id: request_id.0.clone(),
-                    wav_sha256: sha256_hex(&audio),
-                    wav_bytes: u64::try_from(audio.len()).expect("audio length"),
-                    duration_ms: Some(700),
-                    network: NetworkBehavior::Never,
-                },
-                audio.clone(),
-            )
-            .expect("audio published");
-
-        assert_eq!(
-            speech
-                .precommit_audio_bytes(operation, &text_sha256, &descriptor_sha256)
-                .expect("exact retrieval"),
-            audio
-        );
-        assert!(
-            speech
-                .precommit_audio_bytes(
-                    operation,
-                    &sha256_hex(b"different text"),
-                    &descriptor_sha256
-                )
-                .is_err()
-        );
-        assert!(
-            speech
-                .precommit_audio_bytes(operation, &text_sha256, &sha256_hex(b"changed descriptor"))
-                .is_err()
-        );
-        assert!(
-            speech
-                .precommit_audio_bytes("precommit-5678", &text_sha256, &descriptor_sha256)
-                .is_err()
-        );
-        assert!(
-            speech
-                .begin_operation(
-                    operation,
-                    SpeechRequestId("request-precommit-replay".to_string()),
-                    OperationKind::PrecommitSynthesis,
-                )
-                .is_err()
-        );
     }
 
     #[test]
     fn descriptor_hash_binds_request_to_exact_inventory() {
-        let original = apple_descriptor();
+        let original = qwen_descriptor();
         let mut changed = original.clone();
         changed.voices[0].id = "voice.changed".to_string();
         assert_ne!(
@@ -2550,6 +3242,7 @@ mod tests {
                     .iter_mut()
                     .find(|item| item.id == fixture.conversation_id)
                     .expect("owned conversation persisted");
+                conversation.recipient_ids = vec!["persona-gabor_mate".to_string()];
                 conversation.messages.push(Message {
                     id: fixture.message_id.clone(),
                     conversation_id: fixture.conversation_id.clone(),
@@ -2636,11 +3329,11 @@ mod tests {
 
         #[async_trait]
         impl SpeechExecutor for MockPostflightExecutor {
-            fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError> {
+            fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
                 if self.inventory_error.load(Ordering::Relaxed) {
                     Err(SpeechHostError::StateUnavailable)
                 } else {
-                    Ok(vec![apple_descriptor(), parakeet_descriptor()])
+                    Ok(Arc::from([qwen_descriptor(), parakeet_descriptor()]))
                 }
             }
 
@@ -2661,20 +3354,23 @@ mod tests {
                 Ok(SynthesisResponse {
                     request_id: self.respond(request.context.request_id),
                     route: SpeechResolvedRoute {
-                        backend_id: APPLE_BACKEND_ID.to_string(),
-                        model_id: None,
-                        voice_id: Some("voice.local".to_string()),
-                        backend_kind: SpeechBackendKind::PlatformOnDevice,
+                        backend_id: QWEN_BACKEND_ID.to_string(),
+                        model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
+                        voice_id: Some("mom.qwen.icl.gabor_mate".to_string()),
+                        backend_kind: SpeechBackendKind::EmbeddedModel,
                         network: NetworkBehavior::Never,
                     },
                     // Envelope bytes only; no synthesis, decoding or playback.
-                    output: SynthesisOutput::Complete {
-                        audio: MOCK_WAV.to_vec(),
-                        format: AudioOutputFormat::Wav,
+                    output: SynthesisOutput::Streamed {
+                        format: qwen_stream_output(),
+                        emitted_bytes: u64::try_from(MOCK_WAV.len()).unwrap(),
                     },
                     duration_ms: Some(1),
                     alignments: Vec::new(),
-                    usage: SpeechUsage::default(),
+                    usage: SpeechUsage {
+                        real_local_inference: true,
+                        ..SpeechUsage::default()
+                    },
                 })
             }
 
@@ -2735,7 +3431,11 @@ mod tests {
             let executor = Arc::new(MockPostflightExecutor::default());
             let speech = Arc::new(MomSpeech {
                 executor: executor.clone(),
+                _qwen: None,
+                _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                precommit_voices: RwLock::new(BTreeMap::new()),
+                generation_backpressure: Mutex::new(BTreeMap::new()),
             });
             // Prove the public path reaches ordinary publication before any fault.
             let output = speech
@@ -2751,16 +3451,13 @@ mod tests {
                 output.binding.text_sha256,
                 sha256_hex(MESSAGE_TEXT.as_bytes())
             );
-            assert_eq!(
+            assert!(
                 speech
-                    .playback_bytes(
-                        &output.playback_id,
-                        &fixture.message_id,
-                        &output.binding.text_sha256,
-                        &output.binding.backend_descriptor_sha256,
-                    )
-                    .expect("ordinary exact playback bytes"),
-                MOCK_WAV
+                    .state
+                    .lock()
+                    .expect("speech state")
+                    .playback
+                    .contains_key(&output.playback_id)
             );
             assert!(speech.state.lock().expect("speech state").active.is_empty());
             assert!(
@@ -2904,16 +3601,13 @@ mod tests {
                 .await?
                 .result
                 .expect("capacity recovered");
-            assert_eq!(
+            assert!(
                 speech
-                    .playback_bytes(
-                        &recovered.playback_id,
-                        &fixture.message_id,
-                        &recovered.binding.text_sha256,
-                        &recovered.binding.backend_descriptor_sha256,
-                    )
-                    .expect("recovered exact playback bytes"),
-                MOCK_WAV
+                    .state
+                    .lock()
+                    .expect("speech state")
+                    .playback
+                    .contains_key(&recovered.playback_id)
             );
             assert!(speech.state.lock().expect("speech state").active.is_empty());
             assert_eq!(
@@ -2937,7 +3631,11 @@ mod tests {
             let executor = Arc::new(MockPostflightExecutor::default());
             let speech = Arc::new(MomSpeech {
                 executor: executor.clone(),
+                _qwen: None,
+                _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                precommit_voices: RwLock::new(BTreeMap::new()),
+                generation_backpressure: Mutex::new(BTreeMap::new()),
             });
             let published = speech
                 .transcribe_attachment(

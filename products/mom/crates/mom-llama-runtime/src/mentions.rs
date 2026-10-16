@@ -2980,6 +2980,7 @@ pub fn mention_synthesize(
             version: 1,
             invocation_id: invocation_id.to_string(),
             target_order: completed.len(),
+            incomplete: false,
         }),
         attachment_ids: Vec::new(),
     });
@@ -3313,13 +3314,7 @@ where
         let cache_use = if handoff.media.is_empty() {
             match snapshot.profile.chat_template {
                 crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
-                    ensure_persona_prefix(
-                        &handle,
-                        &cache_owner(snapshot),
-                        &format!("Invited context for @{}", snapshot.handle),
-                        &handoff.stable_prefix,
-                        &handoff.messages,
-                    )?
+                    ensure_persona_prefix(&handle, &cache_owner(snapshot), &handoff.messages)?
                 }
                 crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
             }
@@ -3363,8 +3358,9 @@ where
                             &target.snapshot.target_id,
                         )?;
                         let cache_reused = execution::cache_was_reused(&output.metrics.cache);
-                        // Retained native output remains immutable; cancellation only
-                        // removes its authority to become a new conversation message.
+                        // Cancellation retains the exact native prefix. A user who
+                        // stops a response has still sent the invitation and seen
+                        // this text; both belong in the conversation record.
                         invocation.results.push(MentionTargetResult {
                             target_id: target.snapshot.target_id.clone(),
                             handle: target.snapshot.handle.clone(),
@@ -3374,11 +3370,7 @@ where
                             } else {
                                 output.state
                             },
-                            text: if cancelled {
-                                String::new()
-                            } else {
-                                strip_reserved_attribution_prefix(&output.text)
-                            },
+                            text: strip_reserved_attribution_prefix(&output.text),
                             model_id: output.model_id,
                             message_id: None,
                             metrics: output.metrics,
@@ -3414,17 +3406,12 @@ where
     });
     invocation.state = invocation_state(&invocation.results);
     invocation.updated_at = now_ms().to_string();
-    let has_completed_response = invocation.results.iter().any(|result| {
-        result.real_engine_invoked
-            && !result.fake_fixture
-            && result.state == GenerationState::Completed
-            && !result.text.trim().is_empty()
-    });
+    let commit_terminal = terminal_invocation_should_commit(&invocation.results);
     let real_engine_invoked = invocation
         .results
         .iter()
         .any(|result| result.real_engine_invoked && !result.fake_fixture);
-    if !has_completed_response {
+    if !commit_terminal {
         save_invocation(&invocation)?;
         return Ok(CommandResult::blocked_with_evidence(
             "mom_llama.chat_dispatch",
@@ -3832,7 +3819,11 @@ fn append_attributed_results(host: &mut Conversation, invocation: &mut MentionIn
                 });
     let mut parent = Some(invocation.user_message_id.clone());
     for (order, result) in invocation.results.iter_mut().enumerate() {
-        if result.state != GenerationState::Completed || result.text.trim().is_empty() {
+        let publishable = result.state == GenerationState::Completed
+            || (result.state == GenerationState::Cancelled
+                && result.real_engine_invoked
+                && !result.fake_fixture);
+        if !publishable || result.text.trim().is_empty() {
             continue;
         }
         let snapshot = invocation
@@ -3884,6 +3875,7 @@ fn append_attributed_results(host: &mut Conversation, invocation: &mut MentionIn
                 version: snapshot.version,
                 invocation_id: invocation.id.clone(),
                 target_order: order,
+                incomplete: result.state == GenerationState::Cancelled,
             }),
             attachment_ids: Vec::new(),
         });
@@ -4074,6 +4066,20 @@ fn invocation_state(results: &[MentionTargetResult]) -> MentionInvocationState {
     } else {
         MentionInvocationState::Failed
     }
+}
+
+/// A cancelled invitation is a sent turn, even if cancellation won before the
+/// first token. If native generation produced a prefix, that prefix is retained
+/// by `append_attributed_results` and marked incomplete. Ordinary failures do
+/// not consume the draft or create a conversation turn.
+fn terminal_invocation_should_commit(results: &[MentionTargetResult]) -> bool {
+    results.iter().any(|result| {
+        result.state == GenerationState::Cancelled
+            || (result.real_engine_invoked
+                && !result.fake_fixture
+                && result.state == GenerationState::Completed
+                && !result.text.trim().is_empty())
+    })
 }
 
 fn parse_handles(message: &str) -> Result<Vec<String>> {
@@ -4394,6 +4400,124 @@ mod tests {
             super::failed_target_message(&[]),
             "None of the invited local models completed a response."
         );
+    }
+
+    #[test]
+    fn cancelled_consult_serializes_sent_turn_and_marks_retained_prefix_incomplete() {
+        let mut host = mention_conversation("host", "host");
+        host.kind = ConversationKind::Chat;
+        let user_message = Message {
+            id: "user".into(),
+            conversation_id: host.id.clone(),
+            role: MessageRole::User,
+            content: "@researcher explain this".into(),
+            created_at: "1".into(),
+            parent_id: None,
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        };
+        host.messages.push(user_message);
+        host.active_leaf_message_id = Some("user".into());
+        let target = MentionTargetSnapshot {
+            target_id: "persona".into(),
+            kind: MentionTargetKind::Persona,
+            handle: "researcher".into(),
+            label: "Researcher".into(),
+            version: 1,
+            source_leaf_message_id: None,
+            profile: ConversationExecutionProfile::default(),
+            source_messages: Vec::new(),
+            snapshot_sha256: "snapshot".into(),
+        };
+        let mut invocation = MentionInvocation {
+            id: "invocation".into(),
+            host_conversation_id: host.id.clone(),
+            user_message_id: "user".into(),
+            addressed_message: "@researcher explain this".into(),
+            host_context: Vec::new(),
+            targets: vec![target],
+            results: vec![super::MentionTargetResult {
+                target_id: "persona".into(),
+                handle: "researcher".into(),
+                label: "Researcher".into(),
+                state: GenerationState::Cancelled,
+                text: "The retained partial answer".into(),
+                model_id: "model".into(),
+                message_id: None,
+                metrics: GenerationMetrics::default(),
+                cache_id: None,
+                cache_reused: false,
+                tool_receipt_ids: Vec::new(),
+                real_engine_invoked: true,
+                fake_fixture: false,
+            }],
+            tool_approvals: Vec::new(),
+            synthesis_message_id: None,
+            synthesis_sha256: None,
+            state: MentionInvocationState::Cancelled,
+            created_at: "1".into(),
+            updated_at: "2".into(),
+        };
+
+        assert!(super::terminal_invocation_should_commit(
+            &invocation.results
+        ));
+        super::append_attributed_results(&mut host, &mut invocation);
+        let persisted: ConversationDb = serde_json::from_slice(
+            &serde_json::to_vec(&ConversationDb {
+                conversations: vec![host],
+                selected_conversation_id: Some("host".into()),
+            })
+            .expect("serialize retained cancellation"),
+        )
+        .expect("deserialize retained cancellation");
+        let messages = &persisted.conversations[0].messages;
+        assert_eq!(
+            messages.len(),
+            2,
+            "sent invitation and partial must survive"
+        );
+        assert_eq!(messages[0].content, "@researcher explain this");
+        assert_eq!(messages[1].content, "The retained partial answer");
+        assert!(
+            messages[1]
+                .attribution
+                .as_ref()
+                .expect("attributed partial")
+                .incomplete
+        );
+        assert_eq!(
+            persisted.conversations[0].active_leaf_message_id.as_deref(),
+            Some(messages[1].id.as_str())
+        );
+    }
+
+    #[test]
+    fn cancellation_before_first_token_still_commits_the_sent_invitation() {
+        let result = super::MentionTargetResult {
+            target_id: "persona".into(),
+            handle: "researcher".into(),
+            label: "Researcher".into(),
+            state: GenerationState::Cancelled,
+            text: String::new(),
+            model_id: String::new(),
+            message_id: None,
+            metrics: GenerationMetrics::default(),
+            cache_id: None,
+            cache_reused: false,
+            tool_receipt_ids: Vec::new(),
+            real_engine_invoked: false,
+            fake_fixture: false,
+        };
+        assert!(super::terminal_invocation_should_commit(&[result]));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

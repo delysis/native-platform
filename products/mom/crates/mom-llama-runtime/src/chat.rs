@@ -4,19 +4,22 @@ use crate::attachments::{
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
     ChatTemplatePolicy, Message, MessageRole, active_leaf_id, get_or_create_conversation, load_db,
-    strip_reserved_attribution_prefix,
+    load_db_with_settings, strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
-    compatible_conversation_prefix, ensure_persona_prefix, invalidate_cache,
-    persist_session_checkpoint,
+    compatible_cached_prefix_for_owner_with_settings, compatible_conversation_prefix,
+    ensure_persona_prefix, invalidate_cache, persist_session_checkpoint,
 };
-use crate::native_runtime::resident_model_for_profile;
+use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
 use crate::operation_scope::{ChatOperationLease, OperationScope};
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::{applied_skill_prompt, persona_prefix_cache_owner_id};
 use anyhow::Result;
-use llama_native_engine::GenerationTicket;
+use llama_native_engine::{
+    GenerationTicket, IncrementalAudioCancellation, IncrementalAudioGeneration,
+    IncrementalAudioMonitor, IncrementalAudioResume, NativeModelHandle,
+};
 use llama_native_types::{
     ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
     GenerationOutput, GenerationRequest, GenerationState, NativeError, NativeErrorCode,
@@ -25,8 +28,110 @@ use llama_native_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+pub struct VoiceAudioSession {
+    request_id: String,
+    prepared: std::sync::Arc<VoiceAudioPreparedTurn>,
+    operation: ChatOperationLease,
+    generation: IncrementalAudioGeneration,
+    begin_metrics: VoiceAudioBeginMetrics,
+}
+
+/// Immutable preparation for one microphone turn.
+///
+/// Silence speculation may be belayed several times before the user actually
+/// yields the floor. Retaining this object keeps settings, history, prompt,
+/// model acquisition, and prefix lookup off every retry while the eventual
+/// commit still checks the exact leaf captured here.
+#[derive(Debug)]
+pub struct VoiceAudioPreparedTurn {
+    resume_key: String,
+    conversation_id: String,
+    message: String,
+    db: crate::conversation_store::ConversationDb,
+    conversation: crate::conversation_store::Conversation,
+    expected_active_leaf: Option<String>,
+    settings: crate::Settings,
+    model_path: PathBuf,
+    parse_reasoning: bool,
+    handle: NativeModelHandle,
+    request_template: GenerationRequest,
+    cache_id: Option<String>,
+    preparation_metrics: VoiceAudioBeginMetrics,
+}
+
+impl VoiceAudioPreparedTurn {
+    #[must_use]
+    pub fn matches_turn(&self, conversation_id: &str, message: &str) -> bool {
+        self.conversation_id == conversation_id && self.message == message
+    }
+}
+
+impl VoiceAudioSession {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    #[must_use]
+    pub fn conversation_id(&self) -> &str {
+        &self.prepared.conversation_id
+    }
+
+    /// Returns the exact immutable persona identity loaded with this turn.
+    /// Speech can bind its resident voice while microphone/model preparation
+    /// is already in flight instead of reopening the conversation store when
+    /// the first generated text reaches TTS.
+    #[must_use]
+    pub fn persona_identity(&self) -> crate::conversation_store::ConversationPersonaIdentity {
+        crate::conversation_store::ConversationPersonaIdentity {
+            recipient_ids: self.prepared.conversation.recipient_ids.clone(),
+            source_conversation_id: self.prepared.conversation.source_conversation_id.clone(),
+        }
+    }
+
+    pub fn push_pcm(&self, samples: &[f32]) -> Result<usize> {
+        self.generation
+            .push_pcm(samples)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub fn seal_input(&self) -> Result<bool> {
+        self.generation.seal_input().map_err(anyhow::Error::new)
+    }
+
+    pub fn cancel(&self) -> usize {
+        self.generation.cancel()
+    }
+
+    #[must_use]
+    pub fn cancellation_handle(&self) -> Option<IncrementalAudioCancellation> {
+        self.generation.cancellation_handle()
+    }
+
+    pub fn wait_for_resume(&self) -> Result<IncrementalAudioResume> {
+        self.generation
+            .wait_for_resume()
+            .map_err(anyhow::Error::new)
+    }
+
+    #[must_use]
+    pub fn audio_monitor(&self) -> IncrementalAudioMonitor {
+        self.generation.monitor()
+    }
+
+    #[must_use]
+    pub fn begin_metrics(&self) -> &VoiceAudioBeginMetrics {
+        &self.begin_metrics
+    }
+
+    #[must_use]
+    pub fn prepared_turn(&self) -> std::sync::Arc<VoiceAudioPreparedTurn> {
+        std::sync::Arc::clone(&self.prepared)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatSendInput {
@@ -194,6 +299,142 @@ pub struct ChatSendOutput {
     pub completion_tokens: usize,
     pub cache_id: Option<String>,
     pub cache_reused: bool,
+    /// Present only for an audio-native turn whose microphone attachment was
+    /// persisted concurrently with generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_audio_metrics: Option<VoiceAudioMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceAudioMetrics {
+    pub begin: VoiceAudioBeginMetrics,
+    pub accepted_samples: u64,
+    pub consumed_samples: u64,
+    pub chunks: u64,
+    pub high_water_samples: usize,
+    pub first_accept_ms: Option<u64>,
+    pub first_read_ms: Option<u64>,
+    pub finish_ms: Option<u64>,
+    pub decode_start_ms: Option<u64>,
+    pub prefix_start_ms: Option<u64>,
+    pub prefix_finish_ms: Option<u64>,
+    pub prefix_ms: u64,
+    pub prefix_tokens: usize,
+    pub restored_prefix_tokens: usize,
+    pub projector_ms: u64,
+    pub projected_blocks: u64,
+    pub projected_samples: u64,
+    pub first_projector_start_ms: Option<u64>,
+    pub first_projector_finish_ms: Option<u64>,
+    pub last_projector_finish_ms: Option<u64>,
+    pub projector_max_ms: u64,
+    pub tail_samples: u64,
+    #[serde(default)]
+    pub tail_projector_ms: u64,
+    pub producer_lock_wait_us: u64,
+    pub producer_lock_wait_max_us: u64,
+    pub ring_write_us: u64,
+    pub ring_write_max_us: u64,
+    pub archive_copy_us: u64,
+    pub archive_copy_max_us: u64,
+    pub consumer_lock_wait_us: u64,
+    pub consumer_lock_wait_max_us: u64,
+    pub ring_read_us: u64,
+    pub ring_read_max_us: u64,
+    #[serde(default)]
+    pub reader_notifications: u64,
+    #[serde(default)]
+    pub reader_waits: u64,
+    #[serde(default)]
+    pub reader_wakeups: u64,
+    pub first_accept_us: Option<u64>,
+    pub first_read_us: Option<u64>,
+    pub finish_us: Option<u64>,
+    pub decode_start_us: Option<u64>,
+    #[serde(default)]
+    pub closing_boundary_finish_us: Option<u64>,
+    #[serde(default)]
+    pub suffix_tokenize_finish_us: Option<u64>,
+    #[serde(default)]
+    pub suffix_eval_finish_us: Option<u64>,
+    #[serde(default)]
+    pub sampler_start_us: Option<u64>,
+    #[serde(default)]
+    pub sampler_ready_us: Option<u64>,
+    #[serde(default)]
+    pub first_sample_start_us: Option<u64>,
+    #[serde(default)]
+    pub first_sample_finish_us: Option<u64>,
+    #[serde(default)]
+    pub first_token_event_us: Option<u64>,
+    #[serde(default)]
+    pub sampled_tokens: u64,
+    #[serde(default)]
+    pub nonempty_token_pieces: u64,
+    #[serde(default)]
+    pub emitted_token_events: u64,
+    #[serde(default)]
+    pub last_sample_start_us: Option<u64>,
+    #[serde(default)]
+    pub last_sample_finish_us: Option<u64>,
+    #[serde(default)]
+    pub last_token_event_us: Option<u64>,
+    #[serde(default)]
+    pub continuation_decode_start_us: Option<u64>,
+    #[serde(default)]
+    pub continuation_decode_finish_us: Option<u64>,
+    #[serde(default)]
+    pub continuation_decode_steps: u64,
+    #[serde(default)]
+    pub continuation_decode_us: u64,
+    #[serde(default)]
+    pub continuation_decode_max_us: u64,
+    pub prefix_start_us: Option<u64>,
+    pub prefix_finish_us: Option<u64>,
+    pub prefix_us: u64,
+    pub projector_us: u64,
+    pub first_projector_start_us: Option<u64>,
+    pub first_projector_finish_us: Option<u64>,
+    pub last_projector_finish_us: Option<u64>,
+    pub projector_max_us: u64,
+    #[serde(default)]
+    pub tail_projector_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceAudioBeginMetrics {
+    pub total_us: u64,
+    /// Context cells allocated by the exact resident used for this turn.
+    /// This is reported from the live fingerprint rather than a persisted
+    /// preference, so latency receipts prove the effective memory plan.
+    pub resident_context_tokens: u32,
+    pub settings_cache_hit: bool,
+    pub model_resident_hit: bool,
+    pub settings_us: u64,
+    pub conversation_us: u64,
+    pub history_us: u64,
+    pub attachments_us: u64,
+    pub skills_us: u64,
+    pub prompt_us: u64,
+    pub model_acquire_us: u64,
+    pub cache_lookup_us: u64,
+    pub sampling_us: u64,
+    pub operation_register_us: u64,
+    pub generation_admission_us: u64,
+    pub cached_prefix_tokens: usize,
+    pub cached_prefix_found: bool,
+    pub existing_conversation_fast_path: bool,
+    pub attachment_free_fast_path: bool,
+    pub skill_free_fast_path: bool,
+    pub prepared_reuse: bool,
+    pub preparation_source_us: u64,
+    pub request_clone_us: u64,
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,6 +462,10 @@ pub struct ChatStreamEvent {
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Native emission clock for latency milestones. Ordinary deltas omit it
+    /// after the first content delta to avoid timing work per token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emitted_at_unix_us: Option<u64>,
     pub fake_fixture: bool,
     pub real_engine_invoked: bool,
 }
@@ -378,6 +623,515 @@ pub fn chat_send_in_scope(
         None,
         None::<fn(ChatStreamEvent) -> Result<()>>,
     )
+}
+
+/// Start one audio-native turn while the microphone is still open.
+///
+/// This deliberately excludes the not-yet-finalized voice attachment from
+/// storage preparation. The exact WAV is admitted and committed only at
+/// `voice_audio_finish_in_scope`; the resident model receives these same
+/// samples incrementally through `push_pcm` in the meantime.
+pub fn voice_audio_begin_in_scope(
+    scope: &OperationScope,
+    conversation_id: &str,
+    message: &str,
+) -> Result<VoiceAudioSession> {
+    let total_started = Instant::now();
+    let stage_started = Instant::now();
+    let (mut settings, settings_cache_hit) = crate::config::resolve_settings_with_cache_status()?;
+    let settings_us = elapsed_us(stage_started);
+
+    // Voice capture always starts from a chat already visible in the UI. Do
+    // not acquire a write transaction merely to rediscover that unchanged
+    // record. A genuinely absent conversation still uses the guarded creation
+    // path, including removed-persona and concurrent-removal checks.
+    let stage_started = Instant::now();
+    let loaded = load_db_with_settings(&settings)?;
+    let existing = loaded
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .cloned();
+    let existing_conversation_fast_path = existing.is_some();
+    let (db, conversation) = match existing {
+        Some(conversation) => (loaded, conversation),
+        None => get_or_create_conversation(conversation_id)?,
+    };
+    let conversation_us = elapsed_us(stage_started);
+    let expected_active_leaf = conversation.active_leaf_message_id.clone();
+    apply_conversation_model_pair(
+        &mut settings,
+        conversation.execution_profile.model_path.clone(),
+        conversation.selected_model_path.clone(),
+        conversation.execution_profile.mmproj_path.clone(),
+    );
+    let stage_started = Instant::now();
+    let active_messages = crate::document::checked_active_messages(&conversation)?;
+    let history_us = elapsed_us(stage_started);
+
+    let attachment_free_fast_path = active_messages
+        .iter()
+        .all(|message| message.attachment_ids.is_empty());
+    let stage_started = Instant::now();
+    let history = if attachment_free_fast_path {
+        ChatAttachmentContext {
+            staged_ids: Vec::new(),
+            draft_snapshot: None,
+            text_by_message_id: std::collections::HashMap::new(),
+            current_text: String::new(),
+            media: Vec::new(),
+        }
+    } else {
+        prepare_chat_attachments(
+            conversation_id,
+            &active_messages,
+            Some("live-audio-history-only"),
+        )?
+        .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?
+    };
+    let attachments_us = elapsed_us(stage_started);
+
+    let skill_free_fast_path = conversation.current_skill_ids.is_empty();
+    let stage_started = Instant::now();
+    let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
+    let skills_us = elapsed_us(stage_started);
+    let stage_started = Instant::now();
+    let system_message = conversation
+        .execution_profile
+        .system_message
+        .clone()
+        .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
+    let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
+    let messages = build_native_messages(
+        &system_message,
+        &skill_prompt.prompt,
+        &active_messages,
+        message,
+        upstream_setting_bool(&settings, "excludeReasoningFromContext"),
+        &history.text_by_message_id,
+        "",
+    );
+    let prompt_us = elapsed_us(stage_started);
+    let model_path = settings.model_path.clone().unwrap_or_default();
+    let stage_started = Instant::now();
+    let (handle, model_resident_hit) = resident_model_for_profile_with_status(
+        scope,
+        &settings,
+        &model_path,
+        settings.mmproj_path.as_deref(),
+    )
+    .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
+    let model_acquire_us = elapsed_us(stage_started);
+    let resident_context_tokens = handle
+        .status()
+        .fingerprint
+        .as_ref()
+        .map_or(settings.context_tokens, |fingerprint| {
+            fingerprint.context_tokens
+        });
+    let stage_started = Instant::now();
+    let cached_prefix = if history.media.is_empty() {
+        let persona_owner = persona_prefix_cache_owner_id(
+            conversation.source_conversation_id.as_deref(),
+            &conversation.current_skill_ids,
+            skill_prompt.cache_owner_id.is_some(),
+        );
+        let owner_id = if conversation.source_conversation_id.is_some() {
+            persona_owner
+        } else if conversation.current_skill_ids.is_empty() {
+            Some(conversation.id.as_str())
+        } else {
+            skill_prompt.cache_owner_id.as_deref()
+        };
+        if let Some(owner_id) = owner_id {
+            compatible_cached_prefix_for_owner_with_settings(
+                &handle,
+                &messages,
+                Some(owner_id),
+                &settings,
+            )?
+            .filter(|(_, sequence)| handle.has_live_sequence_receipt(&sequence.export_receipt()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let cache_lookup_us = elapsed_us(stage_started);
+    let cached_prefix_tokens = cached_prefix
+        .as_ref()
+        .map_or(0, |(_, sequence)| sequence.token_count);
+    let cached_prefix_found = cached_prefix.is_some();
+    let cache_id = cached_prefix.as_ref().map(|(id, _)| id.clone());
+    let cached_prefix = cached_prefix.map(|(_, sequence)| sequence);
+    let stage_started = Instant::now();
+    let mut sampling =
+        settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
+    let phone_call = message.starts_with("[Phone call]");
+    // This entry point is used only by live calls and voice notes. Classify
+    // the non-call case explicitly so debug builds do not reject the voice
+    // note path and release builds do not silently retain text-chat sampling.
+    configure_voice_sampling(&mut sampling, phone_call, !phone_call);
+    let sampling_us = elapsed_us(stage_started);
+    let request_template = GenerationRequest {
+        request_id: String::new(),
+        model_id: handle.status().model_id,
+        input: GenerationInput::Chat {
+            messages,
+            // Voice latency wins over an optional reasoning channel. The
+            // engine applies a verified non-thinking contract where one
+            // exists and otherwise preserves the model default.
+            template: ChatTemplateChoice::PreferNonThinking,
+        },
+        sampling,
+        media: Vec::new(),
+        cached_prefix,
+    };
+    let preparation_source_us = elapsed_us(total_started);
+    let preparation_metrics = VoiceAudioBeginMetrics {
+        total_us: 0,
+        resident_context_tokens,
+        settings_cache_hit,
+        model_resident_hit,
+        settings_us,
+        conversation_us,
+        history_us,
+        attachments_us,
+        skills_us,
+        prompt_us,
+        model_acquire_us,
+        cache_lookup_us,
+        sampling_us,
+        operation_register_us: 0,
+        generation_admission_us: 0,
+        cached_prefix_tokens,
+        cached_prefix_found,
+        existing_conversation_fast_path,
+        attachment_free_fast_path,
+        skill_free_fast_path,
+        prepared_reuse: false,
+        preparation_source_us,
+        request_clone_us: 0,
+    };
+    let prepared = std::sync::Arc::new(VoiceAudioPreparedTurn {
+        resume_key: Uuid::new_v4().to_string(),
+        conversation_id: conversation_id.to_string(),
+        message: message.to_string(),
+        db,
+        conversation,
+        expected_active_leaf,
+        settings,
+        model_path,
+        parse_reasoning,
+        handle,
+        request_template,
+        cache_id,
+        preparation_metrics,
+    });
+    start_prepared_voice_audio(scope, prepared, false, total_started)
+}
+
+/// Restart the exact prepared microphone turn after resumed speech belays an
+/// earlier speculative decode. Only cheap request identity, cancellation
+/// registration, and worker admission remain on this path.
+pub fn voice_audio_restart_prepared_in_scope(
+    scope: &OperationScope,
+    prepared: std::sync::Arc<VoiceAudioPreparedTurn>,
+) -> Result<VoiceAudioSession> {
+    start_prepared_voice_audio(scope, prepared, true, Instant::now())
+}
+
+fn start_prepared_voice_audio(
+    scope: &OperationScope,
+    prepared: std::sync::Arc<VoiceAudioPreparedTurn>,
+    reused: bool,
+    total_started: Instant,
+) -> Result<VoiceAudioSession> {
+    let request_id = Uuid::new_v4().to_string();
+    let clone_started = Instant::now();
+    let mut request = prepared.request_template.clone();
+    request.request_id.clone_from(&request_id);
+    let request_clone_us = elapsed_us(clone_started);
+    let stage_started = Instant::now();
+    let operation = scope.register_chat(&request_id, &prepared.conversation_id)?;
+    let operation_register_us = elapsed_us(stage_started);
+    let stage_started = Instant::now();
+    let generation = prepared
+        .handle
+        .generate_incremental_audio_resumable(request, Some(prepared.resume_key.clone()))
+        .map_err(anyhow::Error::new)?;
+    let generation_admission_us = elapsed_us(stage_started);
+    let mut begin_metrics = prepared.preparation_metrics.clone();
+    if reused {
+        begin_metrics.settings_us = 0;
+        begin_metrics.conversation_us = 0;
+        begin_metrics.history_us = 0;
+        begin_metrics.attachments_us = 0;
+        begin_metrics.skills_us = 0;
+        begin_metrics.prompt_us = 0;
+        begin_metrics.model_acquire_us = 0;
+        begin_metrics.cache_lookup_us = 0;
+        begin_metrics.sampling_us = 0;
+    }
+    begin_metrics.prepared_reuse = reused;
+    begin_metrics.request_clone_us = request_clone_us;
+    begin_metrics.operation_register_us = operation_register_us;
+    begin_metrics.generation_admission_us = generation_admission_us;
+    begin_metrics.total_us = elapsed_us(total_started);
+    Ok(VoiceAudioSession {
+        request_id,
+        prepared,
+        operation,
+        generation,
+        begin_metrics,
+    })
+}
+
+pub fn voice_audio_finish_in_scope<F>(
+    session: VoiceAudioSession,
+    options: ChatSendOptions,
+    on_event: Option<F>,
+) -> Result<CommandResult<ChatSendOutput>>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    voice_audio_finish_with_precommit_in_scope(session, options, on_event, || Ok(None))
+}
+
+/// Finish an audio-native generation while allowing the caller's already
+/// running microphone persistence task to join immediately before the
+/// generated exchange is committed. This keeps attachment I/O under model
+/// decoding without weakening the exact attachment/message transaction.
+pub fn voice_audio_finish_with_precommit_in_scope<F, P>(
+    session: VoiceAudioSession,
+    options: ChatSendOptions,
+    mut on_event: Option<F>,
+    before_commit: P,
+) -> Result<CommandResult<ChatSendOutput>>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+    P: FnOnce() -> Result<Option<String>>,
+{
+    let prepared = std::sync::Arc::clone(&session.prepared);
+    let audio_monitor = session.generation.monitor();
+    let ticket = session.generation.finish().map_err(anyhow::Error::new)?;
+    let mut stream = ChatStreamLifecycle::new(
+        &session.request_id,
+        &prepared.conversation_id,
+        options,
+        &mut on_event,
+        session.operation,
+    );
+    stream.mark_engine_invoked();
+    emit(
+        stream.callback(),
+        stream_event(
+            &session.request_id,
+            &prepared.conversation_id,
+            "started",
+            None,
+            Some("Streaming response from the resident audio model.".to_string()),
+            options,
+        ),
+    )?;
+    let outputs = consume_chat_ticket(
+        ticket,
+        &session.request_id,
+        &prepared.conversation_id,
+        options,
+        prepared.parse_reasoning,
+        stream.callback(),
+    )
+    .map_err(chat_ticket_error)?;
+    let Some(output) = outputs.into_iter().next() else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.voice_audio_finish",
+            "blocked_native_runtime",
+            Blocker::new(
+                "native_response_missing",
+                "The native model returned no response.",
+                vec!["Try the request again.".to_string()],
+            ),
+        ));
+    };
+    let audio_stats = audio_monitor.stats();
+    if output.state == GenerationState::Cancelled || stream.arbitrate_terminal() {
+        return stream.finish_cancelled();
+    }
+    let parsed = parse_reasoning_output(&output.text, prepared.parse_reasoning);
+    let assistant_text = strip_reserved_attribution_prefix(&parsed.content)
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if assistant_text.is_empty() {
+        return Ok(empty_native_response_result(
+            (!parsed.reasoning.is_empty()).then_some(parsed.reasoning.as_str()),
+            false,
+        ));
+    }
+    let voice_attachment_id = before_commit()?;
+    let mut conversation = prepared.conversation.clone();
+    let active_messages = crate::document::checked_active_messages(&conversation)?;
+    let attachments = prepare_chat_attachments(&prepared.conversation_id, &active_messages, None)?
+        .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
+    let user_message = Message {
+        id: Uuid::new_v4().to_string(),
+        conversation_id: prepared.conversation_id.clone(),
+        role: MessageRole::User,
+        content: prepared.message.clone(),
+        created_at: now_ms().to_string(),
+        parent_id: active_leaf_id(&conversation),
+        model: model_name(&prepared.model_path),
+        receipt_id: None,
+        prompt_tokens: Some(output.metrics.prompt_tokens),
+        completion_tokens: None,
+        reasoning_content: None,
+        reasoning_incomplete: false,
+        branch_index: None,
+        branch_count: None,
+        attribution: None,
+        attachment_ids: attachments.staged_ids.clone(),
+    };
+    let user_message_id = user_message.id.clone();
+    let assistant_message = Message {
+        id: Uuid::new_v4().to_string(),
+        conversation_id: prepared.conversation_id.clone(),
+        role: MessageRole::Assistant,
+        content: assistant_text.clone(),
+        created_at: now_ms().to_string(),
+        parent_id: Some(user_message_id.clone()),
+        model: model_name(&prepared.model_path),
+        receipt_id: Some(format!(
+            "mom_llama.voice_audio_finish:{}",
+            session.request_id
+        )),
+        prompt_tokens: None,
+        completion_tokens: Some(output.metrics.completion_tokens),
+        reasoning_content: (!parsed.reasoning.is_empty()).then_some(parsed.reasoning.clone()),
+        reasoning_incomplete: parsed.incomplete,
+        branch_index: None,
+        branch_count: None,
+        attribution: None,
+        attachment_ids: Vec::new(),
+    };
+    let assistant_message_id = assistant_message.id.clone();
+    conversation.messages.push(user_message);
+    conversation.messages.push(assistant_message);
+    conversation.active_leaf_message_id = Some(assistant_message_id.clone());
+    conversation.updated_at = now_ms().to_string();
+    conversation.selected_model_path = prepared.settings.model_path.clone();
+    conversation.execution_profile.model_path = prepared.settings.model_path.clone();
+    conversation.execution_profile.mmproj_path = prepared.settings.mmproj_path.clone();
+    let generated = vec![user_message_id.clone(), assistant_message_id.clone()];
+    let path = commit_generated_exchange(
+        prepared.db.clone(),
+        conversation,
+        prepared.expected_active_leaf.as_deref(),
+        &generated,
+        &attachments.staged_ids,
+        &user_message_id,
+        attachments.draft_snapshot.as_ref(),
+    )?;
+    let cache_reused = output.metrics.cache.restored_prefix_tokens > 0;
+    let result = ChatSendOutput {
+        request_id: session.request_id,
+        conversation_id: prepared.conversation_id.clone(),
+        user_message_id,
+        assistant_message_id,
+        assistant_text,
+        reasoning_content: (!parsed.reasoning.is_empty()).then_some(parsed.reasoning),
+        reasoning_incomplete: parsed.incomplete,
+        model_path: prepared.model_path.display().to_string(),
+        duration_ms: output.metrics.duration_ms,
+        first_token_ms: output.metrics.first_token_ms,
+        prompt_tokens: output.metrics.prompt_tokens,
+        completion_tokens: output.metrics.completion_tokens,
+        cache_id: prepared.cache_id.clone().filter(|_| cache_reused),
+        cache_reused,
+        voice_attachment_id,
+        voice_audio_metrics: Some(VoiceAudioMetrics {
+            begin: session.begin_metrics,
+            accepted_samples: audio_stats.accepted_samples,
+            consumed_samples: audio_stats.consumed_samples,
+            chunks: audio_stats.chunks,
+            high_water_samples: audio_stats.high_water_samples,
+            first_accept_ms: audio_stats.first_accept_ms,
+            first_read_ms: audio_stats.first_read_ms,
+            finish_ms: audio_stats.finish_ms,
+            decode_start_ms: audio_stats.decode_start_ms,
+            prefix_start_ms: audio_stats.prefix_start_ms,
+            prefix_finish_ms: audio_stats.prefix_finish_ms,
+            prefix_ms: audio_stats.prefix_ms,
+            prefix_tokens: audio_stats.prefix_tokens,
+            restored_prefix_tokens: audio_stats.restored_prefix_tokens,
+            projector_ms: audio_stats.projector_ms,
+            projected_blocks: audio_stats.projected_blocks,
+            projected_samples: audio_stats.projected_samples,
+            first_projector_start_ms: audio_stats.first_projector_start_ms,
+            first_projector_finish_ms: audio_stats.first_projector_finish_ms,
+            last_projector_finish_ms: audio_stats.last_projector_finish_ms,
+            projector_max_ms: audio_stats.projector_max_ms,
+            tail_samples: audio_stats.tail_samples,
+            tail_projector_ms: audio_stats.tail_projector_ms,
+            producer_lock_wait_us: audio_stats.producer_lock_wait_us,
+            producer_lock_wait_max_us: audio_stats.producer_lock_wait_max_us,
+            ring_write_us: audio_stats.ring_write_us,
+            ring_write_max_us: audio_stats.ring_write_max_us,
+            archive_copy_us: audio_stats.archive_copy_us,
+            archive_copy_max_us: audio_stats.archive_copy_max_us,
+            consumer_lock_wait_us: audio_stats.consumer_lock_wait_us,
+            consumer_lock_wait_max_us: audio_stats.consumer_lock_wait_max_us,
+            ring_read_us: audio_stats.ring_read_us,
+            ring_read_max_us: audio_stats.ring_read_max_us,
+            reader_notifications: audio_stats.reader_notifications,
+            reader_waits: audio_stats.reader_waits,
+            reader_wakeups: audio_stats.reader_wakeups,
+            first_accept_us: audio_stats.first_accept_us,
+            first_read_us: audio_stats.first_read_us,
+            finish_us: audio_stats.finish_us,
+            decode_start_us: audio_stats.decode_start_us,
+            closing_boundary_finish_us: audio_stats.closing_boundary_finish_us,
+            suffix_tokenize_finish_us: audio_stats.suffix_tokenize_finish_us,
+            suffix_eval_finish_us: audio_stats.suffix_eval_finish_us,
+            sampler_start_us: audio_stats.sampler_start_us,
+            sampler_ready_us: audio_stats.sampler_ready_us,
+            first_sample_start_us: audio_stats.first_sample_start_us,
+            first_sample_finish_us: audio_stats.first_sample_finish_us,
+            first_token_event_us: audio_stats.first_token_event_us,
+            sampled_tokens: audio_stats.sampled_tokens,
+            nonempty_token_pieces: audio_stats.nonempty_token_pieces,
+            emitted_token_events: audio_stats.emitted_token_events,
+            last_sample_start_us: audio_stats.last_sample_start_us,
+            last_sample_finish_us: audio_stats.last_sample_finish_us,
+            last_token_event_us: audio_stats.last_token_event_us,
+            continuation_decode_start_us: audio_stats.continuation_decode_start_us,
+            continuation_decode_finish_us: audio_stats.continuation_decode_finish_us,
+            continuation_decode_steps: audio_stats.continuation_decode_steps,
+            continuation_decode_us: audio_stats.continuation_decode_us,
+            continuation_decode_max_us: audio_stats.continuation_decode_max_us,
+            prefix_start_us: audio_stats.prefix_start_us,
+            prefix_finish_us: audio_stats.prefix_finish_us,
+            prefix_us: audio_stats.prefix_us,
+            projector_us: audio_stats.projector_us,
+            first_projector_start_us: audio_stats.first_projector_start_us,
+            first_projector_finish_us: audio_stats.first_projector_finish_us,
+            last_projector_finish_us: audio_stats.last_projector_finish_us,
+            projector_max_us: audio_stats.projector_max_us,
+            tail_projector_us: audio_stats.tail_projector_us,
+        }),
+    };
+    stream.finish("completed", Some(result.assistant_text.clone()))?;
+    Ok(CommandResult::passed(
+        "mom_llama.voice_audio_finish",
+        "real_prompt_smoke_passed",
+        result,
+        vec![path.display().to_string()],
+        Vec::new(),
+        true,
+        false,
+    ))
 }
 
 pub fn chat_send_stream_in_scope<F>(
@@ -677,30 +1431,15 @@ where
                 &conversation.current_skill_ids,
                 skill_prompt.cache_owner_id.is_some(),
             );
-            let (cache_owner_id, cache_label) = if conversation.source_conversation_id.is_some() {
-                (persona_owner, format!("Persona: {}", conversation.title))
+            let cache_owner_id = if conversation.source_conversation_id.is_some() {
+                persona_owner
             } else if conversation.current_skill_ids.is_empty() {
-                (None, skill_prompt.cache_label.clone())
+                None
             } else {
-                (
-                    skill_prompt.cache_owner_id.as_deref(),
-                    skill_prompt.cache_label.clone(),
-                )
+                skill_prompt.cache_owner_id.as_deref()
             };
             if let Some(owner_id) = cache_owner_id {
-                let stable_messages = messages
-                    .first()
-                    .filter(|message| message.role == ChatRole::System)
-                    .cloned()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let cache = ensure_persona_prefix(
-                    &handle,
-                    owner_id,
-                    &cache_label,
-                    &stable_messages,
-                    &messages,
-                )?;
+                let cache = ensure_persona_prefix(&handle, owner_id, &messages)?;
                 (
                     cache
                         .as_ref()
@@ -722,20 +1461,21 @@ where
         let mut sampling =
             settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
         if phone_call || voice_note {
-            sampling.max_tokens = sampling.max_tokens.min(if phone_call { 64 } else { 96 });
-            if !sampling.stop.iter().any(|stop| stop == "\n\n") {
-                sampling.stop.push("\n\n".to_string());
-            }
+            configure_voice_sampling(&mut sampling, phone_call, voice_note);
         }
         let build_request = |cached_prefix: Option<SequenceStateBlob>| GenerationRequest {
             request_id: request_id.clone(),
             model_id: status.model_id.clone(),
             input: GenerationInput::Chat {
                 messages: messages.clone(),
-                template: match &conversation.execution_profile.chat_template {
-                    ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
-                    ChatTemplatePolicy::FrozenSource(template) => {
-                        ChatTemplateChoice::Override(template.clone())
+                template: if phone_call || voice_note {
+                    ChatTemplateChoice::PreferNonThinking
+                } else {
+                    match &conversation.execution_profile.chat_template {
+                        ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
+                        ChatTemplatePolicy::FrozenSource(template) => {
+                            ChatTemplateChoice::Override(template.clone())
+                        }
                     }
                 },
             },
@@ -933,6 +1673,8 @@ where
         completion_tokens,
         cache_id,
         cache_reused,
+        voice_attachment_id: None,
+        voice_audio_metrics: None,
     };
     stream.finish("completed", Some(result.assistant_text.clone()))?;
     Ok(CommandResult::passed(
@@ -1253,6 +1995,7 @@ where
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(options.timeout_s.max(0.001));
     let mut reasoning_parser = parse_reasoning.then(ReasoningStreamParser::default);
+    let mut first_content_emitted = false;
     loop {
         if started.elapsed() >= timeout {
             ticket.cancel_all();
@@ -1262,35 +2005,38 @@ where
                 GenerationEventKind::Delta { text } => {
                     if let Some(parser) = reasoning_parser.as_mut() {
                         for routed in parser.push(&text) {
-                            emit(
-                                on_event,
-                                stream_event(
-                                    request_id,
-                                    conversation_id,
-                                    match routed.target {
-                                        ReasoningTarget::Content => "delta",
-                                        ReasoningTarget::Reasoning => "reasoning_delta",
-                                    },
-                                    Some(routed.text),
-                                    None,
-                                    options,
-                                ),
-                            )
-                            .map_err(ChatTicketError::Callback)?;
-                        }
-                    } else {
-                        emit(
-                            on_event,
-                            stream_event(
+                            let content = routed.target == ReasoningTarget::Content;
+                            let mut event = stream_event(
                                 request_id,
                                 conversation_id,
-                                "delta",
-                                Some(text),
+                                match routed.target {
+                                    ReasoningTarget::Content => "delta",
+                                    ReasoningTarget::Reasoning => "reasoning_delta",
+                                },
+                                Some(routed.text),
                                 None,
                                 options,
-                            ),
-                        )
-                        .map_err(ChatTicketError::Callback)?;
+                            );
+                            if content && !first_content_emitted {
+                                event.emitted_at_unix_us = Some(unix_now_us());
+                                first_content_emitted = true;
+                            }
+                            emit(on_event, event).map_err(ChatTicketError::Callback)?;
+                        }
+                    } else {
+                        let mut event = stream_event(
+                            request_id,
+                            conversation_id,
+                            "delta",
+                            Some(text),
+                            None,
+                            options,
+                        );
+                        if !first_content_emitted {
+                            event.emitted_at_unix_us = Some(unix_now_us());
+                            first_content_emitted = true;
+                        }
+                        emit(on_event, event).map_err(ChatTicketError::Callback)?;
                     }
                 }
                 // Native state is not a product terminal. Expose only latency
@@ -1302,11 +2048,10 @@ where
                         _ => None,
                     };
                     if let Some(stage) = stage {
-                        emit(
-                            on_event,
-                            stream_event(request_id, conversation_id, stage, None, None, options),
-                        )
-                        .map_err(ChatTicketError::Callback)?;
+                        let mut event =
+                            stream_event(request_id, conversation_id, stage, None, None, options);
+                        event.emitted_at_unix_us = Some(unix_now_us());
+                        emit(on_event, event).map_err(ChatTicketError::Callback)?;
                     }
                 }
                 GenerationEventKind::Warning { code, message } => emit(
@@ -1328,21 +2073,23 @@ where
     }
     if let Some(parser) = reasoning_parser.as_mut() {
         for routed in parser.finish() {
-            emit(
-                on_event,
-                stream_event(
-                    request_id,
-                    conversation_id,
-                    match routed.target {
-                        ReasoningTarget::Content => "delta",
-                        ReasoningTarget::Reasoning => "reasoning_delta",
-                    },
-                    Some(routed.text),
-                    None,
-                    options,
-                ),
-            )
-            .map_err(ChatTicketError::Callback)?;
+            let content = routed.target == ReasoningTarget::Content;
+            let mut event = stream_event(
+                request_id,
+                conversation_id,
+                match routed.target {
+                    ReasoningTarget::Content => "delta",
+                    ReasoningTarget::Reasoning => "reasoning_delta",
+                },
+                Some(routed.text),
+                None,
+                options,
+            );
+            if content && !first_content_emitted {
+                event.emitted_at_unix_us = Some(unix_now_us());
+                first_content_emitted = true;
+            }
+            emit(on_event, event).map_err(ChatTicketError::Callback)?;
         }
     }
     ticket.wait().map_err(ChatTicketError::Native)
@@ -1364,8 +2111,36 @@ fn stream_event(
         event: event.to_string(),
         delta,
         message,
+        emitted_at_unix_us: None,
         fake_fixture: options.fake_fixture,
         real_engine_invoked: !options.fake_fixture && event != "started",
+    }
+}
+
+fn unix_now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+        })
+}
+
+fn configure_voice_sampling(
+    sampling: &mut llama_native_types::SamplingConfig,
+    phone_call: bool,
+    voice_note: bool,
+) {
+    debug_assert!(phone_call || voice_note);
+    if phone_call {
+        // Calls should sound spontaneous even when the conversation has a
+        // frozen sampling profile. This is the language sampler; the separate
+        // acoustic TTS sampler remains tuned for stable PCM generation.
+        sampling.temperature = 1.0;
+        sampling.dynamic_temperature_range = 0.0;
+    }
+    sampling.max_tokens = sampling.max_tokens.min(if phone_call { 64 } else { 96 });
+    if !sampling.stop.iter().any(|stop| stop == "\n\n") {
+        sampling.stop.push("\n\n".to_string());
     }
 }
 
@@ -1374,8 +2149,8 @@ mod tests {
     use super::{
         ChatAttachmentContext, ChatSendOptions, ChatStreamLifecycle, Message, MessageRole,
         ReasoningStreamParser, ReasoningTarget, apply_conversation_model_pair,
-        build_native_messages, empty_native_response_result, native_context_messages,
-        parse_reasoning_output, user_turn_is_empty,
+        build_native_messages, configure_voice_sampling, empty_native_response_result,
+        native_context_messages, parse_reasoning_output, user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
@@ -1400,6 +2175,31 @@ mod tests {
             attribution: None,
             attachment_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn phone_calls_override_frozen_temperature_without_changing_voice_notes() {
+        let mut call = llama_native_types::SamplingConfig {
+            temperature: 0.2,
+            dynamic_temperature_range: 0.4,
+            max_tokens: 512,
+            ..Default::default()
+        };
+        configure_voice_sampling(&mut call, true, false);
+        assert_eq!(call.temperature, 1.0);
+        assert_eq!(call.dynamic_temperature_range, 0.0);
+        assert_eq!(call.max_tokens, 64);
+        assert_eq!(call.stop, ["\n\n"]);
+
+        let mut note = llama_native_types::SamplingConfig {
+            temperature: 0.2,
+            max_tokens: 512,
+            ..Default::default()
+        };
+        configure_voice_sampling(&mut note, false, true);
+        assert_eq!(note.temperature, 0.2);
+        assert_eq!(note.max_tokens, 96);
+        assert_eq!(note.stop, ["\n\n"]);
     }
 
     #[test]
@@ -1612,6 +2412,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 0,
+            incomplete: false,
         });
 
         let context = native_context_messages(&message, false);

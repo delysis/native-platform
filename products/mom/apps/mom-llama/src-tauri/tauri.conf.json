@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.delysis.llama-native-kit.mom-llama",
   "build": {
+    "beforeBuildCommand": "pnpm run build:qwen-helper",
     "frontendDist": "../ui"
   },
   "app": {

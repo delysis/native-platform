@@ -9,8 +9,86 @@ private struct Result: Encodable {
 private struct Request: Decodable {
     let id: String
     let text: String
+    let persona_id: String
     let ref_audio: String
+    let ref_sha256: String
     let ref_text: String
+    var warm_only: Bool? = nil
+    var chunk_size: Int? = nil
+}
+
+private struct ControlRequest: Decodable {
+    let op: String?
+    let id: String?
+}
+
+private enum ResidentInput {
+    case request(Request)
+    case invalid
+}
+
+private final class ResidentRequestQueue: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var pending: [ResidentInput] = []
+    private var closed = false
+
+    func push(_ input: ResidentInput) {
+        condition.lock()
+        pending.append(input)
+        condition.signal()
+        condition.unlock()
+    }
+
+    func close() {
+        condition.lock()
+        closed = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func pop() -> ResidentInput? {
+        condition.lock()
+        defer { condition.unlock() }
+        while pending.isEmpty && !closed { condition.wait() }
+        return pending.isEmpty ? nil : pending.removeFirst()
+    }
+}
+
+private final class RequestCancellationRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = Set<String>()
+    private var cancelled = Set<String>()
+
+    func begin(_ id: String) {
+        lock.lock()
+        active.insert(id)
+        cancelled.remove(id)
+        lock.unlock()
+    }
+
+    func cancel(_ id: String) {
+        lock.lock()
+        if active.contains(id) { cancelled.insert(id) }
+        lock.unlock()
+    }
+
+    func contains(_ id: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled.contains(id)
+    }
+
+    func finish(_ id: String) {
+        lock.lock()
+        active.remove(id)
+        cancelled.remove(id)
+        lock.unlock()
+    }
+}
+
+private struct EmbeddingRequest: Decodable {
+    let id: String
+    let audio: String
 }
 
 private struct WireEvent: Encodable {
@@ -20,15 +98,36 @@ private struct WireEvent: Encodable {
     var samples: Int? = nil
     var data: String? = nil
     var detail: String? = nil
+    var reference_cache: String? = nil
+    var reference_us: Int? = nil
+    var reference_identity_us: Int? = nil
+    var reference_memory_lookup_us: Int? = nil
+    var reference_disk_lookup_us: Int? = nil
+    var reference_source_read_us: Int? = nil
+    var reference_source_hash_us: Int? = nil
+    var reference_compute_us: Int? = nil
+    var reference_persist_us: Int? = nil
+    var text_chunk_us: Int? = nil
+    var code_generation_us: Int? = nil
+    var prepared_prefix_cache_hit: Bool? = nil
+    var first_decode_us: Int? = nil
+    var first_pcm_us: Int? = nil
+    var embedding: [Float]? = nil
 }
+
+private let residentProtocol = "mom-qwen3-tts-resident-v2"
 
 @main
 private enum Qwen3TTSHelperMain {
     static func main() async {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
-            if arguments.first == "--resident", arguments.count == 2 {
+            if arguments == ["--protocol"] {
+                print(residentProtocol)
+            } else if arguments.first == "--resident", arguments.count == 2 {
                 try await runResident(modelPath: URL(fileURLWithPath: arguments[1]))
+            } else if arguments.first == "--embedding-resident", arguments.count == 2 {
+                try runEmbeddingResident(modelPath: URL(fileURLWithPath: arguments[1]))
             } else if arguments.first == "--icl", arguments.count == 6 {
                 try await runICL(
                     modelPath: URL(fileURLWithPath: arguments[1]),
@@ -43,11 +142,41 @@ private enum Qwen3TTSHelperMain {
                 fputs("usage: qwen3-tts-helper MODEL OUTPUT VOICE_DESCRIPTION TEXT\n", stderr)
                 fputs("       qwen3-tts-helper --icl MODEL REF_AUDIO REF_TEXT OUTPUT TEXT\n", stderr)
                 fputs("       qwen3-tts-helper --resident MODEL\n", stderr)
+                fputs("       qwen3-tts-helper --embedding-resident MODEL\n", stderr)
+                fputs("       qwen3-tts-helper --protocol\n", stderr)
                 exit(2)
             }
         } catch {
             fputs("qwen3-tts synthesis failed: \(error)\n", stderr)
             exit(1)
+        }
+    }
+
+    /// Offline archive worker. It deliberately exposes embeddings only through
+    /// a separate protocol so diarization can never occupy or mutate the live
+    /// synthesis resident used by calls.
+    private static func runEmbeddingResident(modelPath: URL) throws {
+        let pipeline = try Qwen3TTSPipeline(modelPath: modelPath)
+        guard pipeline.supportsVoiceCloning else {
+            throw NSError(domain: "MomQwen3TTSHelper", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "Speaker encoder is unavailable"])
+        }
+        writeJSON(WireEvent(event: "ready"))
+        while let line = readLine() {
+            guard let data = line.data(using: .utf8) else { continue }
+            do {
+                let request = try JSONDecoder().decode(EmbeddingRequest.self, from: data)
+                let wav = try Data(contentsOf: URL(fileURLWithPath: request.audio))
+                let samples = try referenceSamples(data: wav)
+                guard let embedding = pipeline.extractSpeakerEmbedding(audioSamples: samples),
+                      !embedding.isEmpty else {
+                    throw NSError(domain: "MomQwen3TTSHelper", code: 8,
+                                  userInfo: [NSLocalizedDescriptionKey: "Could not extract speaker embedding"])
+                }
+                writeJSON(WireEvent(event: "embedding", id: request.id, embedding: embedding))
+            } catch {
+                writeJSON(WireEvent(event: "error", detail: String(describing: error)))
+            }
         }
     }
 
@@ -95,49 +224,224 @@ private enum Qwen3TTSHelperMain {
 
     private static func runResident(modelPath: URL) async throws {
         let pipeline = try Qwen3TTSPipeline(modelPath: modelPath)
-        guard pipeline.supportsICL else {
+        var referenceVoiceCache = ReferenceVoiceCache(modelPath: modelPath)
+        var warmedPrefixKeys = Set<String>()
+        guard pipeline.supportsVoiceCloning else {
             throw NSError(domain: "MomQwen3TTSHelper", code: 4,
                           userInfo: [NSLocalizedDescriptionKey: "Base ICL audio encoder is unavailable"])
         }
         writeJSON(WireEvent(event: "ready", sample_rate: Qwen3TTSPipeline.sampleRate))
 
-        while let line = readLine() {
-            guard let data = line.data(using: .utf8) else { continue }
-            let request: Request
-            do {
-                request = try JSONDecoder().decode(Request.self, from: data)
-            } catch {
+        // Keep stdin consumption independent from the serial Metal owner.
+        // A cancel command must remain readable while that owner is inside
+        // MLX generation; otherwise cancellation waits behind the work it is
+        // intended to stop and can wedge the resident worker.
+        let queue = ResidentRequestQueue()
+        let cancellations = RequestCancellationRegistry()
+        Thread.detachNewThread {
+            while let line = readLine() {
+                guard let data = line.data(using: .utf8) else { continue }
+                if let control = try? JSONDecoder().decode(ControlRequest.self, from: data),
+                   control.op == "cancel", let id = control.id {
+                    cancellations.cancel(id)
+                    continue
+                }
+                if let request = try? JSONDecoder().decode(Request.self, from: data) {
+                    cancellations.begin(request.id)
+                    queue.push(.request(request))
+                } else {
+                    queue.push(.invalid)
+                }
+            }
+            queue.close()
+        }
+
+        while let input = queue.pop() {
+            guard case let .request(request) = input else {
                 writeJSON(WireEvent(event: "fatal", detail: "Invalid request JSON"))
                 continue
             }
             do {
-                let codes = try referenceCodes(pipeline: pipeline, path: URL(fileURLWithPath: request.ref_audio))
-                let stream = pipeline.generateStream(
-                    text: request.text,
-                    referenceTranscript: request.ref_text,
-                    referenceAudioCodes: codes,
-                    chunkSize: 5
-                )
-                for try await chunk in stream {
-                    guard !chunk.samples.isEmpty else { continue }
-                    let pcm = pcm16LE(chunk.samples)
-                    writeJSON(WireEvent(
-                        event: "audio",
-                        id: request.id,
-                        sample_rate: Qwen3TTSPipeline.sampleRate,
-                        samples: chunk.samples.count,
-                        data: pcm.base64EncodedString()
-                    ))
+                let requestStarted = DispatchTime.now().uptimeNanoseconds
+                let lookup = try referenceVoiceCache.voice(
+                    path: URL(fileURLWithPath: request.ref_audio),
+                    personaID: request.persona_id,
+                    expectedDigest: request.ref_sha256
+                ) { data in
+                    let samples = try referenceSamples(data: data)
+                    guard let speakerEmbedding = pipeline.extractSpeakerEmbedding(audioSamples: samples),
+                          !speakerEmbedding.isEmpty else {
+                        throw NSError(domain: "MomQwen3TTSHelper", code: 8,
+                                      userInfo: [NSLocalizedDescriptionKey: "Could not extract reference speaker embedding"])
+                    }
+                    guard let decoderContext = pipeline.encodeReferenceAudio(audioSamples: samples),
+                          !decoderContext.isEmpty else {
+                        throw NSError(domain: "MomQwen3TTSHelper", code: 8,
+                                      userInfo: [NSLocalizedDescriptionKey: "Could not encode reference decoder context"])
+                    }
+                    return CachedReferenceVoice(
+                        speakerEmbedding: speakerEmbedding,
+                        decoderContext: decoderContext
+                    )
                 }
-                writeJSON(WireEvent(event: "done", id: request.id))
+                let voice = lookup.voice
+                let preparedPrefixKey = "\(request.persona_id):\(request.ref_sha256)"
+                if request.warm_only == true {
+                    // Prime the fixed-shape talker and vocoder graphs once
+                    // during background startup. Reference warmup alone left
+                    // their first compilation on the user's first reply.
+                    if warmedPrefixKeys.insert(preparedPrefixKey).inserted {
+                        let warmStream = pipeline.generateStream(
+                            text: "Ready.",
+                            speakerEmbedding: voice.speakerEmbedding,
+                            referenceTranscript: nil,
+                            referenceAudioCodes: voice.decoderContext,
+                            temperature: 0.65,
+                            // One two-frame emission compiles and evaluates the
+                            // talker, code predictor, and vocoder graphs. Running
+                            // a conversational token budget here only occupies
+                            // the single resident worker and can make an
+                            // immediate foreground call wait behind startup.
+                            maxTokens: 2,
+                            chunkSize: 2,
+                            preparedPrefixKey: preparedPrefixKey,
+                            isCancelled: { cancellations.contains(request.id) }
+                        )
+                        for try await _ in warmStream {}
+                    }
+                    if cancellations.contains(request.id) {
+                        writeJSON(WireEvent(event: "cancelled", id: request.id))
+                        cancellations.finish(request.id)
+                        continue
+                    }
+                    writeJSON(WireEvent(
+                        event: "warmed",
+                        id: request.id,
+                        reference_cache: lookup.source.rawValue,
+                        reference_us: lookup.timings.totalMicros,
+                        reference_identity_us: lookup.timings.identityMicros,
+                        reference_memory_lookup_us: lookup.timings.memoryLookupMicros,
+                        reference_disk_lookup_us: lookup.timings.diskLookupMicros,
+                        reference_source_read_us: lookup.timings.sourceReadMicros,
+                        reference_source_hash_us: lookup.timings.sourceHashMicros,
+                        reference_compute_us: lookup.timings.computeMicros,
+                        reference_persist_us: lookup.timings.persistMicros
+                    ))
+                    cancellations.finish(request.id)
+                    continue
+                }
+                let textChunkStarted = DispatchTime.now().uptimeNanoseconds
+                // The app scheduler is the sole segmentation authority for
+                // live speech. Splitting the same phrase again here reset the
+                // talker and codec at helper-private boundaries, producing
+                // the conspicuous short prosody blocks heard in voice notes.
+                // Retain formatting cleanup, then synthesize this request as
+                // one continuous utterance.
+                let speechText = TextChunker.spokenChunks(request.text, maxWords: .max)
+                    .joined(separator: " ")
+                let speechChunks = speechText.isEmpty ? [] : [speechText]
+                let textChunkMicros = elapsedMicros(since: textChunkStarted)
+                guard !speechChunks.isEmpty else {
+                    throw NSError(domain: "MomQwen3TTSHelper", code: 9,
+                                  userInfo: [NSLocalizedDescriptionKey: "Synthesis text was empty"])
+                }
+                var firstPCM = true
+                let chunkSize = min(8, max(2, request.chunk_size ?? 2))
+                for textChunk in speechChunks {
+                    // Reset generation at natural boundaries before acoustic
+                    // drift can propagate. The cached speaker embedding keeps
+                    // identity stable, and playback consumes earlier PCM while
+                    // the following segment is generated.
+                    // A large fixed floor let a missed EOS extend a tiny live
+                    // phrase into seconds of repeated codec frames. Budget by
+                    // text length and retain a small prosodic tail.
+                    let maxTokens = min(180, max(24, TextChunker.estimateTokens(for: textChunk) + 12))
+                    let stream = pipeline.generateStream(
+                        text: textChunk,
+                        speakerEmbedding: voice.speakerEmbedding,
+                        referenceTranscript: nil,
+                        // Keep embedding-only identity conditioning, while
+                        // giving every rolling vocoder window the tail of the
+                        // exact reference audio as stable decoder context.
+                        referenceAudioCodes: voice.decoderContext,
+                        // The native sampler has less numerical headroom than
+                        // the reference CUDA path. This temperature preserves
+                        // natural prosody without long-form instability.
+                        temperature: 0.65,
+                        maxTokens: maxTokens,
+                        chunkSize: chunkSize,
+                        preparedPrefixKey: preparedPrefixKey,
+                        isCancelled: { cancellations.contains(request.id) }
+                    )
+                    for try await chunk in stream {
+                        if cancellations.contains(request.id) { break }
+                        guard !chunk.samples.isEmpty else { continue }
+                        let pcm = pcm16LE(chunk.samples)
+                        writeJSON(WireEvent(
+                            event: "audio",
+                            id: request.id,
+                            sample_rate: Qwen3TTSPipeline.sampleRate,
+                            samples: chunk.samples.count,
+                            data: pcm.base64EncodedString(),
+                            reference_cache: firstPCM ? lookup.source.rawValue : nil,
+                            reference_us: firstPCM ? lookup.timings.totalMicros : nil,
+                            reference_identity_us: firstPCM ? lookup.timings.identityMicros : nil,
+                            reference_memory_lookup_us: firstPCM ? lookup.timings.memoryLookupMicros : nil,
+                            reference_disk_lookup_us: firstPCM ? lookup.timings.diskLookupMicros : nil,
+                            reference_source_read_us: firstPCM ? lookup.timings.sourceReadMicros : nil,
+                            reference_source_hash_us: firstPCM ? lookup.timings.sourceHashMicros : nil,
+                            reference_compute_us: firstPCM ? lookup.timings.computeMicros : nil,
+                            reference_persist_us: firstPCM ? lookup.timings.persistMicros : nil,
+                            text_chunk_us: firstPCM ? textChunkMicros : nil,
+                            code_generation_us: firstPCM
+                                ? chunk.firstCodeGenerationMicros.map { clampedInt($0) } : nil,
+                            prepared_prefix_cache_hit: firstPCM
+                                ? chunk.preparedPrefixCacheHit : nil,
+                            first_decode_us: firstPCM
+                                ? chunk.firstDecodeMicros.map { clampedInt($0) } : nil,
+                            first_pcm_us: firstPCM ? elapsedMicros(since: requestStarted) : nil
+                        ))
+                        firstPCM = false
+                    }
+                    if cancellations.contains(request.id) { break }
+                }
+                writeJSON(WireEvent(
+                    event: cancellations.contains(request.id) ? "cancelled" : "done",
+                    id: request.id
+                ))
             } catch {
-                writeJSON(WireEvent(event: "error", id: request.id, detail: String(describing: error)))
+                writeJSON(WireEvent(
+                    event: cancellations.contains(request.id) ? "cancelled" : "error",
+                    id: request.id,
+                    detail: cancellations.contains(request.id) ? nil : String(describing: error)
+                ))
             }
+            cancellations.finish(request.id)
         }
+    }
+
+    private static func clampedInt(_ value: UInt64) -> Int {
+        value > UInt64(Int.max) ? Int.max : Int(value)
     }
 
     private static func referenceCodes(pipeline: Qwen3TTSPipeline, path: URL) throws -> [[Int32]] {
         let data = try Data(contentsOf: path)
+        return try referenceCodes(pipeline: pipeline, data: data)
+    }
+
+    fileprivate static func referenceCodes(
+        pipeline: Qwen3TTSPipeline,
+        data: Data
+    ) throws -> [[Int32]] {
+        let samples = try referenceSamples(data: data)
+        guard let codes = pipeline.encodeReferenceAudio(audioSamples: samples), !codes.isEmpty else {
+            throw NSError(domain: "MomQwen3TTSHelper", code: 7,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not encode reference audio for ICL"])
+        }
+        return codes
+    }
+
+    fileprivate static func referenceSamples(data: Data) throws -> [Float] {
         guard data.count >= 44,
               data.prefix(4) == Data("RIFF".utf8),
               data.subdata(in: 8..<12) == Data("WAVE".utf8),
@@ -148,11 +452,11 @@ private enum Qwen3TTSHelperMain {
                           userInfo: [NSLocalizedDescriptionKey: "Reference must be mono 24 kHz 16-bit PCM WAV"])
         }
         let samples = Qwen3TTSPipeline.wavToFloatSamples(data: data)
-        guard !samples.isEmpty, let codes = pipeline.encodeReferenceAudio(audioSamples: samples) else {
+        guard !samples.isEmpty else {
             throw NSError(domain: "MomQwen3TTSHelper", code: 7,
                           userInfo: [NSLocalizedDescriptionKey: "Could not encode reference audio for ICL"])
         }
-        return codes
+        return samples
     }
 
     private static func pcm16LE(_ samples: [Float]) -> Data {
@@ -162,6 +466,11 @@ private enum Qwen3TTSHelperMain {
             withUnsafeBytes(of: value) { data.append(contentsOf: $0) }
         }
         return data
+    }
+
+    private static func elapsedMicros(since started: UInt64) -> Int {
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+        return Int(min(elapsed / 1_000, UInt64(Int.max)))
     }
 
     private static func writeJSON<T: Encodable>(_ value: T) {

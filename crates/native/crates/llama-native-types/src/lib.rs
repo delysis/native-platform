@@ -103,11 +103,18 @@ pub struct NativeModelConfig {
     /// claim that an uncooperative writer could not race the parser.
     #[serde(default)]
     pub expected_model_sha256: Option<String>,
+    /// Opaque file identity recorded by a previous verified load. Supplying it
+    /// together with `expected_model_sha256` lets the engine reuse that digest
+    /// only while the same filesystem object has the same immutable metadata.
+    #[serde(default)]
+    pub expected_model_file_identity: Option<String>,
     pub mmproj_path: Option<PathBuf>,
     /// Optional trusted digest for the multimodal projector, with the same
     /// advisory-lock limitations as `expected_model_sha256`.
     #[serde(default)]
     pub expected_mmproj_sha256: Option<String>,
+    #[serde(default)]
+    pub expected_mmproj_file_identity: Option<String>,
     pub device: NativeDevice,
     pub context_tokens: u32,
     pub batch_tokens: u32,
@@ -136,8 +143,10 @@ impl NativeModelConfig {
             model_id,
             model_path,
             expected_model_sha256: None,
+            expected_model_file_identity: None,
             mmproj_path: None,
             expected_mmproj_sha256: None,
+            expected_mmproj_file_identity: None,
             device: NativeDevice::Auto,
             context_tokens: 8192,
             batch_tokens: 512,
@@ -684,6 +693,9 @@ pub struct ChatMessage {
 pub enum ChatTemplateChoice {
     #[default]
     ModelDefault,
+    /// Disable optional reasoning when the loaded model has a verified native
+    /// non-thinking contract; otherwise retain the model's default template.
+    PreferNonThinking,
     Override(String),
     /// Exact Gemma 4 turn protocol with an empty thought channel before generation.
     /// Rendered natively because the pinned llama.cpp simple template API is not a Jinja engine.
@@ -2799,7 +2811,26 @@ pub struct NativeModelDescriptor {
     pub context_tokens: u32,
     pub max_sequences: u32,
     pub backend: String,
+    #[serde(default)]
+    pub load_metrics: NativeModelLoadMetrics,
+    /// Opaque metadata identity for persisting a verified artifact digest.
+    #[serde(default)]
+    pub model_file_identity: String,
+    #[serde(default)]
+    pub mmproj_file_identity: Option<String>,
     pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeModelLoadMetrics {
+    pub total_us: u64,
+    pub backend_us: u64,
+    pub artifact_open_us: u64,
+    pub model_load_us: u64,
+    pub projector_load_us: u64,
+    pub artifact_verify_us: u64,
+    pub context_create_us: u64,
+    pub fingerprint_us: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]

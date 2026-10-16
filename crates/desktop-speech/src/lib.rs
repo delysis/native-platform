@@ -24,6 +24,38 @@ pub const APPLE_BACKEND_ID: &str = "apple.av-speech";
 /// host and must drain it at its chosen lifecycle boundary.
 pub async fn discover_local_host(
     managed_model_root: Option<PathBuf>,
+    installed_voice_root: Option<PathBuf>,
+) -> Result<Arc<SpeechHost>, SpeechHostError> {
+    discover_local_host_with_qwen(managed_model_root, installed_voice_root, None).await
+}
+
+/// Construct the local Qwen backend early enough for its resident model and
+/// reference prefixes to warm while the product unlocks unrelated state. The
+/// returned backend is the one later registered with the speech host; callers
+/// must not create a second copy for the same process.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn prepare_local_qwen(
+    managed_model_root: Option<PathBuf>,
+    installed_voice_root: Option<PathBuf>,
+) -> Arc<QwenSpeechBackend> {
+    let qwen = Arc::new(QwenSpeechBackend::discover(
+        QwenBackendConfig::discover_with_reference_root(
+            managed_model_root.as_deref(),
+            installed_voice_root.as_deref(),
+        ),
+    ));
+    qwen.warm_icl_in_background();
+    qwen
+}
+
+/// Discover the complete local host while reusing an already warming Qwen
+/// backend when one is supplied.
+pub async fn discover_local_host_with_qwen(
+    managed_model_root: Option<PathBuf>,
+    installed_voice_root: Option<PathBuf>,
+    #[cfg(target_os = "macos")] prepared_qwen: Option<Arc<QwenSpeechBackend>>,
+    #[cfg(not(target_os = "macos"))] _prepared_qwen: Option<Arc<QwenSpeechBackend>>,
 ) -> Result<Arc<SpeechHost>, SpeechHostError> {
     let host = Arc::new(SpeechHost::default());
     let parakeet = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
@@ -33,9 +65,12 @@ pub async fn discover_local_host(
     .await;
     host.register_backend(Arc::new(parakeet))?;
     #[cfg(target_os = "macos")]
-    host.register_backend(Arc::new(QwenSpeechBackend::discover(
-        QwenBackendConfig::discover(managed_model_root.as_deref()),
-    )))?;
+    {
+        let qwen = prepared_qwen.unwrap_or_else(|| {
+            prepare_local_qwen(managed_model_root.clone(), installed_voice_root.clone())
+        });
+        host.register_backend(qwen.clone())?;
+    }
     #[cfg(target_os = "macos")]
     if let Ok(apple) = speech_native_platform::apple_backend::AppleSpeechBackend::discover().await {
         host.register_backend(Arc::new(apple))?;

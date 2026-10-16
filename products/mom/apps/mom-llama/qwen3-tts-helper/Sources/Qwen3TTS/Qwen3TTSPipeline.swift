@@ -2,6 +2,41 @@ import Foundation
 import MLX
 import MLXNN
 
+private actor StreamingBatchGate {
+    private var permit = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        if permit {
+            permit = false
+            return
+        }
+        await withCheckedContinuation { continuation in
+            precondition(waiter == nil, "only one streaming producer may wait")
+            waiter = continuation
+        }
+    }
+
+    func signal() {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume()
+        } else {
+            permit = true
+        }
+    }
+}
+
+/// Emit two codec frames first: enough for about 139 ms of PCM after retaining
+/// the crossfade tail, without waiting for the five-frame steady cadence.
+/// Rejoin that cadence at frame five and preserve the stable decoder windows.
+func streamingFramesToNextEmission(emittedFrames: Int) -> Int {
+    if emittedFrames == 0 { return 2 }
+    if emittedFrames < 5 { return 5 - emittedFrames }
+    if emittedFrames < 48 { return min(5, 48 - emittedFrames) }
+    return 12
+}
+
 /// A chunk of generated audio for streaming playback.
 public struct AudioChunk: Sendable {
     /// Audio samples (Float, 24kHz)
@@ -10,11 +45,30 @@ public struct AudioChunk: Sendable {
     public let tokenRange: Range<Int>
     /// Whether this is the final chunk
     public let isFinal: Bool
+    /// Time from the streaming task starting until its first codec-code batch
+    /// became materialized on the GPU. Present only on the first PCM chunk.
+    public let firstCodeGenerationMicros: UInt64?
+    /// Whether the resident speaker/role KV prefix was already materialized.
+    /// Present only on the first PCM chunk.
+    public let preparedPrefixCacheHit: Bool?
+    /// Wall time spent decoding the first emitted codec window into PCM.
+    /// Present only on the first PCM chunk.
+    public let firstDecodeMicros: UInt64?
 
-    public init(samples: [Float], tokenRange: Range<Int>, isFinal: Bool) {
+    public init(
+        samples: [Float],
+        tokenRange: Range<Int>,
+        isFinal: Bool,
+        firstCodeGenerationMicros: UInt64? = nil,
+        preparedPrefixCacheHit: Bool? = nil,
+        firstDecodeMicros: UInt64? = nil
+    ) {
         self.samples = samples
         self.tokenRange = tokenRange
         self.isFinal = isFinal
+        self.firstCodeGenerationMicros = firstCodeGenerationMicros
+        self.preparedPrefixCacheHit = preparedPrefixCacheHit
+        self.firstDecodeMicros = firstDecodeMicros
     }
 }
 
@@ -72,6 +126,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
     private let config: Qwen3TTSConfig
     private let device: Device
     private let pipelineConfig: Qwen3TTSPipelineConfiguration
+    private var personaAdapterController: PersonaAdapterController?
 
     /// Available built-in speaker names (from the model's spk_id map).
     public var availableSpeakers: [String] {
@@ -148,7 +203,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             DeviceSelector.synchronizeIfNeeded(device: device)
             Memory.clearCache()
 
-            model.load(weights: weights)
+            try model.load(weights: weights)
             DeviceSelector.synchronizeIfNeeded(device: device)
             Memory.clearCache()
 
@@ -210,11 +265,16 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             // Load audio encoder for ICL (optional)
             var audioEncoder: Qwen3TTSAudioEncoder? = nil
             do {
-                let encoder = Qwen3TTSAudioEncoder()
-                try encoder.loadWeights(from: speechWeightsURL, configURL: speechConfigURL)
+                let encoder = Qwen3TTSAudioEncoder(
+                    config: audioConfig.encoder_config ?? Qwen3TTSTokenizerEncoderConfig(),
+                    validNumQuantizers: audioConfig.encoder_valid_num_quantizers ?? 16
+                )
+                try encoder.loadWeights(from: speechWeightsURL)
                 audioEncoder = encoder
             } catch {
-                // ICL mode unavailable
+                if modelConfig.tts_model_type == nil || modelConfig.tts_model_type == "base" {
+                    throw Qwen3TTSError.audioEncoderLoadFailed(error.localizedDescription)
+                }
             }
 
             DeviceSelector.synchronizeIfNeeded(device: device)
@@ -328,7 +388,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         referenceAudioCodes: [[Int32]]? = nil,
         temperature: Float? = nil,
         maxTokens: Int? = nil,
-        chunkSize: Int? = nil
+        chunkSize: Int? = nil,
+        preparedPrefixKey: String? = nil,
+        isCancelled: (@Sendable () -> Bool)? = nil
     ) -> AsyncThrowingStream<AudioChunk, Error> {
         _generateStreamImpl(
             text: text,
@@ -339,7 +401,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             referenceAudioCodes: referenceAudioCodes,
             temperature: temperature,
             maxTokens: maxTokens,
-            chunkSize: chunkSize
+            chunkSize: chunkSize,
+            preparedPrefixKey: preparedPrefixKey,
+            isCancelled: isCancelled
         )
     }
 
@@ -409,7 +473,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             referenceAudioCodes: nil,
             temperature: temperature,
             maxTokens: maxTokens,
-            chunkSize: chunkSize
+            chunkSize: chunkSize,
+            preparedPrefixKey: nil
         )
     }
 
@@ -483,7 +548,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             referenceAudioCodes: nil,
             temperature: temperature,
             maxTokens: maxTokens,
-            chunkSize: chunkSize
+            chunkSize: chunkSize,
+            preparedPrefixKey: nil
         )
     }
 
@@ -498,7 +564,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         referenceAudioCodes: [[Int32]]?,
         temperature: Float?,
         maxTokens: Int?,
-        chunkSize: Int?
+        chunkSize: Int?,
+        preparedPrefixKey: String?,
+        isCancelled: (@Sendable () -> Bool)? = nil
     ) -> AsyncThrowingStream<AudioChunk, Error> {
         let temp = temperature ?? pipelineConfig.defaultTemperature
         let tokens = maxTokens ?? pipelineConfig.defaultMaxTokens
@@ -509,10 +577,15 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         let capturedTokenizer = tokenizer
         let capturedDecoder = decoder
         let capturedDevice = device
+        let batchGate = StreamingBatchGate()
 
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    let streamingStarted = DispatchTime.now().uptimeNanoseconds
+                    let preparedPrefixCacheHit = preparedPrefixKey.map {
+                        capturedModel.hasPreparedPrefix(for: $0)
+                    }
                     let speakerEmbed = speakerEmbedding.map { MLXArray($0) }
                     let codeStream = Device.withDefaultDevice(capturedDevice) {
                         capturedModel.generateStream(
@@ -525,36 +598,58 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             tokenizer: capturedTokenizer,
                             temperature: temp,
                             maxTokens: tokens,
-                            chunkSize: chunk
+                            chunkSize: chunk,
+                            adaptiveChunking: true,
+                            preparedPrefixKey: preparedPrefixKey,
+                            isCancelled: isCancelled,
+                            afterYield: { await batchGate.wait() }
                         )
                     }
 
-                    let FIRST_DECODE_CHUNK_SIZE = 5
-                    let DECODE_CHUNK_SIZE = 12
-                    let LEFT_CONTEXT_SIZE = 8
-                    let SAMPLES_PER_FRAME = 1920
+                    // Two-phase decode: establish intelligible audio quickly,
+                    // then use a larger rolling window for stable sustained
+                    // speech. Every boundary retains and crossfades 21 ms;
+                    // concatenating independently decoded tiny windows caused
+                    // the severe metallic/garbled output heard in the app.
+                    let firstDecodeWindow = 32
+                    let steadyDecodeWindow = 80
+                    let firstPhaseFrames = 48
+                    let samplesPerFrame = 1920
+                    let overlapSamples = 512
 
-                    var codeBuffer: [[Int32]] = []
-                    var leftContext: [[Int32]] = []
-                    var isFirstDecode = true
-                    var totalCodesProcessed = 0
-
-                    func decodeBatch(codes: [[Int32]], isFinal: Bool) -> [Float] {
-                        guard !codes.isEmpty else { return [] }
-
-                        var decodeInput: [[Int32]]
-                        if isFirstDecode {
-                            decodeInput = codes
-                            isFirstDecode = false
-                        } else {
-                            decodeInput = leftContext + codes
+                    let referenceFrames: [[Int32]] = {
+                        guard let referenceAudioCodes,
+                              referenceAudioCodes.count == numCodeGroups,
+                              let frameCount = referenceAudioCodes.map({ $0.count }).min(),
+                              frameCount > 0 else { return [] }
+                        return (0..<frameCount).map { frame in
+                            referenceAudioCodes.map { $0[frame] }
                         }
+                    }()
+                    var generatedCodes: [[Int32]] = []
+                    var emittedFrames = 0
+                    var pendingTail: [Float] = []
+                    var firstCodeGenerationMicros: UInt64?
+                    var firstDecodeMicros: UInt64?
+                    var emittedFirstPcmMetrics = false
 
+                    func cleanSamples(_ samples: [Float]) -> [Float] {
+                        samples.map { value in
+                            if value.isNaN || value.isInfinite { return 0 }
+                            return max(-1, min(1, value))
+                        }
+                    }
+
+                    func decodeWindow(end: Int, newFrames: Int, windowSize: Int) -> [Float] {
+                        guard end > 0, newFrames > 0 else { return [] }
+                        let start = max(0, end - windowSize)
+                        var decodeInput = Array(generatedCodes[start..<end])
+                        let referenceSpace = max(0, windowSize - decodeInput.count)
+                        if referenceSpace > 0, !referenceFrames.isEmpty {
+                            decodeInput = Array(referenceFrames.suffix(referenceSpace)) + decodeInput
+                        }
                         let allSamples = Device.withDefaultDevice(capturedDevice) { () -> [Float] in
-                            defer {
-                                DeviceSelector.synchronizeIfNeeded(device: capturedDevice)
-                                Memory.clearCache()
-                            }
+                            defer { DeviceSelector.synchronizeIfNeeded(device: capturedDevice) }
                             let flatCodes: [Int32] = decodeInput.flatMap { $0 }
                             let codesArray = MLXArray(flatCodes).reshaped([1, decodeInput.count, numCodeGroups])
                             let audio = capturedDecoder.mlxDecode(codes: codesArray)
@@ -562,76 +657,175 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             eval(flatAudio)
                             return flatAudio.asArray(Float.self)
                         }
-
-                        let contextSamplesToDrop = leftContext.count * SAMPLES_PER_FRAME
-                        var newSamples: [Float]
-                        if contextSamplesToDrop > 0 && allSamples.count > contextSamplesToDrop {
-                            newSamples = Array(allSamples.dropFirst(contextSamplesToDrop))
-                        } else {
-                            newSamples = allSamples
-                        }
-
-                        leftContext = Array(codes.suffix(LEFT_CONTEXT_SIZE))
-                        return newSamples
+                        let wanted = min(allSamples.count, newFrames * samplesPerFrame)
+                        return wanted > 0 ? cleanSamples(Array(allSamples.suffix(wanted))) : []
                     }
 
-                    func cleanSamples(_ samples: [Float]) -> [Float] {
-                        samples.map { val -> Float in
-                            if val.isNaN || val.isInfinite { return 0.0 }
-                            return max(-1.0, min(1.0, val))
+                    func blendWithPendingTail(_ samples: [Float], final: Bool) -> [Float] {
+                        guard !samples.isEmpty else { return [] }
+                        var joined = samples
+                        let overlap = min(overlapSamples, pendingTail.count, joined.count)
+                        if overlap > 0 {
+                            for index in 0..<overlap {
+                                let position = Double(index) / Double(max(overlap - 1, 1))
+                                let fadeIn = Float(0.5 * (1 - cos(Double.pi * position)))
+                                joined[index] = pendingTail[pendingTail.count - overlap + index]
+                                    * (1 - fadeIn) + joined[index] * fadeIn
+                            }
+                        } else if pendingTail.isEmpty {
+                            let fadeLength = min(overlapSamples, joined.count)
+                            for index in 0..<fadeLength {
+                                let position = Double(index) / Double(max(fadeLength - 1, 1))
+                                joined[index] *= Float(0.5 * (1 - cos(Double.pi * position)))
+                            }
                         }
+                        if final {
+                            let fadeLength = min(overlapSamples, joined.count)
+                            for index in 0..<fadeLength {
+                                let position = Double(index) / Double(max(fadeLength - 1, 1))
+                                joined[joined.count - fadeLength + index]
+                                    *= Float(0.5 * (1 + cos(Double.pi * position)))
+                            }
+                            pendingTail = []
+                            return joined
+                        }
+                        guard joined.count > overlapSamples * 2 else {
+                            pendingTail = joined
+                            return []
+                        }
+                        pendingTail = Array(joined.suffix(overlapSamples))
+                        return Array(joined.dropLast(overlapSamples))
                     }
 
+                    var requestCancelled = false
                     for try await codes in codeStream {
-                        if Task.isCancelled { break }
-                        guard !codes.isEmpty else { continue }
+                        if Task.isCancelled || isCancelled?() == true {
+                            requestCancelled = true
+                            await batchGate.signal()
+                            break
+                        }
+                        if codes.isEmpty {
+                            await batchGate.signal()
+                            continue
+                        }
 
                         let validCodes = codes.filter { frame in
                             guard let firstCode = frame.first else { return false }
                             return firstCode >= 0 && firstCode < 2048
                         }
-                        guard !validCodes.isEmpty else { continue }
+                        if validCodes.isEmpty {
+                            await batchGate.signal()
+                            continue
+                        }
 
-                        codeBuffer.append(contentsOf: validCodes)
+                        generatedCodes.append(contentsOf: validCodes)
+                        if firstCodeGenerationMicros == nil {
+                            firstCodeGenerationMicros =
+                                (DispatchTime.now().uptimeNanoseconds - streamingStarted) / 1_000
+                        }
 
                         while true {
-                            let nextChunkSize = isFirstDecode ? FIRST_DECODE_CHUNK_SIZE : DECODE_CHUNK_SIZE
-                            guard codeBuffer.count >= nextChunkSize else { break }
-                            let batchChunk = Array(codeBuffer.prefix(nextChunkSize))
-                            codeBuffer = Array(codeBuffer.dropFirst(nextChunkSize))
-
-                            let samples = decodeBatch(codes: batchChunk, isFinal: false)
-                            totalCodesProcessed += batchChunk.count
-
-                            guard !samples.isEmpty else { continue }
-                            let tokenRange = (totalCodesProcessed - batchChunk.count)..<totalCodesProcessed
-                            continuation.yield(AudioChunk(samples: cleanSamples(samples), tokenRange: tokenRange, isFinal: false))
+                            if Task.isCancelled || isCancelled?() == true {
+                                requestCancelled = true
+                                break
+                            }
+                            let firstPhase = emittedFrames < firstPhaseFrames
+                            let emitFrames = streamingFramesToNextEmission(
+                                emittedFrames: emittedFrames
+                            )
+                            guard generatedCodes.count - emittedFrames >= emitFrames else { break }
+                            let end = emittedFrames + emitFrames
+                            let window = firstPhase ? firstDecodeWindow : steadyDecodeWindow
+                            let decodeStarted = DispatchTime.now().uptimeNanoseconds
+                            let decoded = decodeWindow(end: end, newFrames: emitFrames, windowSize: window)
+                            if Task.isCancelled || isCancelled?() == true {
+                                requestCancelled = true
+                                break
+                            }
+                            if firstDecodeMicros == nil {
+                                firstDecodeMicros =
+                                    (DispatchTime.now().uptimeNanoseconds - decodeStarted) / 1_000
+                            }
+                            let samples = blendWithPendingTail(decoded, final: false)
+                            let tokenRange = emittedFrames..<end
+                            emittedFrames = end
+                            if !samples.isEmpty {
+                                continuation.yield(AudioChunk(
+                                    samples: samples,
+                                    tokenRange: tokenRange,
+                                    isFinal: false,
+                                    firstCodeGenerationMicros: emittedFirstPcmMetrics
+                                        ? nil : firstCodeGenerationMicros,
+                                    preparedPrefixCacheHit: emittedFirstPcmMetrics
+                                        ? nil : preparedPrefixCacheHit,
+                                    firstDecodeMicros: emittedFirstPcmMetrics
+                                        ? nil : firstDecodeMicros
+                                ))
+                                emittedFirstPcmMetrics = true
+                            }
                         }
+                        await batchGate.signal()
+                        if requestCancelled { break }
                     }
 
-                    // Flush remaining codes
-                    if !codeBuffer.isEmpty {
-                        let samples = decodeBatch(codes: codeBuffer, isFinal: true)
-                        totalCodesProcessed += codeBuffer.count
-                        if !samples.isEmpty {
-                            let tokenRange = (totalCodesProcessed - codeBuffer.count)..<totalCodesProcessed
-                            continuation.yield(AudioChunk(samples: cleanSamples(samples), tokenRange: tokenRange, isFinal: true))
-                        }
+                    if requestCancelled || Task.isCancelled || isCancelled?() == true {
+                        capturedModel.clearGenerationCache()
+                        continuation.finish()
+                        return
                     }
 
-                    continuation.yield(AudioChunk(samples: [], tokenRange: totalCodesProcessed..<totalCodesProcessed, isFinal: true))
+                    let remaining = generatedCodes.count - emittedFrames
+                    var finalSamples: [Float]
+                    if remaining > 0 {
+                        let decodeStarted = DispatchTime.now().uptimeNanoseconds
+                        let decoded = decodeWindow(
+                            end: generatedCodes.count,
+                            newFrames: remaining,
+                            windowSize: steadyDecodeWindow
+                        )
+                        if firstDecodeMicros == nil {
+                            firstDecodeMicros =
+                                (DispatchTime.now().uptimeNanoseconds - decodeStarted) / 1_000
+                        }
+                        finalSamples = blendWithPendingTail(decoded, final: true)
+                    } else {
+                        finalSamples = pendingTail
+                        pendingTail = []
+                        let fadeLength = min(overlapSamples, finalSamples.count)
+                        for index in 0..<fadeLength {
+                            let position = Double(index) / Double(max(fadeLength - 1, 1))
+                            finalSamples[finalSamples.count - fadeLength + index]
+                                *= Float(0.5 * (1 + cos(Double.pi * position)))
+                        }
+                    }
+                    if !finalSamples.isEmpty {
+                        continuation.yield(AudioChunk(
+                            samples: finalSamples,
+                            tokenRange: emittedFrames..<generatedCodes.count,
+                            isFinal: true,
+                            firstCodeGenerationMicros: emittedFirstPcmMetrics
+                                ? nil : firstCodeGenerationMicros,
+                            preparedPrefixCacheHit: emittedFirstPcmMetrics
+                                ? nil : preparedPrefixCacheHit,
+                            firstDecodeMicros: emittedFirstPcmMetrics ? nil : firstDecodeMicros
+                        ))
+                        emittedFirstPcmMetrics = true
+                    }
+
+                    continuation.yield(AudioChunk(
+                        samples: [],
+                        tokenRange: generatedCodes.count..<generatedCodes.count,
+                        isFinal: true,
+                        firstCodeGenerationMicros: nil,
+                        preparedPrefixCacheHit: nil,
+                        firstDecodeMicros: nil
+                    ))
 
                     capturedModel.clearGenerationCache()
-                    capturedDecoder.clearCompiledCache()
-                    Stream.defaultStream(.gpu).synchronize()
-                    Memory.clearCache()
 
                     continuation.finish()
                 } catch {
                     capturedModel.clearGenerationCache()
-                    capturedDecoder.clearCompiledCache()
-                    Stream.defaultStream(.gpu).synchronize()
-                    Memory.clearCache()
                     continuation.finish(throwing: error)
                 }
             }
@@ -965,9 +1159,32 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
     /// Call this between generations if memory accumulates.
     public func clearCache() {
         model.clearGenerationCache()
+        model.clearPreparedPrefixCache()
         decoder.clearCompiledCache()
         DeviceSelector.synchronizeIfNeeded(device: device)
         Memory.clearCache()
+    }
+
+    /// Install a validated resident adapter bank. This mutates the projection
+    /// graph once; call after model construction and before any generation.
+    public func installPersonaAdapters(_ bank: PersonaAdapterBank) throws {
+        guard personaAdapterController == nil else {
+            throw PersonaAdapterError.invalidManifest("persona adapters are already installed")
+        }
+        personaAdapterController = try PersonaAdapterController(model: model, bank: bank)
+        clearCache()
+    }
+
+    /// Switch adapters only between generations. The resident helper enforces
+    /// that boundary by consuming one complete request at a time.
+    public func selectPersonaAdapter(_ personaID: String?) throws -> [Float]? {
+        guard let controller = personaAdapterController else {
+            if personaID == nil { return nil }
+            throw PersonaAdapterError.personaNotLoaded(personaID!)
+        }
+        let embedding = try controller.activate(personaID)
+        clearCache()
+        return embedding?.asArray(Float.self)
     }
 
     // MARK: - Private
@@ -1000,6 +1217,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
 public enum Qwen3TTSError: LocalizedError {
     case fileNotFound(String)
     case decoderLoadFailed
+    case audioEncoderLoadFailed(String)
     case modelNotLoaded
 
     public var errorDescription: String? {
@@ -1008,6 +1226,8 @@ public enum Qwen3TTSError: LocalizedError {
             return "Required file not found: \(file)"
         case .decoderLoadFailed:
             return "Failed to load MLX audio decoder"
+        case .audioEncoderLoadFailed(let detail):
+            return "Failed to load MLX audio encoder: \(detail)"
         case .modelNotLoaded:
             return "Model is not loaded"
         }

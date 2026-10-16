@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
@@ -19,6 +19,31 @@ const FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 8 * GIB;
 const MEMORY_BUDGET_MODE_KEY: &str = "nativeMemoryBudgetMode";
 const COMPILED_DEFAULT_MODEL_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MODEL_PATH");
 const COMPILED_DEFAULT_MMPROJ_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MMPROJ_PATH");
+
+/// Process-resident settings snapshot. Opening the encrypted SQLite store,
+/// resolving the installation key, and validating its schema cost over 100 ms
+/// on the measured call path. Settings mutations are process-owned and publish
+/// their committed value here, so microphone turns read one immutable clone
+/// without touching Keychain or SQLite.
+static RESOLVED_SETTINGS: OnceLock<RwLock<BTreeMap<PathBuf, Settings>>> = OnceLock::new();
+
+fn resolved_settings_cache() -> &'static RwLock<BTreeMap<PathBuf, Settings>> {
+    RESOLVED_SETTINGS.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+pub(crate) fn publish_resolved_settings(settings: &Settings) {
+    resolved_settings_cache()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(settings.data_dir.clone(), settings.clone());
+}
+
+fn invalidate_resolved_settings(data_dir: &PathBuf) {
+    resolved_settings_cache()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir);
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +72,20 @@ pub struct GenerationDefaults {
     pub max_tokens: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifiedArtifactDigest {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub file_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifiedModelArtifacts {
+    pub model: VerifiedArtifactDigest,
+    #[serde(default)]
+    pub projector: Option<VerifiedArtifactDigest>,
+}
+
 impl Default for GenerationDefaults {
     fn default() -> Self {
         Self {
@@ -62,6 +101,8 @@ pub struct Settings {
     pub model_path: Option<PathBuf>,
     #[serde(default)]
     pub mmproj_path: Option<PathBuf>,
+    #[serde(default)]
+    pub verified_model_artifacts: Option<VerifiedModelArtifacts>,
     pub data_dir: PathBuf,
     pub default_temperature: f32,
     pub default_top_p: f32,
@@ -96,6 +137,7 @@ impl Settings {
         Self {
             model_path: None,
             mmproj_path: None,
+            verified_model_artifacts: None,
             data_dir,
             default_temperature: defaults.temperature,
             default_top_p: defaults.top_p,
@@ -231,6 +273,7 @@ pub const NATIVE_SETTING_EXTENSION_KEYS: &[&str] = &[
 ];
 
 const CUSTOM_JSON_SAMPLING_KEYS: &[&str] = &[
+    "seed",
     "temperature",
     "dynatemp_range",
     "dynatemp_exponent",
@@ -452,10 +495,24 @@ pub fn upstream_setting_string(settings: &Settings, key: &str) -> Option<String>
 }
 
 pub fn resolve_settings() -> Result<Settings> {
+    resolve_settings_with_cache_status().map(|(settings, _)| settings)
+}
+
+pub(crate) fn resolve_settings_with_cache_status() -> Result<(Settings, bool)> {
     let data_dir = resolve_data_dir();
+    if let Some(settings) = resolved_settings_cache()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&data_dir)
+        .cloned()
+    {
+        return Ok((settings, true));
+    }
     let store = RuntimeStore::open(&data_dir)?;
     let settings = store.get::<Settings>(SETTINGS_NAMESPACE)?;
-    settings_from_document(data_dir, settings).map_err(anyhow::Error::new)
+    let settings = settings_from_document(data_dir, settings).map_err(anyhow::Error::new)?;
+    publish_resolved_settings(&settings);
+    Ok((settings, false))
 }
 
 pub(crate) fn settings_from_document(
@@ -623,7 +680,26 @@ pub fn save_settings(settings: &Settings) -> Result<PathBuf> {
     fs::create_dir_all(&settings.data_dir)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.put(SETTINGS_NAMESPACE, settings)?;
+    // Callers may intentionally persist an older or partially projected
+    // document before passing it back through settings normalization. Never
+    // publish unnormalized input; the committing command publishes its final
+    // canonical value below.
+    invalidate_resolved_settings(&settings.data_dir);
     Ok(store.path().to_path_buf())
+}
+
+pub(crate) fn persist_verified_model_artifacts(
+    settings: &Settings,
+    verified: VerifiedModelArtifacts,
+) -> Result<()> {
+    if settings.verified_model_artifacts.as_ref() == Some(&verified) {
+        return Ok(());
+    }
+    let mut updated = settings.clone();
+    updated.verified_model_artifacts = Some(verified);
+    save_settings(&updated)?;
+    publish_resolved_settings(&updated);
+    Ok(())
 }
 
 pub fn settings_get() -> Result<CommandResult<Settings>> {
@@ -676,6 +752,7 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
         .is_some_and(|values| values.contains_key("nativeMemoryBudgetMiB"));
     if let Some(model_path) = update.model_path {
         settings.model_path = normalize_optional_path(model_path);
+        settings.verified_model_artifacts = None;
         if !projector_path_explicit {
             settings.mmproj_path = None;
             settings
@@ -685,6 +762,7 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     }
     if let Some(mmproj_path) = update.mmproj_path {
         settings.mmproj_path = normalize_optional_path(mmproj_path);
+        settings.verified_model_artifacts = None;
         settings.upstream_settings.insert(
             "mmprojPath".to_string(),
             json!(
@@ -794,6 +872,7 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     reconcile_resident_memory_budget_for_runtime(&mut settings);
     crate::memory_policy::reconcile_context(&mut settings);
     let path = save_settings(&settings)?;
+    publish_resolved_settings(&settings);
     Ok(CommandResult::passed(
         "mom_llama.settings_update",
         "contracted",
@@ -951,6 +1030,7 @@ pub fn settings_reset() -> Result<CommandResult<Settings>> {
     let current = resolve_settings()?;
     let settings = Settings::defaults_for_data_dir(current.data_dir.clone());
     let path = save_settings(&settings)?;
+    publish_resolved_settings(&settings);
     Ok(CommandResult::passed(
         "mom_llama.settings_reset",
         "contracted",
@@ -1383,7 +1463,7 @@ mod tests {
         let mut settings = Settings::defaults_for_data_dir(std::env::temp_dir());
         settings.upstream_settings.insert(
             "customJson".to_string(),
-            json!(r#"{"temperature":0.25,"top_k":7,"max_tokens":33}"#),
+            json!(r#"{"seed":17,"temperature":0.25,"top_k":7,"max_tokens":33}"#),
         );
         assert!(
             validate_settings_update(&BTreeMap::from([(
@@ -1393,6 +1473,7 @@ mod tests {
             .is_none()
         );
         let sampling = settings.sampling_config().expect("valid sampling");
+        assert_eq!(sampling.seed, 17);
         assert_eq!(sampling.temperature, 0.25);
         assert_eq!(sampling.top_k, 7);
         assert_eq!(sampling.max_tokens, 33);

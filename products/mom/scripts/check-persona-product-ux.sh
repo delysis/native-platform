@@ -42,7 +42,7 @@ cargo run -q -p mom-llama-cli -- persona instantiate \
   --persona persona-judith_herman --json > "$acceptance_dir/started.json"
 jq -e '
   .status != "blocked"
-  and .result.title == "Chat with Judith Herman"
+  and .result.title == "Judith Herman"
   and .result.kind == "chat"
   and .result.source_conversation_id == "persona-judith_herman"
 ' "$acceptance_dir/started.json" >/dev/null

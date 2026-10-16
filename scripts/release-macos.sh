@@ -313,11 +313,21 @@ if [ -n "$EMBEDDED_MODEL" ]; then
   exit 1
 fi
 
+MOM_ENTITLEMENTS="$ROOT/products/mom/apps/mom-llama/src-tauri/MomLlama.entitlements"
 if [ "$SIGNING_IDENTITY" = "-" ]; then
-  run codesign --force --deep --sign - "$BUNDLE"
+  if [ "$COMPONENT" = mom ]; then
+    run codesign --force --deep --entitlements "$MOM_ENTITLEMENTS" --sign - "$BUNDLE"
+  else
+    run codesign --force --deep --sign - "$BUNDLE"
+  fi
   SIGNING_MODE=ad-hoc
 else
-  run codesign --force --deep --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$BUNDLE"
+  if [ "$COMPONENT" = mom ]; then
+    run codesign --force --deep --options runtime --timestamp \
+      --entitlements "$MOM_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$BUNDLE"
+  else
+    run codesign --force --deep --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$BUNDLE"
+  fi
   if [ "$RELEASE_KIND" = stable ]; then
     SIGNING_MODE=developer-id
   elif [ "$RELEASE_KIND" = human-test ]; then

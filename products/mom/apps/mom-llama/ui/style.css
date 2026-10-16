@@ -230,7 +230,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   gap: 6px;
   overflow: hidden;
   background: var(--sidebar);
-  border-right: 1px solid #1d1d1d;
+  border-right: 0;
   transform: none;
 }
 
@@ -689,14 +689,55 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   padding: 7px 10px;
   border: 0;
   border-radius: 22px;
-  background: var(--accent);
+  background: var(--message-blue);
 }
 .message-row.voice-reply-row .message-card {
   display: flex;
   align-items: center;
   gap: 10px;
-  background: var(--surface-raised);
+  background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
 }
+.message-row.voice-reply-row.voice-reply-has-audio {
+  grid-template-columns: 38px minmax(180px, 360px);
+  align-items: center;
+}
+.message-row.voice-reply-row.voice-reply-has-audio > .message-speaker-avatar {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+}
+.message-row.voice-reply-row.voice-reply-has-audio > .message-card {
+  grid-column: 2;
+  grid-row: 1;
+  width: min(360px, 100%);
+}
+.message-row.voice-reply-row.voice-reply-pending .message-card {
+  min-width: 58px;
+  min-height: 36px;
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 10%, transparent);
+}
+.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio) {
+  grid-template-columns: minmax(0, 1fr);
+}
+.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio)
+  > .message-speaker-avatar { display: none; }
+.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio)
+  > .message-card { grid-column: 1; }
+.message-row.voice-reply-row.voice-reply-pending .typing-indicator > span {
+  background: currentColor;
+}
+.message-row.voice-reply-row.voice-reply-pending
+  .message-card:not(:has(> .typing-indicator)):not(:has(> .voice-message-player))::after {
+  content: "•••";
+  display: inline-block;
+  min-width: 34px;
+  color: var(--muted);
+  letter-spacing: 3px;
+  animation: typing-pulse 1.2s ease-in-out infinite;
+}
+.message-row.voice-reply-row .message-card > :not(.voice-message-player):not(.typing-indicator) { display: none; }
+.message-row.voice-reply-row > .message-actions { display: none; }
 .message-row.voice-message-row .message-attachments { width: 100%; margin: 0; }
 .message-row.voice-message-row > .message-actions { display: none; }
 .attachment-preview.voice-message-bubble {
@@ -727,17 +768,99 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   place-items: center;
   border: 0;
   border-radius: 50%;
-  color: var(--accent);
-  background: color-mix(in srgb, white 92%, transparent);
+  color: var(--message-blue);
+  background: #fff;
+  box-shadow: none;
+  transform: none;
+  appearance: none;
+  -webkit-appearance: none;
+  opacity: 1;
   font: 600 15px/1 var(--sans);
+  filter: none;
+  -webkit-tap-highlight-color: transparent;
 }
+.voice-message-play:hover,
+.voice-message-play:focus,
+.voice-message-play[data-audio-state="ready"] {
+  color: var(--message-blue);
+  background: #fff;
+  box-shadow: none;
+  transform: none;
+}
+.voice-message-play:active:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+.voice-message-play[data-audio-state="ready"]::before,
+.voice-message-play[data-audio-state="playing"]::before,
+.voice-message-play[data-audio-state="failed"]::before {
+  display: block;
+  color: currentColor;
+  -webkit-text-fill-color: currentColor;
+  line-height: 1;
+}
+.voice-message-play[data-audio-state="ready"]::before {
+  content: "";
+  width: 11px;
+  height: 13px;
+  margin-left: 2px;
+  background: currentColor;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+}
+.voice-message-play[data-audio-state="ready"]:not(:disabled) {
+  opacity: 1;
+  filter: none;
+}
+.voice-message-play[data-audio-state="playing"]::before { content: "Ⅱ"; font-size: 14px; }
+.voice-message-play[data-audio-state="failed"]::before { content: "×"; font-size: 18px; }
+.voice-message-play[data-audio-state="pending"],
+.voice-message-play[data-audio-state="pending"]:disabled {
+  color: var(--message-blue);
+  background: #fff;
+  opacity: 1;
+  filter: none;
+}
+.voice-message-play[data-audio-state="pending"]::before {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border: 2px solid color-mix(in srgb, currentColor 24%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: voice-reply-spin .7s linear infinite;
+}
+.voice-message-play[data-audio-state="failed"] { opacity: .52; }
 .message-row.voice-reply-row .voice-reply-play {
   color: var(--text);
   background: color-mix(in srgb, var(--surface) 84%, transparent);
 }
 .voice-reply-play .icon { display: none; }
-.voice-reply-play::before { content: "▶"; font-size: 15px; line-height: 1; }
-.voice-reply-play[aria-pressed="true"]::before { content: "Ⅱ"; }
+.voice-reply-play.is-awaiting-audio { display: grid; }
+.voice-reply-play[data-audio-state="playing"]::before { content: "Ⅱ"; }
+.voice-reply-play.is-loading::before,
+.voice-message-play.is-loading::before {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border: 2px solid color-mix(in srgb, currentColor 24%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: voice-reply-spin .7s linear infinite;
+}
+body .message-row.voice-message-row .voice-message-play {
+  color: var(--message-blue);
+  -webkit-text-fill-color: currentColor;
+  background: #fff;
+  box-shadow: none;
+}
+body .message-row.voice-message-row .voice-message-play[data-audio-state="ready"]::before {
+  background: var(--message-blue);
+}
+body .message-row.voice-message-row .voice-message-play[data-audio-state="playing"]::before {
+  color: var(--message-blue);
+  -webkit-text-fill-color: var(--message-blue);
+}
+@keyframes voice-reply-spin { to { transform: rotate(360deg); } }
 .voice-waveform {
   display: flex;
   min-width: 0;
@@ -750,6 +873,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 }
 .voice-waveform i {
   display: block;
+  flex: 0 0 3px;
   width: 3px;
   border-radius: 999px;
   background: currentColor;
@@ -825,12 +949,8 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   font: 10px/1.45 var(--mono);
 }
 .speech-playback {
-  display: grid;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
+  display: none;
 }
-.speech-playback audio { width: 100%; }
 .tool-turn-stats { color: var(--faint); font-size: 12px; margin: 8px 0 0; }
 .build-version {
   position: fixed;
@@ -1032,12 +1152,16 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   animation: voice-listening-breathe 1.8s ease-in-out infinite;
 }
 .voice-listening-core {
+  display: grid;
   width: 46px;
   height: 46px;
+  place-items: center;
   border-radius: 50%;
+  color: rgba(18, 36, 50, .82);
   background: radial-gradient(circle at 40% 34%, #fff 0 8%, #b8d3eb 38%, #3d566b 78%, #17212a 100%);
   box-shadow: inset 0 1px 5px rgba(255, 255, 255, .72), 0 2px 10px rgba(7, 22, 34, .22);
 }
+.voice-listening-core .icon { width: 20px; height: 20px; stroke-width: 2.4; }
 @keyframes voice-listening-breathe {
   50% { transform: scale(1.055); box-shadow: 0 14px 34px rgba(49, 115, 168, .28), inset 0 1px 1px rgba(255, 255, 255, .84); }
 }
@@ -1479,10 +1603,10 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 .chrome .icon-button { border-radius: 50%; }
 
 .recipients-header { position: relative; flex: 0 0 auto; width: min(100%, var(--content-width)); padding: 8px 0; border-bottom: 1px solid var(--border); margin-bottom: 8px; font-size: 13px; }
-.recipient-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 32px; }
-.recipient-line label { color: var(--muted); }
-.recipient-chip { display: inline-flex; align-items: center; gap: 5px; border-radius: 16px; background: var(--surface); padding: 3px 6px; max-width: 100%; }
-.recipient-chip > span:not(.contact-avatar) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recipient-line { display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; min-width: 0; min-height: 32px; overflow: hidden; }
+.recipient-line label { flex: 0 0 auto; color: var(--muted); }
+.recipient-chip { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; overflow: hidden; border-radius: 16px; background: var(--surface); padding: 3px 6px; }
+.recipient-chip > span:not(.contact-avatar) { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recipient-chip .contact-avatar { width: 24px; height: 24px; flex-basis: 24px; }
 .recipient-chip .icon-button { width: 24px; height: 24px; }
 .recipient-chip .icon { width: 12px; height: 12px; }
@@ -1492,7 +1616,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 .recipient-option { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 13px; }
 .recipient-option:hover, .recipient-option:focus, .recipient-option[aria-selected="true"] { background: var(--surface-active); }
 
-.chrome .icon-button, .composer .round-button, .composer .send-button { background: linear-gradient(#ffffff10, #ffffff05); border: 1px solid #ffffff18; border-radius: 50%; }
+.composer .round-button, .composer .send-button { background: linear-gradient(#ffffff10, #ffffff05); border: 1px solid #ffffff18; border-radius: 50%; }
 
 .conversation-copy { min-width: 0; flex: 1; display: grid; gap: 3px; }
 .conversation-copy small { display: block; font-size: 12px; color: var(--muted); text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
@@ -1509,6 +1633,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 .llama-ui-shell {
   --message-blue: #0a84ff;
   --message-blue-deep: #0877e6;
+  --chat-pane: #202020;
   --glass-fill: color-mix(in srgb, var(--surface-raised) 72%, transparent);
   --glass-edge: color-mix(in srgb, var(--text) 16%, transparent);
   --glass-glyph: color-mix(in srgb, var(--text) 94%, transparent);
@@ -1520,6 +1645,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 
 .llama-ui-shell[data-theme="light"] {
   --bg: #fbfbfc;
+  --chat-pane: #fff;
   --sidebar: rgba(238, 238, 241, .82);
   --surface: rgba(225, 225, 230, .72);
   --surface-raised: rgba(255, 255, 255, .82);
@@ -1536,6 +1662,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 @media (prefers-color-scheme: light) {
   .llama-ui-shell[data-theme="system"] {
     --bg: #fbfbfc;
+    --chat-pane: #fff;
     --sidebar: rgba(238, 238, 241, .82);
     --surface: rgba(225, 225, 230, .72);
     --surface-raised: rgba(255, 255, 255, .82);
@@ -1558,20 +1685,21 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 }
 
 .llama-ui-shell .chrome {
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-bottom: 0;
   background: linear-gradient(to right,
-    color-mix(in srgb, var(--sidebar) 92%, transparent) 0 var(--sidebar-width),
-    color-mix(in srgb, var(--bg) 88%, transparent) var(--sidebar-width) 100%);
+    var(--sidebar) 0 var(--sidebar-width),
+    var(--chat-pane) var(--sidebar-width) 100%);
 }
 
 .llama-ui-shell .sidebar {
   padding: 10px 10px 12px;
   gap: 10px;
-  background: color-mix(in srgb, var(--sidebar) 91%, transparent);
-  border-right-color: var(--border);
+  background: var(--sidebar);
+  border-right: 0;
 }
 
-.chrome .icon-button,
+.llama-ui-shell .chat-main { background: var(--chat-pane); }
+
 .composer .round-button,
 .composer .send-button {
   color: var(--glass-glyph);
@@ -1586,7 +1714,6 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   backdrop-filter: blur(24px) saturate(1.65) brightness(1.06);
 }
 
-.chrome .icon-button:hover,
 .composer .round-button:hover,
 .composer .send-button:hover:not(:disabled) {
   background:
@@ -1596,7 +1723,6 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   transform: translateY(-1px);
 }
 
-.chrome .icon-button:active,
 .composer .round-button:active,
 .composer .send-button:active:not(:disabled) {
   transform: scale(.96);
@@ -1605,6 +1731,20 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
     inset 0 1px 3px rgba(34, 64, 88, .13),
     inset 0 1px 0 rgba(255, 255, 255, .66);
 }
+
+/* Messages-style toolbar items sit directly in the shared titlebar material.
+   A second raised glass disc made the phone control read like Siri's hardware
+   flashlight affordance and introduced a third surface tone. */
+.chrome .icon-button {
+  color: var(--glass-glyph);
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.chrome .icon-button:hover { background: color-mix(in srgb, var(--surface) 72%, transparent); transform: none; }
+.chrome .icon-button:active { background: var(--surface-active); transform: scale(.96); box-shadow: none; }
 
 .composer .send-button:disabled {
   color: color-mix(in srgb, var(--muted) 76%, transparent);
@@ -1668,24 +1808,30 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   display: flex;
   align-items: center;
   border: 0;
+  min-width: 0;
+  overflow: hidden;
   pointer-events: none;
 }
-.recipients-header .recipient-line { width: 100%; justify-content: center; pointer-events: auto; }
+.recipients-header .recipient-line { width: 100%; min-width: 0; justify-content: center; pointer-events: auto; }
 .recipients-header[data-unsent="false"] .recipient-chip {
-  flex-direction: row;
-  gap: 7px;
-  padding: 3px 10px 3px 4px;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 10px 2px;
   border: 0;
-  background: color-mix(in srgb, var(--surface) 56%, transparent);
-  font-size: 13px;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.1;
   font-weight: 620;
 }
 .recipients-header[data-unsent="false"] .recipient-chip .contact-avatar {
-  flex-basis: 28px;
-  width: 28px;
-  height: 28px;
+  flex-basis: 32px;
+  width: 32px;
+  height: 32px;
 }
 .recipients-header[data-unsent="true"] .recipient-chip {
+  flex: 0 1 auto;
+  max-width: calc(100% - 34px);
   border: 1px solid var(--glass-edge);
   background: var(--glass-fill);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12);
@@ -1773,7 +1919,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   max-height: calc(100dvh - 24px);
   padding: 14px;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: 1fr auto;
   color: var(--text);
   border: 1px solid var(--glass-edge);
   border-radius: 30px;
@@ -1784,8 +1930,6 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   -webkit-backdrop-filter: blur(34px) saturate(1.35);
   backdrop-filter: blur(34px) saturate(1.35);
 }
-.voice-call-titlebar { display: flex; justify-content: flex-end; }
-.voice-call-titlebar .icon-button { border-radius: 50%; }
 .voice-call-contact { align-self: center; display: grid; justify-items: center; gap: 9px; }
 .voice-call-contact h2 { margin: 0; font-size: 13px; font-weight: 500; color: var(--muted); }
 .voice-call-contact strong { font-size: 24px; }
@@ -1832,4 +1976,19 @@ body .message-row.call-turn + .message-row.assistant { display: none; }
 body .message-row.voice-message-row .message-card,
 body .message-row.voice-reply-row .message-card { width: min(360px, 78%); padding: 7px 10px; }
 body .message-row.voice-message-row .message-card { background: var(--message-blue); }
-body .message-row.voice-reply-row .message-card { background: var(--surface-raised); }
+body .message-row.voice-reply-row .message-card {
+  background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
+}
+/* The retained player is the durable identity of an incoming voice note.
+   Paint that element as the bubble instead of relying on transient live-row
+   classes that can be replaced when the persisted message projection lands. */
+body .message-row.assistant .message-card:has(> .voice-message-player) {
+  padding: 0;
+  background: transparent;
+}
+body .message-row.assistant .message-card > .voice-message-player {
+  min-height: 48px;
+  padding: 7px 10px;
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
+}

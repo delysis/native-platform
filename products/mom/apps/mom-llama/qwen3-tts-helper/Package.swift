@@ -17,6 +17,7 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift")
             ]
         ),
-        .executableTarget(name: "Qwen3TTSHelper", dependencies: ["Qwen3TTS"])
+        .executableTarget(name: "Qwen3TTSHelper", dependencies: ["Qwen3TTS"]),
+        .testTarget(name: "Qwen3TTSTests", dependencies: ["Qwen3TTS"])
     ]
 )

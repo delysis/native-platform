@@ -1008,7 +1008,7 @@ mod tests {
         let model_path = directory.path.join("model.gguf");
         std::fs::write(&model_path, b"immutable model bytes").expect("write model artifact");
         let model_guard =
-            ModelArtifactGuard::open(&model_path, "model", None).expect("open guarded model");
+            ModelArtifactGuard::open(&model_path, "model", None, None).expect("open guarded model");
         let resident = resident_fingerprint(&model_guard.expected_sha256);
         let execution = execution_fingerprint(&resident);
         let request = request();

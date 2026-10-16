@@ -1,0 +1,137 @@
+{
+  "schema": "mom.ane_tts_candidates.v1",
+  "recorded_at": "2026-10-15",
+  "host": {
+    "model": "MacBook Pro Mac16,6",
+    "soc": "Apple M4 Max",
+    "cpu_cores": 16,
+    "memory_bytes": 137438953472,
+    "macos": "27.0.1 (26A434)"
+  },
+  "sources": {
+    "espresso": {
+      "url": "https://github.com/christopherkarani/Espresso",
+      "revision": "05ea6a3da91be642abd3d4741c0341a941ce1064",
+      "license": "MIT"
+    },
+    "ane_tts": {
+      "url": "https://github.com/yinkev/ane-tts",
+      "revision": "839902259fd6568dd68fb209792da290dbbc1bf3",
+      "license": "MIT"
+    },
+    "audio8_coreai": {
+      "url": "https://huggingface.co/coreai-community/Audio8-TTS-Preview-0.6b-CoreAI",
+      "revision": "91a97eb275335bf44f3eec74637af09363a75705",
+      "license": "Apache-2.0",
+      "runtime_revision": "172127871ad2b595642664a9febb9b6eb97fb9d8"
+    }
+  },
+  "espresso_hardware_probe": {
+    "command": "swift run espresso-bench --ane-only --inference --layers 6",
+    "configuration": {
+      "dimension": 768,
+      "hidden_dimension": 2048,
+      "sequence_length": 256,
+      "heads": 12,
+      "layers": 6,
+      "kernels": 30
+    },
+    "result": "failed",
+    "compile_attempts": 5,
+    "error": "com.apple.appleneuralengine Code=10: verifyBundleAtPath: invalid model",
+    "measurement_valid": false
+  },
+  "audio8_gpu_probe": {
+    "text": "The meeting has been moved to Thursday afternoon.",
+    "chunk_frames": 32,
+    "sample_rate_hz": 44100,
+    "frames": 52,
+    "audio_seconds": 2.414875283446712,
+    "cold_specialization": {
+      "load_seconds": 6.084177375,
+      "first_audio_seconds": 5.511264041,
+      "wall_seconds": 6.379879625,
+      "rtf": 2.6419085361
+    },
+    "warm_runs": [
+      {
+        "load_seconds": 0.755322208,
+        "first_audio_seconds": 1.514117084,
+        "wall_seconds": 2.367926417,
+        "rtf": 0.9805584716,
+        "prefill_seconds": 0.072093875,
+        "frame_seconds": 1.723707086,
+        "codec_seconds": 0.366715668
+      },
+      {
+        "load_seconds": 0.739669834,
+        "first_audio_seconds": 1.518564417,
+        "wall_seconds": 2.377630584,
+        "rtf": 0.9845769677,
+        "prefill_seconds": 0.070974209,
+        "frame_seconds": 1.73860996,
+        "codec_seconds": 0.36218275
+      },
+      {
+        "load_seconds": 0.818629833,
+        "first_audio_seconds": 1.527414791,
+        "wall_seconds": 2.540378166,
+        "rtf": 1.0519707512,
+        "prefill_seconds": 0.070812958,
+        "frame_seconds": 1.844844296,
+        "codec_seconds": 0.416752791
+      }
+    ],
+    "warm_median": {
+      "load_seconds": 0.755322208,
+      "first_audio_seconds": 1.518564417,
+      "rtf": 0.9845769677,
+      "prefill_seconds": 0.070974209,
+      "frame_seconds": 1.73860996,
+      "codec_seconds": 0.366715668
+    }
+  },
+  "audio8_ane_preference_probe": {
+    "result": "fallback",
+    "load_seconds": 43.583432083,
+    "first_audio_seconds": 1.373716166,
+    "rtf": 0.9085479718,
+    "diagnostic": "ANE validation warnings followed by explicit ANECCompile() FAILED; Core AI preference retained CPU/GPU fallback",
+    "measurement_valid_as_ane": false
+  },
+  "comparison": {
+    "resident_qwen_mlx": {
+      "source_receipt": "2026-10-15-qwen-tts-first-segment-sweep.json",
+      "first_audio_p50_ms_range": [126.584166, 127.777958],
+      "worst_measured_rtf": 0.689815802,
+      "streams_pcm": true,
+      "voice_clone": true,
+      "product_integrated": true
+    },
+    "chatterbox_nano_cpu": {
+      "source_receipt": "2026-10-15-chatterbox-nano-cpu.json",
+      "first_audio_p50_ms_range": [498.778, 1387.88],
+      "rtf_median_range": [0.2155, 0.3862],
+      "streams_pcm": false,
+      "voice_clone": true,
+      "model_load_seconds": 92.756994,
+      "reference_condition_seconds": 6.830498
+    },
+    "audio8_coreai_gpu": {
+      "first_audio_p50_ms": 1518.564417,
+      "rtf_p50": 0.9845769677,
+      "streams_pcm": true,
+      "chunk_audio_seconds": 1.4860770975,
+      "voice_clone": true,
+      "voice_clone_locally_validated": false,
+      "model_and_decoder_bytes": 1157361531,
+      "voice_encoder_additional_bytes": 416030404,
+      "runtime_maturity": "unmerged CoreAIKit PR and preview checkpoint"
+    }
+  },
+  "recommendation": {
+    "immediate": "Keep resident Qwen as the product voice path; investigate CPU Chatterbox Nano streaming as the simplest way to remove Metal contention.",
+    "alternate": "Retain Audio8 CoreAI GPU as a bounded alternate model, but its measured first audio and RTF do not beat resident Qwen.",
+    "ane": "First restore Espresso's own fallback-disabled hardware fixture on macOS 27, then port one Audio8 or Qwen transformer frame and prove parity and placement before product integration."
+  }
+}

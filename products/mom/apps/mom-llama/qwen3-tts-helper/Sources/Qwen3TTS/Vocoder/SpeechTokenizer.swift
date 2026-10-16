@@ -492,7 +492,7 @@ nonisolated public class DecoderTransformer: Module {
 nonisolated public class EuclideanCodebook: Module {
     let dim: Int
     let codebookSize: Int
-    let embed: Embedding
+    @ModuleInfo var embed: Embedding
 
     public init(dim: Int, codebookSize: Int) {
         self.dim = dim
@@ -513,7 +513,7 @@ nonisolated public class EuclideanCodebook: Module {
         // L2 distance: ||x - e||^2 = ||x||^2 - 2*x·e + ||e||^2
         let xSq = sum(x * x, axis: -1, keepDims: true)               // [B, T, 1]
         let eSq = sum(embedWeight * embedWeight, axis: -1, keepDims: false)  // [codebookSize]
-        let dot = matmul(x, embedWeight.transposed(0, 1))             // [B, T, codebookSize]
+        let dot = matmul(x, embedWeight.T)                            // [B, T, codebookSize]
         let dist = xSq - 2 * dot + eSq  // broadcast eSq to [B, T, codebookSize]
         return argMin(dist, axis: -1).asType(.int32)                  // [B, T]
     }

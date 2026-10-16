@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "macos", test))]
 mod installation_key;
 #[cfg(target_os = "macos")]
-use installation_key::load_or_create_macos_key;
+use installation_key::{KeychainInteraction, load_or_create_macos_key};
 
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -16,8 +16,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", test))]
-use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
@@ -36,6 +37,19 @@ const STORE_SCHEMA: &str = "CREATE TABLE encrypted_documents (
                 ciphertext BLOB NOT NULL,
                 created_at INTEGER NOT NULL
             );";
+
+// SQLite permits many readers but only one writer. The runtime deliberately
+// uses short-lived connections, so serialize our own write transactions rather
+// than making call capture, attachment import, receipts, and transcript
+// indexing race for the single WAL writer slot.
+static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn store_write_guard() -> Result<MutexGuard<'static, ()>> {
+    STORE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow!("Mom store write coordinator is unavailable"))
+}
 
 /// Build privately, then publish a complete database without replacing any
 /// existing path. The hard-link operation arbitrates independent processes as
@@ -136,6 +150,10 @@ const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1"
 // the hashed data-directory account, so isolated stores never share keys.
 #[cfg(target_os = "macos")]
 static INSTALLATION_KEYS: OnceLock<Mutex<HashMap<String, CachedInstallationKey>>> = OnceLock::new();
+/// Automatic startup is noninteractive. Only the explicit startup Retry
+/// action arms exactly one Keychain request, consumed by the next store open.
+#[cfg(target_os = "macos")]
+static ALLOW_KEYCHAIN_INTERACTION_ONCE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
@@ -301,6 +319,7 @@ impl RuntimeStore {
     where
         T: DeserializeOwned,
     {
+        let _write = store_write_guard()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let encrypted = transaction
@@ -341,6 +360,7 @@ impl RuntimeStore {
     }
 
     pub(crate) fn clear_cache_family(&self, namespace: &str, member_prefix: &str) -> Result<usize> {
+        let _write = store_write_guard()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let removed = transaction.execute(
@@ -359,6 +379,7 @@ impl RuntimeStore {
     where
         T: Serialize,
     {
+        let _write = store_write_guard()?;
         let connection = self.connection()?;
         let (nonce, ciphertext) = self.encrypt_json(namespace, value)?;
         connection.execute(
@@ -389,6 +410,7 @@ impl RuntimeStore {
 
     #[cfg(test)]
     pub(crate) fn put_bytes(&self, namespace: &str, value: &[u8]) -> Result<()> {
+        let _write = store_write_guard()?;
         let connection = self.connection()?;
         let (nonce, ciphertext) = self.encrypt_bytes(namespace, value)?;
         connection.execute(
@@ -422,6 +444,7 @@ impl RuntimeStore {
                 Ok((namespace, nonce, ciphertext))
             })
             .collect::<Result<Vec<_>>>()?;
+        let _write = store_write_guard()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (namespace, nonce, ciphertext) in encrypted {
@@ -448,6 +471,7 @@ impl RuntimeStore {
     where
         T: Serialize + DeserializeOwned,
     {
+        let _write = store_write_guard()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let encrypted = transaction
@@ -485,6 +509,7 @@ impl RuntimeStore {
     where
         T: Serialize + DeserializeOwned,
     {
+        let _write = store_write_guard()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let encrypted = transaction
@@ -584,6 +609,7 @@ impl RuntimeStore {
     where
         T: Serialize,
     {
+        let _write = store_write_guard()?;
         let namespace = format!("receipt:{receipt_id}");
         let (nonce, ciphertext) = self.encrypt_json(&namespace, receipt)?;
         self.connection()?.execute(
@@ -601,9 +627,20 @@ impl RuntimeStore {
     fn connection_once(&self) -> Result<Connection> {
         let connection =
             Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        connection.busy_timeout(Duration::from_millis(100))?;
+        // Keep setup retries responsive. Normal operations receive the longer
+        // timeout below after schema and connection pragmas are established.
+        connection.busy_timeout(Duration::from_millis(250))?;
         validate_schema(&connection)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        // `PRAGMA journal_mode=WAL` is a write-like mode transition even when
+        // WAL is already active. Reissuing it on every short-lived read can
+        // contend with another reader and strand parallel attachment
+        // hydration behind SQLITE_BUSY. Only perform the transition when the
+        // published store is genuinely in another mode.
+        let journal_mode: String =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -713,8 +750,13 @@ fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
     #[cfg(target_os = "macos")]
     {
         let account = keychain_account(data_dir);
+        let interaction = if ALLOW_KEYCHAIN_INTERACTION_ONCE.swap(false, Ordering::AcqRel) {
+            KeychainInteraction::AllowOnce
+        } else {
+            KeychainInteraction::Suppress
+        };
         cached_installation_key(&account, &INSTALLATION_KEYS, || {
-            load_or_create_macos_key(&account, data_dir.join(DATABASE_FILE).exists())
+            load_or_create_macos_key(&account, data_dir.join(DATABASE_FILE).exists(), interaction)
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -815,6 +857,7 @@ pub(crate) fn prepare_secure_store_retry() -> Result<()> {
         let data_dir = crate::config::resolve_data_dir();
         let account = keychain_account(&data_dir);
         clear_cached_installation_key_failure(&account, &INSTALLATION_KEYS)?;
+        ALLOW_KEYCHAIN_INTERACTION_ONCE.store(true, Ordering::Release);
     }
     Ok(())
 }
@@ -1091,6 +1134,50 @@ mod tests {
             .get::<SecretDocument>("values")?
             .ok_or_else(|| anyhow!("document missing"))?;
         assert_eq!(document.values.len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_import_and_receipt_writes_do_not_compete_for_the_wal_writer() -> Result<()> {
+        let data_dir = test_dir("call-write-contention");
+        let store = RuntimeStore::open_with_key(&data_dir, [19_u8; 32])?;
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let workers = (0..16)
+            .map(|index| {
+                let store = store.clone();
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || -> Result<()> {
+                    ready.wait();
+                    if index % 2 == 0 {
+                        store.put(
+                            &format!("attachment-{index}"),
+                            &SecretDocument {
+                                values: vec![format!("voice-{index}")],
+                            },
+                        )
+                    } else {
+                        store.write_receipt(
+                            &format!("receipt-{index}"),
+                            "mom_llama.voice_audio_finish",
+                            &SecretDocument {
+                                values: vec![format!("reply-{index}")],
+                            },
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().map_err(|_| anyhow!("writer panicked"))??;
+        }
+        for index in (0..16).step_by(2) {
+            assert_eq!(
+                store
+                    .get::<SecretDocument>(&format!("attachment-{index}"))?
+                    .map(|document| document.values),
+                Some(vec![format!("voice-{index}")])
+            );
+        }
         Ok(())
     }
 

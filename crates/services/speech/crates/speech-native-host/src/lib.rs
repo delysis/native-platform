@@ -719,8 +719,10 @@ impl SpeechHost {
         &self,
         mut request: SynthesisRequest,
     ) -> Result<SynthesisTicket, SpeechHostError> {
+        let host_admission_started = Instant::now();
         let request_id = request.context.request_id.clone();
         let budget = RequestBudget::new(&request.context.deadline, &request_id, self.clock.now())?;
+        let host_route_started = Instant::now();
         let ReservedRoute {
             plan,
             backend,
@@ -729,6 +731,7 @@ impl SpeechHost {
             limiter,
             cancellation,
         } = self.reserve_synthesis(&request)?;
+        let host_route_us = elapsed_micros(host_route_started.elapsed());
         pin_route(&mut request.context.route, &plan);
         let mut setup = SetupGuard::new(
             Arc::clone(&self.lifecycle),
@@ -739,6 +742,7 @@ impl SpeechHost {
             self.lifecycle.mark_faulted();
             map_registry_error(error)
         })?;
+        let host_queue_started = Instant::now();
         let backend_lease = match self
             .acquire_backend_lease(
                 limiter,
@@ -757,6 +761,7 @@ impl SpeechHost {
             }
             Err(error) => return Err(error),
         };
+        let host_queue_us = elapsed_micros(host_queue_started.elapsed());
         let attempt = operation
             .start()
             .and_then(|()| operation.start_attempt())
@@ -787,6 +792,7 @@ impl SpeechHost {
             return Err(error.into());
         }
         let dispatch_backend = Arc::clone(&backend);
+        let host_dispatch_started = Instant::now();
         let dispatch: DispatchFuture<SynthesisTicket> =
             Box::pin(async move { dispatch_backend.synthesize(request).await });
         let mut pending = PendingDispatch::new(
@@ -856,6 +862,8 @@ impl SpeechHost {
                 return Err(error.into());
             }
         };
+        let host_dispatch_us = elapsed_micros(host_dispatch_started.elapsed());
+        let host_admission_us = elapsed_micros(host_admission_started.elapsed());
         let mut executor = pending.complete();
         let mut backend_ticket = match backend_ticket_result {
             Ok(ticket) => ticket,
@@ -953,6 +961,13 @@ impl SpeechHost {
                                 backend_id: Some(monitor_backend_id.clone()),
                                 safe_detail: "speech streamed audio could not be delivered through the public event channel".to_owned(),
                             })
+                        }
+                        Ok(mut response) => {
+                            response.usage.host_route_us = Some(host_route_us);
+                            response.usage.host_queue_us = Some(host_queue_us);
+                            response.usage.host_dispatch_us = Some(host_dispatch_us);
+                            response.usage.host_admission_us = Some(host_admission_us);
+                            Ok(response)
                         }
                         result => result,
                     };
@@ -1885,6 +1900,10 @@ fn earliest_deadline(
         }),
         (None, None) => None,
     }
+}
+
+fn elapsed_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 async fn wait_for_deadline(
@@ -4156,6 +4175,10 @@ mod tests {
             Some("fixture-voice-model")
         );
         assert_eq!(response.route.voice_id.as_deref(), Some("fixture-voice"));
+        assert!(response.usage.host_route_us.is_some());
+        assert!(response.usage.host_queue_us.is_some());
+        assert!(response.usage.host_dispatch_us.is_some());
+        assert!(response.usage.host_admission_us.is_some());
         assert_eq!(terminal, 1);
         assert_eq!(backend.calls.load(Ordering::Acquire), 1);
     }

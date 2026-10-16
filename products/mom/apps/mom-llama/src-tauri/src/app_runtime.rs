@@ -1,9 +1,9 @@
 use llama_native_host::{NativeClient, NativeHost, ProcessExitJoinedNativeHost};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OnceCell};
@@ -14,7 +14,7 @@ use crate::operation_supervisor::{
     LifecyclePhase as OperationLifecyclePhase, OperationReservation, OperationSupervisor,
     TerminalClass, validate_worker_sets,
 };
-use crate::speech::{APPLE_SYNTHESIS_IS_NON_PREEMPTIVE, MomSpeech};
+use crate::speech::MomSpeech;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppPhase {
@@ -50,7 +50,6 @@ pub struct AppShutdownSummary {
     pub speech_host_joined: bool,
     pub speech_active_operation_count: usize,
     pub speech_retained_playback_count: usize,
-    pub apple_inner_call_non_preemptive: bool,
     /// Product-owned operation-supervisor facts at the terminal boundary.
     pub operation_supervisor_phase: OperationLifecyclePhase,
     pub active_operation_count: usize,
@@ -131,6 +130,81 @@ struct AppRuntime {
     operation_supervisor: OperationSupervisor,
     persona_approval_recovery: Arc<PersonaApprovalRecoveryWorker>,
     persona_approval_authority: Option<mom_llama_runtime::PersonaToolApprovalRecovery>,
+    voice_audio_sessions: Mutex<BTreeMap<String, Arc<mom_llama_runtime::VoiceAudioSession>>>,
+    voice_speculations: Mutex<BTreeMap<String, Arc<VoiceSpeculationControl>>>,
+    /// Cancellation may cross the renderer/native boundary just before the
+    /// long-running speculate command registers its control. Remember that
+    /// exact identity so a late admission starts aborted instead of escaping
+    /// the user's resumed speech or hang-up.
+    early_voice_speculation_aborts: Mutex<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceSpeculationState {
+    Pending,
+    Confirmed,
+    Aborted,
+}
+
+#[derive(Debug)]
+pub(crate) struct VoiceSpeculationControl {
+    state: Mutex<VoiceSpeculationState>,
+    changed: Condvar,
+    prepared: Option<Arc<mom_llama_runtime::VoiceAudioPreparedTurn>>,
+}
+
+impl VoiceSpeculationControl {
+    fn new(prepared: Option<Arc<mom_llama_runtime::VoiceAudioPreparedTurn>>) -> Self {
+        Self {
+            state: Mutex::new(VoiceSpeculationState::Pending),
+            changed: Condvar::new(),
+            prepared,
+        }
+    }
+
+    pub(crate) fn prepared_turn(
+        &self,
+    ) -> Result<Arc<mom_llama_runtime::VoiceAudioPreparedTurn>, String> {
+        self.prepared
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "The speculative voice turn has no reusable preparation".to_string())
+    }
+
+    pub(crate) fn wait_for_confirmation(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Voice speculation state is unavailable".to_string())?;
+        while *state == VoiceSpeculationState::Pending {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| "Voice speculation state is unavailable".to_string())?;
+        }
+        match *state {
+            VoiceSpeculationState::Confirmed => Ok(()),
+            VoiceSpeculationState::Aborted => Err("voice_speculation_aborted".to_string()),
+            VoiceSpeculationState::Pending => unreachable!("wait loop excludes pending state"),
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        let _ = self.transition(VoiceSpeculationState::Aborted);
+    }
+
+    fn transition(&self, next: VoiceSpeculationState) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Voice speculation state is unavailable".to_string())?;
+        if *state != VoiceSpeculationState::Pending {
+            return Ok(*state == next);
+        }
+        *state = next;
+        self.changed.notify_all();
+        Ok(true)
+    }
 }
 
 #[derive(Clone)]
@@ -432,9 +506,18 @@ impl AppWorkLease {
         T: Send + 'static,
         F: FnOnce() -> Result<T, String> + Send + 'static,
     {
-        let reservation = self.supervised.take().ok_or_else(|| {
-            "Blessenger's long operation has no supervisor reservation".to_owned()
-        })?;
+        let Some(reservation) = self.supervised.take() else {
+            return tokio::task::spawn_blocking(move || {
+                // Keep the application lease alive until short blocking work
+                // has actually stopped. Mutations participate in product
+                // shutdown even though only cancellable long operations need
+                // an operation-supervisor reservation.
+                let _app_lease = self;
+                operation()
+            })
+            .await
+            .map_err(|error| format!("Blessenger blocking operation worker failed: {error}"))?;
+        };
         let supervisor = reservation
             .lease
             .supervisor()
@@ -461,9 +544,14 @@ impl AppWorkLease {
         T: Send + 'static,
         F: FnOnce() -> Result<(T, bool), String> + Send + 'static,
     {
-        let reservation = self.supervised.take().ok_or_else(|| {
-            "Blessenger's long operation has no supervisor reservation".to_owned()
-        })?;
+        let Some(reservation) = self.supervised.take() else {
+            return tokio::task::spawn_blocking(move || {
+                let _app_lease = self;
+                operation().map(|(value, _authoritative_cancellation)| value)
+            })
+            .await
+            .map_err(|error| format!("Blessenger blocking operation worker failed: {error}"))?;
+        };
         let supervisor = reservation
             .lease
             .supervisor()
@@ -652,6 +740,9 @@ impl AppRuntimeHandle {
             operation_supervisor,
             persona_approval_recovery,
             persona_approval_authority,
+            voice_audio_sessions: Mutex::new(BTreeMap::new()),
+            voice_speculations: Mutex::new(BTreeMap::new()),
+            early_voice_speculation_aborts: Mutex::new(BTreeSet::new()),
         }))
     }
 
@@ -737,6 +828,186 @@ impl AppRuntimeHandle {
 
     pub fn operation_scope(&self) -> mom_llama_runtime::OperationScope {
         self.0.operation_scope.clone()
+    }
+
+    pub fn insert_voice_audio_session(
+        &self,
+        session: mom_llama_runtime::VoiceAudioSession,
+    ) -> Result<String, String> {
+        let id = session.request_id().to_string();
+        let mut sessions = self
+            .0
+            .voice_audio_sessions
+            .lock()
+            .map_err(|_| "Blessenger voice session state is unavailable".to_string())?;
+        if sessions.insert(id.clone(), Arc::new(session)).is_some() {
+            return Err("Blessenger generated a duplicate voice session identity".to_string());
+        }
+        Ok(id)
+    }
+
+    pub fn push_voice_audio(&self, session: &str, samples: Vec<f32>) -> Result<usize, String> {
+        let voice = self
+            .0
+            .voice_audio_sessions
+            .lock()
+            .map_err(|_| "Blessenger voice session state is unavailable".to_string())?
+            .get(session)
+            .ok_or_else(|| "The live voice session is no longer active".to_string())?
+            .clone();
+        voice.push_pcm(&samples).map_err(|error| error.to_string())
+    }
+
+    pub fn voice_audio_session(
+        &self,
+        session: &str,
+    ) -> Result<Arc<mom_llama_runtime::VoiceAudioSession>, String> {
+        self.0
+            .voice_audio_sessions
+            .lock()
+            .map_err(|_| "Blessenger voice session state is unavailable".to_string())?
+            .get(session)
+            .cloned()
+            .ok_or_else(|| "The live voice session is no longer active".to_string())
+    }
+
+    pub fn take_voice_audio_session(
+        &self,
+        session: &str,
+    ) -> Result<mom_llama_runtime::VoiceAudioSession, String> {
+        let voice = self
+            .0
+            .voice_audio_sessions
+            .lock()
+            .map_err(|_| "Blessenger voice session state is unavailable".to_string())?
+            .remove(session)
+            .ok_or_else(|| "The live voice session is no longer active".to_string())?;
+        Arc::try_unwrap(voice)
+            .map_err(|_| "The live voice session still has an in-flight audio block".to_string())
+    }
+
+    pub fn abort_voice_audio_session(&self, session: &str) -> Result<usize, String> {
+        let voice = self
+            .0
+            .voice_audio_sessions
+            .lock()
+            .map_err(|_| "Blessenger voice session state is unavailable".to_string())?
+            .remove(session)
+            .ok_or_else(|| "The live voice session is no longer active".to_string())?;
+        Ok(voice.cancel())
+    }
+
+    pub(crate) fn begin_voice_speculation_with_prepared(
+        &self,
+        speculation: &str,
+        prepared: Option<Arc<mom_llama_runtime::VoiceAudioPreparedTurn>>,
+    ) -> Result<Arc<VoiceSpeculationControl>, String> {
+        validate_voice_speculation_id(speculation)?;
+        let control = Arc::new(VoiceSpeculationControl::new(prepared));
+        let mut speculations = self
+            .0
+            .voice_speculations
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?;
+        let mut early_aborts = self
+            .0
+            .early_voice_speculation_aborts
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?;
+        if early_aborts.remove(speculation) {
+            return Err("voice_speculation_aborted".to_string());
+        }
+        if speculations
+            .insert(speculation.to_string(), Arc::clone(&control))
+            .is_some()
+        {
+            return Err("Blessenger generated a duplicate voice speculation identity".to_string());
+        }
+        Ok(control)
+    }
+
+    pub(crate) fn confirm_voice_speculation(&self, speculation: &str) -> Result<bool, String> {
+        let control = self
+            .0
+            .voice_speculations
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+            .get(speculation)
+            .cloned()
+            .ok_or_else(|| "The speculative voice turn is no longer active".to_string())?;
+        control.transition(VoiceSpeculationState::Confirmed)
+    }
+
+    /// Abort and consume an admitted speculation. If admission has not yet
+    /// happened, retain the early-abort tombstone so the racing command cannot
+    /// resurrect it after the user has stopped capture.
+    pub(crate) fn abort_and_remove_voice_speculation(
+        &self,
+        speculation: &str,
+    ) -> Result<bool, String> {
+        validate_voice_speculation_id(speculation)?;
+        let control = self
+            .0
+            .voice_speculations
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+            .remove(speculation);
+        if let Some(control) = control {
+            let aborted = control.transition(VoiceSpeculationState::Aborted)?;
+            self.0
+                .early_voice_speculation_aborts
+                .lock()
+                .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+                .remove(speculation);
+            return Ok(aborted);
+        }
+        self.0
+            .early_voice_speculation_aborts
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+            .insert(speculation.to_string());
+        Ok(true)
+    }
+
+    /// Atomically consume the failed attempt's immutable preparation for a
+    /// resumed-speech replacement. The producer may have already cancelled
+    /// and joined; keeping cleanup consumer-owned prevents that completion
+    /// race from discarding the only checkpoint-compatible turn description.
+    pub(crate) fn take_voice_speculation_for_handoff(
+        &self,
+        speculation: &str,
+    ) -> Result<(bool, Arc<mom_llama_runtime::VoiceAudioPreparedTurn>), String> {
+        validate_voice_speculation_id(speculation)?;
+        let control = self
+            .0
+            .voice_speculations
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+            .remove(speculation)
+            .ok_or_else(|| "The speculative voice turn is no longer active".to_string())?;
+        self.0
+            .early_voice_speculation_aborts
+            .lock()
+            .map_err(|_| "Blessenger voice speculation state is unavailable".to_string())?
+            .remove(speculation);
+        let prepared = control.prepared_turn()?;
+        let aborted = control.transition(VoiceSpeculationState::Aborted)?;
+        Ok((aborted, prepared))
+    }
+
+    pub(crate) fn finish_voice_speculation(&self, speculation: &str) {
+        let _ = self
+            .0
+            .voice_speculations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(speculation);
+        let _ = self
+            .0
+            .early_voice_speculation_aborts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(speculation);
     }
 
     pub fn speech(&self) -> Arc<MomSpeech> {
@@ -830,6 +1101,33 @@ impl AppRuntimeHandle {
                 // operation before application work drains. That drain
                 // precedes the sole terminal native join.
                 self.request_product_cancellation();
+                let voice_sessions = self
+                    .0
+                    .voice_audio_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for voice in voice_sessions {
+                    voice.cancel();
+                }
+                self.0
+                    .voice_audio_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                let speculations = self
+                    .0
+                    .voice_speculations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for speculation in speculations {
+                    let _ = speculation.transition(VoiceSpeculationState::Aborted);
+                }
                 let persona_approval_worker = Arc::clone(&self.0.persona_approval_recovery);
                 let worker_to_stop = Arc::clone(&persona_approval_worker);
                 let persona_approval_recovery =
@@ -954,7 +1252,6 @@ impl AppRuntimeHandle {
                     speech_host_joined,
                     speech_active_operation_count,
                     speech_retained_playback_count,
-                    apple_inner_call_non_preemptive: APPLE_SYNTHESIS_IS_NON_PREEMPTIVE,
                     operation_supervisor_phase,
                     active_operation_count,
                     retained_operation_task_count,
@@ -1019,6 +1316,18 @@ impl AppRuntimeHandle {
     }
 }
 
+fn validate_voice_speculation_id(speculation: &str) -> Result<(), String> {
+    if speculation.is_empty()
+        || speculation.len() > 64
+        || !speculation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("Voice speculation identity is invalid".to_string());
+    }
+    Ok(())
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1049,6 +1358,89 @@ mod tests {
         // only where that storage capability is implemented; independent
         // supervisor and approval-worker tests remain portable.
         runtime_with_finalizer(Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resumed_speech_before_speculation_admission_is_not_lost() {
+        let runtime = runtime();
+        let speculation = "early-abort-fixture";
+        assert_eq!(
+            runtime.abort_and_remove_voice_speculation(speculation),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime
+                .begin_voice_speculation_with_prepared(speculation, None)
+                .expect_err("an early abort must close later admission"),
+            "voice_speculation_aborted"
+        );
+        assert!(
+            runtime
+                .begin_voice_speculation_with_prepared(speculation, None)
+                .is_ok(),
+            "the consumed early-abort identity must not poison future admission"
+        );
+        runtime.finish_voice_speculation(speculation);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_speculation_remains_until_its_abort_consumer_removes_it() {
+        let runtime = runtime();
+        let speculation = "consumer-owned-failure";
+        let control = runtime
+            .begin_voice_speculation_with_prepared(speculation, None)
+            .expect("speculation is admitted");
+        control.abort();
+        assert!(
+            runtime
+                .0
+                .voice_speculations
+                .lock()
+                .expect("speculation registry")
+                .contains_key(speculation),
+            "producer completion must not erase handoff state"
+        );
+        assert_eq!(
+            runtime.abort_and_remove_voice_speculation(speculation),
+            Ok(true)
+        );
+        assert!(
+            !runtime
+                .0
+                .voice_speculations
+                .lock()
+                .expect("speculation registry")
+                .contains_key(speculation)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn short_blocking_mutation_runs_without_a_long_operation_reservation() {
+        let runtime = runtime();
+        let lease = runtime
+            .admit(command_spec("mom_llama_voice_audio_push"))
+            .expect("short mutation admission");
+        assert!(lease.supervised.is_none());
+
+        let value = lease
+            .run_blocking(|| Ok::<_, String>(7_u8))
+            .await
+            .expect("short blocking mutation");
+
+        assert_eq!(value, 7);
+        assert!(
+            runtime
+                .0
+                .lifecycle
+                .lock()
+                .expect("application lifecycle")
+                .active_work
+                .is_empty(),
+            "the short worker must release its application lease"
+        );
     }
 
     #[tokio::test]
@@ -1580,7 +1972,6 @@ mod tests {
         assert!(summary.speech_host_joined);
         assert_eq!(summary.speech_active_operation_count, 0);
         assert_eq!(summary.speech_retained_playback_count, 0);
-        assert!(summary.apple_inner_call_non_preemptive);
         assert_eq!(summary.active_product_operation_count, 0);
         assert!(
             summary

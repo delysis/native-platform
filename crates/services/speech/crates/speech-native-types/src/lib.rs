@@ -754,7 +754,80 @@ pub struct SpeechUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub queue_ms: Option<u64>,
+    /// Exact worker admission latency at microsecond resolution. `queue_ms`
+    /// remains for compatibility and coarse reporting.
+    #[serde(default)]
+    pub queue_us: Option<u64>,
+    /// Host time spent snapshotting capabilities, selecting the exact route,
+    /// and reserving cancellation ownership before backend admission.
+    #[serde(default)]
+    pub host_route_us: Option<u64>,
+    /// Host time spent waiting for the selected backend's admission permit.
+    #[serde(default)]
+    pub host_queue_us: Option<u64>,
+    /// Host time from polling the backend synthesis future until it returns
+    /// the public streaming ticket.
+    #[serde(default)]
+    pub host_dispatch_us: Option<u64>,
+    /// Complete host entry-to-streaming-ticket latency.
+    #[serde(default)]
+    pub host_admission_us: Option<u64>,
     pub model_load_ms: Option<u64>,
+    /// Background cache state observed when this request entered the backend.
+    #[serde(default)]
+    pub background_warm_active: Option<bool>,
+    #[serde(default)]
+    pub background_warm_completed: Option<u64>,
+    #[serde(default)]
+    pub background_warm_total: Option<u64>,
+    /// Time spent selecting the already validated immutable persona reference
+    /// in the backend before worker admission.
+    #[serde(default)]
+    pub reference_admission_us: Option<u64>,
+    /// Exact source used for persona conditioning: resident memory, disk, or
+    /// a fresh computation. Present for the first streamed PCM packet.
+    #[serde(default)]
+    pub reference_cache: Option<String>,
+    /// Time spent resolving persona conditioning inside the resident helper.
+    #[serde(default)]
+    pub reference_us: Option<u64>,
+    /// Helper time validating the content identity and deriving its cache key.
+    #[serde(default)]
+    pub reference_identity_us: Option<u64>,
+    /// Helper time spent checking the resident in-memory reference cache.
+    #[serde(default)]
+    pub reference_memory_lookup_us: Option<u64>,
+    /// Helper time spent reading and validating a persisted reference artifact.
+    #[serde(default)]
+    pub reference_disk_lookup_us: Option<u64>,
+    /// Helper time spent reading source WAV bytes on a cache miss.
+    #[serde(default)]
+    pub reference_source_read_us: Option<u64>,
+    /// Helper time spent hashing source WAV bytes on a cache miss.
+    #[serde(default)]
+    pub reference_source_hash_us: Option<u64>,
+    /// Helper time spent deriving the speaker embedding and decoder context.
+    #[serde(default)]
+    pub reference_compute_us: Option<u64>,
+    /// Helper time spent atomically persisting a newly derived artifact.
+    #[serde(default)]
+    pub reference_persist_us: Option<u64>,
+    /// Helper-local request-to-first-PCM time, excluding Rust admission and
+    /// transport of the first packet back across the resident pipe.
+    #[serde(default)]
+    pub helper_first_pcm_us: Option<u64>,
+    /// Helper time spent finding natural text boundaries before synthesis.
+    #[serde(default)]
+    pub helper_text_chunk_us: Option<u64>,
+    /// Streaming-task time to the first materialized codec-code batch.
+    #[serde(default)]
+    pub helper_code_generation_us: Option<u64>,
+    /// Whether the resident Qwen talker reused a materialized persona prefix.
+    #[serde(default)]
+    pub helper_prepared_prefix_cache_hit: Option<bool>,
+    /// Time spent decoding the first emitted codec window into PCM.
+    #[serde(default)]
+    pub helper_first_decode_us: Option<u64>,
     pub time_to_first_result_ms: Option<u64>,
     pub total_ms: Option<u64>,
     #[serde(default)]

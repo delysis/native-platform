@@ -1,16 +1,25 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
     AttachmentPreviewAnchor, ChatDispatchOutput, ChatSendInput, ChatSendOptions,
-    ComposerAutocompleteAnchor, ComposerAutocompleteInput, ConversationExportFormat,
-    EngineCheckOptions, KvCachePolicy, PathSelection, PathSelectionKind, config::SettingsUpdate,
+    ComposerAutocompleteAnchor, ComposerAutocompleteInput, Conversation, ConversationExportFormat,
+    ConversationPersonaIdentity, EngineCheckOptions, KvCachePolicy, PathSelection,
+    PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::AsyncFileDialog;
 use serde::Deserialize;
 use serde_json::{Value, to_value};
+use speech_native_types::{AudioChunk, PcmSampleFormat};
+use std::any::Any;
+use std::cell::Cell;
+use std::fs;
+use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use tauri::ipc::Response;
-use tauri::{Emitter, State, Window};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tauri::ipc::{Channel, InvokeResponseBody, Response};
+use tauri::{Emitter, Manager, State, Window};
 
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
 use crate::command_registry::command_spec;
@@ -18,6 +27,57 @@ use crate::information::{
     AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
     ManagedRemovalSelection,
 };
+use crate::native_voice_capture::{CaptureTarget, NativeVoiceCapture};
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
+
+fn bind_precommit_voice_for_conversation(
+    runtime: &AppRuntimeHandle,
+    conversation: &Conversation,
+) -> Result<bool, String> {
+    runtime.speech().bind_precommit_voice(
+        &conversation.id,
+        &ConversationPersonaIdentity {
+            recipient_ids: conversation.recipient_ids.clone(),
+            source_conversation_id: conversation.source_conversation_id.clone(),
+        },
+    )
+}
+
+fn emit_voice_speculation_stage(window: &Window, speculation: &str, stage: &str, started: Instant) {
+    emit_voice_speculation_stage_with_detail(window, speculation, stage, started, Value::Null);
+}
+
+fn emit_voice_speculation_stage_with_detail(
+    window: &Window,
+    speculation: &str,
+    stage: &str,
+    started: Instant,
+    detail: Value,
+) {
+    let emitted_at_unix_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+        });
+    let _ = window.emit(
+        "mom_llama_voice_speculation_stage",
+        serde_json::json!({
+            "schema": "mom_llama.voice_speculation_stage.v1",
+            "speculation": speculation,
+            "stage": stage,
+            "command_elapsed_us": started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            "emitted_at_unix_us": emitted_at_unix_us,
+            "detail": detail,
+        }),
+    );
+}
 
 #[tauri::command]
 pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
@@ -50,6 +110,78 @@ pub fn mom_llama_render_settings_fragment(
     let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_render_settings_fragment"))?;
     markup_response(crate::view::render_settings_fragment(&scope))
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_latency_record(
+    runtime: State<'_, AppRuntimeHandle>,
+    app: tauri::AppHandle,
+    trace: String,
+) -> Result<(), String> {
+    let _lease = runtime.admit(command_spec("mom_llama_voice_latency_record"))?;
+    let (id, stage_count, checkpoint) = validate_voice_latency_trace(&trace)?;
+    let directory = app.path().app_log_dir().map_err(to_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        fs::create_dir_all(&directory).map_err(to_error)?;
+        let history = directory.join("voice-latency-history");
+        fs::create_dir_all(&history).map_err(to_error)?;
+        let snapshot = history.join(format!("{id}-{checkpoint:04}-{stage_count:02}.json"));
+        let mut receipt = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(snapshot)
+            .map_err(to_error)?;
+        receipt.write_all(trace.as_bytes()).map_err(to_error)?;
+        receipt.sync_all().map_err(to_error)?;
+        fs::write(directory.join("voice-latency-latest.json"), &trace).map_err(to_error)
+    })
+    .await
+    .map_err(to_error)?
+}
+
+const MAX_VOICE_LATENCY_TRACE_BYTES: usize = 64 * 1024;
+const MAX_VOICE_LATENCY_STAGES: usize = 512;
+
+fn validate_voice_latency_trace(trace: &str) -> Result<(String, usize, u64), String> {
+    if trace.len() > MAX_VOICE_LATENCY_TRACE_BYTES {
+        return Err("voice latency trace exceeds its bounded size".to_string());
+    }
+    let value: Value = serde_json::from_str(&trace).map_err(to_error)?;
+    let stages = value
+        .get("stages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "voice latency trace is missing stages".to_string())?;
+    if stages.len() > MAX_VOICE_LATENCY_STAGES
+        || stages.iter().any(|stage| {
+            stage
+                .get("stage")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name.len() > 64)
+        })
+    {
+        return Err("voice latency trace has invalid stages".to_string());
+    }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .ok_or_else(|| "voice latency trace has an invalid id".to_string())?
+        .to_owned();
+    let stage_count = stages.len();
+    let checkpoint = value
+        .get("checkpoint")
+        .and_then(Value::as_u64)
+        .unwrap_or(stage_count as u64);
+    if checkpoint > 10_000 {
+        return Err("voice latency trace has an invalid checkpoint".to_string());
+    }
+    Ok((id, stage_count, checkpoint))
 }
 
 #[tauri::command]
@@ -884,7 +1016,11 @@ pub fn mom_llama_persona_instantiate(
     title: Option<String>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_persona_instantiate"))?;
-    command_value(mom_llama_runtime::persona_instantiate(&persona, title))
+    let result = mom_llama_runtime::persona_instantiate(&persona, title).map_err(to_error)?;
+    if let Some(conversation) = result.result.as_ref() {
+        bind_precommit_voice_for_conversation(runtime.inner(), conversation)?;
+    }
+    command_value(Ok(result))
 }
 
 #[tauri::command]
@@ -930,15 +1066,16 @@ pub fn mom_llama_persona_group_delete(
 }
 
 #[tauri::command]
-pub fn mom_llama_chat_cancel(
+pub async fn mom_llama_chat_cancel(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_chat_cancel"))?;
-    command_value(mom_llama_runtime::chat_cancel_in_scope(
-        &runtime.operation_scope(),
-        &conversation,
-    ))
+    let lease = runtime.admit(command_spec("mom_llama_chat_cancel"))?;
+    let operations = runtime.operation_scope();
+    blocking_command(lease, move || {
+        mom_llama_runtime::chat_cancel_in_scope(&operations, &conversation)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1022,6 +1159,18 @@ pub fn mom_llama_conversation_draft_submit(
 }
 
 #[tauri::command]
+pub fn mom_llama_conversation_draft_call_start(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_call_start"))?;
+    let result = mom_llama_runtime::conversation_draft_call_start().map_err(to_error)?;
+    if let Some(conversation) = result.result.as_ref() {
+        bind_precommit_voice_for_conversation(runtime.inner(), conversation)?;
+    }
+    command_value(Ok(result))
+}
+
+#[tauri::command]
 pub fn mom_llama_conversation_new(
     runtime: State<'_, AppRuntimeHandle>,
     title: Option<String>,
@@ -1033,7 +1182,13 @@ pub fn mom_llama_conversation_new(
 #[tauri::command]
 pub fn mom_llama_conversation_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_conversation_list"))?;
-    command_value(mom_llama_runtime::conversation_list())
+    let result = mom_llama_runtime::conversation_list().map_err(to_error)?;
+    if let Some(conversations) = result.result.as_ref() {
+        for conversation in conversations {
+            bind_precommit_voice_for_conversation(runtime.inner(), conversation)?;
+        }
+    }
+    command_value(Ok(result))
 }
 
 #[tauri::command]
@@ -1042,7 +1197,11 @@ pub fn mom_llama_conversation_select(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_conversation_select"))?;
-    command_value(mom_llama_runtime::conversation_select(&conversation))
+    let result = mom_llama_runtime::conversation_select(&conversation).map_err(to_error)?;
+    if let Some(conversation) = result.result.as_ref() {
+        bind_precommit_voice_for_conversation(runtime.inner(), conversation)?;
+    }
+    command_value(Ok(result))
 }
 
 #[tauri::command]
@@ -1234,15 +1393,77 @@ pub async fn mom_llama_speech_read_aloud(
     message: String,
     operation: String,
     require_persona_voice: Option<bool>,
+    pcm_stream: Channel<InvokeResponseBody>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_speech_read_aloud"))?;
     let speech = runtime.speech();
     let result = speech
-        .read_aloud_with_mode(
+        .read_aloud_streaming_with_mode(
             &conversation,
             &message,
             &operation,
             require_persona_voice.unwrap_or(false),
+            Some(Arc::new(move |chunk| {
+                pcm_stream
+                    .send(InvokeResponseBody::Raw(pcm_stream_frame(chunk)?))
+                    .map_err(|error| format!("speech_stream_ipc_failed: {error}"))
+            })),
+        )
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
+
+fn pcm_stream_frame(chunk: &AudioChunk) -> Result<Vec<u8>, String> {
+    let sample_format = match chunk.format.sample_format {
+        PcmSampleFormat::I16Le => 1,
+        PcmSampleFormat::I24Le => 2,
+        PcmSampleFormat::I32Le => 3,
+        PcmSampleFormat::F32Le => 4,
+    };
+    let channels = u8::try_from(chunk.format.channels).map_err(|_| {
+        "speech_stream_channels_invalid: channel count exceeded IPC framing".to_string()
+    })?;
+    let byte_len = u32::try_from(chunk.data.len()).map_err(|_| {
+        "speech_stream_chunk_too_large: PCM packet exceeded IPC framing".to_string()
+    })?;
+    let mut frame = Vec::with_capacity(32 + chunk.data.len());
+    frame.extend_from_slice(b"MPCM");
+    frame.push(1);
+    frame.push(u8::from(chunk.end_of_stream) | (u8::from(chunk.format.interleaved) << 1));
+    frame.push(sample_format);
+    frame.push(channels);
+    frame.extend_from_slice(&chunk.format.sample_rate_hz.to_le_bytes());
+    frame.extend_from_slice(&chunk.sequence.to_le_bytes());
+    frame.extend_from_slice(&chunk.sample_offset.to_le_bytes());
+    frame.extend_from_slice(&byte_len.to_le_bytes());
+    frame.extend_from_slice(&chunk.data);
+    Ok(frame)
+}
+
+#[tauri::command]
+pub async fn mom_llama_speech_precommit_synthesize(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    operation: String,
+    text: String,
+    pcm_stream: Channel<InvokeResponseBody>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_precommit_synthesize"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .synthesize_precommit(
+            &conversation,
+            &operation,
+            &text,
+            Arc::new(move |chunk| {
+                pcm_stream
+                    .send(InvokeResponseBody::Raw(pcm_stream_frame(chunk)?))
+                    .map_err(|error| format!("speech_stream_ipc_failed: {error}"))
+            }),
         )
         .await
         .map_err(to_error)?;
@@ -1253,22 +1474,18 @@ pub async fn mom_llama_speech_read_aloud(
 }
 
 #[tauri::command]
-pub async fn mom_llama_speech_precommit_synthesize(
+pub fn mom_llama_voice_generation_backpressure(
     runtime: State<'_, AppRuntimeHandle>,
-    conversation: String,
-    operation: String,
-    text: String,
+    request: String,
+    active: bool,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_speech_precommit_synthesize"))?;
-    let speech = runtime.speech();
-    let result = speech
-        .synthesize_precommit(&conversation, &operation, &text)
-        .await
-        .map_err(to_error)?;
-    let terminal = speech_terminal(&result);
-    let value = command_value(Ok(result));
-    lease.finish(terminal)?;
-    value
+    let _lease = runtime.admit(command_spec("mom_llama_voice_generation_backpressure"))?;
+    to_value(
+        runtime
+            .speech()
+            .set_generation_backpressure(&request, active)?,
+    )
+    .map_err(to_error)
 }
 
 #[tauri::command]
@@ -1350,6 +1567,784 @@ pub async fn mom_llama_voice_message_import(
         move || mom_llama_runtime::attachment_import_voice_message(&scope, &conversation, bytes),
     )
     .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_begin(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_begin"))?;
+    let operations = runtime.operation_scope();
+    let owner = runtime.inner().clone();
+    let speech = runtime.speech();
+    lease
+        .run_blocking(move || {
+            let stage = Cell::new("prepare_incremental_generation");
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let session = mom_llama_runtime::voice_audio_begin_in_scope(
+                    &operations,
+                    &conversation,
+                    &message,
+                )
+                .map_err(to_error)?;
+                let request_id = session.request_id().to_string();
+                let begin_metrics = session.begin_metrics().clone();
+                stage.set("bind_consultant_voice");
+                if !speech.bind_precommit_voice(&conversation, &session.persona_identity())? {
+                    return Err(
+                        "The prepared microphone turn is not bound to a consultant voice"
+                            .to_string(),
+                    );
+                }
+                stage.set("publish_voice_session");
+                let session_id = owner.insert_voice_audio_session(session)?;
+                Ok(serde_json::json!({
+                    "session": session_id,
+                    "request_id": request_id,
+                    "conversation_id": conversation,
+                    "begin_metrics": begin_metrics,
+                }))
+            }));
+            match result {
+                Ok(result) => result,
+                Err(payload) => Err(format!(
+                    "voice_audio_begin_panicked:{}: {}",
+                    stage.get(),
+                    panic_payload_message(payload.as_ref()),
+                )),
+            }
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_prepare(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_prepare"))?;
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let metrics = controller.prepare().map_err(to_error)?;
+            serde_json::to_value(metrics).map_err(to_error)
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_start(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    window: Window,
+    capture: String,
+    call: bool,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_start"))?;
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let events = window.clone();
+            controller
+                .start(
+                    capture.clone(),
+                    None,
+                    call,
+                    Arc::new(move |event| {
+                        let _ = events.emit("mom_llama_voice_capture_event", event);
+                    }),
+                )
+                .map_err(to_error)?;
+            Ok(serde_json::json!({
+                "capture": capture,
+                "native": true,
+            }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_pause(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    capture: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_pause"))?;
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            controller.pause_prefill(capture).map_err(to_error)?;
+            Ok(serde_json::json!({ "paused": true }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_retarget(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    capture: String,
+    session: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_retarget"))?;
+    let sink = runtime.voice_audio_session(&session)?;
+    let cancellation = sink
+        .cancellation_handle()
+        .ok_or_else(|| "The live voice session has no cancellation authority".to_string())?;
+    let target = CaptureTarget {
+        id: session.clone(),
+        sink,
+        cancel: Arc::new(move || {
+            cancellation.cancel();
+        }),
+    };
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let started = Instant::now();
+            let replay = controller.retarget(capture, target, 0).map_err(to_error)?;
+            Ok(serde_json::json!({
+                "session": session,
+                "retargeted": true,
+                "replay": replay,
+                "native_elapsed_us": started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_stop(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    window: Window,
+    capture: String,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_stop"))?;
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let output = controller.stop(capture.clone()).map_err(to_error)?;
+            let _ = window.emit(
+                "mom_llama_voice_capture_metrics",
+                serde_json::json!({
+                    "capture": capture,
+                    "heard_voice": output.heard_voice,
+                    "wav_bytes": output.wav.len(),
+                    "metrics": output.metrics,
+                }),
+            );
+            Ok(Response::new(output.wav))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_capture_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    window: Window,
+    capture: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_capture_cancel"))?;
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let metrics = controller.cancel(capture.clone()).map_err(to_error)?;
+            let _ = window.emit(
+                "mom_llama_voice_capture_metrics",
+                serde_json::json!({
+                    "capture": capture,
+                    "cancelled": true,
+                    "metrics": metrics,
+                }),
+            );
+            Ok(serde_json::json!({ "cancelled": true }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_push(
+    runtime: State<'_, AppRuntimeHandle>,
+    session: String,
+    samples: Vec<f32>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_push"))?;
+    let owner = runtime.inner().clone();
+    lease
+        .run_blocking(move || {
+            let buffered_samples = owner.push_voice_audio(&session, samples)?;
+            Ok(serde_json::json!({
+                "accepted": true,
+                "buffered_samples": buffered_samples,
+            }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_finish(
+    runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
+    session: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_finish"))?;
+    let owner = runtime.inner().clone();
+    let voice = owner.take_voice_audio_session(&session)?;
+    let archive = voice.audio_monitor();
+    let conversation = voice.conversation_id().to_string();
+    let operations = runtime.operation_scope();
+    let import = std::thread::Builder::new()
+        .name("mom-voice-attachment-import".to_string())
+        .spawn(move || {
+            let bytes = archive.wav_bytes().map_err(anyhow::Error::new)?;
+            mom_llama_runtime::attachment_import_voice_message(&operations, &conversation, bytes)
+        })
+        .map_err(|error| format!("voice_attachment_import_spawn_failed: {error}"))?;
+    let import = Arc::new(std::sync::Mutex::new(Some(import)));
+    let precommit_import = Arc::clone(&import);
+    let events = window.clone();
+    lease
+        .run_blocking_with_cancellation_evidence(move || {
+            let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
+                voice,
+                ChatSendOptions::default(),
+                Some(move |event: mom_llama_runtime::ChatStreamEvent| {
+                    events
+                        .emit("mom_llama_chat_dispatch_stream", &event)
+                        .map_err(anyhow::Error::new)
+                }),
+                move || {
+                    let handle = precommit_import
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("voice attachment import lock poisoned"))?
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("voice attachment import already joined"))?;
+                    let imported = handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
+                    let attachment = imported.result.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{}",
+                            imported
+                                .blocker
+                                .map(|blocker| blocker.message)
+                                .unwrap_or_else(|| "voice attachment import failed".to_string())
+                        )
+                    })?;
+                    Ok(Some(attachment.attachment.id))
+                },
+            )
+            .map_err(to_error);
+            // Generation errors and cancellation can return before the
+            // pre-commit hook. Never detach an attachment writer from its turn.
+            if let Some(handle) = import
+                .lock()
+                .map_err(|_| "voice_attachment_import_lock_poisoned".to_string())?
+                .take()
+            {
+                let _ = handle.join();
+            }
+            let result = result?;
+            let cancelled = result.has_authoritative_cancellation_evidence();
+            Ok((to_value(result).map_err(to_error)?, cancelled))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_speculate(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    window: Window,
+    session: String,
+    speculation: String,
+    capture: Option<String>,
+    wait_for_silence: Option<bool>,
+    generation_timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    let command_started = Instant::now();
+    emit_voice_speculation_stage(
+        &window,
+        &speculation,
+        "native_command_entered",
+        command_started,
+    );
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_speculate"))?;
+    emit_voice_speculation_stage(
+        &window,
+        &speculation,
+        "native_admission_complete",
+        command_started,
+    );
+    let owner = runtime.inner().clone();
+    // Register cancellation authority before touching capture. Resumed speech
+    // can then belay this command at every point after native admission.
+    let prepared = {
+        let voice = owner.voice_audio_session(&session)?;
+        voice.prepared_turn()
+    };
+    let control = owner.begin_voice_speculation_with_prepared(&speculation, Some(prepared))?;
+    emit_voice_speculation_stage(
+        &window,
+        &speculation,
+        "native_cancellation_registered",
+        command_started,
+    );
+    let wait_for_silence = wait_for_silence.unwrap_or(false);
+    // This timeout is consumed by the chat ticket only after incremental
+    // audio has been sealed and generation begins. Time spent speaking while
+    // the native silence gate is armed is therefore never charged to it.
+    let generation_timeout_ms = generation_timeout_ms.unwrap_or(20_000).clamp(1_000, 30_000);
+    let silence_gate = if wait_for_silence {
+        let capture = capture
+            .as_ref()
+            .ok_or_else(|| "native silence speculation requires an active capture".to_string())?;
+        let gate = match capture_state.inner().arm_silence(capture.clone()) {
+            Ok(gate) => gate,
+            Err(error) => {
+                control.abort();
+                owner.finish_voice_speculation(&speculation);
+                return Err(to_error(error));
+            }
+        };
+        emit_voice_speculation_stage(
+            &window,
+            &speculation,
+            "native_silence_armed",
+            command_started,
+        );
+        Some(gate)
+    } else {
+        None
+    };
+    // Silence is detected by the native capture owner after it has already
+    // flushed the trailing partial PCM batch. Detach that exact producer in
+    // this same command so the renderer does not pay a second IPC round trip.
+    if !wait_for_silence && let Some(capture) = capture {
+        if let Err(error) = capture_state.inner().pause_prefill(capture) {
+            control.abort();
+            owner.finish_voice_speculation(&speculation);
+            return Err(to_error(error));
+        }
+    }
+    let operations = runtime.operation_scope();
+    let worker_owner = owner.clone();
+    let worker_control = Arc::clone(&control);
+    let events = window.clone();
+    let worker_events = window.clone();
+    let worker_speculation = speculation.clone();
+    let result = lease
+        .run_blocking_with_cancellation_evidence(move || {
+            // This supervisor worker is admitted while the user is still
+            // speaking. It sleeps on the capture owner's condition variable
+            // and continues directly into generation when silence releases
+            // it; there is no async-runtime bounce or second worker dispatch
+            // on the latency-critical silence edge.
+            emit_voice_speculation_stage(
+                &worker_events,
+                &worker_speculation,
+                "native_generation_worker_prearmed",
+                command_started,
+            );
+            if let Some(gate) = silence_gate {
+                gate.wait()?;
+                emit_voice_speculation_stage(
+                    &worker_events,
+                    &worker_speculation,
+                    "native_silence_released",
+                    command_started,
+                );
+            }
+            emit_voice_speculation_stage(
+                &worker_events,
+                &worker_speculation,
+                "native_capture_detached",
+                command_started,
+            );
+            let voice = match worker_owner.take_voice_audio_session(&session) {
+                Ok(voice) => voice,
+                Err(error) => {
+                    worker_control.abort();
+                    worker_owner.finish_voice_speculation(&worker_speculation);
+                    return Err(error);
+                }
+            };
+            emit_voice_speculation_stage(
+                &worker_events,
+                &worker_speculation,
+                "native_voice_session_acquired",
+                command_started,
+            );
+            emit_voice_speculation_stage(
+                &worker_events,
+                &worker_speculation,
+                "native_generation_worker_started",
+                command_started,
+            );
+            let progress = voice.audio_monitor();
+            let archive = progress.clone();
+            let conversation = voice.conversation_id().to_string();
+            let import_control = Arc::clone(&worker_control);
+            let import_conversation = conversation.clone();
+            let import_operations = operations.clone();
+            let import = match std::thread::Builder::new()
+                .name("mom-speculative-voice-import".to_string())
+                .spawn(move || {
+                    import_control
+                        .wait_for_confirmation()
+                        .map_err(anyhow::Error::msg)?;
+                    let bytes = archive.wav_bytes().map_err(anyhow::Error::new)?;
+                    mom_llama_runtime::attachment_import_voice_message(
+                        &import_operations,
+                        &import_conversation,
+                        bytes,
+                    )
+                }) {
+                Ok(import) => import,
+                Err(error) => {
+                    worker_control.abort();
+                    worker_owner.finish_voice_speculation(&worker_speculation);
+                    return Err(format!("voice_speculative_import_spawn_failed: {error}"));
+                }
+            };
+            let import = Arc::new(std::sync::Mutex::new(Some(import)));
+            let precommit_import = Arc::clone(&import);
+            let failure_control = Arc::clone(&worker_control);
+            emit_voice_speculation_stage(
+                &worker_events,
+                &worker_speculation,
+                "native_audio_finish_entered",
+                command_started,
+            );
+            let stream_speculation = worker_speculation.clone();
+            let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
+                voice,
+                ChatSendOptions {
+                    timeout_s: generation_timeout_ms as f64 / 1_000.0,
+                    ..ChatSendOptions::default()
+                },
+                Some(move |event: mom_llama_runtime::ChatStreamEvent| {
+                    let detail = serde_json::json!({
+                        "kind": "chat",
+                        "event": &event.event,
+                        "request_id": &event.request_id,
+                        "conversation_id": &event.conversation_id,
+                        "delta_bytes": event.delta.as_ref().map_or(0, String::len),
+                    });
+                    emit_voice_speculation_stage_with_detail(
+                        &events,
+                        &stream_speculation,
+                        "native_chat_stream_event",
+                        command_started,
+                        detail,
+                    );
+                    events
+                        .emit("mom_llama_chat_dispatch_stream", &event)
+                        .map_err(anyhow::Error::new)
+                }),
+                move || {
+                    let handle = precommit_import
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("voice attachment import lock poisoned"))?
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("voice attachment import already joined"))?;
+                    let imported = handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
+                    let attachment = imported.result.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{}",
+                            imported
+                                .blocker
+                                .map(|blocker| blocker.message)
+                                .unwrap_or_else(|| "voice attachment import failed".to_string())
+                        )
+                    })?;
+                    Ok(Some(attachment.attachment.id))
+                },
+            )
+            .map_err(to_error);
+            let audio = progress.stats();
+            let mut audio_detail = serde_json::Map::new();
+            macro_rules! audio_metric {
+                ($name:literal, $value:expr) => {
+                    audio_detail.insert($name.to_string(), to_value($value).unwrap_or(Value::Null));
+                };
+            }
+            audio_metric!("accepted_samples", audio.accepted_samples);
+            audio_metric!("consumed_samples", audio.consumed_samples);
+            audio_metric!("chunks", audio.chunks);
+            audio_metric!("high_water_samples", audio.high_water_samples);
+            audio_metric!("first_accept_us", audio.first_accept_us);
+            audio_metric!("first_read_us", audio.first_read_us);
+            audio_metric!("finish_us", audio.finish_us);
+            audio_metric!("cancellation_requested_us", audio.cancellation_requested_us);
+            audio_metric!("cancellation_observed_us", audio.cancellation_observed_us);
+            audio_metric!("decode_start_us", audio.decode_start_us);
+            audio_metric!("prefix_start_us", audio.prefix_start_us);
+            audio_metric!("prefix_finish_us", audio.prefix_finish_us);
+            audio_metric!("prefix_us", audio.prefix_us);
+            audio_metric!("prefix_tokens", audio.prefix_tokens);
+            audio_metric!("restored_prefix_tokens", audio.restored_prefix_tokens);
+            audio_metric!("projector_us", audio.projector_us);
+            audio_metric!("projected_blocks", audio.projected_blocks);
+            audio_metric!("projected_samples", audio.projected_samples);
+            audio_metric!("first_projector_start_us", audio.first_projector_start_us);
+            audio_metric!("first_projector_finish_us", audio.first_projector_finish_us);
+            audio_metric!("last_projector_finish_us", audio.last_projector_finish_us);
+            audio_metric!("projector_max_us", audio.projector_max_us);
+            audio_metric!("tail_samples", audio.tail_samples);
+            audio_metric!("tail_projector_us", audio.tail_projector_us);
+            audio_metric!(
+                "closing_boundary_finish_us",
+                audio.closing_boundary_finish_us
+            );
+            audio_metric!("suffix_tokenize_finish_us", audio.suffix_tokenize_finish_us);
+            audio_metric!("suffix_eval_finish_us", audio.suffix_eval_finish_us);
+            audio_metric!("sampler_start_us", audio.sampler_start_us);
+            audio_metric!("sampler_ready_us", audio.sampler_ready_us);
+            audio_metric!("first_sample_start_us", audio.first_sample_start_us);
+            audio_metric!("first_sample_finish_us", audio.first_sample_finish_us);
+            audio_metric!("first_token_event_us", audio.first_token_event_us);
+            audio_metric!("sampled_tokens", audio.sampled_tokens);
+            audio_metric!("nonempty_token_pieces", audio.nonempty_token_pieces);
+            audio_metric!("emitted_token_events", audio.emitted_token_events);
+            audio_metric!("last_sample_start_us", audio.last_sample_start_us);
+            audio_metric!("last_sample_finish_us", audio.last_sample_finish_us);
+            audio_metric!("last_token_event_us", audio.last_token_event_us);
+            audio_metric!(
+                "continuation_decode_start_us",
+                audio.continuation_decode_start_us
+            );
+            audio_metric!(
+                "continuation_decode_finish_us",
+                audio.continuation_decode_finish_us
+            );
+            audio_metric!("continuation_decode_steps", audio.continuation_decode_steps);
+            audio_metric!("continuation_decode_us", audio.continuation_decode_us);
+            audio_metric!(
+                "continuation_decode_max_us",
+                audio.continuation_decode_max_us
+            );
+            audio_metric!("producer_lock_wait_us", audio.producer_lock_wait_us);
+            audio_metric!("producer_lock_wait_max_us", audio.producer_lock_wait_max_us);
+            audio_metric!("ring_write_us", audio.ring_write_us);
+            audio_metric!("ring_write_max_us", audio.ring_write_max_us);
+            audio_metric!("archive_copy_us", audio.archive_copy_us);
+            audio_metric!("archive_copy_max_us", audio.archive_copy_max_us);
+            audio_metric!("consumer_lock_wait_us", audio.consumer_lock_wait_us);
+            audio_metric!("consumer_lock_wait_max_us", audio.consumer_lock_wait_max_us);
+            audio_metric!("ring_read_us", audio.ring_read_us);
+            audio_metric!("ring_read_max_us", audio.ring_read_max_us);
+            audio_metric!("reader_notifications", audio.reader_notifications);
+            audio_metric!("reader_waits", audio.reader_waits);
+            audio_metric!("reader_wakeups", audio.reader_wakeups);
+            let mut detail = serde_json::Map::new();
+            detail.insert("audio".to_string(), Value::Object(audio_detail));
+            if let Err(error) = &result {
+                detail.insert("error".to_string(), Value::String(error.clone()));
+            }
+            emit_voice_speculation_stage_with_detail(
+                &worker_events,
+                &worker_speculation,
+                if result.is_ok() {
+                    "native_audio_finish_returned"
+                } else {
+                    "native_audio_finish_failed"
+                },
+                command_started,
+                Value::Object(detail),
+            );
+            if result.is_err() {
+                // A failed or cancelled decode may return before reaching the
+                // pre-commit latch. Release the conditional import before
+                // joining it so cancellation can never strand this worker.
+                failure_control.abort();
+            }
+            if let Some(handle) = import
+                .lock()
+                .map_err(|_| "voice_attachment_import_lock_poisoned".to_string())?
+                .take()
+            {
+                let _ = handle.join();
+            }
+            let result = result?;
+            let cancelled = result.has_authoritative_cancellation_evidence();
+            Ok((to_value(result).map_err(to_error)?, cancelled))
+        })
+        .await;
+    // A native resumed-speech cancellation may complete before the renderer's
+    // handoff command arrives. Keep failed attempts consumer-owned so their
+    // immutable preparation and resident audio checkpoint remain reusable.
+    if result.is_ok() {
+        owner.finish_voice_speculation(&speculation);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_speculation_confirm(
+    runtime: State<'_, AppRuntimeHandle>,
+    speculation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_confirm"))?;
+    Ok(serde_json::json!({
+        "confirmed": runtime.confirm_voice_speculation(&speculation)?,
+    }))
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_speculation_abort(
+    runtime: State<'_, AppRuntimeHandle>,
+    speculation: String,
+    conversation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_abort"))?;
+    let owner = runtime.inner().clone();
+    let operations = runtime.operation_scope();
+    lease
+        .run_blocking(move || {
+            let aborted = owner.abort_and_remove_voice_speculation(&speculation)?;
+            let cancellation = mom_llama_runtime::chat_cancel_in_scope(&operations, &conversation)
+                .map_err(to_error)?;
+            Ok(serde_json::json!({
+                "aborted": aborted,
+                "cancellation": cancellation,
+            }))
+        })
+        .await
+}
+
+/// Belay one speculative reply and hand the still-open microphone directly to
+/// a replacement incremental-audio session. Resumed speech used to cross four
+/// renderer/native waits (TTS stop, speculation abort, session restart,
+/// capture retarget). Keeping cancellation and retarget under one native
+/// admission lets the capture owner replay everything retained so far and
+/// resume its 10 ms producer without waiting for renderer bookkeeping. The
+/// replacement reuses the exact immutable prompt/model/cache preparation.
+#[tauri::command]
+pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
+    runtime: State<'_, AppRuntimeHandle>,
+    capture_state: State<'_, NativeVoiceCapture>,
+    capture: String,
+    speculation: String,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec(
+        "mom_llama_voice_audio_speculation_abort_and_retarget",
+    ))?;
+    let owner = runtime.inner().clone();
+    let operations = runtime.operation_scope();
+    let controller = capture_state.inner().clone();
+    lease
+        .run_blocking(move || {
+            let total_started = Instant::now();
+
+            // Cancel the old request before registering its replacement. Chat
+            // cancellation resolves the newest request for this conversation;
+            // reversing this order would cancel the replacement itself.
+            let abort_started = Instant::now();
+            let (aborted, prepared) = owner.take_voice_speculation_for_handoff(&speculation)?;
+            if !prepared.matches_turn(&conversation, &message) {
+                return Err("voice_speculation_preparation_identity_changed".to_string());
+            }
+            let cancellation = mom_llama_runtime::chat_cancel_in_scope(&operations, &conversation)
+                .map_err(to_error)?;
+            let abort_us = abort_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+
+            let begin_started = Instant::now();
+            let session =
+                mom_llama_runtime::voice_audio_restart_prepared_in_scope(&operations, prepared)
+                    .map_err(to_error)?;
+            let resume_wait_started = Instant::now();
+            let resume = session.wait_for_resume().map_err(to_error)?;
+            let resume_wait_us = resume_wait_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            let request_id = session.request_id().to_string();
+            let begin_metrics = session.begin_metrics().clone();
+            let session_id = owner.insert_voice_audio_session(session)?;
+            let begin_us = begin_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+
+            let sink = owner.voice_audio_session(&session_id)?;
+            let exact_cancellation = sink.cancellation_handle().ok_or_else(|| {
+                "The replacement voice session has no cancellation authority".to_string()
+            })?;
+            let target = CaptureTarget {
+                id: session_id.clone(),
+                sink,
+                cancel: Arc::new(move || {
+                    exact_cancellation.cancel();
+                }),
+            };
+            let retarget_started = Instant::now();
+            let replay = match controller.retarget(capture, target, resume.sample_offset) {
+                Ok(metrics) => metrics,
+                Err(error) => {
+                    let _ = owner.abort_voice_audio_session(&session_id);
+                    return Err(to_error(error));
+                }
+            };
+            let retarget_us = retarget_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+
+            Ok(serde_json::json!({
+                "aborted": aborted,
+                "cancellation": cancellation,
+                "session": session_id,
+                "request_id": request_id,
+                "conversation_id": conversation,
+                "begin_metrics": begin_metrics,
+                "abort_us": abort_us,
+                "begin_us": begin_us,
+                "resume_wait_us": resume_wait_us,
+                "resume_reused": resume.reused,
+                "resume_sample_offset": resume.sample_offset,
+                "resume_resident_max_sequences": resume.resident_max_sequences,
+                "resume_checkpoint_supported": resume.checkpoint_supported,
+                "resume_checkpoint_available": resume.checkpoint_available,
+                "resume_key_matched": resume.resume_key_matched,
+                "resume_request_matched": resume.request_matched,
+                "resume_binding_us": resume.binding_us,
+                "resume_restore_us": resume.restore_us,
+                "retarget_us": retarget_us,
+                "replay": replay,
+                "total_us": total_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            }))
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_voice_audio_abort(
+    runtime: State<'_, AppRuntimeHandle>,
+    session: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_voice_audio_abort"))?;
+    let owner = runtime.inner().clone();
+    lease
+        .run_blocking(move || {
+            let cancelled_branches = owner.abort_voice_audio_session(&session)?;
+            Ok(serde_json::json!({
+                "cancelled": true,
+                "cancelled_branches": cancelled_branches,
+            }))
+        })
+        .await
 }
 
 #[tauri::command]
@@ -1447,47 +2442,6 @@ pub async fn mom_llama_speech_transcribe_attachment(
     let value = command_value(Ok(result));
     lease.finish(terminal)?;
     value
-}
-
-#[tauri::command]
-pub async fn mom_llama_speech_audio(
-    runtime: State<'_, AppRuntimeHandle>,
-    playback: String,
-    message: String,
-    text_sha256: String,
-    backend_descriptor_sha256: String,
-) -> Result<Response, String> {
-    let lease = runtime.admit(command_spec("mom_llama_speech_audio"))?;
-    let speech = runtime.speech();
-    blocking_response(lease, move || {
-        speech
-            .playback_bytes(
-                &playback,
-                &message,
-                &text_sha256,
-                &backend_descriptor_sha256,
-            )
-            .map(Response::new)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn mom_llama_speech_precommit_audio(
-    runtime: State<'_, AppRuntimeHandle>,
-    operation: String,
-    text_sha256: String,
-    backend_descriptor_sha256: String,
-) -> Result<Response, String> {
-    let lease = runtime.admit(command_spec("mom_llama_speech_precommit_audio"))?;
-    let speech = runtime.speech();
-    blocking_response(lease, move || {
-        speech
-            .precommit_audio_bytes(&operation, &text_sha256, &backend_descriptor_sha256)
-            .map_err(to_error)
-            .map(Response::new)
-    })
-    .await
 }
 
 #[tauri::command]
@@ -2037,7 +2991,11 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::path_setting_patch;
+    use super::{
+        MAX_VOICE_LATENCY_STAGES, MAX_VOICE_LATENCY_TRACE_BYTES, path_setting_patch,
+        pcm_stream_frame, validate_voice_latency_trace,
+    };
+    use speech_native_types::{AudioChunk, PcmFormat, PcmSampleFormat};
     use std::path::PathBuf;
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -2048,6 +3006,40 @@ mod tests {
         let rest = &source[start..];
         let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    #[test]
+    fn durable_voice_trace_accepts_the_renderer_bound_and_rejects_overflow() {
+        let stages = (0..MAX_VOICE_LATENCY_STAGES)
+            .map(|_| serde_json::json!({ "stage": "packet" }))
+            .collect::<Vec<_>>();
+        let trace = serde_json::json!({
+            "id": "bounded-voice-trace",
+            "checkpoint": 512,
+            "stages": stages,
+        })
+        .to_string();
+        let (_, stage_count, checkpoint) =
+            validate_voice_latency_trace(&trace).expect("renderer-sized trace remains durable");
+        assert_eq!(stage_count, MAX_VOICE_LATENCY_STAGES);
+        assert_eq!(checkpoint, 512);
+
+        let overflow = serde_json::json!({
+            "id": "overflow-voice-trace",
+            "stages": (0..=MAX_VOICE_LATENCY_STAGES)
+                .map(|_| serde_json::json!({ "stage": "packet" }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        assert_eq!(
+            validate_voice_latency_trace(&overflow).unwrap_err(),
+            "voice latency trace has invalid stages"
+        );
+        assert_eq!(
+            validate_voice_latency_trace(&"x".repeat(MAX_VOICE_LATENCY_TRACE_BYTES + 1))
+                .unwrap_err(),
+            "voice latency trace exceeds its bounded size"
+        );
     }
 
     #[test]
@@ -2121,10 +3113,116 @@ mod tests {
                     .contains("policy_fingerprint"),
             "raw attachment previews must read and decrypt outside the async dispatch thread"
         );
+
+        for name in [
+            "mom_llama_chat_cancel",
+            "mom_llama_voice_audio_push",
+            "mom_llama_voice_audio_speculation_abort",
+            "mom_llama_voice_audio_speculation_abort_and_retarget",
+            "mom_llama_voice_audio_abort",
+        ] {
+            let body = command_body(source, name);
+            assert!(
+                body.contains(".run_blocking(") || body.contains("blocking_command("),
+                "{name} must never wait for inference or teardown on the UI dispatch thread"
+            );
+        }
+        for name in [
+            "mom_llama_voice_audio_finish",
+            "mom_llama_voice_audio_speculate",
+        ] {
+            assert!(
+                !command_body(source, name).contains("bytes: Vec<u8>"),
+                "{name} must reuse the bounded native PCM archive instead of round-tripping WAV bytes"
+            );
+        }
+        let speculate = command_body(source, "mom_llama_voice_audio_speculate");
         assert!(
-            command_body(source, "mom_llama_speech_audio").contains("blocking_response("),
-            "bounded complete WAV cloning must stay off the async dispatch thread"
+            speculate.contains("capture: Option<String>")
+                && speculate.contains("wait_for_silence: Option<bool>")
+                && speculate.contains("generation_timeout_ms: Option<u64>")
+                && speculate.contains("timeout_s: generation_timeout_ms as f64 / 1_000.0")
+                && speculate.contains("arm_silence(capture.clone())")
+                && speculate.contains("run_blocking_with_cancellation_evidence(move ||")
+                && speculate.contains("gate.wait()?")
+                && !speculate.contains("spawn_blocking(move || gate.wait())")
+                && speculate.contains("pause_prefill(capture)")
+                && speculate.find("begin_voice_speculation_with_prepared(&speculation")
+                    < speculate.find("pause_prefill(capture)"),
+            "native silence handoff must prearm one supervised worker and continue without a second dispatch"
         );
+        for stage in [
+            "native_command_entered",
+            "native_admission_complete",
+            "native_cancellation_registered",
+            "native_silence_armed",
+            "native_generation_worker_prearmed",
+            "native_silence_released",
+            "native_capture_detached",
+            "native_voice_session_acquired",
+            "native_generation_worker_started",
+            "native_audio_finish_entered",
+            "native_audio_finish_returned",
+            "native_audio_finish_failed",
+        ] {
+            assert!(
+                speculate.contains(stage),
+                "speculative generation must instrument {stage}"
+            );
+        }
+        for metric in [
+            "accepted_samples",
+            "consumed_samples",
+            "projected_blocks",
+            "decode_start_us",
+            "cancellation_requested_us",
+            "cancellation_observed_us",
+            "suffix_eval_finish_us",
+            "first_token_event_us",
+            "sampled_tokens",
+            "nonempty_token_pieces",
+            "emitted_token_events",
+            "last_sample_finish_us",
+            "last_token_event_us",
+            "continuation_decode_steps",
+            "continuation_decode_us",
+            "continuation_decode_max_us",
+        ] {
+            assert!(
+                speculate.contains(metric),
+                "failed speculative generation must preserve partial native metric {metric}"
+            );
+        }
+        assert!(
+            speculate.contains("detail.insert(\"error\"")
+                && speculate.contains("Value::String(error.clone())"),
+            "failed speculative generation must preserve the native error text"
+        );
+        let handoff = command_body(
+            source,
+            "mom_llama_voice_audio_speculation_abort_and_retarget",
+        );
+        assert!(
+            handoff.find("take_voice_speculation_for_handoff(&speculation)")
+                < handoff.find("voice_audio_restart_prepared_in_scope"),
+            "resumed-speech handoff must atomically consume the old prepared turn before registering its replacement"
+        );
+        assert!(
+            handoff.find("voice_audio_restart_prepared_in_scope")
+                < handoff.find("controller.retarget"),
+            "replacement audio authority must exist before retained PCM is replayed"
+        );
+        assert!(
+            handoff.contains("take_voice_speculation_for_handoff(&speculation)")
+                && handoff.contains("prepared.matches_turn(&conversation, &message)"),
+            "resumed-speech retry must reuse only the exact immutable turn preparation"
+        );
+        for metric in ["abort_us", "begin_us", "retarget_us", "replay", "total_us"] {
+            assert!(
+                handoff.contains(metric),
+                "resumed-speech handoff must report {metric}"
+            );
+        }
     }
 
     #[test]
@@ -2135,6 +3233,8 @@ mod tests {
             read_aloud.contains("&conversation")
                 && read_aloud.contains("&message")
                 && read_aloud.contains("&operation")
+                && read_aloud.contains("pcm_stream")
+                && read_aloud.contains("InvokeResponseBody::Raw")
                 && !read_aloud.contains("PathBuf")
                 && !read_aloud.contains("path:"),
             "Read Aloud IPC must accept only opaque operation and message identity"
@@ -2149,5 +3249,32 @@ mod tests {
                 && !transcribe.contains("path:"),
             "transcription IPC must re-present exact Attachment authority without a path"
         );
+    }
+
+    #[test]
+    fn pcm_stream_frame_is_binary_bounded_and_self_describing() {
+        let chunk = AudioChunk {
+            sequence: 7,
+            sample_offset: 960,
+            format: PcmFormat {
+                sample_rate_hz: 24_000,
+                channels: 1,
+                sample_format: PcmSampleFormat::I16Le,
+                interleaved: true,
+            },
+            data: vec![0x34, 0x12, 0xcd, 0xab],
+            end_of_stream: true,
+        };
+        let frame = pcm_stream_frame(&chunk).expect("frame");
+        assert_eq!(&frame[..4], b"MPCM");
+        assert_eq!(frame[4], 1);
+        assert_eq!(frame[5], 3);
+        assert_eq!(frame[6], 1);
+        assert_eq!(frame[7], 1);
+        assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), 24_000);
+        assert_eq!(u64::from_le_bytes(frame[12..20].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(frame[20..28].try_into().unwrap()), 960);
+        assert_eq!(u32::from_le_bytes(frame[28..32].try_into().unwrap()), 4);
+        assert_eq!(&frame[32..], chunk.data);
     }
 }

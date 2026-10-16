@@ -1,13 +1,15 @@
-use crate::config::{Settings, resolve_settings, upstream_setting_string};
-use crate::conversation_store::{ChatTemplatePolicy, ConversationKind};
-use crate::kv_cache::ensure_persona_prefix;
+use crate::config::{
+    Settings, VerifiedArtifactDigest, VerifiedModelArtifacts, persist_verified_model_artifacts,
+    resolve_settings,
+};
 use crate::native_runtime::{resident_model, resident_slots, resident_status};
-use crate::personas::persona_list;
 use crate::receipts::{Blocker, CommandResult};
-use crate::skill_store::{applied_skill_prompt, persona_prefix_cache_owner_id};
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
-use llama_native_types::{ChatMessage, ChatRole};
+use llama_native_types::{
+    ChatMessage, ChatRole, ChatTemplateChoice, GenerationInput, GenerationRequest, MediaKind,
+    NativeModelLoadMetrics, SamplingConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,54 +33,21 @@ pub struct EngineCheckOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeWarmOutput {
     pub model_loaded: bool,
+    pub audio_projector_warmed: bool,
+    pub audio_projector_warm_us: u64,
     pub persona_prefixes_ready: usize,
     pub persona_prefixes_reused: usize,
+    pub settings_us: u64,
+    pub model_acquire_us: u64,
+    pub model_load: Option<NativeModelLoadMetrics>,
 }
 
-struct PersonaPrefixPlan {
-    owner_id: String,
-    label: String,
-    stable_messages: Vec<ChatMessage>,
-}
-
-fn persona_prefix_plan(
-    persona_id: &str,
-    persona_title: &str,
-    skill_ids: &[String],
-    skills_cacheable: bool,
-    system: &str,
-    skill_prompt: &str,
-    skill_label: &str,
-) -> Option<PersonaPrefixPlan> {
-    let owner_id = persona_prefix_cache_owner_id(Some(persona_id), skill_ids, skills_cacheable)?;
-    let combined = [system.trim(), skill_prompt.trim()]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if combined.is_empty() {
-        return None;
-    }
-    let label = if skill_prompt.trim().is_empty() {
-        format!("Persona: {persona_title}")
-    } else {
-        format!("Persona: {persona_title} ({skill_label})")
-    };
-    Some(PersonaPrefixPlan {
-        owner_id: owner_id.to_string(),
-        label,
-        stable_messages: vec![ChatMessage {
-            role: ChatRole::System,
-            content: combined,
-        }],
-    })
-}
-
-/// Restores the configured model and stable system/persona prefixes after the
-/// shell has painted. Both persona prefixes and conversation checkpoints are
-/// content-addressed on disk; existing entries are promoted instead of being
-/// recomputed, and recent conversations are promoted by the chat path when
-/// selected.
+/// Loads the configured model as soon as the shell exists.
+///
+/// Persona prefixes are built on first use and retained in the resident memory
+/// cache. Walking every Persona here serialized and encrypted hundreds of
+/// megabytes per prefix for long-context hybrid models, turning startup into a
+/// minute-long CPU job and delaying foreground calls behind background work.
 pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<RuntimeWarmOutput>> {
     runtime_warm_until_cancelled(scope, None)
 }
@@ -88,9 +57,15 @@ pub fn runtime_warm_until_cancelled(
     cancellation: Option<&AtomicBool>,
 ) -> Result<CommandResult<RuntimeWarmOutput>> {
     if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
-        return Ok(runtime_warm_result(false, 0, 0));
+        return Ok(runtime_warm_result(false, false, 0, 0, 0, 0, 0, None));
     }
+    let settings_started = std::time::Instant::now();
     let settings = resolve_settings()?;
+    let settings_us = settings_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let acquire_started = std::time::Instant::now();
     let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
@@ -101,96 +76,158 @@ pub fn runtime_warm_until_cancelled(
             ));
         }
     };
-    let global_system = upstream_setting_string(&settings, "systemMessage").unwrap_or_default();
-    let personas = persona_list()?.result.unwrap_or_default();
-    let mut ready = 0usize;
-    let mut reused = 0usize;
-    for persona in personas {
-        if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
-            break;
-        }
-        if persona.kind != ConversationKind::PersonaTemplate
-            || !matches!(
-                persona.execution_profile.chat_template,
-                ChatTemplatePolicy::ModelDefault
-            )
-            || persona
-                .execution_profile
-                .model_path
-                .as_ref()
-                .is_some_and(|path| {
-                    settings
-                        .model_path
-                        .as_ref()
-                        .is_none_or(|default| default != path)
-                })
-            || persona
-                .execution_profile
-                .mmproj_path
-                .as_ref()
-                .is_some_and(|path| {
-                    settings
-                        .mmproj_path
-                        .as_ref()
-                        .is_none_or(|default| default != path)
-                })
-        {
-            continue;
-        }
-        let applied = applied_skill_prompt(&persona.current_skill_ids)?;
-        let system = persona
-            .execution_profile
-            .system_message
-            .as_deref()
-            .unwrap_or(&global_system);
-        let Some(plan) = persona_prefix_plan(
-            &persona.id,
-            &persona.title,
-            &persona.current_skill_ids,
-            applied.cache_owner_id.is_some(),
-            system,
-            &applied.prompt,
-            &applied.cache_label,
-        ) else {
-            continue;
-        };
-        let mut target = plan.stable_messages.clone();
-        target.push(ChatMessage {
-            role: ChatRole::User,
-            content: String::new(),
-        });
-        if let Some(prefix) = ensure_persona_prefix(
-            &handle,
-            &plan.owner_id,
-            &plan.label,
-            &plan.stable_messages,
-            &target,
-        )? {
-            ready += 1;
-            reused += usize::from(prefix.reused);
-        }
+    let model_acquire_us = acquire_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let status = handle.status();
+    let model_load = status
+        .descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.load_metrics.clone());
+    if let (Some(descriptor), Some(fingerprint), Some(model_path)) = (
+        status.descriptor.as_ref(),
+        status.fingerprint.as_ref(),
+        settings.model_path.as_ref(),
+    ) && !descriptor.model_file_identity.is_empty()
+    {
+        let projector = settings
+            .mmproj_path
+            .as_ref()
+            .zip(fingerprint.multimodal_projector_sha256.as_ref())
+            .zip(descriptor.mmproj_file_identity.as_ref())
+            .map(|((path, sha256), file_identity)| VerifiedArtifactDigest {
+                path: path.clone(),
+                sha256: sha256.clone(),
+                file_identity: file_identity.clone(),
+            });
+        persist_verified_model_artifacts(
+            &settings,
+            VerifiedModelArtifacts {
+                model: VerifiedArtifactDigest {
+                    path: model_path.clone(),
+                    sha256: fingerprint.model_sha256.clone(),
+                    file_identity: descriptor.model_file_identity.clone(),
+                },
+                projector,
+            },
+        )?;
     }
-    Ok(runtime_warm_result(true, ready, reused))
+    let audio_warm_started = std::time::Instant::now();
+    let supports_audio = status.descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor
+            .capabilities
+            .media_kinds
+            .contains(&MediaKind::Audio)
+    });
+    let audio_projector_warmed = if supports_audio {
+        warm_audio_projector(&handle, cancellation)?
+    } else {
+        false
+    };
+    let audio_projector_warm_us = if audio_projector_warmed {
+        audio_warm_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
+    } else {
+        0
+    };
+    drop(handle);
+    Ok(runtime_warm_result(
+        true,
+        audio_projector_warmed,
+        audio_projector_warm_us,
+        0,
+        0,
+        settings_us,
+        model_acquire_us,
+        model_load,
+    ))
 }
 
 fn runtime_warm_result(
     model_loaded: bool,
+    audio_projector_warmed: bool,
+    audio_projector_warm_us: u64,
     persona_prefixes_ready: usize,
     persona_prefixes_reused: usize,
+    settings_us: u64,
+    model_acquire_us: u64,
+    model_load: Option<NativeModelLoadMetrics>,
 ) -> CommandResult<RuntimeWarmOutput> {
     CommandResult::passed(
         "mom_llama.runtime_warm",
         "host_integrated",
         RuntimeWarmOutput {
             model_loaded,
+            audio_projector_warmed,
+            audio_projector_warm_us,
             persona_prefixes_ready,
             persona_prefixes_reused,
+            settings_us,
+            model_acquire_us,
+            model_load,
         },
         Vec::new(),
         Vec::new(),
         true,
         false,
     )
+}
+
+/// Compile the audio projector and its first recurrent-model evaluation before
+/// the application advertises voice readiness. Loading GGUF weights alone does
+/// not compile Metal pipelines; without this probe the caller's first 40 ms
+/// frame can stall for hundreds of milliseconds after they stop speaking.
+fn warm_audio_projector(
+    handle: &llama_native_engine::NativeModelHandle,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool> {
+    let mut sampling = SamplingConfig::default();
+    sampling.max_tokens = 1;
+    sampling.temperature = 0.0;
+    let generation = handle.generate_incremental_audio(GenerationRequest {
+        request_id: format!("runtime-audio-warm-{}", uuid::Uuid::new_v4()),
+        model_id: handle.status().model_id,
+        input: GenerationInput::Chat {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Warm the live audio path.".to_string(),
+            }],
+            template: ChatTemplateChoice::PreferNonThinking,
+        },
+        sampling,
+        media: Vec::new(),
+        cached_prefix: None,
+    })?;
+    generation.wait_for_resume()?;
+    let frame = (0..640)
+        .map(|index| {
+            let phase = index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0;
+            phase.sin() * 0.01
+        })
+        .collect::<Vec<_>>();
+    generation.push_pcm(&frame)?;
+    generation.seal_input()?;
+    let monitor = generation.monitor();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while monitor.stats().projected_blocks == 0 {
+        if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+            generation.cancel();
+            let _ = generation.finish().and_then(|ticket| ticket.wait());
+            return Ok(false);
+        }
+        if std::time::Instant::now() >= deadline {
+            generation.cancel();
+            let _ = generation.finish().and_then(|ticket| ticket.wait());
+            anyhow::bail!("the live audio projector did not warm before its bounded deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    generation.cancel();
+    let _ = generation.finish().and_then(|ticket| ticket.wait());
+    Ok(true)
 }
 
 pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
@@ -388,57 +425,9 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::{persona_prefix_plan, runtime_warm_until_cancelled, validate_model_path};
+    use super::{runtime_warm_until_cancelled, validate_model_path};
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn built_in_personas_without_skills_get_distinct_system_prefix_owners() {
-        let first = persona_prefix_plan(
-            "persona-ad-de-jongh",
-            "Ad de Jongh",
-            &[],
-            false,
-            "System prompt for Ad",
-            "",
-            "Applied Skills",
-        )
-        .expect("built-in persona system prompt should be cacheable without skills");
-        let second = persona_prefix_plan(
-            "persona-janina-fisher",
-            "Janina Fisher",
-            &[],
-            false,
-            "System prompt for Janina",
-            "",
-            "Applied Skills",
-        )
-        .expect("second persona system prompt should be cacheable without skills");
-        assert_eq!(first.owner_id, "persona-ad-de-jongh");
-        assert_eq!(first.stable_messages[0].content, "System prompt for Ad");
-        assert_eq!(second.owner_id, "persona-janina-fisher");
-        assert_eq!(
-            second.stable_messages[0].content,
-            "System prompt for Janina"
-        );
-        assert_ne!(first.owner_id, second.owner_id);
-    }
-
-    #[test]
-    fn persona_warm_skips_explicitly_non_cacheable_skills() {
-        assert!(
-            persona_prefix_plan(
-                "persona-private-skill",
-                "Private Skill Persona",
-                &["private-skill".to_string()],
-                false,
-                "system prompt",
-                "sensitive skill prompt",
-                "Private Skill",
-            )
-            .is_none()
-        );
-    }
 
     #[test]
     fn cancelled_background_warm_never_touches_the_model() {
@@ -449,6 +438,8 @@ mod tests {
                 .result
                 .expect("cancelled warm output");
         assert!(!output.model_loaded);
+        assert!(!output.audio_projector_warmed);
+        assert_eq!(output.audio_projector_warm_us, 0);
         assert_eq!(output.persona_prefixes_ready, 0);
         assert_eq!(output.persona_prefixes_reused, 0);
     }

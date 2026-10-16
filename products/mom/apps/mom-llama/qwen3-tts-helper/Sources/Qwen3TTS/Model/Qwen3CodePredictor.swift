@@ -36,13 +36,13 @@ nonisolated class CodePredictorAttention: Module {
     let scale: Float
     let numKVGroups: Int
 
-    let q_proj: Linear
-    let k_proj: Linear
-    let v_proj: Linear
-    let o_proj: Linear
-    let q_norm: Qwen3RMSNorm
-    let k_norm: Qwen3RMSNorm
-    let rope: CodePredictorRotaryEmbedding
+    @ModuleInfo var q_proj: Linear
+    @ModuleInfo var k_proj: Linear
+    @ModuleInfo var v_proj: Linear
+    @ModuleInfo var o_proj: Linear
+    @ModuleInfo var q_norm: Qwen3RMSNorm
+    @ModuleInfo var k_norm: Qwen3RMSNorm
+    @ModuleInfo var rope: CodePredictorRotaryEmbedding
 
     init(config: CodePredictorConfig) {
         self.numHeads = config.num_attention_heads
@@ -116,10 +116,10 @@ nonisolated class CodePredictorAttention: Module {
 // MARK: - Code Predictor Decoder Layer
 
 nonisolated class CodePredictorDecoderLayer: Module {
-    let self_attn: CodePredictorAttention
-    let mlp: Qwen3MLP
-    let input_layernorm: Qwen3RMSNorm
-    let post_attention_layernorm: Qwen3RMSNorm
+    @ModuleInfo var self_attn: CodePredictorAttention
+    @ModuleInfo var mlp: Qwen3MLP
+    @ModuleInfo var input_layernorm: Qwen3RMSNorm
+    @ModuleInfo var post_attention_layernorm: Qwen3RMSNorm
 
     init(config: CodePredictorConfig) {
         self.self_attn = CodePredictorAttention(config: config)
@@ -143,11 +143,11 @@ nonisolated public class Qwen3CodePredictor: Module {
     let config: CodePredictorConfig
     let talkerHiddenSize: Int
 
-    let codec_embedding: [Embedding]
-    let layers: [CodePredictorDecoderLayer]
-    let norm: Qwen3RMSNorm
-    let lm_head: [Linear]
-    let small_to_mtp_projection: Linear?
+    @ModuleInfo var codec_embedding: [Embedding]
+    @ModuleInfo var layers: [CodePredictorDecoderLayer]
+    @ModuleInfo var norm: Qwen3RMSNorm
+    @ModuleInfo var lm_head: [Linear]
+    @ModuleInfo var small_to_mtp_projection: Linear?
 
     public init(config: CodePredictorConfig, talkerHiddenSize: Int) {
         self.config = config

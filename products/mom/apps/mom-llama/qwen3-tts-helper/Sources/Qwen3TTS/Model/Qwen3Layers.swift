@@ -107,6 +107,13 @@ public typealias KVCache = (MLXArray, MLXArray)
 /// Maximum number of tokens to keep in KV cache (sliding window)
 let maxKVCacheWindow: Int = 192
 
+/// Compact only at a coarse boundary after the live cache has actually grown
+/// beyond its window. Synchronizing and purging MLX's allocator cache while
+/// the cache is still in bounds stalls streaming without releasing anything.
+func shouldCompactKVCache(step: Int, currentLength: Int, maxWindow: Int) -> Bool {
+    (step + 1).isMultiple(of: 15) && currentLength > maxWindow
+}
+
 /// Trim KV cache to keep only the most recent tokens within the window.
 func trimKVCache(_ cache: [KVCache], maxWindow: Int) -> [KVCache] {
     guard let first = cache.first else { return cache }
@@ -131,15 +138,15 @@ nonisolated class Qwen3Attention: Module {
     let scale: Float
     let numKVGroups: Int
 
-    let q_proj: Linear
-    let k_proj: Linear
-    let v_proj: Linear
-    let o_proj: Linear
+    @ModuleInfo var q_proj: Linear
+    @ModuleInfo var k_proj: Linear
+    @ModuleInfo var v_proj: Linear
+    @ModuleInfo var o_proj: Linear
 
-    let q_norm: Qwen3RMSNorm
-    let k_norm: Qwen3RMSNorm
+    @ModuleInfo var q_norm: Qwen3RMSNorm
+    @ModuleInfo var k_norm: Qwen3RMSNorm
 
-    let rope: Qwen3RotaryEmbedding
+    @ModuleInfo var rope: Qwen3RotaryEmbedding
 
     init(config: Qwen3TTSConfig) {
         self.numHeads = config.num_attention_heads
@@ -220,9 +227,9 @@ nonisolated class Qwen3Attention: Module {
 // MARK: - MLP
 
 nonisolated class Qwen3MLP: Module {
-    let gate_proj: Linear
-    let up_proj: Linear
-    let down_proj: Linear
+    @ModuleInfo var gate_proj: Linear
+    @ModuleInfo var up_proj: Linear
+    @ModuleInfo var down_proj: Linear
 
     init(hiddenSize: Int, intermediateSize: Int, quantization: QuantizationSettings = .fullPrecision) {
         self.gate_proj = QuantizedLayerFactory.linear(hiddenSize, intermediateSize, bias: false, settings: quantization)
@@ -239,10 +246,10 @@ nonisolated class Qwen3MLP: Module {
 // MARK: - Decoder Layer
 
 nonisolated class Qwen3DecoderLayer: Module {
-    let self_attn: Qwen3Attention
-    let mlp: Qwen3MLP
-    let input_layernorm: Qwen3RMSNorm
-    let post_attention_layernorm: Qwen3RMSNorm
+    @ModuleInfo var self_attn: Qwen3Attention
+    @ModuleInfo var mlp: Qwen3MLP
+    @ModuleInfo var input_layernorm: Qwen3RMSNorm
+    @ModuleInfo var post_attention_layernorm: Qwen3RMSNorm
 
     init(config: Qwen3TTSConfig) {
         self.self_attn = Qwen3Attention(config: config)
@@ -263,8 +270,8 @@ nonisolated class Qwen3DecoderLayer: Module {
 // MARK: - Text Projection
 
 nonisolated public class Qwen3TextProjection: Module {
-    let linear_fc1: Linear
-    let linear_fc2: Linear
+    @ModuleInfo var linear_fc1: Linear
+    @ModuleInfo var linear_fc2: Linear
 
     init(textHiddenSize: Int, hiddenSize: Int, quantization: QuantizationSettings = .fullPrecision) {
         self.linear_fc1 = QuantizedLayerFactory.linear(textHiddenSize, textHiddenSize, bias: true, settings: quantization)

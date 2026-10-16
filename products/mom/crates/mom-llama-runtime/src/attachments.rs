@@ -392,6 +392,7 @@ pub fn attachment_import_voice_message(
         "mom_llama.voice_message_import",
         &host,
         None,
+        Some("[Voice note]"),
     )
 }
 
@@ -461,6 +462,7 @@ fn attachment_import_with_identity(
         "mom_llama.attachment_import",
         &host,
         attachment_id,
+        None,
     )
 }
 
@@ -508,6 +510,7 @@ pub fn attachment_import_pasted_text(
         provided,
         "mom_llama.attachment_import_paste",
         &host,
+        None,
         None,
     )
 }
@@ -594,6 +597,7 @@ fn canonicalize_and_stage(
     command: &str,
     host: &AttachmentHost,
     attachment_id: Option<&str>,
+    internal_draft_marker: Option<&str>,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
     let file_name = provided.display_name.clone();
     let canonicalized = match host.inspect_and_canonicalize(provided) {
@@ -620,6 +624,21 @@ fn canonicalize_and_stage(
     attachment_db.attachments.insert(0, record.clone());
     let mut draft_db = load_drafts()?;
     stage_in_draft(&mut draft_db, conversation_id, &id);
+    if let Some(marker) = internal_draft_marker {
+        if let Some(draft) = draft_db
+            .drafts
+            .iter_mut()
+            .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
+        {
+            // Persist transport ownership in the same atomic document write as
+            // the captured attachment. A crash can therefore restore either
+            // the user's prior draft or a hidden voice transport draft, never
+            // a microphone file masquerading as a user-staged attachment.
+            if draft.message.trim().is_empty() {
+                draft.message = marker.to_string();
+            }
+        }
+    }
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     let mut documents = vec![
@@ -3195,6 +3214,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 0,
+            incomplete: false,
         });
         current.messages.push(source);
         current.selected_model_path = Some(PathBuf::from("   "));
@@ -4355,6 +4375,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 0,
+            incomplete: false,
         });
         let mut second = first.clone();
         second.id = "mention-second".to_string();
@@ -4367,6 +4388,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 1,
+            incomplete: false,
         });
         generated.messages = vec![user.clone(), first, second.clone()];
         generated.active_leaf_message_id = Some(second.id.clone());

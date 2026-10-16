@@ -1377,9 +1377,7 @@ pub(crate) fn instantiate_from_documents(
     crate::attachments::snapshot_message_attachments_from_documents(id, &mut messages, documents)?;
     let conversation = Conversation {
         id: id.to_string(),
-        title: title
-            .clone()
-            .unwrap_or_else(|| format!("Chat with {}", persona.title)),
+        title: title.clone().unwrap_or_else(|| persona.title.clone()),
         created_at: now.to_string(),
         updated_at: now.to_string(),
         kind: ConversationKind::Chat,
@@ -2952,6 +2950,152 @@ mod tests {
         assert_eq!(
             load_db().expect("catalog").conversations.len(),
             before.conversations.len() + 1
+        );
+    }
+
+    #[test]
+    fn empty_single_recipient_draft_materializes_the_exact_call_persona_once() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("single-recipient-call-draft");
+        super::ensure_builtin_catalog().expect("catalog");
+        let before = load_db().expect("catalog");
+        let contact = before
+            .conversations
+            .iter()
+            .find(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .expect("contact")
+            .clone();
+        conversation_draft_open(Some(contact.id.clone())).expect("open exact contact");
+        let call = conversation_draft_call_start()
+            .expect("start call")
+            .result
+            .expect("materialized call");
+        assert_eq!(
+            call.source_conversation_id.as_deref(),
+            Some(contact.id.as_str())
+        );
+        assert_eq!(call.recipient_ids, vec![contact.id.clone()]);
+        assert_eq!(
+            load_db().expect("selected call").selected_conversation_id,
+            Some(call.id.clone())
+        );
+        assert!(
+            conversation_draft_recipients()
+                .expect("cleared route")
+                .recipient_ids
+                .is_empty()
+        );
+        assert_eq!(
+            load_db().expect("one new call").conversations.len(),
+            before.conversations.len() + 1
+        );
+        assert!(
+            conversation_draft_call_start()
+                .expect("stale repeat")
+                .blocker
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn contact_reopens_latest_existing_chat_instead_of_masking_it_with_empty_draft() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("contact-reopens-chat");
+        super::ensure_builtin_catalog().expect("catalog");
+        let contact = load_db()
+            .expect("catalog")
+            .conversations
+            .into_iter()
+            .find(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .expect("contact");
+
+        conversation_draft_open(Some(contact.id.clone())).expect("open contact");
+        draft_update(Some("default"), "hello".into(), Vec::new()).expect("draft");
+        let chat = conversation_draft_submit()
+            .expect("submit")
+            .result
+            .expect("chat");
+        conversation_select(&contact.id).expect("leave chat");
+
+        conversation_draft_open(Some(contact.id)).expect("reopen contact");
+        assert_eq!(
+            load_db().expect("reopened chat").selected_conversation_id,
+            Some(chat.id),
+            "contact navigation must restore history rather than select an empty shared draft"
+        );
+    }
+
+    #[test]
+    fn startup_repair_unmasks_existing_chat_from_legacy_empty_contact_draft() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("startup-unmasks-chat");
+        super::ensure_builtin_catalog().expect("catalog");
+        let contact = load_db()
+            .expect("catalog")
+            .conversations
+            .into_iter()
+            .find(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .expect("contact");
+        conversation_draft_open(Some(contact.id.clone())).expect("open contact");
+        draft_update(Some("default"), "hello".into(), Vec::new()).expect("draft");
+        let chat = conversation_draft_submit()
+            .expect("submit")
+            .result
+            .expect("chat");
+
+        let store = RuntimeStore::current().expect("store");
+        store
+            .mutate_documents(
+                CONVERSATIONS_NAMESPACE,
+                ConversationDb::default,
+                |db, documents| {
+                    db.selected_conversation_id = Some("default".into());
+                    documents.put_bytes(
+                        NEW_CHAT_CONTEXT_NAMESPACE,
+                        &serde_json::to_vec(&Some(contact.id.clone()))?,
+                    )?;
+                    Ok(())
+                },
+            )
+            .expect("legacy empty contact draft");
+
+        assert_eq!(
+            conversation_resume_existing_for_empty_draft().expect("repair"),
+            Some(chat.id.clone())
+        );
+        assert_eq!(
+            load_db()
+                .expect("repaired selection")
+                .selected_conversation_id,
+            Some(chat.id)
+        );
+    }
+
+    #[test]
+    fn call_start_preserves_nonempty_new_message_draft() {
+        use crate::conversation_store::*;
+        let _session = TestDataDir::new("call-preserves-message-draft");
+        super::ensure_builtin_catalog().expect("catalog");
+        let contact = load_db()
+            .expect("catalog")
+            .conversations
+            .into_iter()
+            .find(|contact| contact.kind == ConversationKind::PersonaTemplate)
+            .expect("contact");
+        conversation_draft_open(Some(contact.id)).expect("open contact");
+        draft_update(Some("default"), "unsent text".into(), Vec::new()).expect("draft");
+        let result = conversation_draft_call_start().expect("blocked call");
+        assert_eq!(
+            result.blocker.as_ref().map(|blocker| blocker.code.as_str()),
+            Some("draft_call_content_pending")
+        );
+        assert_eq!(
+            draft_get(Some("default"))
+                .expect("draft remains")
+                .result
+                .expect("draft")
+                .message,
+            "unsent text"
         );
     }
 

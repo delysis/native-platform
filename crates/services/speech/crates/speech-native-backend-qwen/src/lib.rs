@@ -20,9 +20,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 pub const QWEN_BACKEND_ID: &str = "qwen3-tts.mlx-swift";
@@ -33,6 +33,7 @@ pub const QWEN_MODEL_REVISION: &str = "5c390979e4b93af5f2932f90742ca99c7dd04687"
 pub const QWEN_ICL_MODEL_ID: &str = "qwen3-tts-1.7b-base-icl-mlx-audio";
 pub const QWEN_ICL_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-base-bf16";
 const ICL_VOICE_PREFIX: &str = "mom.qwen.icl.";
+const ICL_HELPER_PROTOCOL: &str = "mom-qwen3-tts-resident-v2";
 const ICL_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const ICL_SAMPLE_RATE_HZ: u32 = 24_000;
 const ICL_MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -55,6 +56,14 @@ pub struct QwenIclConfig {
 impl QwenBackendConfig {
     #[must_use]
     pub fn discover(managed_model_root: Option<&Path>) -> Self {
+        Self::discover_with_reference_root(managed_model_root, None)
+    }
+
+    #[must_use]
+    pub fn discover_with_reference_root(
+        managed_model_root: Option<&Path>,
+        installed_reference_root: Option<&Path>,
+    ) -> Self {
         let helper = std::env::var_os("MOM_QWEN3_TTS_HELPER")
             .map(PathBuf::from)
             .or_else(|| {
@@ -75,7 +84,7 @@ impl QwenBackendConfig {
             .or_else(|| managed_model.filter(|path| model_admitted(path)))
             .or_else(|| legacy_model.filter(|path| model_admitted(path)))
             .unwrap_or_else(|| PathBuf::from(QWEN_MODEL_DIRECTORY));
-        let icl = discover_icl_config(managed_model_root, &helper);
+        let icl = discover_icl_config(managed_model_root, installed_reference_root, &helper);
         Self {
             helper,
             model_dir,
@@ -88,24 +97,59 @@ impl QwenBackendConfig {
 pub struct QwenSpeechBackend {
     descriptor: SpeechBackendDescriptor,
     config: QwenBackendConfig,
+    icl_references: Arc<Vec<AdmittedIclReference>>,
     tasks: Arc<TaskSupervisor>,
     active: Arc<Mutex<HashMap<SpeechRequestId, Arc<AtomicBool>>>>,
     icl_worker: Arc<Mutex<Option<ResidentIclWorker>>>,
+    icl_foreground_waiters: Arc<AtomicUsize>,
+    icl_warm_active: Arc<AtomicBool>,
+    icl_warm_cancelled: Arc<AtomicBool>,
+    icl_warm_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    icl_warm_completed: Arc<AtomicUsize>,
+    icl_warm_total: Arc<AtomicUsize>,
+    icl_warm_resident_us: Arc<AtomicU64>,
+    icl_warm_probe_us: Arc<AtomicU64>,
+    icl_warm_total_us: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IclWarmStatus {
+    pub active: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub resident_us: u64,
+    pub probe_us: u64,
+    pub total_us: u64,
 }
 
 struct ResidentIclWorker {
     child: Child,
-    input: BufWriter<ChildStdin>,
+    input: Arc<Mutex<BufWriter<ChildStdin>>>,
     output: BufReader<ChildStdout>,
     sample_rate_hz: u32,
+}
+
+#[derive(Clone)]
+struct AdmittedIclReference {
+    entry: ReferenceEntry,
+    clip: PathBuf,
 }
 
 #[derive(Serialize)]
 struct IclWorkerJob<'a> {
     id: &'a str,
     text: &'a str,
+    persona_id: &'a str,
     ref_audio: &'a str,
+    ref_sha256: &'a str,
     ref_text: &'a str,
+    warm_only: bool,
+}
+
+#[derive(Serialize)]
+struct IclWorkerCancel<'a> {
+    op: &'static str,
+    id: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -121,24 +165,293 @@ struct IclWorkerMessage {
     data: Option<String>,
     #[serde(default)]
     detail: Option<String>,
+    #[serde(default)]
+    reference_cache: Option<String>,
+    #[serde(default)]
+    reference_us: Option<u64>,
+    #[serde(default)]
+    reference_identity_us: Option<u64>,
+    #[serde(default)]
+    reference_memory_lookup_us: Option<u64>,
+    #[serde(default)]
+    reference_disk_lookup_us: Option<u64>,
+    #[serde(default)]
+    reference_source_read_us: Option<u64>,
+    #[serde(default)]
+    reference_source_hash_us: Option<u64>,
+    #[serde(default)]
+    reference_compute_us: Option<u64>,
+    #[serde(default)]
+    reference_persist_us: Option<u64>,
+    #[serde(default)]
+    first_pcm_us: Option<u64>,
+    #[serde(default)]
+    text_chunk_us: Option<u64>,
+    #[serde(default)]
+    code_generation_us: Option<u64>,
+    #[serde(default)]
+    prepared_prefix_cache_hit: Option<bool>,
+    #[serde(default)]
+    first_decode_us: Option<u64>,
+}
+
+struct IclSynthesisResult {
+    sample_count: u64,
+    time_to_first_audio_ms: u64,
+    reference_cache: Option<String>,
+    reference_us: Option<u64>,
+    reference_identity_us: Option<u64>,
+    reference_memory_lookup_us: Option<u64>,
+    reference_disk_lookup_us: Option<u64>,
+    reference_source_read_us: Option<u64>,
+    reference_source_hash_us: Option<u64>,
+    reference_compute_us: Option<u64>,
+    reference_persist_us: Option<u64>,
+    helper_first_pcm_us: Option<u64>,
+    helper_text_chunk_us: Option<u64>,
+    helper_code_generation_us: Option<u64>,
+    helper_prepared_prefix_cache_hit: Option<bool>,
+    helper_first_decode_us: Option<u64>,
 }
 
 impl QwenSpeechBackend {
     #[must_use]
     pub fn discover(config: QwenBackendConfig) -> Self {
         let design_ready = config.helper.is_file() && model_admitted(&config.model_dir);
+        let icl_references = config
+            .icl
+            .as_ref()
+            .map_or_else(Vec::new, admitted_icl_references);
         let icl_voices = config
             .icl
             .as_ref()
-            .map_or_else(Vec::new, admitted_icl_voices);
+            .map_or_else(Vec::new, |icl| admitted_icl_voices(icl, &icl_references));
         let ready = design_ready || !icl_voices.is_empty();
         Self {
             descriptor: descriptor(ready, design_ready, &config, &icl_voices),
             config,
+            icl_references: Arc::new(icl_references),
             tasks: Arc::new(TaskSupervisor::with_scope("qwen3-tts")),
             active: Arc::new(Mutex::new(HashMap::new())),
             icl_worker: Arc::new(Mutex::new(None)),
+            icl_foreground_waiters: Arc::new(AtomicUsize::new(0)),
+            icl_warm_active: Arc::new(AtomicBool::new(false)),
+            icl_warm_cancelled: Arc::new(AtomicBool::new(false)),
+            icl_warm_thread: Arc::new(Mutex::new(None)),
+            icl_warm_completed: Arc::new(AtomicUsize::new(0)),
+            icl_warm_total: Arc::new(AtomicUsize::new(0)),
+            icl_warm_resident_us: Arc::new(AtomicU64::new(0)),
+            icl_warm_probe_us: Arc::new(AtomicU64::new(0)),
+            icl_warm_total_us: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Start the resident model and compile the shared fixed-shape acoustic
+    /// graphs with one admitted reference. Warming every persona here keeps
+    /// submitting Metal work long after the model is resident and can starve
+    /// a live microphone projector. Per-persona reference artifacts remain
+    /// content-addressed on disk and are admitted lazily on first use.
+    pub fn warm_icl_in_background(&self) {
+        let Some(config) = self.config.icl.clone() else {
+            return;
+        };
+        if self
+            .icl_warm_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.icl_warm_cancelled.store(false, Ordering::Release);
+        if let Ok(mut prior) = self.icl_warm_thread.lock()
+            && let Some(handle) = prior.take()
+        {
+            let _ = handle.join();
+        }
+        let worker_slot = Arc::clone(&self.icl_worker);
+        let foreground_waiters = Arc::clone(&self.icl_foreground_waiters);
+        let warm_active = Arc::clone(&self.icl_warm_active);
+        let warm_cancelled = Arc::clone(&self.icl_warm_cancelled);
+        let warm_completed = Arc::clone(&self.icl_warm_completed);
+        let warm_total = Arc::clone(&self.icl_warm_total);
+        let warm_resident_us = Arc::clone(&self.icl_warm_resident_us);
+        let warm_probe_us = Arc::clone(&self.icl_warm_probe_us);
+        let warm_total_us = Arc::clone(&self.icl_warm_total_us);
+        let mut references = self.icl_references.as_ref().clone();
+        references.sort_by_key(|reference| match reference.entry.persona_id.as_str() {
+            "gabor_mate" => 0,
+            "bessel_van_der_kolk" => 1,
+            _ => 2,
+        });
+        references.truncate(1);
+        warm_completed.store(0, Ordering::Release);
+        warm_total.store(references.len(), Ordering::Release);
+        warm_resident_us.store(0, Ordering::Release);
+        warm_probe_us.store(0, Ordering::Release);
+        warm_total_us.store(0, Ordering::Release);
+        let spawned = std::thread::Builder::new()
+            .name("qwen-tts-warm".into())
+            .spawn(move || {
+                let warm_started = Instant::now();
+                let request_id = SpeechRequestId("qwen-startup-warm".into());
+                {
+                    let Some(mut slot) =
+                        lock_background_worker(&worker_slot, &foreground_waiters, &warm_cancelled)
+                    else {
+                        warm_total_us.store(elapsed_us(warm_started), Ordering::Release);
+                        warm_active.store(false, Ordering::Release);
+                        return;
+                    };
+                    if slot.is_none() {
+                        let Ok(worker) = ResidentIclWorker::start(&config, &request_id) else {
+                            warm_total_us.store(elapsed_us(warm_started), Ordering::Release);
+                            warm_active.store(false, Ordering::Release);
+                            return;
+                        };
+                        *slot = Some(worker);
+                    }
+                }
+                warm_resident_us.store(elapsed_us(warm_started), Ordering::Release);
+                for reference in references {
+                    if warm_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Leave a scheduling window between cache entries. A live
+                    // synthesis declares itself before contending for the
+                    // worker and must always win the next admission.
+                    std::thread::sleep(Duration::from_millis(1));
+                    let Some(mut slot) =
+                        lock_background_worker(&worker_slot, &foreground_waiters, &warm_cancelled)
+                    else {
+                        warm_total_us.store(elapsed_us(warm_started), Ordering::Release);
+                        warm_active.store(false, Ordering::Release);
+                        return;
+                    };
+                    if slot.is_none() {
+                        let Ok(worker) = ResidentIclWorker::start(&config, &request_id) else {
+                            continue;
+                        };
+                        *slot = Some(worker);
+                    }
+                    let probe_started = Instant::now();
+                    let warm_failed = slot
+                        .as_mut()
+                        .expect("worker initialized")
+                        .warm_voice(
+                            &request_id,
+                            &reference.entry.persona_id,
+                            &reference.clip,
+                            &reference.entry.clip_sha256,
+                            &reference.entry.reference_transcript,
+                        )
+                        .is_err();
+                    warm_probe_us.store(elapsed_us(probe_started), Ordering::Release);
+                    if warm_failed && slot.as_mut().is_some_and(|worker| !worker.is_running()) {
+                        // A broken pipe belongs to this process generation. A
+                        // bad reference belongs only to this voice: the helper
+                        // has consumed that complete request and remains useful
+                        // for every other persona and the next live synthesis.
+                        slot.take();
+                    }
+                    if !warm_failed {
+                        warm_completed.fetch_add(1, Ordering::AcqRel);
+                    }
+                    drop(slot);
+                }
+                warm_total_us.store(elapsed_us(warm_started), Ordering::Release);
+                warm_active.store(false, Ordering::Release);
+            });
+        match spawned {
+            Ok(handle) => {
+                if let Ok(mut thread) = self.icl_warm_thread.lock() {
+                    *thread = Some(handle);
+                } else {
+                    self.icl_warm_cancelled.store(true, Ordering::Release);
+                    let _ = handle.join();
+                    self.icl_warm_active.store(false, Ordering::Release);
+                }
+            }
+            Err(_) => self.icl_warm_active.store(false, Ordering::Release),
+        }
+    }
+
+    /// Join the one startup compile probe before the application advertises
+    /// resident speech readiness. This is intentionally outside any live
+    /// microphone turn: once it returns, startup work cannot compete with
+    /// Gemma's continuous audio prefill.
+    pub fn wait_for_icl_background_warm(&self) -> Result<IclWarmStatus, SpeechError> {
+        let warm_thread = self
+            .icl_warm_thread
+            .lock()
+            .map_err(|_| {
+                unavailable(
+                    &SpeechRequestId("qwen-startup-warm".into()),
+                    "qwen_warm_state_unavailable",
+                    "Qwen warm worker state is unavailable",
+                )
+            })?
+            .take();
+        if let Some(warm_thread) = warm_thread {
+            warm_thread.join().map_err(|_| {
+                unavailable(
+                    &SpeechRequestId("qwen-startup-warm".into()),
+                    "qwen_warm_worker_panicked",
+                    "Qwen warm worker stopped unexpectedly",
+                )
+            })?;
+        }
+        Ok(IclWarmStatus {
+            active: self.icl_warm_active.load(Ordering::Acquire),
+            completed: self.icl_warm_completed.load(Ordering::Acquire),
+            total: self.icl_warm_total.load(Ordering::Acquire),
+            resident_us: self.icl_warm_resident_us.load(Ordering::Acquire),
+            probe_us: self.icl_warm_probe_us.load(Ordering::Acquire),
+            total_us: self.icl_warm_total_us.load(Ordering::Acquire),
+        })
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+struct ForegroundWorkerWait<'a> {
+    waiters: &'a AtomicUsize,
+}
+
+impl<'a> ForegroundWorkerWait<'a> {
+    fn begin(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters }
+    }
+}
+
+impl Drop for ForegroundWorkerWait<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn lock_background_worker<'a, T>(
+    worker_slot: &'a Mutex<T>,
+    foreground_waiters: &AtomicUsize,
+    cancelled: &AtomicBool,
+) -> Option<MutexGuard<'a, T>> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        if foreground_waiters.load(Ordering::Acquire) == 0 {
+            match worker_slot.try_lock() {
+                Ok(slot) if foreground_waiters.load(Ordering::Acquire) == 0 => return Some(slot),
+                Ok(slot) => drop(slot),
+                Err(TryLockError::Poisoned(_)) => return None,
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        // This is startup-only background work. Sleeping avoids stealing a
+        // core from inference while bounding handoff delay to one millisecond.
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -168,7 +481,11 @@ fn model_admitted(model_dir: &Path) -> bool {
     })
 }
 
-fn discover_icl_config(managed_model_root: Option<&Path>, helper: &Path) -> Option<QwenIclConfig> {
+fn discover_icl_config(
+    managed_model_root: Option<&Path>,
+    installed_reference_root: Option<&Path>,
+    helper: &Path,
+) -> Option<QwenIclConfig> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let default_model = home
         .join("Library/Caches/delysis/voice-ab/models")
@@ -176,9 +493,12 @@ fn discover_icl_config(managed_model_root: Option<&Path>, helper: &Path) -> Opti
     let model_dir = std::env::var_os("MOM_QWEN3_TTS_BASE_MODEL")
         .map(PathBuf::from)
         .unwrap_or(default_model);
-    let installed_reference_root = managed_model_root
+    let colocated_reference_root = managed_model_root
         .and_then(Path::parent)
         .map(|data_dir| data_dir.join("speech-voices/qwen-icl"))
+        .filter(|root| root.join("manifest.json").is_file());
+    let installed_reference_root = installed_reference_root
+        .map(Path::to_path_buf)
         .filter(|root| root.join("manifest.json").is_file());
     let development_reference_root = if cfg!(debug_assertions) {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -194,6 +514,7 @@ fn discover_icl_config(managed_model_root: Option<&Path>, helper: &Path) -> Opti
     let reference_root = std::env::var_os("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")
         .map(PathBuf::from)
         .or(installed_reference_root)
+        .or(colocated_reference_root)
         .or(development_reference_root)?;
     Some(QwenIclConfig {
         helper: helper.to_path_buf(),
@@ -235,22 +556,32 @@ fn manifest_entries(config: &QwenIclConfig) -> Vec<ReferenceEntry> {
     if !manifest.distribution.starts_with("local-only") {
         return Vec::new();
     }
-    manifest
-        .entries
+    manifest.entries
+}
+
+fn admitted_icl_references(config: &QwenIclConfig) -> Vec<AdmittedIclReference> {
+    manifest_entries(config)
         .into_iter()
-        .filter(|entry| entry_is_admitted(config, entry).is_ok())
+        .filter_map(|entry| {
+            entry_is_admitted(config, &entry)
+                .ok()
+                .map(|clip| AdmittedIclReference { entry, clip })
+        })
         .collect()
 }
 
-fn admitted_icl_voices(config: &QwenIclConfig) -> Vec<VoiceDescriptor> {
-    if !config.helper.is_file() || !base_model_admitted(&config.model_dir) {
+fn admitted_icl_voices(
+    config: &QwenIclConfig,
+    references: &[AdmittedIclReference],
+) -> Vec<VoiceDescriptor> {
+    if !helper_supports_icl_protocol(&config.helper) || !base_model_admitted(&config.model_dir) {
         return Vec::new();
     }
-    manifest_entries(config)
-        .into_iter()
-        .map(|entry| VoiceDescriptor {
-            id: icl_voice_id(&entry.persona_id),
-            name: entry.speaker,
+    references
+        .iter()
+        .map(|reference| VoiceDescriptor {
+            id: icl_voice_id(&reference.entry.persona_id),
+            name: reference.entry.speaker.clone(),
             language: "en-US".into(),
             gender: None,
             quality: Some(VoiceQuality::Premium),
@@ -259,6 +590,21 @@ fn admitted_icl_voices(config: &QwenIclConfig) -> Vec<VoiceDescriptor> {
             installed: true,
         })
         .collect()
+}
+
+fn helper_supports_icl_protocol(helper: &Path) -> bool {
+    if !helper.is_file() {
+        return false;
+    }
+    Command::new(helper)
+        .arg("--protocol")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == ICL_HELPER_PROTOCOL
+        })
 }
 
 fn base_model_admitted(model_dir: &Path) -> bool {
@@ -322,16 +668,15 @@ fn entry_is_admitted(
     Ok(clip)
 }
 
-fn resolve_icl_entry(config: &QwenIclConfig, voice_id: &str) -> Option<(ReferenceEntry, PathBuf)> {
+fn resolve_icl_entry(
+    references: &[AdmittedIclReference],
+    voice_id: &str,
+) -> Option<AdmittedIclReference> {
     let key = persona_key_from_voice_id(voice_id)?;
-    manifest_entries(config).into_iter().find_map(|entry| {
-        if normalize_persona_key(&entry.persona_id) != key {
-            return None;
-        }
-        entry_is_admitted(config, &entry)
-            .ok()
-            .map(|clip| (entry, clip))
-    })
+    references
+        .iter()
+        .find(|reference| normalize_persona_key(&reference.entry.persona_id) == key)
+        .cloned()
 }
 
 fn normalize_persona_key(persona_id: &str) -> &str {
@@ -401,6 +746,11 @@ impl SpeechBackend for QwenSpeechBackend {
             .insert(request_id.clone(), Arc::clone(&cancelled));
         let active = Arc::clone(&self.active);
         let icl_worker = Arc::clone(&self.icl_worker);
+        let icl_references = Arc::clone(&self.icl_references);
+        let icl_foreground_waiters = Arc::clone(&self.icl_foreground_waiters);
+        let icl_warm_active = Arc::clone(&self.icl_warm_active);
+        let icl_warm_completed = Arc::clone(&self.icl_warm_completed);
+        let icl_warm_total = Arc::clone(&self.icl_warm_total);
         let config = self.config.clone();
         let worker_id = request_id.clone();
         let cancellation = Arc::clone(&cancelled);
@@ -410,13 +760,25 @@ impl SpeechBackend for QwenSpeechBackend {
                     synthesize_streaming_icl(
                         &request,
                         &config,
+                        &icl_references,
                         &route,
                         &cancellation,
                         &events_tx,
                         &icl_worker,
+                        &icl_foreground_waiters,
+                        &icl_warm_active,
+                        &icl_warm_completed,
+                        &icl_warm_total,
                     )
                 } else {
-                    synthesize_complete(&request, &config, &route, &cancellation, &events_tx)
+                    synthesize_complete(
+                        &request,
+                        &config,
+                        &icl_references,
+                        &route,
+                        &cancellation,
+                        &events_tx,
+                    )
                 };
                 let _ = match &result {
                     Ok(response) => events_tx.blocking_send(SynthesisEvent::Completed {
@@ -458,6 +820,7 @@ impl SpeechBackend for QwenSpeechBackend {
     }
 
     async fn shutdown(&self) -> Result<(), SpeechError> {
+        self.icl_warm_cancelled.store(true, Ordering::Release);
         if let Ok(map) = self.active.lock() {
             for flag in map.values() {
                 flag.store(true, Ordering::Release);
@@ -477,6 +840,35 @@ impl SpeechBackend for QwenSpeechBackend {
                 &e.to_string(),
             )
         })?;
+        let warm_thread = self
+            .icl_warm_thread
+            .lock()
+            .map_err(|_| {
+                unavailable(
+                    &SpeechRequestId("qwen-shutdown".into()),
+                    "qwen_shutdown_failed",
+                    "Qwen warm worker state is unavailable",
+                )
+            })?
+            .take();
+        if let Some(warm_thread) = warm_thread {
+            tokio::task::spawn_blocking(move || warm_thread.join())
+                .await
+                .map_err(|error| {
+                    unavailable(
+                        &SpeechRequestId("qwen-shutdown".into()),
+                        "qwen_shutdown_failed",
+                        &error.to_string(),
+                    )
+                })?
+                .map_err(|_| {
+                    unavailable(
+                        &SpeechRequestId("qwen-shutdown".into()),
+                        "qwen_shutdown_failed",
+                        "Qwen warm worker panicked",
+                    )
+                })?;
+        }
         if let Ok(mut worker) = self.icl_worker.lock() {
             worker.take();
         }
@@ -570,6 +962,7 @@ fn validate_request(
 fn synthesize_complete(
     request: &SynthesisRequest,
     config: &QwenBackendConfig,
+    references: &[AdmittedIclReference],
     route: &SpeechResolvedRoute,
     cancelled: &AtomicBool,
     events: &mpsc::Sender<SynthesisEvent>,
@@ -599,11 +992,18 @@ fn synthesize_complete(
                 "Local Qwen voice references are unavailable",
             )
         })?;
-        let (entry, clip) = resolve_icl_entry(icl, voice_id).ok_or_else(|| {
+        let reference = resolve_icl_entry(references, voice_id).ok_or_else(|| {
             unavailable(
                 request_id,
                 "qwen_icl_reference_invalid",
                 "The selected local reference failed manifest, transcript, or hash validation",
+            )
+        })?;
+        let clip = entry_is_admitted(icl, &reference.entry).map_err(|_| {
+            unavailable(
+                request_id,
+                "qwen_icl_reference_invalid",
+                "The selected local reference changed after admission",
             )
         })?;
         let output = tempfile::Builder::new()
@@ -615,7 +1015,7 @@ fn synthesize_complete(
             .arg("--icl")
             .arg(&icl.model_dir)
             .arg(clip)
-            .arg(&entry.reference_transcript)
+            .arg(&reference.entry.reference_transcript)
             .arg(output.path())
             .arg(text)
             .stdout(Stdio::null())
@@ -700,11 +1100,17 @@ fn synthesize_complete(
 fn synthesize_streaming_icl(
     request: &SynthesisRequest,
     config: &QwenBackendConfig,
+    references: &[AdmittedIclReference],
     route: &SpeechResolvedRoute,
     cancelled: &AtomicBool,
     events: &mpsc::Sender<SynthesisEvent>,
     worker_slot: &Mutex<Option<ResidentIclWorker>>,
+    foreground_waiters: &AtomicUsize,
+    warm_active: &AtomicBool,
+    warm_completed: &AtomicUsize,
+    warm_total: &AtomicUsize,
 ) -> Result<SynthesisResponse, SpeechError> {
+    let started = Instant::now();
     let request_id = &request.context.request_id;
     let voice_id = voice_id_from_selector(request).ok_or_else(|| {
         SpeechError::invalid_request(
@@ -720,13 +1126,16 @@ fn synthesize_streaming_icl(
             "Local Qwen voice references are unavailable",
         )
     })?;
-    let (entry, clip) = resolve_icl_entry(icl, voice_id).ok_or_else(|| {
+    let reference_started = Instant::now();
+    let reference = resolve_icl_entry(references, voice_id).ok_or_else(|| {
         unavailable(
             request_id,
             "qwen_icl_reference_invalid",
             "The selected local reference failed manifest, transcript, or hash validation",
         )
     })?;
+    let reference_admission_us =
+        u64::try_from(reference_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let text = match &request.input {
         SynthesisInput::Text { text } => text,
         SynthesisInput::Ssml { .. } => unreachable!(),
@@ -737,7 +1146,11 @@ fn synthesize_streaming_icl(
             route: route.clone(),
         })
         .map_err(|_| cancelled_error(request_id))?;
-    let started = Instant::now();
+    let warm_active_at_dispatch = warm_active.load(Ordering::Acquire);
+    let warm_completed_at_dispatch = warm_completed.load(Ordering::Acquire);
+    let warm_total_at_dispatch = warm_total.load(Ordering::Acquire);
+    let worker_lock_started = Instant::now();
+    let foreground_wait = ForegroundWorkerWait::begin(foreground_waiters);
     let mut worker = worker_slot.lock().map_err(|_| {
         unavailable(
             request_id,
@@ -745,21 +1158,36 @@ fn synthesize_streaming_icl(
             "The resident Qwen worker is unavailable",
         )
     })?;
+    drop(foreground_wait);
+    let queue_elapsed = worker_lock_started.elapsed();
+    let queue_ms = u64::try_from(queue_elapsed.as_millis()).unwrap_or(u64::MAX);
+    let queue_us = u64::try_from(queue_elapsed.as_micros()).unwrap_or(u64::MAX);
+    let mut model_load_ms = None;
     if worker.is_none() {
+        let model_load_started = Instant::now();
         *worker = Some(ResidentIclWorker::start(icl, request_id)?);
+        model_load_ms =
+            Some(u64::try_from(model_load_started.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
     let result = worker.as_mut().expect("worker initialized").synthesize(
         request_id,
         text,
-        &clip,
-        &entry.reference_transcript,
+        &reference.entry.persona_id,
+        &reference.clip,
+        &reference.entry.clip_sha256,
+        &reference.entry.reference_transcript,
         cancelled,
         events,
+        started,
     );
-    if result.is_err() {
+    if result
+        .as_ref()
+        .is_err_and(|error| !worker_is_reusable_after(error))
+    {
         worker.take();
     }
-    let sample_count = result?;
+    let result = result?;
+    let sample_count = result.sample_count;
     let duration_ms = sample_count.saturating_mul(1000) / u64::from(ICL_SAMPLE_RATE_HZ);
     Ok(SynthesisResponse {
         request_id: request_id.clone(),
@@ -773,6 +1201,30 @@ fn synthesize_streaming_icl(
         usage: SpeechUsage {
             output_audio_ms: Some(duration_ms),
             input_characters: Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
+            queue_ms: Some(queue_ms),
+            queue_us: Some(queue_us),
+            model_load_ms,
+            background_warm_active: Some(warm_active_at_dispatch),
+            background_warm_completed: Some(
+                u64::try_from(warm_completed_at_dispatch).unwrap_or(u64::MAX),
+            ),
+            background_warm_total: Some(u64::try_from(warm_total_at_dispatch).unwrap_or(u64::MAX)),
+            reference_admission_us: Some(reference_admission_us),
+            reference_cache: result.reference_cache,
+            reference_us: result.reference_us,
+            reference_identity_us: result.reference_identity_us,
+            reference_memory_lookup_us: result.reference_memory_lookup_us,
+            reference_disk_lookup_us: result.reference_disk_lookup_us,
+            reference_source_read_us: result.reference_source_read_us,
+            reference_source_hash_us: result.reference_source_hash_us,
+            reference_compute_us: result.reference_compute_us,
+            reference_persist_us: result.reference_persist_us,
+            helper_first_pcm_us: result.helper_first_pcm_us,
+            helper_text_chunk_us: result.helper_text_chunk_us,
+            helper_code_generation_us: result.helper_code_generation_us,
+            helper_prepared_prefix_cache_hit: result.helper_prepared_prefix_cache_hit,
+            helper_first_decode_us: result.helper_first_decode_us,
+            time_to_first_result_ms: Some(result.time_to_first_audio_ms),
             total_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             provenance: UsageProvenance::Exact,
             real_local_inference: true,
@@ -781,7 +1233,18 @@ fn synthesize_streaming_icl(
     })
 }
 
+fn worker_is_reusable_after(error: &SpeechError) -> bool {
+    // `error` and `fatal` are complete terminal protocol messages for the
+    // submitted job. All other failures may have unread audio or a broken
+    // pipe, so reusing that process could bind stale PCM to the next request.
+    error.code == "qwen_icl_synthesis_failed" || error.code == "qwen_icl_cancelled_clean"
+}
+
 impl ResidentIclWorker {
+    fn is_running(&mut self) -> bool {
+        self.child.try_wait().is_ok_and(|status| status.is_none())
+    }
+
     fn start(config: &QwenIclConfig, request_id: &SpeechRequestId) -> Result<Self, SpeechError> {
         let mut child = Command::new(&config.helper)
             .arg("--resident")
@@ -807,7 +1270,7 @@ impl ResidentIclWorker {
         })?;
         let mut worker = Self {
             child,
-            input: BufWriter::new(input),
+            input: Arc::new(Mutex::new(BufWriter::new(input))),
             output: BufReader::new(output),
             sample_rate_hz: 0,
         };
@@ -827,27 +1290,28 @@ impl ResidentIclWorker {
         &mut self,
         request_id: &SpeechRequestId,
         text: &str,
+        persona_id: &str,
         clip: &Path,
+        clip_sha256: &str,
         transcript: &str,
         cancelled: &AtomicBool,
         events: &mpsc::Sender<SynthesisEvent>,
-    ) -> Result<u64, SpeechError> {
+        started: Instant,
+    ) -> Result<IclSynthesisResult, SpeechError> {
         if cancelled.load(Ordering::Acquire) {
-            return Err(cancelled_error(request_id));
+            return Err(clean_icl_cancelled_error(request_id));
         }
         let clip_path = clip.to_string_lossy();
         let job = IclWorkerJob {
             id: request_id.0.as_str(),
             text,
+            persona_id,
             ref_audio: &clip_path,
+            ref_sha256: clip_sha256,
             ref_text: transcript,
+            warm_only: false,
         };
-        serde_json::to_writer(&mut self.input, &job)
-            .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))?;
-        self.input
-            .write_all(b"\n")
-            .and_then(|()| self.input.flush())
-            .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))?;
+        write_worker_command(&self.input, request_id, &job)?;
 
         let format = speech_native_types::PcmFormat {
             sample_rate_hz: self.sample_rate_hz,
@@ -857,118 +1321,230 @@ impl ResidentIclWorker {
         };
         let mut sequence = 0_u64;
         let mut sample_offset = 0_u64;
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                return Err(cancelled_error(request_id));
-            }
-            let message = self.read_message(request_id)?;
-            if message.id.as_deref().is_some_and(|id| id != request_id.0) {
-                return Err(unavailable(
-                    request_id,
-                    "qwen_icl_worker_protocol_error",
-                    "The resident Qwen worker returned audio for a different request",
-                ));
-            }
-            match message.event.as_str() {
-                "audio" => {
-                    if message.sample_rate != Some(self.sample_rate_hz) {
-                        return Err(unavailable(
-                            request_id,
-                            "qwen_icl_audio_invalid",
-                            "Qwen returned an unexpected sample rate",
-                        ));
+        let mut time_to_first_audio_ms = None;
+        let mut reference_cache = None;
+        let mut reference_us = None;
+        let mut reference_identity_us = None;
+        let mut reference_memory_lookup_us = None;
+        let mut reference_disk_lookup_us = None;
+        let mut reference_source_read_us = None;
+        let mut reference_source_hash_us = None;
+        let mut reference_compute_us = None;
+        let mut reference_persist_us = None;
+        let mut helper_first_pcm_us = None;
+        let mut helper_text_chunk_us = None;
+        let mut helper_code_generation_us = None;
+        let mut helper_prepared_prefix_cache_hit = None;
+        let mut helper_first_decode_us = None;
+        let cancel_input = Arc::clone(&self.input);
+        let watcher_done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !watcher_done.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire) {
+                        let command = IclWorkerCancel {
+                            op: "cancel",
+                            id: request_id.0.as_str(),
+                        };
+                        let _ = write_worker_command(&cancel_input, request_id, &command);
+                        break;
                     }
-                    let encoded = message.data.as_deref().ok_or_else(|| {
-                        unavailable(
-                            request_id,
-                            "qwen_icl_audio_invalid",
-                            "Qwen returned an empty audio packet",
-                        )
-                    })?;
-                    let data = base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .map_err(|_| {
-                            unavailable(
-                                request_id,
-                                "qwen_icl_audio_invalid",
-                                "Qwen returned an invalid audio packet",
-                            )
-                        })?;
-                    if data.is_empty()
-                        || data.len() > ICL_MAX_CHUNK_BYTES
-                        || !data.len().is_multiple_of(2)
-                    {
-                        return Err(unavailable(
-                            request_id,
-                            "qwen_icl_audio_invalid",
-                            "Qwen audio packet exceeded bounds or was misaligned",
-                        ));
-                    }
-                    let samples = u64::try_from(data.len() / 2).unwrap_or(u64::MAX);
-                    if message.samples != Some(samples) {
-                        return Err(unavailable(
-                            request_id,
-                            "qwen_icl_audio_invalid",
-                            "Qwen audio packet sample count did not match its data",
-                        ));
-                    }
-                    let chunk = speech_native_types::AudioChunk {
-                        sequence,
-                        sample_offset,
-                        format: format.clone(),
-                        data,
-                        end_of_stream: false,
-                    };
-                    chunk.validate(request_id)?;
-                    events
-                        .blocking_send(SynthesisEvent::Audio {
-                            request_id: request_id.clone(),
-                            chunk,
-                        })
-                        .map_err(|_| cancelled_error(request_id))?;
-                    sequence = sequence.saturating_add(1);
-                    sample_offset = sample_offset.saturating_add(samples);
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                "done" => {
-                    if sample_offset == 0 {
-                        return Err(unavailable(
-                            request_id,
-                            "qwen_icl_audio_empty",
-                            "Qwen returned no streaming audio",
-                        ));
-                    }
-                    events
-                        .blocking_send(SynthesisEvent::Audio {
-                            request_id: request_id.clone(),
-                            chunk: speech_native_types::AudioChunk {
-                                sequence,
-                                sample_offset,
-                                format,
-                                data: Vec::new(),
-                                end_of_stream: true,
-                            },
-                        })
-                        .map_err(|_| cancelled_error(request_id))?;
-                    return Ok(sample_offset);
-                }
-                "error" | "fatal" => {
-                    return Err(unavailable(
-                        request_id,
-                        "qwen_icl_synthesis_failed",
-                        message
-                            .detail
-                            .as_deref()
-                            .unwrap_or("The resident Qwen worker failed synthesis"),
-                    ));
-                }
-                _ => {
+            });
+            let result = (|| loop {
+                let message = self.read_message(request_id)?;
+                if message.id.as_deref().is_some_and(|id| id != request_id.0) {
                     return Err(unavailable(
                         request_id,
                         "qwen_icl_worker_protocol_error",
-                        "The resident Qwen worker returned an unknown event",
+                        "The resident Qwen worker returned audio for a different request",
                     ));
                 }
-            }
+                match message.event.as_str() {
+                    "audio" => {
+                        let first_audio_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if message.sample_rate != Some(self.sample_rate_hz) {
+                            return Err(unavailable(
+                                request_id,
+                                "qwen_icl_audio_invalid",
+                                "Qwen returned an unexpected sample rate",
+                            ));
+                        }
+                        let encoded = message.data.as_deref().ok_or_else(|| {
+                            unavailable(
+                                request_id,
+                                "qwen_icl_audio_invalid",
+                                "Qwen returned an empty audio packet",
+                            )
+                        })?;
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .map_err(|_| {
+                                unavailable(
+                                    request_id,
+                                    "qwen_icl_audio_invalid",
+                                    "Qwen returned an invalid audio packet",
+                                )
+                            })?;
+                        if data.is_empty()
+                            || data.len() > ICL_MAX_CHUNK_BYTES
+                            || !data.len().is_multiple_of(2)
+                        {
+                            return Err(unavailable(
+                                request_id,
+                                "qwen_icl_audio_invalid",
+                                "Qwen audio packet exceeded bounds or was misaligned",
+                            ));
+                        }
+                        let samples = u64::try_from(data.len() / 2).unwrap_or(u64::MAX);
+                        if message.samples != Some(samples) {
+                            return Err(unavailable(
+                                request_id,
+                                "qwen_icl_audio_invalid",
+                                "Qwen audio packet sample count did not match its data",
+                            ));
+                        }
+                        if sequence == 0 {
+                            if message.reference_cache.as_deref().is_some_and(|source| {
+                                !matches!(source, "memory" | "disk" | "computed")
+                            }) {
+                                return Err(unavailable(
+                                    request_id,
+                                    "qwen_icl_worker_protocol_error",
+                                    "Qwen returned an unknown reference cache source",
+                                ));
+                            }
+                            reference_cache = message.reference_cache;
+                            reference_us = message.reference_us;
+                            reference_identity_us = message.reference_identity_us;
+                            reference_memory_lookup_us = message.reference_memory_lookup_us;
+                            reference_disk_lookup_us = message.reference_disk_lookup_us;
+                            reference_source_read_us = message.reference_source_read_us;
+                            reference_source_hash_us = message.reference_source_hash_us;
+                            reference_compute_us = message.reference_compute_us;
+                            reference_persist_us = message.reference_persist_us;
+                            helper_first_pcm_us = message.first_pcm_us;
+                            helper_text_chunk_us = message.text_chunk_us;
+                            helper_code_generation_us = message.code_generation_us;
+                            helper_prepared_prefix_cache_hit = message.prepared_prefix_cache_hit;
+                            helper_first_decode_us = message.first_decode_us;
+                        }
+                        let chunk = speech_native_types::AudioChunk {
+                            sequence,
+                            sample_offset,
+                            format: format.clone(),
+                            data,
+                            end_of_stream: false,
+                        };
+                        chunk.validate(request_id)?;
+                        events
+                            .blocking_send(SynthesisEvent::Audio {
+                                request_id: request_id.clone(),
+                                chunk,
+                            })
+                            .map_err(|_| cancelled_error(request_id))?;
+                        time_to_first_audio_ms.get_or_insert(first_audio_ms);
+                        sequence = sequence.saturating_add(1);
+                        sample_offset = sample_offset.saturating_add(samples);
+                    }
+                    "done" => {
+                        if sample_offset == 0 {
+                            return Err(unavailable(
+                                request_id,
+                                "qwen_icl_audio_empty",
+                                "Qwen returned no streaming audio",
+                            ));
+                        }
+                        events
+                            .blocking_send(SynthesisEvent::Audio {
+                                request_id: request_id.clone(),
+                                chunk: speech_native_types::AudioChunk {
+                                    sequence,
+                                    sample_offset,
+                                    format,
+                                    data: Vec::new(),
+                                    end_of_stream: true,
+                                },
+                            })
+                            .map_err(|_| cancelled_error(request_id))?;
+                        return Ok(IclSynthesisResult {
+                            sample_count: sample_offset,
+                            time_to_first_audio_ms: time_to_first_audio_ms
+                                .expect("nonempty audio has a first packet"),
+                            reference_cache,
+                            reference_us,
+                            reference_identity_us,
+                            reference_memory_lookup_us,
+                            reference_disk_lookup_us,
+                            reference_source_read_us,
+                            reference_source_hash_us,
+                            reference_compute_us,
+                            reference_persist_us,
+                            helper_first_pcm_us,
+                            helper_text_chunk_us,
+                            helper_code_generation_us,
+                            helper_prepared_prefix_cache_hit,
+                            helper_first_decode_us,
+                        });
+                    }
+                    "cancelled" => return Err(clean_icl_cancelled_error(request_id)),
+                    "error" | "fatal" => {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_synthesis_failed",
+                            message
+                                .detail
+                                .as_deref()
+                                .unwrap_or("The resident Qwen worker failed synthesis"),
+                        ));
+                    }
+                    _ => {
+                        return Err(unavailable(
+                            request_id,
+                            "qwen_icl_worker_protocol_error",
+                            "The resident Qwen worker returned an unknown event",
+                        ));
+                    }
+                }
+            })();
+            watcher_done.store(true, Ordering::Release);
+            result
+        })
+    }
+
+    fn warm_voice(
+        &mut self,
+        request_id: &SpeechRequestId,
+        persona_id: &str,
+        clip: &Path,
+        clip_sha256: &str,
+        transcript: &str,
+    ) -> Result<(), SpeechError> {
+        let clip_path = clip.to_string_lossy();
+        let job = IclWorkerJob {
+            id: request_id.0.as_str(),
+            text: "",
+            persona_id,
+            ref_audio: &clip_path,
+            ref_sha256: clip_sha256,
+            ref_text: transcript,
+            warm_only: true,
+        };
+        write_worker_command(&self.input, request_id, &job)?;
+        let message = self.read_message(request_id)?;
+        if message.event == "warmed" && message.id.as_deref() == Some(request_id.0.as_str()) {
+            Ok(())
+        } else {
+            Err(unavailable(
+                request_id,
+                "qwen_icl_worker_protocol_error",
+                message
+                    .detail
+                    .as_deref()
+                    .unwrap_or("Qwen voice warmup failed"),
+            ))
         }
     }
 
@@ -996,6 +1572,26 @@ impl ResidentIclWorker {
             )
         })
     }
+}
+
+fn write_worker_command<T: Serialize>(
+    input: &Arc<Mutex<BufWriter<ChildStdin>>>,
+    request_id: &SpeechRequestId,
+    command: &T,
+) -> Result<(), SpeechError> {
+    let mut input = input.lock().map_err(|_| {
+        unavailable(
+            request_id,
+            "qwen_icl_worker_write_failed",
+            "The resident Qwen worker input is unavailable",
+        )
+    })?;
+    serde_json::to_writer(&mut *input, command)
+        .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))?;
+    input
+        .write_all(b"\n")
+        .and_then(|()| input.flush())
+        .map_err(|e| unavailable(request_id, "qwen_icl_worker_write_failed", &e.to_string()))
 }
 
 impl Drop for ResidentIclWorker {
@@ -1270,6 +1866,16 @@ fn cancelled_error(id: &SpeechRequestId) -> SpeechError {
     )
 }
 
+fn clean_icl_cancelled_error(id: &SpeechRequestId) -> SpeechError {
+    error(
+        id,
+        "qwen_icl_cancelled_clean",
+        SpeechErrorClass::Cancelled,
+        false,
+        "Qwen3 TTS synthesis was cancelled and the resident worker acknowledged quiescence",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,6 +1883,62 @@ mod tests {
         AlignmentGranularity, SpeechDeadlinePolicy, SpeechPrivacyPolicy, SpeechRequestContext,
         SpeechRouteProfile, SpeechRoutingPolicy,
     };
+
+    #[test]
+    fn foreground_waiter_wins_next_worker_admission() {
+        let worker = Arc::new(Mutex::new(0_u8));
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let initial = worker.lock().expect("initial worker owner");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+
+        let foreground_worker = Arc::clone(&worker);
+        let foreground_waiters = Arc::clone(&waiters);
+        let foreground_order = order_tx.clone();
+        let foreground = std::thread::spawn(move || {
+            let waiting = ForegroundWorkerWait::begin(&foreground_waiters);
+            ready_tx.send(()).expect("foreground ready");
+            let mut worker = foreground_worker.lock().expect("foreground lock");
+            drop(waiting);
+            *worker = 1;
+            foreground_order
+                .send("foreground")
+                .expect("foreground order");
+            std::thread::sleep(Duration::from_millis(5));
+        });
+        ready_rx.recv().expect("foreground declared");
+
+        let background_worker = Arc::clone(&worker);
+        let background_waiters = Arc::clone(&waiters);
+        let background_cancelled = Arc::new(AtomicBool::new(false));
+        let background = std::thread::spawn(move || {
+            let mut worker = lock_background_worker(
+                &background_worker,
+                &background_waiters,
+                &background_cancelled,
+            )
+            .expect("background lock");
+            *worker = 2;
+            order_tx.send("background").expect("background order");
+        });
+
+        drop(initial);
+        assert_eq!(order_rx.recv().expect("first admission"), "foreground");
+        assert_eq!(order_rx.recv().expect("second admission"), "background");
+        foreground.join().expect("foreground join");
+        background.join().expect("background join");
+        assert_eq!(waiters.load(Ordering::Acquire), 0);
+        assert_eq!(*worker.lock().expect("final worker"), 2);
+    }
+
+    #[test]
+    fn cancelled_background_warm_never_waits_for_worker_admission() {
+        let worker = Mutex::new(0_u8);
+        let waiters = AtomicUsize::new(1);
+        let cancelled = AtomicBool::new(true);
+        assert!(lock_background_worker(&worker, &waiters, &cancelled).is_none());
+    }
+
     #[test]
     fn wav_duration_rejects_wrong_shape() {
         assert_eq!(wav_duration_ms(b"not wav"), None);
@@ -1295,6 +1957,47 @@ mod tests {
         let mut wrong_rate = pcm_wav();
         wrong_rate[24..28].copy_from_slice(&16_000_u32.to_le_bytes());
         assert_eq!(wav_duration_ms(&wrong_rate), None);
+    }
+
+    #[test]
+    fn resident_worker_survives_only_a_consumed_terminal_job_error() {
+        let request = SpeechRequestId("resident-reuse-policy".into());
+        assert!(worker_is_reusable_after(&unavailable(
+            &request,
+            "qwen_icl_synthesis_failed",
+            "job failed"
+        )));
+        assert!(worker_is_reusable_after(&clean_icl_cancelled_error(
+            &request
+        )));
+        assert!(!worker_is_reusable_after(&unavailable(
+            &request,
+            "qwen_synthesis_cancelled",
+            "stream may still have unread PCM"
+        )));
+        assert!(!worker_is_reusable_after(&unavailable(
+            &request,
+            "qwen_icl_audio_invalid",
+            "stream framing is no longer trusted"
+        )));
+    }
+
+    #[test]
+    fn resident_job_binds_the_admitted_persona_identity() {
+        let job = IclWorkerJob {
+            id: "request-1",
+            text: "hello",
+            persona_id: "gabor_mate",
+            ref_audio: "/immutable/reference.wav",
+            ref_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ref_text: "reference",
+            warm_only: false,
+        };
+        let value = serde_json::to_value(job).expect("serialize resident job");
+
+        assert_eq!(value["persona_id"], "gabor_mate");
+        assert_eq!(value["ref_sha256"], "a".repeat(64));
+        assert_eq!(value["warm_only"], false);
     }
 
     #[test]
@@ -1329,11 +2032,45 @@ mod tests {
             entry_is_admitted(&config, &wrong_hash),
             Err("reference clip hash mismatch")
         );
-        let mut traversal = entry;
+        let mut traversal = entry.clone();
         traversal.clip_path = "../outside.wav".into();
         assert_eq!(
             entry_is_admitted(&config, &traversal),
             Err("reference clip path is not a safe relative path")
+        );
+
+        let admitted = AdmittedIclReference {
+            entry,
+            clip: fs::canonicalize(root.path().join("clips/ref.wav")).expect("canonical clip"),
+        };
+        fs::remove_file(root.path().join("clips/ref.wav")).expect("remove after admission");
+        let resolved = resolve_icl_entry(&[admitted], &icl_voice_id("gabor_mate"))
+            .expect("immutable admitted reference");
+        assert_eq!(resolved.entry.persona_id, "gabor_mate");
+    }
+
+    #[test]
+    fn installed_reference_root_is_independent_from_runtime_model_storage() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let managed_model_root = fixture.path().join("encrypted-runtime/speech-models");
+        let installed_reference_root = fixture
+            .path()
+            .join("platform-app-data/speech-voices/qwen-icl");
+        fs::create_dir_all(&installed_reference_root).expect("installed voice root");
+        fs::write(installed_reference_root.join("manifest.json"), b"{}")
+            .expect("installed voice manifest");
+
+        let config = QwenBackendConfig::discover_with_reference_root(
+            Some(&managed_model_root),
+            Some(&installed_reference_root),
+        );
+
+        assert_eq!(
+            config
+                .icl
+                .expect("explicit installed voice root")
+                .reference_root,
+            installed_reference_root
         );
     }
 

@@ -2,12 +2,14 @@ mod app_runtime;
 mod command_registry;
 mod commands;
 mod information;
+mod native_voice_capture;
 mod operation_supervisor;
 mod speech;
 mod view;
 use anyhow::Result;
 use app_runtime::AppRuntimeHandle;
 use serde_json::json;
+use speech_native_types::SpeechBackend;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,51 @@ const APPLICATION_SETTINGS_MENU_ID: &str = "mom-llama.application.settings";
 
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
+
+#[derive(Clone)]
+struct PreparedSpeech {
+    qwen: Arc<speech_native_backend_qwen::QwenSpeechBackend>,
+    claimed_by_runtime: Arc<AtomicBool>,
+    shutdown_started: Arc<AtomicBool>,
+    started: std::time::Instant,
+}
+
+impl PreparedSpeech {
+    fn new(app_data_dir: &std::path::Path) -> Self {
+        let qwen = desktop_speech::prepare_local_qwen(
+            Some(app_data_dir.join("speech-models")),
+            Some(app_data_dir.join("speech-voices/qwen-icl")),
+        );
+        Self {
+            qwen,
+            claimed_by_runtime: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn backend(&self) -> Arc<speech_native_backend_qwen::QwenSpeechBackend> {
+        Arc::clone(&self.qwen)
+    }
+
+    fn claim(&self) {
+        self.claimed_by_runtime.store(true, Ordering::Release);
+    }
+
+    async fn shutdown_if_unclaimed(&self) -> bool {
+        if self.claimed_by_runtime.load(Ordering::Acquire) {
+            return true;
+        }
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.qwen.shutdown().await.is_ok()
+    }
+}
 
 #[derive(Clone)]
 struct StartupController {
@@ -331,45 +378,64 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
     };
     startup.begin_runtime_build()?;
     let runtime_data_dir = settings.data_dir.clone();
+    let installed_voice_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Blessenger could not locate its voice data: {error}"))?
+        .join("speech-voices/qwen-icl");
 
     let shared_client = app
         .try_state::<EmbeddedMom>()
         .map(|embedded| embedded.client.clone());
     let embedded = shared_client.is_some();
-    let built =
-        match tauri::async_runtime::spawn_blocking(move || build_runtime(settings, shared_client))
-            .await
-        {
-            Ok(built) => built,
-            Err(error) => {
-                startup.finish_failed_build();
-                return Err(format!("Blessenger startup worker failed: {error}"));
-            }
-        };
+    let prepared_speech = app
+        .try_state::<PreparedSpeech>()
+        .map(|value| value.inner().clone());
+    let prepared_qwen = prepared_speech.as_ref().map(PreparedSpeech::backend);
+    let built = match tauri::async_runtime::spawn_blocking(move || {
+        build_runtime(settings, shared_client, installed_voice_root, prepared_qwen)
+    })
+    .await
+    {
+        Ok(built) => built,
+        Err(error) => {
+            startup.finish_failed_build();
+            return Err(format!("Blessenger startup worker failed: {error}"));
+        }
+    };
 
     match built {
-        Ok(runtime) => match startup.install(&app, runtime) {
-            Ok(()) => {
-                eprintln!("mom-llama runtime ready: {}", runtime_data_dir.display());
-                Ok(())
+        Ok(runtime) => {
+            if let Some(prepared) = &prepared_speech {
+                prepared.claim();
+                eprintln!(
+                    "mom-llama prepared speech claimed after {} ms",
+                    prepared.started.elapsed().as_millis()
+                );
             }
-            Err(runtime) => {
-                runtime.begin_quiesce();
-                let shutdown = if embedded {
-                    runtime.drain_shared_services().await
-                } else {
-                    runtime.shutdown().await
-                };
-                let safe_to_exit = if embedded {
-                    shutdown.is_ok()
-                } else {
-                    safe_to_exit_after_shutdown(&shutdown)
-                };
-                log_shutdown_result(&shutdown);
-                startup.finish_rejected_build(runtime, safe_to_exit);
-                Err("Blessenger stopped before encrypted runtime startup completed".to_string())
+            match startup.install(&app, runtime) {
+                Ok(()) => {
+                    eprintln!("mom-llama runtime ready: {}", runtime_data_dir.display());
+                    Ok(())
+                }
+                Err(runtime) => {
+                    runtime.begin_quiesce();
+                    let shutdown = if embedded {
+                        runtime.drain_shared_services().await
+                    } else {
+                        runtime.shutdown().await
+                    };
+                    let safe_to_exit = if embedded {
+                        shutdown.is_ok()
+                    } else {
+                        safe_to_exit_after_shutdown(&shutdown)
+                    };
+                    log_shutdown_result(&shutdown);
+                    startup.finish_rejected_build(runtime, safe_to_exit);
+                    Err("Blessenger stopped before encrypted runtime startup completed".to_string())
+                }
             }
-        },
+        }
         Err(error) => {
             let message = format!("Blessenger could not initialize its local runtime: {error:#}");
             startup.finish_failed_build();
@@ -385,6 +451,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_render_chat_fragment,
         commands::mom_llama_render_sidebar_fragment,
         commands::mom_llama_render_settings_fragment,
+        commands::mom_llama_voice_latency_record,
         commands::mom_llama_pick_file,
         commands::mom_llama_information_pick_alexandria,
         commands::mom_llama_information_register_alexandria,
@@ -411,6 +478,20 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_composer_autocomplete_cancel,
         commands::mom_llama_composer_autocomplete_accept,
         commands::mom_llama_chat_dispatch,
+        commands::mom_llama_voice_audio_begin,
+        commands::mom_llama_voice_capture_prepare,
+        commands::mom_llama_voice_capture_start,
+        commands::mom_llama_voice_capture_pause,
+        commands::mom_llama_voice_capture_retarget,
+        commands::mom_llama_voice_capture_stop,
+        commands::mom_llama_voice_capture_cancel,
+        commands::mom_llama_voice_audio_push,
+        commands::mom_llama_voice_audio_finish,
+        commands::mom_llama_voice_audio_speculate,
+        commands::mom_llama_voice_audio_speculation_confirm,
+        commands::mom_llama_voice_audio_speculation_abort,
+        commands::mom_llama_voice_audio_speculation_abort_and_retarget,
+        commands::mom_llama_voice_audio_abort,
         commands::mom_llama_mention_dispatch,
         commands::mom_llama_chat_cancel,
         commands::mom_llama_chat_skip_reasoning,
@@ -437,6 +518,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_conversation_draft_open,
         commands::mom_llama_conversation_draft_recipients_update,
         commands::mom_llama_conversation_draft_submit,
+        commands::mom_llama_conversation_draft_call_start,
         commands::mom_llama_conversation_new,
         commands::mom_llama_conversation_list,
         commands::mom_llama_conversation_select,
@@ -454,6 +536,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_message_copy,
         commands::mom_llama_speech_read_aloud,
         commands::mom_llama_speech_precommit_synthesize,
+        commands::mom_llama_voice_generation_backpressure,
         commands::mom_llama_message_edit,
         commands::mom_llama_message_record_call_transcript,
         commands::mom_llama_message_delete,
@@ -468,8 +551,6 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_attachment_preview_content,
         commands::mom_llama_attachment_preview_bytes,
         commands::mom_llama_speech_transcribe_attachment,
-        commands::mom_llama_speech_audio,
-        commands::mom_llama_speech_precommit_audio,
         commands::mom_llama_speech_stop,
         commands::mom_llama_settings_get,
         commands::mom_llama_settings_reset,
@@ -524,6 +605,7 @@ impl EmbeddedMom {
         builder
             .manage(self.clone())
             .manage(self.startup.clone())
+            .manage(native_voice_capture::NativeVoiceCapture::new())
             .invoke_handler(command_handler())
     }
 
@@ -669,6 +751,12 @@ pub fn run() {
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
         .manage(startup)
+        .manage(native_voice_capture::NativeVoiceCapture::new())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+            app.manage(PreparedSpeech::new(&app_data_dir));
+            Ok(())
+        })
         .invoke_handler(command_handler())
         .build(tauri::generate_context!());
     match app {
@@ -706,7 +794,7 @@ pub fn run() {
                 // Dock Quit and AppleEvent Quit may reach this final boundary
                 // without an interceptable ExitRequested. Do not let AppKit
                 // or static teardown proceed while Metal owns live resources.
-                let decision = decide_final_exit(&event_startup);
+                let decision = decide_final_exit(app_handle, &event_startup);
                 if decision == FinalExitDecision::AbortWithoutRustTeardown {
                     eprintln!(
                         "Blessenger aborts final exit because native shutdown lacks joined evidence"
@@ -872,9 +960,21 @@ fn safe_to_exit_after_shutdown(
     }
 }
 
-fn decide_final_exit(startup: &StartupController) -> FinalExitDecision {
+fn decide_final_exit<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    startup: &StartupController,
+) -> FinalExitDecision {
+    let target = startup.final_exit_target();
+    if matches!(target, FinalExitTarget::NoRuntime) {
+        let safe = app_handle
+            .try_state::<PreparedSpeech>()
+            .is_none_or(|prepared| {
+                tauri::async_runtime::block_on(prepared.shutdown_if_unclaimed())
+            });
+        return final_exit_decision(safe);
+    }
     decide_final_exit_target(
-        startup.final_exit_target(),
+        target,
         |runtime| {
             runtime.begin_quiesce();
             let result = tauri::async_runtime::block_on(runtime.shutdown());
@@ -923,18 +1023,41 @@ fn request_startup_aware_exit<R: Runtime>(
             let exit_allowed = Arc::clone(exit_allowed);
             tauri::async_runtime::spawn(async move {
                 if startup.wait_for_build().await {
-                    exit_allowed.store(true, Ordering::Release);
-                    app_handle.exit(exit_code);
+                    let speech_safe = match app_handle.try_state::<PreparedSpeech>() {
+                        Some(prepared) => prepared.shutdown_if_unclaimed().await,
+                        None => true,
+                    };
+                    if speech_safe {
+                        exit_allowed.store(true, Ordering::Release);
+                        app_handle.exit(exit_code);
+                    } else {
+                        eprintln!(
+                            "Blessenger remains open because prepared speech shutdown failed"
+                        );
+                    }
                 } else {
                     eprintln!("Blessenger remains open because startup native shutdown failed");
                 }
             });
         }
         StartupShutdownAction::NoRuntime => {
-            // Unlocking owns no native resources. A late Keychain result cannot
-            // advance to native construction after this state transition.
-            exit_allowed.store(true, Ordering::Release);
-            app_handle.exit(exit_code);
+            // A late Keychain result cannot advance to native construction
+            // after this transition, but launch-time speech warming already
+            // owns a resident helper and must be joined before AppKit exits.
+            let app_handle = app_handle.clone();
+            let exit_allowed = Arc::clone(exit_allowed);
+            tauri::async_runtime::spawn(async move {
+                let speech_safe = match app_handle.try_state::<PreparedSpeech>() {
+                    Some(prepared) => prepared.shutdown_if_unclaimed().await,
+                    None => true,
+                };
+                if speech_safe {
+                    exit_allowed.store(true, Ordering::Release);
+                    app_handle.exit(exit_code);
+                } else {
+                    eprintln!("Blessenger remains open because prepared speech shutdown failed");
+                }
+            });
         }
     }
 }
@@ -951,6 +1074,8 @@ fn log_shutdown_result(
 fn build_runtime(
     settings: mom_llama_runtime::config::Settings,
     shared_client: Option<llama_native_host::NativeClient>,
+    installed_voice_root: std::path::PathBuf,
+    prepared_qwen: Option<Arc<speech_native_backend_qwen::QwenSpeechBackend>>,
 ) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
     let speech_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -959,7 +1084,18 @@ fn build_runtime(
             message: format!("speech runtime construction failed: {error}"),
         })?;
     let speech = speech_runtime
-        .block_on(crate::speech::MomSpeech::discover(&settings.data_dir))
+        .block_on(async {
+            if let Some(prepared_qwen) = prepared_qwen {
+                crate::speech::MomSpeech::discover_with_prepared_qwen(
+                    &settings.data_dir,
+                    &installed_voice_root,
+                    Some(prepared_qwen),
+                )
+                .await
+            } else {
+                crate::speech::MomSpeech::discover(&settings.data_dir, &installed_voice_root).await
+            }
+        })
         .map_err(|error| RuntimeBuildError {
             message: format!("speech host initialization failed: {error}"),
         })?;
@@ -1145,7 +1281,6 @@ mod tests {
             speech_host_joined: true,
             speech_active_operation_count: 0,
             speech_retained_playback_count: 0,
-            apple_inner_call_non_preemptive: true,
             operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
             active_operation_count: 0,
             retained_operation_task_count: 0,

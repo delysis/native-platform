@@ -1422,7 +1422,21 @@ fn store_blocker(blocker: &Blocker) -> Markup {
     }
 }
 
+fn conversation_display_title(title: &str) -> &str {
+    title
+        .strip_prefix("Chat with ")
+        .filter(|display| !display.is_empty())
+        .unwrap_or(title)
+}
+
 pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
+    if mom_llama_runtime::conversation_store::load_db()?
+        .selected_conversation_id
+        .as_deref()
+        == Some("default")
+    {
+        let _ = mom_llama_runtime::conversation_resume_existing_for_empty_draft()?;
+    }
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status(scope)?;
     let personas = persona_projection();
@@ -1960,9 +1974,10 @@ fn sidebar(
                             @for conversation in chats.iter()
                                 .filter(|conversation| conversation.kind == ConversationKind::Chat) {
                                 @let active = active_id == Some(conversation.id.as_str());
+                                @let display_title = conversation_display_title(&conversation.title);
                                 li data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
                                     data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default())
-                                    data-conversation-title=(conversation.title.clone()) {
+                                    data-conversation-title=(display_title) {
                                     button type="button"
                                         class=(format!("conversation-item {}", if active { "active" } else { "" }))
                                         data-affordance="conversation.select"
@@ -1978,7 +1993,7 @@ fn sidebar(
                                             span class="contact-avatar" aria-hidden="true" { (icon_markup(if conversation.recipient_ids.is_empty() { "message-circle" } else { "users" })) }
                                         }
                                         div class="conversation-copy" {
-                                            span { (conversation.title.clone()) }
+                                            span { (display_title) }
                                             @if let Some(message) = conversation.messages.iter().rev().find(|message| !is_call_turn(conversation, message)) {
                                                 small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
                                             }
@@ -2059,7 +2074,18 @@ fn composer(
     // content, and may still exist while generation is running or after an
     // interrupted process.  Do not project it into the visible UI.
     let internal_voice_draft = draft.is_some_and(|draft| {
-        draft.message.starts_with("[Voice note]") || draft.message.starts_with("[Phone call]")
+        draft.message.starts_with("[Voice note]")
+            || draft.message.starts_with("[Phone call]")
+            // Repair drafts written by older builds that could atomically
+            // persist the capture before they persisted its private marker.
+            || (draft.message.trim().is_empty()
+                && !draft.attachment_ids.is_empty()
+                && draft.attachment_ids.iter().all(|id| {
+                    attachments.iter().any(|attachment| {
+                        attachment.id == *id
+                            && attachment.source_path == "microphone://voice-message"
+                    })
+                }))
     });
     let draft_message = (!internal_voice_draft)
         .then(|| {
@@ -2237,7 +2263,7 @@ fn composer(
                     data-cli=(voice_control.cli)
                     data-effect=(voice_control.effect)
                     data-action="voice-message-send" {
-                    span class="voice-listening-core" aria-hidden="true" {}
+                    span class="voice-listening-core" aria-hidden="true" { (icon_markup("arrow-up")) }
                 }
                 button type="button" class="round-button voice-message-keyboard" aria-label="Use keyboard"
                     title="Keyboard"
@@ -2309,6 +2335,9 @@ fn message_row(
                         })) }
                         strong { (attribution.label.clone()) }
                         span { "@" (attribution.handle.clone()) }
+                        @if attribution.incomplete {
+                            span class="message-attribution-state" { "Stopped" }
+                        }
                     }
                 }
                 @if !attachments.is_empty() {
@@ -2385,6 +2414,17 @@ fn is_call_turn(conversation: &Conversation, message: &Message) -> bool {
         })
 }
 
+fn waveform_bars() -> Markup {
+    const MOTIF: [u8; 11] = [7, 13, 20, 11, 17, 8, 15, 10, 19, 12, 7];
+    html! {
+        span class="voice-waveform" aria-hidden="true" {
+            @for index in 0..165 {
+                i style=(format!("height: {}px", MOTIF[index % MOTIF.len()])) {}
+            }
+        }
+    }
+}
+
 fn attachment_preview_card(attachment: &AttachmentRecord) -> Markup {
     let control = control("attachment.preview");
     let voice_message = attachment.kind == AttachmentKind::Audio
@@ -2404,7 +2444,23 @@ fn attachment_preview_card(attachment: &AttachmentRecord) -> Markup {
             data-cli=(control.cli)
             data-effect=(control.effect) {
             div class="attachment-preview-body" aria-live="polite" {
-                (icon_markup(attachment_icon(&attachment.kind)))
+                @if voice_message {
+                    div class="voice-message-player voice-message-pending" {
+                        button type="button" class="voice-message-play"
+                            data-affordance=(control.affordance)
+                            data-command=(control.command)
+                            data-tauri-command=(control.tauri_command)
+                            data-cli=(control.cli)
+                            data-effect=(control.effect)
+                            data-action="voice-message-pending-play"
+                            data-audio-state="pending"
+                            data-audio-proof="pending"
+                            aria-label="Loading voice message" {}
+                        (waveform_bars())
+                    }
+                } @else {
+                    (icon_markup(attachment_icon(&attachment.kind)))
+                }
             }
             @if !voice_message {
                 figcaption {
@@ -3272,14 +3328,6 @@ fn voice_call_modal() -> Markup {
             aria-hidden="true" {
             section class="voice-call-dialog" role="dialog" aria-modal="true"
                 aria-labelledby="voice-call-title" data-voice-persona="" {
-                header class="voice-call-titlebar" {
-                    button type="button" class="icon-button" aria-label="Close" title="Close"
-                        data-affordance=(call.affordance) data-command=(call.command)
-                        data-tauri-command=(call.tauri_command) data-cli=(call.cli)
-                        data-effect=(call.effect) data-action="voice-call-close" {
-                        (icon_markup("x"))
-                    }
-                }
                 div class="voice-call-contact" {
                     span id="voice-call-avatar" class="voice-call-avatar contact-avatar" aria-hidden="true" {
                         (icon_markup("user-round"))
@@ -4199,6 +4247,19 @@ mod tests {
     }
 
     #[test]
+    fn conversation_titles_omit_the_redundant_legacy_prefix() {
+        assert_eq!(
+            conversation_display_title("Chat with Janina Fisher"),
+            "Janina Fisher"
+        );
+        assert_eq!(
+            conversation_display_title("Case consultation"),
+            "Case consultation"
+        );
+        assert_eq!(conversation_display_title("Chat with "), "Chat with ");
+    }
+
+    #[test]
     fn rendered_app_controls_have_contract_metadata() -> Result<()> {
         let data_dir = tempfile::tempdir()?;
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
@@ -4577,7 +4638,7 @@ mod tests {
                 && js.contains("Array.isArray(response)")
                 && js.contains("Number.isInteger(byte)")
                 && js.contains("16 * 1024 * 1024")
-                && js.contains("64 * 1024 * 1024"),
+                && js.contains("8 * 1024 * 1024"),
             "binary IPC must accept every packaged transport representation while validating bytes and preserving native size ceilings"
         );
         assert!(
@@ -4906,6 +4967,28 @@ mod tests {
     }
 
     #[test]
+    fn persisted_assistant_text_never_claims_to_be_stored_voice() {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut message = test_message("assistant", MessageRole::Assistant, "Stored reply");
+        message.parent_id = Some("voice-note".to_string());
+
+        let html = message_row(&message, &settings, &[], true, true, None).into_string();
+
+        assert!(html.contains("Stored reply"));
+        assert!(!html.contains("voice-reply-row"));
+        assert!(!html.contains("voice-message-player"));
+        assert!(html.contains(r#"data-action="message-read-aloud""#));
+    }
+
+    #[test]
     fn dynamic_interactions_are_contract_backed_and_validate_stale_choices() {
         let js = include_str!("../../ui/coop-hx.js");
         for unmanaged in [
@@ -4979,7 +5062,6 @@ mod tests {
 
         for creation in [
             r#"createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
-            r#"createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentTranscribe)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.draftUpdate)"#,
             r#"createCommandElement("video", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
@@ -5024,12 +5106,12 @@ mod tests {
         let js = include_str!("../../ui/coop-hx.js");
         assert!(
             js.contains("mom_llama_speech_read_aloud")
-                && js.contains("message: result.binding.message_id")
-                && js.contains("textSha256: result.binding.text_sha256")
-                && js.contains("backendDescriptorSha256: result.binding.backend_descriptor_sha256")
-                && js.contains("await sha256Hex(bytes) !== binding.wav_sha256")
-                && js.contains("button.dataset.playback !== result.playback_id"),
-            "Read Aloud must rebind the exact message, descriptor and complete WAV at raw IPC"
+                && js.contains("pcmStream: stream")
+                && js.contains("decodePcmFrame(value)")
+                && js.contains("InvokeResponseBody::Raw") == false
+                && js.contains("button.dataset.playback = result.playback_id")
+                && !js.contains("mom_llama_speech_audio"),
+            "Read Aloud must bind the exact message and consume framed PCM without a complete-WAV browser path"
         );
         assert!(
             js.contains("mom_llama_speech_transcribe_attachment")
@@ -5244,6 +5326,40 @@ mod tests {
             assert!(!html.contains("private-voice-capture.wav"));
             assert!(!html.contains("voice-clip"));
         }
+
+        let mut interrupted_capture = attachment_record(
+            "interrupted-voice-clip",
+            "",
+            "voice-message-interrupted.wav",
+            AttachmentKind::Audio,
+        );
+        interrupted_capture.source_path = "microphone://voice-message".to_string();
+        let stale_draft = CommandResult::passed(
+            "mom_llama.draft_get",
+            "contracted",
+            DraftMessage {
+                conversation_id: Some("old-build-crash".to_string()),
+                message: String::new(),
+                attachment_ids: vec!["interrupted-voice-clip".to_string()],
+                updated_at: "1".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let stale_html = composer(
+            &engine,
+            &settings,
+            &models,
+            None,
+            Some(&stale_draft),
+            &[interrupted_capture],
+        )
+        .into_string();
+        assert!(stale_html.contains("data-internal-voice-draft"));
+        assert!(!stale_html.contains("data-staged-attachment-id"));
+        assert!(!stale_html.contains("voice-message-interrupted.wav"));
 
         let ordinary = CommandResult::passed(
             "mom_llama.draft_get",
@@ -5483,6 +5599,23 @@ mod tests {
         assert!(!js.contains("persona_mmproj_path"));
         assert!(!js.contains("persona_model_path"));
         assert!(js.contains("persona_model_choice"));
+    }
+
+    #[test]
+    fn pending_voice_attachment_does_not_claim_playback_before_hydration() {
+        let attachment = attachment_record(
+            "voice",
+            "message",
+            "voice-message-fixture.wav",
+            AttachmentKind::Audio,
+        );
+        let html = attachment_preview_card(&attachment).into_string();
+        assert!(html.contains(r#"data-audio-state="pending""#));
+        assert!(html.contains(r#"aria-label="Loading voice message""#));
+        assert!(
+            !html.contains('▶'),
+            "a pending attachment must render its loading state, not a false play glyph"
+        );
     }
 
     fn attachment_record(

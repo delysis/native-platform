@@ -86,7 +86,9 @@ fi
 # Tauri's custom per-run identity changes the bundle resources after its build
 # signature is created. Re-seal the isolated local artifact before the strict
 # smoke verifier binds it to the exact executable inode and hash.
-codesign --force --deep --sign - "$BUNDLE"
+codesign --force --deep \
+  --entitlements "$ROOT/products/mom/apps/mom-llama/src-tauri/MomLlama.entitlements" \
+  --sign - "$BUNDLE"
 codesign --verify --deep --strict "$BUNDLE"
 
 MOM_ACCEPTANCE_PRODUCT_NAME="$PRODUCT_NAME" \
