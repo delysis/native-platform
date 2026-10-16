@@ -5790,10 +5790,13 @@
     return startVoicePrefill(conversation, recording.call);
   };
 
-  const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null) => {
+  const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null,
+    sourceTrace = null) => {
     const attachment = output?.voice_attachment_id || fallbackAttachment;
     const messageId = output?.user_message_id;
-    const trace = voiceLatencyTrace;
+    // Playback may have opened the next microphone turn already. Backfill
+    // stages belong to the physical turn that produced this recording.
+    const trace = sourceTrace || sourceCapture?.trace || voiceLatencyTrace;
     const started = performance.now();
     markVoiceLatencyIn(trace, "voice_transcript_started", {
       source: output?.voice_attachment_id ? "live" : "fallback",
@@ -5932,6 +5935,7 @@
         heardVoice: wavBytes.byteLength > 44,
         metrics: recording.nativeMetrics || {},
         wavBytes,
+        trace: recording.trace,
       };
     }
     recording.processor.onaudioprocess = null;
@@ -5978,6 +5982,7 @@
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
       transcription: recording.transcription,
+      trace: recording.trace,
       // The saved turn is the physical microphone stream. Editing it here
       // would make the archive differ from Parakeet's parallel PCM consumer.
       samples: () => mergeFloat32(recording.capturedPcm),
@@ -6035,6 +6040,7 @@
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
+      trace: voiceLatencyTrace,
       // Optional staged tap. Default callers remain unchanged until the native
       // owner/command and exact saved-source binding are implemented.
       transcription,
@@ -6248,6 +6254,7 @@
     if (!preserveLatencyTrace) startVoiceLatency(call ? "call" : "voice_note");
     const recording = {
       native: true,
+      trace: voiceLatencyTrace,
       capture: crypto.randomUUID(),
       call,
       sourceConversation: selectedConversation(),
@@ -6745,7 +6752,8 @@
         cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
-      indexVoiceTurn(live.conversation, response.result, null, speculation.captureReady);
+      indexVoiceTurn(live.conversation, response.result, null, speculation.captureReady,
+        recording.trace);
       const synthesized = await tts.finish(response.result.assistant_text || tts.text);
       if (!synthesized) {
         throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");

@@ -291,7 +291,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
     bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
   );
-  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result, null, speculation\.captureReady\);\s*const synthesized = await tts\.finish/);
+  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result, null, speculation\.captureReady,\s*recording\.trace\);\s*const synthesized = await tts\.finish/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
