@@ -334,7 +334,10 @@
           resolveFinal(result);
         }
       } catch (error) {
-        fail(error?.message || "live_transcription_failed");
+        // Tauri rejects commands with strings. Preserve that native reason in
+        // the turn trace so a failed parallel reader is diagnosable while the
+        // saved recording remains the authoritative fallback.
+        fail(error?.message || String(error ?? "live_transcription_failed"));
       } finally {
         running = false;
         if (queue.length && phase !== "failed" && phase !== "complete") schedule();

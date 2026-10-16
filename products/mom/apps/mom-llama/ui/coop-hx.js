@@ -4190,6 +4190,10 @@
       prompt_prefix_start_ms: metricMs("prefix_start"),
       prompt_prefix_finish_ms: metricMs("prefix_finish"),
       prompt_prefix_cpu_ms: metricMs("prefix"),
+      prompt_prefix_tokens: Number.isFinite(Number(audio?.prefix_tokens))
+        ? Number(audio.prefix_tokens) : null,
+      prompt_prefix_restored_tokens: Number.isFinite(Number(audio?.restored_prefix_tokens))
+        ? Number(audio.restored_prefix_tokens) : null,
       projector_first_start_ms: metricMs("first_projector_start"),
       projector_first_finish_ms: firstProjectorFinish,
       projector_last_finish_ms: lastProjectorFinish,

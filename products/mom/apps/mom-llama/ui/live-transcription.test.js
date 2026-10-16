@@ -154,6 +154,20 @@ test("invalid PCM and empty turns fail without publishing text", async () => {
   await assert.rejects(empty.seal(), /empty/);
 });
 
+test("native string failures retain the reason while audio remains authoritative", async () => {
+  const events = [];
+  const tap = make({
+    finish: async () => { throw "live_transcription_backend_unavailable"; },
+    onTrace: (event) => events.push(event),
+  });
+  tap.append(new Float32Array(640));
+  await assert.rejects(tap.seal(), /live_transcription_backend_unavailable/);
+  await tick();
+  assert.equal(tap.metrics().failure, "live_transcription_backend_unavailable");
+  assert.ok(events.some((event) => event.stage === "failed_audio_retained"
+    && event.failure === "live_transcription_backend_unavailable"));
+});
+
 test("source-bound hook is outside Gemma prefill and seals only at physical browser stop", () => {
   const bridge = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
   const prefill = bridge.slice(bridge.indexOf("  const enqueueVoicePrefill ="), bridge.indexOf("  const prepareVoicePrefill ="));
