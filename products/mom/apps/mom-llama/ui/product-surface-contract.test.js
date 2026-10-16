@@ -473,8 +473,8 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(close.includes('invoke("mom_llama_chat_cancel", { conversation })'));
   assert.ok(
     close.indexOf('setModalVisibility("voice-call-modal", false)')
-      < close.indexOf("await Promise.allSettled"),
-    "the red button must close immediately instead of waiting for native acknowledgements",
+      < close.indexOf("stopVoiceCapture({ discard: true"),
+    "the red button must close before local audio cleanup or native cancellation starts",
   );
 
   const liveStart = bridge.indexOf("  const beginLiveVoiceTts =");
@@ -516,7 +516,7 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
   assert.ok(live.includes("if (stopped || activeOperation !== operation) return;"));
   assert.ok(interrupt.includes('markVoiceLatencyIn(recording.trace, "barge_in_detected"'));
-  assert.ok(interrupt.includes("void reply.stop()"));
+  assert.ok(interrupt.includes("void reply.interruptForSpeech()"));
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));
   assert.ok(bridge.includes("const sharedCallStream = call && voiceCallMicrophoneStream?.active"));
   assert.ok(bridge.includes("sharedCallStream: stream === voiceCallMicrophoneStream"));
@@ -1260,6 +1260,8 @@ test("call barge-in can stop only an actually audible reply", () => {
   const interruption = bridge.slice(start, end);
   assert.ok(interruption.includes("if (!reply?.audible) return;"));
   assert.ok(bridge.includes("get audible() { return controller.playing; }"));
+  assert.ok(interruption.includes("reply.interruptForSpeech()"));
+  assert.ok(bridge.includes("if (!synthesized && tts.interruptedForSpeech) return true;"));
 });
 
 test("call generation cannot stall forever or disappear without a visible terminal error", () => {

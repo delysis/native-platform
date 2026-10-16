@@ -3069,6 +3069,78 @@ mod tests {
         assert!(duration_ms.is_some_and(|duration| duration > 500));
         speech.shutdown().await.expect("speech host joined");
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "diagnoses an existing exact voice attachment with the installed Parakeet model"]
+    async fn real_local_saved_voice_transcription_diagnostic() {
+        let conversation = std::env::var("MOM_DIAG_CONVERSATION").expect("conversation id");
+        let attachment = std::env::var("MOM_DIAG_ATTACHMENT").expect("attachment id");
+        let catalog = mom_llama_runtime::attachment_preview(&attachment)
+            .expect("attachment preview")
+            .result
+            .expect("owned attachment preview");
+        let anchor = AttachmentPreviewAnchor {
+            attachment_id: catalog.attachment_id,
+            root_sha256: catalog.root_sha256,
+            artifact_id: catalog.primary.expect("canonical audio").artifact_id,
+            policy_fingerprint: catalog.policy_fingerprint,
+        };
+        let input = mom_llama_runtime::attachment_transcription_input(&conversation, &anchor)
+            .expect("audio input")
+            .expect("owned audio input");
+        let pcm = input.bytes.get(44..).expect("PCM WAV payload");
+        let samples = pcm
+            .chunks_exact(2)
+            .map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+            .collect::<Vec<_>>();
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f64>()
+            / samples.len().max(1) as f64)
+            .sqrt();
+        let peak = samples
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "saved voice input: bytes={}, samples={}, rms={rms:.5}, peak={peak:.5}",
+            input.bytes.len(),
+            samples.len()
+        );
+        let data_dir = mom_llama_runtime::config::resolve_data_dir();
+        // Keep this diagnostic isolated from Qwen's independent voice warmup.
+        let host = Arc::new(SpeechHost::default());
+        let parakeet = speech_native_backend_parakeet::ParakeetSpeechBackend::discover(
+            speech_native_backend_parakeet::ParakeetBackendConfig {
+                model_dir: None,
+                managed_model_root: Some(data_dir.join("speech-models")),
+            },
+        )
+        .await;
+        host.register_backend(Arc::new(parakeet))
+            .expect("register installed Parakeet");
+        let speech = MomSpeech {
+            executor: Arc::new(HostSpeechExecutor::new(host).expect("speech inventory")),
+            _qwen: None,
+            _qwen_startup_warm: None,
+            state: Mutex::new(SpeechState::default()),
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
+        };
+        let result = speech
+            .transcribe_attachment(&conversation, &anchor, "diagnose-existing-voice")
+            .await
+            .expect("transcription command");
+        eprintln!(
+            "saved voice diagnostic: status={}, blocker={:?}, transcript_bytes={}",
+            result.status,
+            result.blocker.as_ref().map(|blocker| &blocker.code),
+            result
+                .result
+                .as_ref()
+                .map_or(0, |output| output.transcript.len())
+        );
+        speech.shutdown().await.expect("speech host joined");
+    }
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,

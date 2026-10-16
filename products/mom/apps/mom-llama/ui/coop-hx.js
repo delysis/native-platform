@@ -2208,6 +2208,10 @@
       const greeting = output?.assistant_text?.trim() || tts.text.trim();
       if (!greeting) throw new Error("The contact did not answer the call.");
       const synthesized = await tts.finish(greeting);
+      // The caller may speak over the greeting as soon as its first packet is
+      // audible. That intentionally stops this TTS controller; the listener
+      // is already running and the interrupted pickup is still a valid call.
+      if (!synthesized && tts.interruptedForSpeech) return true;
       if (!synthesized) {
         throw greetingFailure
           || new Error("The contact answered, but their voice could not be produced.");
@@ -2398,9 +2402,12 @@
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
     activeCallPlayback = null;
+    // Dismiss the call immediately. Some local stop paths touch Web Audio or
+    // native cancellation before their first await; neither owns the UI.
+    setModalVisibility("voice-call-modal", false);
 
     // Each stop function severs its local Web Audio nodes before its first
-    // await. Start all of them before hiding the surface or waiting on IPC.
+    // await. Start all of them before waiting on IPC.
     const stops = [
       stopVoiceCapture({ discard: true, reason: "call_closed" }),
       callTts?.stop(),
@@ -2411,7 +2418,6 @@
     if (cancelGeneration) {
       stops.push(invoke("mom_llama_chat_cancel", { conversation }).catch(() => {}));
     }
-    setModalVisibility("voice-call-modal", false);
     await Promise.allSettled(stops.filter(Boolean));
     releaseCallMicrophoneStream(microphoneStream);
     void recoverPendingVoiceHistory().catch(() => {});
@@ -4831,6 +4837,7 @@
     let running = false;
     let closed = false;
     let stopped = false;
+    let interruptedForSpeech = false;
     let firstRequest = true;
     let activeOperation = null;
     let nextCallPrefill = null;
@@ -5528,6 +5535,11 @@
       },
       get button() { return button; },
       get audible() { return controller.playing; },
+      get interruptedForSpeech() { return interruptedForSpeech; },
+      interruptForSpeech() {
+        interruptedForSpeech = true;
+        return this.stop();
+      },
       bindPendingRow() {
         if (!voiceNoteComplete) return button;
         const voiceButton = mountVoiceReplyPlayer();
@@ -6204,7 +6216,7 @@
     if (!reply?.audible) return;
     const startedAt = performance.now();
     markVoiceLatencyIn(recording.trace, "barge_in_detected", detail);
-    void reply.stop().then(() => {
+    void reply.interruptForSpeech().then(() => {
       markVoiceLatencyIn(recording.trace, "barge_in_playback_stopped", {
         duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       });
