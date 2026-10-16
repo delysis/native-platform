@@ -1034,7 +1034,7 @@ where
         &user_message_id,
         attachments.draft_snapshot.as_ref(),
     )?;
-    let cache_reused = output.metrics.cache.restored_prefix_tokens > 0;
+    let cache_reused = prefix_cells_reused(&output.metrics.cache);
     let result = ChatSendOutput {
         request_id: session.request_id,
         conversation_id: prepared.conversation_id.clone(),
@@ -1500,10 +1500,9 @@ where
             stream.callback(),
         ) {
             Ok(outputs) => {
-                let reused = attempted_cache_id.is_some()
-                    && outputs
-                        .iter()
-                        .any(|output| output.metrics.cache.restored_prefix_tokens > 0);
+                let reused = outputs
+                    .iter()
+                    .any(|output| prefix_cells_reused(&output.metrics.cache));
                 (outputs, reused)
             }
             Err(ChatTicketError::Native(error))
@@ -2127,6 +2126,15 @@ fn unix_now_us() -> u64 {
         .map_or(0, |elapsed| {
             elapsed.as_micros().min(u128::from(u64::MAX)) as u64
         })
+}
+
+fn prefix_cells_reused(cache: &GenerationCacheMetrics) -> bool {
+    // A resident prefix is already evaluated KV in the same model worker.
+    // Counting only an imported state blob falsely reports a cache miss for
+    // the startup-prepared persona used by call pickup.
+    cache.restored_prefix_tokens > 0
+        || cache.resident_prefix_tokens > 0
+        || cache.batch_shared_prefix_tokens > 0
 }
 
 fn configure_voice_sampling(

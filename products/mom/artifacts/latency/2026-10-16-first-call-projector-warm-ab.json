@@ -4,7 +4,7 @@
   "model": "google/gemma-4-12B-it-qat-q4_0-gguf with matching mmproj",
   "pcm": "16 kHz mono, paced 160 samples per 10 ms",
   "base_commit": "32410b6b",
-  "interpretation": "The four-frame probe cannot be credited with the warm improvement: reversing to one frame retained 118 ms. The selected-persona first turn restores 1364 tokens and reaches first token 131 ms after 500 ms of paced audio; this is a real-model component check, not packaged-call acceptance.",
+  "interpretation": "The four-frame probe cannot be credited with the warm improvement: reversing to one frame retained 118 ms. The selected-persona first turn restores 1364 tokens and reaches first token 131 ms after 500 ms of paced audio; this is a real-model component check, not packaged-call acceptance. A later exact greeting-plus-spoken-turn test confirms resident KV reuse across both stages; the old cache_reused flag omitted resident hits and is corrected in the same branch.",
   "trials": [
     {
       "name": "one_frame_initial",
@@ -222,5 +222,93 @@
       "metal_pipeline_compiles": 28,
       "passed": true
     }
-  ]
+  ],
+  "selected_persona_greeting_and_first_turn": {
+    "prefix": {
+      "prepare_ms": 19470,
+      "prefix_ms": 4664.752,
+      "status": "ready",
+      "ready": 1
+    },
+    "greeting": {
+      "cache_metrics": {
+        "batch_shared_prefix_tokens": 0,
+        "replayed_prefix_tokens": 0,
+        "resident_prefix_tokens": 1364,
+        "restored_prefix_tokens": 0,
+        "supplied_prefix_tokens": 0
+      },
+      "cache_reused": true,
+      "completion_tokens": 8,
+      "first_token_ms": 188,
+      "prompt_tokens": 1416,
+      "wall_ms": 395
+    },
+    "first_turn": {
+      "cached_prefix_tokens": 1361,
+      "decode_start_us": 546336,
+      "last_projector_finish_us": 511843,
+      "prefix_us": 6461,
+      "projector_max_us": 91597,
+      "projector_us": 162437,
+      "restored_prefix_tokens": 1412,
+      "silence_to_first_token_ms": 188
+    },
+    "passed": true
+  },
+  "selected_persona_greeting_and_first_turn_repeat": {
+    "prefix": {
+      "prepare_ms": 23049,
+      "prefix_ms": 8320.485,
+      "status": "ready",
+      "ready": 1
+    },
+    "greeting": {
+      "cache_metrics": {
+        "batch_shared_prefix_tokens": 0,
+        "replayed_prefix_tokens": 0,
+        "resident_prefix_tokens": 1364,
+        "restored_prefix_tokens": 0,
+        "supplied_prefix_tokens": 0
+      },
+      "cache_reused": true,
+      "completion_tokens": 8,
+      "first_token_ms": 210,
+      "prompt_tokens": 1416,
+      "wall_ms": 419
+    },
+    "first_turn": {
+      "cached_prefix_tokens": 1361,
+      "decode_start_us": 551466,
+      "last_projector_finish_us": 515851,
+      "prefix_us": 7017,
+      "projector_max_us": 96587,
+      "projector_us": 190797,
+      "restored_prefix_tokens": 1412,
+      "silence_to_first_token_ms": 210
+    },
+    "passed": true
+  },
+  "cache_policy_check": {
+    "warm": {
+      "cold_metrics": {
+        "batch_shared_prefix_tokens": 0,
+        "replayed_prefix_tokens": 0,
+        "resident_prefix_tokens": 0,
+        "restored_prefix_tokens": 0,
+        "supplied_prefix_tokens": 0
+      },
+      "cold_reused": false,
+      "warm_cache_id": null,
+      "warm_metrics": {
+        "batch_shared_prefix_tokens": 0,
+        "replayed_prefix_tokens": 0,
+        "resident_prefix_tokens": 14,
+        "restored_prefix_tokens": 0,
+        "supplied_prefix_tokens": 0
+      },
+      "warm_reused": true
+    },
+    "passed": true
+  }
 }

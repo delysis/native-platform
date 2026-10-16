@@ -252,6 +252,17 @@ experiment still needs to distinguish pipeline compilation from projector
 compute on the exact app launch path. Structured results and qualification
 limits are retained in
 `products/mom/artifacts/latency/2026-10-16-first-call-projector-warm-ab.json`.
+The complete pickup-plus-first-turn version reused 1,364 resident KV tokens
+for the greeting, reached its first greeting token in 188 ms, then restored
+1,412 tokens for a paced 500 ms spoken turn and emitted first text 188 ms after
+speech ended. A product cache flag had reported the greeting as a miss because
+it counted imported state but omitted resident KV cells; that flag now counts
+both forms of actual reuse. This remains a native component test, with TTS and
+the packaged microphone/player outside its measured boundary.
+The cache-policy integration test also distinguishes the managed cache ID from
+actual worker residency: clearing or turning off the managed tier removes its
+entry, while a token-exact prefix still live in the model worker can be reused
+and is reported as such.
 
 Loading the GGUF does not compile the first Metal audio-projector evaluation.
 The packaged runtime now feeds one exact 640-sample frame through the resident

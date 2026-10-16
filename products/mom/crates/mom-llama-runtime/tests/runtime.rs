@@ -2878,10 +2878,31 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let conversation = mom_llama_runtime::conversation_draft_call_start()?
         .result
         .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;
+    let greeting_started = Instant::now();
+    let greeting = product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
+    )?;
+    eprintln!(
+        "VOICE_PERSONA_GREETING {}",
+        serde_json::to_string(&json!({
+            "wall_ms": greeting_started.elapsed().as_millis(),
+            "first_token_ms": greeting.first_token_ms,
+            "prompt_tokens": greeting.prompt_tokens,
+            "completion_tokens": greeting.completion_tokens,
+            "cache_reused": greeting.cache_reused,
+            "cache_metrics": greeting.cache_metrics,
+        }))?
+    );
+    assert!(
+        greeting.cache_reused,
+        "pickup greeting missed the prepared persona prefix"
+    );
     let voice = mom_llama_runtime::voice_audio_begin_in_scope(
         &scope,
         &conversation.id,
-        "[Phone call] [Greeting] Greet Jan briefly.",
+        "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.",
     )?;
     assert!(
         voice.begin_metrics().cached_prefix_found,
@@ -2987,6 +3008,16 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         "cold generation must persist a real encrypted checkpoint"
     );
     let warm = product_chat_cache_request(&scope, &conversation.id, "Return the word warm.")?;
+    eprintln!(
+        "VOICE_TEXT_CACHE_POLICY_WARM {}",
+        serde_json::to_string(&json!({
+            "cold_reused": cold.cache_reused,
+            "cold_metrics": cold.cache_metrics,
+            "warm_reused": warm.cache_reused,
+            "warm_metrics": warm.cache_metrics,
+            "warm_cache_id": warm.cache_id,
+        }))?
+    );
     assert!(
         warm.cache_reused,
         "the second direct chat request must reuse its prefix"
@@ -2997,10 +3028,16 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
     assert!(cleared.blocker.is_none());
     let after_clear =
         product_chat_cache_request(&scope, &conversation.id, "Return the words after clear.")?;
-    assert!(
-        !after_clear.cache_reused,
-        "explicit clear must force a cold request"
+    assert_eq!(
+        after_clear.cache_id, None,
+        "explicit clear must revoke the product-managed cache entry"
     );
+    if after_clear.cache_reused {
+        assert!(
+            after_clear.cache_metrics.resident_prefix_tokens > 0,
+            "a post-clear hit must come only from exact cells still resident in the worker"
+        );
+    }
     let warm_after_clear =
         product_chat_cache_request(&scope, &conversation.id, "Return the words after warmup.")?;
     assert!(warm_after_clear.cache_reused);
@@ -3017,8 +3054,17 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         product_chat_cache_request(&scope, &conversation.id, "Caching is off, first request.")?;
     let off_second =
         product_chat_cache_request(&scope, &conversation.id, "Caching is off, second request.")?;
-    assert!(!off_first.cache_reused);
-    assert!(!off_second.cache_reused);
+    assert_eq!(off_first.cache_id, None);
+    assert_eq!(off_second.cache_id, None);
+    // Off removes the product-managed prefix tier. The native worker can still
+    // use token-exact cells from the immediately preceding request, and the
+    // public cache flag must report that physical reuse honestly.
+    assert_eq!(
+        off_second.cache_reused,
+        off_second.cache_metrics.resident_prefix_tokens > 0
+            || off_second.cache_metrics.restored_prefix_tokens > 0
+            || off_second.cache_metrics.batch_shared_prefix_tokens > 0
+    );
     assert!(
         !encrypted_document_snapshot(session.path())?
             .contains_key("native-host-prefix-cache.mom-llama"),
