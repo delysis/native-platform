@@ -5597,46 +5597,53 @@
       recording.prefillParts.push(samples);
       recording.prefillSamples += samples.length;
     }
-    // Voice activity still runs every render quantum. Send 100 ms blocks to
-    // the native PCM ring so IPC and projector setup do not run twenty times
-    // per second; an onset-of-silence flush remains immediate.
-    if (!flush && recording.prefillSamples < 1600) return;
+    // Keep publication aligned with the projector's 40 ms audio frame; an
+    // onset-of-silence flush still sends any short tail immediately.
+    if (!flush && recording.prefillSamples < 640) return;
     if (!recording.prefillSamples) return;
     const block = mergeFloat32(recording.prefillParts);
     recording.prefillParts = [];
     recording.prefillSamples = 0;
+    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block);
+    const epoch = recording.prefillEpoch;
+    const session = recording.prefillSession;
     recording.pushChain = recording.pushChain.then(async () => {
-      const live = await recording.prefillSession;
-      if (!live?.session || recording.prefillFailed) return;
-      const pushStarted = performance.now();
-      const accepted = await invoke("mom_llama_voice_audio_push", {
-        session: live.session,
-        samples: Array.from(block),
-      });
-      recording.prefillPushes += 1;
-      recording.prefillAcceptedSamples += block.length;
-      const pushMs = performance.now() - pushStarted;
-      recording.prefillIpcMs += pushMs;
-      recording.prefillMaxIpcMs = Math.max(recording.prefillMaxIpcMs, pushMs);
-      recording.prefillHighWaterSamples = Math.max(
-        recording.prefillHighWaterSamples,
-        Number(accepted?.buffered_samples || 0),
-      );
-      if (!recording.firstPrefillChunkAccepted) {
-        recording.firstPrefillChunkAccepted = true;
-        markVoiceLatency("audio_prefill_first_chunk_accepted", {
-          samples: block.length,
-          native_buffered_samples: accepted?.buffered_samples,
+      const live = await session;
+      if (!live?.session || recording.prefillFailed || recording.prefillEpoch !== epoch) return;
+      for (const chunk of blocks) {
+        if (recording.prefillEpoch !== epoch) return;
+        const pushStarted = performance.now();
+        const accepted = await invoke("mom_llama_voice_audio_push", {
+          session: live.session,
+          samples: Array.from(chunk),
         });
+        if (recording.prefillEpoch !== epoch) return;
+        recording.prefillPushes += 1;
+        recording.prefillAcceptedSamples += chunk.length;
+        const pushMs = performance.now() - pushStarted;
+        recording.prefillIpcMs += pushMs;
+        recording.prefillMaxIpcMs = Math.max(recording.prefillMaxIpcMs, pushMs);
+        recording.prefillHighWaterSamples = Math.max(
+          recording.prefillHighWaterSamples,
+          Number(accepted?.buffered_samples || 0),
+        );
+        if (!recording.firstPrefillChunkAccepted) {
+          recording.firstPrefillChunkAccepted = true;
+          markVoiceLatency("audio_prefill_first_chunk_accepted", {
+            samples: chunk.length,
+            native_buffered_samples: accepted?.buffered_samples,
+          });
+        }
       }
     }).catch(async (error) => {
+      if (recording.prefillEpoch !== epoch) return;
       recording.prefillFailed = true;
       markVoiceLatency("audio_prefill_push_failed", {
         message: errorMessage(error),
         producer_pushes: recording.prefillPushes || 0,
         producer_accepted_samples: recording.prefillAcceptedSamples || 0,
       });
-      const live = await recording.prefillSession.catch(() => null);
+      const live = await session.catch(() => null);
       if (live?.session) {
         await invoke("mom_llama_voice_audio_abort", { session: live.session }).catch(() => {});
       }
@@ -5801,6 +5808,7 @@
       voiceActivity: globalThis.MomVoiceCapturePolicy.initialVoiceActivity(),
       preRoll: [], preRollSamples: 0, prefillParts: [], prefillSamples: 0,
       pushChain: Promise.resolve(), prefillFailed: false, prefillSession: null,
+      prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
@@ -5812,9 +5820,12 @@
       echoGuardThreshold: 0,
       detectorSilence: new Float32Array(processor.bufferSize),
     };
+    const initialPrefillEpoch = recording.prefillEpoch;
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
-      recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_begin_failed", { message: errorMessage(error) });
+      if (recording.prefillEpoch === initialPrefillEpoch) {
+        recording.prefillFailed = true;
+        markVoiceLatency("audio_prefill_begin_failed", { message: errorMessage(error) });
+      }
       return null;
     });
     processor.onaudioprocess = (event) => {
@@ -6052,6 +6063,8 @@
 
   const restartVoicePrefill = async (recording) => {
     if (voiceRecording !== recording || (recording.call && !voiceCallActive)) return;
+    recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
+    const epoch = recording.prefillEpoch;
     if (recording.native) {
       markVoiceLatency("speculation_restart_prefill_started");
       recording.prefillFailed = false;
@@ -6059,7 +6072,7 @@
         recording.speculation?.conversation || voiceCallConversation || recording.sourceConversation,
         recording.call,
       ).catch(() => {
-        recording.prefillFailed = true;
+        if (recording.prefillEpoch === epoch) recording.prefillFailed = true;
         return null;
       });
       recording.targetChain = recording.prefillSession.then(async (live) => {
@@ -6094,7 +6107,7 @@
       recording.speculation?.conversation || voiceCallConversation || recording.sourceConversation,
       recording.call,
     ).catch(() => {
-      recording.prefillFailed = true;
+      if (recording.prefillEpoch === epoch) recording.prefillFailed = true;
       return null;
     });
     enqueueVoicePrefill(recording, priorAudio, true);

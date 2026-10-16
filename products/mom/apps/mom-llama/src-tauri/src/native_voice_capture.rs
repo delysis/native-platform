@@ -13,15 +13,11 @@ use thiserror::Error;
 const OUTPUT_RATE: u32 = 16_000;
 const MAX_SAMPLES: usize = OUTPUT_RATE as usize * 29;
 const PRE_ROLL_SAMPLES: usize = OUTPUT_RATE as usize / 5;
-// Native capture and the model ring live in the same process. Ten-millisecond
-// publications keep the reader close behind the microphone without paying
-// WebView IPC or waiting up to 100 ms at the first projector boundary.
-const PREFILL_BATCH_SAMPLES: usize = OUTPUT_RATE as usize / 100;
-// A replacement speculative session needs the complete retained utterance,
-// but replaying history at the 10 ms live-publication granularity only adds
-// allocations and lock traffic. The model ring accepts at most four seconds
-// per push, so use that exact ceiling for bounded catch-up.
-const RETARGET_REPLAY_BATCH_SAMPLES: usize = OUTPUT_RATE as usize * 4;
+// Match the resident model's 40 ms audio-projector frame. The capture owner
+// can retain a much longer utterance, but every live or replay publication
+// remains bounded to one frame and preserves source order.
+const PREFILL_BATCH_SAMPLES: usize = OUTPUT_RATE as usize * 40 / 1_000;
+const RETARGET_REPLAY_BATCH_SAMPLES: usize = PREFILL_BATCH_SAMPLES;
 // Measure activity over the same 10 ms window used by conventional realtime
 // speech detectors. One-millisecond RMS frames made ordinary microphone beds
 // look perpetually modulated: tiny frame-to-frame fluctuations repeatedly
@@ -999,27 +995,31 @@ impl Active {
         let Some(target) = self.target.as_ref() else {
             return Ok(());
         };
-        let publication = match publish_retained(&self.samples, &mut self.prefill_cursor, target) {
-            Ok(publication) => publication,
-            Err(error) => {
-                self.terminal_error = Some(error.clone());
-                self.emit(CaptureEventKind::Failed, 0.0, Some(error.clone()));
-                return Err(NativeVoiceCaptureError::Prefill(error));
-            }
-        };
-        let Some(publication) = publication else {
-            return Ok(());
-        };
-        let sample_count = publication.sample_count;
-        let push_us = publication.push_us;
-        self.metrics.prefill_push_cpu_us = self.metrics.prefill_push_cpu_us.saturating_add(push_us);
-        self.metrics.prefill_push_max_us = self.metrics.prefill_push_max_us.max(push_us);
-        self.metrics.prefill_pushes += 1;
-        self.metrics.prefill_samples += sample_count as u64;
-        self.metrics.prefill_high_water_samples = self
-            .metrics
-            .prefill_high_water_samples
-            .max(publication.buffered);
+        loop {
+            let publication =
+                match publish_retained(&self.samples, &mut self.prefill_cursor, target) {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        self.terminal_error = Some(error.clone());
+                        self.emit(CaptureEventKind::Failed, 0.0, Some(error.clone()));
+                        return Err(NativeVoiceCaptureError::Prefill(error));
+                    }
+                };
+            let Some(publication) = publication else {
+                break;
+            };
+            let sample_count = publication.sample_count;
+            let push_us = publication.push_us;
+            self.metrics.prefill_push_cpu_us =
+                self.metrics.prefill_push_cpu_us.saturating_add(push_us);
+            self.metrics.prefill_push_max_us = self.metrics.prefill_push_max_us.max(push_us);
+            self.metrics.prefill_pushes += 1;
+            self.metrics.prefill_samples += sample_count as u64;
+            self.metrics.prefill_high_water_samples = self
+                .metrics
+                .prefill_high_water_samples
+                .max(publication.buffered);
+        }
         Ok(())
     }
 
@@ -1205,7 +1205,9 @@ fn publish_retained(
     cursor: &mut usize,
     target: &CaptureTarget,
 ) -> Result<Option<RetainedPublication>, String> {
-    let end = samples.len();
+    let end = samples
+        .len()
+        .min((*cursor).saturating_add(PREFILL_BATCH_SAMPLES));
     if *cursor >= end {
         return Ok(None);
     }
@@ -2182,6 +2184,31 @@ mod tests {
             .expect("nonempty tail");
         assert_eq!(tail.sample_count, 1);
         assert_eq!(cursor, 3);
+        assert_eq!(*sink.samples.lock().expect("recorded samples"), samples);
+    }
+
+    #[test]
+    fn retained_publication_bounds_catch_up_to_projector_frames() {
+        let sink = Arc::new(RecordingSink::default());
+        let target = recording_target("session", Arc::clone(&sink));
+        let samples = (0..(PREFILL_BATCH_SAMPLES * 3 + 17))
+            .map(|sample| sample as f32)
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        let mut lengths = Vec::new();
+        while let Some(publication) =
+            publish_retained(&samples, &mut cursor, &target).expect("publish")
+        {
+            lengths.push(publication.sample_count);
+        }
+        assert_eq!(
+            lengths,
+            [PREFILL_BATCH_SAMPLES; 3]
+                .into_iter()
+                .chain([17])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cursor, samples.len());
         assert_eq!(*sink.samples.lock().expect("recorded samples"), samples);
     }
 

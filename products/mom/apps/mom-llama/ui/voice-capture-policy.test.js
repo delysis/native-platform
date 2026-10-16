@@ -9,8 +9,18 @@ const {
   initialVoiceActivity,
   nextVoiceActivity,
   speechThreshold,
+  splitPrefillPcm,
   updatePlaybackEchoGuard,
 } = require("./voice-capture-policy.js");
+
+test("resumed call prefill keeps a long captured utterance in bounded ordered blocks", () => {
+  const samples = Float32Array.from({ length: 16_000 * 5 + 17 }, (_, index) => index);
+  const blocks = splitPrefillPcm(samples);
+  assert.equal(blocks.length, 126);
+  assert.ok(blocks.slice(0, -1).every((block) => block.length === 640));
+  assert.equal(blocks.at(-1).length, 17);
+  assert.deepEqual(Array.from(blocks.flatMap((block) => Array.from(block))), Array.from(samples));
+});
 
 test("subframe detector rejects intra-speech microgaps and locates sustained silence", () => {
   const onset = new Float32Array(256);

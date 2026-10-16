@@ -728,7 +728,6 @@ pub struct GenerationTicket {
     control: Arc<ActiveRequest>,
 }
 
-const MAX_INCREMENTAL_AUDIO_SAMPLES: usize = 16_000 * 4;
 const INCREMENTAL_AUDIO_RING_SAMPLES: usize = 16_000 * 30;
 // The intended Gemma 4 12B unified-audio projector (`gemma4ua`) is encoder-free:
 // llama.cpp maps each independent 640-sample raw-waveform frame to one model
@@ -964,7 +963,13 @@ impl IncrementalAudioBuffer {
         }
         let was_projector_ready = state.samples.len() >= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
         let ring_started = Instant::now();
-        debug_assert!(state.samples.push(samples));
+        // Admission is atomic: reject the whole push above if it will not fit,
+        // then copy it in projector-sized frames. An input push is not an
+        // utterance boundary and has no four-second duration limit.
+        for frame in samples.chunks(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES) {
+            let accepted = state.samples.push(frame);
+            debug_assert!(accepted);
+        }
         let ring_write_us = ring_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         state.ring_write_us = state.ring_write_us.saturating_add(ring_write_us);
         state.ring_write_max_us = state.ring_write_max_us.max(ring_write_us);
@@ -1526,13 +1531,10 @@ impl IncrementalAudioGeneration {
     }
 
     pub fn push_pcm(&self, samples: &[f32]) -> NativeResult<usize> {
-        if samples.is_empty()
-            || samples.len() > MAX_INCREMENTAL_AUDIO_SAMPLES
-            || samples.iter().any(|sample| !sample.is_finite())
-        {
+        if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
-                "incremental audio blocks must contain 1 ms to 4 seconds of finite mono PCM",
+                "incremental audio input must contain finite mono PCM",
             ));
         }
         self.input.push(samples)
@@ -10096,6 +10098,24 @@ mod tests {
                 .expect_err("one sample beyond capacity is refused")
                 .code,
             NativeErrorCode::QueueFull
+        );
+    }
+
+    #[test]
+    fn incremental_audio_input_accepts_more_than_four_seconds_without_dropping_samples() {
+        let ring = Arc::new(IncrementalAudioBuffer::new());
+        let samples = vec![0.25; 16_000 * 5];
+        assert_eq!(
+            ring.push(&samples).expect("five-second input"),
+            samples.len()
+        );
+        assert_eq!(ring.stats().accepted_samples, samples.len() as u64);
+        assert_eq!(
+            IncrementalAudioMonitor { input: ring }
+                .wav_bytes()
+                .expect("retained audio")
+                .len(),
+            44 + samples.len() * 2
         );
     }
 
