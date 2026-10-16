@@ -34,6 +34,16 @@ const BUILTIN_CACHE_PROMPT: &str =
 
 pub type KvCacheMetadata = PrefixCacheMetadata;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoicePersonaPrefixPreparation {
+    pub metadata: KvCacheMetadata,
+    pub prefill_us: u64,
+    pub verification_us: u64,
+    pub persistence_us: u64,
+    pub promotion_us: u64,
+    pub persisted: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KvCacheState {
@@ -233,8 +243,14 @@ pub fn kv_cache_save(
         Some(owner_id),
         label,
         &stable_messages,
+        ChatTemplateChoice::ModelDefault,
     )?;
-    if !verify_restore_equivalence(&handle, &stable_messages, &value.sequence)? {
+    if !verify_restore_equivalence(
+        &handle,
+        &stable_messages,
+        &value.sequence,
+        ChatTemplateChoice::ModelDefault,
+    )? {
         return Ok(CommandResult::blocked(
             "mom_llama.kv_cache_save",
             "blocked_native_runtime",
@@ -268,6 +284,222 @@ pub fn kv_cache_save(
                 .display()
                 .to_string(),
         ],
+        Vec::new(),
+        true,
+        false,
+    ))
+}
+
+/// Explicitly prepare the system prefix used by live calls and voice notes.
+/// The ordinary cache command uses the model-default chat template, which can
+/// tokenize differently from the voice path's non-thinking template.
+pub fn kv_cache_save_voice_persona(
+    scope: &crate::OperationScope,
+    persona_id: &str,
+) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
+    let operation = "mom_llama.kv_cache_save_voice_persona";
+    let settings = resolve_settings()?;
+    if !settings.kv_cache_policy.allows_prefix_reuse() {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_policy_disabled",
+                "Prompt caching is disabled.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let Some(persona) = crate::personas::persona_list()?
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .find(|persona| persona.id == persona_id)
+    else {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "persona_not_found",
+                "The selected persona is unavailable.",
+                Vec::new(),
+            ),
+        ));
+    };
+    let handle = match resident_model(scope, &settings) {
+        Ok(handle) => handle,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                operation,
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
+    let messages = stable_persona_prompt_messages(&settings, &persona)?;
+    let template = ChatTemplateChoice::PreferNonThinking;
+    let started = std::time::Instant::now();
+    let value = create_prefix_value(
+        &handle,
+        CacheTier::PersonaPack,
+        Some(persona.id.clone()),
+        format!("Voice persona: {}", persona.title),
+        &messages,
+        template.clone(),
+    )?;
+    let prefill_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let started = std::time::Instant::now();
+    if !verify_restore_equivalence(&handle, &messages, &value.sequence, template)? {
+        return Ok(CommandResult::blocked(
+            operation,
+            "blocked_native_runtime",
+            Blocker::new(
+                "kv_cache_restore_mismatch",
+                "The voice prefix failed deterministic restoration.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let verification_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let started = std::time::Instant::now();
+    if !persist_value(&settings, &value)? {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The persona was removed during preparation.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let persistence_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    Ok(CommandResult::passed(
+        operation,
+        "prompt_smoke_verified",
+        VoicePersonaPrefixPreparation {
+            metadata: value.metadata.clone(),
+            prefill_us,
+            verification_us,
+            persistence_us,
+            promotion_us: 0,
+            persisted: true,
+        },
+        vec![encrypted_blob_uri(&value.metadata.id)],
+        Vec::new(),
+        true,
+        false,
+    ))
+}
+
+/// Prepare one selected voice persona in the resident prefix LRU. This avoids
+/// the large encrypted disk write on the foreground path; durable preparation
+/// remains an explicit, separately measured operation.
+pub fn kv_cache_prepare_voice_persona_resident(
+    scope: &crate::OperationScope,
+    persona_id: &str,
+) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
+    let operation = "mom_llama.kv_cache_prepare_voice_persona_resident";
+    let settings = resolve_settings()?;
+    if !settings.kv_cache_policy.allows_prefix_reuse() {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_policy_disabled",
+                "Prompt caching is disabled.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let Some(persona) = crate::personas::persona_list()?
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .find(|persona| persona.id == persona_id)
+    else {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "persona_not_found",
+                "The selected persona is unavailable.",
+                Vec::new(),
+            ),
+        ));
+    };
+    let handle = match resident_model(scope, &settings) {
+        Ok(handle) => handle,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                operation,
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
+    let messages = stable_persona_prompt_messages(&settings, &persona)?;
+    let template = ChatTemplateChoice::PreferNonThinking;
+    let started = std::time::Instant::now();
+    let value = create_prefix_value(
+        &handle,
+        CacheTier::PersonaPack,
+        Some(persona.id.clone()),
+        format!("Resident voice persona: {}", persona.title),
+        &messages,
+        template.clone(),
+    )?;
+    let prefill_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let started = std::time::Instant::now();
+    if !verify_restore_equivalence(&handle, &messages, &value.sequence, template)? {
+        return Ok(CommandResult::blocked(
+            operation,
+            "blocked_native_runtime",
+            Blocker::new(
+                "kv_cache_restore_mismatch",
+                "The voice prefix failed deterministic restoration.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let verification_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let started = std::time::Instant::now();
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let Some(lease) = MomCachePromotionLease::acquire(&store, Some(&persona.id))? else {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The persona was removed during preparation.",
+                Vec::new(),
+            ),
+        ));
+    };
+    if !lease.promote(value.clone())? {
+        return Ok(CommandResult::blocked(
+            operation,
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_changed",
+                "The persona changed during preparation.",
+                Vec::new(),
+            ),
+        ));
+    }
+    let promotion_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    Ok(CommandResult::passed(
+        operation,
+        "prompt_smoke_verified",
+        VoicePersonaPrefixPreparation {
+            metadata: value.metadata.clone(),
+            prefill_us,
+            verification_us,
+            persistence_us: 0,
+            promotion_us,
+            persisted: false,
+        },
+        Vec::new(),
         Vec::new(),
         true,
         false,
@@ -339,7 +571,12 @@ pub fn kv_cache_restore(
         .as_ref()
         .is_some_and(|value| value.is_valid() && value.metadata.fingerprint == expected);
     let equivalent = if let Some(value) = value.as_ref().filter(|_| compatible) {
-        verify_restore_equivalence(&handle, &stable_messages, &value.sequence)?
+        verify_restore_equivalence(
+            &handle,
+            &stable_messages,
+            &value.sequence,
+            ChatTemplateChoice::ModelDefault,
+        )?
     } else {
         false
     };
@@ -710,6 +947,7 @@ fn create_prefix_value(
     owner_id: Option<String>,
     label: String,
     stable_messages: &[ChatMessage],
+    template: ChatTemplateChoice,
 ) -> Result<PrefixCacheValue> {
     let branches = ["alpha", "beta"]
         .into_iter()
@@ -734,7 +972,7 @@ fn create_prefix_value(
             request_id: format!("kv-cache-prefill-{}", Uuid::new_v4()),
             model_id: handle.status().model_id,
             common_messages: stable_messages.to_vec(),
-            chat_template: ChatTemplateChoice::ModelDefault,
+            chat_template: template,
             branches,
             cached_prefix: None,
         })
@@ -767,6 +1005,7 @@ fn verify_restore_equivalence(
     handle: &NativeModelHandle,
     stable_messages: &[ChatMessage],
     state: &SequenceStateBlob,
+    template: ChatTemplateChoice,
 ) -> Result<bool> {
     let mut messages = stable_messages.to_vec();
     messages.push(ChatMessage {
@@ -779,7 +1018,7 @@ fn verify_restore_equivalence(
             model_id: handle.status().model_id,
             input: GenerationInput::Chat {
                 messages: messages.clone(),
-                template: ChatTemplateChoice::ModelDefault,
+                template: template.clone(),
             },
             sampling: SamplingConfig {
                 seed: 1,

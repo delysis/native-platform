@@ -68,7 +68,10 @@ pub use engine::{
     EngineCheckOptions, RuntimeWarmOutput, engine_check, engine_status, runtime_warm,
     runtime_warm_until_cancelled,
 };
-pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_status};
+pub use kv_cache::{
+    VoicePersonaPrefixPreparation, kv_cache_clear, kv_cache_prepare_voice_persona_resident,
+    kv_cache_restore, kv_cache_save, kv_cache_save_voice_persona, kv_cache_status,
+};
 pub use llama_native_engine::{
     GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,
     RealtimeComputeMetrics, acquire_generation_backpressure, acquire_realtime_compute,

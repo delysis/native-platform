@@ -2829,6 +2829,66 @@ fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
+    let _session = configured_real_session("real-voice-persona-prefix")?;
+    let projector = std::env::var_os("MOM_LLAMA_MMPROJ_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MMPROJ_PATH must point to the matching projector"))?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        max_tokens: Some(8),
+        mmproj_path: Some(Some(projector)),
+        context_tokens: Some(8192),
+        batch_tokens: Some(256),
+        max_parallel_sequences: Some(4),
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let persona = mom_llama_runtime::persona_list()?
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no built-in persona"))?;
+    let started = std::time::Instant::now();
+    let saved = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona.id)?;
+    let prepared = saved
+        .result
+        .ok_or_else(|| anyhow!("voice cache failed: {:?}", saved.blocker))?;
+    eprintln!(
+        "VOICE_PERSONA_PREFIX_CACHE {{\"prepare_ms\":{},\"prefill_ms\":{},\"verification_ms\":{},\"promotion_ms\":{},\"tokens\":{},\"bytes\":{}}}",
+        started.elapsed().as_millis(),
+        prepared.prefill_us as f64 / 1000.0,
+        prepared.verification_us as f64 / 1000.0,
+        prepared.promotion_us as f64 / 1000.0,
+        prepared.metadata.token_ids.len(),
+        prepared.metadata.state_bytes
+    );
+    assert!(!prepared.persisted);
+    assert_eq!(prepared.persistence_us, 0);
+    mom_llama_runtime::conversation_draft_open(Some(persona.id))?;
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;
+    let voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &conversation.id,
+        "[Phone call] [Greeting] Greet Jan briefly.",
+    )?;
+    assert!(
+        voice.begin_metrics().cached_prefix_found,
+        "first voice turn did not reuse the prepared persona cache: {:?}",
+        voice.begin_metrics()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
