@@ -847,6 +847,15 @@ fn cache_fingerprint(handle: &NativeModelHandle) -> Result<CacheFingerprint> {
 }
 
 fn stable_prompt_messages(settings: &Settings, owner_id: Option<&str>) -> Result<Vec<ChatMessage>> {
+    if let Some(owner_id) = owner_id
+        && let Some(persona) = crate::personas::persona_list()?
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .find(|persona| persona.id == owner_id)
+    {
+        return stable_persona_prompt_messages(settings, &persona);
+    }
     let skill_prompt = cache_prompt(owner_id)?;
     let system_message = upstream_setting_string(settings, "systemMessage").unwrap_or_default();
     let combined = [system_message.trim(), skill_prompt.trim()]
@@ -861,6 +870,30 @@ fn stable_prompt_messages(settings: &Settings, owner_id: Option<&str>) -> Result
         })
         .into_iter()
         .collect())
+}
+
+fn stable_persona_prompt_messages(
+    settings: &Settings,
+    persona: &crate::conversation_store::Conversation,
+) -> Result<Vec<ChatMessage>> {
+    let system_message = persona
+        .execution_profile
+        .system_message
+        .clone()
+        .unwrap_or_else(|| upstream_setting_string(settings, "systemMessage").unwrap_or_default());
+    let skill_prompt = crate::skill_store::applied_skill_prompt(&persona.current_skill_ids)?;
+    Ok(crate::chat::build_native_messages(
+        &system_message,
+        &skill_prompt.prompt,
+        &[],
+        "",
+        false,
+        &HashMap::new(),
+        "",
+    )
+    .into_iter()
+    .filter(|message| message.role == ChatRole::System)
+    .collect())
 }
 
 fn cache_prompt(skill_id: Option<&str>) -> Result<String> {
@@ -882,6 +915,14 @@ fn cache_prompt(skill_id: Option<&str>) -> Result<String> {
 
 fn skill_label(skill_id: Option<&str>) -> Result<String> {
     if let Some(skill_id) = skill_id {
+        if let Some(persona) = crate::personas::persona_list()?
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .find(|persona| persona.id == skill_id)
+        {
+            return Ok(format!("Persona: {}", persona.title));
+        }
         let db = load_skill_db()?;
         if let Some(skill) = db
             .skills
@@ -1459,6 +1500,33 @@ mod tests {
             cache_prompt(Some(BUILTIN_CACHE_OWNER))?,
             BUILTIN_CACHE_PROMPT
         );
+        Ok(())
+    }
+
+    #[test]
+    fn persona_cache_uses_the_same_system_prefix_as_live_chat() -> Result<()> {
+        let settings = Settings::defaults_for_data_dir(PathBuf::from("/tmp/persona-cache-test"));
+        let persona: Conversation = serde_json::from_value(serde_json::json!({
+            "id": "persona-example",
+            "title": "Example",
+            "created_at": "1",
+            "updated_at": "1",
+            "kind": "persona_template",
+            "execution_profile": {"system_message": "Speak as Example."},
+            "selected_model_path": null,
+            "messages": []
+        }))?;
+        let cached = stable_persona_prompt_messages(&settings, &persona)?;
+        let live = crate::chat::build_native_messages(
+            "Speak as Example.",
+            "",
+            &[],
+            "Hello",
+            false,
+            &HashMap::new(),
+            "",
+        );
+        assert_eq!(cached, live[..1]);
         Ok(())
     }
 
