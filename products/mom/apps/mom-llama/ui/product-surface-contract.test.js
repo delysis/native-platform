@@ -1115,16 +1115,20 @@ test("next-turn prefetch is never charged to the current microphone session", ()
   assert.equal(prefetched.voice_session_prepare_ms, null);
   assert.equal(prefetched.voice_session_prepared_before_capture, true);
   assert.equal(prefetched.voice_session_prepare_native_ms, null);
+  assert.equal(prefetched.voice_session_handoff_ms, null);
 
   const ordinary = summarize({ stages: [
     { stage: "capture_started", elapsed_ms: 10 },
+    { stage: "audio_prefill_begin_requested", elapsed_ms: 11 },
     { stage: "audio_prefill_session_ready", elapsed_ms: 42,
-      begin: { total_us: 31_500 } },
+      begin: { total_us: 20_000 } },
     { stage: "audio_prefill_native_targeted", elapsed_ms: 43 },
   ] });
   assert.equal(ordinary.voice_session_prepare_ms, 32);
   assert.equal(ordinary.voice_session_prepared_before_capture, false);
-  assert.equal(ordinary.voice_session_prepare_native_ms, 31.5);
+  assert.equal(ordinary.voice_session_prepare_native_ms, 20);
+  assert.equal(ordinary.voice_session_request_to_ready_ms, 31);
+  assert.equal(ordinary.voice_session_handoff_ms, 11);
 });
 
 test("live speech uses punctuation or a mode-appropriate PCM runway", () => {
