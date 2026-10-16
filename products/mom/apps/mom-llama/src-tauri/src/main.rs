@@ -405,7 +405,7 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         }
     };
 
-    let settings = match settings {
+    let mut settings = match settings {
         Ok(settings) => settings,
         Err(error) => {
             startup.record_failure();
@@ -414,20 +414,12 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             ));
         }
     };
-    if settings.model_path.as_ref() == Some(&acquired.gemma) {
-        let expected_mtp = acquired.mtp_assistant.to_string_lossy();
-        if settings.mmproj_path.as_ref() != Some(&acquired.projector)
-            || settings
-                .upstream_settings
-                .get("mtpAssistantPath")
-                .and_then(serde_json::Value::as_str)
-                != Some(expected_mtp.as_ref())
-        {
+    if bind_acquired_model_pair(&mut settings, &acquired) {
+        if let Err(error) = mom_llama_runtime::config::save_settings(&settings) {
             startup.record_failure();
-            return Err(
-                "Blessenger's language and listening models did not resolve as one verified set"
-                    .to_string(),
-            );
+            return Err(format!(
+                "Blessenger could not save its verified model set: {error:#}"
+            ));
         }
     }
     if !acquired.qwen_root.join("config.json").is_file() {
@@ -496,12 +488,18 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                 .map_err(|error| {
                     format!("Blessenger could not warm its listening model: {error:#}")
                 })?;
-                let ready = warm.status == "passed"
-                    && warm
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| result.model_loaded && result.audio_projector_warmed);
+                let ready = first_run_warm_ready(&warm);
                 if !ready {
+                    let reason = if let Some(blocker) = warm.blocker.as_ref() {
+                        format!("{}: {}", blocker.code, blocker.message)
+                    } else if let Some(result) = warm.result.as_ref() {
+                        format!(
+                            "model loaded: {}, audio projector warmed: {}",
+                            result.model_loaded, result.audio_projector_warmed
+                        )
+                    } else {
+                        format!("runtime warm returned {}", warm.status)
+                    };
                     runtime.begin_quiesce();
                     let _ = if embedded {
                         runtime.drain_shared_services().await
@@ -509,7 +507,9 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                         runtime.shutdown().await
                     };
                     startup.record_failure();
-                    return Err("Blessenger could not make its listening model ready".to_string());
+                    return Err(format!(
+                        "Blessenger could not make its listening model ready: {reason}"
+                    ));
                 }
             }
             if let Some(prepared) = &prepared_speech {
@@ -557,6 +557,44 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             Err(message)
         }
     }
+}
+
+fn bind_acquired_model_pair(
+    settings: &mut mom_llama_runtime::config::Settings,
+    acquired: &model_acquisition::AcquiredModels,
+) -> bool {
+    if settings.model_path.as_ref() != Some(&acquired.gemma) {
+        return false;
+    }
+    let previous_projector = settings.mmproj_path.clone();
+    let previous_projection = settings.upstream_settings.get("mmprojPath").cloned();
+    let previous_mtp = settings.upstream_settings.get("mtpAssistantPath").cloned();
+    settings.mmproj_path = Some(acquired.projector.clone());
+    settings.upstream_settings.insert(
+        "mmprojPath".to_string(),
+        json!(acquired.projector.display().to_string()),
+    );
+    settings.upstream_settings.insert(
+        "mtpAssistantPath".to_string(),
+        json!(acquired.mtp_assistant.display().to_string()),
+    );
+    let changed = previous_projector != settings.mmproj_path
+        || previous_projection != settings.upstream_settings.get("mmprojPath").cloned()
+        || previous_mtp != settings.upstream_settings.get("mtpAssistantPath").cloned();
+    if changed {
+        settings.verified_model_artifacts = None;
+    }
+    changed
+}
+
+fn first_run_warm_ready(
+    warm: &mom_llama_runtime::receipts::CommandResult<mom_llama_runtime::engine::RuntimeWarmOutput>,
+) -> bool {
+    warm.status == "host_integrated"
+        && warm
+            .result
+            .as_ref()
+            .is_some_and(|result| result.model_loaded && result.audio_projector_warmed)
 }
 
 fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
@@ -1296,10 +1334,12 @@ fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
 mod tests {
     use super::{
         FinalExitDecision, FinalExitTarget, StartupAction, StartupController,
-        StartupShutdownAction, decide_final_exit_target, final_exit_decision,
-        rejected_build_disposition, safe_to_exit_after_shutdown, smoke_receipt,
+        StartupShutdownAction, bind_acquired_model_pair, decide_final_exit_target,
+        final_exit_decision, first_run_warm_ready, model_acquisition, rejected_build_disposition,
+        safe_to_exit_after_shutdown, smoke_receipt,
     };
     use crate::app_runtime::{AppShutdownError, AppShutdownSummary};
+    use serde_json::json;
 
     fn startup_controller() -> StartupController {
         StartupController::new()
@@ -1476,6 +1516,82 @@ mod tests {
         assert!(script.contains("mom_llama_model_acquisition_progress"));
         assert!(script.contains("mom_llama_voice_initialization_progress"));
         assert!(script.contains("Checking ${payload.voice}"));
+    }
+
+    #[test]
+    fn acquired_default_rebinds_stale_companions_without_changing_custom_model() {
+        use std::path::PathBuf;
+
+        let acquired = model_acquisition::AcquiredModels {
+            gemma: PathBuf::from("/cache/gemma.gguf"),
+            projector: PathBuf::from("/cache/projector.gguf"),
+            mtp_assistant: PathBuf::from("/cache/mtp.gguf"),
+            qwen_root: PathBuf::from("/cache/qwen"),
+        };
+        let mut settings =
+            mom_llama_runtime::config::Settings::defaults_for_data_dir(PathBuf::from("/data"));
+        settings.model_path = Some(acquired.gemma.clone());
+        settings.mmproj_path = Some(PathBuf::from("/old/projector.gguf"));
+        settings
+            .upstream_settings
+            .insert("mtpAssistantPath".to_string(), json!("/old/mtp.gguf"));
+        assert!(bind_acquired_model_pair(&mut settings, &acquired));
+        assert_eq!(settings.mmproj_path.as_ref(), Some(&acquired.projector));
+        assert_eq!(
+            settings.upstream_settings["mmprojPath"],
+            json!("/cache/projector.gguf")
+        );
+        assert_eq!(
+            settings.upstream_settings["mtpAssistantPath"],
+            json!("/cache/mtp.gguf")
+        );
+        assert!(!bind_acquired_model_pair(&mut settings, &acquired));
+
+        settings.model_path = Some(PathBuf::from("/chosen/custom.gguf"));
+        settings.mmproj_path = Some(PathBuf::from("/chosen/projector.gguf"));
+        let custom = settings.clone();
+        assert!(!bind_acquired_model_pair(&mut settings, &acquired));
+        assert_eq!(settings, custom);
+    }
+
+    #[test]
+    fn first_run_accepts_the_runtime_warm_receipt_status() {
+        use mom_llama_runtime::engine::RuntimeWarmOutput;
+        use mom_llama_runtime::receipts::CommandResult;
+
+        let output = RuntimeWarmOutput {
+            model_loaded: true,
+            audio_projector_warmed: true,
+            audio_projector_warm_us: 1,
+            persona_prefixes_ready: 0,
+            persona_prefixes_reused: 0,
+            settings_us: 1,
+            model_acquire_us: 1,
+            model_load: None,
+        };
+        let warm = CommandResult::passed(
+            "mom_llama.runtime_warm",
+            "host_integrated",
+            output.clone(),
+            vec![],
+            vec![],
+            true,
+            false,
+        );
+        assert!(first_run_warm_ready(&warm));
+        let missing_audio = CommandResult::passed(
+            "mom_llama.runtime_warm",
+            "host_integrated",
+            RuntimeWarmOutput {
+                audio_projector_warmed: false,
+                ..output
+            },
+            vec![],
+            vec![],
+            true,
+            false,
+        );
+        assert!(!first_run_warm_ready(&missing_audio));
     }
 
     #[test]

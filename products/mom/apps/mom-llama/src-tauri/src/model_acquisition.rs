@@ -179,6 +179,7 @@ pub(crate) struct AcquisitionProgress {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct VoiceProgress {
+    pub persona_id: String,
     pub persona: String,
     pub voice: String,
     pub completed: usize,
@@ -334,7 +335,8 @@ pub(crate) fn validate_persona_voices(
             )));
         }
         progress(VoiceProgress {
-            persona: format!("{} persona", entry.speaker),
+            persona_id: entry.persona_id.clone(),
+            persona: entry.speaker.clone(),
             voice: format!("{} voice", entry.speaker),
             completed: index + 1,
             total: EXPECTED_PERSONAS.len(),

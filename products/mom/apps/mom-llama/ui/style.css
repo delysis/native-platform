@@ -160,6 +160,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 .chrome .icon-button { width: 40px; height: 40px; flex: 0 0 40px; }
+.boot-chrome { background: transparent; }
 html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 76px; }
 .chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }
 .titlebar-drag-surface { position: relative; flex: 1; height: 100%; min-width: 28px; }
@@ -185,14 +186,14 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 /* WebKit can win pointer hit testing at an overlay window's outermost pixels.
    Explicit regions keep the native resize gesture and cursor discoverable. */
 .window-resize-region { position: fixed; z-index: 1000; }
-.window-resize-north, .window-resize-south { left: 18px; right: 18px; height: 12px; cursor: ns-resize; }
-.window-resize-east, .window-resize-west { top: 18px; bottom: 18px; width: 12px; cursor: ew-resize; }
+.window-resize-north, .window-resize-south { left: 18px; right: 18px; height: 10px; cursor: ns-resize; }
+.window-resize-east, .window-resize-west { top: 18px; bottom: 18px; width: 10px; cursor: ew-resize; }
 .window-resize-north { top: 0; }
 .window-resize-south { bottom: 0; }
 .window-resize-east { right: 0; }
 .window-resize-west { left: 0; }
 .window-resize-north-east, .window-resize-north-west,
-.window-resize-south-east, .window-resize-south-west { width: 20px; height: 20px; }
+.window-resize-south-east, .window-resize-south-west { width: 18px; height: 18px; }
 .window-resize-north-east { top: 0; right: 0; cursor: nesw-resize; }
 .window-resize-north-west { top: 0; left: 0; cursor: nwse-resize; }
 .window-resize-south-east { right: 0; bottom: 0; cursor: nwse-resize; }
@@ -1547,6 +1548,10 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
 .startup-card { display: grid; gap: 12px; min-width: min(440px, calc(100vw - 48px)); padding: 28px; border: 1px solid var(--border); border-radius: 24px; background: var(--surface); box-shadow: 0 18px 60px rgb(0 0 0 / 12%); }
 .startup-card:not(.first-run) { min-width: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
 .boot h1 { margin: 0 0 10px; }
+.boot .startup-friends { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; max-width: 448px; margin: 2px auto 12px; }
+.boot .startup-friends[hidden] { display: none; }
+.boot .startup-friend { width: 48px; height: 48px; flex: 0 0 48px; border-radius: 50%; background-image: url("contact-portraits.png"); background-size: 400% 400%; box-shadow: 0 1px 5px rgb(0 0 0 / 15%); opacity: .72; transition: opacity 180ms, transform 180ms, box-shadow 180ms; }
+.boot .startup-friend.active { opacity: 1; transform: scale(1.14); box-shadow: 0 0 0 3px var(--focus), 0 2px 8px rgb(0 0 0 / 18%); }
 .boot p { margin: 0; color: var(--muted); }
 .boot progress { width: 100%; }
 .boot .primary-button { justify-self: center; margin-top: 4px; }

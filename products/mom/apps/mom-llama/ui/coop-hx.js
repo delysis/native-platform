@@ -8909,7 +8909,7 @@
     });
   };
 
-  const RESIZE_EDGE_PX = 16;
+  const RESIZE_EDGE_PX = 14;
   const resizeHitForPoint = (clientX, clientY) => {
     const west = clientX <= RESIZE_EDGE_PX;
     const east = clientX >= window.innerWidth - RESIZE_EDGE_PX;
@@ -8969,6 +8969,35 @@
     const greeting = document.getElementById("startup-greeting");
     const setupProgress = document.getElementById("startup-progress");
     const persona = document.getElementById("startup-persona");
+    const friends = document.getElementById("startup-friends");
+    const friendPortraits = [
+      ["bessel_van_der_kolk", "Bessel van der Kolk"],
+      ["gabor_mate", "Gabor Maté"],
+      ["peter_levine", "Peter Levine"],
+      ["judith_herman", "Judith Herman"],
+      ["richard_schwartz", "Richard Schwartz"],
+      ["janina_fisher", "Janina Fisher"],
+      ["ad_de_jongh", "Ad de Jongh"],
+      ["christine_courtois", "Christine Courtois"],
+      ["robert_miller", "Robert Miller"],
+      ["arnold_popky", "Arnold Popky"],
+      ["jim_knipe", "Jim Knipe"],
+      ["francine_shapiro", "Francine Shapiro"],
+      ["shirley_jean_schmidt", "Shirley Jean Schmidt"],
+      ["dolores_mosquera", "Dolores Mosquera"],
+    ];
+    if (friends) {
+      for (const [index, [id, name]] of friendPortraits.entries()) {
+        const portrait = document.createElement("span");
+        portrait.className = "startup-friend";
+        portrait.dataset.personaId = id;
+        portrait.setAttribute("role", "img");
+        portrait.setAttribute("aria-label", name);
+        portrait.title = name;
+        portrait.style.backgroundPosition = `${(index % 4) * 100 / 3}% ${Math.floor(index / 4) * 100 / 3}%`;
+        friends.append(portrait);
+      }
+    }
     let firstRunSetup = false;
     const initialize = async () => {
       if (status) {
@@ -8988,6 +9017,7 @@
         firstRunSetup = true;
         card?.classList.add("first-run");
         if (greeting) greeting.hidden = false;
+        if (friends) friends.hidden = false;
         if (setupProgress) setupProgress.hidden = false;
       };
       const artifactLabel = (artifact) => ({
@@ -9018,6 +9048,9 @@
         if (persona) {
           persona.hidden = false;
           persona.textContent = payload.persona;
+        }
+        for (const portrait of friends?.children || []) {
+          portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
         }
         if (setupProgress) setupProgress.value = Math.floor((Number(payload.completed || 0) / Number(payload.total || 1)) * 100);
       });

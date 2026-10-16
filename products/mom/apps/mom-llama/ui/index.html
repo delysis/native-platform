@@ -13,9 +13,11 @@
 </head>
 <body>
   <main id="app" data-runtime="tauri-maud-htmx" data-native-core-only="true">
+    <header class="chrome boot-chrome" aria-label="Window toolbar"></header>
     <section class="boot">
       <div id="startup-card" class="startup-card">
       <h1 id="startup-greeting" hidden>Hi Jan — I’m getting Blessenger ready.</h1>
+      <div id="startup-friends" class="startup-friends" role="group" aria-label="Jan’s friends" hidden></div>
       <p id="startup-status" role="status">Opening</p>
       <progress id="startup-progress" max="100" value="0" hidden></progress>
       <p id="startup-persona" hidden></p>
