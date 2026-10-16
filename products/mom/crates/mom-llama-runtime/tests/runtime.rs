@@ -2828,19 +2828,25 @@ fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+#[ignore = "requires real Gemma GGUF, matching projector, and 16 kHz voice WAV"]
 fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let _session = configured_real_session("real-voice-persona-prefix")?;
     let projector = std::env::var_os("MOM_LLAMA_MMPROJ_PATH")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .ok_or_else(|| anyhow!("MOM_LLAMA_MMPROJ_PATH must point to the matching projector"))?;
+    let wav_path = std::env::var_os("MOM_LLAMA_TEST_VOICE_WAV")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_TEST_VOICE_WAV must point to a 16 kHz WAV"))?;
+    let samples = pcm16_mono_16khz_wav_samples(&wav_path)?;
+    anyhow::ensure!(samples.len() >= 8_000, "voice WAV needs 500 ms of PCM");
     mom_llama_runtime::settings_update(SettingsUpdate {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         native_device: Some(llama_native_types::NativeDevice::Metal),
         max_tokens: Some(8),
         mmproj_path: Some(Some(projector)),
-        context_tokens: Some(8192),
+        context_tokens: Some(51_200),
         batch_tokens: Some(256),
         max_parallel_sequences: Some(4),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
@@ -2881,6 +2887,63 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         voice.begin_metrics().cached_prefix_found,
         "first voice turn did not reuse the prepared persona cache: {:?}",
         voice.begin_metrics()
+    );
+    let restored_tokens = voice.begin_metrics().cached_prefix_tokens;
+    voice.wait_for_resume()?;
+    let capture_started = Instant::now();
+    for (index, chunk) in samples[..8_000].chunks(160).enumerate() {
+        let deadline = capture_started + Duration::from_millis(index as u64 * 10);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        voice.push_pcm(chunk)?;
+    }
+    if let Some(wait) =
+        (capture_started + Duration::from_millis(500)).checked_duration_since(Instant::now())
+    {
+        std::thread::sleep(wait);
+    }
+    let silence = Instant::now();
+    voice.seal_input()?;
+    let mut first_token_ms = None;
+    let finished = mom_llama_runtime::voice_audio_finish_in_scope(
+        voice,
+        ChatSendOptions {
+            timeout_s: 60.0,
+            fake_fixture: false,
+        },
+        Some(|event: mom_llama_runtime::ChatStreamEvent| {
+            if first_token_ms.is_none()
+                && matches!(event.event.as_str(), "delta" | "reasoning_delta")
+            {
+                first_token_ms = Some(silence.elapsed().as_millis());
+            }
+            Ok(())
+        }),
+    )?;
+    let output = finished
+        .result
+        .ok_or_else(|| anyhow!("prepared first voice turn failed: {:#?}", finished.blocker))?;
+    let audio = output
+        .voice_audio_metrics
+        .as_ref()
+        .ok_or_else(|| anyhow!("prepared first voice turn omitted audio metrics"))?;
+    eprintln!(
+        "VOICE_PERSONA_FIRST_TURN {}",
+        serde_json::to_string(&json!({
+            "cached_prefix_tokens": restored_tokens,
+            "silence_to_first_token_ms": first_token_ms,
+            "prefix_us": audio.prefix_us,
+            "restored_prefix_tokens": audio.restored_prefix_tokens,
+            "projector_us": audio.projector_us,
+            "projector_max_us": audio.projector_max_us,
+            "last_projector_finish_us": audio.last_projector_finish_us,
+            "decode_start_us": audio.decode_start_us,
+        }))?
+    );
+    anyhow::ensure!(
+        first_token_ms.is_some(),
+        "prepared turn emitted no text token"
     );
     Ok(())
 }

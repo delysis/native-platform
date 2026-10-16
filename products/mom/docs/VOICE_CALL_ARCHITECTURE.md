@@ -27,8 +27,8 @@ thresholds, model names, and instructions do not belong in visible chrome.
    20 ms release; resumed speech cancels uncommitted generation.
 4. A compactor omits long silence from model input while preserving a reversible
    ledger from compacted samples to original frame numbers and times.
-5. The audio model consumes exact 15,840-sample projector blocks during speech.
-   These match Gemma 4's 100-frame acoustic unit. A trailing partial block is
+5. The audio model consumes exact 640-sample (40 ms) projector frames during speech.
+   A trailing partial frame is
    sealed immediately at silence; no additional response delay is inserted.
 6. Speech synthesis produces bounded audio chunks. Playback begins once the first
    verified chunk is available and remains cancellable at every boundary.
@@ -234,6 +234,24 @@ to one model token. At 16 kHz that is 40 ms, with no fixed-length padding and no
 downsampling. The earlier 15,840-sample batching rule belonged to the older
 spectrogram frontend and retained almost a second of already-heard speech. The
 resident path and its acceptance now use 640-sample projector frames.
+
+A 2026-10-16 real-model check exposed a cold-path qualification trap. With the
+one-frame launch warm-up, a 500 ms streamed utterance took 1,249 ms from
+physical silence to first token, although its text-prefix restore took only
+2 ms. Four additional Metal pipelines compiled during that first turn. A
+four-frame launch probe appeared to cut the delay to 113 ms, but repeating the
+original one-frame probe after the machine's shader cache was warm also reached
+118 ms. The four-frame change was therefore not retained: the paired results
+do not prove it fixed a cold first call. The long four-second turn reached first
+token 117 ms after silence in the first run and 107-110 ms in the warm runs.
+The selected-persona launch path was also exercised at the app's 51.2K context:
+it prepared a 1,361-token prefix, restored 1,364 tokens on the first 500 ms
+spoken turn, and reached first text 131 ms after physical silence. This is a
+real-model component result, not packaged-call acceptance. A cold-start
+experiment still needs to distinguish pipeline compilation from projector
+compute on the exact app launch path. Structured results and qualification
+limits are retained in
+`products/mom/artifacts/latency/2026-10-16-first-call-projector-warm-ab.json`.
 
 Loading the GGUF does not compile the first Metal audio-projector evaluation.
 The packaged runtime now feeds one exact 640-sample frame through the resident
