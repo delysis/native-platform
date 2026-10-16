@@ -276,7 +276,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     bridge.indexOf('  document.addEventListener("input"', submitStart),
   );
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
-  assert.match(submitHandler, /if \(voiceDispatch\) await waitForVoiceTranscript\(conversation\);[\s\S]*result = await invoke\("mom_llama_chat_dispatch"/);
+  assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
   assert.match(submitHandler, /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"\) \{[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment\)/);
   const voiceTranscript = bridge.slice(
     bridge.indexOf("  const indexVoiceTurn ="),
@@ -284,7 +284,9 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   );
   assert.ok(voiceTranscript.includes('invoke("mom_llama_speech_transcribe_attachment"'));
   assert.ok(voiceTranscript.includes('invoke("mom_llama_message_record_voice_transcript"'));
-  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call\) => \{\s*await waitForVoiceTranscript\(conversation\);[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
+  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call\) => \{[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
+  assert.ok(!voiceTranscript.includes("waitForVoiceTranscript"), "new microphone turns cannot wait for transcription");
+  assert.ok(!voiceTranscript.includes("await previous"), "one failed transcript cannot strand later backfills");
   const speculate = bridge.slice(
     bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
     bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),

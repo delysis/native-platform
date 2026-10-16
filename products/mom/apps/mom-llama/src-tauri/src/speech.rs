@@ -394,9 +394,20 @@ pub struct AttachmentTranscriptionOutput {
     pub transcript: String,
     pub language: Option<String>,
     pub provenance: AttachmentTranscriptionProvenance,
+    pub timing: AttachmentTranscriptionTiming,
     /// The renderer may offer this as a separate normal composer edit. This
     /// command never changes a draft and never dispatches a message.
     pub insertion_requires_explicit_normal_edit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AttachmentTranscriptionTiming {
+    pub input_audio_ms: Option<u64>,
+    pub queue_us: Option<u64>,
+    pub host_admission_us: Option<u64>,
+    pub model_load_ms: Option<u64>,
+    pub first_result_ms: Option<u64>,
+    pub total_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1268,6 +1279,14 @@ impl MomSpeech {
             transcript: response.text,
             language: response.language,
             provenance: provenance.clone(),
+            timing: AttachmentTranscriptionTiming {
+                input_audio_ms: response.usage.input_audio_ms,
+                queue_us: response.usage.queue_us,
+                host_admission_us: response.usage.host_admission_us,
+                model_load_ms: response.usage.model_load_ms,
+                first_result_ms: response.usage.time_to_first_result_ms,
+                total_ms: response.usage.total_ms,
+            },
             insertion_requires_explicit_normal_edit: true,
         };
         Ok(CommandResult::passed(

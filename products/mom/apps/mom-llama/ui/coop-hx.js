@@ -3667,7 +3667,6 @@
   let voiceCallConversation = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
-  const pendingVoiceTranscripts = new Map();
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
   let pendingVoiceDispatchPrompt = null;
@@ -4575,7 +4574,32 @@
       : Date.now() * 1000;
     let recorded = null;
     let firstOccurrence = true;
-    if (stage === "playback_underrun") {
+    if (stage === "playback_consumed") {
+      let consumed = trace.stages.find((entry) => entry.stage === stage);
+      const frames = Math.max(0, Number(detail.frames) || 0);
+      const buffered = Math.max(0, Number(detail.buffered_frames) || 0);
+      if (!consumed && trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
+        consumed = {
+          stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs,
+          first_elapsed_ms: elapsedMs, first_observed_at_unix_us: observedAtUnixUs,
+          occurrences: 0, total_frames: 0,
+          min_buffered_frames: buffered, max_buffered_frames: buffered,
+        };
+        trace.stages.push(consumed);
+      }
+      if (consumed) {
+        consumed.elapsed_ms = elapsedMs;
+        consumed.observed_at_unix_us = observedAtUnixUs;
+        consumed.occurrences += 1;
+        consumed.total_frames += frames;
+        consumed.min_buffered_frames = Math.min(consumed.min_buffered_frames, buffered);
+        consumed.max_buffered_frames = Math.max(consumed.max_buffered_frames, buffered);
+        consumed.rendered_frames = Number(detail.rendered_frames) || 0;
+        consumed.queued_frames = Number(detail.queued_frames) || 0;
+        consumed.audio_context_ms = Number(detail.audio_context_ms) || 0;
+      }
+      recorded = consumed;
+    } else if (stage === "playback_underrun") {
       let underrun = trace.stages.find((entry) => entry.stage === stage);
       if (!underrun) {
         underrun = { stage, elapsed_ms: elapsedMs, occurrences: 0, total_gap_ms: 0, max_gap_ms: 0 };
@@ -4622,10 +4646,10 @@
       "native_generation_worker_started",
       "generation_finished",
       "voice_transcript_started",
+      "voice_transcript_inference_started",
+      "voice_transcript_inference_finished",
       "voice_transcript_finished",
       "voice_transcript_failed",
-      "voice_transcript_wait_started",
-      "voice_transcript_wait_finished",
       "first_content_delta",
       "first_content_delta_received",
       "tts_first_chunk_ready",
@@ -5734,9 +5758,7 @@
     markVoiceLatencyIn(trace, "voice_transcript_started", {
       source: output?.voice_attachment_id ? "live" : "fallback",
     });
-    const previous = pendingVoiceTranscripts.get(conversation);
     const task = (async () => {
-      if (previous) await previous;
       if (!attachment || !messageId) {
         throw new Error("voice_transcript_source_missing: The saved voice turn has no recording identity.");
       }
@@ -5747,36 +5769,46 @@
       if (!primary || primary.kind !== "audio") {
         throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
       }
+      markVoiceLatencyIn(trace, "voice_transcript_source_ready", {
+        duration_ms: Math.round((performance.now() - started) * 100) / 100,
+      });
+      const inferenceStarted = performance.now();
+      markVoiceLatencyIn(trace, "voice_transcript_inference_started");
       const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
         conversation,
         ...attachmentPreviewAnchor(catalog, primary),
         operation: speechOperationToken(),
       });
-      if (transcribed?.status === "blocked") {
-        throw new Error(`${transcribed.blocker?.code || "voice_transcript_blocked"}: ${transcribed.blocker?.message || "The recorded voice could not be transcribed."}`);
+      markVoiceLatencyIn(trace, "voice_transcript_inference_finished", {
+        duration_ms: Math.round((performance.now() - inferenceStarted) * 100) / 100,
+        ...(transcribed?.result?.timing || {}),
+      });
+      if (transcribed?.status !== "passed") {
+        throw new Error(`${transcribed?.blocker?.code || "voice_transcript_blocked"}: ${transcribed?.blocker?.message || "The recorded voice could not be transcribed."}`);
       }
       const transcript = transcribed?.result?.transcript?.trim();
       if (!transcript) {
         throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
       }
+      const recordStarted = performance.now();
+      markVoiceLatencyIn(trace, "voice_transcript_record_started");
       const recorded = await invoke("mom_llama_message_record_voice_transcript", {
         conversation, message: messageId, attachment, transcript,
+      });
+      markVoiceLatencyIn(trace, "voice_transcript_record_finished", {
+        duration_ms: Math.round((performance.now() - recordStarted) * 100) / 100,
       });
       if (recorded?.status !== "passed") {
         throw new Error(`${recorded?.blocker?.code || "voice_transcript_record_failed"}: ${recorded?.blocker?.message || "The voice transcript could not be saved."}`);
       }
     })();
-    pendingVoiceTranscripts.set(conversation, task);
     void task.then(() => {
-      if (pendingVoiceTranscripts.get(conversation) === task) {
-        pendingVoiceTranscripts.delete(conversation);
-      }
       markVoiceLatencyIn(trace, "voice_transcript_finished", {
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
       });
     }, (error) => {
-      // Keep the failed barrier: silently using a stale text prefix would
-      // lose this utterance from every later turn in the same call.
+      // Transcription enriches history when it succeeds. A failed or slow
+      // transcriber must never hold the live listener or the next reply.
       markVoiceLatencyIn(trace, "voice_transcript_failed", {
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
         message: errorMessage(error),
@@ -5786,22 +5818,7 @@
     return task;
   };
 
-  const waitForVoiceTranscript = async (conversation) => {
-    const pending = pendingVoiceTranscripts.get(conversation);
-    if (!pending) return;
-    const started = performance.now();
-    markVoiceLatency("voice_transcript_wait_started");
-    try {
-      await pending;
-    } finally {
-      markVoiceLatency("voice_transcript_wait_finished", {
-        duration_ms: Math.round((performance.now() - started) * 100) / 100,
-      });
-    }
-  };
-
   const startVoicePrefill = async (conversation, call) => {
-    await waitForVoiceTranscript(conversation);
     markVoiceLatency("audio_prefill_begin_requested", { conversation, call });
     const live = await invoke("mom_llama_voice_audio_begin", {
       conversation,
@@ -8442,7 +8459,6 @@
             if (liveVoice) pendingVoiceAudioSession = null;
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
-            if (voiceDispatch) await waitForVoiceTranscript(conversation);
             if (liveVoice) {
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
