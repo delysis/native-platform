@@ -4840,6 +4840,7 @@
     let interruptedForSpeech = false;
     let firstRequest = true;
     let activeOperation = null;
+    let activeSynthesis = null;
     let nextCallPrefill = null;
     let nextCallPrefillRetryPending = false;
     let retryHook = null;
@@ -5202,6 +5203,7 @@
       window.clearTimeout(schedulerWakeTimer);
       schedulerWakeTimer = null;
       const operation = activeOperation;
+      const synthesis = activeSynthesis;
       activeOperation = null;
       const continueCall = !onFailure && mode === "call"
         && voiceCallActive && voiceCallEpoch === callEpoch;
@@ -5209,7 +5211,7 @@
       const releaseProducer = Promise.allSettled([
         controller.stop(),
         operation ? invoke("mom_llama_speech_stop", { operation }) : Promise.resolve(),
-      ]);
+      ]).then(() => synthesis ? Promise.allSettled([synthesis]) : null);
       if (button) voiceReplyPlayback.delete(button);
       if (button) settleUnavailableVoiceReply(button);
       else if (mode === "voice_note") {
@@ -5428,12 +5430,14 @@
         } catch (error) { fail(error); }
       });
       if (segment === 1) markTtsLatency("tts_native_dispatched", { characters: next.chunk.length });
-      invoke("mom_llama_speech_precommit_synthesize", {
+      const synthesis = invoke("mom_llama_speech_precommit_synthesize", {
         conversation,
         operation,
         text: next.chunk,
         pcmStream: stream,
-      }).then((response) => {
+      });
+      activeSynthesis = synthesis;
+      synthesis.then((response) => {
         if (response?.status === "blocked" || !response?.result) {
           throw new Error(response?.blocker?.message || "Voice synthesis stopped.");
         }
@@ -5513,6 +5517,7 @@
         audioProgressWatchdog = null;
         watchdogActive = false;
         if (activeOperation === operation) activeOperation = null;
+        if (activeSynthesis === synthesis) activeSynthesis = null;
         running = false;
         pump();
       });
@@ -5628,7 +5633,11 @@
         window.clearTimeout(schedulerWakeTimer);
         schedulerWakeTimer = null;
         abortUnclaimedCallPrefill();
+        const synthesis = activeSynthesis;
+        const operation = activeOperation;
         await controller.stop();
+        if (operation) await invoke("mom_llama_speech_stop", { operation }).catch(() => {});
+        if (synthesis) await Promise.allSettled([synthesis]);
         if (button) {
           voiceReplyPlayback.delete(button);
           settleUnavailableVoiceReply(button);
@@ -5653,6 +5662,7 @@
         window.clearTimeout(schedulerWakeTimer);
         schedulerWakeTimer = null;
         const operation = activeOperation;
+        const synthesis = activeSynthesis;
         activeOperation = null;
         abortUnclaimedCallPrefill();
         // Silence the speaker first. Native cancellation can take longer and
@@ -5666,6 +5676,10 @@
         } else {
           await stoppedController;
         }
+        // Cancellation acknowledgement is not backend completion. The next
+        // Qwen request must not enter its bounded queue until this producer
+        // has actually released the backend lease.
+        if (synthesis) await Promise.allSettled([synthesis]);
         if (button) {
           voiceReplyPlayback.delete(button);
           settleUnavailableVoiceReply(button);
