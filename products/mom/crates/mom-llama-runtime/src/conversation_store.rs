@@ -1307,6 +1307,17 @@ pub fn message_edit(
                     ),
                 ));
             }
+            if is_recorded_voice_turn(&message) {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.message_edit",
+                    "stub_blocked",
+                    Blocker::new(
+                        "recorded_voice_turn_not_editable",
+                        "A recorded voice turn can only gain its exact final transcript.",
+                        Vec::new(),
+                    ),
+                ));
+            }
             let attribution = message.attribution.clone();
             let mut edited = message;
             edited.id = Uuid::new_v4().to_string();
@@ -1451,6 +1462,12 @@ fn voice_prompt_for_transcript(message: &Message, attachment_id: &str) -> Option
         && message.attachment_ids.len() == 1
         && message.attachment_ids[0] == attachment_id)
         .then_some(prompt)
+}
+
+fn is_recorded_voice_turn(message: &Message) -> bool {
+    message.attachment_ids.len() == 1
+        && (voice_prompt_for_transcript(message, &message.attachment_ids[0]).is_some()
+            || has_final_voice_transcript(message))
 }
 
 /// A retried publication of the same complete result is harmless. A different
@@ -2481,6 +2498,7 @@ mod tests {
         ] {
             let mut turn = message("spoken", None, MessageRole::User, prompt);
             turn.attachment_ids.push("exact-audio".into());
+            assert!(super::is_recorded_voice_turn(&turn));
             assert_eq!(
                 super::voice_prompt_for_transcript(&turn, "exact-audio"),
                 Some(prompt)
@@ -2502,6 +2520,7 @@ mod tests {
                 None
             );
             assert!(super::has_final_voice_transcript(&turn));
+            assert!(super::is_recorded_voice_turn(&turn));
             assert!(super::voice_final_transcript_matches(
                 &turn,
                 "exact-audio",
@@ -2519,6 +2538,7 @@ mod tests {
             ));
             turn.attachment_ids.push("another-source".into());
             assert!(!super::has_final_voice_transcript(&turn));
+            assert!(!super::is_recorded_voice_turn(&turn));
             assert!(!super::voice_final_transcript_matches(
                 &turn,
                 "exact-audio",

@@ -8590,8 +8590,8 @@
             // that presentation-only tag is unavailable at this boundary.
             const output = result?.result?.output || null;
             if (result?.status !== "blocked" && result?.result?.kind === "direct") {
-              // Start the CPU transcript as soon as this turn commits. The
-              // next Gemma prompt must not snapshot history before it lands.
+              // Backfill this exact turn after commit. The next Gemma prompt
+              // may proceed with its recorded audio if Parakeet is still busy.
               indexVoiceTurn(conversation, output, voiceTranscriptAttachment);
             }
             if (result?.status !== "blocked" && output?.assistant_text) {
