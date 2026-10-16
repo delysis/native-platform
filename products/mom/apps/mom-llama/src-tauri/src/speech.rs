@@ -425,6 +425,9 @@ pub struct GenerationBackpressureReceipt {
 #[async_trait]
 trait SpeechExecutor: Send + Sync {
     fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError>;
+    fn current_descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+        self.descriptors()
+    }
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String>;
     async fn synthesize_streaming(
         &self,
@@ -452,6 +455,10 @@ struct HostSpeechExecutor {
 impl SpeechExecutor for HostSpeechExecutor {
     fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
         Ok(Arc::clone(&self.descriptors))
+    }
+
+    fn current_descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+        Ok(Arc::from(self.host.descriptors()?))
     }
 
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String> {
@@ -1163,7 +1170,7 @@ impl MomSpeech {
                     return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
                 }
             };
-        let _deferred_selection = match select_parakeet(&self.executor.descriptors()?) {
+        let _deferred_selection = match select_parakeet(&self.executor.current_descriptors()?) {
             Ok(selection) => selection,
             Err(blocker) => {
                 return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
@@ -1243,7 +1250,7 @@ impl MomSpeech {
             self.finish_operation(operation, &request_id);
             return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
         }
-        let descriptors = self.executor.descriptors().inspect_err(|_| {
+        let descriptors = self.executor.current_descriptors().inspect_err(|_| {
             self.finish_operation(operation, &request_id);
         })?;
         let selection = match select_resident_parakeet(&descriptors) {
@@ -3304,6 +3311,7 @@ mod tests {
         struct MockPostflightExecutor {
             after_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
             inventory_error: Arc<AtomicBool>,
+            deferred_snapshot: AtomicBool,
             foreign_request: AtomicBool,
             calls: AtomicUsize,
         }
@@ -3332,6 +3340,28 @@ mod tests {
             fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
                 if self.inventory_error.load(Ordering::Relaxed) {
                     Err(SpeechHostError::StateUnavailable)
+                } else if self.deferred_snapshot.load(Ordering::Relaxed) {
+                    Ok(Arc::from([
+                        qwen_descriptor(),
+                        deferred_parakeet_descriptor(),
+                    ]))
+                } else {
+                    Ok(Arc::from([qwen_descriptor(), parakeet_descriptor()]))
+                }
+            }
+
+            fn current_descriptors(
+                &self,
+            ) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+                if self.inventory_error.load(Ordering::Relaxed) {
+                    Err(SpeechHostError::StateUnavailable)
+                } else if self.deferred_snapshot.load(Ordering::Relaxed)
+                    && self.calls.load(Ordering::Relaxed) == 0
+                {
+                    Ok(Arc::from([
+                        qwen_descriptor(),
+                        deferred_parakeet_descriptor(),
+                    ]))
                 } else {
                     Ok(Arc::from([qwen_descriptor(), parakeet_descriptor()]))
                 }
@@ -3422,6 +3452,34 @@ mod tests {
             async fn shutdown(&self) -> Result<(), SpeechHostError> {
                 Ok(())
             }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn transcription_accepts_verified_deferred_to_resident_transition()
+        -> anyhow::Result<()> {
+            let fixture = OwnedSpeechStore::new()?;
+            let anchor = fixture.audio_anchor()?;
+            let executor = Arc::new(MockPostflightExecutor::default());
+            executor.deferred_snapshot.store(true, Ordering::Relaxed);
+            let speech = MomSpeech {
+                executor: executor.clone(),
+                _qwen: None,
+                _qwen_startup_warm: None,
+                state: Mutex::new(SpeechState::default()),
+                precommit_voices: RwLock::new(BTreeMap::new()),
+                generation_backpressure: Mutex::new(BTreeMap::new()),
+            };
+
+            let result = speech
+                .transcribe_attachment(&fixture.conversation_id, &anchor, "stt-deferred-load")
+                .await?;
+            assert_eq!(executor.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                result.result.expect("resident transcript").transcript,
+                "Owned mock transcript."
+            );
+            assert!(speech.state.lock().expect("speech state").active.is_empty());
+            Ok(())
         }
 
         #[tokio::test(flavor = "current_thread")]
