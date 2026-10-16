@@ -4378,6 +4378,51 @@ mod tests {
     }
 
     #[test]
+    fn generation_merge_preserves_a_transcript_committed_after_prompt_snapshot() {
+        let mut recorded = message("spoken", vec!["audio-1".to_string()]);
+        recorded.content = "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.".to_string();
+        let mut snapshot = Conversation {
+            id: "chat".to_string(),
+            title: "Chat".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: crate::conversation_store::ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some(recorded.id.clone()),
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages: vec![recorded.clone()],
+        };
+        let mut assistant = message("reply", Vec::new());
+        assistant.role = crate::conversation_store::MessageRole::Assistant;
+        assistant.parent_id = Some(recorded.id.clone());
+        snapshot.messages.push(assistant.clone());
+        snapshot.active_leaf_message_id = Some(assistant.id.clone());
+
+        recorded
+            .content
+            .push_str("\n\nThe complete final transcript.");
+        let mut db = ConversationDb {
+            conversations: vec![Conversation {
+                messages: vec![recorded],
+                ..snapshot.clone()
+            }],
+            selected_conversation_id: Some("chat".to_string()),
+        };
+        merge_generated_conversation(&mut db, &snapshot, Some("spoken"), &[assistant.id])
+            .expect("merge generation from an earlier prompt snapshot");
+        assert_eq!(
+            db.conversations[0].messages[0].content,
+            "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.\n\nThe complete final transcript."
+        );
+        assert_eq!(db.conversations[0].messages.len(), 2);
+    }
+
+    #[test]
     fn concurrent_draft_edit_keeps_new_text_and_releases_sent_attachment_ids() {
         let expected = crate::conversation_store::DraftMessage {
             conversation_id: Some("chat".to_string()),
