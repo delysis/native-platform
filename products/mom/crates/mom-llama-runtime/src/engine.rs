@@ -152,23 +152,34 @@ pub fn runtime_warm_until_cancelled(
         0
     };
     let prefix_started = std::time::Instant::now();
-    let (persona_prefixes_ready, persona_prefix_warm_status) = if audio_projector_warmed
-        && !cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
-    {
-        match selected_voice_persona_to_warm() {
-            Ok(Some(persona_id)) => {
-                match crate::kv_cache::kv_cache_prepare_voice_persona_resident(scope, &persona_id) {
-                    Ok(prepared) if prepared.result.is_some() => (1, "ready"),
-                    Ok(_) => (0, "blocked"),
-                    Err(_) => (0, "failed"),
+    let (persona_prefixes_ready, persona_prefixes_reused, persona_prefix_warm_status) =
+        if audio_projector_warmed && !cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            match selected_voice_persona_to_warm() {
+                Ok(Some(persona_id)) => {
+                    match crate::kv_cache::kv_cache_prepare_voice_persona_resident(
+                        scope,
+                        &persona_id,
+                    ) {
+                        Ok(prepared)
+                            if prepared
+                                .result
+                                .as_ref()
+                                .is_some_and(|value| value.prefill_us == 0) =>
+                        {
+                            (1, 1, "reused")
+                        }
+                        Ok(prepared) if prepared.result.is_some() => (1, 0, "ready"),
+                        Ok(_) => (0, 0, "blocked"),
+                        Err(_) => (0, 0, "failed"),
+                    }
                 }
+                Ok(None) => (0, 0, "no_selected_persona"),
+                Err(_) => (0, 0, "selection_unavailable"),
             }
-            Ok(None) => (0, "no_selected_persona"),
-            Err(_) => (0, "selection_unavailable"),
-        }
-    } else {
-        (0, "skipped")
-    };
+        } else {
+            (0, 0, "skipped")
+        };
     let persona_prefix_warm_us = prefix_started
         .elapsed()
         .as_micros()
@@ -179,7 +190,7 @@ pub fn runtime_warm_until_cancelled(
         audio_projector_warmed,
         audio_projector_warm_us,
         persona_prefixes_ready,
-        0,
+        persona_prefixes_reused,
         persona_prefix_warm_us,
         persona_prefix_warm_status,
         settings_us,

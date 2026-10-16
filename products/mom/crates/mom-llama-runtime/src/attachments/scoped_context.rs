@@ -9,6 +9,7 @@ pub(crate) enum CurrentAttachmentSelection<'a> {
     DraftTextOnly,
     ExistingUser(&'a str),
     HistoryOnly,
+    HistoryTextOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +98,9 @@ pub(crate) fn prepare_scoped_chat_attachments(
             }
             message.attachment_ids.clone()
         }
-        CurrentAttachmentSelection::HistoryOnly => Vec::new(),
+        CurrentAttachmentSelection::HistoryOnly | CurrentAttachmentSelection::HistoryTextOnly => {
+            Vec::new()
+        }
     };
     let store = RuntimeStore::current()?;
     let mut text_by_message_id = HashMap::new();
@@ -143,7 +146,11 @@ pub(crate) fn prepare_scoped_chat_attachments(
             AttachmentState::Committed,
             &records,
             &mut resolution,
-            !matches!(current_selection, CurrentAttachmentSelection::DraftTextOnly),
+            !matches!(
+                current_selection,
+                CurrentAttachmentSelection::DraftTextOnly
+                    | CurrentAttachmentSelection::HistoryTextOnly
+            ),
         )? {
             Ok(resolved) => resolved,
             Err(blocked) => return Ok(Err(blocked)),

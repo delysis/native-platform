@@ -7280,28 +7280,26 @@ fn generate_incremental_audio(
             )
         })?;
     let mut prefix_token_ids = Vec::with_capacity(prefix_chunks.total_tokens());
-    if request.media.is_empty() {
-        for index in 0..prefix_chunks.len() {
-            let chunk = prefix_chunks.get(index).ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "incremental audio prefix chunk disappeared during validation",
-                )
-            })?;
-            let Some(tokens) = chunk.text_tokens() else {
-                return Err(NativeError::new(
-                    NativeErrorCode::ModelInvalid,
-                    "incremental audio text-only prefix unexpectedly contained media",
-                ));
-            };
-            prefix_token_ids.extend(tokens.iter().map(|token| token.0));
-        }
-        if prefix_token_ids.len() != prefix_chunks.total_tokens() {
-            return Err(NativeError::new(
-                NativeErrorCode::ModelInvalid,
-                "incremental audio prefix token accounting changed during validation",
-            ));
-        }
+    // Text before the first historical recording is still an exact reusable
+    // prefix. The projector's later chunks do not invalidate those cells.
+    // Stop at the first media boundary; never describe media KV as text KV.
+    for index in 0..prefix_chunks.len() {
+        let chunk = prefix_chunks.get(index).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio prefix chunk disappeared during validation",
+            )
+        })?;
+        let Some(tokens) = chunk.text_tokens() else {
+            break;
+        };
+        prefix_token_ids.extend(tokens.iter().map(|token| token.0));
+    }
+    if request.media.is_empty() && prefix_token_ids.len() != prefix_chunks.total_tokens() {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "incremental audio prefix token accounting changed during validation",
+        ));
     }
     // Validation and selection below are read-only. Mutate resident KV state
     // only after the selected prefix is proven to match this audio turn.
@@ -7320,8 +7318,7 @@ fn generate_incremental_audio(
         .is_some_and(|checkpoint| checkpoint.request_sha256 == request_sha256);
     let audio_checkpoint_matches =
         audio_checkpoint_supported && resume_key_matched && request_matched;
-    let resident_text_prefix_supported = request.media.is_empty()
-        && audio_checkpoint_supported
+    let resident_text_prefix_supported = audio_checkpoint_supported
         && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32;
     let resident_prefix_tokens = if !audio_checkpoint_matches && resident_text_prefix_supported {
         resident_audio_text_prefix
@@ -7411,7 +7408,29 @@ fn generate_incremental_audio(
             0,
         )
     } else if !request.media.is_empty() {
-        clear_audio_working_sequences(context, fingerprint.max_sequences, None)?;
+        let retained_sequence = resident_audio_text_prefix
+            .as_ref()
+            .map(|prefix| prefix.sequence_id);
+        clear_audio_working_sequences(context, fingerprint.max_sequences, retained_sequence)?;
+        if resident_prefix_tokens > 0 {
+            let retained = resident_audio_text_prefix.as_ref().ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "resident audio prefix disappeared before reuse",
+                )
+            })?;
+            let end = u32::try_from(resident_prefix_tokens).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "resident audio prefix exceeded the native sequence API",
+                )
+            })?;
+            context
+                .copy_kv_cache_seq(retained.sequence_id, 0, Some(0), Some(end))
+                .map_err(|error| {
+                    native_decode_error("failed to reuse the resident audio prefix", error)
+                })?;
+        }
         let mut position = 0_i32;
         for index in 0..prefix_chunks.len() {
             let chunk = prefix_chunks.get(index).ok_or_else(|| {
@@ -7429,6 +7448,7 @@ fn generate_incremental_audio(
                     "historical audio prefix and completion exceed the native context",
                 ));
             }
+            let chunk_start = position;
             if chunk.chunk_type() == MtmdInputChunkType::Text {
                 let tokens = chunk.text_tokens().ok_or_else(|| {
                     NativeError::new(
@@ -7436,7 +7456,23 @@ fn generate_incremental_audio(
                         "historical audio prefix text chunk contained no tokens",
                     )
                 })?;
-                decode_tokens_chunked(context, tokens, 0, position, false)?;
+                let reused_here = resident_prefix_tokens
+                    .saturating_sub(chunk_start.max(0) as usize)
+                    .min(tokens.len());
+                if reused_here < tokens.len() {
+                    decode_tokens_chunked(
+                        context,
+                        &tokens[reused_here..],
+                        0,
+                        position.saturating_add(i32::try_from(reused_here).map_err(|_| {
+                            NativeError::new(
+                                NativeErrorCode::PromptTooLarge,
+                                "resident audio prefix exceeded the native position range",
+                            )
+                        })?),
+                        false,
+                    )?;
+                }
                 position = position.saturating_add(i32::try_from(tokens.len()).map_err(|_| {
                     NativeError::new(
                         NativeErrorCode::PromptTooLarge,
@@ -7444,6 +7480,12 @@ fn generate_incremental_audio(
                     )
                 })?);
             } else if chunk.chunk_type() == MtmdInputChunkType::Audio {
+                if resident_prefix_tokens > chunk_start.max(0) as usize {
+                    return Err(NativeError::new(
+                        NativeErrorCode::CacheIncompatible,
+                        "resident text prefix crossed a historical audio boundary",
+                    ));
+                }
                 position = chunk
                     .eval(
                         multimodal,
@@ -7467,6 +7509,14 @@ fn generate_incremental_audio(
                     "incremental audio history only accepts audio media",
                 ));
             }
+        }
+        if resident_text_prefix_supported {
+            retain_incremental_audio_text_prefix(
+                context,
+                0,
+                &prefix_token_ids,
+                resident_audio_text_prefix,
+            )?;
         }
         (0, position, None, prefix_chunks.total_tokens(), 0)
     } else {
@@ -14624,18 +14674,39 @@ mod tests {
         let owner = NativeModelOwner::load(config)?;
         let handle = owner.handle();
         let wav = one_second_tone_wav();
+        let prior_user = ChatMessage {
+            role: ChatRole::User,
+            content: "Answer briefly after listening to the caller.".to_string(),
+        };
+        let greeting = require_ready(
+            handle
+                .generate(GenerationRequest {
+                    request_id: "native-audio-history-greeting".to_string(),
+                    model_id: handle.status().model_id,
+                    input: GenerationInput::Chat {
+                        messages: vec![prior_user.clone()],
+                        template: ChatTemplateChoice::PreferNonThinking,
+                    },
+                    sampling: SamplingConfig {
+                        seed: 17,
+                        temperature: 0.0,
+                        max_tokens: 12,
+                        ..SamplingConfig::default()
+                    },
+                    media: Vec::new(),
+                    cached_prefix: None,
+                })?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
         let audio = handle.generate_incremental_audio(GenerationRequest {
             request_id: "native-audio-with-history".to_string(),
             model_id: handle.status().model_id,
             input: GenerationInput::Chat {
                 messages: vec![
-                    ChatMessage {
-                        role: ChatRole::User,
-                        content: "Answer briefly after listening to the caller.".to_string(),
-                    },
+                    prior_user,
                     ChatMessage {
                         role: ChatRole::Assistant,
-                        content: "I'm listening.".to_string(),
+                        content: greeting[0].text.clone(),
                     },
                     ChatMessage {
                         role: ChatRole::User,
@@ -14663,6 +14734,10 @@ mod tests {
         })?;
         let resumed = audio.wait_for_resume()?;
         assert!(!resumed.reused);
+        assert!(
+            audio.monitor().stats().restored_prefix_tokens > 0,
+            "historical recordings must not discard the shared greeting KV"
+        );
         let samples = vec![0.0_f32; 16_000];
         for chunk in samples.chunks(160) {
             audio.push_pcm(chunk)?;

@@ -440,6 +440,45 @@ pub fn kv_cache_prepare_voice_persona_resident(
     };
     let messages = stable_persona_prompt_messages(&settings, &persona)?;
     let template = ChatTemplateChoice::PreferNonThinking;
+    // First-run setup and the webview can both request launch warming. A
+    // matching worker-owned state is already evaluated; exporting it again
+    // merely serialized seconds of duplicate work onto call pickup.
+    let fingerprint = cache_fingerprint(&handle)?;
+    let tokenized = handle
+        .tokenize_messages_with_template(messages.clone(), template.clone())
+        .map_err(|error| anyhow!(error))?;
+    let live_value = {
+        let mut memory = memory_cache()
+            .lock()
+            .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?;
+        memory
+            .cache
+            .best_match_for_owner(&fingerprint, &tokenized.token_ids, &persona.id)
+            .and_then(|matched| memory.cache.get(&matched.id, now_ms()))
+    };
+    if let Some(value) = live_value.filter(|value| {
+        // The shared-prefix prefill intentionally leaves the branch boundary
+        // unevaluated. The exact token-prefix match was already established by
+        // best_match_for_owner above; requiring equal lengths rejects it.
+        handle.has_live_sequence_receipt(&value.sequence.export_receipt())
+    }) {
+        return Ok(CommandResult::passed(
+            operation,
+            "prompt_smoke_verified",
+            VoicePersonaPrefixPreparation {
+                metadata: value.metadata,
+                prefill_us: 0,
+                verification_us: 0,
+                persistence_us: 0,
+                promotion_us: 0,
+                persisted: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        ));
+    }
     let started = std::time::Instant::now();
     let value = create_prefix_value(
         &handle,

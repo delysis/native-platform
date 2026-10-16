@@ -2875,6 +2875,11 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     );
     assert_eq!(warmed.persona_prefix_warm_status, "ready");
     assert_eq!(warmed.persona_prefixes_ready, 1);
+    let warmed_again = mom_llama_runtime::runtime_warm(&scope)?
+        .result
+        .ok_or_else(|| anyhow!("second runtime warm failed"))?;
+    assert_eq!(warmed_again.persona_prefix_warm_status, "reused");
+    assert_eq!(warmed_again.persona_prefixes_reused, 1);
     let conversation = mom_llama_runtime::conversation_draft_call_start()?
         .result
         .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;

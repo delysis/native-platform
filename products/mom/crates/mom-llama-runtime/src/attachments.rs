@@ -1064,6 +1064,21 @@ pub(crate) fn prepare_live_audio_history(
     .map(|result| result.map(|scoped| scoped.context))
 }
 
+/// A pickup greeting needs the saved conversation text but does not answer
+/// old recordings. Leave those recordings intact for the next microphone
+/// turn while avoiding their read, admission budget, and projector work here.
+pub(crate) fn prepare_call_greeting_history(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::HistoryTextOnly,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
 /// The microphone PCM has already been evaluated when a voice turn commits.
 /// Retain the exact draft attachment IDs for the saved message, while keeping
 /// historical and current media out of this bookkeeping-only pass.
@@ -5136,6 +5151,11 @@ mod tests {
             pending.blocker.code,
             "attachment_context_media_count_exceeded"
         );
+        let greeting = prepare_call_greeting_history("chat", &messages)
+            .expect("pickup preparation")
+            .expect("a greeting does not require old recordings");
+        assert!(greeting.media.is_empty());
+        assert!(greeting.staged_ids.is_empty());
 
         let current = attachment_import_pasted_text(&scope, "chat", "current note".to_string())
             .expect("stage current note")

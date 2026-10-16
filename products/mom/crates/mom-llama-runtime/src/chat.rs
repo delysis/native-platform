@@ -1,6 +1,7 @@
 use crate::attachments::{
-    ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
-    prepare_live_audio_commit, prepare_live_audio_history, prepare_voice_reply_attachments,
+    ChatAttachmentContext, commit_generated_exchange, prepare_call_greeting_history,
+    prepare_chat_attachments, prepare_live_audio_commit, prepare_live_audio_history,
+    prepare_voice_reply_attachments,
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
@@ -1243,7 +1244,10 @@ where
     let active_messages = crate::document::checked_active_messages(&conversation)?;
     let voice_reply = regenerate_user_id.is_none()
         && (input.message.starts_with("[Voice note]") || input.message.starts_with("[Phone call]"));
-    let prepared_attachments = if voice_reply {
+    let call_greeting = input.message.starts_with("[Phone call] [Greeting]");
+    let prepared_attachments = if call_greeting {
+        prepare_call_greeting_history(&input.conversation_id, &active_messages)?
+    } else if voice_reply {
         prepare_voice_reply_attachments(&input.conversation_id, &active_messages)?
     } else {
         prepare_chat_attachments(
@@ -1288,9 +1292,16 @@ where
             ),
         ));
     }
-    // Every pending recorded turn remains audio in model input until its
-    // complete transcript replaces that exact turn, including at pickup.
-    let media = attachment_context.media.clone();
+    // A pickup is a short acknowledgement, not a reply to the recorded
+    // history. Keep the recordings attached to their saved turns; the live
+    // microphone turn will receive them until exact transcripts replace them.
+    // Admitting them here defeats the prepared persona prefix and makes the
+    // caller wait for every historical audio projector pass before pickup.
+    let media = if call_greeting {
+        Vec::new()
+    } else {
+        attachment_context.media.clone()
+    };
     if !media.is_empty()
         && !settings
             .mmproj_path
@@ -1989,10 +2000,12 @@ where
 {
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(options.timeout_s.max(0.001));
+    let mut timed_out = false;
     let mut reasoning_parser = parse_reasoning.then(ReasoningStreamParser::default);
     let mut first_content_emitted = false;
     loop {
-        if started.elapsed() >= timeout {
+        if !timed_out && started.elapsed() >= timeout {
+            timed_out = true;
             ticket.cancel_all();
         }
         match ticket.events.recv_timeout(Duration::from_millis(20)) {
@@ -2087,7 +2100,15 @@ where
             emit(on_event, event).map_err(ChatTicketError::Callback)?;
         }
     }
-    ticket.wait().map_err(ChatTicketError::Native)
+    match ticket.wait() {
+        Err(error) if timed_out && error.code == NativeErrorCode::Cancelled => {
+            Err(ChatTicketError::Callback(anyhow::anyhow!(
+                "generation timed out after {:.1} seconds",
+                options.timeout_s
+            )))
+        }
+        result => result.map_err(ChatTicketError::Native),
+    }
 }
 
 fn stream_event(

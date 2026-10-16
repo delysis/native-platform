@@ -264,6 +264,29 @@ actual worker residency: clearing or turning off the managed tier removes its
 entry, while a token-exact prefix still live in the model worker can be reused
 and is reported as such.
 
+The 2026-10-16 call regression was a cache-path change, not evidence that
+Parakeet must run in series with Gemma. Commit `926db9ec` read pending older
+WAVs into pickup and incremental turns. That made pickup multimodal, bypassed
+its prepared text prefix, and made the incremental worker discard its resident
+text prefix whenever historical media was present. In the failing packaged
+trace, launch warm spent 4.0 seconds on the selected persona yet pickup used
+zero cached cells; the next turn then prefetched 4,174 history tokens for
+11.1 seconds and hit its 10-second generation deadline. Pickup now prepares
+only verified historical text, preserving the recordings for the following
+microphone turn. The incremental worker compares and copies the exact leading
+text KV cells before evaluating historical media. A real Gemma 4 12B plus
+projector test proves the reuse with two older WAVs; live microphone/playback
+acceptance remains separate. A second warm request in the same worker also
+reuses an already verified persona prefix instead of exporting it again.
+
+The disk cache is not yet a cross-process native KV restore. It preserves
+versioned token IDs and authenticated state bytes, but the native parser
+accepts a snapshot only while its exporting worker still owns the receipt.
+After a restart the safe path replays those tokens. First-run currently warms
+only the selected persona and does not durably prepare every persona or recent
+conversation. These limits must remain visible in readiness and latency
+receipts; a saved metadata entry alone is not a warm resident prefix.
+
 Loading the GGUF does not compile the first Metal audio-projector evaluation.
 The packaged runtime now feeds one exact 640-sample frame through the resident
 incremental-audio path during supervised launch warm-up and does not report the
