@@ -1241,7 +1241,8 @@ test("call barge-in can stop only an actually audible reply", () => {
 });
 
 test("call generation cannot stall forever or disappear without a visible terminal error", () => {
-  assert.ok(bridge.includes('error.code = "voice_generation_timeout"'));
+  assert.ok(bridge.includes('code = "voice_generation_timeout"'));
+  assert.ok(bridge.includes("error.code = code"));
   assert.ok(bridge.includes('"call_reply_timeout: The contact did not finish answering the call."'));
   assert.ok(bridge.includes('"voice_generation_timeout: The contact stopped making progress while preparing a reply."'));
   assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "generation_timeout"'));

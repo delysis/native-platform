@@ -227,6 +227,20 @@ test("identifies a call that abandoned a pending prefill instead of silently wai
   assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_wait_expired"));
 });
 
+test("locates a stalled audio push drain before the recorded-audio fallback", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "prefill_flush_started", elapsed_ms: 180 },
+      { stage: "audio_prefill_drain_failed", elapsed_ms: 900,
+        message: "voice_audio_prefill_drain_timeout" },
+      { stage: "fallback_capture_encoded", elapsed_ms: 910 },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_drain_to_failure_ms, 720);
+  assert.equal(row.prefill_failure_stage, "audio_prefill_drain_failed");
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_drain_stalled"));
+});
+
 test("a pickup completion inside the next capture is not a missing call reply", () => {
   const row = latencyRow({ checkpoint: 4, path: "/trace.json", trace: {
     id: "next-capture", mode: "call", stages: [

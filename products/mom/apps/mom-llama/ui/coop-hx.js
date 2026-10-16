@@ -75,7 +75,7 @@
   };
   const wait = (milliseconds) =>
     new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-  const withDeadline = async (promise, milliseconds, message) => {
+  const withDeadline = async (promise, milliseconds, message, code = "voice_generation_timeout") => {
     let timeout = null;
     try {
       return await Promise.race([
@@ -83,7 +83,7 @@
         new Promise((_, reject) => {
           timeout = window.setTimeout(() => {
             const error = new Error(message);
-            error.code = "voice_generation_timeout";
+            error.code = code;
             reject(error);
           }, milliseconds);
         }),
@@ -6704,7 +6704,34 @@
       await recording.targetChain;
     } else {
       enqueueVoicePrefill(recording, new Float32Array(), true);
-      await recording.pushChain;
+      try {
+        // This is a snapshot of pushes already queued at the silence edge.
+        // A stalled IPC/ring producer must not strand the entire call.
+        await withDeadline(recording.pushChain, recording.call ? 720 : 1_200,
+          "voice_audio_prefill_drain_timeout: The microphone audio stopped reaching the model.",
+          "voice_audio_prefill_drain_timeout");
+      } catch (error) {
+        recording.speculationStarting = false;
+        if (recording.voiceActivity.voiced) {
+          markVoiceLatencyIn(recording.trace, "audio_prefill_drain_deferred", {
+            message: errorMessage(error), reason: "speech_resumed",
+          });
+          return;
+        }
+        if (voiceRecording === recording) {
+          recording.prefillFailed = true;
+          recording.prefillEpoch += 1;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_drain_failed", {
+            message: errorMessage(error),
+            producer_pushes: recording.prefillPushes || 0,
+            producer_accepted_samples: recording.prefillAcceptedSamples || 0,
+          });
+          void recording.prefillSession.then((live) => live?.session
+            ? invoke("mom_llama_voice_audio_abort", { session: live.session })
+            : null).catch(() => {});
+        }
+        return;
+      }
     }
     markVoiceLatencyIn(recording.trace, "prefill_flush_accepted", {
       producer: recording.native ? "native_ring" : "renderer_ipc",
