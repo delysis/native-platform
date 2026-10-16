@@ -22,10 +22,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 desktop-speech.workspace = true
+desktop-model-defaults.workspace = true
 operation-lifecycle.workspace = true
 anyhow = "1"
 cpal = "=0.16.0"
 crossbeam-channel.workspace = true
+fs4.workspace = true
 mom-llama-runtime.workspace = true
 llama-native-types = { workspace = true }
 llama-native-host = { workspace = true }
@@ -46,6 +48,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["h
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true
+reqwest.workspace = true
 async-trait.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "=2.4.5"

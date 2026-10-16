@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+desktop-model-defaults.workspace = true
 speech-native-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

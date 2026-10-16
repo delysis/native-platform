@@ -2,6 +2,7 @@ mod app_runtime;
 mod command_registry;
 mod commands;
 mod information;
+mod model_acquisition;
 mod native_voice_capture;
 mod operation_supervisor;
 mod speech;
@@ -25,7 +26,7 @@ const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
 #[derive(Clone)]
 struct PreparedSpeech {
-    qwen: Arc<speech_native_backend_qwen::QwenSpeechBackend>,
+    qwen: Arc<Mutex<Arc<speech_native_backend_qwen::QwenSpeechBackend>>>,
     claimed_by_runtime: Arc<AtomicBool>,
     shutdown_started: Arc<AtomicBool>,
     started: std::time::Instant,
@@ -38,7 +39,7 @@ impl PreparedSpeech {
             Some(app_data_dir.join("speech-voices/qwen-icl")),
         );
         Self {
-            qwen,
+            qwen: Arc::new(Mutex::new(qwen)),
             claimed_by_runtime: Arc::new(AtomicBool::new(false)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             started: std::time::Instant::now(),
@@ -46,7 +47,15 @@ impl PreparedSpeech {
     }
 
     fn backend(&self) -> Arc<speech_native_backend_qwen::QwenSpeechBackend> {
-        Arc::clone(&self.qwen)
+        self.qwen.lock().expect("prepared speech lock").clone()
+    }
+
+    fn refresh(&self, app_data_dir: &std::path::Path, voice_root: &std::path::Path) {
+        let qwen = desktop_speech::prepare_local_qwen(
+            Some(app_data_dir.join("speech-models")),
+            Some(voice_root.to_path_buf()),
+        );
+        *self.qwen.lock().expect("prepared speech lock") = qwen;
     }
 
     fn claim(&self) {
@@ -64,7 +73,7 @@ impl PreparedSpeech {
         {
             return false;
         }
-        self.qwen.shutdown().await.is_ok()
+        self.backend().shutdown().await.is_ok()
     }
 }
 
@@ -350,6 +359,35 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         } => retry_cached_failure,
     };
 
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Blessenger could not locate its setup data: {error}"))?;
+    let first_run = !model_acquisition::installation_receipt_is_current(&app_data_dir);
+    let _ = app.emit(
+        "mom_llama_setup_state",
+        model_acquisition::SetupState {
+            first_run,
+            phase: "starting",
+        },
+    );
+    let acquisition_app = app.clone();
+    let acquisition = tauri::async_runtime::spawn_blocking(move || {
+        model_acquisition::acquire_required_models(first_run, |progress| {
+            let _ = acquisition_app.emit("mom_llama_model_acquisition_progress", progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Blessenger setup worker failed: {error}"))?
+    .map_err(|error| format!("Blessenger could not finish its first-time setup: {error}"));
+    let acquired = match acquisition {
+        Ok(acquired) => acquired,
+        Err(error) => {
+            startup.record_failure();
+            return Err(error);
+        }
+    };
+
     let settings = match tauri::async_runtime::spawn_blocking(move || {
         if retry_cached_failure {
             mom_llama_runtime::prepare_secure_store_retry().map_err(|error| {
@@ -376,13 +414,52 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             ));
         }
     };
+    if settings.model_path.as_ref() == Some(&acquired.gemma) {
+        let expected_mtp = acquired.mtp_assistant.to_string_lossy();
+        if settings.mmproj_path.as_ref() != Some(&acquired.projector)
+            || settings
+                .upstream_settings
+                .get("mtpAssistantPath")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_mtp.as_ref())
+        {
+            startup.record_failure();
+            return Err(
+                "Blessenger's language and listening models did not resolve as one verified set"
+                    .to_string(),
+            );
+        }
+    }
+    if !acquired.qwen_root.join("config.json").is_file() {
+        startup.record_failure();
+        return Err(
+            "Blessenger's voice model did not resolve to its verified installation".to_string(),
+        );
+    }
     startup.begin_runtime_build()?;
     let runtime_data_dir = settings.data_dir.clone();
-    let installed_voice_root = app
+    let resource_dir = app
         .path()
-        .app_data_dir()
-        .map_err(|error| format!("Blessenger could not locate its voice data: {error}"))?
-        .join("speech-voices/qwen-icl");
+        .resource_dir()
+        .map_err(|error| format!("Blessenger could not locate its installed voices: {error}"))?;
+    let packaged_voice_root = resource_dir.join("speech-voices/qwen-icl");
+    let source_voice_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/speech-voices/qwen-icl");
+    let installed_voice_root = if packaged_voice_root.join("manifest.json").is_file() {
+        packaged_voice_root
+    } else {
+        source_voice_root
+    };
+    let voice_app = app.clone();
+    let voice_root = installed_voice_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        model_acquisition::validate_persona_voices(&voice_root, |progress| {
+            let _ = voice_app.emit("mom_llama_voice_initialization_progress", progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Blessenger voice setup worker failed: {error}"))?
+    .map_err(|error| format!("Blessenger could not validate its persona voices: {error}"))?;
 
     let shared_client = app
         .try_state::<EmbeddedMom>()
@@ -391,6 +468,9 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
     let prepared_speech = app
         .try_state::<PreparedSpeech>()
         .map(|value| value.inner().clone());
+    if let Some(prepared) = &prepared_speech {
+        prepared.refresh(&app_data_dir, &installed_voice_root);
+    }
     let prepared_qwen = prepared_speech.as_ref().map(PreparedSpeech::backend);
     let built = match tauri::async_runtime::spawn_blocking(move || {
         build_runtime(settings, shared_client, installed_voice_root, prepared_qwen)
@@ -406,6 +486,32 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
 
     match built {
         Ok(runtime) => {
+            if first_run {
+                let scope = runtime.operation_scope();
+                let warm = tauri::async_runtime::spawn_blocking(move || {
+                    mom_llama_runtime::runtime_warm(&scope)
+                })
+                .await
+                .map_err(|error| format!("Blessenger model warm worker failed: {error}"))?
+                .map_err(|error| {
+                    format!("Blessenger could not warm its listening model: {error:#}")
+                })?;
+                let ready = warm.status == "passed"
+                    && warm
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.model_loaded && result.audio_projector_warmed);
+                if !ready {
+                    runtime.begin_quiesce();
+                    let _ = if embedded {
+                        runtime.drain_shared_services().await
+                    } else {
+                        runtime.shutdown().await
+                    };
+                    startup.record_failure();
+                    return Err("Blessenger could not make its listening model ready".to_string());
+                }
+            }
             if let Some(prepared) = &prepared_speech {
                 prepared.claim();
                 eprintln!(
@@ -413,8 +519,17 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                     prepared.started.elapsed().as_millis()
                 );
             }
+            model_acquisition::write_installation_receipt(&app_data_dir)
+                .map_err(|error| format!("Blessenger could not finish setup: {error}"))?;
             match startup.install(&app, runtime) {
                 Ok(()) => {
+                    let _ = app.emit(
+                        "mom_llama_setup_state",
+                        model_acquisition::SetupState {
+                            first_run,
+                            phase: "ready",
+                        },
+                    );
                     eprintln!("mom-llama runtime ready: {}", runtime_data_dir.display());
                     Ok(())
                 }
@@ -1354,7 +1469,13 @@ mod tests {
         assert!(main.contains("mom_llama_runtime::prepare_secure_store_retry"));
         assert!(index.contains("startup-status"));
         assert!(index.contains("startup-retry"));
+        assert!(index.contains("Hi Jan — I’m getting Blessenger ready."));
+        assert!(index.contains("startup-progress"));
         assert!(script.contains("await invoke(\"mom_llama_runtime_initialize\")"));
+        assert!(script.contains("mom_llama_setup_state"));
+        assert!(script.contains("mom_llama_model_acquisition_progress"));
+        assert!(script.contains("mom_llama_voice_initialization_progress"));
+        assert!(script.contains("Checking ${payload.voice}"));
     }
 
     #[test]

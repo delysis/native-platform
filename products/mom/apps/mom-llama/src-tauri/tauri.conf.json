@@ -32,6 +32,9 @@
     "active": true,
     "targets": ["app"],
     "externalBin": ["binaries/qwen3-tts-helper", "binaries/mlx.metallib"],
+    "resources": {
+      "resources/speech-voices/qwen-icl/": "speech-voices/qwen-icl/"
+    },
     "icon": ["icons/icon.png"],
     "macOS": {
       "minimumSystemVersion": "14.0",

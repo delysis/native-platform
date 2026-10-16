@@ -265,6 +265,7 @@ pub const NATIVE_SETTING_EXTENSION_KEYS: &[&str] = &[
     "lookupCacheEnabled",
     "mcpNativeEnabled",
     "mmprojPath",
+    "mtpAssistantPath",
     "nativeBatchTokens",
     "nativeContextTokens",
     "nativeDevice",
@@ -555,6 +556,12 @@ fn apply_cached_default_model(
     {
         settings.model_path = Some(cached.model);
         settings.mmproj_path = cached.projector;
+        if let Some(assistant) = cached.mtp_assistant {
+            settings.upstream_settings.insert(
+                "mtpAssistantPath".to_string(),
+                json!(assistant.display().to_string()),
+            );
+        }
         settings.upstream_settings.insert(
             "mmprojPath".to_string(),
             json!(
@@ -1268,6 +1275,7 @@ mod tests {
         let cached = desktop_model_defaults::CachedDefaultModel {
             model: PathBuf::from("/cache/gemma.gguf"),
             projector: Some(PathBuf::from("/cache/mmproj.gguf")),
+            mtp_assistant: Some(PathBuf::from("/cache/mtp.gguf")),
         };
         apply_cached_default_model(&mut settings, Some(cached.clone()));
         assert_eq!(settings.model_path.as_ref(), Some(&cached.model));
@@ -1275,6 +1283,10 @@ mod tests {
         assert_eq!(
             settings.upstream_settings.get("mmprojPath"),
             Some(&json!("/cache/mmproj.gguf"))
+        );
+        assert_eq!(
+            settings.upstream_settings.get("mtpAssistantPath"),
+            Some(&json!("/cache/mtp.gguf"))
         );
 
         settings.model_path = Some(PathBuf::from("/chosen/custom.gguf"));

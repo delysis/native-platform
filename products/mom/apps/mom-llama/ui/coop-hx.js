@@ -8965,6 +8965,11 @@
     const retry = document.getElementById("startup-retry");
     const details = document.getElementById("startup-details");
     const diagnostic = document.getElementById("startup-error");
+    const card = document.getElementById("startup-card");
+    const greeting = document.getElementById("startup-greeting");
+    const setupProgress = document.getElementById("startup-progress");
+    const persona = document.getElementById("startup-persona");
+    let firstRunSetup = false;
     const initialize = async () => {
       if (status) {
         status.classList.remove("startup-error");
@@ -8978,6 +8983,44 @@
         retry.hidden = true;
         retry.disabled = true;
       }
+      const events = tauri()?.event;
+      const revealSetup = () => {
+        firstRunSetup = true;
+        card?.classList.add("first-run");
+        if (greeting) greeting.hidden = false;
+        if (setupProgress) setupProgress.hidden = false;
+      };
+      const artifactLabel = (artifact) => ({
+        gemma: "language model",
+        projector: "listening model",
+        mtp: "response accelerator",
+        "qwen-weights": "voice model",
+        "qwen-codec-weights": "speech decoder",
+      })[artifact] || "voice support";
+      const stopSetupState = await events?.listen?.("mom_llama_setup_state", ({ payload }) => {
+        if (!payload?.first_run) return;
+        revealSetup();
+        if (payload.phase === "ready" && status) status.textContent = "Ready";
+      });
+      const stopModelProgress = await events?.listen?.("mom_llama_model_acquisition_progress", ({ payload }) => {
+        if (!firstRunSetup || !payload) return;
+        const total = Number(payload.total_bytes || 0);
+        const completed = Number(payload.completed_bytes || 0);
+        const percent = total > 0 ? Math.max(0, Math.min(100, Math.floor((completed / total) * 100))) : 0;
+        if (setupProgress) setupProgress.value = percent;
+        if (status) status.textContent = payload.phase === "downloading"
+          ? `Getting Blessenger ready · ${artifactLabel(payload.artifact)} · ${percent}%`
+          : `Checking ${artifactLabel(payload.artifact)} · ${percent}%`;
+      });
+      const stopVoiceProgress = await events?.listen?.("mom_llama_voice_initialization_progress", ({ payload }) => {
+        if (!firstRunSetup || !payload) return;
+        if (status) status.textContent = `Checking ${payload.voice}`;
+        if (persona) {
+          persona.hidden = false;
+          persona.textContent = payload.persona;
+        }
+        if (setupProgress) setupProgress.value = Math.floor((Number(payload.completed || 0) / Number(payload.total || 1)) * 100);
+      });
       try {
         await invoke("mom_llama_runtime_initialize");
         const root = document.getElementById("app");
@@ -9046,6 +9089,10 @@
           retry.hidden = false;
           retry.disabled = false;
         }
+      } finally {
+        if (typeof stopModelProgress === "function") stopModelProgress();
+        if (typeof stopVoiceProgress === "function") stopVoiceProgress();
+        if (typeof stopSetupState === "function") stopSetupState();
       }
     };
     retry?.addEventListener("click", initialize);
