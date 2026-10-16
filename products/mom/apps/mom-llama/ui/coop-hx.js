@@ -6568,6 +6568,7 @@
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
     const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    markVoiceLatencyIn(recording.trace, "capture_stopped", { speculative: true });
     speculation.capturePromise = stoppedCapture;
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));

@@ -176,6 +176,25 @@ test("preserves absent metrics instead of reporting false zeroes", () => {
   assert.equal(row.tts_helper_first_pcm_ms, null);
   assert.equal(row.tts_aggregate_rtf, null);
   assert.equal(row.next_prefill_overlapped_tts, null);
+  assert.equal(row.transcript_ready_before_next_prefill, null);
+  assert.equal(row.capture_stop_to_transcript_committed_ms, null);
+});
+
+test("shows whether complete transcript replacement preceded the next prefill", () => {
+  const row = (committedAt) => latencyRow({ checkpoint: 1, path: "/turn.json", trace: {
+    id: "turn", mode: "call", stages: [
+      { stage: "capture_stopped", elapsed_ms: 100 },
+      { stage: "voice_transcript_live_verified", elapsed_ms: 145 },
+      { stage: "next_turn_prefill_started", elapsed_ms: 200 },
+      { stage: "voice_transcript_finished", elapsed_ms: committedAt },
+    ], summary: {},
+  } });
+  assert.equal(row(180).capture_stop_to_transcript_verified_ms, 45);
+  assert.equal(row(180).capture_stop_to_transcript_committed_ms, 80);
+  assert.equal(row(180).transcript_ready_before_next_prefill, true);
+  assert.equal(row(180).transcript_to_next_prefill_ms, 20);
+  assert.equal(row(240).transcript_ready_before_next_prefill, false);
+  assert.equal(row(240).transcript_to_next_prefill_ms, -40);
 });
 
 test("diagnoses a fallen-back voice turn that finishes without PCM", () => {

@@ -127,6 +127,11 @@ export function latencyRow(snapshot) {
     ?? (number(stage.total_ms) !== null && number(stage.output_audio_ms) > 0
       ? number(stage.total_ms) / number(stage.output_audio_ms) : null))
     .filter((value) => value !== null);
+  const stageDelta = (from, to) => nativeDelta(
+    number(lastStage(from)?.elapsed_ms), number(lastStage(to)?.elapsed_ms),
+  );
+  const transcriptFinished = number(lastStage("voice_transcript_finished")?.elapsed_ms);
+  const nextPrefillStarted = number(lastStage("next_turn_prefill_started")?.elapsed_ms);
   return {
     ...scalarSummary,
     ...(foreignGreetingOnly ? {
@@ -313,6 +318,14 @@ export function latencyRow(snapshot) {
     next_prefill_prepare_ms: pick("next_prefill_prepare_ms"),
     next_prefill_buffered_ms: pick("next_prefill_buffered_runway_ms"),
     next_prefill_overlapped_tts: summary.next_prefill_overlapped_active_tts ?? null,
+    capture_stop_to_transcript_verified_ms:
+      stageDelta("capture_stopped", "voice_transcript_live_verified"),
+    capture_stop_to_transcript_committed_ms:
+      stageDelta("capture_stopped", "voice_transcript_finished"),
+    transcript_ready_before_next_prefill: transcriptFinished !== null && nextPrefillStarted !== null
+      ? transcriptFinished <= nextPrefillStarted : null,
+    transcript_to_next_prefill_ms: transcriptFinished !== null && nextPrefillStarted !== null
+      ? Math.round((nextPrefillStarted - transcriptFinished) * 100) / 100 : null,
     playback_underruns: pick("playback_underrun_occurrences"),
     path: snapshot.path,
   };
