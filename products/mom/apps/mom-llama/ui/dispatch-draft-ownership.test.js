@@ -148,7 +148,7 @@ test("voice replies do not create an incoming card or expose streamed text", () 
     },
   };
   vm.createContext(context);
-  const start = source.indexOf("  const chatRequestLease =");
+  const start = source.indexOf("  const voiceStreamRequestIds =");
   const end = source.indexOf("\n  const mentionLiveId", start);
   vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r1", conversation_id: "conversation-a" } });
@@ -179,7 +179,7 @@ test("call replies suppress live text but still own the chat request lease", () 
     },
   };
   vm.createContext(context);
-  const start = source.indexOf("  const chatRequestLease =");
+  const start = source.indexOf("  const voiceStreamRequestIds =");
   const end = source.indexOf("\n  const mentionLiveId", start);
   vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r-call", conversation_id: "conversation-a" } });
@@ -213,7 +213,7 @@ test("an exact call request keeps its TTS owner after stale conversation cleanup
     },
   };
   vm.createContext(context);
-  const start = source.indexOf("  const chatRequestLease =");
+  const start = source.indexOf("  const voiceStreamRequestIds =");
   const end = source.indexOf("\n  const mentionLiveId", start);
   vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: {
@@ -227,6 +227,50 @@ test("an exact call request keeps its TTS owner after stale conversation cleanup
     ["acquire", "chat-request:replacement-request"],
     ["tts", "This must reach speech."],
   ]);
+});
+
+test("late voice events cannot become text or enter the next turn's trace", () => {
+  const events = [];
+  const trace = { stages: [] };
+  const context = {
+    voiceReplyConversation: null,
+    callReplyConversation: null,
+    activeDispatchConversation: null,
+    liveVoiceTts: null,
+    chatRequestLease: ({ request_id }) => `chat-request:${request_id}`,
+    acquireStableChatBusy: (lease) => events.push(["acquire", lease]),
+    appendLiveMessage: (...args) => events.push(["text", ...args]),
+    appendLiveDelta: (...args) => events.push(["delta", ...args]),
+    document: { getElementById: () => null, querySelector: () => null },
+    finishLiveMessage() {},
+    releaseChatBusy: (lease) => events.push(["release", lease]),
+    settingEnabled: () => true,
+    keepLiveTailVisible() {},
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const voiceStreamRequestIds =");
+  const end = source.indexOf("\n  const mentionLiveId", start);
+  vm.runInContext(`let voiceLatencyTrace = globalThis.nextTrace;
+const markVoiceLatencyIn = (trace, stage) => trace.stages.push(stage);
+${source.slice(start, end)}
+globalThis.testOnChatEvent = onChatEvent;
+globalThis.rememberVoice = rememberVoiceStreamRequest;`, Object.assign(context, { nextTrace: trace }));
+  context.rememberVoice("retired-voice");
+  for (const event of ["started", "delta", "completed"]) {
+    context.testOnChatEvent({ payload: {
+      event, request_id: "retired-voice", conversation_id: "conversation-a", delta: "late speech",
+    } });
+  }
+  assert.deepEqual(events, [["release", "chat-request:retired-voice"]]);
+  assert.deepEqual(trace.stages, []);
+  context.testOnChatEvent({ payload: {
+    event: "started", request_id: "ordinary-text", conversation_id: "conversation-b",
+  } });
+  assert.deepEqual(events.slice(1), [
+    ["acquire", "chat-request:ordinary-text"],
+    ["text", "assistant", "", "live-assistant-ordinary-text"],
+  ]);
+  assert.deepEqual(trace.stages, [], "unrelated text work never changes a voice-turn trace");
 });
 
 test("the native voice dispatch routes a direct chat stream event", () => {

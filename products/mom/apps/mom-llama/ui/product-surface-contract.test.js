@@ -725,7 +725,8 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(live.includes("acceptsRequest(candidate"));
   assert.ok(live.includes("return requestId === candidate"));
   assert.ok(events.includes("liveVoiceTts.acceptsRequest(payload.request_id, payload.event)"));
-  assert.ok(events.includes("if (sameLiveConversation && !ownsLiveVoice)"));
+  assert.ok(events.includes("(sameLiveConversation || voiceStreamRequestIds.has(payload.request_id)) && !ownsLiveVoice"));
+  assert.ok(events.includes("const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null"));
   assert.ok(live.includes("voice_reply_timeout: Voice synthesis stopped making progress."));
   assert.ok(!live.includes("if (!deferProgressWatchdog) armAudioProgressWatchdog();"));
   assert.ok(live.includes("running = true;\n      // The audio watchdog covers only time owned by an active synthesis"));

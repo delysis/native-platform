@@ -4823,6 +4823,7 @@
     onFirstChunk = null,
     onFailure = null,
   }) => {
+    if (requestId) rememberVoiceStreamRequest(requestId);
     let pendingText = "";
     let streamedText = "";
     let running = false;
@@ -5518,6 +5519,7 @@
         if (requestId) return requestId === candidate;
         if (!allowRequestBinding || eventName !== "started") return false;
         requestId = candidate;
+        rememberVoiceStreamRequest(candidate);
         void reconcileSemanticBackpressure();
         return true;
       },
@@ -7131,6 +7133,19 @@
     renderChatBusyState();
   };
 
+  // A canceled voice request can emit a late terminal or delta after its
+  // controller is gone. Retain its identity so that event can neither create
+  // an ordinary text bubble nor enter the next physical turn's latency trace.
+  const voiceStreamRequestIds = new Set();
+  const rememberVoiceStreamRequest = (requestId) => {
+    if (!requestId) return;
+    voiceStreamRequestIds.delete(requestId);
+    voiceStreamRequestIds.add(requestId);
+    if (voiceStreamRequestIds.size > 512) {
+      voiceStreamRequestIds.delete(voiceStreamRequestIds.values().next().value);
+    }
+  };
+
   const chatRequestLease = (payload) => payload.request_id
     ? `chat-request:${payload.request_id}`
     : null;
@@ -7145,8 +7160,13 @@
     const sameLiveConversation = liveVoiceTts?.conversation === payload.conversation_id;
     const ownsLiveVoice = sameLiveConversation
       && liveVoiceTts.acceptsRequest(payload.request_id, payload.event);
-    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : voiceLatencyTrace;
+    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null;
     if (eventTrace) {
+      markVoiceLatencyIn(eventTrace, "chat_stream_event_received", {
+        event: payload.event,
+        request_id: payload.request_id,
+        conversation_id: payload.conversation_id,
+      });
       markVoiceLatencyIn(eventTrace, "chat_stream_route_decision", {
         event: payload.event,
         request_id: payload.request_id,
@@ -7159,7 +7179,7 @@
     }
     const voiceReply = ownsLiveVoice && liveVoiceTts.mode === "voice_note";
     const callReply = ownsLiveVoice && liveVoiceTts.mode === "call";
-    if (sameLiveConversation && !ownsLiveVoice) {
+    if ((sameLiveConversation || voiceStreamRequestIds.has(payload.request_id)) && !ownsLiveVoice) {
       if (["completed", "cancelled", "failed"].includes(payload.event)) {
         releaseChatBusy(chatRequestLease(payload));
       }
@@ -7253,13 +7273,6 @@
       ? envelope.event
       : (envelope.request_id && envelope.conversation_id ? envelope : null);
     if (chatEvent) {
-      if (voiceLatencyTrace) {
-        markVoiceLatency("chat_stream_event_received", {
-          event: chatEvent.event,
-          request_id: chatEvent.request_id,
-          conversation_id: chatEvent.conversation_id,
-        });
-      }
       onChatEvent({ payload: chatEvent });
       return;
     }
