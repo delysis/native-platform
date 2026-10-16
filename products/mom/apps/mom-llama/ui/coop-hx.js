@@ -6081,7 +6081,8 @@
       if (activity.heardVoice && !activity.voiced
           && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
           && voiceRecording === recording
-          && !recording.sending && !recording.speculation && !recording.speculationStarting) {
+          && !recording.sending && !recording.speculation && !recording.speculationStarting
+          && !recording.prefillFailed) {
         markVoiceLatency("silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
@@ -6089,6 +6090,12 @@
           threshold,
         });
         void startVoiceSpeculation(recording).catch(reportError);
+      } else if (recording.call && recording.prefillFailed && activity.heardVoice
+          && activity.silentMs >= 900 && voiceRecording === recording && !recording.sending) {
+        // Incremental audio cannot admit a still-pending historical WAV.
+        // The physical recording can use the complete-media chat path without
+        // waiting for Parakeet or leaving the call stuck at a silence edge.
+        void sendVoiceCapture(recording).catch(reportError);
       } else if (!recording.call && activity.heardVoice && activity.silentMs >= 900
           && voiceRecording === recording && !recording.sending) {
         if (recording.speculation && !recording.speculation.aborting) {
