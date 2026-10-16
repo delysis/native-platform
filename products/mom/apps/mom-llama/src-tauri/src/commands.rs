@@ -2096,6 +2096,7 @@ pub async fn mom_llama_voice_audio_speculate(
                 command_started,
             );
             let stream_speculation = worker_speculation.clone();
+            let stream_progress = progress.clone();
             let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
                 voice,
                 ChatSendOptions {
@@ -2103,13 +2104,35 @@ pub async fn mom_llama_voice_audio_speculate(
                     ..ChatSendOptions::default()
                 },
                 Some(move |event: mom_llama_runtime::ChatStreamEvent| {
-                    let detail = serde_json::json!({
+                    let mut detail = serde_json::json!({
                         "kind": "chat",
                         "event": &event.event,
                         "request_id": &event.request_id,
                         "conversation_id": &event.conversation_id,
                         "delta_bytes": event.delta.as_ref().map_or(0, String::len),
                     });
+                    if event.event == "decode_started" {
+                        let audio = stream_progress.stats();
+                        detail["audio"] = serde_json::json!({
+                            "accepted_samples": audio.accepted_samples,
+                            "consumed_samples": audio.consumed_samples,
+                            "prefix_start_us": audio.prefix_start_us,
+                            "prefix_finish_us": audio.prefix_finish_us,
+                            "prefix_us": audio.prefix_us,
+                            "prefix_tokens": audio.prefix_tokens,
+                            "restored_prefix_tokens": audio.restored_prefix_tokens,
+                            "projector_us": audio.projector_us,
+                            "projected_blocks": audio.projected_blocks,
+                            "projected_samples": audio.projected_samples,
+                            "first_projector_start_us": audio.first_projector_start_us,
+                            "last_projector_finish_us": audio.last_projector_finish_us,
+                            "finish_us": audio.finish_us,
+                            "closing_boundary_finish_us": audio.closing_boundary_finish_us,
+                            "suffix_tokenize_finish_us": audio.suffix_tokenize_finish_us,
+                            "suffix_eval_finish_us": audio.suffix_eval_finish_us,
+                            "decode_start_us": audio.decode_start_us,
+                        });
+                    }
                     emit_voice_speculation_stage_with_detail(
                         &events,
                         &stream_speculation,

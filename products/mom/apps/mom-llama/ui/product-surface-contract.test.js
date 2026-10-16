@@ -1305,6 +1305,28 @@ test("failed voice generation retains partial native audio progress", () => {
   assert.equal(summary.voice_cancel_to_observed_ms, 658.11);
 });
 
+test("decode boundary preserves prefix and projector timing before a reply completes", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const summary = summarize({ stages: [
+    { stage: "speculation_started", elapsed_ms: 100, speculation: "current" },
+    { stage: "native_chat_stream_event", event: "decode_started", elapsed_ms: 4_500,
+      speculation: "current", audio: {
+        accepted_samples: 16_000, consumed_samples: 16_000,
+        prefix_start_us: 100_000, prefix_finish_us: 3_100_000,
+        prefix_us: 3_000_000, prefix_tokens: 2_900, restored_prefix_tokens: 0,
+        projector_us: 900_000, projected_blocks: 25, projected_samples: 16_000,
+        first_projector_start_us: 3_110_000, last_projector_finish_us: 4_050_000,
+        finish_us: 4_100_000, decode_start_us: 4_300_000,
+      } },
+  ] });
+  assert.equal(summary.prompt_prefix_cpu_ms, 3_000);
+  assert.equal(summary.projector_cpu_ms, 900);
+  assert.equal(summary.projector_audio_ms, 1_000);
+  assert.equal(summary.audio_finish_to_decode_ms, 200);
+});
+
 test("voice latency exposes resumed-speech checkpoint and replay cost", () => {
   const start = bridge.indexOf("  const voiceLatencySummary =");
   const end = bridge.indexOf("\n  const persistVoiceLatency =", start);

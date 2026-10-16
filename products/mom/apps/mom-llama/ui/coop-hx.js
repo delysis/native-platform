@@ -3828,7 +3828,11 @@
     // suffix, sampler, or first-token stalls in real packaged calls.
     const nativeAudioTerminal = latestAttemptStage("native_audio_finish_failed")
       || latestAttemptStage("native_audio_finish_returned");
-    const audio = generation?.voice_audio || nativeAudioTerminal?.audio || null;
+    const nativeDecodeAudio = [...indexedStages].reverse().find(({ entry }) =>
+      entry.stage === "native_chat_stream_event" && entry.event === "decode_started"
+        && entry.audio && (!currentSpeculation || entry.speculation === currentSpeculation)
+    )?.entry.audio || null;
+    const audio = generation?.voice_audio || nativeAudioTerminal?.audio || nativeDecodeAudio;
     const cancelledAudio = latestAttemptStage("native_audio_finish_failed")?.audio || null;
     const captureStarted = firstIndexed("native_capture_requested")
       || firstIndexed("capture_started");
