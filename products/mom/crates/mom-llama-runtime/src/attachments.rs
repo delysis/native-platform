@@ -1046,6 +1046,21 @@ pub(crate) fn prepare_chat_attachments(
         .map(|result| result.map(|scoped| scoped.context))
 }
 
+/// The live microphone already supplies the current audio to the model.
+/// Historical attachments contribute inspected text only; loading their raw
+/// media would add disk and hash work while admitting none of it to this turn.
+pub(crate) fn prepare_live_audio_history(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::HistoryTextOnly,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
 pub(crate) fn commit_generated_exchange(
     fallback_db: ConversationDb,
     conversation: Conversation,

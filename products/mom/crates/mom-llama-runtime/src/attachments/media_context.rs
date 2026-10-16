@@ -11,6 +11,7 @@ pub(super) fn resolve_attachment_set(
     expected_state: AttachmentState,
     records: &HashMap<&str, &AttachmentRecord>,
     resolution: &mut AttachmentResolution<'_>,
+    materialize_media: bool,
 ) -> Result<std::result::Result<ResolvedAttachmentWithBindings, AttachmentContextBlocker>> {
     let mut text = Vec::new();
     let mut media = Vec::new();
@@ -117,6 +118,14 @@ pub(super) fn resolve_attachment_set(
                     "attachment_context_media_bytes_exceeded",
                     "The retained media exceeds the per-request byte budget.".into(),
                 )));
+            }
+            if !materialize_media {
+                // The live audio path retains validated canonical text and
+                // occurrence identity, but never puts historical media into
+                // the incremental request. Avoid reading and hashing bytes
+                // that cannot contribute to this generation.
+                has_representation = true;
+                continue;
             }
             // Always load and verify this occurrence before deduplication.
             // Earlier good bytes cannot authorize a later corrupt occurrence.
@@ -356,6 +365,60 @@ mod tests {
             store.get_bytes(DRAFTS_NAMESPACE).expect("unchanged draft"),
             before
         );
+    }
+
+    #[test]
+    fn live_audio_history_validates_occurrences_without_materializing_old_media() {
+        let session = Session::new();
+        let image = session.image();
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment registry");
+        let record = db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == image.id)
+            .expect("imported occurrence");
+        record.state = AttachmentState::Committed;
+        record.message_id = "history".to_string();
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit fixture");
+        let message = Message {
+            id: "history".to_string(),
+            conversation_id: "chat".to_string(),
+            role: crate::conversation_store::MessageRole::User,
+            content: "[Voice note]".to_string(),
+            created_at: "1".to_string(),
+            parent_id: None,
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: vec![image.id],
+        };
+        let ordinary = prepare_scoped_chat_attachments(
+            "chat",
+            std::slice::from_ref(&message),
+            CurrentAttachmentSelection::HistoryOnly,
+        )
+        .expect("ordinary history")
+        .expect("valid occurrence");
+        assert_eq!(ordinary.media.len(), 1);
+        let live = prepare_scoped_chat_attachments(
+            "chat",
+            &[message],
+            CurrentAttachmentSelection::HistoryTextOnly,
+        )
+        .expect("live history")
+        .expect("valid occurrence");
+        assert!(live.media.is_empty());
+        assert!(live.media_by_message_id["history"].is_empty());
+        assert!(live.current_media.is_empty());
     }
 
     #[test]

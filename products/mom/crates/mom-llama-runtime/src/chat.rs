@@ -1,5 +1,6 @@
 use crate::attachments::{
     ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
+    prepare_live_audio_history,
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
@@ -681,12 +682,8 @@ pub fn voice_audio_begin_in_scope(
             media: Vec::new(),
         }
     } else {
-        prepare_chat_attachments(
-            conversation_id,
-            &active_messages,
-            Some("live-audio-history-only"),
-        )?
-        .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?
+        prepare_live_audio_history(conversation_id, &active_messages)?
+            .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?
     };
     let attachments_us = elapsed_us(stage_started);
 
