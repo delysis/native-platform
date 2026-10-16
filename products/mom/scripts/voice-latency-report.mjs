@@ -456,6 +456,7 @@ const aggregateMetricNames = [
   "capture_resample_cpu_ms",
   "capture_prefill_ipc_queue_high_water_ms",
   "capture_prefill_ipc_queued_at_stop_ms",
+  "capture_prefill_suppressed_silence_ms",
   "capture_queue_delay_max_ms",
   "capture_prefill_push_max_ms",
   "capture_vad_latched_ms",

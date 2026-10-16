@@ -1064,7 +1064,8 @@ test("browser microphone cost and queued PCM survive into the latency summary", 
   const summary = summarize({ stages: [
     { stage: "capture_processing", callback_cpu_ms: 24.5, callback_max_ms: 1.25,
       detector_cpu_ms: 8.5, resample_cpu_ms: 6,
-      prefill_ipc_queued_samples: 1_280, prefill_ipc_queue_high_water_samples: 4_800 },
+      prefill_ipc_queued_samples: 1_280, prefill_ipc_queue_high_water_samples: 4_800,
+      prefill_suppressed_silence_samples: 3_200 },
   ] });
   assert.equal(summary.capture_processing_cpu_ms, 24.5);
   assert.equal(summary.capture_processing_max_ms, 1.25);
@@ -1072,6 +1073,7 @@ test("browser microphone cost and queued PCM survive into the latency summary", 
   assert.equal(summary.capture_resample_cpu_ms, 6);
   assert.equal(summary.capture_prefill_ipc_queued_at_stop_ms, 80);
   assert.equal(summary.capture_prefill_ipc_queue_high_water_ms, 300);
+  assert.equal(summary.capture_prefill_suppressed_silence_ms, 200);
   const absent = summarize({ stages: [] });
   assert.equal(absent.capture_prefill_ipc_queued_at_stop_ms, null);
 });

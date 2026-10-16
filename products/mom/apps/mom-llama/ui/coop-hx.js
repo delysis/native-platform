@@ -4018,6 +4018,9 @@
       capture_prefill_ipc_queued_at_stop_ms:
         capture && Number.isFinite(Number(capture.prefill_ipc_queued_samples))
           ? Number(capture.prefill_ipc_queued_samples) / 16 : null,
+      capture_prefill_suppressed_silence_ms:
+        capture && Number.isFinite(Number(capture.prefill_suppressed_silence_samples))
+          ? Number(capture.prefill_suppressed_silence_samples) / 16 : null,
       capture_vad_voice_onsets: Number.isFinite(Number(capture?.vad_voice_onsets))
         ? Number(capture.vad_voice_onsets) : null,
       capture_vad_settle_ms: Number.isFinite(Number(capture?.vad_settle_samples))
@@ -6056,6 +6059,7 @@
       echo_guard_threshold: recording.echoGuardThreshold || 0,
       prefill_ipc_queued_samples: recording.prefillQueuedSamples || 0,
       prefill_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
+      prefill_suppressed_silence_samples: recording.prefillSuppressedSilenceSamples || 0,
       prefill_failed: recording.prefillFailed === true,
     };
     markVoiceLatencyIn(recording.trace, "capture_processing", { ...captureMetrics, reason, discard });
@@ -6161,6 +6165,7 @@
       speculationReleaseMs: 180,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
       prefillQueuedSamples: 0, prefillQueueHighWaterSamples: 0,
+      prefillSuppressedSilenceSamples: 0,
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
       captureCallbacks: 0, captureCpuMs: 0, captureMaxCpuMs: 0,
       detectorCpuMs: 0, detectorSubframes: 0, resampleCpuMs: 0,
@@ -6311,7 +6316,14 @@
         }
         enqueueVoicePrefill(recording, pcm);
       } else if (!recording.speculation && activity.heardVoice) {
-        if (activity.silentMs <= 600) enqueueVoicePrefill(recording, pcm);
+        // The first silence edge has already flushed the model input. Further
+        // silence belongs only to the physical recording; pushing it after
+        // speculative decode starts can race native end-of-input.
+        if (!recording.speculationStarting && activity.silentMs <= 600) {
+          enqueueVoicePrefill(recording, pcm);
+        } else {
+          recording.prefillSuppressedSilenceSamples += pcm.length;
+        }
       } else if (!recording.speculation) {
         recording.preRoll.push(pcm);
         recording.preRollSamples += pcm.length;
