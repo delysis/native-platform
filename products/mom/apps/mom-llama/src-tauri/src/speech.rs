@@ -3139,6 +3139,77 @@ mod tests {
                 .as_ref()
                 .map_or(0, |output| output.transcript.len())
         );
+        if result
+            .result
+            .as_ref()
+            .is_some_and(|output| output.transcript.trim().is_empty())
+        {
+            // Diagnostic only: test whether Parakeet rejected a quiet or
+            // abruptly terminated clip. The original stored WAV is untouched.
+            let gain = if peak > 0.0 {
+                (0.65 / peak).min(32.0)
+            } else {
+                1.0
+            };
+            let mut conditioned = vec![0_i16; 3_200];
+            conditioned.extend(samples.iter().map(|sample| {
+                (sample * gain * 32767.0).clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+            }));
+            conditioned.extend(std::iter::repeat_n(0_i16, 8_000));
+            let pcm_bytes = conditioned
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>();
+            let data_size = u32::try_from(pcm_bytes.len()).expect("diagnostic size");
+            let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&16_000_u32.to_le_bytes());
+            wav.extend_from_slice(&32_000_u32.to_le_bytes());
+            wav.extend_from_slice(&2_u16.to_le_bytes());
+            wav.extend_from_slice(&16_u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_size.to_le_bytes());
+            wav.extend_from_slice(&pcm_bytes);
+            let request_id = SpeechRequestId("diagnose-conditioned-voice".to_owned());
+            let conditioned_result = speech
+                .executor
+                .transcribe(TranscriptionRequest {
+                    context: request_context(
+                        request_id,
+                        SpeechRouteSelector::ExactBackend {
+                            backend_id: PARAKEET_BACKEND_ID.to_owned(),
+                            model_id: Some(PARAKEET_MODEL_ID.to_owned()),
+                            voice_id: None,
+                        },
+                        120_000,
+                    ),
+                    input: TranscriptionInput::Complete {
+                        audio: AudioInput::Encoded {
+                            format: EncodedAudioFormat::Wav,
+                            data: wav,
+                        },
+                    },
+                    language: Some("en".to_owned()),
+                    task: TranscriptionTask::Transcribe,
+                    timestamps: TimestampGranularity::None,
+                    diarization: DiarizationPolicy::Disabled,
+                    partial_results: false,
+                    punctuation: true,
+                    hotwords: Vec::new(),
+                })
+                .await;
+            eprintln!(
+                "conditioned voice diagnostic: gain={gain:.2}, result={:?}",
+                conditioned_result
+                    .as_ref()
+                    .map(|response| response.text.len())
+            );
+        }
         speech.shutdown().await.expect("speech host joined");
     }
     use speech_native_types::{
