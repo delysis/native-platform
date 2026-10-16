@@ -273,6 +273,35 @@ globalThis.rememberVoice = rememberVoiceStreamRequest;`, Object.assign(context, 
   assert.deepEqual(trace.stages, [], "unrelated text work never changes a voice-turn trace");
 });
 
+test("a replacement speculation gets its own first-content timing", () => {
+  const trace = { stages: [] };
+  const owner = (requestId) => ({
+    conversation: "conversation-a", mode: "call", trace, firstDeltaSeen: false,
+    acceptsRequest: (candidate) => candidate === requestId,
+    push() {},
+  });
+  const context = {
+    liveVoiceTts: owner("first-attempt"),
+    chatRequestLease: () => null,
+    acquireStableChatBusy() {}, releaseChatBusy() {},
+    document: { getElementById: () => null },
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const voiceStreamRequestIds =");
+  const end = source.indexOf("\n  const mentionLiveId", start);
+  vm.runInContext(`const markVoiceLatencyIn = (trace, stage) => trace?.stages.push(stage);
+${source.slice(start, end)}
+globalThis.testOnChatEvent = onChatEvent;`, context);
+  for (const requestId of ["first-attempt", "replacement-attempt"]) {
+    if (requestId === "replacement-attempt") context.liveVoiceTts = owner(requestId);
+    context.testOnChatEvent({ payload: {
+      event: "delta", request_id: requestId, conversation_id: "conversation-a", delta: "Hello",
+    } });
+  }
+  assert.equal(trace.stages.filter((stage) => stage === "first_content_delta").length, 2);
+  assert.equal(trace.stages.filter((stage) => stage === "first_content_delta_received").length, 2);
+});
+
 test("the native voice dispatch routes a direct chat stream event", () => {
   const received = [];
   const context = {

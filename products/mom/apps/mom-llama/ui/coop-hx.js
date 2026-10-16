@@ -5513,6 +5513,7 @@
       conversation,
       mode,
       trace: ttsLatencyTrace,
+      firstDeltaSeen: false,
       get requestId() { return requestId; },
       acceptsRequest(candidate, eventName = "") {
         if (!candidate) return false;
@@ -7202,8 +7203,8 @@
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "delta" && (voiceReply || callReply) && !eventTrace?.firstDeltaSeen) {
-      if (eventTrace) eventTrace.firstDeltaSeen = true;
+    if (payload.event === "delta" && (voiceReply || callReply) && !liveVoiceTts.firstDeltaSeen) {
+      liveVoiceTts.firstDeltaSeen = true;
       markVoiceLatencyIn(eventTrace, "first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
       markVoiceLatencyIn(eventTrace, "first_content_delta_received");
     }
