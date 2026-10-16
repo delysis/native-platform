@@ -974,6 +974,12 @@ pub fn run() {
                 // Dock Quit and AppleEvent Quit may reach this final boundary
                 // without an interceptable ExitRequested. Do not let AppKit
                 // or static teardown proceed while Metal owns live resources.
+                // Hide the window before that bounded native join. AppKit is
+                // otherwise stuck displaying a beachball over a dead call
+                // modal while the speech workers acknowledge cancellation.
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
                 let decision = decide_final_exit(app_handle, &event_startup);
                 if decision == FinalExitDecision::AbortWithoutRustTeardown {
                     eprintln!(
