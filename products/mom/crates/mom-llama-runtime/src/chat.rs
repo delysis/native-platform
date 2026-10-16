@@ -731,19 +731,23 @@ pub fn voice_audio_begin_in_scope(
         });
     let stage_started = Instant::now();
     let cached_prefix = if history.media.is_empty() {
-        let persona_owner = persona_prefix_cache_owner_id(
+        let owner_ids = reusable_prefix_owner_ids(
+            &conversation.id,
             conversation.source_conversation_id.as_deref(),
             &conversation.current_skill_ids,
             skill_prompt.cache_owner_id.is_some(),
+            skill_prompt.cache_owner_id.as_deref(),
         );
-        let owner_id = if conversation.source_conversation_id.is_some() {
-            persona_owner
-        } else if conversation.current_skill_ids.is_empty() {
-            Some(conversation.id.as_str())
-        } else {
-            skill_prompt.cache_owner_id.as_deref()
-        };
-        if let Some(owner_id) = owner_id {
+        let conversation_prefix = compatible_cached_prefix_for_owner_with_settings(
+            &handle,
+            &messages,
+            Some(owner_ids[0]),
+            &settings,
+        )?
+        .filter(|(_, sequence)| handle.has_live_sequence_receipt(&sequence.export_receipt()));
+        if conversation_prefix.is_some() {
+            conversation_prefix
+        } else if let Some(owner_id) = owner_ids.get(1).copied() {
             compatible_cached_prefix_for_owner_with_settings(
                 &handle,
                 &messages,
@@ -1426,19 +1430,18 @@ where
             return stream.finish_cancelled();
         }
         let (cached_prefix, cache_was_preexisting) = if media.is_empty() && default_template {
-            let persona_owner = persona_prefix_cache_owner_id(
+            let owner_ids = reusable_prefix_owner_ids(
+                &conversation.id,
                 conversation.source_conversation_id.as_deref(),
                 &conversation.current_skill_ids,
                 skill_prompt.cache_owner_id.is_some(),
+                skill_prompt.cache_owner_id.as_deref(),
             );
-            let cache_owner_id = if conversation.source_conversation_id.is_some() {
-                persona_owner
-            } else if conversation.current_skill_ids.is_empty() {
-                None
-            } else {
-                skill_prompt.cache_owner_id.as_deref()
-            };
-            if let Some(owner_id) = cache_owner_id {
+            let conversation_cache =
+                compatible_conversation_prefix(&handle, &messages, owner_ids[0])?;
+            if conversation_cache.is_some() {
+                (conversation_cache, true)
+            } else if let Some(owner_id) = owner_ids.get(1).copied() {
                 let cache = ensure_persona_prefix(&handle, owner_id, &messages)?;
                 (
                     cache
@@ -1446,12 +1449,6 @@ where
                         .map(|cache| (cache.cache_id.clone(), cache.sequence.clone())),
                     cache.is_some_and(|cache| cache.reused),
                 )
-            } else if conversation.source_conversation_id.is_none()
-                && conversation.current_skill_ids.is_empty()
-            {
-                let cache = compatible_conversation_prefix(&handle, &messages, &conversation.id)?;
-                let reused = cache.is_some();
-                (cache, reused)
             } else {
                 (None, false)
             }
@@ -2144,13 +2141,35 @@ fn configure_voice_sampling(
     }
 }
 
+fn reusable_prefix_owner_ids<'a>(
+    conversation_id: &'a str,
+    source_persona_id: Option<&'a str>,
+    skill_ids: &[String],
+    skills_cacheable: bool,
+    skill_cache_owner_id: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut owners = vec![conversation_id];
+    let fallback = if source_persona_id.is_some() {
+        persona_prefix_cache_owner_id(source_persona_id, skill_ids, skills_cacheable)
+    } else if skill_ids.is_empty() {
+        None
+    } else {
+        skill_cache_owner_id
+    };
+    if let Some(owner) = fallback.filter(|owner| *owner != conversation_id) {
+        owners.push(owner);
+    }
+    owners
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ChatAttachmentContext, ChatSendOptions, ChatStreamLifecycle, Message, MessageRole,
         ReasoningStreamParser, ReasoningTarget, apply_conversation_model_pair,
         build_native_messages, configure_voice_sampling, empty_native_response_result,
-        native_context_messages, parse_reasoning_output, user_turn_is_empty,
+        native_context_messages, parse_reasoning_output, reusable_prefix_owner_ids,
+        user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
@@ -2200,6 +2219,29 @@ mod tests {
         assert_eq!(note.temperature, 0.2);
         assert_eq!(note.max_tokens, 96);
         assert_eq!(note.stop, ["\n\n"]);
+    }
+
+    #[test]
+    fn inference_checks_the_exact_conversation_before_broader_prefixes() {
+        let no_skills = Vec::new();
+        assert_eq!(
+            reusable_prefix_owner_ids("conversation", Some("persona"), &no_skills, false, None,),
+            ["conversation", "persona"],
+        );
+        assert_eq!(
+            reusable_prefix_owner_ids(
+                "conversation",
+                None,
+                &["skill".to_string()],
+                true,
+                Some("skill-prefix"),
+            ),
+            ["conversation", "skill-prefix"],
+        );
+        assert_eq!(
+            reusable_prefix_owner_ids("conversation", None, &no_skills, false, None),
+            ["conversation"],
+        );
     }
 
     #[test]
