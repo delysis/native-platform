@@ -2228,7 +2228,8 @@
   };
 
   const prepareCallMicrophoneStream = async () => {
-    if (voiceCallMicrophoneStream?.active
+    if (voiceCallCaptureGraph?.context?.state !== "closed"
+        && voiceCallMicrophoneStream?.active
         && voiceCallMicrophoneStream.getAudioTracks().some((track) => track.readyState === "live")) {
       return { reused: true };
     }
@@ -2247,18 +2248,38 @@
       throw new Error("The microphone did not become ready for the call.");
     }
     voiceCallMicrophoneStream = stream;
+    const context = new AudioContext();
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(256, 1, 1);
+    const silence = context.createGain();
+    silence.gain.value = 0;
+    source.connect(processor);
+    processor.connect(silence);
+    silence.connect(context.destination);
+    await context.resume();
+    voiceCallCaptureGraph = { context, source, processor, silence, stream };
     const settings = track.getSettings?.() || {};
     return {
       reused: false,
       permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       source_rate_hz: settings.sampleRate || null,
       echo_cancellation: settings.echoCancellation ?? true,
+      graph_state: context.state,
     };
   };
 
   const releaseCallMicrophoneStream = (expected = voiceCallMicrophoneStream) => {
     if (!expected || voiceCallMicrophoneStream !== expected) return;
+    const graph = voiceCallCaptureGraph;
+    voiceCallCaptureGraph = null;
     voiceCallMicrophoneStream = null;
+    if (graph) {
+      graph.processor.onaudioprocess = null;
+      graph.source.disconnect();
+      graph.processor.disconnect();
+      graph.silence.disconnect();
+      void graph.context.close().catch(() => {});
+    }
     expected.getTracks().forEach((track) => track.stop());
   };
 
@@ -3642,6 +3663,7 @@
   let voiceCallAudio = null;
   let voiceCallConversation = null;
   let voiceCallMicrophoneStream = null;
+  let voiceCallCaptureGraph = null;
   let pendingCallMemoryTranscript = null;
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
@@ -5679,14 +5701,28 @@
         wavBytes,
       };
     }
-    if (!recording.sharedCallStream) {
+    recording.processor.onaudioprocess = null;
+    if (!recording.sharedCallGraph) {
       recording.stream.getTracks().forEach((track) => track.stop());
+      recording.source.disconnect();
+      recording.processor.disconnect();
+      recording.silence.disconnect();
+      await recording.context.close().catch(() => {});
     }
-    recording.source.disconnect();
-    recording.processor.disconnect();
-    recording.silence.disconnect();
     setVoiceRecordingVisible(false);
-    await recording.context.close().catch(() => {});
+    const captureMetrics = {
+      callbacks: recording.captureCallbacks,
+      detector_subframes: recording.detectorSubframes,
+      callback_cpu_ms: Math.round(recording.captureCpuMs * 100) / 100,
+      callback_max_ms: Math.round(recording.captureMaxCpuMs * 100) / 100,
+      detector_cpu_ms: Math.round(recording.detectorCpuMs * 100) / 100,
+      resample_cpu_ms: Math.round(recording.resampleCpuMs * 100) / 100,
+      echo_guard_callbacks: recording.echoGuardCallbacks || 0,
+      echo_guard_suppressed_callbacks: recording.echoGuardSuppressedCallbacks || 0,
+      echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
+      echo_guard_threshold: recording.echoGuardThreshold || 0,
+    };
+    markVoiceLatency("capture_processing", captureMetrics);
     if (discard) {
       if (recording.speculation && !recording.speculation.confirmed) {
         void abortCallSpeculation(recording);
@@ -5699,15 +5735,6 @@
     }
     enqueueVoicePrefill(recording, new Float32Array(), true);
     await recording.pushChain;
-    const captureMetrics = {
-      callbacks: recording.captureCallbacks,
-      detector_subframes: recording.detectorSubframes,
-      callback_cpu_ms: Math.round(recording.captureCpuMs * 100) / 100,
-      callback_max_ms: Math.round(recording.captureMaxCpuMs * 100) / 100,
-      detector_cpu_ms: Math.round(recording.detectorCpuMs * 100) / 100,
-      resample_cpu_ms: Math.round(recording.resampleCpuMs * 100) / 100,
-    };
-    markVoiceLatency("capture_processing", captureMetrics);
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
@@ -5749,18 +5776,24 @@
     const stream = sharedCallStream || await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
+    const sharedCallGraph = call && sharedCallStream
+      && voiceCallCaptureGraph?.stream === sharedCallStream
+      && voiceCallCaptureGraph.context.state !== "closed"
+      ? voiceCallCaptureGraph
+      : null;
+    const context = sharedCallGraph?.context || new AudioContext();
+    const source = sharedCallGraph?.source || context.createMediaStreamSource(stream);
     // WebKit's smallest ScriptProcessor quantum is 256 samples (~5.3 ms at
     // 48 kHz). The detector subdivides it into 64-sample windows, giving the
     // squelch ~1.3 ms resolution without allocating per subframe.
-    const processor = context.createScriptProcessor(256, 1, 1);
-    const silence = context.createGain();
-    silence.gain.value = 0;
+    const processor = sharedCallGraph?.processor || context.createScriptProcessor(256, 1, 1);
+    const silence = sharedCallGraph?.silence || context.createGain();
+    if (!sharedCallGraph) silence.gain.value = 0;
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
       sharedCallStream: stream === voiceCallMicrophoneStream,
+      sharedCallGraph: Boolean(sharedCallGraph),
       resampler: globalThis.MomVoiceCapturePolicy.createStreamingMonoResampler(context.sampleRate),
       limit: null, call,
       sourceConversation: selectedConversation(), sourceKind: selectedConversationKind(),
@@ -5773,6 +5806,11 @@
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
       captureCallbacks: 0, captureCpuMs: 0, captureMaxCpuMs: 0,
       detectorCpuMs: 0, detectorSubframes: 0, resampleCpuMs: 0,
+      echoGuard: globalThis.MomVoiceCapturePolicy.initialPlaybackEchoGuard(),
+      echoGuardCallbacks: 0,
+      echoGuardSuppressedCallbacks: 0, echoGuardPeakRms: 0,
+      echoGuardThreshold: 0,
+      detectorSilence: new Float32Array(processor.bufferSize),
     };
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
       recording.prefillFailed = true;
@@ -5783,10 +5821,34 @@
       const callbackStarted = performance.now();
       const chunk = event.inputBuffer.getChannelData(0);
       const previousActivity = recording.voiceActivity;
+      const playbackAudible = recording.call && liveVoiceTts?.mode === "call"
+        && liveVoiceTts.audible;
+      let detectorChunk = chunk;
+      if (playbackAudible) {
+        let power = 0;
+        for (let index = 0; index < chunk.length; index += 1) power += chunk[index] * chunk[index];
+        const rawRms = Math.sqrt(power / Math.max(1, chunk.length));
+        const durationMs = chunk.length * 1000 / context.sampleRate;
+        const echo = globalThis.MomVoiceCapturePolicy.updatePlaybackEchoGuard(
+          recording.echoGuard,
+          rawRms,
+          durationMs,
+        );
+        recording.echoGuard = echo.guard;
+        recording.echoGuardCallbacks += 1;
+        recording.echoGuardPeakRms = Math.max(recording.echoGuardPeakRms, rawRms);
+        recording.echoGuardThreshold = echo.threshold;
+        if (echo.suppressed) {
+          recording.echoGuardSuppressedCallbacks += 1;
+          detectorChunk = recording.detectorSilence;
+        }
+      } else {
+        recording.echoGuard = globalThis.MomVoiceCapturePolicy.initialPlaybackEchoGuard();
+      }
       const detectorStarted = performance.now();
       const analysis = globalThis.MomVoiceCapturePolicy.analyzeVoiceSamples(
         previousActivity,
-        chunk,
+        detectorChunk,
         context.sampleRate,
       );
       recording.detectorCpuMs += performance.now() - detectorStarted;
@@ -5854,7 +5916,9 @@
       recording.captureCpuMs += callbackMs;
       recording.captureMaxCpuMs = Math.max(recording.captureMaxCpuMs, callbackMs);
     };
-    source.connect(processor); processor.connect(silence); silence.connect(context.destination);
+    if (!sharedCallGraph) {
+      source.connect(processor); processor.connect(silence); silence.connect(context.destination);
+    }
     voiceRecording = recording;
     voiceRecording.limit = window.setTimeout(() => {
       if (voiceRecording === recording && !recording.sending && !recording.speculation) {

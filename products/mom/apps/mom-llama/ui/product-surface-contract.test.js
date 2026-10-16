@@ -512,7 +512,10 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));
   assert.ok(bridge.includes("const sharedCallStream = call && voiceCallMicrophoneStream?.active"));
   assert.ok(bridge.includes("sharedCallStream: stream === voiceCallMicrophoneStream"));
-  assert.ok(bridge.includes("if (!recording.sharedCallStream)"));
+  assert.ok(bridge.includes("const sharedCallGraph = call && sharedCallStream"));
+  assert.ok(bridge.includes("sharedCallGraph: Boolean(sharedCallGraph)"));
+  assert.ok(bridge.includes("if (!recording.sharedCallGraph)"));
+  assert.ok(bridge.includes("recording.echoGuardSuppressedCallbacks += 1"));
   assert.ok(bridge.includes("if (options.call) return beginBrowserVoiceCapture(options);"));
 });
 
