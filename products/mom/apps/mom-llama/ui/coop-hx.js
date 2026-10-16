@@ -6233,11 +6233,6 @@
       source.connect(processor); processor.connect(silence); silence.connect(context.destination);
     }
     voiceRecording = recording;
-    voiceRecording.limit = window.setTimeout(() => {
-      if (voiceRecording === recording && !recording.sending && !recording.speculation) {
-        void sendVoiceCapture(recording).catch(reportError);
-      }
-    }, 29000);
     if (!call) setVoiceRecordingVisible(true);
     return recording;
   };
@@ -6337,11 +6332,6 @@
         : null).catch(() => {});
       throw error;
     }
-    recording.limit = window.setTimeout(() => {
-      if (voiceRecording === recording && !recording.sending && !recording.speculation) {
-        void sendVoiceCapture(recording).catch(reportError);
-      }
-    }, 29000);
     return recording;
   };
 
