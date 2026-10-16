@@ -3,6 +3,9 @@ mod command_registry;
 mod commands;
 mod information;
 mod model_acquisition;
+// Capture/host stage only; activation awaits the runtime and KV owners.
+#[allow(dead_code)]
+mod live_transcription;
 mod native_voice_capture;
 mod operation_supervisor;
 mod speech;

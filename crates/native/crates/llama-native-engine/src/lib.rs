@@ -4001,6 +4001,40 @@ fn run_worker(
                     resident_text_prefix.invalidate();
                     emit_failed_case_events(&event_tx, &request);
                 }
+                // A one-branch text reply can be followed immediately by a
+                // microphone turn. Its evaluated KV cells are already in
+                // sequence zero; retain them in the audio prefix lane so the
+                // next incremental request can reuse its exact common tokens
+                // instead of evaluating the persona prompt again. The audio
+                // path compares token IDs before copying any cells back.
+                if request.media.is_empty()
+                    && request.cases.len() == 1
+                    && matches!(&request.cases[0].input, GenerationInput::Chat { .. })
+                    && generated.as_ref().is_ok_and(|execution| {
+                        execution
+                            .outputs
+                            .first()
+                            .is_some_and(|output| output.state == GenerationState::Completed)
+                    })
+                    && multimodal.as_ref().is_some_and(|projector| {
+                        media_kinds_for_context(projector).contains(&MediaKind::Audio)
+                    })
+                    && worker_identity.kv_unified
+                    && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+                    && !resident_text_prefix.token_ids.is_empty()
+                    && retain_incremental_audio_text_prefix(
+                        &mut context,
+                        0,
+                        &resident_text_prefix.token_ids,
+                        &mut resident_audio_text_prefix,
+                    )
+                    .is_err()
+                {
+                    invalidate_resident_audio_text_prefix(
+                        &mut context,
+                        &mut resident_audio_text_prefix,
+                    );
+                }
                 if retain_authority_evidence {
                     unrecorded_control_used |= reasoning_forces
                         .iter()
@@ -14411,6 +14445,85 @@ mod tests {
             wav.extend_from_slice(&((phase.sin() * 8_000.0) as i16).to_le_bytes());
         }
         wav
+    }
+
+    #[test]
+    #[ignore = "requires the real Gemma 4 12B GGUF and matching audio projector"]
+    fn real_text_greeting_seeds_next_incremental_audio_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
+        let model_path = std::env::var("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?;
+        let mmproj_path = std::env::var("MOM_LLAMA_MM_PROJ_PATH")?;
+        let mut config = NativeModelConfig::local(PathBuf::from(model_path));
+        config.mmproj_path = Some(PathBuf::from(mmproj_path));
+        config.device = NativeDevice::Auto;
+        config.context_tokens = 4096;
+        config.batch_tokens = 512;
+        config.max_sequences = 4;
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
+        let model_id = handle.status().model_id;
+        let prior_user = ChatMessage {
+            role: ChatRole::User,
+            content: "You are answering a short phone call. Keep the greeting warm and concise. The caller may talk about their family, plans, or memories. Listen to the next turn before offering advice. Say hello now.".repeat(5),
+        };
+        let sampling = SamplingConfig {
+            seed: 17,
+            temperature: 0.0,
+            max_tokens: 12,
+            ..SamplingConfig::default()
+        };
+        let greeting = require_ready(
+            handle
+                .generate(GenerationRequest {
+                    request_id: "native-audio-prefix-greeting".to_string(),
+                    model_id: model_id.clone(),
+                    input: GenerationInput::Chat {
+                        messages: vec![prior_user.clone()],
+                        template: ChatTemplateChoice::PreferNonThinking,
+                    },
+                    sampling: sampling.clone(),
+                    media: Vec::new(),
+                    cached_prefix: None,
+                })?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(greeting.len(), 1);
+        assert!(!greeting[0].text.trim().is_empty());
+        let audio = handle.generate_incremental_audio(GenerationRequest {
+            request_id: "native-audio-prefix-next-turn".to_string(),
+            model_id,
+            input: GenerationInput::Chat {
+                messages: vec![
+                    prior_user,
+                    ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: greeting[0].text.clone(),
+                    },
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: "Respond to what the caller says next.".to_string(),
+                    },
+                ],
+                template: ChatTemplateChoice::PreferNonThinking,
+            },
+            sampling,
+            media: Vec::new(),
+            cached_prefix: None,
+        })?;
+        audio.wait_for_resume()?;
+        let monitor = audio.monitor();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while monitor.stats().prefix_finish_ms.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let stats = monitor.stats();
+        audio.cancel();
+        assert!(
+            stats.restored_prefix_tokens > 100,
+            "greeting KV should cover the shared chat prefix: {stats:?}"
+        );
+        Ok(())
     }
 
     #[test]

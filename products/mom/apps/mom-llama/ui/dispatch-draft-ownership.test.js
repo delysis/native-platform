@@ -150,7 +150,7 @@ test("voice replies do not create an incoming card or expose streamed text", () 
   vm.createContext(context);
   const start = source.indexOf("  const chatRequestLease =");
   const end = source.indexOf("\n  const mentionLiveId", start);
-  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r1", conversation_id: "conversation-a" } });
   context.testOnChatEvent({ payload: { event: "delta", request_id: "r1", conversation_id: "conversation-a", delta: "hidden assistant text" } });
   context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r1", conversation_id: "conversation-a", delta: "hidden reasoning" } });
@@ -181,7 +181,7 @@ test("call replies suppress live text but still own the chat request lease", () 
   vm.createContext(context);
   const start = source.indexOf("  const chatRequestLease =");
   const end = source.indexOf("\n  const mentionLiveId", start);
-  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: { event: "started", request_id: "r-call", conversation_id: "conversation-a" } });
   context.testOnChatEvent({ payload: { event: "delta", request_id: "r-call", conversation_id: "conversation-a", delta: "hidden reply" } });
   context.testOnChatEvent({ payload: { event: "reasoning_delta", request_id: "r-call", conversation_id: "conversation-a", delta: "hidden reasoning" } });
@@ -215,7 +215,7 @@ test("an exact call request keeps its TTS owner after stale conversation cleanup
   vm.createContext(context);
   const start = source.indexOf("  const chatRequestLease =");
   const end = source.indexOf("\n  const mentionLiveId", start);
-  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
+  vm.runInContext(`let voiceLatencyTrace = null;\nconst markVoiceLatency = () => {};\nconst markVoiceLatencyIn = () => {};\nconst startVoiceLatency = () => { voiceLatencyTrace = {}; };\n${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`, context);
   context.testOnChatEvent({ payload: {
     event: "started", request_id: "replacement-request", conversation_id: "conversation-a",
   } });

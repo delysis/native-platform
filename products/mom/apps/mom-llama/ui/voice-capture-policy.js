@@ -233,7 +233,150 @@
     };
   };
 
+  // Staged bridge endpoint: send/finish/cancel must be supplied by the admitted
+  // native turn owner. This object does not invoke commands or edit history.
+  // A fixed source survives Gemma speculation; never append Gemma replay here.
+  const createLiveTranscriptionTap = ({ turn, capture, send, finish, cancel, onTrace = () => {},
+    deadlineMs = 5000, maxQueuedSamples = 40960 } = {}) => {
+    if (![turn, capture].every((id) => typeof id === "string" && id.length > 0 && id.length <= 128)
+        || typeof send !== "function" || typeof finish !== "function" || typeof cancel !== "function"
+        || !Number.isInteger(maxQueuedSamples) || maxQueuedSamples < 640 || maxQueuedSamples > 40960
+        || !Number.isFinite(deadlineMs) || deadlineMs <= 0 || deadlineMs > 5000) {
+      throw new Error("live_transcription_configuration_invalid");
+    }
+    let phase = "open";
+    let accepted = 0;
+    let delivered = 0;
+    let highWater = 0;
+    let running = false;
+    let scheduled = false;
+    let staged = new Float32Array(640);
+    let stagedCount = 0;
+    const queue = [];
+    const began = performance.now();
+    let firstCaptureMs = null;
+    let lastCaptureMs = null;
+    let firstIngressMs = null;
+    let lastIngressMs = null;
+    let failure = null;
+    let resolveFinal;
+    let rejectFinal;
+    const finished = new Promise((resolve, reject) => { resolveFinal = resolve; rejectFinal = reject; });
+    // The owning command may attach its final handler after physical capture
+    // stops. Observe rejection now, without converting it into success.
+    void finished.catch(() => {});
+    const metrics = () => ({ turn, capture, phase, accepted_samples: accepted,
+      bridge_accepted_samples: delivered, backlog_samples: accepted - delivered,
+      backlog_high_water_samples: highWater, first_sample_offset: accepted ? 0 : null,
+      last_sample_exclusive: accepted, first_capture_ms: firstCaptureMs, last_capture_ms: lastCaptureMs,
+      first_bridge_ack_ms: firstIngressMs, last_bridge_ack_ms: lastIngressMs, failure });
+    const trace = (stage) => {
+      const event = { schema: "mom_llama.live_transcription_browser.v1", stage, ...metrics() };
+      // Keep an arbitrary logging callback off the microphone's synchronous work.
+      queueMicrotask(() => { try { onTrace(event); } catch { /* telemetry is not capture authority */ } });
+    };
+    const fail = (code) => {
+      if (phase === "failed" || phase === "complete") return false;
+      phase = "failed";
+      failure = String(code);
+      queue.length = 0;
+      stagedCount = 0;
+      trace(code === "live_transcription_overflow" ? "overflow" : "failed_audio_retained");
+      // At most one send is in flight. Native cancellation must poison that
+      // source even when its eventual IPC completion races with this failure.
+      void Promise.resolve().then(() => cancel({ turn, capture, reason: failure })).catch(() => {});
+      rejectFinal(new Error(failure));
+      return false;
+    };
+    const bounded = async (operation) => {
+      let timer;
+      try {
+        return await Promise.race([
+          Promise.resolve().then(operation),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("live_transcription_backlog_timeout")), deadlineMs);
+          }),
+        ]);
+      } finally { clearTimeout(timer); }
+    };
+    const schedule = () => {
+      if (scheduled || running) return;
+      scheduled = true;
+      queueMicrotask(() => { scheduled = false; void drain(); });
+    };
+    const drain = async () => {
+      if (running || phase === "failed" || phase === "complete") return;
+      running = true;
+      try {
+        while (queue.length && phase !== "failed") {
+          const packet = queue.shift();
+          await bounded(() => send({ turn, capture, sample_offset: packet.offset, samples: packet.samples }));
+          if (phase === "failed") return;
+          delivered += packet.samples.length;
+          lastIngressMs = performance.now() - began;
+          if (firstIngressMs === null) { firstIngressMs = lastIngressMs; trace("first_bridge_ack"); }
+        }
+        if (phase === "sealed" && delivered === accepted) {
+          trace("last_bridge_ack");
+          const result = await bounded(() => finish({ turn, capture, samples: accepted }));
+          if (phase === "failed") return;
+          phase = "complete";
+          trace("final_uncommitted");
+          resolveFinal(result);
+        }
+      } catch (error) {
+        fail(error?.message || "live_transcription_failed");
+      } finally {
+        running = false;
+        if (queue.length && phase !== "failed" && phase !== "complete") schedule();
+      }
+    };
+    const flush = () => {
+      if (!stagedCount) return;
+      queue.push({ offset: accepted - stagedCount, samples: staged.slice(0, stagedCount) });
+      staged = new Float32Array(640);
+      stagedCount = 0;
+    };
+    return {
+      finished,
+      metrics,
+      append(samples) {
+        if (phase !== "open") return phase === "failed" ? false : fail("live_transcription_source_after_seal");
+        if (!(samples instanceof Float32Array)) return fail("live_transcription_invalid_pcm");
+        if (!samples.length) return true;
+        if (accepted + samples.length > 16000 * 29) return fail("live_transcription_too_long");
+        // Includes the in-flight packet and staging, not just queued packets.
+        if (accepted - delivered + samples.length > maxQueuedSamples) return fail("live_transcription_overflow");
+        if (samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {
+          return fail("live_transcription_invalid_pcm");
+        }
+        lastCaptureMs = performance.now() - began;
+        if (firstCaptureMs === null) firstCaptureMs = lastCaptureMs;
+        for (const sample of samples) {
+          staged[stagedCount++] = sample;
+          accepted += 1;
+          if (stagedCount === 640) flush();
+        }
+        highWater = Math.max(highWater, accepted - delivered);
+        if (accepted === samples.length) trace("first_capture_ingress");
+        schedule();
+        return true;
+      },
+      seal() {
+        if (phase !== "open") return finished;
+        if (!accepted) { fail("live_transcription_empty"); return finished; }
+        phase = "sealed";
+        flush();
+        trace("source_sealed");
+        schedule();
+        return finished;
+      },
+      cancel() { fail("live_transcription_cancelled"); },
+    };
+  };
+
   const api = {
+    createLiveTranscriptionTap,
     analyzeVoiceSamples,
     createStreamingMonoResampler,
     initialPlaybackEchoGuard,

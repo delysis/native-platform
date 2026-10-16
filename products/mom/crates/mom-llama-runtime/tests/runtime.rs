@@ -2792,6 +2792,43 @@ fn product_chat_cache_request(
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
+    let _session = configured_real_session("real-voice-template-cache")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        max_tokens: Some(16),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        ..SettingsUpdate::default()
+    })?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let conversation = mom_llama_runtime::conversation_new(Some("Voice cache proof".to_owned()))?
+        .result
+        .ok_or_else(|| anyhow!("voice cache proof conversation missing"))?;
+    let _first = product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "[Phone call] [Greeting] Greet Jan in one short sentence.",
+    )?;
+    let second = product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "[Phone call] [Greeting] Greet Jan again in one short sentence.",
+    )?;
+    assert!(
+        second.cache_metrics.resident_prefix_tokens > 0
+            || second.cache_metrics.restored_prefix_tokens > 0,
+        "the next greeting must reuse actual KV cells: {:?}",
+        second.cache_metrics
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {

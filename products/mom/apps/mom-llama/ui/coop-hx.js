@@ -2149,6 +2149,7 @@
 
   const startStreamedCallGreeting = async (epoch, conversation) => {
     if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
+    const greetingTrace = voiceLatencyTrace;
     callReplyConversation = conversation;
     activeDispatchConversation = conversation;
     let greetingFailure = null;
@@ -2177,7 +2178,7 @@
       // system prompt and model profile. Sending directly avoids re-routing
       // the saved recipient through the multi-consultant mention dispatcher,
       // whose differently shaped stream/result previously stranded pickup.
-      markVoiceLatency("generation_dispatched", { purpose: "call_greeting" });
+      markVoiceLatencyIn(greetingTrace, "generation_dispatched", { purpose: "call_greeting" });
       const response = await withDeadline(
         invoke("mom_llama_chat_send", {
           conversation,
@@ -2191,13 +2192,14 @@
         throw new Error(response?.blocker?.message || "The contact could not answer the call.");
       }
       const output = response.result;
-      markVoiceLatency("generation_finished", {
+      markVoiceLatencyIn(greetingTrace, "generation_finished", {
         purpose: "call_greeting",
         native_duration_ms: output?.duration_ms,
         first_token_ms: output?.first_token_ms,
         prompt_tokens: output?.prompt_tokens,
         completion_tokens: output?.completion_tokens,
         cache_reused: output?.cache_reused === true,
+        cache_metrics: output?.cache_metrics || null,
       });
       // Stream events are the low-latency authority. Some successful native
       // turns deliberately omit the duplicated final assistant_text envelope;
@@ -2217,7 +2219,7 @@
       // acknowledgement, not a user-visible failure.
       if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
       if (error?.code === "voice_generation_timeout") {
-        markVoiceLatency("generation_timeout", { phase: "call_greeting", timeout_ms: 12_000 });
+        markVoiceLatencyIn(greetingTrace, "generation_timeout", { phase: "call_greeting", timeout_ms: 12_000 });
         void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});
       }
       throw error;
@@ -3775,7 +3777,11 @@
         : null;
       return start === null || end < start ? null : Math.round((end - start) / 10) / 100;
     };
-    const completedGeneration = latestIndexed("generation_finished");
+    // Older call captures could inherit a late greeting completion when the
+    // global trace changed during pickup. It is not a reply from this turn.
+    const completedGeneration = [...indexedStages].reverse().find(({ entry }) =>
+      entry.stage === "generation_finished"
+        && !(entry.purpose === "call_greeting" && trace.mode !== "call_greeting")) || null;
     const timedOutGeneration = latestIndexed("generation_timeout");
     const generationTerminalIndexed = !completedGeneration
       ? timedOutGeneration
@@ -3939,6 +3945,15 @@
         ? Number(generation.completion_tokens) : null,
       generation_cache_reused: typeof generation?.cache_reused === "boolean"
         ? generation.cache_reused : null,
+      generation_cache_resident_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.resident_prefix_tokens))
+          ? Number(generation.cache_metrics.resident_prefix_tokens) : null,
+      generation_cache_restored_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.restored_prefix_tokens))
+          ? Number(generation.cache_metrics.restored_prefix_tokens) : null,
+      generation_cache_replayed_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.replayed_prefix_tokens))
+          ? Number(generation.cache_metrics.replayed_prefix_tokens) : null,
       call_request_to_playback_ms: delta(
         "call_requested",
         playbackRendered ? "playback_render_started" : "playback_started",
@@ -4638,9 +4653,15 @@
       "call_requested",
       "call_ringing_started",
       "call_conversation_ready",
+      "audio_prefill_begin_requested",
+      "audio_prefill_session_ready",
+      "audio_prefill_begin_failed",
+      "audio_prefill_push_failed",
+      "native_capture_started",
       "capture_processing",
       "native_capture_failed",
       "generation_dispatched",
+      "speculation_dispatch_started",
       "native_silence_armed",
       "native_silence_released",
       "native_generation_worker_started",
@@ -4659,6 +4680,7 @@
       "tts_all_segments_finished",
       "next_turn_prefill_started",
       "next_turn_prefill_ready",
+      "next_turn_prefill_failed",
       "barge_in_detected",
       "barge_in_playback_stopped",
       "barge_in_playback_stop_failed",
@@ -5393,6 +5415,7 @@
     const playback = {
       conversation,
       mode,
+      trace: ttsLatencyTrace,
       get requestId() { return requestId; },
       acceptsRequest(candidate, eventName = "") {
         if (!candidate) return false;
@@ -5883,6 +5906,7 @@
     };
     markVoiceLatency("capture_processing", captureMetrics);
     if (discard) {
+      recording.transcription?.cancel();
       if (recording.speculation && !recording.speculation.confirmed) {
         void abortCallSpeculation(recording);
       } else if (abortPrefill) {
@@ -5892,6 +5916,9 @@
       }
       return null;
     }
+    // Physical stop seals the transcript independently. Never await Parakeet
+    // here, and never seal it at speculative Gemma end-of-input.
+    recording.transcription?.seal();
     enqueueVoicePrefill(recording, new Float32Array(), true);
     await recording.pushChain;
     return {
@@ -5919,7 +5946,7 @@
     });
   };
 
-  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null } = {}) => {
+  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null } = {}) => {
     if (voiceRecording) throw new Error("Voice capture is already active.");
     // The call controller opens the next microphone turn as playback starts so
     // speech can stop the speaker locally. Its model target is attached only
@@ -5951,6 +5978,9 @@
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
+      // Optional staged tap. Default callers remain unchanged until the native
+      // owner/command and exact saved-source binding are implemented.
+      transcription,
       capturedSamples: 0, prefillInputStartSample: null,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
@@ -6035,6 +6065,9 @@
       if (pcm.length) {
         recording.capturedPcm.push(pcm);
         recording.capturedSamples += pcm.length;
+        // Source-side only: this executes during speculation as well. The
+        // Gemma replay/retarget path never feeds this independent cursor.
+        recording.transcription?.append(pcm);
       }
       // A speculative decode has consumed its native prefill session. Keep
       // recording locally; on resumed speech, restore its prepared turn and
@@ -6071,7 +6104,8 @@
       if (activity.heardVoice && !activity.voiced
           && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
           && voiceRecording === recording
-          && !recording.sending && !recording.speculation && !recording.speculationStarting) {
+          && !recording.sending && !recording.speculation && !recording.speculationStarting
+          && !recording.prefillFailed) {
         markVoiceLatency("silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
@@ -6079,6 +6113,12 @@
           threshold,
         });
         void startVoiceSpeculation(recording).catch(reportError);
+      } else if (recording.call && recording.prefillFailed && activity.heardVoice
+          && activity.silentMs >= 900 && voiceRecording === recording && !recording.sending) {
+        // Incremental audio cannot admit a still-pending historical WAV.
+        // The physical recording can use the complete-media chat path without
+        // waiting for Parakeet or leaving the call stuck at a silence edge.
+        void sendVoiceCapture(recording).catch(reportError);
       } else if (!recording.call && activity.heardVoice && activity.silentMs >= 900
           && voiceRecording === recording && !recording.sending) {
         if (recording.speculation && !recording.speculation.aborting) {
@@ -6587,6 +6627,7 @@
         speculation: speculation.id,
         native_duration_ms: response.result.duration_ms,
         first_token_ms: response.result.first_token_ms,
+        cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
       indexVoiceTurn(live.conversation, response.result);
@@ -6794,8 +6835,9 @@
     const sameLiveConversation = liveVoiceTts?.conversation === payload.conversation_id;
     const ownsLiveVoice = sameLiveConversation
       && liveVoiceTts.acceptsRequest(payload.request_id, payload.event);
-    if (voiceLatencyTrace) {
-      markVoiceLatency("chat_stream_route_decision", {
+    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : voiceLatencyTrace;
+    if (eventTrace) {
+      markVoiceLatencyIn(eventTrace, "chat_stream_route_decision", {
         event: payload.event,
         request_id: payload.request_id,
         conversation_id: payload.conversation_id,
@@ -6814,7 +6856,7 @@
       return;
     }
     if ((voiceReply || callReply) && ["prefill_started", "decode_started"].includes(payload.event)) {
-      markVoiceLatency(payload.event, { observed_at_unix_us: payload.emitted_at_unix_us });
+      markVoiceLatencyIn(eventTrace, payload.event, { observed_at_unix_us: payload.emitted_at_unix_us });
     }
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
@@ -6830,11 +6872,10 @@
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "delta" && (voiceReply || callReply) && !voiceLatencyTrace?.firstDeltaSeen) {
-      if (!voiceLatencyTrace) startVoiceLatency(callReply ? "call" : "voice_note");
-      voiceLatencyTrace.firstDeltaSeen = true;
-      markVoiceLatency("first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
-      markVoiceLatency("first_content_delta_received");
+    if (payload.event === "delta" && (voiceReply || callReply) && !eventTrace?.firstDeltaSeen) {
+      if (eventTrace) eventTrace.firstDeltaSeen = true;
+      markVoiceLatencyIn(eventTrace, "first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
+      markVoiceLatencyIn(eventTrace, "first_content_delta_received");
     }
     if (payload.event === "delta" && (voiceReply || callReply)) {
       liveVoiceTts?.push(payload.delta || "");
@@ -8482,6 +8523,7 @@
               markVoiceLatency("generation_finished", {
                 native_duration_ms: output?.duration_ms,
                 first_token_ms: output?.first_token_ms,
+                cache_metrics: output?.cache_metrics || null,
                 voice_audio: output?.voice_audio_metrics,
               });
             }

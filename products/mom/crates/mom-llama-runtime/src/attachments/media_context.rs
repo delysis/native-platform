@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn live_audio_history_validates_occurrences_without_materializing_old_media() {
+    fn live_audio_history_materializes_pending_media() {
         let session = Session::new();
         let image = session.image();
         let store = RuntimeStore::current().expect("store");
@@ -417,12 +417,12 @@ mod tests {
         let live = prepare_scoped_chat_attachments(
             "chat",
             &[message],
-            CurrentAttachmentSelection::HistoryTextOnly,
+            CurrentAttachmentSelection::HistoryOnly,
         )
         .expect("live history")
         .expect("valid occurrence");
-        assert!(live.media.is_empty());
-        assert!(live.media_by_message_id["history"].is_empty());
+        assert_eq!(live.media.len(), 1);
+        assert_eq!(live.media_by_message_id["history"].len(), 1);
         assert!(live.current_media.is_empty());
     }
 

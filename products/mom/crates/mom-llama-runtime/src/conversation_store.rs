@@ -1400,6 +1400,17 @@ pub fn message_record_voice_transcript(
                     message_id,
                 ));
             };
+            if voice_final_transcript_matches(message, attachment_id, transcript) {
+                return Ok(CommandResult::passed(
+                    "mom_llama.message_record_voice_transcript",
+                    "contracted",
+                    message.clone(),
+                    vec![store.path().display().to_string()],
+                    Vec::new(),
+                    false,
+                    false,
+                ));
+            }
             let Some(voice_prompt) = voice_prompt_for_transcript(message, attachment_id) else {
                 return Ok(CommandResult::blocked(
                     "mom_llama.message_record_voice_transcript",
@@ -1440,6 +1451,23 @@ fn voice_prompt_for_transcript(message: &Message, attachment_id: &str) -> Option
         && message.attachment_ids.len() == 1
         && message.attachment_ids[0] == attachment_id)
         .then_some(prompt)
+}
+
+/// A retried publication of the same complete result is harmless. A different
+/// result, source, or turn must still fail the pending-turn compare-and-swap.
+fn voice_final_transcript_matches(
+    message: &Message,
+    attachment_id: &str,
+    transcript: &str,
+) -> bool {
+    message.role == MessageRole::User
+        && message.attachment_ids.len() == 1
+        && message.attachment_ids[0] == attachment_id
+        && has_final_voice_transcript(message)
+        && message
+            .content
+            .split_once("\n\n")
+            .is_some_and(|(_, saved)| saved == transcript)
 }
 
 /// A finalized transcript replaces this turn's recorded audio in future model
@@ -2474,8 +2502,28 @@ mod tests {
                 None
             );
             assert!(super::has_final_voice_transcript(&turn));
+            assert!(super::voice_final_transcript_matches(
+                &turn,
+                "exact-audio",
+                "Already transcribed"
+            ));
+            assert!(!super::voice_final_transcript_matches(
+                &turn,
+                "other-audio",
+                "Already transcribed"
+            ));
+            assert!(!super::voice_final_transcript_matches(
+                &turn,
+                "exact-audio",
+                "Competing transcript"
+            ));
             turn.attachment_ids.push("another-source".into());
             assert!(!super::has_final_voice_transcript(&turn));
+            assert!(!super::voice_final_transcript_matches(
+                &turn,
+                "exact-audio",
+                "Already transcribed"
+            ));
         }
     }
 

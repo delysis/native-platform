@@ -874,6 +874,10 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   assert.ok(bridge.includes("trace.checkpoint = (trace.checkpoint || 0) + 1"));
   assert.ok(bridge.includes('markVoiceLatency("audio_prefill_begin_failed"'));
   assert.ok(bridge.includes('markVoiceLatency("audio_prefill_push_failed"'));
+  for (const stage of ["audio_prefill_begin_requested", "audio_prefill_session_ready",
+    "audio_prefill_begin_failed", "next_turn_prefill_failed"]) {
+    assert.ok(bridge.includes(`      "${stage}",`), `${stage} must persist a diagnostic checkpoint`);
+  }
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_state", runtimeWarmState)'));
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_completed", runtimeWarmState)'));
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_failed", runtimeWarmState)'));
@@ -1039,6 +1043,19 @@ test("voice latency includes endpoint-decision time from the physical silence ed
   assert.equal(summary.silence_to_tts_pcm_ms, 650);
   assert.equal(summary.silence_release_to_playback_ms, 500);
   assert.equal(summary.silence_to_playback_ms, 750);
+});
+
+test("a late pickup result cannot become the next call turn's generation", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stages = [
+    { stage: "capture_started", elapsed_ms: 0 },
+    { stage: "generation_finished", purpose: "call_greeting", elapsed_ms: 685,
+      prompt_tokens: 2984, completion_tokens: 11 },
+  ];
+  assert.equal(summarize({ mode: "call", stages }).generation_completion_tokens, null);
+  assert.equal(summarize({ mode: "call_greeting", stages }).generation_completion_tokens, 11);
 });
 
 test("physical silence timing stays paired with the latest release attempt", () => {
