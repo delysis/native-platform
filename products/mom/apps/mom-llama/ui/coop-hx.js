@@ -3667,6 +3667,7 @@
   let voiceCallConversation = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
+  const pendingVoiceTranscripts = new Map();
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
   let pendingVoiceDispatchPrompt = null;
@@ -4620,6 +4621,11 @@
       "native_silence_released",
       "native_generation_worker_started",
       "generation_finished",
+      "voice_transcript_started",
+      "voice_transcript_finished",
+      "voice_transcript_failed",
+      "voice_transcript_wait_started",
+      "voice_transcript_wait_finished",
       "first_content_delta",
       "first_content_delta_received",
       "tts_first_chunk_ready",
@@ -5720,7 +5726,82 @@
     return startVoicePrefill(conversation, recording.call);
   };
 
+  const indexVoiceTurn = (conversation, output, fallbackAttachment = null) => {
+    const attachment = output?.voice_attachment_id || fallbackAttachment;
+    const messageId = output?.user_message_id;
+    const trace = voiceLatencyTrace;
+    const started = performance.now();
+    markVoiceLatencyIn(trace, "voice_transcript_started", {
+      source: output?.voice_attachment_id ? "live" : "fallback",
+    });
+    const previous = pendingVoiceTranscripts.get(conversation);
+    const task = (async () => {
+      if (previous) await previous;
+      if (!attachment || !messageId) {
+        throw new Error("voice_transcript_source_missing: The saved voice turn has no recording identity.");
+      }
+      const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
+        attachment,
+      }));
+      const primary = catalog.primary;
+      if (!primary || primary.kind !== "audio") {
+        throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
+      }
+      const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+        conversation,
+        ...attachmentPreviewAnchor(catalog, primary),
+        operation: speechOperationToken(),
+      });
+      if (transcribed?.status === "blocked") {
+        throw new Error(`${transcribed.blocker?.code || "voice_transcript_blocked"}: ${transcribed.blocker?.message || "The recorded voice could not be transcribed."}`);
+      }
+      const transcript = transcribed?.result?.transcript?.trim();
+      if (!transcript) {
+        throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
+      }
+      const recorded = await invoke("mom_llama_message_record_voice_transcript", {
+        conversation, message: messageId, attachment, transcript,
+      });
+      if (recorded?.status !== "passed") {
+        throw new Error(`${recorded?.blocker?.code || "voice_transcript_record_failed"}: ${recorded?.blocker?.message || "The voice transcript could not be saved."}`);
+      }
+    })();
+    pendingVoiceTranscripts.set(conversation, task);
+    void task.then(() => {
+      if (pendingVoiceTranscripts.get(conversation) === task) {
+        pendingVoiceTranscripts.delete(conversation);
+      }
+      markVoiceLatencyIn(trace, "voice_transcript_finished", {
+        duration_ms: Math.round((performance.now() - started) * 100) / 100,
+      });
+    }, (error) => {
+      // Keep the failed barrier: silently using a stale text prefix would
+      // lose this utterance from every later turn in the same call.
+      markVoiceLatencyIn(trace, "voice_transcript_failed", {
+        duration_ms: Math.round((performance.now() - started) * 100) / 100,
+        message: errorMessage(error),
+      });
+      reportError(error);
+    });
+    return task;
+  };
+
+  const waitForVoiceTranscript = async (conversation) => {
+    const pending = pendingVoiceTranscripts.get(conversation);
+    if (!pending) return;
+    const started = performance.now();
+    markVoiceLatency("voice_transcript_wait_started");
+    try {
+      await pending;
+    } finally {
+      markVoiceLatency("voice_transcript_wait_finished", {
+        duration_ms: Math.round((performance.now() - started) * 100) / 100,
+      });
+    }
+  };
+
   const startVoicePrefill = async (conversation, call) => {
+    await waitForVoiceTranscript(conversation);
     markVoiceLatency("audio_prefill_begin_requested", { conversation, call });
     const live = await invoke("mom_llama_voice_audio_begin", {
       conversation,
@@ -6491,6 +6572,7 @@
         first_token_ms: response.result.first_token_ms,
         voice_audio: response.result.voice_audio_metrics,
       });
+      indexVoiceTurn(live.conversation, response.result);
       const synthesized = await tts.finish(response.result.assistant_text || tts.text);
       if (!synthesized) {
         throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
@@ -8360,6 +8442,7 @@
             if (liveVoice) pendingVoiceAudioSession = null;
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
+            if (voiceDispatch) await waitForVoiceTranscript(conversation);
             if (liveVoice) {
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
@@ -8426,41 +8509,10 @@
             // the attachment fallback can commit valid assistant text while
             // that presentation-only tag is unavailable at this boundary.
             const output = result?.result?.output || null;
-            const transcriptAttachment = output?.voice_attachment_id || voiceTranscriptAttachment;
-            if (result?.status !== "blocked" && result?.result?.kind === "direct"
-                && transcriptAttachment && output?.user_message_id) {
-              // The committed recording is still the current model input.
-              // Index its text on CPU while speech synthesis drains, so the
-              // next turn can use words instead of replaying an older WAV.
-              void (async () => {
-                const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
-                  attachment: transcriptAttachment,
-                }));
-                const primary = catalog.primary;
-                if (!primary || primary.kind !== "audio") {
-                  throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
-                }
-                const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
-                  conversation,
-                  ...attachmentPreviewAnchor(catalog, primary),
-                  operation: speechOperationToken(),
-                });
-                if (transcribed?.status === "blocked") {
-                  report(transcribed);
-                  return;
-                }
-                const transcript = transcribed?.result?.transcript?.trim();
-                if (!transcript) {
-                  throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
-                }
-                const recorded = await invoke("mom_llama_message_record_voice_transcript", {
-                  conversation,
-                  message: output.user_message_id,
-                  attachment: transcriptAttachment,
-                  transcript,
-                });
-                if (recorded?.status === "blocked") report(recorded);
-              })().catch(reportError);
+            if (result?.status !== "blocked" && result?.result?.kind === "direct") {
+              // Start the CPU transcript as soon as this turn commits. The
+              // next Gemma prompt must not snapshot history before it lands.
+              indexVoiceTurn(conversation, output, voiceTranscriptAttachment);
             }
             if (result?.status !== "blocked" && output?.assistant_text) {
               markVoiceLatency("tts_text_admitted", {
