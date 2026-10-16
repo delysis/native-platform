@@ -414,13 +414,13 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             ));
         }
     };
-    if bind_acquired_model_pair(&mut settings, &acquired) {
-        if let Err(error) = mom_llama_runtime::config::save_settings(&settings) {
-            startup.record_failure();
-            return Err(format!(
-                "Blessenger could not save its verified model set: {error:#}"
-            ));
-        }
+    if bind_acquired_model_pair(&mut settings, &acquired)
+        && let Err(error) = mom_llama_runtime::config::save_settings(&settings)
+    {
+        startup.record_failure();
+        return Err(format!(
+            "Blessenger could not save its verified model set: {error:#}"
+        ));
     }
     if !acquired.qwen_root.join("config.json").is_file() {
         startup.record_failure();

@@ -554,7 +554,7 @@ impl HostSpeechExecutor {
                         );
                     }
                 } else {
-                    format = Some(chunk.format.clone());
+                    format = Some(chunk.format);
                 }
                 emitted_bytes = emitted_bytes
                     .checked_add(u64::try_from(chunk.data.len()).unwrap_or(u64::MAX))
@@ -583,7 +583,7 @@ impl HostSpeechExecutor {
         }
         match &response.output {
             SynthesisOutput::Streamed { format: output, emitted_bytes: output_bytes }
-                if output == &AudioOutputFormat::Pcm { format: format.clone() }
+                if output == &AudioOutputFormat::Pcm { format }
                     && *output_bytes == emitted_bytes => {}
             _ => return Err("speech_stream_receipt_invalid: Qwen's final streamed receipt did not match the emitted PCM".to_string()),
         }
@@ -3363,7 +3363,7 @@ mod tests {
                     // Envelope bytes only; no synthesis, decoding or playback.
                     output: SynthesisOutput::Streamed {
                         format: qwen_stream_output(),
-                        emitted_bytes: u64::try_from(MOCK_WAV.len()).unwrap(),
+                        emitted_bytes: u64::try_from(MOCK_WAV.len()).expect("mock WAV length"),
                     },
                     duration_ms: Some(1),
                     alignments: Vec::new(),

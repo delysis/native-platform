@@ -146,7 +146,7 @@ fn validate_voice_latency_trace(trace: &str) -> Result<(String, usize, u64), Str
     if trace.len() > MAX_VOICE_LATENCY_TRACE_BYTES {
         return Err("voice latency trace exceeds its bounded size".to_string());
     }
-    let value: Value = serde_json::from_str(&trace).map_err(to_error)?;
+    let value: Value = serde_json::from_str(trace).map_err(to_error)?;
     let stages = value
         .get("stages")
         .and_then(Value::as_array)
@@ -1855,6 +1855,10 @@ pub async fn mom_llama_voice_audio_finish(
         .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri command arguments are bound by the invoke protocol"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_speculate(
     runtime: State<'_, AppRuntimeHandle>,
@@ -1924,12 +1928,13 @@ pub async fn mom_llama_voice_audio_speculate(
     // Silence is detected by the native capture owner after it has already
     // flushed the trailing partial PCM batch. Detach that exact producer in
     // this same command so the renderer does not pay a second IPC round trip.
-    if !wait_for_silence && let Some(capture) = capture {
-        if let Err(error) = capture_state.inner().pause_prefill(capture) {
-            control.abort();
-            owner.finish_voice_speculation(&speculation);
-            return Err(to_error(error));
-        }
+    if !wait_for_silence
+        && let Some(capture) = capture
+        && let Err(error) = capture_state.inner().pause_prefill(capture)
+    {
+        control.abort();
+        owner.finish_voice_speculation(&speculation);
+        return Err(to_error(error));
     }
     let operations = runtime.operation_scope();
     let worker_owner = owner.clone();
@@ -3043,12 +3048,12 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            validate_voice_latency_trace(&overflow).unwrap_err(),
+            validate_voice_latency_trace(&overflow).expect_err("overflow trace"),
             "voice latency trace has invalid stages"
         );
         assert_eq!(
             validate_voice_latency_trace(&"x".repeat(MAX_VOICE_LATENCY_TRACE_BYTES + 1))
-                .unwrap_err(),
+                .expect_err("oversized trace"),
             "voice latency trace exceeds its bounded size"
         );
     }
@@ -3282,10 +3287,22 @@ mod tests {
         assert_eq!(frame[5], 3);
         assert_eq!(frame[6], 1);
         assert_eq!(frame[7], 1);
-        assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), 24_000);
-        assert_eq!(u64::from_le_bytes(frame[12..20].try_into().unwrap()), 7);
-        assert_eq!(u64::from_le_bytes(frame[20..28].try_into().unwrap()), 960);
-        assert_eq!(u32::from_le_bytes(frame[28..32].try_into().unwrap()), 4);
+        assert_eq!(
+            u32::from_le_bytes(frame[8..12].try_into().expect("rate")),
+            24_000
+        );
+        assert_eq!(
+            u64::from_le_bytes(frame[12..20].try_into().expect("offset")),
+            7
+        );
+        assert_eq!(
+            u64::from_le_bytes(frame[20..28].try_into().expect("frames")),
+            960
+        );
+        assert_eq!(
+            u32::from_le_bytes(frame[28..32].try_into().expect("bytes")),
+            4
+        );
         assert_eq!(&frame[32..], chunk.data);
     }
 }

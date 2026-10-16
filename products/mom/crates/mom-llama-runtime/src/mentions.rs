@@ -432,6 +432,10 @@ pub struct MentionDispatchInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "wire shape keeps direct replies inline"
+)]
 pub enum ChatDispatchOutput {
     Direct {
         conversation_id: String,

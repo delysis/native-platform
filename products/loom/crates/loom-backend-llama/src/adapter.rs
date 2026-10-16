@@ -2453,7 +2453,7 @@ mod tests {
                 context_tokens: 8_192,
                 max_sequences: 4,
                 backend: "cpu".to_string(),
-                load_metrics: Default::default(),
+                load_metrics: llama_native_types::NativeModelLoadMetrics::default(),
                 model_file_identity: String::new(),
                 mmproj_file_identity: None,
                 capabilities: ModelCapabilities {

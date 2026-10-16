@@ -227,6 +227,7 @@ impl LlamaModel {
     ///
     /// See [`TokenToStringError`] for more information.
     #[deprecated(since = "0.1.0", note = "Use `token_to_piece` instead")]
+    #[allow(deprecated)]
     pub fn token_to_str(
         &self,
         token: LlamaToken,
@@ -252,6 +253,7 @@ impl LlamaModel {
     /// [`Self::token_to_bytes_with_size`] contains a positive nonzero value. This should never
     /// happen.
     #[deprecated(since = "0.1.0", note = "Use `token_to_piece_bytes` instead")]
+    #[allow(deprecated)]
     pub fn token_to_bytes(
         &self,
         token: LlamaToken,
@@ -278,6 +280,7 @@ impl LlamaModel {
         since = "0.1.0",
         note = "Use `token_to_piece` for each token individually instead"
     )]
+    #[allow(deprecated)]
     pub fn tokens_to_str(
         &self,
         tokens: &[LlamaToken],
@@ -493,6 +496,7 @@ impl LlamaModel {
     /// - if `buffer_size` does not fit into a [`c_int`].
     /// - if the returned size from llama-cpp does not fit into a [`usize`]. (this should never happen)
     #[deprecated(since = "0.1.0", note = "Use `token_to_piece` instead")]
+    #[allow(deprecated)]
     pub fn token_to_str_with_size(
         &self,
         token: LlamaToken,
@@ -523,6 +527,7 @@ impl LlamaModel {
     /// - if `buffer_size` does not fit into a [`c_int`].
     /// - if the returned size from llama-cpp does not fit into a [`usize`]. (this should never happen)
     #[deprecated(since = "0.1.0", note = "Use `token_to_piece_bytes` instead")]
+    #[allow(deprecated)]
     pub fn token_to_bytes_with_size(
         &self,
         token: LlamaToken,

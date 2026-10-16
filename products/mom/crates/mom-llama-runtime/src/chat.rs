@@ -1422,9 +1422,7 @@ where
                 skill_prompt.cache_owner_id.is_some(),
                 skill_prompt.cache_owner_id.as_deref(),
             );
-            let cache =
-                longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, false)?;
-            cache
+            longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, false)?
         } else {
             None
         };

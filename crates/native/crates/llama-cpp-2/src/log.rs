@@ -70,14 +70,14 @@ log_cs!(
 
 #[derive(Clone, Copy)]
 pub(super) enum Module {
-    GGML,
+    Ggml,
     LlamaCpp,
 }
 
 impl Module {
     const fn name(&self) -> &'static str {
         match self {
-            Module::GGML => "ggml",
+            Module::Ggml => "ggml",
             Module::LlamaCpp => "llama.cpp",
         }
     }

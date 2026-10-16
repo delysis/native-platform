@@ -213,6 +213,6 @@ fn status_to_result(status: llama_cpp_sys_2::llama_rs_status) -> Result<(), MtpS
     if status_is_ok(status) {
         Ok(())
     } else {
-        Err(MtpSpeculativeError::Status(status as i32))
+        Err(MtpSpeculativeError::Status(status))
     }
 }

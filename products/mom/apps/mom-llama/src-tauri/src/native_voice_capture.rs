@@ -362,12 +362,12 @@ impl CaptureSilenceGate {
     }
 
     fn transition(&self, next: SilenceGateState) -> bool {
-        if let Ok(mut state) = self.state.lock() {
-            if *state == SilenceGateState::Armed {
-                *state = next;
-                self.changed.notify_all();
-                return true;
-            }
+        if let Ok(mut state) = self.state.lock()
+            && *state == SilenceGateState::Armed
+        {
+            *state = next;
+            self.changed.notify_all();
+            return true;
         }
         false
     }
@@ -2075,7 +2075,7 @@ mod tests {
 
         let mut elapsed_samples = 0;
         while activity.voiced && elapsed_samples < OUTPUT_RATE as usize {
-            let background = if (elapsed_samples / VAD_FRAME_SAMPLES) % 2 == 0 {
+            let background = if (elapsed_samples / VAD_FRAME_SAMPLES).is_multiple_of(2) {
                 0.004_3
             } else {
                 0.004_7

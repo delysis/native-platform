@@ -7094,6 +7094,10 @@ fn fork_resident_audio_checkpoint(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint captures the exact audio sequence state"
+)]
 fn capture_resident_audio_checkpoint(
     context: &mut LlamaContext<'_>,
     fingerprint: &ModelFingerprint,
@@ -7161,6 +7165,10 @@ fn alternate_checkpoint_sequence(source_sequence_id: i32) -> NativeResult<i32> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "incremental audio shares one resident worker state"
+)]
 fn generate_incremental_audio(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -7570,10 +7578,7 @@ fn generate_incremental_audio(
                     .iter()
                     .rposition(|kind| *kind == MtmdInputChunkType::Audio)
                     .unwrap_or(first_audio);
-                if chunk_types
-                    .iter()
-                    .any(|kind| *kind == MtmdInputChunkType::Image)
-                {
+                if chunk_types.contains(&MtmdInputChunkType::Image) {
                     return Err(NativeError::new(
                         NativeErrorCode::ModelInvalid,
                         "incremental audio tokenization produced an image chunk",

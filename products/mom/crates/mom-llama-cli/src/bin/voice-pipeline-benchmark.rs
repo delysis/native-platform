@@ -550,13 +550,12 @@ fn main() -> Result<()> {
         )?;
         let baseline_tts = drain_request(&helper_reader, "baseline")?;
         let turns = run_product_turns(&args, &mut helper_stdin, &helper_reader, &base)?;
-        let (control, mut mtp) = if args.mtp_assistant.is_some() {
+        let (control, mut mtp) = if let Some(assistant) = args.mtp_assistant.as_ref() {
             let control = run_direct_leg(&args, false, &mut helper_stdin, &helper_reader, &base)?;
             let mut mtp = run_direct_leg(&args, true, &mut helper_stdin, &helper_reader, &base)?;
             if control["text"] != mtp["text"] {
                 bail!("MTP changed sampled output under the same seed and prompt");
             }
-            let assistant = args.mtp_assistant.as_ref().expect("present");
             mtp["assistant_path"] = json!(assistant.display().to_string());
             mtp["assistant_sha256"] = json!(format!("{:x}", Sha256::digest(fs::read(assistant)?)));
             (Some(control), Some(mtp))
@@ -599,14 +598,14 @@ mod tests {
     #[test]
     fn safe_playback_can_begin_between_packet_arrivals() {
         let timeline = [(100.0, 3_336), (250.0, 3_336)]; // 139 ms per packet.
-        let playable = earliest_safe_playback_ms(&timeline, 120.0).unwrap();
+        let playable = earliest_safe_playback_ms(&timeline, 120.0).expect("playable");
         assert!((playable - 111.0).abs() < 0.001);
     }
 
     #[test]
     fn startup_floor_waits_for_enough_received_audio() {
         let timeline = [(100.0, 1_440), (130.0, 1_440)]; // 60 ms per packet.
-        let playable = earliest_safe_playback_ms(&timeline, 120.0).unwrap();
+        let playable = earliest_safe_playback_ms(&timeline, 120.0).expect("playable");
         assert!((playable - 130.0).abs() < 0.001);
     }
 }

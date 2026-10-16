@@ -146,6 +146,10 @@ pub fn runtime_warm_until_cancelled(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "warm result reports distinct measured stages"
+)]
 fn runtime_warm_result(
     model_loaded: bool,
     audio_projector_warmed: bool,
@@ -184,9 +188,11 @@ fn warm_audio_projector(
     handle: &llama_native_engine::NativeModelHandle,
     cancellation: Option<&AtomicBool>,
 ) -> Result<bool> {
-    let mut sampling = SamplingConfig::default();
-    sampling.max_tokens = 1;
-    sampling.temperature = 0.0;
+    let sampling = SamplingConfig {
+        max_tokens: 1,
+        temperature: 0.0,
+        ..SamplingConfig::default()
+    };
     let generation = handle.generate_incremental_audio(GenerationRequest {
         request_id: format!("runtime-audio-warm-{}", uuid::Uuid::new_v4()),
         model_id: handle.status().model_id,

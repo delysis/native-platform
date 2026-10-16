@@ -589,6 +589,10 @@ fn canonical_attachment_record(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "attachment admission keeps its explicit scope and identity"
+)]
 fn canonicalize_and_stage(
     scope: &crate::OperationScope,
     conversation_id: &str,
@@ -624,19 +628,18 @@ fn canonicalize_and_stage(
     attachment_db.attachments.insert(0, record.clone());
     let mut draft_db = load_drafts()?;
     stage_in_draft(&mut draft_db, conversation_id, &id);
-    if let Some(marker) = internal_draft_marker {
-        if let Some(draft) = draft_db
+    if let Some(marker) = internal_draft_marker
+        && let Some(draft) = draft_db
             .drafts
             .iter_mut()
             .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
-        {
-            // Persist transport ownership in the same atomic document write as
-            // the captured attachment. A crash can therefore restore either
-            // the user's prior draft or a hidden voice transport draft, never
-            // a microphone file masquerading as a user-staged attachment.
-            if draft.message.trim().is_empty() {
-                draft.message = marker.to_string();
-            }
+    {
+        // Persist transport ownership in the same atomic document write as
+        // the captured attachment. A crash can therefore restore either
+        // the user's prior draft or a hidden voice transport draft, never
+        // a microphone file masquerading as a user-staged attachment.
+        if draft.message.trim().is_empty() {
+            draft.message = marker.to_string();
         }
     }
     let settings = resolve_settings()?;
