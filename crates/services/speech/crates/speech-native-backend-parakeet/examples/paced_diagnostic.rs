@@ -1,6 +1,7 @@
 //! Opt-in local diagnostic: feed an English f32/16 kHz WAV at microphone pace.
 //! This measures Parakeet alone; it does not qualify the packaged voice call.
 
+use sha2::{Digest, Sha256};
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
 };
@@ -48,6 +49,7 @@ async fn main() {
     let model_dir = PathBuf::from(args.next().expect("model directory"));
     let wav_path = PathBuf::from(args.next().expect("WAV input"));
     let wav = fs::read(&wav_path).expect("read WAV");
+    let wav_sha256 = format!("{:x}", Sha256::digest(&wav));
     let mut reader = hound::WavReader::new(std::io::Cursor::new(&wav)).expect("decode WAV");
     let spec = reader.spec();
     assert_eq!(spec.sample_rate, 16_000);
@@ -73,7 +75,7 @@ async fn main() {
             TranscriptionInput::Complete {
                 audio: AudioInput::Encoded {
                     format: EncodedAudioFormat::Wav,
-                    data: wav,
+                    data: wav.clone(),
                 },
             },
         ))
@@ -81,6 +83,7 @@ async fn main() {
         .expect("warm route");
     let warm_ticket_ms = warm_start.elapsed().as_millis();
     let warm_result = warm.final_response().await.expect("warm complete");
+    let warm_total_ms = warm_start.elapsed().as_millis();
     assert!(!warm_result.text.trim().is_empty(), "warm transcript");
     eprintln!(
         "warm_ticket_ms={} warm_total_ms={} model_load_ms={:?}",
@@ -136,16 +139,55 @@ async fn main() {
     let input_end = Instant::now();
     sink.finish().await.expect("finish stream");
     let result = ticket.final_response().await.expect("final transcript");
+    let stream_final_after_input_ms = input_end.elapsed().as_millis();
     assert!(!result.text.trim().is_empty(), "stream transcript");
+
+    // Compare against the same already-resident backend receiving the entire
+    // recording only after input stops. This isolates the overlap saved by
+    // streaming without charging model load to either measured path.
+    let complete_started = Instant::now();
+    let complete = host
+        .transcribe(request(
+            "paced-complete-baseline",
+            TranscriptionInput::Complete {
+                audio: AudioInput::Encoded {
+                    format: EncodedAudioFormat::Wav,
+                    data: wav,
+                },
+            },
+        ))
+        .await
+        .expect("complete baseline route");
+    let complete = complete.final_response().await.expect("complete baseline");
+    let complete_after_input_ms = complete_started.elapsed().as_millis();
     println!(
-        "audio_ms={} input_wall_ms={} final_after_input_ms={} max_push_ms={:.2} total_push_ms={:.2} first_result_ms={:?} total_backend_ms={:?} transcript_chars={}",
-        sample_offset * 1_000 / 16_000,
-        input_end.duration_since(started).as_millis(),
-        input_end.elapsed().as_millis(),
-        max_push_ms,
-        total_push_ms,
-        result.usage.time_to_first_result_ms,
-        result.usage.total_ms,
-        result.text.chars().count()
+        "{}",
+        serde_json::json!({
+            "schema": "blessenger.parakeet_paced_diagnostic.v1",
+            "scope": "parakeet_component_only",
+            "model_id": PARAKEET_MODEL_ID,
+            "input_wav_sha256": wav_sha256,
+            "audio_ms": sample_offset * 1_000 / 16_000,
+            "warm": {
+                "ticket_ms": warm_ticket_ms,
+                "total_ms": warm_total_ms,
+                "model_load_ms": warm_result.usage.model_load_ms,
+            },
+            "paced_stream": {
+                "input_wall_ms": input_end.duration_since(started).as_millis(),
+                "final_after_input_ms": stream_final_after_input_ms,
+                "first_result_ms": result.usage.time_to_first_result_ms,
+                "backend_total_ms": result.usage.total_ms,
+                "max_push_ms": max_push_ms,
+                "total_push_ms": total_push_ms,
+                "transcript_chars": result.text.chars().count(),
+            },
+            "complete_after_input": {
+                "final_ms": complete_after_input_ms,
+                "backend_total_ms": complete.usage.total_ms,
+                "transcript_chars": complete.text.chars().count(),
+            },
+            "transcripts_equal": result.text == complete.text,
+        })
     );
 }
