@@ -3802,12 +3802,19 @@
     const captureStarted = firstIndexed("native_capture_requested")
       || firstIndexed("capture_started");
     const firstNativeTarget = firstIndexed("audio_prefill_native_targeted");
+    const firstPrefillRequest = firstIndexed("audio_prefill_begin_requested");
     const firstPrefillReady = firstIndexed("audio_prefill_session_ready");
     // A prefetched next-turn session is recorded later in the same trace.
     // Never attribute that later preparation to the current microphone turn.
     const initialPrefillReady = firstPrefillReady
       && (!firstNativeTarget || firstPrefillReady.index <= firstNativeTarget.index)
       ? firstPrefillReady
+      : null;
+    const initialPrefillRequest = firstPrefillRequest
+      && initialPrefillReady
+      && firstPrefillRequest.index <= initialPrefillReady.index
+      && (!firstNativeTarget || firstPrefillRequest.index <= firstNativeTarget.index)
+      ? firstPrefillRequest
       : null;
     const prefillPreparedBeforeCapture = Boolean(captureStarted && (
       (initialPrefillReady
@@ -4053,6 +4060,16 @@
       voice_session_prepared_before_capture: prefillPreparedBeforeCapture,
       voice_session_prepare_native_ms: Number.isFinite(Number(begin?.total_us))
         ? Math.round(Number(begin.total_us) / 10) / 100
+        : null,
+      voice_session_request_to_ready_ms: initialPrefillRequest && initialPrefillReady
+        ? Math.max(0, Number(initialPrefillReady.entry.elapsed_ms)
+          - Number(initialPrefillRequest.entry.elapsed_ms))
+        : null,
+      voice_session_handoff_ms: initialPrefillRequest && initialPrefillReady
+        && Number.isFinite(Number(begin?.total_us))
+        ? Math.max(0, Math.round(((Number(initialPrefillReady.entry.elapsed_ms)
+          - Number(initialPrefillRequest.entry.elapsed_ms))
+          - Number(begin.total_us) / 1000) * 100) / 100)
         : null,
       voice_session_resident_context_tokens: Number.isFinite(Number(begin?.resident_context_tokens))
         ? Number(begin.resident_context_tokens)
@@ -5668,6 +5685,7 @@
   };
 
   const startVoicePrefill = async (conversation, call) => {
+    markVoiceLatency("audio_prefill_begin_requested", { conversation, call });
     const live = await invoke("mom_llama_voice_audio_begin", {
       conversation,
       message: voiceModePrompt(call),
