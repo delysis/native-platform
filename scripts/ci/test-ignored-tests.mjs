@@ -580,8 +580,8 @@ test("all ignored tests carry exact target, platform, evidence, and non-promotio
   const metadata = workspaceMetadata();
   const report = validateRegistry({ registry, metadata, repoRoot: root });
   assert.equal(report.registry_count, report.source_ignored_count);
-  assert.equal(report.cargo_target_count, 18);
-  assert.equal(report.reviewed_build_script_count, 7);
+  assert.equal(report.cargo_target_count, 21);
+  assert.equal(report.reviewed_build_script_count, 8);
 
   assert.equal(report.workspace_proc_macro_count, 0);
   assert.ok(report.guarded_source_count > 0);
@@ -637,6 +637,14 @@ test("the only platform-limited tests match their source cfg gates", () => {
     [
       "peer_compute::batch::native_qualification::independent_peers_share_native_decode",
       ["linux", "macos"],
+    ],
+    [
+      "tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
+      ["macos"],
+    ],
+    [
+      "tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
+      ["macos"],
     ],
   ]);
   assert.match(

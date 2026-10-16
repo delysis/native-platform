@@ -1,6 +1,6 @@
 use crate::attachments::{
     ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
-    prepare_live_audio_history,
+    prepare_live_audio_commit, prepare_live_audio_history,
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
@@ -955,7 +955,7 @@ where
     let voice_attachment_id = before_commit()?;
     let mut conversation = prepared.conversation.clone();
     let active_messages = crate::document::checked_active_messages(&conversation)?;
-    let attachments = prepare_chat_attachments(&prepared.conversation_id, &active_messages, None)?
+    let attachments = prepare_live_audio_commit(&prepared.conversation_id, &active_messages)?
         .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
     let user_message = Message {
         id: Uuid::new_v4().to_string(),

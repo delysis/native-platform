@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 51,
+  "expected_test_count": 59,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -289,9 +289,62 @@
         "windows"
       ],
       "harness": "libtest"
+    },
+    {
+      "package": "llama-cpp-2",
+      "selector": "test:hidden_states",
+      "name": "hidden_states",
+      "kinds": [
+        "test"
+      ],
+      "src_path": "crates/native/crates/llama-cpp-2/tests/hidden_states.rs",
+      "manifest_path": "crates/native/crates/llama-cpp-2/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "llama-cpp-2",
+      "selector": "test:state_capacity",
+      "name": "state_capacity",
+      "kinds": [
+        "test"
+      ],
+      "src_path": "crates/native/crates/llama-cpp-2/tests/state_capacity.rs",
+      "manifest_path": "crates/native/crates/llama-cpp-2/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "mom-llama-app",
+      "selector": "lib",
+      "name": "mom_llama_app",
+      "kinds": [
+        "rlib"
+      ],
+      "src_path": "products/mom/apps/mom-llama/src-tauri/src/main.rs",
+      "manifest_path": "products/mom/apps/mom-llama/src-tauri/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
     }
   ],
   "reviewed_build_scripts": [
+    {
+      "package": "llama-cpp-2",
+      "src_path": "crates/native/crates/llama-cpp-2/build.rs",
+      "sha256": "70e1739fd85d2e3de4df2718d5ece533d2e285b8d4f5cc089ef53b491d4d7a2e"
+    },
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
@@ -1197,6 +1250,143 @@
       "platforms": [
         "linux",
         "macos"
+      ]
+    },
+    {
+      "test_id": "local_model_capture_and_noop_controls",
+      "package": "llama-cpp-2",
+      "target": "test:hidden_states",
+      "source": "crates/native/crates/llama-cpp-2/tests/hidden_states.rs",
+      "prerequisite": "requires LLAMA_HIDDEN_STATE_MODEL pointing to a local GGUF",
+      "required_environment": [
+        "LLAMA_HIDDEN_STATE_MODEL"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "sequence_export_respects_destination_capacity",
+      "package": "llama-cpp-2",
+      "target": "test:state_capacity",
+      "source": "crates/native/crates/llama-cpp-2/tests/state_capacity.rs",
+      "prerequisite": "requires LLAMA_TEST_MODEL pointing to a real GGUF",
+      "required_environment": [
+        "LLAMA_TEST_MODEL"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_gemma4_mtp_assistant_reports_acceptance_and_throughput",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4 and matching MTP assistant GGUF files",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH",
+        "MOM_LLAMA_MTP_ASSISTANT_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_gemma4_mtp_audio_reports_silence_to_streamed_text",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4, MTP assistant, matching audio projector, and PCM WAV",
+      "required_environment": [
+        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
+        "MOM_LLAMA_MTP_ASSISTANT_PATH",
+        "MOM_LLAMA_MM_PROJ_PATH",
+        "MOM_LLAMA_TEST_VOICE_WAV"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_local_qwen_base_icl_synthesis_returns_bound_wav",
+      "package": "speech-native-backend-qwen",
+      "target": "lib",
+      "source": "crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs",
+      "prerequisite": "requires locally discoverable Qwen Base ICL model, helper, and persona reference audio",
+      "required_environment": [],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
+      "package": "mom-llama-app",
+      "target": "lib",
+      "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
+      "prerequisite": "requires locally discoverable Qwen Base ICL model, helper, and persona reference audio",
+      "required_environment": [],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "macos"
+      ]
+    },
+    {
+      "test_id": "tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
+      "package": "mom-llama-app",
+      "target": "lib",
+      "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
+      "prerequisite": "requires Gemma audio model/projector, Qwen helper/model/voice archive, and benchmark WAV",
+      "required_environment": [
+        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
+        "MOM_LLAMA_MM_PROJ_PATH",
+        "MOM_LLAMA_TEST_VOICE_WAV",
+        "MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "macos"
+      ]
+    },
+    {
+      "test_id": "real_incremental_voice_prefill_reports_silence_to_first_token",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires real Gemma audio GGUF, matching projector, and PCM16 mono 16 kHz WAV",
+      "required_environment": [
+        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
+        "MOM_LLAMA_MM_PROJ_PATH",
+        "MOM_LLAMA_TEST_VOICE_WAV"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
       ]
     }
   ]

@@ -1061,6 +1061,21 @@ pub(crate) fn prepare_live_audio_history(
     .map(|result| result.map(|scoped| scoped.context))
 }
 
+/// The microphone PCM has already been evaluated when a voice turn commits.
+/// Retain the exact draft attachment IDs for the saved message, while keeping
+/// historical and current media out of this bookkeeping-only pass.
+pub(crate) fn prepare_live_audio_commit(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::DraftTextOnly,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
 pub(crate) fn commit_generated_exchange(
     fallback_db: ConversationDb,
     conversation: Conversation,
@@ -4884,6 +4899,58 @@ mod tests {
         assert_eq!(prepared.media.len(), 1);
         assert_eq!(prepared.media[0].kind, MediaKind::Audio);
         assert_eq!(prepared.media[0].mime, "audio/wav");
+    }
+
+    #[test]
+    fn live_audio_commit_keeps_draft_without_readmitting_old_recordings() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("voice-history-commit");
+        let data_dir = resolve_settings().expect("settings").data_dir;
+        let mut historical = Vec::new();
+        for index in 0..=MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS {
+            let mut wav = STRUCTURALLY_VALID_WAV.to_vec();
+            *wav.last_mut().expect("sample byte") = index as u8;
+            let path = data_dir.join(format!("recording-{index}.wav"));
+            std::fs::write(&path, wav).expect("write recording");
+            let attachment = attachment_import(&scope, "chat", &path)
+                .expect("import recording")
+                .result
+                .expect("recording result")
+                .attachment;
+            historical.push(attachment.id);
+        }
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment db");
+        for record in &mut db.attachments {
+            record.state = AttachmentState::Committed;
+            record.message_id = "earlier-turn".to_string();
+        }
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit recordings");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear draft");
+        let messages = vec![message("earlier-turn", historical)];
+        let ordinary = prepare_chat_attachments("chat", &messages, None)
+            .expect("ordinary preparation")
+            .expect_err("ordinary media admission must retain its limit");
+        assert_eq!(
+            ordinary.blocker.code,
+            "attachment_context_media_count_exceeded"
+        );
+
+        let current = attachment_import_pasted_text(&scope, "chat", "current note".to_string())
+            .expect("stage current note")
+            .result
+            .expect("current note result")
+            .attachment;
+        let commit = prepare_live_audio_commit("chat", &messages)
+            .expect("voice commit preparation")
+            .expect("old audio must not be readmitted");
+        assert_eq!(commit.staged_ids, vec![current.id]);
+        assert!(commit.media.is_empty());
+        assert!(commit.current_text.contains("current note"));
     }
 
     #[test]
