@@ -785,6 +785,13 @@ impl SpeechBackend for QwenSpeechBackend {
         self.tasks
             .spawn_blocking(format!("qwen-tts:{request_id}"), move || {
                 let result = if request.stream {
+                    let worker_state = IclStreamingWorkerState {
+                        worker_slot: &icl_worker,
+                        foreground_waiters: &icl_foreground_waiters,
+                        warm_active: &icl_warm_active,
+                        warm_completed: &icl_warm_completed,
+                        warm_total: &icl_warm_total,
+                    };
                     synthesize_streaming_icl(
                         &request,
                         &config,
@@ -792,11 +799,7 @@ impl SpeechBackend for QwenSpeechBackend {
                         &route,
                         &cancellation,
                         &events_tx,
-                        &icl_worker,
-                        &icl_foreground_waiters,
-                        &icl_warm_active,
-                        &icl_warm_completed,
-                        &icl_warm_total,
+                        worker_state,
                     )
                 } else {
                     synthesize_complete(
@@ -1125,6 +1128,14 @@ fn synthesize_complete(
     })
 }
 
+struct IclStreamingWorkerState<'a> {
+    worker_slot: &'a Mutex<Option<ResidentIclWorker>>,
+    foreground_waiters: &'a AtomicUsize,
+    warm_active: &'a AtomicBool,
+    warm_completed: &'a AtomicUsize,
+    warm_total: &'a AtomicUsize,
+}
+
 fn synthesize_streaming_icl(
     request: &SynthesisRequest,
     config: &QwenBackendConfig,
@@ -1132,12 +1143,15 @@ fn synthesize_streaming_icl(
     route: &SpeechResolvedRoute,
     cancelled: &AtomicBool,
     events: &mpsc::Sender<SynthesisEvent>,
-    worker_slot: &Mutex<Option<ResidentIclWorker>>,
-    foreground_waiters: &AtomicUsize,
-    warm_active: &AtomicBool,
-    warm_completed: &AtomicUsize,
-    warm_total: &AtomicUsize,
+    worker_state: IclStreamingWorkerState<'_>,
 ) -> Result<SynthesisResponse, SpeechError> {
+    let IclStreamingWorkerState {
+        worker_slot,
+        foreground_waiters,
+        warm_active,
+        warm_completed,
+        warm_total,
+    } = worker_state;
     let started = Instant::now();
     let request_id = &request.context.request_id;
     let voice_id = voice_id_from_selector(request).ok_or_else(|| {
@@ -1197,17 +1211,10 @@ fn synthesize_streaming_icl(
         model_load_ms =
             Some(u64::try_from(model_load_started.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
-    let result = worker.as_mut().expect("worker initialized").synthesize(
-        request_id,
-        text,
-        &reference.entry.persona_id,
-        &reference.clip,
-        &reference.entry.clip_sha256,
-        &reference.entry.reference_transcript,
-        cancelled,
-        events,
-        started,
-    );
+    let result = worker
+        .as_mut()
+        .expect("worker initialized")
+        .synthesize(request_id, text, &reference, cancelled, events, started);
     if result
         .as_ref()
         .is_err_and(|error| !worker_is_reusable_after(error))
@@ -1318,10 +1325,7 @@ impl ResidentIclWorker {
         &mut self,
         request_id: &SpeechRequestId,
         text: &str,
-        persona_id: &str,
-        clip: &Path,
-        clip_sha256: &str,
-        transcript: &str,
+        reference: &AdmittedIclReference,
         cancelled: &AtomicBool,
         events: &mpsc::Sender<SynthesisEvent>,
         started: Instant,
@@ -1329,14 +1333,14 @@ impl ResidentIclWorker {
         if cancelled.load(Ordering::Acquire) {
             return Err(clean_icl_cancelled_error(request_id));
         }
-        let clip_path = clip.to_string_lossy();
+        let clip_path = reference.clip.to_string_lossy();
         let job = IclWorkerJob {
             id: request_id.0.as_str(),
             text,
-            persona_id,
+            persona_id: &reference.entry.persona_id,
             ref_audio: &clip_path,
-            ref_sha256: clip_sha256,
-            ref_text: transcript,
+            ref_sha256: &reference.entry.clip_sha256,
+            ref_text: &reference.entry.reference_transcript,
             warm_only: false,
         };
         write_worker_command(&self.input, request_id, &job)?;
@@ -1462,7 +1466,7 @@ impl ResidentIclWorker {
                         let chunk = speech_native_types::AudioChunk {
                             sequence,
                             sample_offset,
-                            format: format.clone(),
+                            format,
                             data,
                             end_of_stream: false,
                         };
