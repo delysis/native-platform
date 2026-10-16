@@ -45,11 +45,15 @@ test("the audio-thread ring converts and drains exact PCM order", () => {
   const output = new Float32Array(4);
   assert.equal(processor.process([], [[output]]), true);
   assert.deepEqual(Array.from(output), [-1, -0.5, 0, 32767 / 32768]);
+  assert.equal(messages.some((message) => message.type === "drained"), false);
+  for (let index = 0; index < 19; index += 1) {
+    processor.process([], [[new Float32Array(128)]]);
+  }
   assert.deepEqual({ ...messages.at(-1) }, {
     type: "drained",
     receivedFrames: 4,
     renderedFrames: 4,
-    renderQuanta: 1,
+    renderQuanta: 20,
     maxBufferedFrames: 4,
     underruns: 0,
     recoveries: 0,

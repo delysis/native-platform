@@ -839,8 +839,8 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   assert.ok(bridge.includes("dispatch_to_native_worker_ms"));
   assert.ok(bridge.includes("native_admission_to_worker_prearmed_ms"));
   assert.ok(bridge.includes("native_worker_to_first_content_ms"));
-  assert.ok(bridge.includes("const terminalSpeculation = generationTerminal?.speculation"));
-  assert.ok(bridge.includes("entry.stage === stage && entry.speculation === terminalSpeculation"));
+  assert.ok(bridge.includes("const currentSpeculation = latestSpeculationStart?.entry?.speculation"));
+  assert.ok(bridge.includes("entry.stage === stage && entry.speculation === currentSpeculation"));
   assert.ok(bridge.includes("entry.speculation === payload?.speculation"));
   assert.ok(bridge.includes("first_content_to_tts_pcm_ms"));
   assert.ok(bridge.includes("first_content_to_tts_chunk_ms"));
@@ -1099,6 +1099,26 @@ test("voice latency retains terminal metrics from the exact speculative attempt"
   ] });
   assert.equal(summary.audio_accepted_samples, 12_800);
   assert.equal(summary.generation_sampled_tokens, 3);
+});
+
+test("an in-flight speculative turn cannot inherit the prior turn's audio or TTS timing", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const summary = summarize({ stages: [
+    { stage: "silence_onset", elapsed_ms: 100, silence_ms: 180 },
+    { stage: "speculation_started", elapsed_ms: 101, speculation: "old" },
+    { stage: "first_content_delta", elapsed_ms: 200 },
+    { stage: "tts_first_pcm", elapsed_ms: 300 },
+    { stage: "native_audio_finish_returned", elapsed_ms: 310, speculation: "old",
+      audio: { accepted_samples: 12_800 } },
+    { stage: "generation_finished", elapsed_ms: 320, speculation: "old" },
+    { stage: "silence_onset", elapsed_ms: 500, silence_ms: 320 },
+    { stage: "speculation_started", elapsed_ms: 501, speculation: "new" },
+  ] });
+  assert.equal(summary.audio_accepted_samples, null);
+  assert.equal(summary.first_content_to_tts_pcm_ms, null);
+  assert.equal(summary.silence_decision_delay_ms, 320);
 });
 
 test("next-turn prefetch is never charged to the current microphone session", () => {

@@ -3,6 +3,7 @@
 ((root) => {
   const SPEECH_RELEASE_MS = 20;
   const SPEECH_OPEN_MS = 48;
+  const SPEECH_RESUME_MS = 40;
   // Match Gemma's 40 ms audio-projector frame at 16 kHz. A delayed WebView
   // callback may accumulate much more; catch-up still publishes every frame.
   const PREFILL_MAX_BLOCK_SAMPLES = 640;
@@ -176,13 +177,15 @@
 
     // A single loud subframe is not an utterance. Keep the prospective onset
     // in pre-roll, then admit speech only after sustained evidence.
-    const candidateMs = aboveThreshold
+    const candidateMs = current.voiced ? 0 : aboveThreshold
       ? (Number(current.candidateMs) || 0) + Math.max(0, durationMs)
       : Math.max(0, (Number(current.candidateMs) || 0) - Math.max(0, durationMs));
     const heardVoice = current.heardVoice || candidateMs >= SPEECH_OPEN_MS;
     const releaseMs = aboveThreshold ? 0
       : (heardVoice ? (Number(current.releaseMs) || 0) + Math.max(0, durationMs) : 0);
-    const voiced = heardVoice && (aboveThreshold || (current.voiced && releaseMs < SPEECH_RELEASE_MS));
+    const freshOnset = candidateMs >= (current.heardVoice ? SPEECH_RESUME_MS : SPEECH_OPEN_MS);
+    const voiced = heardVoice && (current.voiced
+      ? releaseMs < SPEECH_RELEASE_MS : freshOnset);
     return {
       heardVoice,
       silentMs: heardVoice ? releaseMs : 0,
@@ -190,7 +193,7 @@
       threshold,
       voiced,
       releaseMs,
-      candidateMs,
+      candidateMs: voiced ? 0 : candidateMs,
       noiseQuantile: current.noiseQuantile,
     };
   };
