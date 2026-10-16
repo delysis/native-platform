@@ -1339,10 +1339,8 @@ impl MomSpeech {
         ))
     }
 
-    /// Staged capture-to-host API. The caller must own this future under an
-    /// AppWorkLease and persist trace events. This does NOT publish a transcript
-    /// or register a new command; the omitted save/KV owners are required first.
-    #[allow(dead_code)]
+    /// The live capture owner holds this future under an AppWorkLease. A final
+    /// result is still uncommitted until the exact saved turn is verified.
     pub(crate) async fn transcribe_live(
         &self,
         operation: &str,

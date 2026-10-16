@@ -277,7 +277,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   );
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
   assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
-  assert.match(submitHandler, /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"\) \{[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment\)/);
+  assert.match(submitHandler, /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"\) \{[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
   const voiceTranscript = bridge.slice(
     bridge.indexOf("  const indexVoiceTurn ="),
     bridge.indexOf("  const stopVoiceCapture =", bridge.indexOf("  const indexVoiceTurn =")),
@@ -291,7 +291,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
     bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
   );
-  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result\);\s*const synthesized = await tts\.finish/);
+  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result, null, speculation\.captureReady\);\s*const synthesized = await tts\.finish/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(

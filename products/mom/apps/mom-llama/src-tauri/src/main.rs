@@ -6,6 +6,7 @@ mod model_acquisition;
 // Capture/host stage only; activation awaits the runtime and KV owners.
 #[allow(dead_code)]
 mod live_transcription;
+mod live_transcription_owner;
 mod native_voice_capture;
 mod operation_supervisor;
 mod speech;
@@ -654,6 +655,10 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_voice_audio_begin,
         commands::mom_llama_voice_capture_prepare,
         commands::mom_llama_voice_capture_start,
+        commands::mom_llama_live_transcription_begin,
+        commands::mom_llama_live_transcription_push,
+        commands::mom_llama_live_transcription_finish,
+        commands::mom_llama_live_transcription_cancel,
         commands::mom_llama_voice_capture_pause,
         commands::mom_llama_voice_capture_retarget,
         commands::mom_llama_voice_capture_stop,
@@ -779,6 +784,7 @@ impl EmbeddedMom {
             .manage(self.clone())
             .manage(self.startup.clone())
             .manage(native_voice_capture::NativeVoiceCapture::new())
+            .manage(live_transcription_owner::LiveTranscriptionOwner::default())
             .invoke_handler(command_handler())
     }
 
@@ -925,6 +931,7 @@ pub fn run() {
         .menu(build_desktop_menu)
         .manage(startup)
         .manage(native_voice_capture::NativeVoiceCapture::new())
+        .manage(live_transcription_owner::LiveTranscriptionOwner::default())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             app.manage(PreparedSpeech::new(&app_data_dir));

@@ -201,6 +201,10 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
     long("mom_llama_speech_transcribe_attachment", true, true),
+    long("mom_llama_live_transcription_begin", false, true),
+    mutation("mom_llama_live_transcription_push", false, true),
+    mutation("mom_llama_live_transcription_finish", false, true),
+    mutation("mom_llama_live_transcription_cancel", false, true),
     mutation("mom_llama_speech_stop", true, true),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
@@ -392,6 +396,10 @@ mod tests {
             "mom_llama_speech_precommit_synthesize",
             "mom_llama_voice_generation_backpressure",
             "mom_llama_speech_transcribe_attachment",
+            "mom_llama_live_transcription_begin",
+            "mom_llama_live_transcription_push",
+            "mom_llama_live_transcription_finish",
+            "mom_llama_live_transcription_cancel",
             "mom_llama_speech_stop",
         ]);
         let command_source = include_str!("commands.rs");

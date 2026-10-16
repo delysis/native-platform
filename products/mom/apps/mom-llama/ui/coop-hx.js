@@ -5790,7 +5790,7 @@
     return startVoicePrefill(conversation, recording.call);
   };
 
-  const indexVoiceTurn = (conversation, output, fallbackAttachment = null) => {
+  const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null) => {
     const attachment = output?.voice_attachment_id || fallbackAttachment;
     const messageId = output?.user_message_id;
     const trace = voiceLatencyTrace;
@@ -5802,6 +5802,10 @@
       if (!attachment || !messageId) {
         throw new Error("voice_transcript_source_missing: The saved voice turn has no recording identity.");
       }
+      // Speculative generation can finish before the first audible packet.
+      // Its recording becomes authoritative only after confirmation commits.
+      const physicalCapture = await Promise.resolve(sourceCapture);
+      if (sourceCapture && !physicalCapture) return;
       const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
         attachment,
       }));
@@ -5814,11 +5818,41 @@
       });
       const inferenceStarted = performance.now();
       markVoiceLatencyIn(trace, "voice_transcript_inference_started");
-      const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
-        conversation,
-        ...attachmentPreviewAnchor(catalog, primary),
-        operation: speechOperationToken(),
-      });
+      let transcribed = null;
+      if (physicalCapture?.transcription && typeof physicalCapture.samples === "function") {
+        try {
+          const live = await physicalCapture.transcription.finished;
+          const samples = physicalCapture.samples();
+          const identity = physicalCapture.transcription.metrics();
+          const source = live?.source;
+          const digest = await sha256Hex(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength));
+          const archivedWavSha256 = await sha256Hex(encodePcmWav(samples));
+          if (source?.identity?.turn !== identity.turn
+              || source?.identity?.capture !== identity.capture
+              || source?.identity?.conversation !== conversation
+              || source?.samples !== samples.length
+              || source?.pcm_f32le_sha256 !== digest
+              || catalog.root_sha256 !== archivedWavSha256) {
+            throw new Error("live_transcription_source_mismatch");
+          }
+          transcribed = { status: "passed", result: { transcript: live.transcript } };
+          markVoiceLatencyIn(trace, "voice_transcript_live_verified", {
+            samples: source.samples,
+            ...(source.metrics || {}),
+          });
+        } catch (error) {
+          // The saved WAV remains authoritative. A failed parallel reader may
+          // be retried from that recording without delaying the reply.
+          markVoiceLatencyIn(trace, "voice_transcript_live_failed", { message: errorMessage(error) });
+        }
+      }
+      if (!transcribed) {
+        transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+          conversation,
+          ...attachmentPreviewAnchor(catalog, primary),
+          operation: speechOperationToken(),
+        });
+      }
       markVoiceLatencyIn(trace, "voice_transcript_inference_finished", {
         duration_ms: Math.round((performance.now() - inferenceStarted) * 100) / 100,
         ...(transcribed?.result?.timing || {}),
@@ -5943,6 +5977,7 @@
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
+      transcription: recording.transcription,
       // The saved turn is the physical microphone stream. Editing it here
       // would make the archive differ from Parakeet's parallel PCM consumer.
       samples: () => mergeFloat32(recording.capturedPcm),
@@ -6026,6 +6061,36 @@
       echoGuardThreshold: 0,
       detectorSilence: new Float32Array(processor.bufferSize),
     };
+    if (call && !transcription) {
+      const turn = crypto.randomUUID();
+      const capture = crypto.randomUUID();
+      const conversation = voiceCallConversation || recording.sourceConversation;
+      const transcriptionTrace = voiceLatencyTrace;
+      const begun = invoke("mom_llama_live_transcription_begin", {
+        turn, capture, conversation, operation: speechOperationToken(),
+      });
+      void begun.catch(() => {});
+      recording.transcription = globalThis.MomVoiceCapturePolicy.createLiveTranscriptionTap({
+        turn, capture,
+        send: async (packet) => {
+          await begun;
+          return invoke("mom_llama_live_transcription_push", {
+            turn, capture, sampleOffset: packet.sample_offset,
+            samples: Array.from(packet.samples),
+          });
+        },
+        finish: async ({ samples }) => {
+          await begun;
+          return invoke("mom_llama_live_transcription_finish", { turn, capture, samples });
+        },
+        cancel: async () => {
+          await begun;
+          return invoke("mom_llama_live_transcription_cancel", { turn, capture });
+        },
+        onTrace: (event) => markVoiceLatencyIn(transcriptionTrace,
+          "live_transcription_" + event.stage, event),
+      });
+    }
     const initialPrefillEpoch = recording.prefillEpoch;
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
       if (recording.prefillEpoch === initialPrefillEpoch) {
@@ -6334,6 +6399,7 @@
     const speculation = recording?.speculation;
     if (!speculation || speculation.confirmed || speculation.aborting) return;
     speculation.aborting = true;
+    speculation.resolveCapture?.(null);
     markVoiceLatency("speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
     if (!recording.native && recording.call && restartPrefill) {
       // A short intra-utterance pause can cross the first speculative edge.
@@ -6495,7 +6561,9 @@
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
     const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    speculation.capturePromise = stoppedCapture;
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
+    speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
     // Local capture is already severed before any promise is awaited. Start
     // the buffered reply now; native commit and recorder drain are bookkeeping
     // that can complete concurrently and must not extend time to first sound.
@@ -6527,6 +6595,7 @@
 
     const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
+    speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
     const [capture] = await Promise.all([stoppedCapture, confirmed]);
     if (capture?.wavBytes?.byteLength > 44) {
       hydrateOptimisticVoiceMessage(outgoing, capture.wavBytes);
@@ -6585,6 +6654,9 @@
     });
     speculation.generationReleased = new Promise((resolve) => {
       speculation.releaseGeneration = resolve;
+    });
+    speculation.captureReady = new Promise((resolve) => {
+      speculation.resolveCapture = resolve;
     });
     const tts = beginLiveVoiceTts({
       conversation: live.conversation,
@@ -6673,7 +6745,7 @@
         cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
-      indexVoiceTurn(live.conversation, response.result);
+      indexVoiceTurn(live.conversation, response.result, null, speculation.captureReady);
       const synthesized = await tts.finish(response.result.assistant_text || tts.text);
       if (!synthesized) {
         throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
@@ -6708,6 +6780,7 @@
         throw error;
       }
     } finally {
+      if (!speculation.confirmed) speculation.resolveCapture?.(null);
       // All speculative attempts for one call share a conversation. Do not
       // let a superseded attempt clear the routing markers published by its
       // replacement after a resumed-speech handoff.
@@ -6771,6 +6844,7 @@
         conversation,
         requestId: live.request_id,
         recording: sealedVoiceRecordingBytes(capture),
+        sourceCapture: capture,
       };
     } else {
       const wav = capture.wavBytes || encodePcmWav(capture.samples());
@@ -6792,6 +6866,7 @@
       pendingVoiceFallbackAttachment = imported.result?.attachment?.id ? {
         conversation,
         attachment: imported.result.attachment.id,
+        sourceCapture: capture,
       } : null;
     }
     if (call) callReplyConversation = conversation;
@@ -8615,7 +8690,8 @@
             if (result?.status !== "blocked" && result?.result?.kind === "direct") {
               // Backfill this exact turn after commit. The next Gemma prompt
               // may proceed with its recorded audio if Parakeet is still busy.
-              indexVoiceTurn(conversation, output, voiceTranscriptAttachment);
+              indexVoiceTurn(conversation, output, voiceTranscriptAttachment,
+                (liveVoice || fallbackVoice)?.sourceCapture || null);
             }
             if (result?.status !== "blocked" && output?.assistant_text) {
               markVoiceLatency("tts_text_admitted", {

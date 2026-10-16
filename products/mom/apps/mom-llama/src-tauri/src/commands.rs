@@ -27,6 +27,8 @@ use crate::information::{
     AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
     ManagedRemovalSelection,
 };
+use crate::live_transcription::TurnIdentity;
+use crate::live_transcription_owner::LiveTranscriptionOwner;
 use crate::native_voice_capture::{CaptureTarget, NativeVoiceCapture};
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
@@ -1634,6 +1636,68 @@ pub async fn mom_llama_voice_capture_prepare(
             serde_json::to_value(metrics).map_err(to_error)
         })
         .await
+}
+
+#[tauri::command]
+pub fn mom_llama_live_transcription_begin(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    window: Window,
+    turn: String,
+    capture: String,
+    conversation: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_live_transcription_begin"))?;
+    owner.begin(
+        TurnIdentity {
+            turn: turn.clone(),
+            capture,
+            conversation,
+        },
+        operation,
+        runtime.speech(),
+        lease,
+        window,
+    )?;
+    Ok(serde_json::json!({ "turn": turn }))
+}
+
+#[tauri::command]
+pub fn mom_llama_live_transcription_push(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+    sample_offset: usize,
+    samples: Vec<f32>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_push"))?;
+    serde_json::to_value(owner.push(&turn, &capture, sample_offset, &samples)?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_live_transcription_finish(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+    samples: usize,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_finish"))?;
+    serde_json::to_value(owner.finish(&turn, &capture, samples).await?).map_err(to_error)
+}
+
+#[tauri::command]
+pub fn mom_llama_live_transcription_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_cancel"))?;
+    owner.cancel(&turn, &capture)?;
+    Ok(serde_json::json!({ "turn": turn, "cancelled": true }))
 }
 
 #[tauri::command]

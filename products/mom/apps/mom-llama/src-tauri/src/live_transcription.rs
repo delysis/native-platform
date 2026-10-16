@@ -466,6 +466,10 @@ pub(crate) struct SavedVoiceSource {
 }
 
 impl FinalTranscript {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
     pub(crate) fn from_complete(
         source: SourceReceipt,
         text: String,

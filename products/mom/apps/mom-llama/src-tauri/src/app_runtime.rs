@@ -155,13 +155,23 @@ pub(crate) struct VoiceSpeculationControl {
 }
 
 pub(crate) fn complete_voice_wav(recording: &[u8]) -> bool {
-    if recording.len() <= 44 || recording.len() % 2 != 0 {
+    if recording.len() <= 44 || !recording.len().is_multiple_of(2) {
         return false;
     }
-    let u32_at =
-        |offset: usize| u32::from_le_bytes(recording[offset..offset + 4].try_into().unwrap());
-    let u16_at =
-        |offset: usize| u16::from_le_bytes(recording[offset..offset + 2].try_into().unwrap());
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(
+            recording[offset..offset + 4]
+                .try_into()
+                .expect("checked WAV header length"),
+        )
+    };
+    let u16_at = |offset: usize| {
+        u16::from_le_bytes(
+            recording[offset..offset + 2]
+                .try_into()
+                .expect("checked WAV header length"),
+        )
+    };
     recording.starts_with(b"RIFF")
         && u32_at(4) as usize == recording.len() - 8
         && &recording[8..16] == b"WAVEfmt "
