@@ -5,9 +5,11 @@ const assert = require("node:assert/strict");
 const {
   analyzeVoiceSamples,
   createStreamingMonoResampler,
+  initialPlaybackEchoGuard,
   initialVoiceActivity,
   nextVoiceActivity,
   speechThreshold,
+  updatePlaybackEchoGuard,
 } = require("./voice-capture-policy.js");
 
 test("subframe detector rejects intra-speech microgaps and locates sustained silence", () => {
@@ -76,4 +78,37 @@ test("streaming noise percentile follows a changed quiet floor in constant memor
   assert.ok(activity.noiseFloor < .0021);
   assert.equal(activity.noiseQuantile.heights.length, 5);
   assert.equal(nextVoiceActivity(activity, .008, 1.33).voiced, true);
+});
+
+test("playback echo is suppressed while the canceller converges", () => {
+  let guard = initialPlaybackEchoGuard();
+  for (let frame = 0; frame < 40; frame += 1) {
+    const result = updatePlaybackEchoGuard(guard, .0074, 5.33);
+    guard = result.guard;
+    assert.equal(result.suppressed, true);
+  }
+  assert.ok(guard.residualRms > .006);
+});
+
+test("sustained double talk crosses the adaptive playback guard", () => {
+  let guard = initialPlaybackEchoGuard();
+  for (let frame = 0; frame < 48; frame += 1) {
+    guard = updatePlaybackEchoGuard(guard, .006, 5.33).guard;
+  }
+  let result;
+  for (let frame = 0; frame < 10; frame += 1) {
+    result = updatePlaybackEchoGuard(guard, .03, 5.33);
+    guard = result.guard;
+  }
+  assert.equal(result.suppressed, false);
+  assert.ok(result.threshold > .009);
+  assert.ok(result.threshold < .03);
+});
+
+test("speech during convergence does not poison the residual estimate", () => {
+  let guard = initialPlaybackEchoGuard();
+  for (let frame = 0; frame < 40; frame += 1) {
+    guard = updatePlaybackEchoGuard(guard, .04, 5.33).guard;
+  }
+  assert.equal(guard.residualRms, .003);
 });

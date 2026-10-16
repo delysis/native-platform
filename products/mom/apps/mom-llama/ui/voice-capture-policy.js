@@ -82,6 +82,35 @@
     releaseMs: 0,
   });
 
+  const initialPlaybackEchoGuard = () => ({
+    playbackMs: 0,
+    residualRms: .003,
+    aboveMs: 0,
+  });
+
+  const updatePlaybackEchoGuard = (guard, rms, durationMs) => {
+    const current = guard || initialPlaybackEchoGuard();
+    const level = Math.max(0, Number(rms) || 0);
+    const elapsed = Math.max(0, Number(durationMs) || 0);
+    current.playbackMs += elapsed;
+    const threshold = Math.max(.009, (current.residualRms * 2.8) + .001);
+    const warming = current.playbackMs <= 250;
+    if (level < threshold || warming) {
+      // Learn only plausible residual echo. A caller who speaks during the
+      // short convergence interval must not teach the guard to reject them.
+      if (level < .012) current.residualRms = (current.residualRms * .92) + (level * .08);
+      current.aboveMs = 0;
+      return { guard: current, suppressed: true, threshold, warming };
+    }
+    current.aboveMs += elapsed;
+    return {
+      guard: current,
+      suppressed: current.aboveMs < 48,
+      threshold,
+      warming: false,
+    };
+  };
+
   const createStreamingMonoResampler = (sourceRate, targetRate = 16000) => {
     const ratio = Number(sourceRate) / Number(targetRate);
     if (!Number.isFinite(ratio) || ratio < 1) {
@@ -185,9 +214,11 @@
   const api = {
     analyzeVoiceSamples,
     createStreamingMonoResampler,
+    initialPlaybackEchoGuard,
     initialVoiceActivity,
     nextVoiceActivity,
     speechThreshold,
+    updatePlaybackEchoGuard,
   };
   root.MomVoiceCapturePolicy = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
