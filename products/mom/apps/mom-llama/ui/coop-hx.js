@@ -5868,7 +5868,7 @@
     return { ...live, conversation };
   };
 
-  const stopVoiceCapture = async ({ discard = false, abortPrefill = true } = {}) => {
+  const stopVoiceCapture = async ({ discard = false, abortPrefill = true, flushPrefill = true } = {}) => {
     const recording = voiceRecording;
     voiceRecording = null;
     if (!recording) return null;
@@ -5936,12 +5936,16 @@
     // Physical stop seals the transcript independently. Never await Parakeet
     // here, and never seal it at speculative Gemma end-of-input.
     recording.transcription?.seal();
-    enqueueVoicePrefill(recording, new Float32Array(), true);
-    await recording.pushChain;
+    if (flushPrefill) {
+      enqueueVoicePrefill(recording, new Float32Array(), true);
+      await recording.pushChain;
+    }
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
-      samples: () => trimVoiceSilence(mergeFloat32(recording.capturedPcm)),
+      // The saved turn is the physical microphone stream. Editing it here
+      // would make the archive differ from Parakeet's parallel PCM consumer.
+      samples: () => mergeFloat32(recording.capturedPcm),
     };
   };
 
@@ -6457,6 +6461,27 @@
     if (replacementError) throw replacementError;
   };
 
+  const sealedVoiceRecordingBytes = (capture) => {
+    if (!capture?.heardVoice) throw new Error("The voice turn has no complete recording.");
+    const bytes = capture.wavBytes || encodePcmWav(capture.samples());
+    if (bytes.byteLength <= 44) throw new Error("The voice turn has no complete recording.");
+    return Array.from(bytes);
+  };
+
+  const confirmRecordedSpeculation = (speculation, stoppedCapture) => stoppedCapture
+    .then((capture) => invoke("mom_llama_voice_audio_speculation_confirm", {
+      speculation: speculation.id,
+      recording: sealedVoiceRecordingBytes(capture),
+    }))
+    .catch(async (error) => {
+      await speculation.tts.stop().catch(() => {});
+      await invoke("mom_llama_voice_audio_speculation_abort", {
+        speculation: speculation.id,
+        conversation: speculation.conversation,
+      }).catch(() => {});
+      throw error;
+    });
+
   const confirmCallSpeculation = async (recording, speculation) => {
     if (recording.speculation !== speculation || speculation.confirmed
         || speculation.aborting || recording.voiceActivity.voiced
@@ -6469,10 +6494,8 @@
     // Sever microphone capture synchronously at the commit boundary. The
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
-    const stoppedCapture = stopVoiceCapture({ discard: true, abortPrefill: false });
-    const confirmed = invoke("mom_llama_voice_audio_speculation_confirm", {
-      speculation: speculation.id,
-    });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     // Local capture is already severed before any promise is awaited. Start
     // the buffered reply now; native commit and recorder drain are bookkeeping
     // that can complete concurrently and must not extend time to first sound.
@@ -6502,10 +6525,8 @@
     voiceReplyConversation = speculation.conversation;
     liveVoiceTts = speculation.tts;
 
-    const stoppedCapture = stopVoiceCapture({ abortPrefill: false });
-    const confirmed = invoke("mom_llama_voice_audio_speculation_confirm", {
-      speculation: speculation.id,
-    });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     const [capture] = await Promise.all([stoppedCapture, confirmed]);
     if (capture?.wavBytes?.byteLength > 44) {
       hydrateOptimisticVoiceMessage(outgoing, capture.wavBytes);
@@ -6749,6 +6770,7 @@
         session: live.session,
         conversation,
         requestId: live.request_id,
+        recording: sealedVoiceRecordingBytes(capture),
       };
     } else {
       const wav = capture.wavBytes || encodePcmWav(capture.samples());
@@ -8525,6 +8547,7 @@
             if (liveVoice) {
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
+                recording: liveVoice.recording,
               });
               result = finished?.result ? {
                 ...finished,

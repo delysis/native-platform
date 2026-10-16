@@ -614,7 +614,13 @@ test("call and voice-note replies speculate on the first silence edge and commit
   assert.ok(capture.includes("recoveryAttempt"));
   assert.ok(bridge.includes('markVoiceLatency("capture_processing"'));
   assert.ok(!capture.includes("createScriptProcessor"));
-  assert.ok(!capture.includes("Array.from"));
+  const captureCallback = bridge.slice(
+    bridge.indexOf("recording.processor.onaudioprocess =", captureStart),
+    bridge.indexOf("if (!sharedCallGraph)", captureStart),
+  );
+  assert.ok(!captureCallback.includes("Array.from"), "the PCM capture callback must not serialize samples");
+  assert.ok(speculate.includes("recording: sealedVoiceRecordingBytes(capture)"),
+    "only a complete physical recording may confirm a speculative turn");
   assert.ok(capture.includes("if (!call && chatBusyLeases.size)"));
   assert.match(
     bridge,
@@ -625,7 +631,9 @@ test("call and voice-note replies speculate on the first silence edge and commit
   assert.ok(speculate.includes('invoke("mom_llama_voice_audio_speculate"'));
   assert.ok(speculate.includes("capture: recording.native ? recording.capture : null"));
   assert.ok(!speculate.includes('invoke("mom_llama_voice_capture_pause"'));
-  assert.ok(!speculate.includes("encodePcmWav"));
+  const speculativeGeneration = speculate.slice(speculate.indexOf("  const startVoiceSpeculation ="));
+  assert.ok(!speculativeGeneration.includes("encodePcmWav"),
+    "silence-onset generation must not encode the physical recording");
   assert.doesNotMatch(
     speculate,
     /mom_llama_voice_audio_speculate[\s\S]{0,160}bytes:/,

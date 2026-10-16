@@ -151,6 +151,29 @@ pub(crate) struct VoiceSpeculationControl {
     state: Mutex<VoiceSpeculationState>,
     changed: Condvar,
     prepared: Option<Arc<mom_llama_runtime::VoiceAudioPreparedTurn>>,
+    recording: Mutex<Option<Vec<u8>>>,
+}
+
+pub(crate) fn complete_voice_wav(recording: &[u8]) -> bool {
+    if recording.len() <= 44 || recording.len() % 2 != 0 {
+        return false;
+    }
+    let u32_at =
+        |offset: usize| u32::from_le_bytes(recording[offset..offset + 4].try_into().unwrap());
+    let u16_at =
+        |offset: usize| u16::from_le_bytes(recording[offset..offset + 2].try_into().unwrap());
+    recording.starts_with(b"RIFF")
+        && u32_at(4) as usize == recording.len() - 8
+        && &recording[8..16] == b"WAVEfmt "
+        && u32_at(16) == 16
+        && u16_at(20) == 1
+        && u16_at(22) == 1
+        && u32_at(24) == 16_000
+        && u32_at(28) == 32_000
+        && u16_at(32) == 2
+        && u16_at(34) == 16
+        && &recording[36..40] == b"data"
+        && u32_at(40) as usize == recording.len() - 44
 }
 
 impl VoiceSpeculationControl {
@@ -159,6 +182,7 @@ impl VoiceSpeculationControl {
             state: Mutex::new(VoiceSpeculationState::Pending),
             changed: Condvar::new(),
             prepared,
+            recording: Mutex::new(None),
         }
     }
 
@@ -171,7 +195,7 @@ impl VoiceSpeculationControl {
             .ok_or_else(|| "The speculative voice turn has no reusable preparation".to_string())
     }
 
-    pub(crate) fn wait_for_confirmation(&self) -> Result<(), String> {
+    pub(crate) fn wait_for_confirmation(&self) -> Result<Vec<u8>, String> {
         let mut state = self
             .state
             .lock()
@@ -183,7 +207,12 @@ impl VoiceSpeculationControl {
                 .map_err(|_| "Voice speculation state is unavailable".to_string())?;
         }
         match *state {
-            VoiceSpeculationState::Confirmed => Ok(()),
+            VoiceSpeculationState::Confirmed => self
+                .recording
+                .lock()
+                .map_err(|_| "Voice recording is unavailable".to_string())?
+                .take()
+                .ok_or_else(|| "Confirmed voice turn has no recording".to_string()),
             VoiceSpeculationState::Aborted => Err("voice_speculation_aborted".to_string()),
             VoiceSpeculationState::Pending => unreachable!("wait loop excludes pending state"),
         }
@@ -191,6 +220,26 @@ impl VoiceSpeculationControl {
 
     pub(crate) fn abort(&self) {
         let _ = self.transition(VoiceSpeculationState::Aborted);
+    }
+
+    fn confirm_with_recording(&self, recording: Vec<u8>) -> Result<bool, String> {
+        if !complete_voice_wav(&recording) {
+            return Err("The voice turn has no complete recording".to_string());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Voice speculation state is unavailable".to_string())?;
+        if *state != VoiceSpeculationState::Pending {
+            return Ok(*state == VoiceSpeculationState::Confirmed);
+        }
+        *self
+            .recording
+            .lock()
+            .map_err(|_| "Voice recording is unavailable".to_string())? = Some(recording);
+        *state = VoiceSpeculationState::Confirmed;
+        self.changed.notify_all();
+        Ok(true)
     }
 
     fn transition(&self, next: VoiceSpeculationState) -> Result<bool, String> {
@@ -926,7 +975,11 @@ impl AppRuntimeHandle {
         Ok(control)
     }
 
-    pub(crate) fn confirm_voice_speculation(&self, speculation: &str) -> Result<bool, String> {
+    pub(crate) fn confirm_voice_speculation(
+        &self,
+        speculation: &str,
+        recording: Vec<u8>,
+    ) -> Result<bool, String> {
         let control = self
             .0
             .voice_speculations
@@ -935,7 +988,7 @@ impl AppRuntimeHandle {
             .get(speculation)
             .cloned()
             .ok_or_else(|| "The speculative voice turn is no longer active".to_string())?;
-        control.transition(VoiceSpeculationState::Confirmed)
+        control.confirm_with_recording(recording)
     }
 
     /// Abort and consume an admitted speculation. If admission has not yet
@@ -1341,7 +1394,7 @@ mod tests {
     use super::{
         AppRuntimeConstruction, AppRuntimeHandle, MomSpeech, NativeFinalizer,
         PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
-        PersonaApprovalRecoveryWorker,
+        PersonaApprovalRecoveryWorker, VoiceSpeculationControl, complete_voice_wav,
     };
     use crate::command_registry::command_spec;
     use crate::information::MomInformation;
@@ -1358,6 +1411,31 @@ mod tests {
         // only where that storage capability is implemented; independent
         // supervisor and approval-worker tests remain portable.
         runtime_with_finalizer(Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn speculative_turn_requires_complete_recording_before_confirmation() {
+        let control = VoiceSpeculationControl::new(None);
+        assert!(control.confirm_with_recording(Vec::new()).is_err());
+        let mut recording = vec![0; 46];
+        recording[..4].copy_from_slice(b"RIFF");
+        recording[4..8].copy_from_slice(&38_u32.to_le_bytes());
+        recording[8..16].copy_from_slice(b"WAVEfmt ");
+        recording[16..20].copy_from_slice(&16_u32.to_le_bytes());
+        recording[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        recording[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        recording[24..28].copy_from_slice(&16_000_u32.to_le_bytes());
+        recording[28..32].copy_from_slice(&32_000_u32.to_le_bytes());
+        recording[32..34].copy_from_slice(&2_u16.to_le_bytes());
+        recording[34..36].copy_from_slice(&16_u16.to_le_bytes());
+        recording[36..40].copy_from_slice(b"data");
+        recording[40..44].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(complete_voice_wav(&recording));
+        let mut truncated = recording.clone();
+        truncated.pop();
+        assert!(!complete_voice_wav(&truncated));
+        assert_eq!(control.confirm_with_recording(recording.clone()), Ok(true));
+        assert_eq!(control.wait_for_confirmation(), Ok(recording));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{Emitter, Manager, State, Window};
 
-use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
+use crate::app_runtime::{AppRuntimeHandle, AppWorkLease, complete_voice_wav};
 use crate::command_registry::command_spec;
 use crate::information::{
     AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
@@ -1792,18 +1792,24 @@ pub async fn mom_llama_voice_audio_finish(
     runtime: State<'_, AppRuntimeHandle>,
     window: Window,
     session: String,
+    recording: Vec<u8>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_audio_finish"))?;
+    if !complete_voice_wav(&recording) {
+        return Err("The voice turn has no complete recording".to_string());
+    }
     let owner = runtime.inner().clone();
     let voice = owner.take_voice_audio_session(&session)?;
-    let archive = voice.audio_monitor();
     let conversation = voice.conversation_id().to_string();
     let operations = runtime.operation_scope();
     let import = std::thread::Builder::new()
         .name("mom-voice-attachment-import".to_string())
         .spawn(move || {
-            let bytes = archive.wav_bytes().map_err(anyhow::Error::new)?;
-            mom_llama_runtime::attachment_import_voice_message(&operations, &conversation, bytes)
+            mom_llama_runtime::attachment_import_voice_message(
+                &operations,
+                &conversation,
+                recording,
+            )
         })
         .map_err(|error| format!("voice_attachment_import_spawn_failed: {error}"))?;
     let import = Arc::new(std::sync::Mutex::new(Some(import)));
@@ -1993,7 +1999,6 @@ pub async fn mom_llama_voice_audio_speculate(
                 command_started,
             );
             let progress = voice.audio_monitor();
-            let archive = progress.clone();
             let conversation = voice.conversation_id().to_string();
             let import_control = Arc::clone(&worker_control);
             let import_conversation = conversation.clone();
@@ -2001,14 +2006,13 @@ pub async fn mom_llama_voice_audio_speculate(
             let import = match std::thread::Builder::new()
                 .name("mom-speculative-voice-import".to_string())
                 .spawn(move || {
-                    import_control
+                    let recording = import_control
                         .wait_for_confirmation()
                         .map_err(anyhow::Error::msg)?;
-                    let bytes = archive.wav_bytes().map_err(anyhow::Error::new)?;
                     mom_llama_runtime::attachment_import_voice_message(
                         &import_operations,
                         &import_conversation,
-                        bytes,
+                        recording,
                     )
                 }) {
                 Ok(import) => import,
@@ -2197,10 +2201,11 @@ pub async fn mom_llama_voice_audio_speculate(
 pub async fn mom_llama_voice_audio_speculation_confirm(
     runtime: State<'_, AppRuntimeHandle>,
     speculation: String,
+    recording: Vec<u8>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_confirm"))?;
     Ok(serde_json::json!({
-        "confirmed": runtime.confirm_voice_speculation(&speculation)?,
+        "confirmed": runtime.confirm_voice_speculation(&speculation, recording)?,
     }))
 }
 
