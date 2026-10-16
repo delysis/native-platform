@@ -2710,6 +2710,7 @@
       && replacement?.dataset.currentConversation === conversation) {
       requestAnimationFrame(() => requestAnimationFrame(() => {
         recordConversationSwitchPaint(startedAt, performance.now());
+        void recoverPendingVoiceHistory().catch(() => {});
       }));
     }
     // Sidebar and settings carry secondary state. Refresh them after the chat
