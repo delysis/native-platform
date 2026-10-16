@@ -3884,9 +3884,11 @@
       const coarse = Number(audio?.[`${name}_ms`]);
       return Number.isFinite(coarse) ? coarse : null;
     };
-    const captureMetricMs = (name) => {
+    const captureMetricMs = (name, browserName = null) => {
       const precise = Number(capture?.[`${name}_us`]);
-      return Number.isFinite(precise) ? Math.round(precise / 10) / 100 : null;
+      if (Number.isFinite(precise)) return Math.round(precise / 10) / 100;
+      const browser = browserName === null ? NaN : Number(capture?.[browserName]);
+      return Number.isFinite(browser) ? browser : null;
     };
     const firstProjectorFinish = metricMs("first_projector_finish");
     const lastProjectorFinish = metricMs("last_projector_finish");
@@ -4004,12 +4006,18 @@
       capture_callback_frames_max: Number.isFinite(Number(capture?.callback_frames_max))
         ? Number(capture.callback_frames_max)
         : null,
-      capture_processing_cpu_ms: captureMetricMs("processing_cpu"),
-      capture_processing_max_ms: captureMetricMs("processing_max"),
-      capture_resample_cpu_ms: captureMetricMs("resample_cpu"),
+      capture_processing_cpu_ms: captureMetricMs("processing_cpu", "callback_cpu_ms"),
+      capture_processing_max_ms: captureMetricMs("processing_max", "callback_max_ms"),
+      capture_resample_cpu_ms: captureMetricMs("resample_cpu", "resample_cpu_ms"),
       capture_resample_max_ms: captureMetricMs("resample_max"),
-      capture_detector_cpu_ms: captureMetricMs("detector_cpu"),
+      capture_detector_cpu_ms: captureMetricMs("detector_cpu", "detector_cpu_ms"),
       capture_detector_max_ms: captureMetricMs("detector_max"),
+      capture_prefill_ipc_queue_high_water_ms:
+        capture && Number.isFinite(Number(capture.prefill_ipc_queue_high_water_samples))
+          ? Number(capture.prefill_ipc_queue_high_water_samples) / 16 : null,
+      capture_prefill_ipc_queued_at_stop_ms:
+        capture && Number.isFinite(Number(capture.prefill_ipc_queued_samples))
+          ? Number(capture.prefill_ipc_queued_samples) / 16 : null,
       capture_vad_voice_onsets: Number.isFinite(Number(capture?.vad_voice_onsets))
         ? Number(capture.vad_voice_onsets) : null,
       capture_vad_settle_ms: Number.isFinite(Number(capture?.vad_settle_samples))
@@ -6046,6 +6054,9 @@
       echo_guard_suppressed_callbacks: recording.echoGuardSuppressedCallbacks || 0,
       echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
       echo_guard_threshold: recording.echoGuardThreshold || 0,
+      prefill_ipc_queued_samples: recording.prefillQueuedSamples || 0,
+      prefill_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
+      prefill_failed: recording.prefillFailed === true,
     };
     markVoiceLatencyIn(recording.trace, "capture_processing", { ...captureMetrics, reason, discard });
     if (discard) {

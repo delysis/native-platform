@@ -1057,6 +1057,25 @@ test("voice latency includes endpoint-decision time from the physical silence ed
   assert.equal(summary.silence_to_playback_ms, 750);
 });
 
+test("browser microphone cost and queued PCM survive into the latency summary", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const summary = summarize({ stages: [
+    { stage: "capture_processing", callback_cpu_ms: 24.5, callback_max_ms: 1.25,
+      detector_cpu_ms: 8.5, resample_cpu_ms: 6,
+      prefill_ipc_queued_samples: 1_280, prefill_ipc_queue_high_water_samples: 4_800 },
+  ] });
+  assert.equal(summary.capture_processing_cpu_ms, 24.5);
+  assert.equal(summary.capture_processing_max_ms, 1.25);
+  assert.equal(summary.capture_detector_cpu_ms, 8.5);
+  assert.equal(summary.capture_resample_cpu_ms, 6);
+  assert.equal(summary.capture_prefill_ipc_queued_at_stop_ms, 80);
+  assert.equal(summary.capture_prefill_ipc_queue_high_water_ms, 300);
+  const absent = summarize({ stages: [] });
+  assert.equal(absent.capture_prefill_ipc_queued_at_stop_ms, null);
+});
+
 test("a late pickup result cannot become the next call turn's generation", () => {
   const start = bridge.indexOf("  const voiceLatencySummary =");
   const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
