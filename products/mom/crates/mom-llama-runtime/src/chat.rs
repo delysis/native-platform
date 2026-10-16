@@ -728,25 +728,24 @@ pub fn voice_audio_begin_in_scope(
             fingerprint.context_tokens
         });
     let stage_started = Instant::now();
-    let cached_prefix = if history.media.is_empty() {
-        let owner_ids = reusable_prefix_owner_ids(
-            &conversation.id,
-            conversation.source_conversation_id.as_deref(),
-            &conversation.current_skill_ids,
-            skill_prompt.cache_owner_id.is_some(),
-            skill_prompt.cache_owner_id.as_deref(),
-        );
-        longest_cached_prefix_for_owners(
-            &handle,
-            &messages,
-            &owner_ids,
-            &settings,
-            true,
-            ChatTemplateChoice::PreferNonThinking,
-        )?
-    } else {
-        None
-    };
+    // Historical audio is evaluated after the leading text prefix. Its
+    // presence must not prevent reuse of the exact persona/conversation KV
+    // shared by both the cached request and this live microphone turn.
+    let owner_ids = reusable_prefix_owner_ids(
+        &conversation.id,
+        conversation.source_conversation_id.as_deref(),
+        &conversation.current_skill_ids,
+        skill_prompt.cache_owner_id.is_some(),
+        skill_prompt.cache_owner_id.as_deref(),
+    );
+    let cached_prefix = longest_cached_prefix_for_owners(
+        &handle,
+        &messages,
+        &owner_ids,
+        &settings,
+        true,
+        ChatTemplateChoice::PreferNonThinking,
+    )?;
     let cache_lookup_us = elapsed_us(stage_started);
     let cached_prefix_tokens = cached_prefix
         .as_ref()

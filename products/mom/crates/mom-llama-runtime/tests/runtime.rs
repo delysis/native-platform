@@ -2932,7 +2932,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let silence = Instant::now();
     voice.seal_input()?;
     let mut first_token_ms = None;
-    let finished = mom_llama_runtime::voice_audio_finish_in_scope(
+    let finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
         voice,
         ChatSendOptions {
             timeout_s: 60.0,
@@ -2946,6 +2946,22 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
             }
             Ok(())
         }),
+        || {
+            let imported = mom_llama_runtime::attachment_import_voice_message(
+                &scope,
+                &conversation.id,
+                std::fs::read(&wav_path)?,
+            )?;
+            Ok(Some(
+                imported
+                    .result
+                    .ok_or_else(|| {
+                        anyhow!("voice attachment import failed: {:?}", imported.blocker)
+                    })?
+                    .attachment
+                    .id,
+            ))
+        },
     )?;
     let output = finished
         .result
@@ -2971,6 +2987,21 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         first_token_ms.is_some(),
         "prepared turn emitted no text token"
     );
+    let following = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &conversation.id,
+        "[Phone call] Continue the conversation naturally.",
+    )?;
+    assert!(
+        !following.begin_metrics().attachment_free_fast_path,
+        "the prior user recording must still be present until transcription completes"
+    );
+    assert!(
+        following.begin_metrics().cached_prefix_found,
+        "pending historical audio must not bypass the resident text prefix: {:?}",
+        following.begin_metrics()
+    );
+    following.cancel();
     Ok(())
 }
 

@@ -7333,7 +7333,6 @@ fn generate_incremental_audio(
     let cached_prefix = request
         .cached_prefix
         .as_ref()
-        .filter(|_| request.media.is_empty())
         .filter(|state| !resident_prefix_wins(resident_prefix_tokens, state.token_count));
     if let Some(state) = cached_prefix {
         validate_incremental_audio_prefix_tokens(state, &prefix_token_ids)?;
@@ -9433,12 +9432,6 @@ fn validate_incremental_audio_request(
         return Err(NativeError::new(
             NativeErrorCode::UnsupportedMedia,
             "incremental audio history accepts only earlier audio recordings",
-        ));
-    }
-    if !request.media.is_empty() && request.cached_prefix.is_some() {
-        return Err(NativeError::new(
-            NativeErrorCode::CacheIncompatible,
-            "text-only saved KV prefixes cannot represent historical audio",
         ));
     }
     if !matches!(request.input, GenerationInput::Chat { .. }) {
