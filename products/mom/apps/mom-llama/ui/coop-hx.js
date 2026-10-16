@@ -6103,7 +6103,15 @@
       });
     }
     const initialPrefillEpoch = recording.prefillEpoch;
-    recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
+    recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).then((live) => {
+      if (!live?.session && recording.prefillEpoch === initialPrefillEpoch) {
+        recording.prefillFailed = true;
+        markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
+          message: "The live audio session was unavailable; the saved recording will carry this turn.",
+        });
+      }
+      return live;
+    }).catch((error) => {
       if (recording.prefillEpoch === initialPrefillEpoch) {
         recording.prefillFailed = true;
         markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", { message: errorMessage(error) });
@@ -6627,6 +6635,12 @@
       producer_max_ipc_ms: Math.round(recording.prefillMaxIpcMs || 0),
     });
     const live = await recording.prefillSession.catch(() => null);
+    if (!live?.session && voiceRecording === recording && !recording.prefillFailed) {
+      recording.prefillFailed = true;
+      markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
+        message: "The live audio session was unavailable; the saved recording will carry this turn.",
+      });
+    }
     if (!live?.session || recording.prefillFailed || voiceRecording !== recording
         || (!prearm && recording.voiceActivity.voiced)
         || (recording.call && !voiceCallActive)) {
