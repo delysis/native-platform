@@ -62,7 +62,7 @@ pub use conversation_store::{
     conversation_resume_existing_for_empty_draft, conversation_search, conversation_select,
     conversation_siblings, conversation_system_message_update, draft_clear, draft_get,
     draft_update, message_branch_select, message_branches, message_copy, message_delete,
-    message_edit, message_record_call_transcript, text_attachment_import,
+    message_edit, message_record_voice_transcript, text_attachment_import,
 };
 pub use engine::{
     EngineCheckOptions, RuntimeWarmOutput, engine_check, engine_status, runtime_warm,

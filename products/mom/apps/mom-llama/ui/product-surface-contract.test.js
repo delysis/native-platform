@@ -283,9 +283,11 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
   assert.match(
     submitHandler,
-    /if \(callTranscript && result\?\.result\?\.kind === "direct"\)[\s\S]*?void \(async \(\) => \{[\s\S]*?invoke\("mom_llama_speech_transcribe_attachment"/,
+    /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"[\s\S]*?void \(async \(\) => \{[\s\S]*?invoke\("mom_llama_speech_transcribe_attachment"/,
     "Parakeet transcript work must start only in a detached sidecar after the awaited dispatch result",
   );
+  assert.ok(submitHandler.includes("output?.voice_attachment_id || voiceTranscriptAttachment"));
+  assert.ok(submitHandler.includes('invoke("mom_llama_message_record_voice_transcript"'));
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(

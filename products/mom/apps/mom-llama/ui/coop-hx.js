@@ -3667,7 +3667,6 @@
   let voiceCallConversation = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
-  let pendingCallMemoryTranscript = null;
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
   let pendingVoiceDispatchPrompt = null;
@@ -6610,12 +6609,6 @@
         conversation,
         attachment: imported.result.attachment.id,
       } : null;
-      if (call && imported.result?.attachment?.id) {
-        pendingCallMemoryTranscript = {
-          conversation,
-          attachment: imported.result.attachment.id,
-        };
-      }
     }
     if (call) callReplyConversation = conversation;
     const currentForm = document.getElementById("chat-form");
@@ -8353,6 +8346,7 @@
             : (voiceDispatch && liveVoiceTts?.conversation === conversation ? liveVoiceTts : null);
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
+          let voiceTranscriptAttachment = null;
           try {
             if (voiceDispatch) markVoiceLatency("generation_dispatched");
             const liveVoice = voiceDispatch
@@ -8365,6 +8359,7 @@
               : null;
             if (liveVoice) pendingVoiceAudioSession = null;
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
+            voiceTranscriptAttachment = fallbackVoice?.attachment || null;
             if (liveVoice) {
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
@@ -8431,14 +8426,41 @@
             // the attachment fallback can commit valid assistant text while
             // that presentation-only tag is unavailable at this boundary.
             const output = result?.result?.output || null;
-            if (callReplyConversation === conversation && output?.voice_attachment_id) {
-              // Native audio is the model input. Keep only the authority needed
-              // for a later private-memory transcript; Parakeet remains off the
-              // response hot path.
-              pendingCallMemoryTranscript = {
-                conversation,
-                attachment: output.voice_attachment_id,
-              };
+            const transcriptAttachment = output?.voice_attachment_id || voiceTranscriptAttachment;
+            if (result?.status !== "blocked" && result?.result?.kind === "direct"
+                && transcriptAttachment && output?.user_message_id) {
+              // The committed recording is still the current model input.
+              // Index its text on CPU while speech synthesis drains, so the
+              // next turn can use words instead of replaying an older WAV.
+              void (async () => {
+                const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
+                  attachment: transcriptAttachment,
+                }));
+                const primary = catalog.primary;
+                if (!primary || primary.kind !== "audio") {
+                  throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
+                }
+                const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+                  conversation,
+                  ...attachmentPreviewAnchor(catalog, primary),
+                  operation: speechOperationToken(),
+                });
+                if (transcribed?.status === "blocked") {
+                  report(transcribed);
+                  return;
+                }
+                const transcript = transcribed?.result?.transcript?.trim();
+                if (!transcript) {
+                  throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
+                }
+                const recorded = await invoke("mom_llama_message_record_voice_transcript", {
+                  conversation,
+                  message: output.user_message_id,
+                  attachment: transcriptAttachment,
+                  transcript,
+                });
+                if (recorded?.status === "blocked") report(recorded);
+              })().catch(reportError);
             }
             if (result?.status !== "blocked" && output?.assistant_text) {
               markVoiceLatency("tts_text_admitted", {
@@ -8461,32 +8483,6 @@
                 await beginVoiceCapture({ call: true });
               }
             }
-          }
-          const callTranscript = message.startsWith("[Phone call]") ? pendingCallMemoryTranscript : null;
-          pendingCallMemoryTranscript = null;
-          if (callTranscript && result?.result?.kind === "direct") {
-            const userMessage = result.result.output?.user_message_id;
-            // This indexing sidecar begins only after the omni-model response
-            // has completed. It never gates or supplies the current response.
-            void (async () => {
-              const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
-                attachment: callTranscript.attachment,
-              }));
-              const primary = catalog.primary;
-              if (!primary || primary.kind !== "audio") return null;
-              const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
-                conversation: callTranscript.conversation,
-                ...attachmentPreviewAnchor(catalog, primary),
-                operation: speechOperationToken(),
-              });
-              const transcript = transcribed?.result?.transcript?.trim();
-              if (!transcript || !userMessage) return null;
-              return invoke("mom_llama_message_record_call_transcript", {
-                conversation,
-                message: userMessage,
-                transcript,
-              });
-            })().catch(() => {});
           }
           if (!voiceDispatch) {
             document.querySelectorAll(".optimistic-voice-message").forEach((row) => {

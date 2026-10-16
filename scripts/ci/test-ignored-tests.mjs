@@ -639,11 +639,11 @@ test("the only platform-limited tests match their source cfg gates", () => {
       ["linux", "macos"],
     ],
     [
-      "tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
+      "speech::tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
       ["macos"],
     ],
     [
-      "tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
+      "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
       ["macos"],
     ],
   ]);

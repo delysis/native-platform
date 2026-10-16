@@ -1352,16 +1352,18 @@ pub fn mom_llama_message_edit(
 }
 
 #[tauri::command]
-pub fn mom_llama_message_record_call_transcript(
+pub fn mom_llama_message_record_voice_transcript(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     message: String,
+    attachment: String,
     transcript: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_message_record_call_transcript"))?;
-    command_value(mom_llama_runtime::message_record_call_transcript(
+    let _lease = runtime.admit(command_spec("mom_llama_message_record_voice_transcript"))?;
+    command_value(mom_llama_runtime::message_record_voice_transcript(
         &conversation,
         &message,
+        &attachment,
         transcript,
     ))
 }

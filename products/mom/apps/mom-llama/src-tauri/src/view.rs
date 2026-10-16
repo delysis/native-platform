@@ -652,12 +652,12 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Edit",
     },
     ControlSpec {
-        affordance: "message.record_call_transcript",
-        command: "mom_llama.message_record_call_transcript",
-        tauri_command: "mom_llama_message_record_call_transcript",
-        cli: "app-only; records a private transcript against its exact phone-call turn",
+        affordance: "message.record_voice_transcript",
+        command: "mom_llama.message_record_voice_transcript",
+        tauri_command: "mom_llama_message_record_voice_transcript",
+        cli: "app-only; records a private transcript against its exact voice turn",
         effect: "mom_llama.effects.conversation_store.v1",
-        label: "Remember call",
+        label: "Remember voice",
     },
     ControlSpec {
         affordance: "message.delete",

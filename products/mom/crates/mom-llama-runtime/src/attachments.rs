@@ -4989,6 +4989,20 @@ mod tests {
             .expect("old audio must not crowd out the current recording");
         assert_eq!(voice_reply.media.len(), 1);
         assert_eq!(voice_reply.staged_ids, vec![current.id, current_audio.id]);
+
+        // Long voice conversations retain occurrence evidence, but old WAVs
+        // do not consume the per-request attachment budget once omitted from
+        // model input. The historical prompt still carries message text.
+        let long_history = (0..=MAX_ACTIVE_ATTACHMENT_REFERENCES)
+            .map(|index| {
+                let prior = &messages[index % messages.len()];
+                message(&format!("long-turn-{index}"), prior.attachment_ids.clone())
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_live_audio_history("chat", &long_history)
+            .expect("long voice history preparation")
+            .expect("omitted old WAVs must not cap the number of turns");
+        assert!(prepared.media.is_empty());
     }
 
     #[test]
