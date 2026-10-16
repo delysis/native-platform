@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 59,
+  "expected_test_count": 64,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1369,6 +1369,61 @@
       "platforms": [
         "macos"
       ]
+    },
+    {
+      "test_id": "tests::real_incremental_audio_accepts_earlier_recording",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector",
+      "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH"],
+      "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "tests::real_text_greeting_seeds_next_incremental_audio_prefix",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector",
+      "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH"],
+      "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "speech::tests::real_local_saved_voice_transcription_diagnostic",
+      "package": "mom-llama-app",
+      "target": "lib",
+      "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
+      "prerequisite": "requires an existing saved voice attachment and the installed Parakeet model",
+      "required_environment": ["MOM_DIAG_CONVERSATION", "MOM_DIAG_ATTACHMENT"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local diagnostic cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["macos"]
+    },
+    {
+      "test_id": "real_prepared_persona_prefix_is_reused_by_first_voice_turn",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires real Gemma GGUF, matching projector, and 16 kHz voice WAV",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MMPROJ_PATH", "MOM_LLAMA_TEST_VOICE_WAV"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "real_voice_greeting_reports_its_actual_prefix_reuse",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
     },
     {
       "test_id": "real_incremental_voice_prefill_reports_silence_to_first_token",
