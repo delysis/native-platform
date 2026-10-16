@@ -23,18 +23,27 @@ test("resumed call prefill keeps a long captured utterance in bounded ordered bl
 });
 
 test("subframe detector rejects intra-speech microgaps and locates sustained silence", () => {
-  const onset = new Float32Array(256);
+  const onset = new Float32Array(4096);
   onset.fill(.001, 0, 64);
   onset.fill(.02, 64);
   const started = analyzeVoiceSamples(initialVoiceActivity(), onset, 48000, 64);
   const microgap = analyzeVoiceSamples(started.activity, new Float32Array(256), 48000, 64);
-  assert.equal(started.voiceOnsetSample, 64);
+  assert.ok(started.voiceOnsetSample >= 2000);
   assert.equal(microgap.silenceOnsetSample, null);
   const result = analyzeVoiceSamples(microgap.activity, new Float32Array(768), 48000, 64);
   assert.equal(result.silenceOnsetSample, 704);
   assert.equal(result.hadVoiced, true);
   assert.equal(result.subframes, 12);
   assert.equal(result.activity.voiced, false);
+});
+
+test("a short microphone spike never becomes a user turn", () => {
+  const spike = new Float32Array(4096);
+  spike.fill(.02, 0, 48000 * .032);
+  const result = analyzeVoiceSamples(initialVoiceActivity(), spike, 48000, 64);
+  assert.equal(result.activity.heardVoice, false);
+  assert.equal(result.hadVoiced, false);
+  assert.equal(result.voiceOnsetSample, null);
 });
 
 test("streaming resampling preserves phase across render quanta", () => {
@@ -87,7 +96,7 @@ test("streaming noise percentile follows a changed quiet floor in constant memor
   assert.ok(activity.noiseFloor > .0016);
   assert.ok(activity.noiseFloor < .0021);
   assert.equal(activity.noiseQuantile.heights.length, 5);
-  assert.equal(nextVoiceActivity(activity, .008, 1.33).voiced, true);
+  assert.equal(nextVoiceActivity(activity, .008, 85).voiced, true);
 });
 
 test("playback echo is suppressed while the canceller converges", () => {
