@@ -5011,6 +5011,78 @@ mod tests {
     }
 
     #[test]
+    fn finalizing_one_voice_turn_preserves_other_pending_audio() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("mixed-voice-transcript-history");
+        let data_dir = resolve_settings().expect("settings").data_dir;
+        let mut turns = Vec::new();
+        for index in 0..2 {
+            let path = data_dir.join(format!("recorded-turn-{index}.wav"));
+            let mut wav = STRUCTURALLY_VALID_WAV.to_vec();
+            *wav.last_mut().expect("sample byte") = index as u8;
+            std::fs::write(&path, wav).expect("write recording");
+            let attachment = attachment_import(&scope, "chat", &path)
+                .expect("import recording")
+                .result
+                .expect("recording result")
+                .attachment;
+            let mut turn = message(&format!("spoken-{index}"), vec![attachment.id]);
+            turn.content = "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.".into();
+            turns.push(turn);
+        }
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment db");
+        for turn in &turns {
+            let record = db
+                .attachments
+                .iter_mut()
+                .find(|record| record.id == turn.attachment_ids[0])
+                .expect("imported recording");
+            record.state = AttachmentState::Committed;
+            record.message_id = turn.id.clone();
+        }
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit recordings");
+
+        let pending = prepare_live_audio_history("chat", &turns)
+            .expect("prepare pending history")
+            .expect("both recordings are model input");
+        assert_eq!(pending.media.len(), 2);
+
+        turns[0]
+            .content
+            .push_str("\n\nFinal transcript for the first turn.");
+        let mixed = prepare_live_audio_history("chat", &turns)
+            .expect("prepare mixed history")
+            .expect("only the first recording is replaced");
+        assert_eq!(mixed.media.len(), 1);
+        assert!(
+            mixed.media[0]
+                .id
+                .starts_with(&format!("{}:", turns[1].attachment_ids[0]))
+        );
+        assert_eq!(
+            turns[0].attachment_ids.len(),
+            1,
+            "the saved WAV remains attached"
+        );
+
+        turns[1]
+            .content
+            .push_str("\n\nFinal transcript for the second turn.");
+        let complete = prepare_live_audio_history("chat", &turns)
+            .expect("prepare finalized history")
+            .expect("both exact recordings are replaced");
+        assert!(complete.media.is_empty());
+        assert_eq!(
+            turns[1].attachment_ids.len(),
+            1,
+            "the second WAV remains attached"
+        );
+    }
+
+    #[test]
     fn live_audio_history_keeps_pending_audio_until_exact_transcripts_replace_it() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("voice-history-commit");
