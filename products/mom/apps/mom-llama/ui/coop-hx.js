@@ -4943,12 +4943,12 @@
     };
     const panel = document.createElement("section");
     panel.className = "speech-playback";
-    const startNextCallPrefill = () => {
+    const startNextCallPrefill = (trigger = "buffered_playback_after_tts") => {
       if (nextCallPrefill || mode !== "call" || !voiceCallActive || voiceCallEpoch !== callEpoch) {
         return nextCallPrefill;
       }
       markTtsLatency("next_turn_prefill_started", {
-        overlap: "buffered_playback_after_tts",
+        overlap: trigger,
         buffered_runway_ms: controller.bufferedMs(),
       });
       const startedAt = performance.now();
@@ -4981,6 +4981,7 @@
       void beginVoiceCapture({
         call: true,
         prefillSession: nextCallPrefillGate,
+        onVoiceOnset: () => startNextCallPrefill("caller_voice_onset"),
       }).catch((error) => {
         callCaptureStarted = false;
         reportError(error);
@@ -5035,6 +5036,7 @@
         // the caller can interrupt without a device reopen or a dead interval.
         if (mode === "call" && voiceCallActive && voiceCallEpoch === callEpoch) {
           startCallCapture();
+          startBufferedNextCallPrefill();
         }
         if (button) {
           button.classList.remove("is-loading");
@@ -5062,6 +5064,7 @@
       },
       onBufferLevel: () => {
         if (schedulerWaitStartedAt !== null && !schedulerWakeTimer) queueMicrotask(pump);
+        startBufferedNextCallPrefill();
       },
       onRendererEvent: (event) => markTtsLatency(`playback_${event.type}`, event),
       onRendererMetrics: (metrics) => markTtsLatency("playback_renderer", metrics),
@@ -5085,6 +5088,19 @@
         if (mode === "call" && liveVoiceTts === playback) liveVoiceTts = null;
       },
     });
+
+    const startBufferedNextCallPrefill = () => {
+      if (mode !== "call" || !closed || stopped || !controller.playing) return;
+      // The completed Gemma reply has released its worker. Begin the next
+      // microphone prefix while already-rendering PCM can absorb the brief
+      // GPU handoff, without starving Qwen's first playable packet.
+      if (!leadController.shouldPrepareNextCall({
+        generationComplete: closed,
+        playing: controller.playing,
+        bufferedMs: controller.bufferedMs(),
+      })) return;
+      startNextCallPrefill("generation_complete_buffered_playback");
+    };
 
     const fail = (error) => {
       if (stopped) return;
@@ -5156,10 +5172,9 @@
         if (closed) {
           window.clearTimeout(audioProgressWatchdog);
           audioProgressWatchdog = null;
-          // Preparing the next Gemma audio context contends with Qwen for the
-          // same Metal device. Start it only after the final TTS request has
-          // produced all PCM; the already-buffered tail hides preparation
-          // without starving the audio producer.
+          // The buffered-playback and caller-onset paths may have started the
+          // next Gemma session already. If neither did, the final PCM tail
+          // provides one last opportunity to prepare before playback ends.
           const aggregateRtf = ttsOutputAudioMs > 0
             ? Math.round((ttsSynthesisMs / ttsOutputAudioMs) * 10_000) / 10_000
             : null;
@@ -5402,6 +5417,7 @@
           buffered_runway_ms: controller.bufferedMs(),
           scheduler: leadController.snapshot(),
         });
+        startBufferedNextCallPrefill();
       }).catch(fail).finally(() => {
         window.clearTimeout(audioProgressWatchdog);
         audioProgressWatchdog = null;
@@ -5473,6 +5489,7 @@
         }
         closed = true;
         updateSemanticBackpressure({ terminal: true });
+        startBufferedNextCallPrefill();
         pump();
         return finished;
       },
@@ -5946,11 +5963,12 @@
     });
   };
 
-  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null } = {}) => {
+  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null, onVoiceOnset = null } = {}) => {
     if (voiceRecording) throw new Error("Voice capture is already active.");
     // The call controller opens the next microphone turn as playback starts so
-    // speech can stop the speaker locally. Its model target is attached only
-    // after the current synthesis producer releases the shared compute path.
+    // speech can stop the speaker locally. Its model target is attached when
+    // the playback buffer has runway, or immediately when real caller speech
+    // takes priority over the contact's remaining synthesis.
     // The streamed request lease can outlive audio by one terminal event, so the
     // ordinary composer busy gate must not reject this owned handoff.
     if (!call && chatBusyLeases.size) throw new Error("Voice capture is waiting for the current reply.");
@@ -6082,6 +6100,10 @@
             producer: "browser_capture",
             onset_sample: analysis.voiceOnsetSample,
           });
+          // A real caller takes priority over finishing the contact's voice.
+          // Release the prefetched-session gate at onset so PCM enters Gemma
+          // while the caller is speaking, even if Qwen still has a tail.
+          if (onVoiceOnset) queueMicrotask(onVoiceOnset);
           recording.preRoll.forEach((part) => enqueueVoicePrefill(recording, part));
           recording.preRoll = [];
           recording.preRollSamples = 0;
