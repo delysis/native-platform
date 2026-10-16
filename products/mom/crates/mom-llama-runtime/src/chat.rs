@@ -688,17 +688,6 @@ pub fn voice_audio_begin_in_scope(
             .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?
     };
     let attachments_us = elapsed_us(stage_started);
-    // The incremental engine owns only the current live microphone marker;
-    // it rejects completed media in the history. Fail admission before a
-    // session is returned so the existing recorded-WAV chat path can carry
-    // pending earlier audio and the current turn together. Parakeet does not
-    // gate that fallback or permit an empty historical representation.
-    if !history.media.is_empty() {
-        return Err(anyhow::anyhow!(
-            "voice_audio_pending_history_requires_complete_media_fallback"
-        ));
-    }
-
     let skill_free_fast_path = conversation.current_skill_ids.is_empty();
     let stage_started = Instant::now();
     let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
@@ -784,7 +773,10 @@ pub fn voice_audio_begin_in_scope(
             template: ChatTemplateChoice::PreferNonThinking,
         },
         sampling,
-        media: Vec::new(),
+        // Pending older recordings remain exact model context until a final
+        // transcript replaces each one. The incremental engine evaluates
+        // these before the live microphone marker.
+        media: history.media,
         cached_prefix,
     };
     let preparation_source_us = elapsed_us(total_started);

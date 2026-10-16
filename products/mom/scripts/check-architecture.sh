@@ -152,7 +152,7 @@ then
   exit 1
 fi
 
-if ! rg -q 'std::process::Command' ../../crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs
+if ! rg -q 'use std::process::(Command|\{[^}]*Command[^}]*\})' ../../crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs
 then
   echo "the Qwen speech backend no longer declares its exact managed-helper process boundary" >&2
   exit 1
