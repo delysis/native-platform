@@ -506,7 +506,9 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
   assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
   assert.ok(!live.includes("void beginVoiceCapture({ call: true }).catch(reportError);"));
-  assert.ok(interrupt.includes('liveVoiceTts?.mode === "call"'));
+  assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
+  assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
+  assert.ok(live.includes("if (stopped || activeOperation !== operation) return;"));
   assert.ok(interrupt.includes('markVoiceLatency("barge_in_detected"'));
   assert.ok(interrupt.includes("void reply.stop()"));
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));

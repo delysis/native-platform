@@ -2382,6 +2382,7 @@
     const conversation = voiceCallConversation;
     const microphoneStream = voiceCallMicrophoneStream;
     const callTts = liveVoiceTts?.mode === "call" ? liveVoiceTts : null;
+    const audibleCall = activeCallPlayback;
     const cancelGeneration = Boolean(
       conversation
       && callReplyConversation === conversation
@@ -2393,12 +2394,14 @@
     voiceReplyConversation = null;
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
+    activeCallPlayback = null;
 
     // Each stop function severs its local Web Audio nodes before its first
     // await. Start all of them before hiding the surface or waiting on IPC.
     const stops = [
       stopVoiceCapture({ discard: true }),
       callTts?.stop(),
+      audibleCall && audibleCall !== callTts ? audibleCall.stop() : null,
       stopSpeechPlayback(),
       stopCallBed(),
     ];
@@ -3670,6 +3673,7 @@
   let pendingVoiceDispatchPrompt = null;
   let voiceLatencyTrace = null;
   let liveVoiceTts = null;
+  let activeCallPlayback = null;
   // Retain measured Qwen cadence across turns on this machine. Each reply
   // still owns independent queue counters, while startup runway and segment
   // sizing begin from observed hardware behavior instead of cold constants.
@@ -4972,6 +4976,9 @@
       },
       onPlaybackStarted: (metrics = {}) => {
         markTtsLatency("playback_started", metrics);
+        if (mode === "call" && voiceCallActive && voiceCallEpoch === callEpoch) {
+          activeCallPlayback = playback;
+        }
         // Calls retain one WebKit microphone route with acoustic echo
         // cancellation. Begin processing it as soon as speech is audible so
         // the caller can interrupt without a device reopen or a dead interval.
@@ -5008,6 +5015,7 @@
       onRendererEvent: (event) => markTtsLatency(`playback_${event.type}`, event),
       onRendererMetrics: (metrics) => markTtsLatency("playback_renderer", metrics),
       onEnded: () => {
+        if (activeCallPlayback === playback) activeCallPlayback = null;
         if (button) {
           button.dataset.audioState = "ready";
           button.setAttribute("aria-label", "Play voice message");
@@ -5030,6 +5038,7 @@
     const fail = (error) => {
       if (stopped) return;
       stopped = true;
+      if (activeCallPlayback === playback) activeCallPlayback = null;
       updateSemanticBackpressure({ terminal: true });
       window.clearTimeout(audioProgressWatchdog);
       audioProgressWatchdog = null;
@@ -5199,6 +5208,7 @@
         markTtsLatency("tts_started", { overlap: "content_delta" });
       }
       const stream = pcmChannel((frame) => {
+        if (stopped || activeOperation !== operation) return;
         try {
           const decoded = decodePcmFrame(frame);
           const packetFrames = decoded.data.byteLength / (2 * decoded.channels);
@@ -5445,6 +5455,7 @@
       async cancel() {
         if (stopped) return;
         stopped = true;
+        if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);
         audioProgressWatchdog = null;
@@ -5469,6 +5480,7 @@
       async stop() {
         if (stopped) return;
         stopped = true;
+        if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);
         audioProgressWatchdog = null;
@@ -5793,7 +5805,7 @@
   };
 
   const interruptCallPlaybackForSpeech = (recording, detail = {}) => {
-    const reply = recording?.call && liveVoiceTts?.mode === "call" ? liveVoiceTts : null;
+    const reply = recording?.call ? activeCallPlayback : null;
     // The prearmed speculative reply is also the live TTS owner while the
     // caller is speaking, but it has no audible PCM yet. Treating the caller's
     // initial voice onset as a barge-in stopped that empty controller and left
