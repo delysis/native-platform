@@ -1437,15 +1437,16 @@ fn voice_prompt_for_transcript(message: &Message, attachment_id: &str) -> Option
     };
     (message.role == MessageRole::User
         && message.content == prompt
-        && message.attachment_ids.iter().any(|id| id == attachment_id))
-    .then_some(prompt)
+        && message.attachment_ids.len() == 1
+        && message.attachment_ids[0] == attachment_id)
+        .then_some(prompt)
 }
 
 /// A finalized transcript replaces this turn's recorded audio in future model
 /// context. The audio attachment remains on the message for playback and
 /// provenance; only prompt preparation changes its representation.
 pub(crate) fn has_final_voice_transcript(message: &Message) -> bool {
-    if message.role != MessageRole::User || message.attachment_ids.is_empty() {
+    if message.role != MessageRole::User || message.attachment_ids.len() != 1 {
         return false;
     }
     let prompt = if message.content.starts_with("[Phone call]") {
@@ -2460,11 +2461,21 @@ mod tests {
                 super::voice_prompt_for_transcript(&turn, "other-audio"),
                 None
             );
+            turn.attachment_ids.push("another-source".into());
+            assert_eq!(
+                super::voice_prompt_for_transcript(&turn, "exact-audio"),
+                None,
+                "one transcript cannot replace multiple attached sources"
+            );
+            turn.attachment_ids.pop();
             turn.content.push_str("\n\nAlready transcribed");
             assert_eq!(
                 super::voice_prompt_for_transcript(&turn, "exact-audio"),
                 None
             );
+            assert!(super::has_final_voice_transcript(&turn));
+            turn.attachment_ids.push("another-source".into());
+            assert!(!super::has_final_voice_transcript(&turn));
         }
     }
 
