@@ -344,7 +344,9 @@
         if (phase !== "open") return phase === "failed" ? false : fail("live_transcription_source_after_seal");
         if (!(samples instanceof Float32Array)) return fail("live_transcription_invalid_pcm");
         if (!samples.length) return true;
-        if (accepted + samples.length > 16000 * 29) return fail("live_transcription_too_long");
+        // Keep the browser source bound aligned with the native streaming
+        // reader; a long physical turn must not drop its tail at 29 seconds.
+        if (accepted + samples.length > 16000 * 2 * 60 * 60) return fail("live_transcription_too_long");
         // Includes the in-flight packet and staging, not just queued packets.
         if (accepted - delivered + samples.length > maxQueuedSamples) return fail("live_transcription_overflow");
         if (samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {

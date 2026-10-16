@@ -10,10 +10,13 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, never, s
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::live_transcription::{IngressFailure, IngressMetrics, PACKET_SAMPLES, PcmProducer};
+use crate::live_transcription::{
+    IngressFailure, IngressMetrics, MAX_TURN_SAMPLES, PACKET_SAMPLES, PcmProducer,
+};
 
 const OUTPUT_RATE: u32 = 16_000;
-const MAX_SAMPLES: usize = OUTPUT_RATE as usize * 29;
+const MAX_SAMPLES: usize = MAX_TURN_SAMPLES;
+const INITIAL_CAPTURE_CAPACITY_SAMPLES: usize = OUTPUT_RATE as usize * 29;
 const PRE_ROLL_SAMPLES: usize = OUTPUT_RATE as usize / 5;
 // Match the resident model's 40 ms audio-projector frame. The capture owner
 // can retain a much longer utterance, but every live or replay publication
@@ -1379,7 +1382,7 @@ fn begin(
         resampled: Vec::with_capacity(CALLBACK_CHUNK_FRAMES),
         pre_roll: VecDeque::with_capacity(PRE_ROLL_SAMPLES),
         settle_samples_remaining: CAPTURE_SETTLE_SAMPLES,
-        samples: Vec::with_capacity(MAX_SAMPLES),
+        samples: Vec::with_capacity(INITIAL_CAPTURE_CAPACITY_SAMPLES),
         prefill_cursor: 0,
         silence_gate: None,
         speculation_released: false,

@@ -30,6 +30,20 @@ test("browser tap coalesces callbacks and delivers source offsets exactly once",
   assert.equal(tap.metrics().backlog_samples, 0);
 });
 
+test("a spoken turn longer than 29 seconds keeps its complete transcription source", async () => {
+  let delivered = 0;
+  const tap = make({ send: async ({ samples }) => { delivered += samples.length; } });
+  const frame = new Float32Array(640).fill(0.25);
+  for (let index = 0; index < 750; index += 1) {
+    assert.equal(tap.append(frame), true);
+    await tick();
+  }
+  await tap.seal();
+  assert.equal(tap.metrics().phase, "complete");
+  assert.equal(delivered, 480_000);
+  assert.equal(tap.metrics().bridge_accepted_samples, 480_000);
+});
+
 test("delayed transcription leaves capture admission synchronous and final pending", async () => {
   const first = deferred(); const final = deferred();
   let pushes = 0; let finalCalled = false; let settled = false;
