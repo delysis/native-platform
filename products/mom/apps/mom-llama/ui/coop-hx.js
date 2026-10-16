@@ -2181,7 +2181,7 @@
       const response = await withDeadline(
         invoke("mom_llama_chat_send", {
           conversation,
-          message: "[Phone call] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
+          message: "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
         }),
         12_000,
         "call_reply_timeout: The contact did not finish answering the call.",

@@ -1292,7 +1292,15 @@ where
             ),
         ));
     }
-    let media = attachment_context.media.clone();
+    // The pickup greeting does not need to decode every historical voice note
+    // again. Their inspected text remains in the context messages, while the
+    // live turn keeps its normal audio path and exact attachment authority.
+    let call_greeting = input.message.starts_with("[Phone call] [Greeting]");
+    let media = if call_greeting {
+        Vec::new()
+    } else {
+        attachment_context.media.clone()
+    };
     if !media.is_empty()
         && !settings
             .mmproj_path
