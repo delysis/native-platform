@@ -7,8 +7,7 @@ use crate::conversation_store::{
     load_db_with_settings, strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
-    compatible_cached_prefix_for_owner_with_settings, compatible_conversation_prefix,
-    ensure_persona_prefix, invalidate_cache, persist_session_checkpoint,
+    compatible_cached_prefix_for_owner_with_settings, invalidate_cache, persist_session_checkpoint,
 };
 use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
@@ -738,26 +737,7 @@ pub fn voice_audio_begin_in_scope(
             skill_prompt.cache_owner_id.is_some(),
             skill_prompt.cache_owner_id.as_deref(),
         );
-        let conversation_prefix = compatible_cached_prefix_for_owner_with_settings(
-            &handle,
-            &messages,
-            Some(owner_ids[0]),
-            &settings,
-        )?
-        .filter(|(_, sequence)| handle.has_live_sequence_receipt(&sequence.export_receipt()));
-        if conversation_prefix.is_some() {
-            conversation_prefix
-        } else if let Some(owner_id) = owner_ids.get(1).copied() {
-            compatible_cached_prefix_for_owner_with_settings(
-                &handle,
-                &messages,
-                Some(owner_id),
-                &settings,
-            )?
-            .filter(|(_, sequence)| handle.has_live_sequence_receipt(&sequence.export_receipt()))
-        } else {
-            None
-        }
+        longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, true)?
     } else {
         None
     };
@@ -1445,21 +1425,10 @@ where
                 skill_prompt.cache_owner_id.is_some(),
                 skill_prompt.cache_owner_id.as_deref(),
             );
-            let conversation_cache =
-                compatible_conversation_prefix(&handle, &messages, owner_ids[0])?;
-            if conversation_cache.is_some() {
-                (conversation_cache, true)
-            } else if let Some(owner_id) = owner_ids.get(1).copied() {
-                let cache = ensure_persona_prefix(&handle, owner_id, &messages)?;
-                (
-                    cache
-                        .as_ref()
-                        .map(|cache| (cache.cache_id.clone(), cache.sequence.clone())),
-                    cache.is_some_and(|cache| cache.reused),
-                )
-            } else {
-                (None, false)
-            }
+            let cache =
+                longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, false)?;
+            let found = cache.is_some();
+            (cache, found)
         } else {
             (None, false)
         };
@@ -2149,6 +2118,44 @@ fn configure_voice_sampling(
     }
 }
 
+fn longest_cached_prefix_for_owners(
+    handle: &NativeModelHandle,
+    messages: &[ChatMessage],
+    owner_ids: &[&str],
+    settings: &crate::config::Settings,
+    require_live_receipt: bool,
+) -> Result<Option<(String, SequenceStateBlob)>> {
+    let mut longest: Option<(String, SequenceStateBlob)> = None;
+    for owner_id in owner_ids {
+        let candidate = compatible_cached_prefix_for_owner_with_settings(
+            handle,
+            messages,
+            Some(owner_id),
+            settings,
+        )?;
+        if let Some(candidate) = candidate.filter(|(_, sequence)| {
+            !require_live_receipt || handle.has_live_sequence_receipt(&sequence.export_receipt())
+        }) {
+            longest = prefer_longer_prefix(longest, candidate);
+        }
+    }
+    Ok(longest)
+}
+
+fn prefer_longer_prefix(
+    current: Option<(String, SequenceStateBlob)>,
+    candidate: (String, SequenceStateBlob),
+) -> Option<(String, SequenceStateBlob)> {
+    if current
+        .as_ref()
+        .is_some_and(|(_, sequence)| sequence.token_count >= candidate.1.token_count)
+    {
+        current
+    } else {
+        Some(candidate)
+    }
+}
+
 fn reusable_prefix_owner_ids<'a>(
     conversation_id: &'a str,
     source_persona_id: Option<&'a str>,
@@ -2176,12 +2183,34 @@ mod tests {
         ChatAttachmentContext, ChatSendOptions, ChatStreamLifecycle, Message, MessageRole,
         ReasoningStreamParser, ReasoningTarget, apply_conversation_model_pair,
         build_native_messages, configure_voice_sampling, empty_native_response_result,
-        native_context_messages, parse_reasoning_output, reusable_prefix_owner_ids,
-        user_turn_is_empty,
+        native_context_messages, parse_reasoning_output, prefer_longer_prefix,
+        reusable_prefix_owner_ids, user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
     use std::path::PathBuf;
+
+    #[test]
+    fn cached_prefix_selection_prefers_the_longest_compatible_owner() {
+        let prefix = |id: &str, tokens: usize| {
+            (
+                id.to_string(),
+                llama_native_types::SequenceStateBlob {
+                    sequence_id: 0,
+                    token_count: tokens,
+                    bytes: vec![1].into(),
+                    token_ids: vec![1; tokens],
+                },
+            )
+        };
+        let selected =
+            prefer_longer_prefix(Some(prefix("conversation", 20)), prefix("persona", 80))
+                .expect("a longer persona prefix must win");
+        assert_eq!(selected.0, "persona");
+        let selected = prefer_longer_prefix(Some(selected), prefix("short", 10))
+            .expect("a shorter prefix must not replace the selection");
+        assert_eq!(selected.0, "persona");
+    }
 
     fn assistant_message(reasoning: Option<&str>, content: &str) -> Message {
         Message {

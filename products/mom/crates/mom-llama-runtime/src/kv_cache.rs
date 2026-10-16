@@ -495,14 +495,6 @@ pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvC
     ))
 }
 
-pub(crate) fn compatible_conversation_prefix(
-    handle: &NativeModelHandle,
-    messages: &[ChatMessage],
-    conversation_id: &str,
-) -> Result<Option<(String, SequenceStateBlob)>> {
-    compatible_cached_prefix_for_owner(handle, messages, Some(conversation_id))
-}
-
 fn compatible_cached_prefix_for_owner(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
