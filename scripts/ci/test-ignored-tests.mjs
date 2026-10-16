@@ -646,6 +646,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
       "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
       ["macos"],
     ],
+    [
+      "speech::tests::real_local_saved_voice_transcription_diagnostic",
+      ["macos"],
+    ],
   ]);
   assert.match(
     fs.readFileSync(path.join(root, "products/loom/crates/tauri-plugin-loom/src/peer_compute_batch.rs"), "utf8"),
