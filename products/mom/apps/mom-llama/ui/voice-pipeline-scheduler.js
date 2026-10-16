@@ -147,6 +147,13 @@
       return first || !playing || runway <= this.targetRunwayMs();
     }
 
+    shouldPrepareNextCall({ generationComplete = false, playing = false, bufferedMs = 0 } = {}) {
+      if (!generationComplete || !playing || !Number.isFinite(bufferedMs)) return false;
+      // Preserve a full adaptive TTS refill runway before yielding Metal to
+      // the next microphone prefix. Actual caller speech bypasses this gate.
+      return bufferedMs >= Math.max(240, this.targetRunwayMs());
+    }
+
     chunkWordLimit({ first = false, bufferedMs = 0 } = {}) {
       if (first) return 4;
       const runway = Number.isFinite(bufferedMs) ? Math.max(0, bufferedMs) : 0;

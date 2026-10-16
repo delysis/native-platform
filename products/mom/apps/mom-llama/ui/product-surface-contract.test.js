@@ -757,7 +757,11 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(live.includes("reference_us: binding.tts_reference_us"));
   assert.ok(live.includes("helper_first_pcm_us: binding.tts_helper_first_pcm_us"));
   assert.ok(live.includes("time_to_first_audio_ms: binding.tts_time_to_first_audio_ms"));
-  assert.ok(live.includes('overlap: "buffered_playback_after_tts"'));
+  assert.ok(live.includes('startNextCallPrefill("generation_complete_buffered_playback")'));
+  assert.ok(live.includes('leadController.shouldPrepareNextCall({'));
+  assert.ok(live.includes('startBufferedNextCallPrefill();'));
+  assert.ok(bridge.includes('onVoiceOnset: () => startNextCallPrefill("caller_voice_onset")'));
+  assert.ok(bridge.includes('if (onVoiceOnset) queueMicrotask(onVoiceOnset)'));
   assert.ok(live.includes('markTtsLatency("tts_all_segments_finished"'));
   assert.ok(live.includes('markTtsLatency("next_turn_prefill_ready"'));
   assert.ok(live.includes("production_rtf: aggregateRtf"));

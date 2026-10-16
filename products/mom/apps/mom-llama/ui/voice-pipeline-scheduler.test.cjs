@@ -13,6 +13,17 @@ test("voice lead dispatches immediately for startup and only near its adaptive f
   assert.equal(lead.shouldDispatch({ playing: true, bufferedMs: lead.targetRunwayMs() }), true);
 });
 
+test("next call prefill waits for adaptive runway after generation completes", () => {
+  const lead = new AdaptiveVoiceLeadController();
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: false, playing: true, bufferedMs: 1_000 }), false);
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: false, bufferedMs: 1_000 }), false);
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: 239 }), false);
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: 240 }), true);
+  lead.noteSegment({ synthesisMs: 1_450, audioMs: 1_000, firstAudioMs: 260 });
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: 240 }), false);
+  assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: lead.targetRunwayMs() }), true);
+});
+
 test("slow synthesis and packet jitter raise the runway target", () => {
   const lead = new AdaptiveVoiceLeadController();
   const baseline = lead.targetRunwayMs();
