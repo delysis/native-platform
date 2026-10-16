@@ -430,18 +430,13 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
     }
     startup.begin_runtime_build()?;
     let runtime_data_dir = settings.data_dir.clone();
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|error| format!("Blessenger could not locate its installed voices: {error}"))?;
-    let packaged_voice_root = resource_dir.join("speech-voices/qwen-icl");
     let source_voice_root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/speech-voices/qwen-icl");
-    let installed_voice_root = if packaged_voice_root.join("manifest.json").is_file() {
-        packaged_voice_root
-    } else {
-        source_voice_root
-    };
+    let installed_voice_root = resolve_installed_voice_root(
+        app.path().resource_dir().ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        &source_voice_root,
+    )?;
     let voice_app = app.clone();
     let voice_root = installed_voice_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -557,6 +552,28 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             Err(message)
         }
     }
+}
+
+fn resolve_installed_voice_root(
+    resource_dir: Option<&std::path::Path>,
+    executable: Option<&std::path::Path>,
+    source_voice_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let packaged_from_executable = executable
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .map(|contents| contents.join("Resources"));
+    for candidate in resource_dir
+        .map(|root| root.join("speech-voices/qwen-icl"))
+        .into_iter()
+        .chain(packaged_from_executable.map(|root| root.join("speech-voices/qwen-icl")))
+        .chain(std::iter::once(source_voice_root.to_path_buf()))
+    {
+        if candidate.join("manifest.json").is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err("Blessenger could not locate its installed voices".to_string())
 }
 
 fn bind_acquired_model_pair(
@@ -1336,10 +1353,25 @@ mod tests {
         FinalExitDecision, FinalExitTarget, StartupAction, StartupController,
         StartupShutdownAction, bind_acquired_model_pair, decide_final_exit_target,
         final_exit_decision, first_run_warm_ready, model_acquisition, rejected_build_disposition,
-        safe_to_exit_after_shutdown, smoke_receipt,
+        resolve_installed_voice_root, safe_to_exit_after_shutdown, smoke_receipt,
     };
     use crate::app_runtime::{AppShutdownError, AppShutdownSummary};
     use serde_json::json;
+
+    #[test]
+    fn bundled_voices_resolve_from_executable_when_tauri_resource_path_is_unavailable() {
+        let bundle = tempfile::tempdir().expect("bundle");
+        let contents = bundle.path().join("Blessenger.app/Contents");
+        let voice_root = contents.join("Resources/speech-voices/qwen-icl");
+        std::fs::create_dir_all(&voice_root).expect("voice directory");
+        std::fs::write(voice_root.join("manifest.json"), "{}").expect("manifest");
+        let executable = contents.join("MacOS/mom-llama-app");
+        assert_eq!(
+            resolve_installed_voice_root(None, Some(&executable), &bundle.path().join("absent"))
+                .expect("bundled voices"),
+            voice_root
+        );
+    }
 
     fn startup_controller() -> StartupController {
         StartupController::new()
