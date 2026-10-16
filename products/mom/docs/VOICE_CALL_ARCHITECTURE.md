@@ -464,6 +464,18 @@ packaged trace distinguish late synthesis, IPC/admission delay, renderer-thread
 starvation, and an actual PCM underrun without inferring any of them from a
 spinner or a successful `AudioContext.resume()` call.
 
+The Rust `paced_diagnostic` example for Parakeet now emits a structured paired
+receipt for a 16 kHz float WAV fed in 40 ms chunks at microphone pace, followed
+by the same already-resident backend receiving the complete WAV after input
+stops. On a 14.001-second local sample, the paced stream produced its final
+transcript 55 ms after the last sample; complete-input transcription took
+3,801 ms after that point. Both texts matched. The local receipt is
+`products/mom/artifacts/latency/2026-10-16-parakeet-paced-stream-vs-complete.json`.
+This is a Parakeet component result, not packaged-call acceptance. The app
+still starts its shipped transcript backfill from the saved recording after
+Gemma's reply; its staged live PCM fan-out has not yet been joined to the
+exact saved-turn commit. That integration is the next latency-critical step.
+
 ## Qualification sequence
 
 1. Capture, echo cancellation, playback cancellation, and ownership tests.
