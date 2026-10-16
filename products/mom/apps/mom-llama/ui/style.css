@@ -160,6 +160,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 .chrome .icon-button { width: 40px; height: 40px; flex: 0 0 40px; }
+.boot-chrome { background: transparent; }
 html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 76px; }
 .chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }
 .titlebar-drag-surface { position: relative; flex: 1; height: 100%; min-width: 28px; }
@@ -185,14 +186,14 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
 /* WebKit can win pointer hit testing at an overlay window's outermost pixels.
    Explicit regions keep the native resize gesture and cursor discoverable. */
 .window-resize-region { position: fixed; z-index: 1000; }
-.window-resize-north, .window-resize-south { left: 18px; right: 18px; height: 12px; cursor: ns-resize; }
-.window-resize-east, .window-resize-west { top: 18px; bottom: 18px; width: 12px; cursor: ew-resize; }
+.window-resize-north, .window-resize-south { left: 18px; right: 18px; height: 10px; cursor: ns-resize; }
+.window-resize-east, .window-resize-west { top: 18px; bottom: 18px; width: 10px; cursor: ew-resize; }
 .window-resize-north { top: 0; }
 .window-resize-south { bottom: 0; }
 .window-resize-east { right: 0; }
 .window-resize-west { left: 0; }
 .window-resize-north-east, .window-resize-north-west,
-.window-resize-south-east, .window-resize-south-west { width: 20px; height: 20px; }
+.window-resize-south-east, .window-resize-south-west { width: 18px; height: 18px; }
 .window-resize-north-east { top: 0; right: 0; cursor: nesw-resize; }
 .window-resize-north-west { top: 0; left: 0; cursor: nwse-resize; }
 .window-resize-south-east { right: 0; bottom: 0; cursor: nwse-resize; }

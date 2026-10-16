@@ -8909,7 +8909,7 @@
     });
   };
 
-  const RESIZE_EDGE_PX = 16;
+  const RESIZE_EDGE_PX = 14;
   const resizeHitForPoint = (clientX, clientY) => {
     const west = clientX <= RESIZE_EDGE_PX;
     const east = clientX >= window.innerWidth - RESIZE_EDGE_PX;
