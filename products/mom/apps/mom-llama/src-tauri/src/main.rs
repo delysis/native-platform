@@ -1607,6 +1607,8 @@ mod tests {
             audio_projector_warm_us: 1,
             persona_prefixes_ready: 0,
             persona_prefixes_reused: 0,
+            persona_prefix_warm_us: 0,
+            persona_prefix_warm_status: "no_selected_persona".into(),
             settings_us: 1,
             model_acquire_us: 1,
             model_load: None,

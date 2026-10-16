@@ -440,6 +440,7 @@ const aggregateMetricNames = [
   "call_request_to_playback_ms",
   "runtime_warm_total_ms",
   "runtime_warm_audio_projector_ms",
+  "runtime_warm_persona_prefix_ms",
   "capture_to_model_target_ms",
   "audio_backlog_ms",
   "projector_realtime_factor",

@@ -2,8 +2,12 @@ use crate::config::{
     Settings, VerifiedArtifactDigest, VerifiedModelArtifacts, persist_verified_model_artifacts,
     resolve_settings,
 };
+use crate::conversation_store::{
+    CONVERSATIONS_NAMESPACE, ConversationDb, ConversationKind, DraftRecipients,
+};
 use crate::native_runtime::{resident_model, resident_slots, resident_status};
 use crate::receipts::{Blocker, CommandResult};
+use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
 use llama_native_types::{
@@ -37,12 +41,15 @@ pub struct RuntimeWarmOutput {
     pub audio_projector_warm_us: u64,
     pub persona_prefixes_ready: usize,
     pub persona_prefixes_reused: usize,
+    pub persona_prefix_warm_us: u64,
+    pub persona_prefix_warm_status: String,
     pub settings_us: u64,
     pub model_acquire_us: u64,
     pub model_load: Option<NativeModelLoadMetrics>,
 }
 
-/// Loads the configured model as soon as the shell exists.
+/// Loads the configured model and prepares the selected contact's voice prefix
+/// before the first foreground microphone turn.
 ///
 /// Persona prefixes are built on first use and retained in the resident memory
 /// cache. Walking every Persona here serialized and encrypted hundreds of
@@ -57,7 +64,18 @@ pub fn runtime_warm_until_cancelled(
     cancellation: Option<&AtomicBool>,
 ) -> Result<CommandResult<RuntimeWarmOutput>> {
     if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
-        return Ok(runtime_warm_result(false, false, 0, 0, 0, 0, 0, None));
+        return Ok(runtime_warm_result(
+            false,
+            false,
+            0,
+            0,
+            0,
+            0,
+            "cancelled",
+            0,
+            0,
+            None,
+        ));
     }
     let settings_started = std::time::Instant::now();
     let settings = resolve_settings()?;
@@ -133,17 +151,64 @@ pub fn runtime_warm_until_cancelled(
     } else {
         0
     };
+    let prefix_started = std::time::Instant::now();
+    let (persona_prefixes_ready, persona_prefix_warm_status) = if audio_projector_warmed
+        && !cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        match selected_voice_persona_to_warm() {
+            Ok(Some(persona_id)) => {
+                match crate::kv_cache::kv_cache_prepare_voice_persona_resident(scope, &persona_id) {
+                    Ok(prepared) if prepared.result.is_some() => (1, "ready"),
+                    Ok(_) => (0, "blocked"),
+                    Err(_) => (0, "failed"),
+                }
+            }
+            Ok(None) => (0, "no_selected_persona"),
+            Err(_) => (0, "selection_unavailable"),
+        }
+    } else {
+        (0, "skipped")
+    };
+    let persona_prefix_warm_us = prefix_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
     drop(handle);
     Ok(runtime_warm_result(
         true,
         audio_projector_warmed,
         audio_projector_warm_us,
+        persona_prefixes_ready,
         0,
-        0,
+        persona_prefix_warm_us,
+        persona_prefix_warm_status,
         settings_us,
         model_acquire_us,
         model_load,
     ))
+}
+
+fn selected_voice_persona_to_warm() -> Result<Option<String>> {
+    let store = RuntimeStore::current()?;
+    let db: ConversationDb = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
+    let draft = if db.selected_conversation_id.as_deref() == Some("default") {
+        crate::conversation_store::conversation_draft_recipients()?
+    } else {
+        DraftRecipients::default()
+    };
+    Ok(selected_voice_persona_id(&db, &draft))
+}
+
+fn selected_voice_persona_id(db: &ConversationDb, draft: &DraftRecipients) -> Option<String> {
+    let selected = db.selected_conversation_id.as_deref()?;
+    if selected == "default" {
+        return (draft.recipient_ids.len() == 1).then(|| draft.recipient_ids[0].clone());
+    }
+    let conversation = db.conversations.iter().find(|item| item.id == selected)?;
+    match conversation.kind {
+        ConversationKind::PersonaTemplate => Some(conversation.id.clone()),
+        ConversationKind::Chat => conversation.source_conversation_id.clone(),
+    }
 }
 
 #[expect(
@@ -156,6 +221,8 @@ fn runtime_warm_result(
     audio_projector_warm_us: u64,
     persona_prefixes_ready: usize,
     persona_prefixes_reused: usize,
+    persona_prefix_warm_us: u64,
+    persona_prefix_warm_status: &str,
     settings_us: u64,
     model_acquire_us: u64,
     model_load: Option<NativeModelLoadMetrics>,
@@ -169,6 +236,8 @@ fn runtime_warm_result(
             audio_projector_warm_us,
             persona_prefixes_ready,
             persona_prefixes_reused,
+            persona_prefix_warm_us,
+            persona_prefix_warm_status: persona_prefix_warm_status.to_string(),
             settings_us,
             model_acquire_us,
             model_load,
@@ -431,7 +500,8 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_warm_until_cancelled, validate_model_path};
+    use super::{runtime_warm_until_cancelled, selected_voice_persona_id, validate_model_path};
+    use crate::conversation_store::{ConversationDb, DraftRecipients};
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
@@ -448,6 +518,40 @@ mod tests {
         assert_eq!(output.audio_projector_warm_us, 0);
         assert_eq!(output.persona_prefixes_ready, 0);
         assert_eq!(output.persona_prefixes_reused, 0);
+    }
+
+    #[test]
+    fn launch_warms_only_the_selected_contact() {
+        let mut db = ConversationDb::default();
+        let draft = DraftRecipients {
+            recipient_ids: vec!["persona-janina".into()],
+            name: None,
+        };
+        db.selected_conversation_id = Some("default".into());
+        assert_eq!(
+            selected_voice_persona_id(&db, &draft).as_deref(),
+            Some("persona-janina")
+        );
+        db.selected_conversation_id = Some("chat-janina".into());
+        db.conversations.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "chat-janina", "title": "Janina", "created_at": "1", "updated_at": "1",
+                "kind": "chat", "selected_model_path": null,
+                "source_conversation_id": "persona-janina"
+            }))
+            .expect("chat fixture"),
+        );
+        assert_eq!(
+            selected_voice_persona_id(&db, &DraftRecipients::default()).as_deref(),
+            Some("persona-janina")
+        );
+        db.selected_conversation_id = Some("other-chat".into());
+        assert_eq!(selected_voice_persona_id(&db, &draft), None);
+        db.selected_conversation_id = Some("default".into());
+        assert_eq!(
+            selected_voice_persona_id(&db, &DraftRecipients::default()),
+            None
+        );
     }
 
     #[test]

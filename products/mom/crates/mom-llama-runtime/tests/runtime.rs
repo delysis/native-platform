@@ -2854,23 +2854,21 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no built-in persona"))?;
-    let started = std::time::Instant::now();
-    let saved = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona.id)?;
-    let prepared = saved
-        .result
-        .ok_or_else(|| anyhow!("voice cache failed: {:?}", saved.blocker))?;
-    eprintln!(
-        "VOICE_PERSONA_PREFIX_CACHE {{\"prepare_ms\":{},\"prefill_ms\":{},\"verification_ms\":{},\"promotion_ms\":{},\"tokens\":{},\"bytes\":{}}}",
-        started.elapsed().as_millis(),
-        prepared.prefill_us as f64 / 1000.0,
-        prepared.verification_us as f64 / 1000.0,
-        prepared.promotion_us as f64 / 1000.0,
-        prepared.metadata.token_ids.len(),
-        prepared.metadata.state_bytes
-    );
-    assert!(!prepared.persisted);
-    assert_eq!(prepared.persistence_us, 0);
     mom_llama_runtime::conversation_draft_open(Some(persona.id))?;
+    let started = std::time::Instant::now();
+    let warmed = mom_llama_runtime::runtime_warm(&scope)?;
+    let warmed = warmed
+        .result
+        .ok_or_else(|| anyhow!("runtime warm failed: {:?}", warmed.blocker))?;
+    eprintln!(
+        "VOICE_PERSONA_PREFIX_CACHE {{\"prepare_ms\":{},\"prefix_ms\":{},\"status\":\"{}\",\"ready\":{}}}",
+        started.elapsed().as_millis(),
+        warmed.persona_prefix_warm_us as f64 / 1000.0,
+        warmed.persona_prefix_warm_status,
+        warmed.persona_prefixes_ready
+    );
+    assert_eq!(warmed.persona_prefix_warm_status, "ready");
+    assert_eq!(warmed.persona_prefixes_ready, 1);
     let conversation = mom_llama_runtime::conversation_draft_call_start()?
         .result
         .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;

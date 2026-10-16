@@ -3980,6 +3980,13 @@
         typeof runtimeWarm?.audio_projector_warmed === "boolean"
           ? runtimeWarm.audio_projector_warmed
           : null,
+      runtime_warm_persona_prefix_ms:
+        Number.isFinite(Number(runtimeWarm?.persona_prefix_warm_us))
+          ? Math.round(Number(runtimeWarm.persona_prefix_warm_us) / 10) / 100 : null,
+      runtime_warm_persona_prefix_status: runtimeWarm?.persona_prefix_warm_status || null,
+      runtime_warm_persona_prefixes_ready:
+        Number.isFinite(Number(runtimeWarm?.persona_prefixes_ready))
+          ? Number(runtimeWarm.persona_prefixes_ready) : null,
       model_load_total_ms: Number.isFinite(Number(modelLoad?.total_us))
         ? Math.round(Number(modelLoad.total_us) / 10) / 100 : null,
       model_load_backend_ms: Number.isFinite(Number(modelLoad?.backend_us))
@@ -9595,6 +9602,8 @@
             audio_projector_warm_us: Number(response?.result?.audio_projector_warm_us || 0),
             persona_prefixes_ready: Number(response?.result?.persona_prefixes_ready || 0),
             persona_prefixes_reused: Number(response?.result?.persona_prefixes_reused || 0),
+            persona_prefix_warm_us: Number(response?.result?.persona_prefix_warm_us || 0),
+            persona_prefix_warm_status: response?.result?.persona_prefix_warm_status || "unknown",
             settings_us: Number(response?.result?.settings_us || 0),
             model_acquire_us: Number(response?.result?.model_acquire_us || 0),
             model_load: response?.result?.model_load || null,
