@@ -1206,8 +1206,11 @@ impl AppRuntimeHandle {
                             )),
                         },
                     };
+                eprintln!("Blessenger shutdown: recovery worker {} ms", started.elapsed().as_millis());
                 self.wait_for_work_drained().await;
+                eprintln!("Blessenger shutdown: app work drained {} ms", started.elapsed().as_millis());
                 let supervisor = self.0.operation_supervisor.shutdown();
+                eprintln!("Blessenger shutdown: operations joined {} ms", started.elapsed().as_millis());
                 let final_recovery_worker = Arc::clone(&persona_approval_worker);
                 let final_persona_approval_recovery = match tokio::task::spawn_blocking(move || {
                     final_recovery_worker.reconcile_now()
@@ -1243,6 +1246,7 @@ impl AppRuntimeHandle {
                         (!operation_errors.is_empty()).then(|| operation_errors.join("; "))
                     };
                 let speech_shutdown = self.0.speech.shutdown().await;
+                eprintln!("Blessenger shutdown: speech joined {} ms", started.elapsed().as_millis());
                 let (speech_error, speech_host_joined, speech_active_operation_count, speech_retained_playback_count) =
                     match speech_shutdown {
                         Ok(receipt) => (
@@ -1284,6 +1288,7 @@ impl AppRuntimeHandle {
                         // after both product domains have drained.
                         AppNativeHost::Shared(_) => (Vec::new(), None, 0, false),
                     };
+                eprintln!("Blessenger shutdown: native joined {} ms", started.elapsed().as_millis());
                 let expected_native_worker_count = native_worker_ids.len();
                 let operation_supervisor_phase = supervisor.phase;
                 let active_operation_count = supervisor.active_operations;
