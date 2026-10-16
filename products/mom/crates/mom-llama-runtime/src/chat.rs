@@ -1,6 +1,6 @@
 use crate::attachments::{
     ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
-    prepare_live_audio_commit, prepare_live_audio_history,
+    prepare_live_audio_commit, prepare_live_audio_history, prepare_voice_reply_attachments,
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
@@ -1229,11 +1229,18 @@ where
         conversation.execution_profile.mmproj_path.clone(),
     );
     let active_messages = crate::document::checked_active_messages(&conversation)?;
-    let attachment_context = match prepare_chat_attachments(
-        &input.conversation_id,
-        &active_messages,
-        regenerate_user_id.as_deref(),
-    )? {
+    let voice_reply = regenerate_user_id.is_none()
+        && (input.message.starts_with("[Voice note]") || input.message.starts_with("[Phone call]"));
+    let prepared_attachments = if voice_reply {
+        prepare_voice_reply_attachments(&input.conversation_id, &active_messages)?
+    } else {
+        prepare_chat_attachments(
+            &input.conversation_id,
+            &active_messages,
+            regenerate_user_id.as_deref(),
+        )?
+    };
+    let attachment_context = match prepared_attachments {
         Ok(context) => context,
         Err(blocked) => {
             return Ok(CommandResult::blocked(

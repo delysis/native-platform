@@ -1079,6 +1079,21 @@ pub(crate) fn prepare_live_audio_commit(
     .map(|result| result.map(|scoped| scoped.context))
 }
 
+/// A recorded voice note may fall back to a staged WAV when live prefill is
+/// unavailable. Admit that current recording, but never replay older audio
+/// attachments into this new request.
+pub(crate) fn prepare_voice_reply_attachments(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::DraftCurrentMediaHistoryText,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
 pub(crate) fn commit_generated_exchange(
     fallback_db: ConversationDb,
     conversation: Conversation,
@@ -4924,9 +4939,14 @@ mod tests {
         }
         let store = RuntimeStore::current().expect("store");
         let mut db = load_attachment_db().expect("attachment db");
-        for record in &mut db.attachments {
+        for (index, id) in historical.iter().enumerate() {
+            let record = db
+                .attachments
+                .iter_mut()
+                .find(|record| &record.id == id)
+                .expect("imported recording");
             record.state = AttachmentState::Committed;
-            record.message_id = "earlier-turn".to_string();
+            record.message_id = format!("earlier-turn-{index}");
         }
         store
             .put(ATTACHMENTS_NAMESPACE, &db)
@@ -4934,7 +4954,11 @@ mod tests {
         store
             .put(DRAFTS_NAMESPACE, &DraftDb::default())
             .expect("clear draft");
-        let messages = vec![message("earlier-turn", historical)];
+        let messages = historical
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| message(&format!("earlier-turn-{index}"), vec![id]))
+            .collect::<Vec<_>>();
         let ordinary = prepare_chat_attachments("chat", &messages, None)
             .expect("ordinary preparation")
             .expect_err("ordinary media admission must retain its limit");
@@ -4951,9 +4975,20 @@ mod tests {
         let commit = prepare_live_audio_commit("chat", &messages)
             .expect("voice commit preparation")
             .expect("old audio must not be readmitted");
-        assert_eq!(commit.staged_ids, vec![current.id]);
+        assert_eq!(commit.staged_ids, vec![current.id.clone()]);
         assert!(commit.media.is_empty());
         assert!(commit.current_text.contains("current note"));
+
+        let current_audio = attachment_import(&scope, "chat", &data_dir.join("recording-0.wav"))
+            .expect("stage current audio")
+            .result
+            .expect("current audio result")
+            .attachment;
+        let voice_reply = prepare_voice_reply_attachments("chat", &messages)
+            .expect("voice reply preparation")
+            .expect("old audio must not crowd out the current recording");
+        assert_eq!(voice_reply.media.len(), 1);
+        assert_eq!(voice_reply.staged_ids, vec![current.id, current_audio.id]);
     }
 
     #[test]

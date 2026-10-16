@@ -1340,7 +1340,7 @@
       ]
     },
     {
-      "test_id": "tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
+      "test_id": "speech::tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
       "package": "mom-llama-app",
       "target": "lib",
       "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
@@ -1353,7 +1353,7 @@
       ]
     },
     {
-      "test_id": "tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
+      "test_id": "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
       "package": "mom-llama-app",
       "target": "lib",
       "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
