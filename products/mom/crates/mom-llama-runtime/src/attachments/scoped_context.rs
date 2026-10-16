@@ -122,9 +122,30 @@ pub(crate) fn prepare_scoped_chat_attachments(
         if message.attachment_ids.is_empty() {
             continue;
         }
+        // The final transcript is the model representation of this recorded
+        // user turn. Keep the archived WAV attached to the saved message, but
+        // never send both that WAV and its replacement text to the model.
+        // Unknown records still pass through normal validation and fail closed.
+        let context_ids = if crate::conversation_store::has_final_voice_transcript(message) {
+            message
+                .attachment_ids
+                .iter()
+                .filter(|id| {
+                    records
+                        .get(id.as_str())
+                        .is_none_or(|record| record.kind != AttachmentKind::Audio)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            message.attachment_ids.clone()
+        };
+        if context_ids.is_empty() {
+            continue;
+        }
         let resolved = match resolve_attachment_set(
             conversation_id,
-            &message.attachment_ids,
+            &context_ids,
             AttachmentState::Committed,
             &records,
             &mut resolution,

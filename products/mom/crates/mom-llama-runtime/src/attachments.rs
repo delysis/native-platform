@@ -4965,6 +4965,52 @@ mod tests {
     }
 
     #[test]
+    fn final_voice_transcript_replaces_only_model_audio_not_the_saved_recording() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("final-voice-transcript-swap");
+        let audio_path = resolve_settings()
+            .expect("settings")
+            .data_dir
+            .join("recorded-turn.wav");
+        std::fs::write(&audio_path, STRUCTURALLY_VALID_WAV).expect("write recording");
+        let attachment = attachment_import(&scope, "chat", &audio_path)
+            .expect("import recording")
+            .result
+            .expect("recording result")
+            .attachment;
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment db");
+        let record = db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == attachment.id)
+            .expect("imported recording");
+        record.state = AttachmentState::Committed;
+        record.message_id = "spoken".to_string();
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit recording");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear draft");
+
+        let prompt = "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
+        let mut turn = message("spoken", vec![attachment.id.clone()]);
+        turn.content = prompt.to_string();
+        let pending = prepare_chat_attachments("chat", std::slice::from_ref(&turn), None)
+            .expect("prepare pending turn")
+            .expect("pending audio is valid model input");
+        assert_eq!(pending.media.len(), 1);
+
+        turn.content = format!("{prompt}\n\nThe complete final transcript.");
+        let finalized = prepare_chat_attachments("chat", std::slice::from_ref(&turn), None)
+            .expect("prepare finalized turn")
+            .expect("transcript is valid model input");
+        assert!(finalized.media.is_empty());
+        assert_eq!(turn.attachment_ids, vec![attachment.id]);
+    }
+
+    #[test]
     fn live_audio_commit_keeps_draft_without_readmitting_old_recordings() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("voice-history-commit");

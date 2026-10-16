@@ -1441,6 +1441,27 @@ fn voice_prompt_for_transcript(message: &Message, attachment_id: &str) -> Option
     .then_some(prompt)
 }
 
+/// A finalized transcript replaces this turn's recorded audio in future model
+/// context. The audio attachment remains on the message for playback and
+/// provenance; only prompt preparation changes its representation.
+pub(crate) fn has_final_voice_transcript(message: &Message) -> bool {
+    if message.role != MessageRole::User || message.attachment_ids.is_empty() {
+        return false;
+    }
+    let prompt = if message.content.starts_with("[Phone call]") {
+        "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
+    } else if message.content.starts_with("[Voice note]") {
+        "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble."
+    } else {
+        return false;
+    };
+    message
+        .content
+        .strip_prefix(prompt)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .is_some_and(|transcript| !transcript.trim().is_empty())
+}
+
 pub fn message_delete(
     conversation_id: &str,
     message_id: &str,
