@@ -6012,7 +6012,10 @@
   // from the active chain without ever dropping or truncating its history.
   let voiceHistoryRecovery = null;
   const recoverPendingVoiceHistory = () => {
-    if (voiceHistoryRecovery) return voiceHistoryRecovery;
+    // Selection or call teardown can arrive while an earlier conversation is
+    // still being examined. Revisit the current selection after that pass;
+    // otherwise its recordings can remain forever on the slow media path.
+    if (voiceHistoryRecovery) return voiceHistoryRecovery.then(() => recoverPendingVoiceHistory());
     voiceHistoryRecovery = (async () => {
       const listed = await invoke("mom_llama_conversation_list");
       if (listed?.status === "blocked" || !Array.isArray(listed?.result)) return;
@@ -6037,24 +6040,50 @@
           if (voiceCallActive || voiceRecording) return;
           const attachment = message.attachment_ids[0];
           try {
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_started", {
+              conversation: conversation.id, message: message.id, attachment,
+            });
             const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
               attachment,
             }));
-            if (catalog.primary?.kind !== "audio") continue;
+            if (catalog.primary?.kind !== "audio") {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id, reason: "not_audio",
+              });
+              continue;
+            }
             const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
               conversation: conversation.id,
               ...attachmentPreviewAnchor(catalog, catalog.primary),
               operation: speechOperationToken(),
             });
-            if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) continue;
+            if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id,
+                reason: transcribed?.blocker?.code || "empty_transcript",
+              });
+              continue;
+            }
             const recorded = await invoke("mom_llama_message_record_voice_transcript", {
               conversation: conversation.id,
               message: message.id,
               attachment,
               transcript: transcribed.result.transcript.trim(),
             });
-            if (recorded?.status === "blocked" || !recorded?.result) continue;
+            if (recorded?.status === "blocked" || !recorded?.result) {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id,
+                reason: recorded?.blocker?.code || "record_failed",
+              });
+              continue;
+            }
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_finished", {
+              message: message.id,
+            });
           } catch (error) {
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_failed", {
+              message: message.id, reason: errorMessage(error),
+            });
             console.warn("Voice history recovery paused", errorMessage(error));
             return;
           }
