@@ -5181,10 +5181,12 @@
     });
 
     const startBufferedNextCallPrefill = () => {
-      if (mode !== "call" || !closed || stopped || !controller.playing) return;
+      if (mode !== "call" || !closed || stopped || !controller.playing
+          || running || pendingText.trim()) return;
       // The completed Gemma reply has released its worker. Begin the next
-      // microphone prefix while already-rendering PCM can absorb the brief
-      // GPU handoff, without starving Qwen's first playable packet.
+      // microphone prefix during the final PCM tail only after Qwen has
+      // released its active segment. Competing prefill can otherwise turn a
+      // sub-real-time TTS segment into repeated playback underruns.
       if (!leadController.shouldPrepareNextCall({
         generationComplete: closed,
         playing: controller.playing,
