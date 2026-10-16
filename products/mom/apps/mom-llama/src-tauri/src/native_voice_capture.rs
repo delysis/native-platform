@@ -10,6 +10,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, never, s
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::live_transcription::{IngressFailure, IngressMetrics, PACKET_SAMPLES, PcmProducer};
+
 const OUTPUT_RATE: u32 = 16_000;
 const MAX_SAMPLES: usize = OUTPUT_RATE as usize * 29;
 const PRE_ROLL_SAMPLES: usize = OUTPUT_RATE as usize / 5;
@@ -144,6 +146,8 @@ type EventSink = Arc<dyn Fn(CaptureEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct CaptureMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) transcription_ingress: Option<IngressMetrics>,
     pub(crate) source_rate_hz: u32,
     pub(crate) requested_buffer_frames: u32,
     pub(crate) callbacks: u64,
@@ -379,6 +383,7 @@ enum Command {
     },
     Start {
         capture: String,
+        transcription: Option<PcmProducer>,
         target: Option<CaptureTarget>,
         call: bool,
         events: EventSink,
@@ -419,6 +424,8 @@ struct Chunk {
 
 struct Active {
     capture: String,
+    // Owned by the physical capture, never by CaptureTarget or its replay cursor.
+    transcription: Option<PcmProducer>,
     target: Option<CaptureTarget>,
     call: bool,
     events: EventSink,
@@ -514,8 +521,29 @@ impl NativeVoiceCapture {
         call: bool,
         events: EventSink,
     ) -> Result<(), NativeVoiceCaptureError> {
+        self.start_with_transcription(capture, target, call, events, None)
+    }
+
+    // The current command deliberately calls start(), without activating this
+    // staged path. The missing app_runtime owner must retain the reader's work
+    // lease and bind its source receipt to the actual saved turn first.
+    pub(crate) fn start_with_transcription(
+        &self,
+        capture: String,
+        target: Option<CaptureTarget>,
+        call: bool,
+        events: EventSink,
+        transcription: Option<PcmProducer>,
+    ) -> Result<(), NativeVoiceCaptureError> {
+        if transcription
+            .as_ref()
+            .is_some_and(|source| source.identity().capture != capture)
+        {
+            return Err(NativeVoiceCaptureError::RecordingMismatch);
+        }
         self.request(|reply| Command::Start {
             capture,
+            transcription,
             target,
             call,
             events,
@@ -616,11 +644,12 @@ fn owner_loop(commands: &Receiver<Command>) {
                 }
                 Ok(Command::Start {
                     capture,
+                    transcription,
                     target,
                     call,
                     events,
                     reply,
-                }) => match begin(capture, target, call, events) {
+                }) => match begin(capture, target, call, events, transcription) {
                     Ok(next) => {
                         active = Some(next);
                         let _ = reply.send(Ok(()));
@@ -716,6 +745,7 @@ fn prepare() -> Result<PrepareMetrics, NativeVoiceCaptureError> {
         None,
         true,
         Arc::new(|_| {}),
+        None,
     )?;
     let first = active
         .audio_rx
@@ -940,6 +970,7 @@ impl Active {
         let start = self.samples.len();
         let copy_started = Instant::now();
         self.samples.extend(self.pre_roll.drain(..count));
+        self.publish_transcription();
         self.record_retained_copy(copy_started);
         self.pre_roll.clear();
         if self.target.is_some() && self.terminal_error.is_none() {
@@ -962,9 +993,17 @@ impl Active {
             let _ = self.flush_prefill();
         }
         let available = MAX_SAMPLES.saturating_sub(self.samples.len());
+        if samples.len() > available
+            && let Some(source) = &mut self.transcription
+        {
+            // The existing recording cap remains unchanged, but a transcript
+            // must not silently certify a source whose physical tail was lost.
+            source.reject(IngressFailure::TooLong);
+        }
         let kept = &samples[..samples.len().min(available)];
         let copy_started = Instant::now();
         self.samples.extend_from_slice(kept);
+        self.publish_transcription();
         self.record_retained_copy(copy_started);
         if !prefill {
             self.metrics.retained_only_samples = self
@@ -981,6 +1020,15 @@ impl Active {
             // uses its authoritative checkpoint offset and replays from
             // `samples` if speech resumes.
             self.prefill_cursor = self.samples.len();
+        }
+    }
+
+    fn publish_transcription(&mut self) {
+        if let Some(source) = &mut self.transcription {
+            // Transcription failure is isolated: preserve audio and Gemma work.
+            // The reader observes the sticky failure, never a partial final.
+            let _ = publish_transcription_retained(source, &self.samples, false);
+            self.metrics.transcription_ingress = Some(source.metrics());
         }
     }
 
@@ -1225,6 +1273,26 @@ fn publish_retained(
     }))
 }
 
+fn publish_transcription_retained(
+    producer: &mut PcmProducer,
+    samples: &[f32],
+    flush: bool,
+) -> Result<(), IngressFailure> {
+    if producer.sample_offset() > samples.len() {
+        producer.reject(IngressFailure::SourceOrder);
+        return Err(IngressFailure::SourceOrder);
+    }
+    while producer.sample_offset() < samples.len() {
+        if !flush && samples.len() - producer.sample_offset() < PACKET_SAMPLES {
+            break;
+        }
+        let start = producer.sample_offset();
+        let end = (start + PACKET_SAMPLES).min(samples.len());
+        producer.append_at(start, &samples[start..end])?;
+    }
+    Ok(())
+}
+
 fn retained_replay(
     samples: &[f32],
     sample_offset: usize,
@@ -1242,6 +1310,7 @@ fn begin(
     target: Option<CaptureTarget>,
     call: bool,
     events: EventSink,
+    transcription: Option<PcmProducer>,
 ) -> Result<Active, NativeVoiceCaptureError> {
     let device = cpal::default_host()
         .default_input_device()
@@ -1297,6 +1366,7 @@ fn begin(
         .map_err(|error| NativeVoiceCaptureError::StartStream(error.to_string()))?;
     let active = Active {
         capture,
+        transcription,
         target,
         call,
         events,
@@ -1472,6 +1542,9 @@ fn finish(mut active: Active) -> Result<CaptureOutput, NativeVoiceCaptureError> 
         return Err(NativeVoiceCaptureError::Stream(error));
     }
     if active.overflowed.load(Ordering::Acquire) {
+        if let Some(source) = &mut active.transcription {
+            source.reject(IngressFailure::Overflow);
+        }
         return Err(NativeVoiceCaptureError::QueueOverflow);
     }
     active.metrics.retained_samples = active.samples.len();
@@ -1479,6 +1552,11 @@ fn finish(mut active: Active) -> Result<CaptureOutput, NativeVoiceCaptureError> 
     let wav = encode_wav(&active.samples)?;
     active.metrics.wav_encode_us =
         wav_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    if let Some(source) = &mut active.transcription {
+        let _ = publish_transcription_retained(source, &active.samples, true);
+        let _ = source.seal(active.samples.len());
+        active.metrics.transcription_ingress = Some(source.metrics());
+    }
     Ok(CaptureOutput {
         wav,
         heard_voice: active.voice.heard_voice,
@@ -1817,6 +1895,117 @@ mod tests {
             sink,
             cancel: Arc::new(|| {}),
         }
+    }
+
+    #[tokio::test]
+    async fn transcription_source_survives_model_seal_cancel_and_checkpoint_replay() {
+        use crate::live_transcription::{TurnIdentity, channel};
+        let (mut source, mut reader) = channel(TurnIdentity {
+            turn: "turn-a".into(),
+            capture: "capture-a".into(),
+            conversation: "chat-a".into(),
+        })
+        .expect("test setup");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let old_sink = Arc::new(RecordingSink::default());
+        let cancellation = Arc::clone(&cancelled);
+        let old_target = CaptureTarget {
+            id: "speculation-a".into(),
+            sink: old_sink.clone(),
+            cancel: Arc::new(move || {
+                cancellation.store(true, Ordering::Release);
+            }),
+        };
+        let mut retained = vec![0.25; 1280];
+        let mut model_cursor = 0;
+        publish_transcription_retained(&mut source, &retained, false).expect("test setup");
+        while publish_retained(&retained, &mut model_cursor, &old_target)
+            .expect("test setup")
+            .is_some()
+        {}
+        old_target.sink.seal().expect("test setup");
+        (old_target.cancel)(); // resumed speech belays this model answer only
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(
+            reader.source_receipt().is_err(),
+            "a model seal cannot finalize the source"
+        );
+
+        retained.extend_from_slice(&[0.5; 713]);
+        let new_sink = Arc::new(RecordingSink::default());
+        let new_target = recording_target("resumed-a", Arc::clone(&new_sink));
+        // Exercise the actual retained-replay helper used by retarget().
+        let replay = retained_replay(&retained, 640).expect("test setup");
+        new_target.sink.push(replay).expect("test setup");
+        model_cursor = retained.len();
+        assert_eq!(
+            source.sample_offset(),
+            1280,
+            "Gemma replay cannot rewind Parakeet"
+        );
+        publish_transcription_retained(&mut source, &retained, true).expect("test setup");
+        source.seal(retained.len()).expect("test setup");
+        let mut observed = Vec::new();
+        while let Some(packet) = reader.next().await.expect("test setup") {
+            observed.extend_from_slice(&packet.samples[..packet.count]);
+            reader.acknowledge(&packet).expect("test setup");
+        }
+        assert_eq!(observed, retained, "no duplicate or missing source sample");
+        assert_eq!(
+            model_cursor,
+            reader.source_receipt().expect("test setup").samples
+        );
+        assert_eq!(
+            *new_sink.samples.lock().expect("test setup"),
+            retained[640..]
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_overflow_does_not_poison_the_model_pcm_sink() {
+        use crate::live_transcription::{TurnIdentity, channel};
+        let (mut source, mut reader) = channel(TurnIdentity {
+            turn: "turn-a".into(),
+            capture: "capture-a".into(),
+            conversation: "chat-a".into(),
+        })
+        .expect("test setup");
+        let retained = vec![0.25; 65 * PACKET_SAMPLES];
+        assert_eq!(
+            publish_transcription_retained(&mut source, &retained, true),
+            Err(IngressFailure::Overflow)
+        );
+        let sink = Arc::new(RecordingSink::default());
+        let target = recording_target("gemma-a", Arc::clone(&sink));
+        let mut cursor = 0;
+        while publish_retained(&retained, &mut cursor, &target)
+            .expect("test setup")
+            .is_some()
+        {}
+        assert_eq!(*sink.samples.lock().expect("test setup"), retained);
+        assert!(matches!(reader.next().await, Err(IngressFailure::Overflow)));
+        assert!(reader.source_receipt().is_err());
+    }
+
+    #[test]
+    fn a_shrinking_retained_source_is_not_a_transcription_retarget() {
+        use crate::live_transcription::{TurnIdentity, channel};
+        let (mut source, _reader) = channel(TurnIdentity {
+            turn: "turn-a".into(),
+            capture: "capture-a".into(),
+            conversation: "chat-a".into(),
+        })
+        .expect("test setup");
+        publish_transcription_retained(&mut source, &[0.25; PACKET_SAMPLES], true)
+            .expect("test setup");
+        assert_eq!(
+            publish_transcription_retained(&mut source, &[0.25; 10], true),
+            Err(IngressFailure::SourceOrder)
+        );
+        assert_eq!(
+            source.seal(PACKET_SAMPLES),
+            Err(IngressFailure::SourceOrder)
+        );
     }
 
     #[test]

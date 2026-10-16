@@ -5883,6 +5883,7 @@
     };
     markVoiceLatency("capture_processing", captureMetrics);
     if (discard) {
+      recording.transcription?.cancel();
       if (recording.speculation && !recording.speculation.confirmed) {
         void abortCallSpeculation(recording);
       } else if (abortPrefill) {
@@ -5892,6 +5893,9 @@
       }
       return null;
     }
+    // Physical stop seals the transcript independently. Never await Parakeet
+    // here, and never seal it at speculative Gemma end-of-input.
+    recording.transcription?.seal();
     enqueueVoicePrefill(recording, new Float32Array(), true);
     await recording.pushChain;
     return {
@@ -5919,7 +5923,7 @@
     });
   };
 
-  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null } = {}) => {
+  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null } = {}) => {
     if (voiceRecording) throw new Error("Voice capture is already active.");
     // The call controller opens the next microphone turn as playback starts so
     // speech can stop the speaker locally. Its model target is attached only
@@ -5951,6 +5955,9 @@
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
+      // Optional staged tap. Default callers remain unchanged until the native
+      // owner/command and exact saved-source binding are implemented.
+      transcription,
       capturedSamples: 0, prefillInputStartSample: null,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
@@ -6035,6 +6042,9 @@
       if (pcm.length) {
         recording.capturedPcm.push(pcm);
         recording.capturedSamples += pcm.length;
+        // Source-side only: this executes during speculation as well. The
+        // Gemma replay/retarget path never feeds this independent cursor.
+        recording.transcription?.append(pcm);
       }
       // A speculative decode has consumed its native prefill session. Keep
       // recording locally; on resumed speech, restore its prepared turn and

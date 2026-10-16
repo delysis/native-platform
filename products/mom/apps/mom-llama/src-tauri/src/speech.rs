@@ -1,3 +1,6 @@
+use crate::live_transcription::{
+    self, FinalTranscript, IngressMetrics, PcmReader, SourceReceipt, TurnIdentity,
+};
 use async_trait::async_trait;
 use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult,
@@ -452,6 +455,15 @@ trait SpeechExecutor: Send + Sync {
         &self,
         request: TranscriptionRequest,
     ) -> Result<TranscriptionResponse, String>;
+    // A default preserves existing test executors; only the host implementation
+    // supplies a real streaming path. No complete-WAV emulation is permitted.
+    async fn transcribe_live(
+        &self,
+        _request: TranscriptionRequest,
+        _input: PcmReader,
+    ) -> Result<(TranscriptionResponse, SourceReceipt), String> {
+        Err("speech_live_transcription_unavailable".to_string())
+    }
     fn cancel(&self, request_id: &SpeechRequestId) -> usize;
     fn quiesce(&self) -> Result<(), SpeechHostError>;
     async fn shutdown(&self) -> Result<(), SpeechHostError>;
@@ -495,6 +507,30 @@ impl SpeechExecutor for HostSpeechExecutor {
             .final_response()
             .await
             .map_err(|error| speech_error_message(&error))
+    }
+
+    async fn transcribe_live(
+        &self,
+        request: TranscriptionRequest,
+        input: PcmReader,
+    ) -> Result<(TranscriptionResponse, SourceReceipt), String> {
+        let status = input.status();
+        let work = async {
+            let ticket = self
+                .host
+                .transcribe(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            consume_live_transcription(ticket, input).await
+        };
+        // Overflow/cancel must interrupt both model admission and a blocked
+        // audio push. Dropping a ticket requests its existing owned cancellation.
+        tokio::select! {
+            biased;
+            error = live_transcription::failure(status) => Err(error.to_string()),
+            result = tokio::time::timeout(std::time::Duration::from_secs(90), work) =>
+                result.map_err(|_| "speech_live_transcription_deadline".to_string())?,
+        }
     }
 
     fn cancel(&self, request_id: &SpeechRequestId) -> usize {
@@ -606,6 +642,97 @@ impl HostSpeechExecutor {
             _ => return Err("speech_stream_receipt_invalid: Qwen's final streamed receipt did not match the emitted PCM".to_string()),
         }
         Ok(response)
+    }
+}
+
+/// Final-only forwarding, with a separate source completeness proof. The
+/// backend's EOF/final response alone cannot authorize a truncated stream.
+async fn consume_live_transcription(
+    ticket: speech_native_types::TranscriptionTicket,
+    mut input: PcmReader,
+) -> Result<(TranscriptionResponse, SourceReceipt), String> {
+    let sink = ticket
+        .audio_sink
+        .clone()
+        .ok_or_else(|| "speech_live_sink_missing".to_string())?;
+    let format = live_pcm_format();
+    let forward = async {
+        let mut sequence = 0_u64;
+        while let Some(packet) = input.next().await.map_err(|error| error.to_string())? {
+            let mut bytes = Vec::with_capacity(packet.count * 4);
+            for sample in &packet.samples[..packet.count] {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            let chunk = speech_native_types::AudioChunk {
+                sequence,
+                sample_offset: packet.offset as u64,
+                format,
+                data: bytes,
+                end_of_stream: false,
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), sink.push(chunk))
+                .await
+                .map_err(|_| "speech_live_ingress_backlog".to_string())?
+                .map_err(|error| speech_error_message(&error))?;
+            input
+                .acknowledge(&packet)
+                .map_err(|error| error.to_string())?;
+            sequence += 1;
+        }
+        // All pushes are individually acknowledged before finish. The Speech
+        // sink's finish may intentionally close the data channel; it is not a
+        // guarantee that unacknowledged producer work was consumed.
+        sink.finish()
+            .await
+            .map_err(|error| speech_error_message(&error))?;
+        input.source_receipt().map_err(|error| error.to_string())
+    };
+    let final_response = async {
+        ticket
+            .final_response()
+            .await
+            .map_err(|error| speech_error_message(&error))
+    };
+    let (source, response) = tokio::try_join!(forward, final_response)?;
+    Ok((response, source))
+}
+
+fn live_pcm_format() -> PcmFormat {
+    PcmFormat {
+        sample_rate_hz: live_transcription::RATE,
+        channels: 1,
+        sample_format: PcmSampleFormat::F32Le,
+        interleaved: true,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LiveTranscriptionTrace {
+    pub(crate) schema: &'static str,
+    pub(crate) operation: String,
+    pub(crate) source: TurnIdentity,
+    pub(crate) stage: &'static str,
+    pub(crate) elapsed_us: u64,
+    pub(crate) ingress: IngressMetrics,
+    pub(crate) error: Option<String>,
+}
+
+// Cancelling/dropping the caller also settles the Mom registry, not only the
+// Speech ticket. No detached app task or process is introduced by this stage.
+struct LiveSpeechOperation<'a> {
+    speech: &'a MomSpeech,
+    operation: &'a str,
+    request_id: SpeechRequestId,
+    armed: bool,
+}
+impl Drop for LiveSpeechOperation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.speech.executor.cancel(&self.request_id);
+        self.speech
+            .finish_operation(self.operation, &self.request_id);
     }
 }
 
@@ -1165,6 +1292,83 @@ impl MomSpeech {
             true,
             false,
         ))
+    }
+
+    /// Staged capture-to-host API. The caller must own this future under an
+    /// AppWorkLease and persist trace events. This does NOT publish a transcript
+    /// or register a new command; the omitted save/KV owners are required first.
+    #[allow(dead_code)]
+    pub(crate) async fn transcribe_live(
+        &self,
+        operation: &str,
+        input: PcmReader,
+        trace: Arc<dyn Fn(LiveTranscriptionTrace) + Send + Sync>,
+    ) -> Result<FinalTranscript, String> {
+        validate_operation_token(operation).map_err(|error| error.to_string())?;
+        let observer = input.observer();
+        let started = Instant::now();
+        let emit = |stage, error| {
+            trace(LiveTranscriptionTrace {
+                schema: "mom_llama.live_transcription.v1",
+                operation: operation.to_string(),
+                source: observer.identity().clone(),
+                stage,
+                elapsed_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                ingress: observer.metrics(),
+                error,
+            })
+        };
+        emit("admission_started", None);
+        let result: Result<FinalTranscript, String> = async {
+            let descriptors = self.executor.current_descriptors().map_err(|error| error.to_string())?;
+            let selection = select_parakeet(&descriptors).map_err(|error| error.message)?;
+            let supports_stream = selection.descriptor.capabilities.iter().any(|capability| {
+                capability.model_id.as_deref() == Some(PARAKEET_MODEL_ID)
+                    && matches!(&capability.operation,
+                        SpeechOperationCapability::Transcription(value)
+                            if value.streaming && value.accepted_audio.contains(&AcceptedAudio::Pcm))
+            });
+            if !supports_stream { return Err("speech_live_pcm_route_unavailable".to_string()); }
+            // A reused UI operation label must not let an old turn's guard cancel
+            // a different turn. The activation owner must still allocate fresh
+            // capture/turn identities and prohibit same-source re-admission.
+            let mut request_hash = Sha256::new();
+            for value in [operation, input.identity().turn.as_str(),
+                input.identity().capture.as_str(), input.identity().conversation.as_str()] {
+                request_hash.update((value.len() as u64).to_le_bytes());
+                request_hash.update(value.as_bytes());
+            }
+            let request_id = SpeechRequestId(format!("mom-live-transcribe-{:x}", request_hash.finalize()));
+            self.begin_operation(operation, request_id.clone(), OperationKind::Transcription)
+                .map_err(|error| error.message)?;
+            let mut guard = LiveSpeechOperation { speech: self, operation, request_id: request_id.clone(), armed: true };
+            let request = TranscriptionRequest {
+                context: request_context(request_id.clone(), SpeechRouteSelector::ExactBackend {
+                    backend_id: PARAKEET_BACKEND_ID.to_string(),
+                    model_id: Some(PARAKEET_MODEL_ID.to_string()), voice_id: None,
+                }, 90_000),
+                input: TranscriptionInput::Stream { stream_id: input.identity().turn.clone(), format: live_pcm_format() },
+                language: Some("en".to_string()), task: TranscriptionTask::Transcribe,
+                timestamps: TimestampGranularity::None, diarization: DiarizationPolicy::Disabled,
+                partial_results: false, punctuation: true, hotwords: Vec::new(),
+            };
+            let (response, source) = self.executor.transcribe_live(request, input).await?;
+            emit("final_result", None);
+            validate_parakeet_response(&response, &request_id).map_err(|error| error.message)?;
+            select_resident_parakeet(&self.executor.current_descriptors().map_err(|error| error.to_string())?)
+                .map_err(|error| error.message)?;
+            let candidate = FinalTranscript::from_complete(source, response.text).map_err(|error| error.to_string())?;
+            self.complete_operation(operation, &request_id).map_err(|error| error.message)?;
+            guard.armed = false;
+            // A final candidate is not a store commit. No caller may present
+            // this stage as successful replacement of audio in model history.
+            emit("final_uncommitted", None);
+            Ok(candidate)
+        }.await;
+        if let Err(error) = &result {
+            emit("failed_audio_retained", Some(error.clone()));
+        }
+        result
     }
 
     pub async fn transcribe_attachment(
@@ -3868,5 +4072,192 @@ mod tests {
         -> anyhow::Result<()> {
             transcription_postflight_error(true).await
         }
+    }
+}
+
+#[cfg(test)]
+mod live_forwarding_tests {
+    // Protocol tests only: these mock sinks perform no recognition or inference.
+    use super::*;
+    use speech_native_types::{
+        AudioChunk, SpeechBackendKind, SpeechCancellation, SpeechResolvedRoute, SpeechUsage,
+        TranscriptionAudioSink, TranscriptionEvent, TranscriptionTicket,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Notify, mpsc, oneshot};
+
+    #[derive(Default)]
+    struct Cancellation(AtomicUsize);
+    impl SpeechCancellation for Cancellation {
+        fn cancel(&self, _: &SpeechRequestId) -> usize {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            1
+        }
+    }
+
+    #[derive(Default)]
+    struct Sink {
+        chunks: Mutex<Vec<AudioChunk>>,
+        entered: Notify,
+        release: Notify,
+        finished: Notify,
+        finish_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl TranscriptionAudioSink for Sink {
+        async fn push(&self, chunk: AudioChunk) -> Result<(), SpeechError> {
+            if chunk.sequence == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.chunks.lock().expect("test setup").push(chunk);
+            Ok(())
+        }
+        async fn finish(&self) -> Result<(), SpeechError> {
+            self.finish_calls.fetch_add(1, Ordering::AcqRel);
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    fn identity() -> TurnIdentity {
+        TurnIdentity {
+            turn: "turn-a".into(),
+            capture: "capture-a".into(),
+            conversation: "chat-a".into(),
+        }
+    }
+    fn response() -> TranscriptionResponse {
+        TranscriptionResponse {
+            request_id: SpeechRequestId("mock-live-request".into()),
+            route: SpeechResolvedRoute {
+                backend_id: PARAKEET_BACKEND_ID.into(),
+                model_id: Some(PARAKEET_MODEL_ID.into()),
+                voice_id: None,
+                backend_kind: SpeechBackendKind::EmbeddedModel,
+                network: NetworkBehavior::Never,
+            },
+            text: "Complete final only.".into(),
+            language: Some("en".into()),
+            segments: Vec::new(),
+            usage: SpeechUsage::default(), // deliberately no inference claim
+        }
+    }
+    fn ticket(
+        sink: Arc<Sink>,
+        cancellation: Arc<Cancellation>,
+    ) -> (
+        TranscriptionTicket,
+        mpsc::Sender<TranscriptionEvent>,
+        oneshot::Sender<Result<TranscriptionResponse, SpeechError>>,
+    ) {
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let (final_tx, final_rx) = oneshot::channel();
+        (
+            TranscriptionTicket::new(
+                SpeechRequestId("mock-live-request".into()),
+                events_rx,
+                final_rx,
+                cancellation,
+                Some(sink),
+            ),
+            events_tx,
+            final_tx,
+        )
+    }
+    async fn notified(notify: &Notify) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified())
+            .await
+            .expect("bounded protocol checkpoint");
+    }
+
+    #[tokio::test]
+    async fn live_forwarding_waits_for_all_pcm_and_final_not_partial_events() {
+        let (mut producer, reader) = live_transcription::channel(identity()).expect("test setup");
+        let sink = Arc::new(Sink::default());
+        let cancellation = Arc::new(Cancellation::default());
+        let (ticket, events, final_tx) = ticket(Arc::clone(&sink), cancellation);
+        let task = tokio::spawn(consume_live_transcription(ticket, reader));
+        producer.append_at(0, &[0.25; 640]).expect("test setup");
+        notified(&sink.entered).await; // the first push is blocked
+        events
+            .try_send(TranscriptionEvent::Partial {
+                request_id: SpeechRequestId("mock-live-request".into()),
+                sequence: 0,
+                text: "An incomplete partial".into(),
+            })
+            .expect("test setup");
+        producer.append_at(640, &[0.5; 7]).expect("test setup"); // no wait on the blocked sink
+        producer.seal(647).expect("test setup");
+        assert!(!task.is_finished());
+        sink.release.notify_one();
+        notified(&sink.finished).await;
+        assert!(
+            !task.is_finished(),
+            "a partial event is never the final result"
+        );
+        final_tx.send(Ok(response())).expect("test setup");
+        let (response, receipt) = task.await.expect("test setup").expect("test setup");
+        assert_eq!(response.text, "Complete final only.");
+        assert_eq!(receipt.samples, 647);
+        assert_eq!(receipt.metrics.backlog_samples, 0);
+        let chunks = sink.chunks.lock().expect("test setup");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            (
+                chunks[0].sequence,
+                chunks[0].sample_offset,
+                chunks[0].data.len()
+            ),
+            (0, 0, 2560)
+        );
+        assert_eq!(
+            (
+                chunks[1].sequence,
+                chunks[1].sample_offset,
+                chunks[1].data.len()
+            ),
+            (1, 640, 28)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.format == live_pcm_format() && !chunk.end_of_stream)
+        );
+        assert_eq!(sink.finish_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn early_backend_final_cannot_certify_an_abandoned_source() {
+        let (mut producer, reader) = live_transcription::channel(identity()).expect("test setup");
+        let sink = Arc::new(Sink::default());
+        let (ticket, _events, final_tx) =
+            ticket(Arc::clone(&sink), Arc::new(Cancellation::default()));
+        let task = tokio::spawn(consume_live_transcription(ticket, reader));
+        producer.append_at(0, &[0.25]).expect("test setup");
+        notified(&sink.entered).await;
+        final_tx.send(Ok(response())).expect("test setup"); // even a backend "final" is insufficient
+        drop(producer); // no physical seal; the tail could have been lost
+        sink.release.notify_one();
+        assert!(task.await.expect("test setup").is_err());
+        assert_eq!(sink.finish_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_live_forwarder_cancels_its_owned_ticket() {
+        let (mut producer, reader) = live_transcription::channel(identity()).expect("test setup");
+        let sink = Arc::new(Sink::default());
+        let cancellation = Arc::new(Cancellation::default());
+        let (ticket, _events, _final_tx) = ticket(Arc::clone(&sink), Arc::clone(&cancellation));
+        let task = tokio::spawn(consume_live_transcription(ticket, reader));
+        producer.append_at(0, &[0.25]).expect("test setup");
+        notified(&sink.entered).await;
+        task.abort();
+        assert!(task.await.expect_err("expected error").is_cancelled());
+        assert_eq!(cancellation.0.load(Ordering::Acquire), 1);
+        assert_eq!(
+            producer.append_at(1, &[0.5]),
+            Err(live_transcription::IngressFailure::ConsumerClosed)
+        );
     }
 }
