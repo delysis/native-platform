@@ -71,6 +71,11 @@ Machine-proposed emotion or speaking-style labels require their own exact model
 provenance and confidence. No label is inferred from a video title, persona
 description, clinical specialty, or the words in the transcript.
 
+The optional post-diarization emotion pass is documented in
+`EMOTION_DIARIZATION_ARCHIVE.md`. It binds raw uncalibrated model scores to the
+exact acoustic `segment_id` and creates a separate human review artifact. It
+does not modify or verify the segment's speaker identity.
+
 ## Human queue
 
 Build an immutable review queue and local browser:
