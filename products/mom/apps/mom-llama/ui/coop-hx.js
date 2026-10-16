@@ -2393,6 +2393,7 @@
     voiceCallActive = false;
     voiceCallEpoch = null;
     voiceCallConversation = null;
+    retryCallPrefillAfterTranscript = null;
     voiceReplyConversation = null;
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
@@ -3667,6 +3668,7 @@
   let voiceCallEpoch = null;
   let voiceCallAudio = null;
   let voiceCallConversation = null;
+  let retryCallPrefillAfterTranscript = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
   let pendingVoiceAudioSession = null;
@@ -4804,6 +4806,8 @@
     let firstRequest = true;
     let activeOperation = null;
     let nextCallPrefill = null;
+    let nextCallPrefillRetryPending = false;
+    let retryHook = null;
     let nextCallPrefillHandedOff = false;
     let callCaptureStarted = false;
     let settleNextCallPrefillGate = null;
@@ -4954,6 +4958,7 @@
       });
       const startedAt = performance.now();
       nextCallPrefill = startVoicePrefill(conversation, true, ttsLatencyTrace).then(async (live) => {
+        if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
         if ((stopped && !nextCallPrefillHandedOff)
             || !voiceCallActive || voiceCallEpoch !== callEpoch) {
           if (live?.session) {
@@ -4965,9 +4970,55 @@
           duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
           buffered_runway_ms: controller.bufferedMs(),
         });
+        if (retryCallPrefillAfterTranscript === retryHook) retryCallPrefillAfterTranscript = null;
         return live;
       }).catch((error) => {
-        markTtsLatency("next_turn_prefill_failed", { message: errorMessage(error) });
+        if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
+        const message = errorMessage(error);
+        markTtsLatency("next_turn_prefill_failed", { message });
+        if (message.includes("voice_audio_pending_history_requires_complete_media_fallback")) {
+          retryHook = (settledConversation) => {
+            const recording = callCaptureStarted ? voiceRecording : null;
+            const decision = globalThis.MomVoiceCapturePolicy.callPrefillRetryDecision({
+              expectedConversation: conversation, settledConversation,
+              callActive: voiceCallActive, expectedEpoch: callEpoch,
+              currentEpoch: voiceCallEpoch, captureStarted: callCaptureStarted, recording,
+            });
+            if (decision === "stale") return;
+            if (retryCallPrefillAfterTranscript === retryHook) retryCallPrefillAfterTranscript = null;
+            if (decision === "capture_advanced") {
+              markTtsLatency("next_turn_prefill_retry_skipped", { reason: "capture_advanced" });
+              return;
+            }
+            nextCallPrefill = null;
+            nextCallPrefillRetryPending = true;
+            const retry = startNextCallPrefill("transcript_committed");
+            if (recording) {
+              // Failed admission consumed no microphone PCM. Rebind before
+              // onset; the capture's pre-roll remains available to the retry.
+              recording.prefillEpoch += 1;
+              const epoch = recording.prefillEpoch;
+              recording.prefillFailed = false;
+              recording.prefillRetryPending = true;
+              recording.prefillSession = retry.then((replacement) => {
+                if (recording.prefillEpoch !== epoch || recording.sending
+                    || voiceRecording !== recording) {
+                  if (replacement?.session) {
+                    void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
+                  }
+                  return null;
+                }
+                recording.prefillRetryPending = false;
+                if (!replacement?.session) {
+                  recording.prefillFailed = true;
+                }
+                return replacement;
+              });
+              markVoiceLatencyIn(recording.trace, "audio_prefill_retry_after_transcript");
+            }
+          };
+          retryCallPrefillAfterTranscript = retryHook;
+        }
         return null;
       });
       settleNextCallPrefillGate?.(nextCallPrefill);
@@ -4981,7 +5032,8 @@
       nextCallPrefillHandedOff = true;
       void beginVoiceCapture({
         call: true,
-        prefillSession: nextCallPrefillGate,
+        prefillSession: nextCallPrefill || nextCallPrefillGate,
+        prefillRetryPending: nextCallPrefillRetryPending,
         onVoiceOnset: () => startNextCallPrefill("caller_voice_onset"),
       }).catch((error) => {
         callCaptureStarted = false;
@@ -5884,6 +5936,7 @@
       markVoiceLatencyIn(trace, "voice_transcript_finished", {
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
       });
+      retryCallPrefillAfterTranscript?.(conversation);
     }, (error) => {
       // Transcription enriches history when it succeeds. A failed or slow
       // transcriber must never hold the live listener or the next reply.
@@ -6012,7 +6065,8 @@
     });
   };
 
-  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null, onVoiceOnset = null } = {}) => {
+  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null,
+    prefillRetryPending = false, transcription = null, onVoiceOnset = null } = {}) => {
     if (voiceRecording) throw new Error("Voice capture is already active.");
     // The call controller opens the next microphone turn as playback starts so
     // speech can stop the speaker locally. Its model target is attached when
@@ -6059,6 +6113,7 @@
       voiceActivity: globalThis.MomVoiceCapturePolicy.initialVoiceActivity(),
       preRoll: [], preRollSamples: 0, prefillParts: [], prefillSamples: 0,
       pushChain: Promise.resolve(), prefillFailed: false, prefillSession: null,
+      prefillRetryPending,
       prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
       speculationReleaseMs: 180,
@@ -6104,7 +6159,14 @@
     }
     const initialPrefillEpoch = recording.prefillEpoch;
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).then((live) => {
-      if (!live?.session && recording.prefillEpoch === initialPrefillEpoch) {
+      if (recording.prefillEpoch !== initialPrefillEpoch) {
+        if (live?.session) {
+          void invoke("mom_llama_voice_audio_abort", { session: live.session }).catch(() => {});
+        }
+        return null;
+      }
+      recording.prefillRetryPending = false;
+      if (!live?.session) {
         recording.prefillFailed = true;
         markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
           message: "The live audio session was unavailable; the saved recording will carry this turn.",
@@ -6113,6 +6175,7 @@
       return live;
     }).catch((error) => {
       if (recording.prefillEpoch === initialPrefillEpoch) {
+        recording.prefillRetryPending = false;
         recording.prefillFailed = true;
         markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", { message: errorMessage(error) });
       }
@@ -6215,7 +6278,7 @@
           && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
           && voiceRecording === recording
           && !recording.sending && !recording.speculation && !recording.speculationStarting
-          && !recording.prefillFailed) {
+          && !recording.prefillFailed && !recording.prefillRetryPending) {
         markVoiceLatencyIn(recording.trace, "silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
@@ -6223,8 +6286,17 @@
           threshold,
         });
         void startVoiceSpeculation(recording).catch(reportError);
-      } else if (recording.call && recording.prefillFailed && activity.heardVoice
+      } else if (recording.call && (recording.prefillFailed || recording.prefillRetryPending)
+          && activity.heardVoice
           && activity.silentMs >= 900 && voiceRecording === recording && !recording.sending) {
+        if (recording.prefillRetryPending) {
+          recording.prefillRetryPending = false;
+          recording.prefillFailed = true;
+          recording.prefillEpoch += 1;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_retry_expired", {
+            silence_ms: activity.silentMs,
+          });
+        }
         // Incremental audio cannot admit a still-pending historical WAV.
         // The physical recording can use the complete-media chat path without
         // waiting for Parakeet or leaving the call stuck at a silence edge.
@@ -6842,14 +6914,17 @@
     // shutdown, encoding, and persistence continue after the recorder is gone.
     setVoiceRecordingVisible(false);
     const call = Boolean(voiceRecording?.call);
-    const capture = await stopVoiceCapture();
+    const capture = await stopVoiceCapture({ flushPrefill: !expectedRecording.prefillFailed });
     if (!capture?.heardVoice) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
       if (voiceCallActive) await beginVoiceCapture({ call: true });
       return;
     }
     const form = document.getElementById("chat-form");
-    const live = await expectedRecording.prefillSession.catch(() => null);
+    // Once a failed or expired incremental attempt chose recorded-audio
+    // fallback, its session may still be starting. It cannot hold this turn.
+    const live = expectedRecording.prefillFailed
+      ? null : await expectedRecording.prefillSession.catch(() => null);
     const sourceConversation = call && voiceCallConversation
       ? voiceCallConversation
       : expectedRecording.sourceConversation;

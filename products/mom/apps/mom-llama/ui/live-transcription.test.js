@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { createLiveTranscriptionTap } = require("./voice-capture-policy.js");
+const { callPrefillRetryDecision, createLiveTranscriptionTap } = require("./voice-capture-policy.js");
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => {
   let resolve; let reject;
@@ -13,6 +13,18 @@ const deferred = () => {
 const make = (overrides = {}) => createLiveTranscriptionTap({
   turn: "turn-a", capture: "capture-a", send: async () => {},
   finish: async () => ({ text: "Complete final.", final: true }), cancel: async () => {}, ...overrides,
+});
+
+test("a late transcript retries only the same idle call capture", () => {
+  const state = { expectedConversation: "chat-a", settledConversation: "chat-a",
+    callActive: true, expectedEpoch: "call-a", currentEpoch: "call-a",
+    captureStarted: true, recording: { call: true, heardVoice: false, sending: false } };
+  assert.equal(callPrefillRetryDecision(state), "retry");
+  assert.equal(callPrefillRetryDecision({ ...state, recording: { call: true, heardVoice: true } }),
+    "capture_advanced", "a speaking caller continues on the already chosen fallback");
+  assert.equal(callPrefillRetryDecision({ ...state, settledConversation: "chat-b" }), "stale");
+  assert.equal(callPrefillRetryDecision({ ...state, currentEpoch: "call-b" }), "stale");
+  assert.equal(callPrefillRetryDecision({ ...state, callActive: false }), "stale");
 });
 
 test("browser tap coalesces callbacks and delivers source offsets exactly once", async () => {

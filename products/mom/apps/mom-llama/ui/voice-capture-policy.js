@@ -17,6 +17,15 @@
     return blocks;
   };
 
+  const callPrefillRetryDecision = ({ expectedConversation, settledConversation,
+    callActive, expectedEpoch, currentEpoch, captureStarted, recording }) => {
+    if (!callActive || expectedEpoch !== currentEpoch
+        || expectedConversation !== settledConversation) return "stale";
+    if (captureStarted && (!recording?.call || recording.heardVoice
+        || recording.sending || recording.speculation)) return "capture_advanced";
+    return "retry";
+  };
+
   const speechThreshold = (noiseFloor) => clamp(
     ((Number(noiseFloor) || 0) * 2.4) + .0005,
     .003,
@@ -379,6 +388,7 @@
 
   const api = {
     createLiveTranscriptionTap,
+    callPrefillRetryDecision,
     analyzeVoiceSamples,
     createStreamingMonoResampler,
     initialPlaybackEchoGuard,

@@ -507,7 +507,7 @@ test("call capture remains live during playback through the shared echo-cancelle
   const playbackEndedAt = live.indexOf("onEnded: () => {");
   const playbackEnded = live.slice(playbackEndedAt, live.indexOf("    });", playbackEndedAt));
   assert.ok(playbackEnded.includes("startCallCapture();"));
-  assert.ok(live.includes("prefillSession: nextCallPrefillGate"));
+  assert.ok(live.includes("prefillSession: nextCallPrefill || nextCallPrefillGate"));
   assert.ok(live.includes("startNextCallPrefill();\n          controller.finish();"));
   assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
   assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
