@@ -455,6 +455,7 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("agenticMaxToolPreviewLines".to_string(), json!(25)),
         ("mcpNativeEnabled".to_string(), json!(false)),
         ("mmprojPath".to_string(), json!("")),
+        ("mtpAssistantPath".to_string(), json!("")),
         (
             "nativeModelSlots".to_string(),
             json!(default_parallel_sequences()),
