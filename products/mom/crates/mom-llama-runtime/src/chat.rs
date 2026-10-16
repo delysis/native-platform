@@ -765,7 +765,7 @@ pub fn voice_audio_begin_in_scope(
             template: ChatTemplateChoice::PreferNonThinking,
         },
         sampling,
-        media: Vec::new(),
+        media: history.media.clone(),
         cached_prefix,
     };
     let preparation_source_us = elapsed_us(total_started);
@@ -1276,15 +1276,9 @@ where
             ),
         ));
     }
-    // The pickup greeting does not need to decode every historical voice note
-    // again. Their inspected text remains in the context messages, while the
-    // live turn keeps its normal audio path and exact attachment authority.
-    let call_greeting = input.message.starts_with("[Phone call] [Greeting]");
-    let media = if call_greeting {
-        Vec::new()
-    } else {
-        attachment_context.media.clone()
-    };
+    // Every pending recorded turn remains audio in model input until its
+    // complete transcript replaces that exact turn, including at pickup.
+    let media = attachment_context.media.clone();
     if !media.is_empty()
         && !settings
             .mmproj_path

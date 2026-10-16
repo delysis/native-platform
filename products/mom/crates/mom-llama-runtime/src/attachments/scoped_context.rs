@@ -7,10 +7,8 @@ use super::*;
 pub(crate) enum CurrentAttachmentSelection<'a> {
     Draft,
     DraftTextOnly,
-    DraftCurrentMediaHistoryText,
     ExistingUser(&'a str),
     HistoryOnly,
-    HistoryTextOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -68,9 +66,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
     }
     let draft_snapshot = if matches!(
         current_selection,
-        CurrentAttachmentSelection::Draft
-            | CurrentAttachmentSelection::DraftTextOnly
-            | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+        CurrentAttachmentSelection::Draft | CurrentAttachmentSelection::DraftTextOnly
     ) {
         load_drafts()?
             .drafts
@@ -80,12 +76,12 @@ pub(crate) fn prepare_scoped_chat_attachments(
         None
     };
     let current_ids = match current_selection {
-        CurrentAttachmentSelection::Draft
-        | CurrentAttachmentSelection::DraftTextOnly
-        | CurrentAttachmentSelection::DraftCurrentMediaHistoryText => draft_snapshot
-            .as_ref()
-            .map(|draft| draft.attachment_ids.clone())
-            .unwrap_or_default(),
+        CurrentAttachmentSelection::Draft | CurrentAttachmentSelection::DraftTextOnly => {
+            draft_snapshot
+                .as_ref()
+                .map(|draft| draft.attachment_ids.clone())
+                .unwrap_or_default()
+        }
         CurrentAttachmentSelection::ExistingUser(id) => {
             let Some(message) = active_messages.iter().find(|message| message.id == id) else {
                 return Ok(Err(context_blocker(
@@ -101,9 +97,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
             }
             message.attachment_ids.clone()
         }
-        CurrentAttachmentSelection::HistoryOnly | CurrentAttachmentSelection::HistoryTextOnly => {
-            Vec::new()
-        }
+        CurrentAttachmentSelection::HistoryOnly => Vec::new(),
     };
     let store = RuntimeStore::current()?;
     let mut text_by_message_id = HashMap::new();
@@ -149,12 +143,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
             AttachmentState::Committed,
             &records,
             &mut resolution,
-            !matches!(
-                current_selection,
-                CurrentAttachmentSelection::HistoryTextOnly
-                    | CurrentAttachmentSelection::DraftTextOnly
-                    | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
-            ),
+            !matches!(current_selection, CurrentAttachmentSelection::DraftTextOnly),
         )? {
             Ok(resolved) => resolved,
             Err(blocked) => return Ok(Err(blocked)),
@@ -171,9 +160,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
         &current_ids,
         if matches!(
             current_selection,
-            CurrentAttachmentSelection::Draft
-                | CurrentAttachmentSelection::DraftTextOnly
-                | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+            CurrentAttachmentSelection::Draft | CurrentAttachmentSelection::DraftTextOnly
         ) {
             AttachmentState::Staged
         } else {
@@ -191,9 +178,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
         context: ChatAttachmentContext {
             staged_ids: if matches!(
                 current_selection,
-                CurrentAttachmentSelection::Draft
-                    | CurrentAttachmentSelection::DraftTextOnly
-                    | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+                CurrentAttachmentSelection::Draft | CurrentAttachmentSelection::DraftTextOnly
             ) {
                 current_ids
             } else {

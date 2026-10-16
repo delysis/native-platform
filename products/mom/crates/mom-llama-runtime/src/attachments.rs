@@ -1049,9 +1049,9 @@ pub(crate) fn prepare_chat_attachments(
         .map(|result| result.map(|scoped| scoped.context))
 }
 
-/// The live microphone already supplies the current audio to the model.
-/// Historical attachments contribute inspected text only; loading their raw
-/// media would add disk and hash work while admitting none of it to this turn.
+/// The live microphone supplies the current audio. Each older recorded turn
+/// must remain audio until its complete transcript is committed; after that,
+/// the transcript alone represents it in model input.
 pub(crate) fn prepare_live_audio_history(
     conversation_id: &str,
     active_messages: &[Message],
@@ -1059,7 +1059,7 @@ pub(crate) fn prepare_live_audio_history(
     prepare_scoped_chat_attachments(
         conversation_id,
         active_messages,
-        CurrentAttachmentSelection::HistoryTextOnly,
+        CurrentAttachmentSelection::HistoryOnly,
     )
     .map(|result| result.map(|scoped| scoped.context))
 }
@@ -1080,8 +1080,8 @@ pub(crate) fn prepare_live_audio_commit(
 }
 
 /// A recorded voice note may fall back to a staged WAV when live prefill is
-/// unavailable. Admit that current recording, but never replay older audio
-/// attachments into this new request.
+/// unavailable. Pending historical recordings remain model input until their
+/// exact final transcripts replace them.
 pub(crate) fn prepare_voice_reply_attachments(
     conversation_id: &str,
     active_messages: &[Message],
@@ -1089,7 +1089,7 @@ pub(crate) fn prepare_voice_reply_attachments(
     prepare_scoped_chat_attachments(
         conversation_id,
         active_messages,
-        CurrentAttachmentSelection::DraftCurrentMediaHistoryText,
+        CurrentAttachmentSelection::Draft,
     )
     .map(|result| result.map(|scoped| scoped.context))
 }
@@ -5011,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn live_audio_commit_keeps_draft_without_readmitting_old_recordings() {
+    fn live_audio_history_keeps_pending_audio_until_exact_transcripts_replace_it() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("voice-history-commit");
         let data_dir = resolve_settings().expect("settings").data_dir;
@@ -5057,6 +5057,13 @@ mod tests {
             ordinary.blocker.code,
             "attachment_context_media_count_exceeded"
         );
+        let pending = prepare_live_audio_history("chat", &messages)
+            .expect("live history preparation")
+            .expect_err("pending audio cannot silently disappear from live history");
+        assert_eq!(
+            pending.blocker.code,
+            "attachment_context_media_count_exceeded"
+        );
 
         let current = attachment_import_pasted_text(&scope, "chat", "current note".to_string())
             .expect("stage current note")
@@ -5075,24 +5082,31 @@ mod tests {
             .result
             .expect("current audio result")
             .attachment;
-        let voice_reply = prepare_voice_reply_attachments("chat", &messages)
+        let mut transcribed_messages = messages.clone();
+        for (index, message) in transcribed_messages.iter_mut().enumerate() {
+            message.content = format!(
+                "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.\n\nFinal transcript {index}."
+            );
+        }
+        let voice_reply = prepare_voice_reply_attachments("chat", &transcribed_messages)
             .expect("voice reply preparation")
-            .expect("old audio must not crowd out the current recording");
+            .expect("final transcripts must free the current recording's media budget");
         assert_eq!(voice_reply.media.len(), 1);
         assert_eq!(voice_reply.staged_ids, vec![current.id, current_audio.id]);
 
-        // Long voice conversations retain occurrence evidence, but old WAVs
-        // do not consume the per-request attachment budget once omitted from
-        // model input. The historical prompt still carries message text.
+        // Long voice conversations retain their recordings for playback, but
+        // finalized transcripts alone represent those turns to the model.
         let long_history = (0..=MAX_ACTIVE_ATTACHMENT_REFERENCES)
             .map(|index| {
-                let prior = &messages[index % messages.len()];
-                message(&format!("long-turn-{index}"), prior.attachment_ids.clone())
+                let prior = &transcribed_messages[index % transcribed_messages.len()];
+                let mut turn = message(&format!("long-turn-{index}"), prior.attachment_ids.clone());
+                turn.content = prior.content.clone();
+                turn
             })
             .collect::<Vec<_>>();
         let prepared = prepare_live_audio_history("chat", &long_history)
             .expect("long voice history preparation")
-            .expect("omitted old WAVs must not cap the number of turns");
+            .expect("transcribed old WAVs must not cap the number of turns");
         assert!(prepared.media.is_empty());
     }
 
