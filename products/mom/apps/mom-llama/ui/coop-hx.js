@@ -2149,6 +2149,7 @@
 
   const startStreamedCallGreeting = async (epoch, conversation) => {
     if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
+    const greetingTrace = voiceLatencyTrace;
     callReplyConversation = conversation;
     activeDispatchConversation = conversation;
     let greetingFailure = null;
@@ -2177,7 +2178,7 @@
       // system prompt and model profile. Sending directly avoids re-routing
       // the saved recipient through the multi-consultant mention dispatcher,
       // whose differently shaped stream/result previously stranded pickup.
-      markVoiceLatency("generation_dispatched", { purpose: "call_greeting" });
+      markVoiceLatencyIn(greetingTrace, "generation_dispatched", { purpose: "call_greeting" });
       const response = await withDeadline(
         invoke("mom_llama_chat_send", {
           conversation,
@@ -2191,7 +2192,7 @@
         throw new Error(response?.blocker?.message || "The contact could not answer the call.");
       }
       const output = response.result;
-      markVoiceLatency("generation_finished", {
+      markVoiceLatencyIn(greetingTrace, "generation_finished", {
         purpose: "call_greeting",
         native_duration_ms: output?.duration_ms,
         first_token_ms: output?.first_token_ms,
@@ -2218,7 +2219,7 @@
       // acknowledgement, not a user-visible failure.
       if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
       if (error?.code === "voice_generation_timeout") {
-        markVoiceLatency("generation_timeout", { phase: "call_greeting", timeout_ms: 12_000 });
+        markVoiceLatencyIn(greetingTrace, "generation_timeout", { phase: "call_greeting", timeout_ms: 12_000 });
         void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});
       }
       throw error;
@@ -3776,7 +3777,11 @@
         : null;
       return start === null || end < start ? null : Math.round((end - start) / 10) / 100;
     };
-    const completedGeneration = latestIndexed("generation_finished");
+    // Older call captures could inherit a late greeting completion when the
+    // global trace changed during pickup. It is not a reply from this turn.
+    const completedGeneration = [...indexedStages].reverse().find(({ entry }) =>
+      entry.stage === "generation_finished"
+        && !(entry.purpose === "call_greeting" && trace.mode !== "call_greeting")) || null;
     const timedOutGeneration = latestIndexed("generation_timeout");
     const generationTerminalIndexed = !completedGeneration
       ? timedOutGeneration
@@ -5403,6 +5408,7 @@
     const playback = {
       conversation,
       mode,
+      trace: ttsLatencyTrace,
       get requestId() { return requestId; },
       acceptsRequest(candidate, eventName = "") {
         if (!candidate) return false;
@@ -6822,8 +6828,9 @@
     const sameLiveConversation = liveVoiceTts?.conversation === payload.conversation_id;
     const ownsLiveVoice = sameLiveConversation
       && liveVoiceTts.acceptsRequest(payload.request_id, payload.event);
-    if (voiceLatencyTrace) {
-      markVoiceLatency("chat_stream_route_decision", {
+    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : voiceLatencyTrace;
+    if (eventTrace) {
+      markVoiceLatencyIn(eventTrace, "chat_stream_route_decision", {
         event: payload.event,
         request_id: payload.request_id,
         conversation_id: payload.conversation_id,
@@ -6842,7 +6849,7 @@
       return;
     }
     if ((voiceReply || callReply) && ["prefill_started", "decode_started"].includes(payload.event)) {
-      markVoiceLatency(payload.event, { observed_at_unix_us: payload.emitted_at_unix_us });
+      markVoiceLatencyIn(eventTrace, payload.event, { observed_at_unix_us: payload.emitted_at_unix_us });
     }
     if (payload.event === "started") {
       acquireStableChatBusy(chatRequestLease(payload));
@@ -6858,11 +6865,10 @@
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "delta" && (voiceReply || callReply) && !voiceLatencyTrace?.firstDeltaSeen) {
-      if (!voiceLatencyTrace) startVoiceLatency(callReply ? "call" : "voice_note");
-      voiceLatencyTrace.firstDeltaSeen = true;
-      markVoiceLatency("first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
-      markVoiceLatency("first_content_delta_received");
+    if (payload.event === "delta" && (voiceReply || callReply) && !eventTrace?.firstDeltaSeen) {
+      if (eventTrace) eventTrace.firstDeltaSeen = true;
+      markVoiceLatencyIn(eventTrace, "first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
+      markVoiceLatencyIn(eventTrace, "first_content_delta_received");
     }
     if (payload.event === "delta" && (voiceReply || callReply)) {
       liveVoiceTts?.push(payload.delta || "");

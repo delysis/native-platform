@@ -1041,6 +1041,19 @@ test("voice latency includes endpoint-decision time from the physical silence ed
   assert.equal(summary.silence_to_playback_ms, 750);
 });
 
+test("a late pickup result cannot become the next call turn's generation", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stages = [
+    { stage: "capture_started", elapsed_ms: 0 },
+    { stage: "generation_finished", purpose: "call_greeting", elapsed_ms: 685,
+      prompt_tokens: 2984, completion_tokens: 11 },
+  ];
+  assert.equal(summarize({ mode: "call", stages }).generation_completion_tokens, null);
+  assert.equal(summarize({ mode: "call_greeting", stages }).generation_completion_tokens, 11);
+});
+
 test("physical silence timing stays paired with the latest release attempt", () => {
   const start = bridge.indexOf("  const voiceLatencySummary =");
   const end = bridge.indexOf("\n  const persistVoiceLatency =", start);

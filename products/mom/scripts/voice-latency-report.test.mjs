@@ -193,6 +193,21 @@ test("diagnoses a fallen-back voice turn that finishes without PCM", () => {
   ]);
 });
 
+test("a pickup completion inside the next capture is not a missing call reply", () => {
+  const row = latencyRow({ checkpoint: 4, path: "/trace.json", trace: {
+    id: "next-capture", mode: "call", stages: [
+      { stage: "capture_started" },
+      { stage: "generation_finished", purpose: "call_greeting", completion_tokens: 11 },
+      { stage: "audio_prefill_begin_requested" },
+    ], summary: { generation_completion_tokens: 11, generation_cache_reused: false },
+  } });
+  assert.equal(row.terminal_stage, "audio_prefill_begin_requested");
+  assert.equal(row.generation_completion_tokens, null);
+  assert.equal(row.generation_cache_reused, null);
+  assert.equal(row.generation_finished_without_pcm, false);
+  assert.ok(!latencyDiagnosis(row).findings.includes("response_without_pcm"));
+});
+
 test("classifies a bounded generation stall as a terminal failure", () => {
   const row = latencyRow({ checkpoint: 2, path: "/trace.json", trace: {
     id: "trace-timeout", mode: "call", stages: [

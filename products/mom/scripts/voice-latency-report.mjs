@@ -51,7 +51,14 @@ export function latencyRow(snapshot) {
   )));
   const stages = Array.isArray(trace.stages) ? trace.stages : [];
   const lastStage = (name) => [...stages].reverse().find(({ stage }) => stage === name) ?? null;
-  const generationStage = lastStage("generation_finished");
+  const belongsToThisTurn = ({ stage, purpose }) =>
+    stage !== "generation_finished"
+      || purpose !== "call_greeting"
+      || trace.mode === "call_greeting";
+  const generationStage = [...stages].reverse().find((entry) =>
+    entry.stage === "generation_finished" && belongsToThisTurn(entry)) ?? null;
+  const foreignGreetingOnly = !generationStage && stages.some((entry) =>
+    entry.stage === "generation_finished" && !belongsToThisTurn(entry));
   const nativeAudio = generationStage?.voice_audio ?? null;
   const preciseMs = (name) => {
     const precise = number(nativeAudio?.[`${name}_us`]);
@@ -70,10 +77,10 @@ export function latencyRow(snapshot) {
   const generationToPcm = generationStage && firstPcmAfterGeneration
     ? nativeDelta(number(generationStage.elapsed_ms), number(firstPcmAfterGeneration.elapsed_ms))
     : null;
-  const terminal = [...stages].reverse().find(({ stage }) => [
+  const terminal = [...stages].reverse().find((entry) => belongsToThisTurn(entry) && [
     "playback_started", "generation_finished", "failed", "durable_voice_audio_failed",
     "native_capture_failed", "generation_timeout",
-  ].includes(stage))?.stage ?? stages.at(-1)?.stage ?? null;
+  ].includes(entry.stage))?.stage ?? stages.at(-1)?.stage ?? null;
   const pick = (name) => number(summary[name]);
   const silenceStage = lastStage("silence_onset");
   const persistedSilenceDecisionMs = pick("silence_decision_delay_ms");
@@ -96,7 +103,7 @@ export function latencyRow(snapshot) {
   const prefillFailure = [...stages].reverse().find(({ stage }) => (
     stage === "audio_prefill_begin_failed" || stage === "audio_prefill_push_failed"
   ));
-  const generationFinished = stages.some(({ stage }) => stage === "generation_finished");
+  const generationFinished = Boolean(generationStage);
   const firstPcmObserved = stages.some(({ stage }) => stage === "tts_first_pcm");
   const sumStageMetric = (name) => {
     const values = ttsStages.map((stage) => number(stage[name])).filter((value) => value !== null);
@@ -122,6 +129,14 @@ export function latencyRow(snapshot) {
     .filter((value) => value !== null);
   return {
     ...scalarSummary,
+    ...(foreignGreetingOnly ? {
+      generation_prompt_tokens: null,
+      generation_completion_tokens: null,
+      generation_cache_reused: null,
+      generation_cache_resident_prefix_tokens: null,
+      generation_cache_restored_prefix_tokens: null,
+      generation_cache_replayed_prefix_tokens: null,
+    } : {}),
     id: trace.id,
     mode: trace.mode ?? null,
     began_at: trace.began_at ? new Date(trace.began_at).toISOString() : null,
