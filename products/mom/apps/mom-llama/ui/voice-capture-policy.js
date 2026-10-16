@@ -2,7 +2,18 @@
 
 ((root) => {
   const SPEECH_RELEASE_MS = 20;
+  // Match Gemma's 40 ms audio-projector frame at 16 kHz. A delayed WebView
+  // callback may accumulate much more; catch-up still publishes every frame.
+  const PREFILL_MAX_BLOCK_SAMPLES = 640;
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+
+  const splitPrefillPcm = (samples) => {
+    const blocks = [];
+    for (let offset = 0; offset < samples.length; offset += PREFILL_MAX_BLOCK_SAMPLES) {
+      blocks.push(samples.subarray(offset, offset + PREFILL_MAX_BLOCK_SAMPLES));
+    }
+    return blocks;
+  };
 
   const speechThreshold = (noiseFloor) => clamp(
     ((Number(noiseFloor) || 0) * 2.4) + .0005,
@@ -218,6 +229,7 @@
     initialVoiceActivity,
     nextVoiceActivity,
     speechThreshold,
+    splitPrefillPcm,
     updatePlaybackEchoGuard,
   };
   root.MomVoiceCapturePolicy = api;
