@@ -284,7 +284,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   );
   assert.ok(voiceTranscript.includes('invoke("mom_llama_speech_transcribe_attachment"'));
   assert.ok(voiceTranscript.includes('invoke("mom_llama_message_record_voice_transcript"'));
-  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call\) => \{[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
+  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call, trace\) => \{[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
   assert.ok(!voiceTranscript.includes("waitForVoiceTranscript"), "new microphone turns cannot wait for transcription");
   assert.ok(!voiceTranscript.includes("await previous"), "one failed transcript cannot strand later backfills");
   const speculate = bridge.slice(
@@ -515,7 +515,7 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
   assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
   assert.ok(live.includes("if (stopped || activeOperation !== operation) return;"));
-  assert.ok(interrupt.includes('markVoiceLatency("barge_in_detected"'));
+  assert.ok(interrupt.includes('markVoiceLatencyIn(recording.trace, "barge_in_detected"'));
   assert.ok(interrupt.includes("void reply.stop()"));
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));
   assert.ok(bridge.includes("const sharedCallStream = call && voiceCallMicrophoneStream?.active"));
@@ -536,7 +536,7 @@ test("native microphone admission precedes Gemma preparation", () => {
       < capture.indexOf("recording.prefillSession ="),
     "capture must retain the utterance while model preparation runs",
   );
-  assert.ok(capture.includes('markVoiceLatency("native_capture_requested")'));
+  assert.ok(capture.includes('markVoiceLatencyIn(recording.trace, "native_capture_requested")'));
 });
 
 test("pickup uses the ordinary streamed call reply buffer", () => {
@@ -750,7 +750,7 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(bridge.includes("const voiceTtsOwner = voiceDispatch"));
   assert.ok(bridge.includes("await voiceTtsOwner.finish(output.assistant_text)"));
   assert.ok(bridge.includes("pendingVoiceTtsOwner"));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_session_ready", { begin: live?.begin_metrics || null })'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(trace, "audio_prefill_session_ready", { begin: live?.begin_metrics || null })'));
   assert.ok(live.includes('markTtsLatency("tts_segment_finished"'));
   assert.ok(live.includes("queue_us: binding.tts_queue_us"));
   assert.ok(live.includes("host_route_us: binding.tts_host_route_us"));
@@ -884,8 +884,8 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   assert.ok(bridge.includes("first_observed_at_unix_us"));
   assert.ok(bridge.includes("VOICE_LATENCY_STAGE_LIMIT = 512"));
   assert.ok(bridge.includes("trace.checkpoint = (trace.checkpoint || 0) + 1"));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_begin_failed"'));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_push_failed"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "audio_prefill_push_failed"'));
   for (const stage of ["audio_prefill_begin_requested", "audio_prefill_session_ready",
     "audio_prefill_begin_failed", "next_turn_prefill_failed"]) {
     assert.ok(bridge.includes(`      "${stage}",`), `${stage} must persist a diagnostic checkpoint`);
@@ -1244,7 +1244,7 @@ test("call generation cannot stall forever or disappear without a visible termin
   assert.ok(bridge.includes('error.code = "voice_generation_timeout"'));
   assert.ok(bridge.includes('"call_reply_timeout: The contact did not finish answering the call."'));
   assert.ok(bridge.includes('"voice_generation_timeout: The contact stopped making progress while preparing a reply."'));
-  assert.ok(bridge.includes('markVoiceLatency("generation_timeout"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "generation_timeout"'));
   assert.ok(bridge.includes('void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});'));
   assert.ok(bridge.includes("speculation.generationReleased.then(() => withDeadline("));
   assert.ok(bridge.includes("speculation.releaseGeneration?.();"));

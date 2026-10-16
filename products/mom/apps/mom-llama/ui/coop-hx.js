@@ -4952,7 +4952,7 @@
         buffered_runway_ms: controller.bufferedMs(),
       });
       const startedAt = performance.now();
-      nextCallPrefill = startVoicePrefill(conversation, true).then(async (live) => {
+      nextCallPrefill = startVoicePrefill(conversation, true, ttsLatencyTrace).then(async (live) => {
         if ((stopped && !nextCallPrefillHandedOff)
             || !voiceCallActive || voiceCallEpoch !== callEpoch) {
           if (live?.session) {
@@ -5752,7 +5752,7 @@
         );
         if (!recording.firstPrefillChunkAccepted) {
           recording.firstPrefillChunkAccepted = true;
-          markVoiceLatency("audio_prefill_first_chunk_accepted", {
+          markVoiceLatencyIn(recording.trace, "audio_prefill_first_chunk_accepted", {
             samples: chunk.length,
             native_buffered_samples: accepted?.buffered_samples,
           });
@@ -5761,7 +5761,7 @@
     }).catch(async (error) => {
       if (recording.prefillEpoch !== epoch) return;
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_push_failed", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_push_failed", {
         message: errorMessage(error),
         producer_pushes: recording.prefillPushes || 0,
         producer_accepted_samples: recording.prefillAcceptedSamples || 0,
@@ -5787,7 +5787,7 @@
         chat().dataset.conversationKind = "chat";
       }
     }
-    return startVoicePrefill(conversation, recording.call);
+    return startVoicePrefill(conversation, recording.call, recording.trace);
   };
 
   const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null,
@@ -5895,13 +5895,13 @@
     return task;
   };
 
-  const startVoicePrefill = async (conversation, call) => {
-    markVoiceLatency("audio_prefill_begin_requested", { conversation, call });
+  const startVoicePrefill = async (conversation, call, trace) => {
+    markVoiceLatencyIn(trace, "audio_prefill_begin_requested", { conversation, call });
     const live = await invoke("mom_llama_voice_audio_begin", {
       conversation,
       message: voiceModePrompt(call),
     });
-    markVoiceLatency("audio_prefill_session_ready", { begin: live?.begin_metrics || null });
+    markVoiceLatencyIn(trace, "audio_prefill_session_ready", { begin: live?.begin_metrics || null });
     return { ...live, conversation };
   };
 
@@ -5959,7 +5959,7 @@
       echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
       echo_guard_threshold: recording.echoGuardThreshold || 0,
     };
-    markVoiceLatency("capture_processing", captureMetrics);
+    markVoiceLatencyIn(recording.trace, "capture_processing", captureMetrics);
     if (discard) {
       recording.transcription?.cancel();
       if (recording.speculation && !recording.speculation.confirmed) {
@@ -5997,13 +5997,13 @@
     // the later Gemma result with nowhere to send audio.
     if (!reply?.audible) return;
     const startedAt = performance.now();
-    markVoiceLatency("barge_in_detected", detail);
+    markVoiceLatencyIn(recording.trace, "barge_in_detected", detail);
     void reply.stop().then(() => {
-      markVoiceLatency("barge_in_playback_stopped", {
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stopped", {
         duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       });
     }).catch((error) => {
-      markVoiceLatency("barge_in_playback_stop_failed", { message: errorMessage(error) });
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stop_failed", { message: errorMessage(error) });
     });
   };
 
@@ -6101,7 +6101,7 @@
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
       if (recording.prefillEpoch === initialPrefillEpoch) {
         recording.prefillFailed = true;
-        markVoiceLatency("audio_prefill_begin_failed", { message: errorMessage(error) });
+        markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", { message: errorMessage(error) });
       }
       return null;
     });
@@ -6182,7 +6182,7 @@
           recording.preRoll.forEach((part) => enqueueVoicePrefill(recording, part));
           recording.preRoll = [];
           recording.preRollSamples = 0;
-          markVoiceLatency("voice_activity_first_detected", {
+          markVoiceLatencyIn(recording.trace, "voice_activity_first_detected", {
             onset_sample: analysis.voiceOnsetSample,
             rms,
             threshold,
@@ -6203,7 +6203,7 @@
           && voiceRecording === recording
           && !recording.sending && !recording.speculation && !recording.speculationStarting
           && !recording.prefillFailed) {
-        markVoiceLatency("silence_onset", {
+        markVoiceLatencyIn(recording.trace, "silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
           rms,
@@ -6282,14 +6282,14 @@
     // 2.96 seconds while its 1,643-token prefix was restored. Capture retains
     // this head in fixed native storage and retarget replays it exactly once,
     // so listening can begin immediately while preparation runs in parallel.
-    markVoiceLatency("native_capture_requested");
+    markVoiceLatencyIn(recording.trace, "native_capture_requested");
     recording.startPromise = invoke("mom_llama_voice_capture_start", {
       capture: recording.capture,
       call,
     });
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_begin_failed", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
         producer: "native_ring",
         message: errorMessage(error),
       });
@@ -6303,7 +6303,7 @@
         capture: recording.capture,
         session: live.session,
       });
-      markVoiceLatency("audio_prefill_native_targeted", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_native_targeted", {
         session: live.session,
         round_trip_ms: Math.round((performance.now() - targetedAt) * 100) / 100,
         native_elapsed_us: targeted?.native_elapsed_us || null,
@@ -6320,7 +6320,7 @@
       return targeted;
     }).catch((error) => {
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_target_failed", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_target_failed", {
         producer: "native_ring",
         message: errorMessage(error),
       });
@@ -6328,7 +6328,7 @@
     });
     try {
       await recording.startPromise;
-      markVoiceLatency("native_capture_started");
+      markVoiceLatencyIn(recording.trace, "native_capture_started");
     } catch (error) {
       if (voiceRecording === recording) voiceRecording = null;
       setVoiceRecordingVisible(false);
@@ -6395,7 +6395,7 @@
       begin_metrics: replacement.begin_metrics || null,
     });
     enqueueVoicePrefill(recording, priorAudio, true);
-    markVoiceLatency("speculation_handoff_replay_enqueued", {
+    markVoiceLatencyIn(recording.trace, "speculation_handoff_replay_enqueued", {
       checkpoint_samples: resumeOffset,
       replay_samples: priorAudio.length,
       captured_samples: captured.length,
@@ -6407,7 +6407,7 @@
     if (!speculation || speculation.confirmed || speculation.aborting) return;
     speculation.aborting = true;
     speculation.resolveCapture?.(null);
-    markVoiceLatency("speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
+    markVoiceLatencyIn(recording.trace, "speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
     if (!recording.native && recording.call && restartPrefill) {
       // A short intra-utterance pause can cross the first speculative edge.
       // Repeated belays are direct evidence that this caller needs a longer
@@ -6421,7 +6421,7 @@
     // independently while native capture is retargeted.
     const ttsStopAt = performance.now();
     void speculation.tts.stop().catch(() => {}).finally(() => {
-      markVoiceLatency("speculation_tts_stopped", {
+      markVoiceLatencyIn(recording.trace, "speculation_tts_stopped", {
         duration_ms: Math.round((performance.now() - ttsStopAt) * 100) / 100,
       });
     });
@@ -6430,7 +6430,7 @@
     let replacementError = null;
     const nativeAbortAt = performance.now();
     if (restartPrefill) {
-      markVoiceLatency("speculation_handoff_started");
+      markVoiceLatencyIn(recording.trace, "speculation_handoff_started");
       try {
         await withDeadline(speculation.admissionReady, 2_000,
           "voice_speculation_admission_timeout: The call turn could not be prepared for interruption.");
@@ -6449,7 +6449,7 @@
         recording.prefillFailed = false;
         recording.prefillSession = Promise.resolve(live);
         recording.targetChain = Promise.resolve(replacement);
-        markVoiceLatency("speculation_handoff_ready", {
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_ready", {
           round_trip_ms: Math.round((performance.now() - nativeAbortAt) * 100) / 100,
           abort_ms: Math.round(Number(replacement.abort_us || 0) / 10) / 100,
           begin_ms: Math.round(Number(replacement.begin_us || 0) / 10) / 100,
@@ -6475,14 +6475,14 @@
       } catch (error) {
         replacementError = error;
         recording.prefillFailed = true;
-        markVoiceLatency("speculation_handoff_failed", { message: errorMessage(error) });
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_failed", { message: errorMessage(error) });
       }
     } else {
       await invoke("mom_llama_voice_audio_speculation_abort", {
         speculation: speculation.id,
         conversation: speculation.conversation,
       }).catch((error) => { replacementError = error; });
-      markVoiceLatency("speculation_native_abort_complete", {
+      markVoiceLatencyIn(recording.trace, "speculation_native_abort_complete", {
         duration_ms: Math.round((performance.now() - nativeAbortAt) * 100) / 100,
       });
     }
@@ -6499,7 +6499,7 @@
         void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
         replacementError = error;
         recording.prefillFailed = true;
-        markVoiceLatency("speculation_handoff_failed", { message: errorMessage(error) });
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_failed", { message: errorMessage(error) });
         replacement = null;
       }
     }
@@ -6519,7 +6519,7 @@
             && (!recording.call || voiceCallActive)) {
           if (!recording.native && (recording.voiceActivity.voiced
               || recording.silentMs < recording.speculationReleaseMs)) return;
-          markVoiceLatency("speculation_handoff_rearmed", {
+          markVoiceLatencyIn(recording.trace, "speculation_handoff_rearmed", {
             silent_ms: recording.silentMs || 0,
           });
           void startVoiceSpeculation(recording,
@@ -6563,7 +6563,7 @@
       return;
     }
     speculation.confirmed = true;
-    markVoiceLatency("speculation_confirmed");
+    markVoiceLatencyIn(recording.trace, "speculation_confirmed");
     // Sever microphone capture synchronously at the commit boundary. The
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
@@ -6584,8 +6584,8 @@
     speculation.confirmed = true;
     recording.sending = true;
     setVoiceRecordingVisible(false);
-    markVoiceLatency("capture_stopped", { speculative: true });
-    markVoiceLatency("speculation_confirmed", { mode: "voice_note" });
+    markVoiceLatencyIn(recording.trace, "capture_stopped", { speculative: true });
+    markVoiceLatencyIn(recording.trace, "speculation_confirmed", { mode: "voice_note" });
 
     // The reply has remained private while the user could still resume
     // speaking. Publish only after the send boundary, while capture drain and
@@ -6617,14 +6617,14 @@
         || recording.speculationStarting || recording.sending
         || (recording.call && !voiceCallActive)) return;
     recording.speculationStarting = true;
-    markVoiceLatency("prefill_flush_started");
+    markVoiceLatencyIn(recording.trace, "prefill_flush_started");
     if (recording.native) {
       await recording.targetChain;
     } else {
       enqueueVoicePrefill(recording, new Float32Array(), true);
       await recording.pushChain;
     }
-    markVoiceLatency("prefill_flush_accepted", {
+    markVoiceLatencyIn(recording.trace, "prefill_flush_accepted", {
       producer: recording.native ? "native_ring" : "renderer_ipc",
       producer_pushes: recording.prefillPushes || 0,
       producer_ipc_ms: Math.round(recording.prefillIpcMs || 0),
@@ -6683,7 +6683,7 @@
     if (recording.call) callReplyConversation = live.conversation;
     else voiceReplyConversation = live.conversation;
     activeDispatchConversation = live.conversation;
-    markVoiceLatency(prearm ? "speculation_prearmed" : "speculation_started", {
+    markVoiceLatencyIn(recording.trace, prearm ? "speculation_prearmed" : "speculation_started", {
       speculation: speculation.id,
       producer: recording.native ? "native_ring" : "renderer_ipc",
       producer_pushes: recording.prefillPushes || 0,
@@ -6692,7 +6692,7 @@
       producer_ipc_ms: Math.round(recording.prefillIpcMs || 0),
       producer_max_ipc_ms: Math.round(recording.prefillMaxIpcMs || 0),
     });
-    if (!prearm) markVoiceLatency("generation_dispatched", {
+    if (!prearm) markVoiceLatencyIn(recording.trace, "generation_dispatched", {
       speculative: true,
       speculation: speculation.id,
     });
@@ -6708,7 +6708,7 @@
       });
     }
     try {
-      markVoiceLatency("speculation_dispatch_started", {
+      markVoiceLatencyIn(recording.trace, "speculation_dispatch_started", {
         speculation: speculation.id,
         producer: recording.native ? "native_ring" : "renderer_ipc",
       });
@@ -6744,7 +6744,7 @@
       if (response?.status === "blocked" || !response?.result) {
         throw new Error(response?.blocker?.message || "The speculative call reply failed.");
       }
-      markVoiceLatency("generation_finished", {
+      markVoiceLatencyIn(recording.trace, "generation_finished", {
         speculative: true,
         speculation: speculation.id,
         native_duration_ms: response.result.duration_ms,
@@ -6763,7 +6763,7 @@
       }
     } catch (error) {
       if (error?.code === "voice_generation_timeout") {
-        markVoiceLatency("generation_timeout", {
+        markVoiceLatencyIn(recording.trace, "generation_timeout", {
           speculation: speculation.id,
           phase: recording.call ? "call_turn" : "voice_note",
           timeout_ms: recording.call ? 12_000 : 22_000,
@@ -6832,7 +6832,7 @@
     // shutdown, encoding, and persistence continue after the recorder is gone.
     setVoiceRecordingVisible(false);
     const call = Boolean(voiceRecording?.call);
-    markVoiceLatency("capture_stopped");
+    markVoiceLatencyIn(expectedRecording.trace, "capture_stopped");
     const capture = await stopVoiceCapture();
     if (!capture?.heardVoice) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
@@ -6856,7 +6856,7 @@
       };
     } else {
       const wav = capture.wavBytes || encodePcmWav(capture.samples());
-      markVoiceLatency("fallback_capture_encoded", { wav_bytes: wav.byteLength });
+      markVoiceLatencyIn(expectedRecording.trace, "fallback_capture_encoded", { wav_bytes: wav.byteLength });
       // Preserve the attachment if incremental audio admission failed. This is
       // an explicit degraded path; the normal path persists it concurrently
       // inside voice_audio_finish.
@@ -6864,7 +6864,7 @@
         conversation,
         bytes: Array.from(wav),
       });
-      markVoiceLatency("fallback_import_finished");
+      markVoiceLatencyIn(expectedRecording.trace, "fallback_import_finished");
       report(imported);
       if (imported?.status === "blocked") {
         if (voiceCallActive) await beginVoiceCapture({ call: true });
@@ -6889,7 +6889,7 @@
       // affordance is never shown in a disabled, misleading state.
       const replayStarted = performance.now();
       const replayBytes = capture.wavBytes || encodePcmWav(capture.samples());
-      markVoiceLatency("local_replay_encoded", {
+      markVoiceLatencyIn(expectedRecording.trace, "local_replay_encoded", {
         duration_ms: Math.round((performance.now() - replayStarted) * 100) / 100,
         wav_bytes: replayBytes.byteLength,
       });
@@ -8614,8 +8614,9 @@
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
           let voiceTranscriptAttachment = null;
+          let voiceDispatchTrace = voiceDispatch
+            ? (voiceTtsOwner?.trace || voiceLatencyTrace) : null;
           try {
-            if (voiceDispatch) markVoiceLatency("generation_dispatched");
             const liveVoice = voiceDispatch
               && pendingVoiceAudioSession?.conversation === conversation
               ? pendingVoiceAudioSession
@@ -8624,6 +8625,9 @@
               && pendingVoiceFallbackAttachment?.conversation === conversation
               ? pendingVoiceFallbackAttachment
               : null;
+            voiceDispatchTrace = (liveVoice || fallbackVoice)?.sourceCapture?.trace
+              || voiceDispatchTrace;
+            if (voiceDispatch) markVoiceLatencyIn(voiceDispatchTrace, "generation_dispatched");
             if (liveVoice) pendingVoiceAudioSession = null;
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
@@ -8648,7 +8652,7 @@
             }
             if (voiceDispatch) {
               const output = result?.result?.output;
-              markVoiceLatency("generation_finished", {
+              markVoiceLatencyIn(voiceDispatchTrace, "generation_finished", {
                 native_duration_ms: output?.duration_ms,
                 first_token_ms: output?.first_token_ms,
                 cache_metrics: output?.cache_metrics || null,
@@ -8699,10 +8703,10 @@
               // Backfill this exact turn after commit. The next Gemma prompt
               // may proceed with its recorded audio if Parakeet is still busy.
               indexVoiceTurn(conversation, output, voiceTranscriptAttachment,
-                (liveVoice || fallbackVoice)?.sourceCapture || null);
+                (liveVoice || fallbackVoice)?.sourceCapture || null, voiceDispatchTrace);
             }
             if (result?.status !== "blocked" && output?.assistant_text) {
-              markVoiceLatency("tts_text_admitted", {
+              markVoiceLatencyIn(voiceDispatchTrace, "tts_text_admitted", {
                 characters: output.assistant_text.length,
                 owner_bound: Boolean(voiceTtsOwner),
               });
