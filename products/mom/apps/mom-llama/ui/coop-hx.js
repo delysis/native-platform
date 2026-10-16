@@ -4659,6 +4659,9 @@
       "audio_prefill_session_ready",
       "audio_prefill_begin_failed",
       "audio_prefill_push_failed",
+      "audio_prefill_wait_expired",
+      "audio_prefill_drain_failed",
+      "audio_prefill_producer_overflow",
       "native_capture_started",
       "capture_stopped",
       "capture_processing",
@@ -5783,6 +5786,27 @@
     recording.prefillParts = [];
     recording.prefillSamples = 0;
     const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block);
+    const queuedSamples = blocks.reduce((count, chunk) => count + chunk.length, 0);
+    // The native consumer has a 30-second ring. Bound the browser IPC queue
+    // to the same capacity; the complete physical recording remains available
+    // for the explicit fallback if this producer cannot keep up.
+    const queueLimitSamples = 16_000 * 30;
+    if (recording.prefillQueuedSamples + queuedSamples > queueLimitSamples) {
+      recording.prefillFailed = true;
+      recording.prefillEpoch += 1;
+      markVoiceLatencyIn(recording.trace, "audio_prefill_producer_overflow", {
+        queued_samples: recording.prefillQueuedSamples,
+        incoming_samples: queuedSamples,
+        limit_samples: queueLimitSamples,
+      });
+      void recording.prefillSession.then((live) => live?.session
+        ? invoke("mom_llama_voice_audio_abort", { session: live.session })
+        : null).catch(() => {});
+      return;
+    }
+    recording.prefillQueuedSamples += queuedSamples;
+    recording.prefillQueueHighWaterSamples = Math.max(
+      recording.prefillQueueHighWaterSamples, recording.prefillQueuedSamples);
     const epoch = recording.prefillEpoch;
     const session = recording.prefillSession;
     recording.pushChain = recording.pushChain.then(async () => {
@@ -5824,6 +5848,10 @@
       const live = await session.catch(() => null);
       if (live?.session) {
         await invoke("mom_llama_voice_audio_abort", { session: live.session }).catch(() => {});
+      }
+    }).finally(() => {
+      if (recording.prefillEpoch === epoch) {
+        recording.prefillQueuedSamples = Math.max(0, recording.prefillQueuedSamples - queuedSamples);
       }
     });
   };
@@ -6121,6 +6149,7 @@
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
       speculationReleaseMs: 180,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
+      prefillQueuedSamples: 0, prefillQueueHighWaterSamples: 0,
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
       captureCallbacks: 0, captureCpuMs: 0, captureMaxCpuMs: 0,
       detectorCpuMs: 0, detectorSubframes: 0, resampleCpuMs: 0,
@@ -6461,6 +6490,8 @@
     const priorAudio = captured.subarray(origin + resumeOffset);
     recording.prefillParts = [];
     recording.prefillSamples = 0;
+    recording.prefillQueuedSamples = 0;
+    recording.prefillQueueHighWaterSamples = 0;
     recording.pushChain = Promise.resolve();
     recording.prefillFailed = false;
     recording.firstPrefillChunkAccepted = false;
@@ -6804,6 +6835,7 @@
       producer_pushes: recording.prefillPushes || 0,
       producer_accepted_samples: recording.prefillAcceptedSamples || 0,
       producer_high_water_samples: recording.prefillHighWaterSamples || 0,
+      producer_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
       producer_ipc_ms: Math.round(recording.prefillIpcMs || 0),
       producer_max_ipc_ms: Math.round(recording.prefillMaxIpcMs || 0),
     });

@@ -241,6 +241,19 @@ test("locates a stalled audio push drain before the recorded-audio fallback", ()
   assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_drain_stalled"));
 });
 
+test("reports a bounded browser prefill queue overflow without claiming audio loss", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "audio_prefill_producer_overflow", queued_samples: 480_000,
+        incoming_samples: 640, limit_samples: 480_000 },
+      { stage: "fallback_capture_encoded" },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_producer_overflow_samples, 480_000);
+  assert.equal(row.prefill_producer_limit_samples, 480_000);
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_producer_overflow"));
+});
+
 test("a pickup completion inside the next capture is not a missing call reply", () => {
   const row = latencyRow({ checkpoint: 4, path: "/trace.json", trace: {
     id: "next-capture", mode: "call", stages: [
