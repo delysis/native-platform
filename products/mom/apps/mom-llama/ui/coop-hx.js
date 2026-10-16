@@ -2401,7 +2401,7 @@
     // Each stop function severs its local Web Audio nodes before its first
     // await. Start all of them before hiding the surface or waiting on IPC.
     const stops = [
-      stopVoiceCapture({ discard: true }),
+      stopVoiceCapture({ discard: true, reason: "call_closed" }),
       callTts?.stop(),
       audibleCall && audibleCall !== callTts ? audibleCall.stop() : null,
       stopSpeechPlayback(),
@@ -4658,6 +4658,7 @@
       "audio_prefill_begin_failed",
       "audio_prefill_push_failed",
       "native_capture_started",
+      "capture_stopped",
       "capture_processing",
       "native_capture_failed",
       "generation_dispatched",
@@ -5905,10 +5906,14 @@
     return { ...live, conversation };
   };
 
-  const stopVoiceCapture = async ({ discard = false, abortPrefill = true, flushPrefill = true } = {}) => {
+  const stopVoiceCapture = async ({ discard = false, abortPrefill = true,
+    flushPrefill = true, reason = "sent" } = {}) => {
     const recording = voiceRecording;
     voiceRecording = null;
     if (!recording) return null;
+    markVoiceLatencyIn(recording.trace, "capture_stopped", {
+      reason, discard, producer: recording.native ? "native_ring" : "browser_capture",
+    });
     clearTimeout(recording.limit);
     if (recording.native) {
       setVoiceRecordingVisible(false);
@@ -5959,7 +5964,7 @@
       echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
       echo_guard_threshold: recording.echoGuardThreshold || 0,
     };
-    markVoiceLatencyIn(recording.trace, "capture_processing", captureMetrics);
+    markVoiceLatencyIn(recording.trace, "capture_processing", { ...captureMetrics, reason, discard });
     if (discard) {
       recording.transcription?.cancel();
       if (recording.speculation && !recording.speculation.confirmed) {
@@ -6557,8 +6562,8 @@
     // Sever microphone capture synchronously at the commit boundary. The
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
-    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
-    markVoiceLatencyIn(recording.trace, "capture_stopped", { speculative: true });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false,
+      reason: "call_speculation_confirmed" });
     speculation.capturePromise = stoppedCapture;
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
@@ -6575,7 +6580,6 @@
     speculation.confirmed = true;
     recording.sending = true;
     setVoiceRecordingVisible(false);
-    markVoiceLatencyIn(recording.trace, "capture_stopped", { speculative: true });
     markVoiceLatencyIn(recording.trace, "speculation_confirmed", { mode: "voice_note" });
 
     // The reply has remained private while the user could still resume
@@ -6591,7 +6595,8 @@
     voiceReplyConversation = speculation.conversation;
     liveVoiceTts = speculation.tts;
 
-    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false,
+      reason: "voice_note_speculation_confirmed" });
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
     const [capture] = await Promise.all([stoppedCapture, confirmed]);
@@ -6823,7 +6828,6 @@
     // shutdown, encoding, and persistence continue after the recorder is gone.
     setVoiceRecordingVisible(false);
     const call = Boolean(voiceRecording?.call);
-    markVoiceLatencyIn(expectedRecording.trace, "capture_stopped");
     const capture = await stopVoiceCapture();
     if (!capture?.heardVoice) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
@@ -7601,7 +7605,10 @@
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
     "voice-message-start": async () => beginVoiceCapture(),
-    "voice-message-cancel": async () => { await stopVoiceCapture({ discard: true }); focusComposer(); },
+    "voice-message-cancel": async () => {
+      await stopVoiceCapture({ discard: true, reason: "voice_note_cancelled" });
+      focusComposer();
+    },
     "voice-message-send": async () => sendVoiceCapture(),
     "voice-message-pending-play": async (button) => {
       const preview = button.closest(".voice-message-bubble");
