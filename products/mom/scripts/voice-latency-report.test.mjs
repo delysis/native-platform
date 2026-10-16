@@ -212,6 +212,21 @@ test("diagnoses a fallen-back voice turn that finishes without PCM", () => {
   ]);
 });
 
+test("identifies a call that abandoned a pending prefill instead of silently waiting", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "capture_started" },
+      { stage: "voice_activity_first_detected" },
+      { stage: "audio_prefill_wait_expired", silence_ms: 900, retry: false },
+      { stage: "fallback_capture_encoded" },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_failure_stage, "audio_prefill_wait_expired");
+  assert.equal(row.prefill_wait_expired_ms, 900);
+  assert.equal(row.prefill_wait_expired_on_retry, false);
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_wait_expired"));
+});
+
 test("a pickup completion inside the next capture is not a missing call reply", () => {
   const row = latencyRow({ checkpoint: 4, path: "/trace.json", trace: {
     id: "next-capture", mode: "call", stages: [

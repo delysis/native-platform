@@ -4999,6 +4999,7 @@
               recording.prefillEpoch += 1;
               const epoch = recording.prefillEpoch;
               recording.prefillFailed = false;
+              recording.prefillPending = true;
               recording.prefillRetryPending = true;
               recording.prefillSession = retry.then((replacement) => {
                 if (recording.prefillEpoch !== epoch || recording.sending
@@ -5008,6 +5009,7 @@
                   }
                   return null;
                 }
+                recording.prefillPending = false;
                 recording.prefillRetryPending = false;
                 if (!replacement?.session) {
                   recording.prefillFailed = true;
@@ -6113,6 +6115,7 @@
       voiceActivity: globalThis.MomVoiceCapturePolicy.initialVoiceActivity(),
       preRoll: [], preRollSamples: 0, prefillParts: [], prefillSamples: 0,
       pushChain: Promise.resolve(), prefillFailed: false, prefillSession: null,
+      prefillPending: true,
       prefillRetryPending,
       prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
@@ -6165,6 +6168,7 @@
         }
         return null;
       }
+      recording.prefillPending = false;
       recording.prefillRetryPending = false;
       if (!live?.session) {
         recording.prefillFailed = true;
@@ -6175,6 +6179,7 @@
       return live;
     }).catch((error) => {
       if (recording.prefillEpoch === initialPrefillEpoch) {
+        recording.prefillPending = false;
         recording.prefillRetryPending = false;
         recording.prefillFailed = true;
         markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", { message: errorMessage(error) });
@@ -6278,7 +6283,7 @@
           && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
           && voiceRecording === recording
           && !recording.sending && !recording.speculation && !recording.speculationStarting
-          && !recording.prefillFailed && !recording.prefillRetryPending) {
+          && !recording.prefillFailed && !recording.prefillPending) {
         markVoiceLatencyIn(recording.trace, "silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
@@ -6286,20 +6291,21 @@
           threshold,
         });
         void startVoiceSpeculation(recording).catch(reportError);
-      } else if (recording.call && (recording.prefillFailed || recording.prefillRetryPending)
+      } else if ((recording.prefillFailed || recording.prefillPending)
           && activity.heardVoice
           && activity.silentMs >= 900 && voiceRecording === recording && !recording.sending) {
-        if (recording.prefillRetryPending) {
+        if (recording.prefillPending) {
+          const retry = recording.prefillRetryPending;
+          recording.prefillPending = false;
           recording.prefillRetryPending = false;
           recording.prefillFailed = true;
           recording.prefillEpoch += 1;
-          markVoiceLatencyIn(recording.trace, "audio_prefill_retry_expired", {
-            silence_ms: activity.silentMs,
+          markVoiceLatencyIn(recording.trace, "audio_prefill_wait_expired", {
+            silence_ms: activity.silentMs, retry,
           });
         }
-        // Incremental audio cannot admit a still-pending historical WAV.
         // The physical recording can use the complete-media chat path without
-        // waiting for Parakeet or leaving the call stuck at a silence edge.
+        // waiting for Parakeet or leaving the turn stuck at a silence edge.
         void sendVoiceCapture(recording).catch(reportError);
       } else if (!recording.call && activity.heardVoice && activity.silentMs >= 900
           && voiceRecording === recording && !recording.sending) {

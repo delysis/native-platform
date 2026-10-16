@@ -102,7 +102,9 @@ export function latencyRow(snapshot) {
   const handoffStage = lastStage("speculation_handoff_ready");
   const prefillFailure = [...stages].reverse().find(({ stage }) => (
     stage === "audio_prefill_begin_failed" || stage === "audio_prefill_push_failed"
+      || stage === "audio_prefill_wait_expired"
   ));
+  const prefillWaitExpired = lastStage("audio_prefill_wait_expired");
   const generationFinished = Boolean(generationStage);
   const firstPcmObserved = stages.some(({ stage }) => stage === "tts_first_pcm");
   const sumStageMetric = (name) => {
@@ -150,6 +152,8 @@ export function latencyRow(snapshot) {
     terminal_stage: terminal,
     prefill_failure_stage: prefillFailure?.stage ?? null,
     prefill_failure_message: prefillFailure?.message ?? null,
+    prefill_wait_expired_ms: number(prefillWaitExpired?.silence_ms),
+    prefill_wait_expired_on_retry: prefillWaitExpired?.retry ?? null,
     generation_finished_without_pcm: generationFinished && !firstPcmObserved,
     runtime_warm_total_ms: pick("runtime_warm_total_ms"),
     runtime_warm_settings_ms: pick("runtime_warm_settings_ms"),
@@ -352,6 +356,7 @@ export function latencyDiagnosis(row) {
     findings.push("audio_projector_not_warmed");
   }
   if (row.prefill_failure_stage) findings.push("audio_prefill_failed");
+  if (row.prefill_wait_expired_ms != null) findings.push("audio_prefill_wait_expired");
   if (row.generation_finished_without_pcm) findings.push("response_without_pcm");
   if (row.terminal_stage === "generation_timeout") {
     findings.push("generation_timeout");
