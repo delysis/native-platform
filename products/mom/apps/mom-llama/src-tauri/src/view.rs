@@ -652,12 +652,12 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Edit",
     },
     ControlSpec {
-        affordance: "message.record_call_transcript",
-        command: "mom_llama.message_record_call_transcript",
-        tauri_command: "mom_llama_message_record_call_transcript",
-        cli: "app-only; records a private transcript against its exact phone-call turn",
+        affordance: "message.record_voice_transcript",
+        command: "mom_llama.message_record_voice_transcript",
+        tauri_command: "mom_llama_message_record_voice_transcript",
+        cli: "app-only; records a private transcript against its exact voice turn",
         effect: "mom_llama.effects.conversation_store.v1",
-        label: "Remember call",
+        label: "Remember voice",
     },
     ControlSpec {
         affordance: "message.delete",
@@ -2087,26 +2087,26 @@ fn composer(
                     })
                 }))
     });
-    let draft_message = (!internal_voice_draft)
-        .then(|| {
-            draft
-                .map(|draft| draft.message.as_str())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let staged_attachments = (!internal_voice_draft)
-        .then(|| {
-            draft
-                .map(|draft| {
-                    draft
-                        .attachment_ids
-                        .iter()
-                        .filter_map(|id| attachments.iter().find(|attachment| attachment.id == *id))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let draft_message = if internal_voice_draft {
+        ""
+    } else {
+        draft
+            .map(|draft| draft.message.as_str())
+            .unwrap_or_default()
+    };
+    let staged_attachments = if internal_voice_draft {
+        Vec::new()
+    } else {
+        draft
+            .map(|draft| {
+                draft
+                    .attachment_ids
+                    .iter()
+                    .filter_map(|id| attachments.iter().find(|attachment| attachment.id == *id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
     let draft_control = control("conversation.draft_update");
     let voice_control = control("voice.message.record");
     let voice_local_control = control("voice.message.local_control");
@@ -5108,7 +5108,7 @@ mod tests {
             js.contains("mom_llama_speech_read_aloud")
                 && js.contains("pcmStream: stream")
                 && js.contains("decodePcmFrame(value)")
-                && js.contains("InvokeResponseBody::Raw") == false
+                && !js.contains("InvokeResponseBody::Raw")
                 && js.contains("button.dataset.playback = result.playback_id")
                 && !js.contains("mom_llama_speech_audio"),
             "Read Aloud must bind the exact message and consume framed PCM without a complete-WAV browser path"

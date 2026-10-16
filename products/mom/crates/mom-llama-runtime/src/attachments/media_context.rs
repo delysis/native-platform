@@ -42,9 +42,6 @@ pub(super) fn resolve_attachment_set(
         if record.policy_fingerprint.as_deref() != Some(resolution.current_policy_fingerprint) {
             return Ok(Err(policy_mismatch_blocker(record)));
         }
-        if let Err(blocked) = resolution.budget.reserve_reference() {
-            return Ok(Err(blocked));
-        }
         let Some(namespace) = record.manifest_namespace.as_deref() else {
             return Ok(Err(context_blocker(
                 "attachment_manifest_missing",
@@ -98,6 +95,14 @@ pub(super) fn resolve_attachment_set(
             )));
         }
         let canonical = canonical_text(record, &manifest);
+        // The reference budget bounds material admitted to this request. A
+        // historical audio-only occurrence contributes neither text nor media
+        // on the voice path, even though its manifest is still verified.
+        if (materialize_media || !canonical.is_empty())
+            && let Err(blocked) = resolution.budget.reserve_reference()
+        {
+            return Ok(Err(blocked));
+        }
         match AttachmentContextSource::from_verified(record, &manifest, &canonical) {
             Ok(source) => sources.push(source),
             Err(blocked) => return Ok(Err(blocked)),

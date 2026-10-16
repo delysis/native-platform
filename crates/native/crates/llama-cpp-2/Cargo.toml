@@ -24,7 +24,7 @@ encoding_rs = "0.8.35"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 
 [features]
-default = ["openmp", "android-shared-stdcxx", "common"]
+default = ["common"]
 # Enable the JSON-schema-to-grammar API. Backed by `llama.cpp`'s `common/`
 # static library; disabling drops `libcommon.a` (~14 MB) plus the
 # `wrapper_common.cpp` bindings from the link line. Enabled by default for

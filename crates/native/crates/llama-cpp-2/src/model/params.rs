@@ -704,7 +704,7 @@ mod tests {
         );
         assert_eq!(
             u32::from(LlamaSplitMode::Tensor),
-            llama_cpp_sys_2::LLAMA_SPLIT_MODE_TENSOR as u32
+            llama_cpp_sys_2::LLAMA_SPLIT_MODE_TENSOR
         );
         assert_eq!(
             i32::from(LlamaSplitMode::Tensor),

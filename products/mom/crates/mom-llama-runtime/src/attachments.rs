@@ -589,6 +589,10 @@ fn canonical_attachment_record(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "attachment admission keeps its explicit scope and identity"
+)]
 fn canonicalize_and_stage(
     scope: &crate::OperationScope,
     conversation_id: &str,
@@ -624,19 +628,18 @@ fn canonicalize_and_stage(
     attachment_db.attachments.insert(0, record.clone());
     let mut draft_db = load_drafts()?;
     stage_in_draft(&mut draft_db, conversation_id, &id);
-    if let Some(marker) = internal_draft_marker {
-        if let Some(draft) = draft_db
+    if let Some(marker) = internal_draft_marker
+        && let Some(draft) = draft_db
             .drafts
             .iter_mut()
             .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
-        {
-            // Persist transport ownership in the same atomic document write as
-            // the captured attachment. A crash can therefore restore either
-            // the user's prior draft or a hidden voice transport draft, never
-            // a microphone file masquerading as a user-staged attachment.
-            if draft.message.trim().is_empty() {
-                draft.message = marker.to_string();
-            }
+    {
+        // Persist transport ownership in the same atomic document write as
+        // the captured attachment. A crash can therefore restore either
+        // the user's prior draft or a hidden voice transport draft, never
+        // a microphone file masquerading as a user-staged attachment.
+        if draft.message.trim().is_empty() {
+            draft.message = marker.to_string();
         }
     }
     let settings = resolve_settings()?;
@@ -1057,6 +1060,36 @@ pub(crate) fn prepare_live_audio_history(
         conversation_id,
         active_messages,
         CurrentAttachmentSelection::HistoryTextOnly,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
+/// The microphone PCM has already been evaluated when a voice turn commits.
+/// Retain the exact draft attachment IDs for the saved message, while keeping
+/// historical and current media out of this bookkeeping-only pass.
+pub(crate) fn prepare_live_audio_commit(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::DraftTextOnly,
+    )
+    .map(|result| result.map(|scoped| scoped.context))
+}
+
+/// A recorded voice note may fall back to a staged WAV when live prefill is
+/// unavailable. Admit that current recording, but never replay older audio
+/// attachments into this new request.
+pub(crate) fn prepare_voice_reply_attachments(
+    conversation_id: &str,
+    active_messages: &[Message],
+) -> Result<std::result::Result<ChatAttachmentContext, AttachmentContextBlocker>> {
+    prepare_scoped_chat_attachments(
+        conversation_id,
+        active_messages,
+        CurrentAttachmentSelection::DraftCurrentMediaHistoryText,
     )
     .map(|result| result.map(|scoped| scoped.context))
 }
@@ -4884,6 +4917,92 @@ mod tests {
         assert_eq!(prepared.media.len(), 1);
         assert_eq!(prepared.media[0].kind, MediaKind::Audio);
         assert_eq!(prepared.media[0].mime, "audio/wav");
+    }
+
+    #[test]
+    fn live_audio_commit_keeps_draft_without_readmitting_old_recordings() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("voice-history-commit");
+        let data_dir = resolve_settings().expect("settings").data_dir;
+        let mut historical = Vec::new();
+        for index in 0..=MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS {
+            let mut wav = STRUCTURALLY_VALID_WAV.to_vec();
+            *wav.last_mut().expect("sample byte") = index as u8;
+            let path = data_dir.join(format!("recording-{index}.wav"));
+            std::fs::write(&path, wav).expect("write recording");
+            let attachment = attachment_import(&scope, "chat", &path)
+                .expect("import recording")
+                .result
+                .expect("recording result")
+                .attachment;
+            historical.push(attachment.id);
+        }
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment db");
+        for (index, id) in historical.iter().enumerate() {
+            let record = db
+                .attachments
+                .iter_mut()
+                .find(|record| &record.id == id)
+                .expect("imported recording");
+            record.state = AttachmentState::Committed;
+            record.message_id = format!("earlier-turn-{index}");
+        }
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit recordings");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear draft");
+        let messages = historical
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| message(&format!("earlier-turn-{index}"), vec![id]))
+            .collect::<Vec<_>>();
+        let ordinary = prepare_chat_attachments("chat", &messages, None)
+            .expect("ordinary preparation")
+            .expect_err("ordinary media admission must retain its limit");
+        assert_eq!(
+            ordinary.blocker.code,
+            "attachment_context_media_count_exceeded"
+        );
+
+        let current = attachment_import_pasted_text(&scope, "chat", "current note".to_string())
+            .expect("stage current note")
+            .result
+            .expect("current note result")
+            .attachment;
+        let commit = prepare_live_audio_commit("chat", &messages)
+            .expect("voice commit preparation")
+            .expect("old audio must not be readmitted");
+        assert_eq!(commit.staged_ids, vec![current.id.clone()]);
+        assert!(commit.media.is_empty());
+        assert!(commit.current_text.contains("current note"));
+
+        let current_audio = attachment_import(&scope, "chat", &data_dir.join("recording-0.wav"))
+            .expect("stage current audio")
+            .result
+            .expect("current audio result")
+            .attachment;
+        let voice_reply = prepare_voice_reply_attachments("chat", &messages)
+            .expect("voice reply preparation")
+            .expect("old audio must not crowd out the current recording");
+        assert_eq!(voice_reply.media.len(), 1);
+        assert_eq!(voice_reply.staged_ids, vec![current.id, current_audio.id]);
+
+        // Long voice conversations retain occurrence evidence, but old WAVs
+        // do not consume the per-request attachment budget once omitted from
+        // model input. The historical prompt still carries message text.
+        let long_history = (0..=MAX_ACTIVE_ATTACHMENT_REFERENCES)
+            .map(|index| {
+                let prior = &messages[index % messages.len()];
+                message(&format!("long-turn-{index}"), prior.attachment_ids.clone())
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_live_audio_history("chat", &long_history)
+            .expect("long voice history preparation")
+            .expect("omitted old WAVs must not cap the number of turns");
+        assert!(prepared.media.is_empty());
     }
 
     #[test]

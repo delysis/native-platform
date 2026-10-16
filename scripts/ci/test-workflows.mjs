@@ -925,7 +925,7 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
   assert.equal(
     scripts["check:frontend"],
-    "node --check ui/composer-key-policy.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
+    "node --check ui/composer-key-policy.js && node --check ui/voice-capture-policy.js && node --check ui/voice-pipeline-scheduler.js && node --check ui/pcm-playback-worklet.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
   );
   assert.match(scripts["test:frontend"], /(?:^|\s)ui\/persona-sidebar-wiring\.test\.js(?:\s|$)/);
 });

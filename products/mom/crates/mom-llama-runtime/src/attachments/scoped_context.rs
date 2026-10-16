@@ -6,6 +6,8 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CurrentAttachmentSelection<'a> {
     Draft,
+    DraftTextOnly,
+    DraftCurrentMediaHistoryText,
     ExistingUser(&'a str),
     HistoryOnly,
     HistoryTextOnly,
@@ -64,7 +66,12 @@ pub(crate) fn prepare_scoped_chat_attachments(
             "The retained attachment registry contains duplicate occurrence IDs.".into(),
         )));
     }
-    let draft_snapshot = if matches!(current_selection, CurrentAttachmentSelection::Draft) {
+    let draft_snapshot = if matches!(
+        current_selection,
+        CurrentAttachmentSelection::Draft
+            | CurrentAttachmentSelection::DraftTextOnly
+            | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+    ) {
         load_drafts()?
             .drafts
             .into_iter()
@@ -73,7 +80,9 @@ pub(crate) fn prepare_scoped_chat_attachments(
         None
     };
     let current_ids = match current_selection {
-        CurrentAttachmentSelection::Draft => draft_snapshot
+        CurrentAttachmentSelection::Draft
+        | CurrentAttachmentSelection::DraftTextOnly
+        | CurrentAttachmentSelection::DraftCurrentMediaHistoryText => draft_snapshot
             .as_ref()
             .map(|draft| draft.attachment_ids.clone())
             .unwrap_or_default(),
@@ -122,6 +131,8 @@ pub(crate) fn prepare_scoped_chat_attachments(
             !matches!(
                 current_selection,
                 CurrentAttachmentSelection::HistoryTextOnly
+                    | CurrentAttachmentSelection::DraftTextOnly
+                    | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
             ),
         )? {
             Ok(resolved) => resolved,
@@ -137,14 +148,19 @@ pub(crate) fn prepare_scoped_chat_attachments(
     let current = match resolve_attachment_set(
         conversation_id,
         &current_ids,
-        if matches!(current_selection, CurrentAttachmentSelection::Draft) {
+        if matches!(
+            current_selection,
+            CurrentAttachmentSelection::Draft
+                | CurrentAttachmentSelection::DraftTextOnly
+                | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+        ) {
             AttachmentState::Staged
         } else {
             AttachmentState::Committed
         },
         &records,
         &mut resolution,
-        true,
+        !matches!(current_selection, CurrentAttachmentSelection::DraftTextOnly),
     )? {
         Ok(resolved) => resolved,
         Err(blocked) => return Ok(Err(blocked)),
@@ -152,7 +168,12 @@ pub(crate) fn prepare_scoped_chat_attachments(
     media.extend(current.context.media);
     Ok(Ok(ScopedChatAttachmentContext {
         context: ChatAttachmentContext {
-            staged_ids: if matches!(current_selection, CurrentAttachmentSelection::Draft) {
+            staged_ids: if matches!(
+                current_selection,
+                CurrentAttachmentSelection::Draft
+                    | CurrentAttachmentSelection::DraftTextOnly
+                    | CurrentAttachmentSelection::DraftCurrentMediaHistoryText
+            ) {
                 current_ids
             } else {
                 Vec::new()

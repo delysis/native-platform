@@ -414,13 +414,13 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             ));
         }
     };
-    if bind_acquired_model_pair(&mut settings, &acquired) {
-        if let Err(error) = mom_llama_runtime::config::save_settings(&settings) {
-            startup.record_failure();
-            return Err(format!(
-                "Blessenger could not save its verified model set: {error:#}"
-            ));
-        }
+    if bind_acquired_model_pair(&mut settings, &acquired)
+        && let Err(error) = mom_llama_runtime::config::save_settings(&settings)
+    {
+        startup.record_failure();
+        return Err(format!(
+            "Blessenger could not save its verified model set: {error:#}"
+        ));
     }
     if !acquired.qwen_root.join("config.json").is_file() {
         startup.record_failure();
@@ -708,7 +708,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_speech_precommit_synthesize,
         commands::mom_llama_voice_generation_backpressure,
         commands::mom_llama_message_edit,
-        commands::mom_llama_message_record_call_transcript,
+        commands::mom_llama_message_record_voice_transcript,
         commands::mom_llama_message_delete,
         commands::mom_llama_message_branches,
         commands::mom_llama_message_branch_select,

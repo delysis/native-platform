@@ -283,9 +283,11 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
   assert.match(
     submitHandler,
-    /if \(callTranscript && result\?\.result\?\.kind === "direct"\)[\s\S]*?void \(async \(\) => \{[\s\S]*?invoke\("mom_llama_speech_transcribe_attachment"/,
+    /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"[\s\S]*?void \(async \(\) => \{[\s\S]*?invoke\("mom_llama_speech_transcribe_attachment"/,
     "Parakeet transcript work must start only in a detached sidecar after the awaited dispatch result",
   );
+  assert.ok(submitHandler.includes("output?.voice_attachment_id || voiceTranscriptAttachment"));
+  assert.ok(submitHandler.includes('invoke("mom_llama_message_record_voice_transcript"'));
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
@@ -506,7 +508,9 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
   assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
   assert.ok(!live.includes("void beginVoiceCapture({ call: true }).catch(reportError);"));
-  assert.ok(interrupt.includes('liveVoiceTts?.mode === "call"'));
+  assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
+  assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
+  assert.ok(live.includes("if (stopped || activeOperation !== operation) return;"));
   assert.ok(interrupt.includes('markVoiceLatency("barge_in_detected"'));
   assert.ok(interrupt.includes("void reply.stop()"));
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));
@@ -587,7 +591,7 @@ test("call and voice-note replies speculate on the first silence edge and commit
   const captureStart = bridge.indexOf("  const beginNativeVoiceCapture = async");
   const captureEnd = bridge.indexOf("\n  const sendVoiceCapture = async", captureStart);
   const capture = bridge.slice(captureStart, captureEnd);
-  const speculateStart = bridge.indexOf("  const restartVoicePrefill = async");
+  const speculateStart = bridge.indexOf("  const resumeBrowserVoicePrefill =");
   const speculateEnd = bridge.indexOf("\n  const sendVoiceCapture = async", speculateStart);
   const speculate = bridge.slice(speculateStart, speculateEnd);
 

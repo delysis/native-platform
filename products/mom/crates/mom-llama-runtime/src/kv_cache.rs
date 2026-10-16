@@ -606,7 +606,6 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
 pub(crate) struct PersonaPrefixUse {
     pub cache_id: String,
     pub sequence: SequenceStateBlob,
-    pub reused: bool,
 }
 
 pub(crate) fn ensure_persona_prefix(
@@ -624,7 +623,6 @@ pub(crate) fn ensure_persona_prefix(
         return Ok(Some(PersonaPrefixUse {
             cache_id: value.0,
             sequence: value.1,
-            reused: true,
         }));
     }
     // A cache miss must remain cheaper than ordinary generation. Gemma 4's

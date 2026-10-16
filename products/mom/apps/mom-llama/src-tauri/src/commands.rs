@@ -146,7 +146,7 @@ fn validate_voice_latency_trace(trace: &str) -> Result<(String, usize, u64), Str
     if trace.len() > MAX_VOICE_LATENCY_TRACE_BYTES {
         return Err("voice latency trace exceeds its bounded size".to_string());
     }
-    let value: Value = serde_json::from_str(&trace).map_err(to_error)?;
+    let value: Value = serde_json::from_str(trace).map_err(to_error)?;
     let stages = value
         .get("stages")
         .and_then(Value::as_array)
@@ -1352,16 +1352,18 @@ pub fn mom_llama_message_edit(
 }
 
 #[tauri::command]
-pub fn mom_llama_message_record_call_transcript(
+pub fn mom_llama_message_record_voice_transcript(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     message: String,
+    attachment: String,
     transcript: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_message_record_call_transcript"))?;
-    command_value(mom_llama_runtime::message_record_call_transcript(
+    let _lease = runtime.admit(command_spec("mom_llama_message_record_voice_transcript"))?;
+    command_value(mom_llama_runtime::message_record_voice_transcript(
         &conversation,
         &message,
+        &attachment,
         transcript,
     ))
 }
@@ -1855,6 +1857,10 @@ pub async fn mom_llama_voice_audio_finish(
         .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri command arguments are bound by the invoke protocol"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_speculate(
     runtime: State<'_, AppRuntimeHandle>,
@@ -1924,12 +1930,13 @@ pub async fn mom_llama_voice_audio_speculate(
     // Silence is detected by the native capture owner after it has already
     // flushed the trailing partial PCM batch. Detach that exact producer in
     // this same command so the renderer does not pay a second IPC round trip.
-    if !wait_for_silence && let Some(capture) = capture {
-        if let Err(error) = capture_state.inner().pause_prefill(capture) {
-            control.abort();
-            owner.finish_voice_speculation(&speculation);
-            return Err(to_error(error));
-        }
+    if !wait_for_silence
+        && let Some(capture) = capture
+        && let Err(error) = capture_state.inner().pause_prefill(capture)
+    {
+        control.abort();
+        owner.finish_voice_speculation(&speculation);
+        return Err(to_error(error));
     }
     let operations = runtime.operation_scope();
     let worker_owner = owner.clone();
@@ -2230,7 +2237,7 @@ pub async fn mom_llama_voice_audio_speculation_abort(
 pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
     runtime: State<'_, AppRuntimeHandle>,
     capture_state: State<'_, NativeVoiceCapture>,
-    capture: String,
+    capture: Option<String>,
     speculation: String,
     conversation: String,
     message: String,
@@ -2266,6 +2273,10 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                     .map_err(to_error)?;
             let resume_wait_started = Instant::now();
             let resume = session.wait_for_resume().map_err(to_error)?;
+            if !resume.reused {
+                session.cancel();
+                return Err("voice_audio_checkpoint_unavailable: The live audio prefix could not be resumed".to_string());
+            }
             let resume_wait_us = resume_wait_started
                 .elapsed()
                 .as_micros()
@@ -2278,29 +2289,36 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
 
-            let sink = owner.voice_audio_session(&session_id)?;
-            let exact_cancellation = sink.cancellation_handle().ok_or_else(|| {
-                "The replacement voice session has no cancellation authority".to_string()
-            })?;
-            let target = CaptureTarget {
-                id: session_id.clone(),
-                sink,
-                cancel: Arc::new(move || {
-                    exact_cancellation.cancel();
-                }),
+            // Native capture can retarget its retained ring here. WebKit call
+            // capture has the same retained samples in the renderer and uses
+            // the returned checkpoint offset to replay only its suffix.
+            let (retarget_us, replay) = if let Some(capture) = capture {
+                let sink = owner.voice_audio_session(&session_id)?;
+                let exact_cancellation = sink.cancellation_handle().ok_or_else(|| {
+                    "The replacement voice session has no cancellation authority".to_string()
+                })?;
+                let target = CaptureTarget {
+                    id: session_id.clone(),
+                    sink,
+                    cancel: Arc::new(move || {
+                        exact_cancellation.cancel();
+                    }),
+                };
+                let retarget_started = Instant::now();
+                let replay = match controller.retarget(capture, target, resume.sample_offset) {
+                    Ok(metrics) => metrics,
+                    Err(error) => {
+                        let _ = owner.abort_voice_audio_session(&session_id);
+                        return Err(to_error(error));
+                    }
+                };
+                (
+                    retarget_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    serde_json::json!(replay),
+                )
+            } else {
+                (0, Value::Null)
             };
-            let retarget_started = Instant::now();
-            let replay = match controller.retarget(capture, target, resume.sample_offset) {
-                Ok(metrics) => metrics,
-                Err(error) => {
-                    let _ = owner.abort_voice_audio_session(&session_id);
-                    return Err(to_error(error));
-                }
-            };
-            let retarget_us = retarget_started
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
 
             Ok(serde_json::json!({
                 "aborted": aborted,
@@ -3032,12 +3050,12 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            validate_voice_latency_trace(&overflow).unwrap_err(),
+            validate_voice_latency_trace(&overflow).expect_err("overflow trace"),
             "voice latency trace has invalid stages"
         );
         assert_eq!(
             validate_voice_latency_trace(&"x".repeat(MAX_VOICE_LATENCY_TRACE_BYTES + 1))
-                .unwrap_err(),
+                .expect_err("oversized trace"),
             "voice latency trace exceeds its bounded size"
         );
     }
@@ -3271,10 +3289,22 @@ mod tests {
         assert_eq!(frame[5], 3);
         assert_eq!(frame[6], 1);
         assert_eq!(frame[7], 1);
-        assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), 24_000);
-        assert_eq!(u64::from_le_bytes(frame[12..20].try_into().unwrap()), 7);
-        assert_eq!(u64::from_le_bytes(frame[20..28].try_into().unwrap()), 960);
-        assert_eq!(u32::from_le_bytes(frame[28..32].try_into().unwrap()), 4);
+        assert_eq!(
+            u32::from_le_bytes(frame[8..12].try_into().expect("rate")),
+            24_000
+        );
+        assert_eq!(
+            u64::from_le_bytes(frame[12..20].try_into().expect("offset")),
+            7
+        );
+        assert_eq!(
+            u64::from_le_bytes(frame[20..28].try_into().expect("frames")),
+            960
+        );
+        assert_eq!(
+            u32::from_le_bytes(frame[28..32].try_into().expect("bytes")),
+            4
+        );
         assert_eq!(&frame[32..], chunk.data);
     }
 }

@@ -349,7 +349,6 @@ impl LlamaSampler {
     }
 
     /// Grammar sampler
-    #[must_use]
     pub fn grammar(
         model: &LlamaModel,
         grammar_str: &str,
@@ -386,7 +385,6 @@ impl LlamaSampler {
     ///
     /// This sampler enforces grammar rules only when specific trigger words or tokens are encountered.
     #[cfg(feature = "common")]
-    #[must_use]
     pub fn grammar_lazy(
         model: &LlamaModel,
         grammar_str: &str,
@@ -431,7 +429,6 @@ impl LlamaSampler {
     /// invalid pattern aborts instead of returning
     /// [`GrammarError::NullGrammar`]. An unparseable grammar is reported with a
     /// null pointer either way.
-    #[must_use]
     pub fn grammar_lazy_patterns(
         model: &LlamaModel,
         grammar_str: &str,

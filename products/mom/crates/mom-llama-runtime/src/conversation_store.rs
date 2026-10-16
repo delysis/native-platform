@@ -1356,19 +1356,20 @@ pub fn message_edit(
     )
 }
 
-pub fn message_record_call_transcript(
+pub fn message_record_voice_transcript(
     conversation_id: &str,
     message_id: &str,
+    attachment_id: &str,
     transcript: String,
 ) -> Result<CommandResult<Message>> {
     let transcript = transcript.trim();
     if transcript.is_empty() || transcript.len() > 32_768 {
         return Ok(CommandResult::blocked(
-            "mom_llama.message_record_call_transcript",
+            "mom_llama.message_record_voice_transcript",
             "stub_blocked",
             Blocker::new(
-                "call_transcript_invalid",
-                "The private call transcript is empty or too large.",
+                "voice_transcript_invalid",
+                "The private voice transcript is empty or too large.",
                 vec!["Record a bounded spoken turn and try again.".to_string()],
             ),
         ));
@@ -1385,7 +1386,7 @@ pub fn message_record_call_transcript(
                 .find(|conversation| conversation.id == conversation_id)
             else {
                 return Ok(conversation_not_found(
-                    "mom_llama.message_record_call_transcript",
+                    "mom_llama.message_record_voice_transcript",
                     conversation_id,
                 ));
             };
@@ -1395,28 +1396,26 @@ pub fn message_record_call_transcript(
                 .find(|message| message.id == message_id)
             else {
                 return Ok(message_not_found(
-                    "mom_llama.message_record_call_transcript",
+                    "mom_llama.message_record_voice_transcript",
                     message_id,
                 ));
             };
-            if message.role != MessageRole::User || !message.content.starts_with("[Phone call]") {
+            let Some(voice_prompt) = voice_prompt_for_transcript(message, attachment_id) else {
                 return Ok(CommandResult::blocked(
-                    "mom_llama.message_record_call_transcript",
+                    "mom_llama.message_record_voice_transcript",
                     "stub_blocked",
                     Blocker::new(
-                        "call_transcript_target_invalid",
-                        "The transcript target is not a phone-call turn.",
-                        vec!["Keep the transcript attached to its exact call turn.".to_string()],
+                        "voice_transcript_target_invalid",
+                        "The transcript target is not a recorded voice turn.",
+                        vec!["Keep the transcript attached to its exact voice turn.".to_string()],
                     ),
                 ));
-            }
-            message.content = format!(
-                "[Phone call]\n{transcript}\n\nReply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
-            );
+            };
+            message.content = format!("{voice_prompt}\n\n{transcript}");
             let recorded = message.clone();
             conversation.updated_at = now_ms().to_string();
             Ok(CommandResult::passed(
-                "mom_llama.message_record_call_transcript",
+                "mom_llama.message_record_voice_transcript",
                 "contracted",
                 recorded,
                 vec![store.path().display().to_string()],
@@ -1426,6 +1425,20 @@ pub fn message_record_call_transcript(
             ))
         },
     )
+}
+
+fn voice_prompt_for_transcript(message: &Message, attachment_id: &str) -> Option<&'static str> {
+    let prompt = if message.content.starts_with("[Phone call]") {
+        "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
+    } else if message.content.starts_with("[Voice note]") {
+        "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble."
+    } else {
+        return None;
+    };
+    (message.role == MessageRole::User
+        && message.content == prompt
+        && message.attachment_ids.iter().any(|id| id == attachment_id))
+    .then_some(prompt)
 }
 
 pub fn message_delete(
@@ -2408,6 +2421,30 @@ mod tests {
             .expect("message object")
             .remove("attachment_ids");
         assert!(serde_json::from_value::<Message>(encoded).is_err());
+    }
+
+    #[test]
+    fn voice_transcript_targets_exact_unmodified_recordings() {
+        for prompt in [
+            "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.",
+            "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.",
+        ] {
+            let mut turn = message("spoken", None, MessageRole::User, prompt);
+            turn.attachment_ids.push("exact-audio".into());
+            assert_eq!(
+                super::voice_prompt_for_transcript(&turn, "exact-audio"),
+                Some(prompt)
+            );
+            assert_eq!(
+                super::voice_prompt_for_transcript(&turn, "other-audio"),
+                None
+            );
+            turn.content.push_str("\n\nAlready transcribed");
+            assert_eq!(
+                super::voice_prompt_for_transcript(&turn, "exact-audio"),
+                None
+            );
+        }
     }
 
     #[test]

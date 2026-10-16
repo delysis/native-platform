@@ -12,6 +12,7 @@
       "workspace-document"
     ],
     "native": [
+      "llama-cpp-2",
       "llama-native-cache",
       "llama-native-engine",
       "llama-native-host",
