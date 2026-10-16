@@ -505,7 +505,10 @@ fn persist_default_model_selection(
             Ok(Ok(current.clone()))
         },
     )?;
-    Ok(selected.map(|settings| (settings, store.path().to_path_buf())))
+    Ok(selected.map(|settings| {
+        crate::config::publish_resolved_settings(&settings);
+        (settings, store.path().to_path_buf())
+    }))
 }
 
 /// Finds a projector only beside the selected path. In particular, this scans

@@ -24,9 +24,10 @@ use uuid::Uuid;
 
 const KV_CACHE_NAMESPACE: &str = "kv-cache.v3";
 const KV_CACHE_BLOB_PREFIX: &str = "kv-cache.v3.blob.";
-const DEFAULT_MEMORY_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MEMORY_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_PERSISTENT_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_PERSISTENT_CACHE_ENTRIES: usize = 64;
+const AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const BUILTIN_CACHE_OWNER: &str = "builtin:kind-local-assistant";
 const BUILTIN_CACHE_PROMPT: &str =
     "You are a kind, concise local assistant. Answer clearly and acknowledge uncertainty.";
@@ -507,10 +508,19 @@ fn compatible_cached_prefix_for_owner(
     messages: &[ChatMessage],
     owner_id: Option<&str>,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
+    let settings = resolve_settings()?;
+    compatible_cached_prefix_for_owner_with_settings(handle, messages, owner_id, &settings)
+}
+
+pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
+    handle: &NativeModelHandle,
+    messages: &[ChatMessage],
+    owner_id: Option<&str>,
+    settings: &Settings,
+) -> Result<Option<(String, SequenceStateBlob)>> {
     if messages.is_empty() {
         return Ok(None);
     }
-    let settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
@@ -547,7 +557,16 @@ fn compatible_cached_prefix_for_owner(
             owner,
         ),
         None => longest_compatible_prefix(&db.entries, &fingerprint, &tokenized.token_ids),
-    };
+    }
+    .filter(|candidate| {
+        db.entries
+            .iter()
+            .find(|entry| entry.id == candidate.id)
+            .is_none_or(|entry| {
+                entry.tier != CacheTier::PersonaPack
+                    || entry.state_bytes <= AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES
+            })
+    });
     let selected = choose_match(memory_match, persistent_match);
     let Some(selected) = selected else {
         return Ok(None);
@@ -601,8 +620,6 @@ pub(crate) struct PersonaPrefixUse {
 pub(crate) fn ensure_persona_prefix(
     handle: &NativeModelHandle,
     owner_id: &str,
-    label: &str,
-    stable_messages: &[ChatMessage],
     target_messages: &[ChatMessage],
 ) -> Result<Option<PersonaPrefixUse>> {
     let settings = resolve_settings()?;
@@ -618,25 +635,13 @@ pub(crate) fn ensure_persona_prefix(
             reused: true,
         }));
     }
-    let value = create_prefix_value(
-        handle,
-        CacheTier::PersonaPack,
-        Some(owner_id.to_string()),
-        label.to_string(),
-        stable_messages,
-    )?;
-    if !persist_value(&settings, &value)? {
-        return Ok(None);
-    }
-    Ok(
-        compatible_cached_prefix_for_owner(handle, target_messages, Some(owner_id))?.map(
-            |(cache_id, sequence)| PersonaPrefixUse {
-                cache_id,
-                sequence,
-                reused: false,
-            },
-        ),
-    )
+    // A cache miss must remain cheaper than ordinary generation. Gemma 4's
+    // hybrid recurrent state exports hundreds of megabytes even for a short
+    // system prompt, so eagerly constructing and snapshotting a persona cache
+    // delayed every cold reply by several seconds. Explicit cache preparation
+    // may still populate a reusable entry; the automatic reply path falls
+    // through to direct prompt prefill.
+    Ok(None)
 }
 
 pub fn persist_session_checkpoint(
@@ -671,7 +676,22 @@ pub fn persist_session_checkpoint(
     if !value.is_valid() {
         return Ok(None);
     }
-    if !persist_value(&settings, &value)? {
+    // Conversation checkpoints are produced automatically on the latency-
+    // sensitive reply path. Hybrid recurrent models can export a checkpoint
+    // hundreds of megabytes large even for a short turn. Encrypting that blob
+    // synchronously monopolizes a CPU core and can make the application appear
+    // hung. Retain oversized checkpoints in the resident LRU; explicit cache
+    // saves remain durable.
+    let promoted = if value.metadata.state_bytes > AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES {
+        let store = RuntimeStore::open(&settings.data_dir)?;
+        let Some(lease) = MomCachePromotionLease::acquire(&store, Some(conversation_id))? else {
+            return Ok(None);
+        };
+        lease.promote(value.clone())?
+    } else {
+        persist_value(&settings, &value)?
+    };
+    if !promoted {
         return Ok(None);
     }
     Ok(Some(value.metadata.id))

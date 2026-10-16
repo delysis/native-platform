@@ -11,7 +11,7 @@ user's macOS Keychain. In that mode, copied database files and file-only backups
 are unreadable without the installation key, and authenticated encryption
 detects record substitution.
 
-Debug builds default to a separate `mom-llama-development` data directory and a
+Debug builds default to a schema-qualified `mom-llama-development-mom1-v1` data directory and a
 predictable path-derived key so rapid iteration does not trigger Keychain
 authorization prompts. This preserves the production record format and detects
 accidental corruption, but it is **not a confidentiality boundary**: anyone who

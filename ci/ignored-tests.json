@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 50,
+  "expected_test_count": 51,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -123,6 +123,22 @@
       ],
       "src_path": "crates/services/speech/crates/speech-native-backend-parakeet/tests/real_parakeet.rs",
       "manifest_path": "crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "speech-native-backend-qwen",
+      "selector": "lib",
+      "name": "speech_native_backend_qwen",
+      "kinds": [
+        "lib"
+      ],
+      "src_path": "crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs",
+      "manifest_path": "crates/services/speech/crates/speech-native-backend-qwen/Cargo.toml",
       "platforms": [
         "linux",
         "macos",
@@ -703,6 +719,24 @@
       ],
       "evidence_class": "real-model-audio-runtime",
       "promotion_prohibition": "Passing this test cannot promote transcription accuracy, microphone capture, product integration, or cross-platform readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_local_qwen_synthesis_returns_bound_wav",
+      "package": "speech-native-backend-qwen",
+      "target": "lib",
+      "source": "crates/services/speech/crates/speech-native-backend-qwen/src/lib.rs",
+      "prerequisite": "requires the exact local Qwen model and compiled MLX helper",
+      "required_environment": [
+        "MOM_QWEN3_TTS_HELPER",
+        "MOM_QWEN3_TTS_MODEL"
+      ],
+      "evidence_class": "real-model-audio-runtime",
+      "promotion_prohibition": "Passing this test cannot promote voice quality, consultant likeness, product playback, packaging, or non-macOS readiness.",
       "platforms": [
         "linux",
         "macos",

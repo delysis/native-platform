@@ -2453,6 +2453,9 @@ mod tests {
                 context_tokens: 8_192,
                 max_sequences: 4,
                 backend: "cpu".to_string(),
+                load_metrics: Default::default(),
+                model_file_identity: String::new(),
+                mmproj_file_identity: None,
                 capabilities: ModelCapabilities {
                     prompt_forms: vec![PromptForm::Completion],
                     chat_template_available: false,

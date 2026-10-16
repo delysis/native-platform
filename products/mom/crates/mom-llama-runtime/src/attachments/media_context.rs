@@ -76,14 +76,14 @@ pub(super) fn resolve_attachment_set(
                 ),
             )));
         }
-        // Keep product modality policy independent of byte identity. In
-        // particular, a valid WAV checksum does not authorize direct audio in
-        // Mom's transcription-first path. Preserve existing typed blockers.
+        // Direct model media requires a completely validated canonical payload.
+        // Images and audio use the same identity and resource-accounting gate;
+        // model capability admission happens later against the selected model.
         for artifact in &manifest.artifacts {
             if let ArtifactPayload::Media {
                 family, validation, ..
             } = &artifact.payload
-                && (*family != MediaFamily::Image || !validation.grade.permits_direct_media())
+                && (*family == MediaFamily::Video || !validation.grade.permits_direct_media())
             {
                 return Ok(Err(media_transform_blocker(record, *family)));
             }
@@ -109,7 +109,7 @@ pub(super) fn resolve_attachment_set(
             text.push(canonical);
         }
         for artifact in &manifest.artifacts {
-            let ArtifactPayload::Media { blob, .. } = &artifact.payload else {
+            let ArtifactPayload::Media { family, blob, .. } = &artifact.payload else {
                 continue;
             };
             if blob.byte_len > MAX_ACTIVE_ATTACHMENT_MEDIA_BYTES {
@@ -143,7 +143,11 @@ pub(super) fn resolve_attachment_set(
             }
             let item = MediaInput {
                 id: format!("{}:{}", record.id, artifact.id.0),
-                kind: MediaKind::Image,
+                kind: match family {
+                    MediaFamily::Image => MediaKind::Image,
+                    MediaFamily::Audio => MediaKind::Audio,
+                    MediaFamily::Video => unreachable!("video is rejected before media loading"),
+                },
                 mime: blob.media_type.clone(),
                 sha256: blob.sha256.clone(),
                 bytes,

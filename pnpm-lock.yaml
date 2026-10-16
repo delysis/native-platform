@@ -88,6 +88,12 @@ importers:
         specifier: 4.1.11
         version: 4.1.11(@types/node@26.2.0)(@vitest/browser-playwright@4.1.11)(vite@8.2.1(@types/node@26.2.0))
 
+  products/loom/signal/target/chatterbox-nano-bench-venv/lib/python3.12/site-packages/gradio: {}
+
+  products/loom/signal/target/chatterbox-nano-bench-venv/lib/python3.12/site-packages/gradio/templates/node/build: {}
+
+  products/loom/signal/target/chatterbox-nano-bench-venv/lib/python3.12/site-packages/gradio_client: {}
+
   products/mom/apps/mom-llama:
     devDependencies:
       '@tauri-apps/cli':

@@ -37,6 +37,18 @@ pub struct AppliedSkillPrompt {
     pub cache_label: String,
 }
 
+pub(crate) fn persona_prefix_cache_owner_id<'a>(
+    source_persona_id: Option<&'a str>,
+    skill_ids: &[String],
+    skills_cacheable: bool,
+) -> Option<&'a str> {
+    if !skill_ids.is_empty() && !skills_cacheable {
+        None
+    } else {
+        source_persona_id
+    }
+}
+
 pub fn skill_create(
     name: String,
     description: String,
@@ -224,6 +236,9 @@ pub fn load_skill_db() -> Result<SkillDb> {
 }
 
 pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> {
+    if skill_ids.is_empty() {
+        return Ok(applied_skill_prompt_from_db(skill_ids, &SkillDb::default()));
+    }
     let db = load_skill_db()?;
     Ok(applied_skill_prompt_from_db(skill_ids, &db))
 }
@@ -274,5 +289,38 @@ pub(crate) fn applied_skill_prompt_from_db(
         prompt,
         cache_owner_id,
         cache_label,
+    }
+}
+
+#[cfg(test)]
+mod cache_owner_tests {
+    use super::persona_prefix_cache_owner_id;
+
+    #[test]
+    fn built_in_personas_without_skills_have_distinct_stable_cache_owners() {
+        assert_eq!(
+            persona_prefix_cache_owner_id(Some("persona-ad-de-jongh"), &[], false),
+            Some("persona-ad-de-jongh")
+        );
+        assert_eq!(
+            persona_prefix_cache_owner_id(Some("persona-janina-fisher"), &[], false),
+            Some("persona-janina-fisher")
+        );
+        assert_ne!(
+            persona_prefix_cache_owner_id(Some("persona-ad-de-jongh"), &[], false),
+            persona_prefix_cache_owner_id(Some("persona-janina-fisher"), &[], false),
+        );
+    }
+
+    #[test]
+    fn a_non_cacheable_skill_prevents_prefix_reuse() {
+        assert_eq!(
+            persona_prefix_cache_owner_id(Some("persona-ad-de-jongh"), &["private".into()], false),
+            None
+        );
+        assert_eq!(
+            persona_prefix_cache_owner_id(Some("persona-ad-de-jongh"), &["safe".into()], true),
+            Some("persona-ad-de-jongh")
+        );
     }
 }

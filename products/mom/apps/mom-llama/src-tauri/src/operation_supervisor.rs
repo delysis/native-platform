@@ -4,6 +4,7 @@
 
 use operation_lifecycle::{InstanceId, RunControl, WorkerLedger};
 use serde::Serialize;
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
@@ -12,6 +13,14 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_PROGRESS_CAPACITY: usize = 64;
 const COMPLETED_WORKER_HISTORY: usize = 256;
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("unknown panic payload")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,7 +207,7 @@ pub struct SupervisedTask<T> {
 impl<T> SupervisedTask<T> {
     pub async fn wait(self) -> Result<T, String> {
         let result = self.result.await.map_err(|_| {
-            "Mom Llama's supervised worker stopped before returning a result".to_owned()
+            "Blessenger's supervised worker stopped before returning a result".to_owned()
         })?;
         if self.joined.get().is_none() {
             let reaped = self.supervisor.reap_worker(&self.worker_id);
@@ -697,7 +706,10 @@ impl OperationSupervisor {
                 let result = match (result, published) {
                     (_, Err(error)) => Err(error.to_string()),
                     (Ok(result), Ok(())) => result,
-                    (Err(_), Ok(())) => Err("Mom Llama's supervised worker panicked".to_owned()),
+                    (Err(panic), Ok(())) => Err(format!(
+                        "Blessenger's supervised worker panicked: {}",
+                        panic_payload_message(panic.as_ref())
+                    )),
                 };
                 #[cfg(test)]
                 if let Some(barriers) =

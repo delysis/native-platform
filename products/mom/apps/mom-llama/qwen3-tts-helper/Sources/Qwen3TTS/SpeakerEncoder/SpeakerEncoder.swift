@@ -543,12 +543,6 @@ nonisolated public class SpeakerEncoder: Module {
         return embedding
     }
 
-    private func transposeConv(_ weight: MLXArray) -> MLXArray {
-        let t = weight.transposed(0, 2, 1)
-        eval(t)
-        return t
-    }
-
     public func load(weights: [String: MLXArray]) {
         var w: [String: MLXArray] = [:]
         for (key, val) in weights where key.hasPrefix("speaker_encoder.") {
@@ -563,7 +557,12 @@ nonisolated public class SpeakerEncoder: Module {
         func loadConv(_ conv: Conv1d, weightKey: String, biasKey: String) {
             if let wt = w[weightKey], let b = w[biasKey] {
                 let params = ModuleParameters.unflattened([
-                    "weight": transposeConv(wt),
+                    // These converted MLX weights are already laid out as
+                    // [output, kernel, input]. Transposing them back to the
+                    // PyTorch order made Conv1d see the kernel width as its
+                    // input-channel count and crashed as soon as voice cloning
+                    // tried to extract a speaker embedding.
+                    "weight": wt,
                     "bias": b
                 ])
                 _ = try? conv.update(parameters: params, verify: .none)

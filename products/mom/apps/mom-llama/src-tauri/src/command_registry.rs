@@ -85,6 +85,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_chat_fragment", false, true),
     read("mom_llama_render_sidebar_fragment", false, false),
     read("mom_llama_render_settings_fragment", false, true),
+    read("mom_llama_voice_latency_record", false, false),
     long("mom_llama_pick_file", true, false),
     long("mom_llama_information_pick_alexandria", false, false),
     long("mom_llama_information_register_alexandria", true, false),
@@ -110,6 +111,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     ),
     long("mom_llama_information_managed_removal_commit", true, false),
     long("mom_llama_engine_check", true, true),
+    long("mom_llama_runtime_warm", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
     long("mom_llama_model_select", true, true),
@@ -118,6 +120,24 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_composer_autocomplete_cancel", false, true),
     long("mom_llama_composer_autocomplete_accept", true, true),
     long("mom_llama_chat_dispatch", true, true),
+    long("mom_llama_voice_audio_begin", false, true),
+    long("mom_llama_voice_capture_prepare", false, true),
+    long("mom_llama_voice_capture_start", false, true),
+    mutation("mom_llama_voice_capture_pause", false, true),
+    mutation("mom_llama_voice_capture_retarget", false, true),
+    mutation("mom_llama_voice_capture_stop", false, true),
+    mutation("mom_llama_voice_capture_cancel", false, true),
+    mutation("mom_llama_voice_audio_push", false, true),
+    long("mom_llama_voice_audio_finish", true, true),
+    long("mom_llama_voice_audio_speculate", true, true),
+    mutation("mom_llama_voice_audio_speculation_confirm", false, true),
+    mutation("mom_llama_voice_audio_speculation_abort", true, true),
+    mutation(
+        "mom_llama_voice_audio_speculation_abort_and_retarget",
+        true,
+        true,
+    ),
+    mutation("mom_llama_voice_audio_abort", false, true),
     long("mom_llama_mention_dispatch", true, true),
     read("mom_llama_mention_candidates", true, false),
     read("mom_llama_consult_sources", true, false),
@@ -148,6 +168,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         false,
     ),
     mutation("mom_llama_conversation_draft_submit", true, false),
+    mutation("mom_llama_conversation_draft_call_start", true, false),
     mutation("mom_llama_conversation_new", true, false),
     read("mom_llama_conversation_list", true, false),
     mutation("mom_llama_conversation_select", true, false),
@@ -164,19 +185,22 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_conversation_import", true, false),
     read("mom_llama_message_copy", true, false),
     long("mom_llama_speech_read_aloud", true, true),
+    long("mom_llama_speech_precommit_synthesize", true, true),
+    mutation("mom_llama_voice_generation_backpressure", false, true),
     mutation("mom_llama_message_edit", true, false),
+    mutation("mom_llama_message_record_call_transcript", true, false),
     mutation("mom_llama_message_delete", true, false),
     read("mom_llama_message_branches", true, false),
     mutation("mom_llama_message_branch_select", true, false),
     long("mom_llama_attachment_import_text", true, false),
     long("mom_llama_attachment_import_paste", true, false),
     long("mom_llama_attachment_import", true, false),
+    long("mom_llama_voice_message_import", true, false),
     read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", true, false),
     long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
     long("mom_llama_speech_transcribe_attachment", true, true),
-    long("mom_llama_speech_audio", false, true),
     mutation("mom_llama_speech_stop", true, true),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
@@ -294,11 +318,19 @@ mod tests {
         }
 
         let view = include_str!("view.rs");
+        assert_eq!(
+            view.matches("tauri_command: \"client_only\"").count(),
+            2,
+            "voice-call and voice-message controls are the deliberately local UI commands"
+        );
         for line in view.lines() {
             let Some(value) = line.trim().strip_prefix("tauri_command: \"") else {
                 continue;
             };
             let tauri_command = value.split_once('"').expect("quoted UI Tauri command").0;
+            if tauri_command == "client_only" {
+                continue;
+            }
             assert!(
                 classified.contains(tauri_command),
                 "UI command {tauri_command} must be classified"
@@ -313,6 +345,7 @@ mod tests {
             "mom_llama_render_chat_fragment",
             "mom_llama_render_settings_fragment",
             "mom_llama_engine_check",
+            "mom_llama_runtime_warm",
             "mom_llama_engine_configure",
             "mom_llama_model_select",
             "mom_llama_chat_send",
@@ -321,6 +354,20 @@ mod tests {
             "mom_llama_composer_autocomplete_cancel",
             "mom_llama_composer_autocomplete_accept",
             "mom_llama_chat_dispatch",
+            "mom_llama_voice_audio_begin",
+            "mom_llama_voice_capture_prepare",
+            "mom_llama_voice_capture_start",
+            "mom_llama_voice_capture_pause",
+            "mom_llama_voice_capture_retarget",
+            "mom_llama_voice_capture_stop",
+            "mom_llama_voice_capture_cancel",
+            "mom_llama_voice_audio_push",
+            "mom_llama_voice_audio_finish",
+            "mom_llama_voice_audio_speculate",
+            "mom_llama_voice_audio_speculation_confirm",
+            "mom_llama_voice_audio_speculation_abort",
+            "mom_llama_voice_audio_speculation_abort_and_retarget",
+            "mom_llama_voice_audio_abort",
             "mom_llama_mention_dispatch",
             "mom_llama_mention_cancel",
             "mom_llama_mention_synthesize",
@@ -342,8 +389,9 @@ mod tests {
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
             "mom_llama_speech_read_aloud",
+            "mom_llama_speech_precommit_synthesize",
+            "mom_llama_voice_generation_backpressure",
             "mom_llama_speech_transcribe_attachment",
-            "mom_llama_speech_audio",
             "mom_llama_speech_stop",
         ]);
         let command_source = include_str!("commands.rs");
@@ -374,7 +422,10 @@ mod tests {
                     || body.contains("composer_autocomplete_accept(")
                     || body.contains("register_alexandria(")
                     || body.contains("commit_attachment(")
-                    || body.contains("commit_managed_removal(");
+                    || body.contains("commit_managed_removal(")
+                    || body.contains("voice_audio_finish_in_scope(")
+                    || body.contains("voice_audio_finish_with_precommit_in_scope(")
+                    || body.contains("chat_cancel_in_scope(");
                 assert_eq!(
                     spec.mutates_store, expected_store_mutation,
                     "{} implementation {} store authority",
@@ -382,6 +433,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_warm_is_supervised_resident_initialization() {
+        let warm = super::command_spec("mom_llama_runtime_warm");
+        assert_eq!(warm.admission, super::AdmissionClass::Foreground);
+        assert_eq!(warm.class, super::CommandClass::LongOperation);
+        assert!(warm.mutates_store);
+        assert!(warm.uses_native);
     }
 
     #[test]

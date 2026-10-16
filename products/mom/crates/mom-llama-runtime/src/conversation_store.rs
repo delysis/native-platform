@@ -113,6 +113,11 @@ pub struct MessageAttribution {
     pub version: u64,
     pub invocation_id: String,
     pub target_order: usize,
+    /// The attributed model turn ended before producing its normal terminal
+    /// marker. The retained text is still authoritative, but is only a prefix
+    /// of the response the model was generating.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -416,7 +421,26 @@ pub fn conversation_draft_recipients_update(
     })
 }
 
-/// Opening a composer selects one durable draft, never a saved conversation.
+fn new_chat_draft_is_empty(drafts: &DraftDb) -> bool {
+    !drafts.drafts.iter().any(|draft| {
+        draft_key(draft.conversation_id.as_deref()) == NEW_CHAT_DRAFT_KEY
+            && (!draft.message.trim().is_empty() || !draft.attachment_ids.is_empty())
+    })
+}
+
+fn latest_persona_chat_id(db: &ConversationDb, persona_id: &str) -> Option<String> {
+    db.conversations
+        .iter()
+        .filter(|conversation| {
+            conversation.kind == ConversationKind::Chat
+                && conversation.source_conversation_id.as_deref() == Some(persona_id)
+        })
+        .max_by_key(|conversation| conversation.updated_at.parse::<u128>().unwrap_or_default())
+        .map(|conversation| conversation.id.clone())
+}
+
+/// A contact opens its latest durable conversation when the shared draft is
+/// empty. The explicit new-chat surface remains the sole path to a blank draft.
 pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<Option<String>>> {
     let store = RuntimeStore::current()?;
     let result = store.mutate_documents(
@@ -428,6 +452,23 @@ pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<
                 .unwrap_or_default();
             let explicit_persona = persona.is_some();
             let selected = persona.or(current);
+            if let Some(persona_id) = selected.as_deref() {
+                anyhow::ensure!(
+                    db.conversations.iter().any(|conversation| {
+                        conversation.id == persona_id
+                            && conversation.kind == ConversationKind::PersonaTemplate
+                    }),
+                    "Persona is unavailable"
+                );
+                let drafts: DraftDb = documents.get(DRAFTS_NAMESPACE)?.unwrap_or_default();
+                if explicit_persona
+                    && new_chat_draft_is_empty(&drafts)
+                    && let Some(conversation_id) = latest_persona_chat_id(db, persona_id)
+                {
+                    db.selected_conversation_id = Some(conversation_id);
+                    return Ok(selected);
+                }
+            }
             if explicit_persona {
                 let recipients = DraftRecipients {
                     recipient_ids: selected.iter().cloned().collect(),
@@ -437,15 +478,6 @@ pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<
                     NEW_CHAT_RECIPIENTS_NAMESPACE,
                     &serde_json::to_vec(&recipients)?,
                 )?;
-            }
-            if let Some(id) = &selected {
-                anyhow::ensure!(
-                    db.conversations
-                        .iter()
-                        .any(|conversation| conversation.id == *id
-                            && conversation.kind == ConversationKind::PersonaTemplate),
-                    "Persona is unavailable"
-                );
             }
             documents.put_bytes(NEW_CHAT_CONTEXT_NAMESPACE, &serde_json::to_vec(&selected)?)?;
             db.selected_conversation_id = Some("default".to_string());
@@ -461,6 +493,35 @@ pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<
         false,
         false,
     ))
+}
+
+/// Repairs the legacy state where an empty contact draft masks an existing
+/// conversation after relaunch. It is safe to call on every startup.
+pub fn conversation_resume_existing_for_empty_draft() -> Result<Option<String>> {
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let drafts: DraftDb = documents.get(DRAFTS_NAMESPACE)?.unwrap_or_default();
+            if db.selected_conversation_id.as_deref() != Some("default")
+                || !new_chat_draft_is_empty(&drafts)
+            {
+                return Ok(None);
+            }
+            let persona: Option<String> = documents
+                .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+                .unwrap_or_default();
+            let Some(persona) = persona else {
+                return Ok(None);
+            };
+            let Some(conversation_id) = latest_persona_chat_id(db, &persona) else {
+                return Ok(None);
+            };
+            db.selected_conversation_id = Some(conversation_id.clone());
+            Ok(Some(conversation_id))
+        },
+    )
 }
 
 pub fn conversation_draft_preview() -> Result<Option<Conversation>> {
@@ -591,6 +652,93 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
     }
 }
 
+/// Materialize the exact single recipient of the unsent composer as a call.
+///
+/// A call is itself the first turn, so it may start without a text draft. The
+/// recipient lookup, Persona snapshot, selection change, and draft-routing
+/// cleanup share one transaction; the renderer can never place the visible
+/// recipient's voice request against the synthetic `default` conversation.
+pub fn conversation_draft_call_start() -> Result<CommandResult<Conversation>> {
+    crate::personas::ensure_builtin_catalog()?;
+    let store = RuntimeStore::current()?;
+    let _attachments = crate::attachments::lock_attachment_lifecycle()?;
+    let _ = crate::attachments::load_attachment_db()?;
+    let id = Uuid::new_v4().to_string();
+    let now = now_ms().to_string();
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            if db.selected_conversation_id.as_deref() != Some("default") {
+                return Ok(Err(Blocker::new(
+                    "draft_call_stale",
+                    "The new conversation is no longer selected.",
+                    Vec::new(),
+                )));
+            }
+            let drafts: DraftDb = documents.get(DRAFTS_NAMESPACE)?.unwrap_or_default();
+            if drafts.drafts.iter().any(|draft| {
+                draft_key(draft.conversation_id.as_deref()) == NEW_CHAT_DRAFT_KEY
+                    && (!draft.message.trim().is_empty() || !draft.attachment_ids.is_empty())
+            }) {
+                return Ok(Err(Blocker::new(
+                    "draft_call_content_pending",
+                    "Send or clear the drafted message before starting a call.",
+                    Vec::new(),
+                )));
+            }
+            let recipients: DraftRecipients = documents
+                .get(NEW_CHAT_RECIPIENTS_NAMESPACE)?
+                .unwrap_or_default();
+            let [persona_id] = recipients.recipient_ids.as_slice() else {
+                return Ok(Err(Blocker::new(
+                    "draft_call_recipient_invalid",
+                    "Choose one contact before starting a call.",
+                    Vec::new(),
+                )));
+            };
+            let mut conversation = match crate::personas::instantiate_from_documents(
+                db, documents, persona_id, None, &id, &now,
+            )? {
+                Ok(conversation) => conversation,
+                Err(blocker) => return Ok(Err(blocker)),
+            };
+            conversation.recipient_ids = vec![persona_id.clone()];
+            let saved = db
+                .conversations
+                .iter_mut()
+                .find(|saved| saved.id == conversation.id)
+                .expect("new call conversation");
+            *saved = conversation.clone();
+            documents.put_bytes(
+                NEW_CHAT_RECIPIENTS_NAMESPACE,
+                &serde_json::to_vec(&DraftRecipients::default())?,
+            )?;
+            documents.put_bytes(
+                NEW_CHAT_CONTEXT_NAMESPACE,
+                &serde_json::to_vec(&None::<String>)?,
+            )?;
+            Ok(Ok(conversation))
+        },
+    )?;
+    Ok(match result {
+        Ok(conversation) => CommandResult::passed(
+            "mom_llama.conversation_draft_call_start",
+            "contracted",
+            conversation,
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        ),
+        Err(blocker) => CommandResult::blocked(
+            "mom_llama.conversation_draft_call_start",
+            "blocked_draft_call",
+            blocker,
+        ),
+    })
+}
+
 pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversation>> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::current()?;
@@ -694,6 +842,36 @@ pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
     ))
 }
 
+/// Minimal read-only identity needed to bind a latency-sensitive speech route
+/// to the exact conversation persona. Unlike `conversation_list`, this does
+/// not derive titles or active message paths for every stored conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPersonaIdentity {
+    pub recipient_ids: Vec<String>,
+    pub source_conversation_id: Option<String>,
+}
+
+pub fn conversation_persona_identity(id: &str) -> Result<Option<ConversationPersonaIdentity>> {
+    if !valid_occurrence_id(id) {
+        anyhow::bail!("invalid conversation occurrence identity");
+    }
+    let db = load_db()?;
+    Ok(conversation_persona_identity_in_db(&db, id))
+}
+
+fn conversation_persona_identity_in_db(
+    db: &ConversationDb,
+    id: &str,
+) -> Option<ConversationPersonaIdentity> {
+    db.conversations
+        .iter()
+        .find(|conversation| conversation.id == id)
+        .map(|conversation| ConversationPersonaIdentity {
+            recipient_ids: conversation.recipient_ids.clone(),
+            source_conversation_id: conversation.source_conversation_id.clone(),
+        })
+}
+
 pub fn conversation_select(id: &str) -> Result<CommandResult<Conversation>> {
     let store = RuntimeStore::current()?;
     let Some(conversation) = select_conversation_in_store(&store, id)? else {
@@ -736,6 +914,7 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         let message_match = conversation
             .messages
             .iter()
+            .filter(|message| !is_private_call_turn(conversation, message))
             .find(|message| query.is_empty() || message.content.to_lowercase().contains(&query));
         if !title_matches && message_match.is_none() {
             continue;
@@ -749,7 +928,11 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
             active_leaf_message_id: conversation.active_leaf_message_id.clone(),
             title,
             snippet,
-            message_count: conversation.messages.len(),
+            message_count: conversation
+                .messages
+                .iter()
+                .filter(|message| !is_private_call_turn(conversation, message))
+                .count(),
             updated_at: conversation.updated_at.clone(),
         });
     }
@@ -762,6 +945,17 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         false,
         false,
     ))
+}
+
+fn is_private_call_turn(conversation: &Conversation, message: &Message) -> bool {
+    message.content.starts_with("[Phone call]")
+        || message.parent_id.as_deref().is_some_and(|parent_id| {
+            conversation.messages.iter().any(|parent| {
+                parent.id == parent_id
+                    && parent.role == MessageRole::User
+                    && parent.content.starts_with("[Phone call]")
+            })
+        })
 }
 
 pub fn conversation_rename(id: &str, title: String) -> Result<CommandResult<Conversation>> {
@@ -1153,6 +1347,78 @@ pub fn message_edit(
                 "mom_llama.message_edit",
                 "contracted",
                 edited,
+                vec![store.path().display().to_string()],
+                Vec::new(),
+                false,
+                false,
+            ))
+        },
+    )
+}
+
+pub fn message_record_call_transcript(
+    conversation_id: &str,
+    message_id: &str,
+    transcript: String,
+) -> Result<CommandResult<Message>> {
+    let transcript = transcript.trim();
+    if transcript.is_empty() || transcript.len() > 32_768 {
+        return Ok(CommandResult::blocked(
+            "mom_llama.message_record_call_transcript",
+            "stub_blocked",
+            Blocker::new(
+                "call_transcript_invalid",
+                "The private call transcript is empty or too large.",
+                vec!["Record a bounded spoken turn and try again.".to_string()],
+            ),
+        ));
+    }
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            else {
+                return Ok(conversation_not_found(
+                    "mom_llama.message_record_call_transcript",
+                    conversation_id,
+                ));
+            };
+            let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+            else {
+                return Ok(message_not_found(
+                    "mom_llama.message_record_call_transcript",
+                    message_id,
+                ));
+            };
+            if message.role != MessageRole::User || !message.content.starts_with("[Phone call]") {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.message_record_call_transcript",
+                    "stub_blocked",
+                    Blocker::new(
+                        "call_transcript_target_invalid",
+                        "The transcript target is not a phone-call turn.",
+                        vec!["Keep the transcript attached to its exact call turn.".to_string()],
+                    ),
+                ));
+            }
+            message.content = format!(
+                "[Phone call]\n{transcript}\n\nReply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
+            );
+            let recorded = message.clone();
+            conversation.updated_at = now_ms().to_string();
+            Ok(CommandResult::passed(
+                "mom_llama.message_record_call_transcript",
+                "contracted",
+                recorded,
                 vec![store.path().display().to_string()],
                 Vec::new(),
                 false,
@@ -1853,6 +2119,10 @@ fn descendant_ids(conversation: &Conversation, message_id: &str) -> Result<HashS
 
 pub fn load_db() -> Result<ConversationDb> {
     let settings = resolve_settings()?;
+    load_db_with_settings(&settings)
+}
+
+pub(crate) fn load_db_with_settings(settings: &crate::Settings) -> Result<ConversationDb> {
     let store = RuntimeStore::open(&settings.data_dir)?;
     Ok(store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default())
 }
@@ -2402,6 +2672,36 @@ mod tests {
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn persona_identity_reads_only_the_exact_conversation_routing_fields() {
+        let mut target = rename_fixture("target");
+        target.recipient_ids = vec!["persona-janina".into()];
+        target.source_conversation_id = Some("persona-janina".into());
+        target.title = "A title that speech routing must not need".into();
+        target.messages = vec![message(
+            "reply",
+            None,
+            MessageRole::Assistant,
+            "Conversation history that speech routing must not project",
+        )];
+        let db = super::ConversationDb {
+            conversations: vec![rename_fixture("other"), target],
+            selected_conversation_id: Some("other".into()),
+        };
+
+        assert_eq!(
+            super::conversation_persona_identity_in_db(&db, "target"),
+            Some(super::ConversationPersonaIdentity {
+                recipient_ids: vec!["persona-janina".into()],
+                source_conversation_id: Some("persona-janina".into()),
+            })
+        );
+        assert_eq!(
+            super::conversation_persona_identity_in_db(&db, "missing"),
+            None
+        );
     }
 
     #[cfg(unix)]

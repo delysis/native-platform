@@ -1142,7 +1142,7 @@ fn product_catalog() -> InformationCatalog {
         catalogue_id: "mom-llama.local-information.v1".to_string(),
         generated_at,
         publisher: Publisher {
-            name: "Delysis Mom Llama".to_string(),
+            name: "Delysis Blessenger".to_string(),
             homepage: None,
         },
         declared_trust: CatalogTrust::Unverified,

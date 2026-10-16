@@ -19,7 +19,6 @@ use workspace_document::context::{
 const MAX_MEDIA_SOURCE_NOTE_BYTES: usize = 256 * 1024;
 
 pub(super) struct PreparedHandoff {
-    pub(super) stable_prefix: Vec<ChatMessage>,
     pub(super) messages: Vec<ChatMessage>,
     pub(super) media: Vec<MediaInput>,
     pub(super) receipt: ContextInputReceipt,
@@ -334,9 +333,6 @@ pub(super) fn handoff_messages(
             "The target tokenizer changed while its exact input was being composed.",
         ));
     }
-    let mut stable_prefix = Vec::new();
-    stable_prefix.extend(system.iter().cloned());
-    stable_prefix.extend(flattened(selected_source));
     let selected_records = selected_source
         .iter()
         .chain(selected_host)
@@ -408,7 +404,6 @@ pub(super) fn handoff_messages(
         attachment_sources,
     };
     Ok(PreparedHandoff {
-        stable_prefix,
         messages,
         media,
         receipt,
@@ -515,6 +510,7 @@ mod tests {
             version: 3,
             invocation_id: "old-invocation".into(),
             target_order: 0,
+            incomplete: false,
         });
         original.attachment_ids = vec!["attachment".into()];
         let messages = [original.clone()];

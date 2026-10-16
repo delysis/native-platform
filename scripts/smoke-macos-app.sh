@@ -247,6 +247,21 @@ if [ "$OBSERVED_EXECUTABLE" != "$BINARY_NAME" ]; then
 fi
 codesign --verify --deep --strict "$BUNDLE"
 
+if [ "$COMPONENT" = mom ]; then
+  MICROPHONE_USAGE=$(/usr/libexec/PlistBuddy \
+    -c 'Print :NSMicrophoneUsageDescription' "$PLIST" 2>/dev/null || true)
+  if [ -z "$MICROPHONE_USAGE" ]; then
+    echo "Mom bundle is missing NSMicrophoneUsageDescription" >&2
+    exit 1
+  fi
+  if ! codesign -d --entitlements :- "$BUNDLE" 2>/dev/null |
+    plutil -convert json -o - - |
+    jq -e '.["com.apple.security.device.audio-input"] == true' >/dev/null; then
+    echo "Mom bundle signature is missing the audio-input entitlement" >&2
+    exit 1
+  fi
+fi
+
 reject_legacy_mom_bundle_ui() {
   [ "$COMPONENT" = mom ] || return 0
   for legacy_text in \

@@ -43,7 +43,8 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
+    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunk, MtmdInputChunkType, MtmdInputText,
+    mtmd_default_marker,
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -62,10 +63,11 @@ use llama_native_types::{
     MAX_GENERATED_OUTPUT_BYTES, MAX_PARALLEL_SEQUENCES, MAX_TOKEN_PIECE_BYTES, MediaInput,
     MediaInputCapability, MediaKind, ModelCapabilities, ModelFingerprint, ModelRuntimeState,
     NativeDevice, NativeError, NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig,
-    NativeModelDescriptor, NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm,
-    PromptInputCapabilities, PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig,
-    SamplingParameter, SequenceRestoreKind, SequenceStateBlob, SharedPrefixBatchRequest,
-    SpecialTokenPolicy, TokenizedPrompt, exact_token_batch_cell_budget,
+    NativeModelDescriptor, NativeModelLoadMetrics, NativeTransport, PreparedPrompt,
+    ProjectorRequirement, PromptForm, PromptInputCapabilities, PromptTokenPolicy,
+    ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceRestoreKind,
+    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
+    exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
 
@@ -74,8 +76,8 @@ use std::fs::{File, Metadata};
 use std::io::Read as _;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -94,6 +96,285 @@ const SPECULATIVE_COMMAND_CAPACITY: usize = 1;
 const EVENT_CAPACITY: usize = 256;
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+static REALTIME_COMPUTE_LEASES: AtomicUsize = AtomicUsize::new(0);
+static REALTIME_COMPUTE_YIELDS: AtomicU64 = AtomicU64::new(0);
+static REALTIME_COMPUTE_YIELD_US: AtomicU64 = AtomicU64::new(0);
+static REALTIME_COMPUTE_FAIR_PASSES: AtomicU64 = AtomicU64::new(0);
+static REALTIME_COMPUTE_PRIORITY_UNTIL_US: AtomicU64 = AtomicU64::new(0);
+static REALTIME_COMPUTE_CLOCK: OnceLock<Instant> = OnceLock::new();
+static REALTIME_COMPUTE_CHANGED: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+static GENERATION_BACKPRESSURE_LEASES: AtomicUsize = AtomicUsize::new(0);
+static GENERATION_BACKPRESSURE_YIELDS: AtomicU64 = AtomicU64::new(0);
+static GENERATION_BACKPRESSURE_YIELD_US: AtomicU64 = AtomicU64::new(0);
+static GENERATION_BACKPRESSURE: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RealtimeComputeMetrics {
+    pub generation_yields: u64,
+    pub generation_yield_us: u64,
+    pub generation_fair_passes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationBackpressureMetrics {
+    pub generation_yields: u64,
+    pub generation_yield_us: u64,
+}
+
+/// An exact-request flow-control claim. The matching generation waits at its
+/// next token boundary without discarding its context or KV state; unrelated
+/// requests continue normally.
+#[derive(Debug)]
+pub struct GenerationBackpressureLease {
+    request_id: String,
+    started_yields: u64,
+    started_yield_us: u64,
+    active: bool,
+}
+
+pub fn acquire_generation_backpressure(
+    request_id: impl Into<String>,
+) -> Result<GenerationBackpressureLease, NativeError> {
+    let request_id = request_id.into();
+    if request_id.is_empty() || request_id.len() > 256 || request_id.chars().any(char::is_control) {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "generation backpressure requires a bounded opaque request identifier",
+        ));
+    }
+    let started_yields = GENERATION_BACKPRESSURE_YIELDS.load(Ordering::Acquire);
+    let started_yield_us = GENERATION_BACKPRESSURE_YIELD_US.load(Ordering::Acquire);
+    let registry = GENERATION_BACKPRESSURE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = registry.entry(request_id.clone()).or_default();
+    *count = count.saturating_add(1);
+    GENERATION_BACKPRESSURE_LEASES.fetch_add(1, Ordering::AcqRel);
+    Ok(GenerationBackpressureLease {
+        request_id,
+        started_yields,
+        started_yield_us,
+        active: true,
+    })
+}
+
+impl GenerationBackpressureLease {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Some(registry) = GENERATION_BACKPRESSURE.get() {
+            let mut registry = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = registry.get_mut(&self.request_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    registry.remove(&self.request_id);
+                }
+            }
+        }
+        GENERATION_BACKPRESSURE_LEASES.fetch_sub(1, Ordering::AcqRel);
+        if let Some((_, changed)) = REALTIME_COMPUTE_CHANGED.get() {
+            changed.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> GenerationBackpressureMetrics {
+        self.release();
+        GenerationBackpressureMetrics {
+            generation_yields: GENERATION_BACKPRESSURE_YIELDS
+                .load(Ordering::Acquire)
+                .saturating_sub(self.started_yields),
+            generation_yield_us: GENERATION_BACKPRESSURE_YIELD_US
+                .load(Ordering::Acquire)
+                .saturating_sub(self.started_yield_us),
+        }
+    }
+}
+
+impl Drop for GenerationBackpressureLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A short-lived priority claim for a real-time producer sharing Metal with
+/// llama.cpp. Generation observes this claim only between token decode calls,
+/// preserving its KV state while keeping urgent PCM off the starvation path.
+#[derive(Debug)]
+pub struct RealtimeComputeLease {
+    started_yields: u64,
+    started_yield_us: u64,
+    started_fair_passes: u64,
+    active: bool,
+}
+
+const REALTIME_COMPUTE_STARTUP_PRIORITY: Duration = Duration::from_millis(300);
+const REALTIME_COMPUTE_REFILL_QUANTUM: Duration = Duration::from_millis(100);
+
+fn realtime_compute_clock_us() -> u64 {
+    REALTIME_COMPUTE_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn extend_realtime_priority(duration: Duration) {
+    let until = realtime_compute_clock_us()
+        .saturating_add(duration.as_micros().min(u128::from(u64::MAX)) as u64);
+    REALTIME_COMPUTE_PRIORITY_UNTIL_US.fetch_max(until, Ordering::AcqRel);
+}
+
+#[must_use]
+pub fn acquire_realtime_compute() -> RealtimeComputeLease {
+    let started_yields = REALTIME_COMPUTE_YIELDS.load(Ordering::Acquire);
+    let started_yield_us = REALTIME_COMPUTE_YIELD_US.load(Ordering::Acquire);
+    let started_fair_passes = REALTIME_COMPUTE_FAIR_PASSES.load(Ordering::Acquire);
+    REALTIME_COMPUTE_LEASES.fetch_add(1, Ordering::AcqRel);
+    extend_realtime_priority(REALTIME_COMPUTE_STARTUP_PRIORITY);
+    RealtimeComputeLease {
+        started_yields,
+        started_yield_us,
+        started_fair_passes,
+        active: true,
+    }
+}
+
+impl RealtimeComputeLease {
+    /// Renews the producer's uninterrupted window after observable progress.
+    /// A live PCM producer calls this for each packet so generation cannot
+    /// preempt the very next packet; a wedged producer stops renewing and the
+    /// bounded fair-pass fallback still lets generation advance.
+    pub fn renew_priority(&self) {
+        if self.active {
+            extend_realtime_priority(REALTIME_COMPUTE_STARTUP_PRIORITY);
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if REALTIME_COMPUTE_LEASES.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some((_, changed)) = REALTIME_COMPUTE_CHANGED.get()
+        {
+            changed.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> RealtimeComputeMetrics {
+        self.release();
+        RealtimeComputeMetrics {
+            generation_yields: REALTIME_COMPUTE_YIELDS
+                .load(Ordering::Acquire)
+                .saturating_sub(self.started_yields),
+            generation_yield_us: REALTIME_COMPUTE_YIELD_US
+                .load(Ordering::Acquire)
+                .saturating_sub(self.started_yield_us),
+            generation_fair_passes: REALTIME_COMPUTE_FAIR_PASSES
+                .load(Ordering::Acquire)
+                .saturating_sub(self.started_fair_passes),
+        }
+    }
+}
+
+impl Drop for RealtimeComputeLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn generation_backpressure_active(request_id: &str) -> bool {
+    if GENERATION_BACKPRESSURE_LEASES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    GENERATION_BACKPRESSURE
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .is_some_and(|registry| registry.contains_key(request_id))
+}
+
+fn yield_to_scheduled_compute(request_id: &str, cancellation: &AtomicBool) -> bool {
+    if REALTIME_COMPUTE_LEASES.load(Ordering::Acquire) == 0
+        && !generation_backpressure_active(request_id)
+    {
+        return true;
+    }
+    let (lock, changed) = REALTIME_COMPUTE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
+    let mut guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut counted_realtime = false;
+    let mut counted_backpressure = false;
+    loop {
+        let realtime = REALTIME_COMPUTE_LEASES.load(Ordering::Acquire) != 0;
+        let backpressure = generation_backpressure_active(request_id);
+        if !realtime && !backpressure {
+            break;
+        }
+        // Semantic backpressure is an exact-request stop and remains in force
+        // until its owner releases it. A real-time lease instead grants Qwen
+        // bounded priority: after the startup/refill quantum expires, exactly
+        // one generation worker claims a decode opportunity and renews the
+        // Qwen window. This avoids starving Gemma for an entire utterance while
+        // keeping context switches coarse enough for Metal throughput.
+        if realtime && !backpressure {
+            let now_us = realtime_compute_clock_us();
+            let priority_until_us = REALTIME_COMPUTE_PRIORITY_UNTIL_US.load(Ordering::Acquire);
+            if now_us >= priority_until_us {
+                let next_until_us = now_us.saturating_add(
+                    REALTIME_COMPUTE_REFILL_QUANTUM
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+                if REALTIME_COMPUTE_PRIORITY_UNTIL_US
+                    .compare_exchange(
+                        priority_until_us,
+                        next_until_us,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    REALTIME_COMPUTE_FAIR_PASSES.fetch_add(1, Ordering::AcqRel);
+                    break;
+                }
+                continue;
+            }
+        }
+        if realtime && !counted_realtime {
+            REALTIME_COMPUTE_YIELDS.fetch_add(1, Ordering::AcqRel);
+            counted_realtime = true;
+        }
+        if backpressure && !counted_backpressure {
+            GENERATION_BACKPRESSURE_YIELDS.fetch_add(1, Ordering::AcqRel);
+            counted_backpressure = true;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return false;
+        }
+        let wait_started = Instant::now();
+        let (next, _) = changed
+            .wait_timeout(guard, Duration::from_millis(2))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waited_us = wait_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        if realtime {
+            REALTIME_COMPUTE_YIELD_US.fetch_add(waited_us, Ordering::AcqRel);
+        }
+        if backpressure {
+            GENERATION_BACKPRESSURE_YIELD_US.fetch_add(waited_us, Ordering::AcqRel);
+        }
+        guard = next;
+    }
+    true
+}
 
 type NativeResult<T> = Result<T, NativeError>;
 
@@ -445,6 +726,861 @@ pub struct GenerationTicket {
     pub events: Receiver<GenerationEvent>,
     result: Receiver<NativeResult<GenerationCompletion>>,
     control: Arc<ActiveRequest>,
+}
+
+const MAX_INCREMENTAL_AUDIO_SAMPLES: usize = 16_000 * 4;
+const INCREMENTAL_AUDIO_RING_SAMPLES: usize = 16_000 * 30;
+// The intended Gemma 4 12B unified-audio projector (`gemma4ua`) is encoder-free:
+// llama.cpp maps each independent 640-sample raw-waveform frame to one model
+// token with no fixed-length padding or downsampling. Admit that exact 40 ms
+// frame as soon as it exists so projector and LLM prefill remain under live
+// capture instead of retaining nearly a second of already-heard speech.
+const INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES: usize = 640;
+
+/// Fixed-capacity SPSC storage for the microphone producer and projector
+/// consumer. Ownership is serialized by `IncrementalAudioBuffer::state`; this
+/// accepted samples remain in one fixed allocation for both projector reads
+/// and later WAV materialization. Reads advance a cursor without destroying
+/// archive authority, and no operation allocates after construction.
+#[derive(Debug)]
+struct PcmRing {
+    data: Box<[f32]>,
+    read: usize,
+    written: usize,
+}
+
+impl PcmRing {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: vec![0.0; capacity].into_boxed_slice(),
+            read: 0,
+            written: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.written.saturating_sub(self.read)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.read == self.written
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.written)
+    }
+
+    fn push(&mut self, samples: &[f32]) -> bool {
+        if samples.len() > self.remaining() {
+            return false;
+        }
+        let end = self.written + samples.len();
+        self.data[self.written..end].copy_from_slice(samples);
+        self.written = end;
+        true
+    }
+
+    fn pop_into(&mut self, count: usize, output: &mut Vec<f32>) {
+        let count = count.min(self.len());
+        output.clear();
+        output.extend_from_slice(&self.data[self.read..self.read + count]);
+        self.read += count;
+    }
+
+    fn retained(&self) -> &[f32] {
+        &self.data[..self.written]
+    }
+
+    fn clear(&mut self) {
+        self.read = self.written;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalAudioTerminal {
+    Finished,
+    Aborted,
+}
+
+#[derive(Debug)]
+struct IncrementalAudioBufferState {
+    samples: PcmRing,
+    terminal: Option<IncrementalAudioTerminal>,
+    accepted_samples: u64,
+    consumed_samples: u64,
+    chunks: u64,
+    high_water_samples: usize,
+    first_accept_us: Option<u64>,
+    first_read_us: Option<u64>,
+    finish_us: Option<u64>,
+    cancellation_requested_us: Option<u64>,
+    cancellation_observed_us: Option<u64>,
+    decode_start_us: Option<u64>,
+    closing_boundary_finish_us: Option<u64>,
+    suffix_tokenize_finish_us: Option<u64>,
+    suffix_eval_finish_us: Option<u64>,
+    sampler_start_us: Option<u64>,
+    sampler_ready_us: Option<u64>,
+    first_sample_start_us: Option<u64>,
+    first_sample_finish_us: Option<u64>,
+    first_token_event_us: Option<u64>,
+    sampled_tokens: u64,
+    nonempty_token_pieces: u64,
+    emitted_token_events: u64,
+    last_sample_start_us: Option<u64>,
+    last_sample_finish_us: Option<u64>,
+    last_token_event_us: Option<u64>,
+    continuation_decode_start_us: Option<u64>,
+    continuation_decode_finish_us: Option<u64>,
+    continuation_decode_steps: u64,
+    continuation_decode_us: u64,
+    continuation_decode_max_us: u64,
+    prefix_start_us: Option<u64>,
+    prefix_finish_us: Option<u64>,
+    prefix_us: u64,
+    prefix_tokens: usize,
+    restored_prefix_tokens: usize,
+    projector_us: u64,
+    projected_blocks: u64,
+    projected_samples: u64,
+    first_projector_start_us: Option<u64>,
+    first_projector_finish_us: Option<u64>,
+    last_projector_finish_us: Option<u64>,
+    projector_max_us: u64,
+    tail_samples: u64,
+    tail_projector_us: u64,
+    producer_lock_wait_us: u64,
+    producer_lock_wait_max_us: u64,
+    ring_write_us: u64,
+    ring_write_max_us: u64,
+    archive_copy_us: u64,
+    archive_copy_max_us: u64,
+    consumer_lock_wait_us: u64,
+    consumer_lock_wait_max_us: u64,
+    ring_read_us: u64,
+    ring_read_max_us: u64,
+    reader_notifications: u64,
+    reader_waits: u64,
+    reader_wakeups: u64,
+}
+
+#[derive(Debug)]
+struct IncrementalAudioBuffer {
+    created_at: Instant,
+    state: Mutex<IncrementalAudioBufferState>,
+    readable: Condvar,
+}
+
+impl IncrementalAudioBuffer {
+    fn new() -> Self {
+        Self {
+            created_at: Instant::now(),
+            state: Mutex::new(IncrementalAudioBufferState {
+                samples: PcmRing::new(INCREMENTAL_AUDIO_RING_SAMPLES),
+                terminal: None,
+                accepted_samples: 0,
+                consumed_samples: 0,
+                chunks: 0,
+                high_water_samples: 0,
+                first_accept_us: None,
+                first_read_us: None,
+                finish_us: None,
+                cancellation_requested_us: None,
+                cancellation_observed_us: None,
+                decode_start_us: None,
+                closing_boundary_finish_us: None,
+                suffix_tokenize_finish_us: None,
+                suffix_eval_finish_us: None,
+                sampler_start_us: None,
+                sampler_ready_us: None,
+                first_sample_start_us: None,
+                first_sample_finish_us: None,
+                first_token_event_us: None,
+                sampled_tokens: 0,
+                nonempty_token_pieces: 0,
+                emitted_token_events: 0,
+                last_sample_start_us: None,
+                last_sample_finish_us: None,
+                last_token_event_us: None,
+                continuation_decode_start_us: None,
+                continuation_decode_finish_us: None,
+                continuation_decode_steps: 0,
+                continuation_decode_us: 0,
+                continuation_decode_max_us: 0,
+                prefix_start_us: None,
+                prefix_finish_us: None,
+                prefix_us: 0,
+                prefix_tokens: 0,
+                restored_prefix_tokens: 0,
+                projector_us: 0,
+                projected_blocks: 0,
+                projected_samples: 0,
+                first_projector_start_us: None,
+                first_projector_finish_us: None,
+                last_projector_finish_us: None,
+                projector_max_us: 0,
+                tail_samples: 0,
+                tail_projector_us: 0,
+                producer_lock_wait_us: 0,
+                producer_lock_wait_max_us: 0,
+                ring_write_us: 0,
+                ring_write_max_us: 0,
+                archive_copy_us: 0,
+                archive_copy_max_us: 0,
+                consumer_lock_wait_us: 0,
+                consumer_lock_wait_max_us: 0,
+                ring_read_us: 0,
+                ring_read_max_us: 0,
+                reader_notifications: 0,
+                reader_waits: 0,
+                reader_wakeups: 0,
+            }),
+            readable: Condvar::new(),
+        }
+    }
+
+    fn push(&self, samples: &[f32]) -> NativeResult<usize> {
+        let lock_started = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio ring lock was poisoned",
+            )
+        })?;
+        let lock_wait_us = lock_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        state.producer_lock_wait_us = state.producer_lock_wait_us.saturating_add(lock_wait_us);
+        state.producer_lock_wait_max_us = state.producer_lock_wait_max_us.max(lock_wait_us);
+        if state.terminal.is_some() {
+            return Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "incremental audio stream is already closed",
+            ));
+        }
+        if samples.len() > state.samples.remaining() {
+            return Err(NativeError::new(
+                NativeErrorCode::QueueFull,
+                "incremental audio ring is full",
+            ));
+        }
+        let was_projector_ready = state.samples.len() >= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
+        let ring_started = Instant::now();
+        debug_assert!(state.samples.push(samples));
+        let ring_write_us = ring_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        state.ring_write_us = state.ring_write_us.saturating_add(ring_write_us);
+        state.ring_write_max_us = state.ring_write_max_us.max(ring_write_us);
+        state.accepted_samples = state.accepted_samples.saturating_add(samples.len() as u64);
+        if state.first_accept_us.is_none() {
+            state.first_accept_us = Some(self.elapsed_us());
+        }
+        state.high_water_samples = state.high_water_samples.max(state.samples.len());
+        let buffered = state.samples.len();
+        let notify_reader =
+            !was_projector_ready && buffered >= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
+        if notify_reader {
+            state.reader_notifications = state.reader_notifications.saturating_add(1);
+        }
+        drop(state);
+        // The unified-audio projector consumes aligned 40 ms frames. Waking it for every
+        // 10 ms producer write only creates lock traffic; signal exactly when
+        // a complete block crosses the admission boundary. finish/abort wake
+        // the reader separately for a short tail or cancellation.
+        if notify_reader {
+            self.readable.notify_one();
+        }
+        Ok(buffered)
+    }
+
+    /// Seal the producer side and wake the projector. Sealing is idempotent so
+    /// the capture owner may publish EOF at the native silence edge and the
+    /// later ticket-consuming `finish` call can safely repeat the boundary.
+    fn seal(&self) -> NativeResult<bool> {
+        let mut state = self.state.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio ring lock was poisoned",
+            )
+        })?;
+        match state.terminal {
+            Some(IncrementalAudioTerminal::Finished) => return Ok(false),
+            Some(IncrementalAudioTerminal::Aborted) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::WorkerStopped,
+                    "incremental audio stream was aborted",
+                ));
+            }
+            None => {}
+        }
+        state.terminal = Some(IncrementalAudioTerminal::Finished);
+        state.finish_us = Some(self.elapsed_us());
+        drop(state);
+        self.readable.notify_one();
+        Ok(true)
+    }
+
+    fn abort(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .cancellation_requested_us
+                .get_or_insert_with(|| self.elapsed_us());
+            state.samples.clear();
+            state.terminal = Some(IncrementalAudioTerminal::Aborted);
+        }
+        self.readable.notify_all();
+    }
+
+    fn read_into(&self, output: &mut Vec<f32>, cancelled: &AtomicBool) -> NativeResult<bool> {
+        let lock_started = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio ring lock was poisoned",
+            )
+        })?;
+        let lock_wait_us = lock_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        state.consumer_lock_wait_us = state.consumer_lock_wait_us.saturating_add(lock_wait_us);
+        state.consumer_lock_wait_max_us = state.consumer_lock_wait_max_us.max(lock_wait_us);
+        loop {
+            if cancelled.load(Ordering::Acquire)
+                || state.terminal == Some(IncrementalAudioTerminal::Aborted)
+            {
+                state
+                    .cancellation_observed_us
+                    .get_or_insert_with(|| self.elapsed_us());
+                return Err(NativeError::new(
+                    NativeErrorCode::Cancelled,
+                    "incremental audio generation was cancelled",
+                ));
+            }
+            let producer_finished = state.terminal == Some(IncrementalAudioTerminal::Finished);
+            if state.samples.len() >= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES
+                || (producer_finished && !state.samples.is_empty())
+            {
+                let count = state
+                    .samples
+                    .len()
+                    .min(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
+                let read_started = Instant::now();
+                state.samples.pop_into(count, output);
+                let read_us = read_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                state.ring_read_us = state.ring_read_us.saturating_add(read_us);
+                state.ring_read_max_us = state.ring_read_max_us.max(read_us);
+                state.consumed_samples = state.consumed_samples.saturating_add(count as u64);
+                state.chunks = state.chunks.saturating_add(1);
+                return Ok(true);
+            }
+            if producer_finished {
+                return Ok(false);
+            }
+            // Every state change that can make this reader runnable has an
+            // exact notification: push signals when a full projector block
+            // crosses the boundary, finish signals a terminal tail, and abort
+            // broadcasts cancellation. Polling here used to reacquire this
+            // mutex fifty times per second while the producer was still
+            // filling a block, defeating the boundary-triggered SPSC design.
+            state.reader_waits = state.reader_waits.saturating_add(1);
+            state = self.readable.wait(state).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "incremental audio ring lock was poisoned",
+                )
+            })?;
+            state.reader_wakeups = state.reader_wakeups.saturating_add(1);
+        }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        self.created_at
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn record_cancellation_observed(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .cancellation_observed_us
+                .get_or_insert_with(|| self.elapsed_us());
+        }
+    }
+
+    fn record_first_read(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && state.first_read_us.is_none()
+        {
+            state.first_read_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_closing_boundary_finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closing_boundary_finish_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_suffix_tokenize_finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.suffix_tokenize_finish_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_suffix_eval_finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed = self.elapsed_us();
+            state.suffix_eval_finish_us = Some(elapsed);
+            state.decode_start_us = Some(elapsed);
+        }
+    }
+
+    fn record_sampler_start(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.sampler_start_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_sampler_ready(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.sampler_ready_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_sample_start(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed = self.elapsed_us();
+            state.first_sample_start_us.get_or_insert(elapsed);
+            state.last_sample_start_us = Some(elapsed);
+        }
+    }
+
+    fn record_sample_finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed = self.elapsed_us();
+            state.first_sample_finish_us.get_or_insert(elapsed);
+            state.last_sample_finish_us = Some(elapsed);
+            state.sampled_tokens = state.sampled_tokens.saturating_add(1);
+        }
+    }
+
+    fn record_token_piece(&self, nonempty: bool) {
+        if !nonempty {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.nonempty_token_pieces = state.nonempty_token_pieces.saturating_add(1);
+        }
+    }
+
+    fn record_token_event(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed = self.elapsed_us();
+            state.first_token_event_us.get_or_insert(elapsed);
+            state.last_token_event_us = Some(elapsed);
+            state.emitted_token_events = state.emitted_token_events.saturating_add(1);
+        }
+    }
+
+    fn record_continuation_decode_start(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.continuation_decode_start_us = Some(self.elapsed_us());
+        }
+    }
+
+    fn record_continuation_decode_finish(&self, elapsed: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            state.continuation_decode_finish_us = Some(self.elapsed_us());
+            state.continuation_decode_steps = state.continuation_decode_steps.saturating_add(1);
+            state.continuation_decode_us = state.continuation_decode_us.saturating_add(elapsed_us);
+            state.continuation_decode_max_us = state.continuation_decode_max_us.max(elapsed_us);
+        }
+    }
+
+    fn record_prefix(
+        &self,
+        started_us: u64,
+        elapsed: Duration,
+        tokens: usize,
+        restored_tokens: usize,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            state.prefix_start_us = Some(started_us);
+            state.prefix_finish_us = Some(self.elapsed_us());
+            state.prefix_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            state.prefix_tokens = tokens;
+            state.restored_prefix_tokens = restored_tokens;
+        }
+    }
+
+    fn record_projector(&self, started_us: u64, elapsed: Duration, samples: usize, tail: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            let finished_us = self.elapsed_us();
+            state.projector_us = state.projector_us.saturating_add(elapsed_us);
+            state.projected_blocks = state.projected_blocks.saturating_add(1);
+            state.projected_samples = state.projected_samples.saturating_add(samples as u64);
+            state.first_projector_start_us.get_or_insert(started_us);
+            state.first_projector_finish_us.get_or_insert(finished_us);
+            state.last_projector_finish_us = Some(finished_us);
+            state.projector_max_us = state.projector_max_us.max(elapsed_us);
+            if tail {
+                state.tail_samples = samples as u64;
+                state.tail_projector_us = elapsed_us;
+            }
+        }
+    }
+
+    fn stats(&self) -> IncrementalAudioStats {
+        self.state
+            .lock()
+            .map(|state| IncrementalAudioStats {
+                accepted_samples: state.accepted_samples,
+                consumed_samples: state.consumed_samples,
+                chunks: state.chunks,
+                high_water_samples: state.high_water_samples,
+                first_accept_ms: state.first_accept_us.map(|value| value / 1_000),
+                first_read_ms: state.first_read_us.map(|value| value / 1_000),
+                finish_ms: state.finish_us.map(|value| value / 1_000),
+                cancellation_requested_ms: state
+                    .cancellation_requested_us
+                    .map(|value| value / 1_000),
+                cancellation_observed_ms: state.cancellation_observed_us.map(|value| value / 1_000),
+                decode_start_ms: state.decode_start_us.map(|value| value / 1_000),
+                prefix_start_ms: state.prefix_start_us.map(|value| value / 1_000),
+                prefix_finish_ms: state.prefix_finish_us.map(|value| value / 1_000),
+                prefix_ms: state.prefix_us / 1_000,
+                prefix_tokens: state.prefix_tokens,
+                restored_prefix_tokens: state.restored_prefix_tokens,
+                projector_ms: state.projector_us / 1_000,
+                projected_blocks: state.projected_blocks,
+                projected_samples: state.projected_samples,
+                first_projector_start_ms: state.first_projector_start_us.map(|value| value / 1_000),
+                first_projector_finish_ms: state
+                    .first_projector_finish_us
+                    .map(|value| value / 1_000),
+                last_projector_finish_ms: state.last_projector_finish_us.map(|value| value / 1_000),
+                projector_max_ms: state.projector_max_us / 1_000,
+                first_accept_us: state.first_accept_us,
+                first_read_us: state.first_read_us,
+                finish_us: state.finish_us,
+                cancellation_requested_us: state.cancellation_requested_us,
+                cancellation_observed_us: state.cancellation_observed_us,
+                decode_start_us: state.decode_start_us,
+                closing_boundary_finish_us: state.closing_boundary_finish_us,
+                suffix_tokenize_finish_us: state.suffix_tokenize_finish_us,
+                suffix_eval_finish_us: state.suffix_eval_finish_us,
+                sampler_start_us: state.sampler_start_us,
+                sampler_ready_us: state.sampler_ready_us,
+                first_sample_start_us: state.first_sample_start_us,
+                first_sample_finish_us: state.first_sample_finish_us,
+                first_token_event_us: state.first_token_event_us,
+                sampled_tokens: state.sampled_tokens,
+                nonempty_token_pieces: state.nonempty_token_pieces,
+                emitted_token_events: state.emitted_token_events,
+                last_sample_start_us: state.last_sample_start_us,
+                last_sample_finish_us: state.last_sample_finish_us,
+                last_token_event_us: state.last_token_event_us,
+                continuation_decode_start_us: state.continuation_decode_start_us,
+                continuation_decode_finish_us: state.continuation_decode_finish_us,
+                continuation_decode_steps: state.continuation_decode_steps,
+                continuation_decode_us: state.continuation_decode_us,
+                continuation_decode_max_us: state.continuation_decode_max_us,
+                prefix_start_us: state.prefix_start_us,
+                prefix_finish_us: state.prefix_finish_us,
+                prefix_us: state.prefix_us,
+                projector_us: state.projector_us,
+                first_projector_start_us: state.first_projector_start_us,
+                first_projector_finish_us: state.first_projector_finish_us,
+                last_projector_finish_us: state.last_projector_finish_us,
+                projector_max_us: state.projector_max_us,
+                tail_samples: state.tail_samples,
+                tail_projector_ms: state.tail_projector_us / 1_000,
+                tail_projector_us: state.tail_projector_us,
+                producer_lock_wait_us: state.producer_lock_wait_us,
+                producer_lock_wait_max_us: state.producer_lock_wait_max_us,
+                ring_write_us: state.ring_write_us,
+                ring_write_max_us: state.ring_write_max_us,
+                archive_copy_us: state.archive_copy_us,
+                archive_copy_max_us: state.archive_copy_max_us,
+                consumer_lock_wait_us: state.consumer_lock_wait_us,
+                consumer_lock_wait_max_us: state.consumer_lock_wait_max_us,
+                ring_read_us: state.ring_read_us,
+                ring_read_max_us: state.ring_read_max_us,
+                reader_notifications: state.reader_notifications,
+                reader_waits: state.reader_waits,
+                reader_wakeups: state.reader_wakeups,
+            })
+            .unwrap_or_default()
+    }
+
+    fn wav_bytes(&self) -> NativeResult<Vec<u8>> {
+        let state = self.state.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio ring lock was poisoned",
+            )
+        })?;
+        let retained = state.samples.retained();
+        let data_bytes = retained.len().checked_mul(2).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "voice recording is too large",
+            )
+        })?;
+        let riff_bytes = 36usize.checked_add(data_bytes).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "voice recording is too large",
+            )
+        })?;
+        let data_bytes = u32::try_from(data_bytes).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "voice recording is too large",
+            )
+        })?;
+        let riff_bytes = u32::try_from(riff_bytes).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "voice recording is too large",
+            )
+        })?;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_bytes.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in retained {
+            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        Ok(wav)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncrementalAudioStats {
+    pub accepted_samples: u64,
+    pub consumed_samples: u64,
+    pub chunks: u64,
+    pub high_water_samples: usize,
+    pub first_accept_ms: Option<u64>,
+    pub first_read_ms: Option<u64>,
+    pub finish_ms: Option<u64>,
+    pub cancellation_requested_ms: Option<u64>,
+    pub cancellation_observed_ms: Option<u64>,
+    pub decode_start_ms: Option<u64>,
+    pub prefix_start_ms: Option<u64>,
+    pub prefix_finish_ms: Option<u64>,
+    pub prefix_ms: u64,
+    pub prefix_tokens: usize,
+    pub restored_prefix_tokens: usize,
+    pub projector_ms: u64,
+    pub projected_blocks: u64,
+    pub projected_samples: u64,
+    pub first_projector_start_ms: Option<u64>,
+    pub first_projector_finish_ms: Option<u64>,
+    pub last_projector_finish_ms: Option<u64>,
+    pub projector_max_ms: u64,
+    pub tail_samples: u64,
+    pub tail_projector_ms: u64,
+    pub producer_lock_wait_us: u64,
+    pub producer_lock_wait_max_us: u64,
+    pub ring_write_us: u64,
+    pub ring_write_max_us: u64,
+    pub archive_copy_us: u64,
+    pub archive_copy_max_us: u64,
+    pub consumer_lock_wait_us: u64,
+    pub consumer_lock_wait_max_us: u64,
+    pub ring_read_us: u64,
+    pub ring_read_max_us: u64,
+    pub reader_notifications: u64,
+    pub reader_waits: u64,
+    pub reader_wakeups: u64,
+    pub first_accept_us: Option<u64>,
+    pub first_read_us: Option<u64>,
+    pub finish_us: Option<u64>,
+    pub cancellation_requested_us: Option<u64>,
+    pub cancellation_observed_us: Option<u64>,
+    pub decode_start_us: Option<u64>,
+    pub closing_boundary_finish_us: Option<u64>,
+    pub suffix_tokenize_finish_us: Option<u64>,
+    pub suffix_eval_finish_us: Option<u64>,
+    pub sampler_start_us: Option<u64>,
+    pub sampler_ready_us: Option<u64>,
+    pub first_sample_start_us: Option<u64>,
+    pub first_sample_finish_us: Option<u64>,
+    pub first_token_event_us: Option<u64>,
+    pub sampled_tokens: u64,
+    pub nonempty_token_pieces: u64,
+    pub emitted_token_events: u64,
+    pub last_sample_start_us: Option<u64>,
+    pub last_sample_finish_us: Option<u64>,
+    pub last_token_event_us: Option<u64>,
+    pub continuation_decode_start_us: Option<u64>,
+    pub continuation_decode_finish_us: Option<u64>,
+    pub continuation_decode_steps: u64,
+    pub continuation_decode_us: u64,
+    pub continuation_decode_max_us: u64,
+    pub prefix_start_us: Option<u64>,
+    pub prefix_finish_us: Option<u64>,
+    pub prefix_us: u64,
+    pub projector_us: u64,
+    pub first_projector_start_us: Option<u64>,
+    pub first_projector_finish_us: Option<u64>,
+    pub last_projector_finish_us: Option<u64>,
+    pub projector_max_us: u64,
+    pub tail_projector_us: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalAudioMonitor {
+    input: Arc<IncrementalAudioBuffer>,
+}
+
+impl IncrementalAudioMonitor {
+    #[must_use]
+    pub fn stats(&self) -> IncrementalAudioStats {
+        self.input.stats()
+    }
+
+    /// Materialize the immutable microphone archive when persistence actually
+    /// needs it. Cloning the monitor is O(1), so speculative decode need not
+    /// serialize a WAV before it can start.
+    pub fn wav_bytes(&self) -> NativeResult<Vec<u8>> {
+        self.input.wav_bytes()
+    }
+}
+
+/// A live, bounded microphone-to-model stream.
+///
+/// Each accepted PCM block is evaluated by the resident multimodal worker
+/// before the caller closes the utterance. `finish` closes the user turn and
+/// returns the ordinary generation ticket whose events carry response tokens.
+#[derive(Debug)]
+pub struct IncrementalAudioGeneration {
+    input: Arc<IncrementalAudioBuffer>,
+    ticket: Option<GenerationTicket>,
+    resume: Receiver<NativeResult<IncrementalAudioResume>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalAudioCancellation {
+    input: Arc<IncrementalAudioBuffer>,
+    control: Arc<ActiveRequest>,
+}
+
+impl IncrementalAudioCancellation {
+    /// Cancel this exact incremental-audio request without consulting mutable
+    /// conversation state. Native VAD uses this on resumed speech so a newer
+    /// replacement request can never be cancelled by a late renderer round trip.
+    pub fn cancel(&self) -> usize {
+        self.input.abort();
+        self.control.cancel_all()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncrementalAudioResume {
+    pub reused: bool,
+    pub sample_offset: usize,
+    pub resident_max_sequences: u32,
+    pub checkpoint_supported: bool,
+    pub checkpoint_available: bool,
+    pub resume_key_matched: bool,
+    pub request_matched: bool,
+    pub binding_us: u64,
+    pub restore_us: u64,
+}
+
+impl IncrementalAudioGeneration {
+    #[must_use]
+    pub fn monitor(&self) -> IncrementalAudioMonitor {
+        IncrementalAudioMonitor {
+            input: Arc::clone(&self.input),
+        }
+    }
+
+    #[must_use]
+    pub fn cancellation_handle(&self) -> Option<IncrementalAudioCancellation> {
+        self.ticket
+            .as_ref()
+            .map(|ticket| IncrementalAudioCancellation {
+                input: Arc::clone(&self.input),
+                control: Arc::clone(&ticket.control),
+            })
+    }
+
+    /// Publish cancellation without waiting for the audio worker. This is the
+    /// hard stop used by call teardown; callers must be able to sever capture
+    /// and playback even while a previously accepted PCM block is evaluating.
+    pub fn cancel(&self) -> usize {
+        self.input.abort();
+        self.ticket.as_ref().map_or(0, GenerationTicket::cancel_all)
+    }
+
+    pub fn push_pcm(&self, samples: &[f32]) -> NativeResult<usize> {
+        if samples.is_empty()
+            || samples.len() > MAX_INCREMENTAL_AUDIO_SAMPLES
+            || samples.iter().any(|sample| !sample.is_finite())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "incremental audio blocks must contain 1 ms to 4 seconds of finite mono PCM",
+            ));
+        }
+        self.input.push(samples)
+    }
+
+    /// Publish EOF without consuming the generation ticket. Native capture
+    /// uses this at the first silence edge so a short tail can enter the audio
+    /// projector while command/session bookkeeping catches up concurrently.
+    pub fn seal_input(&self) -> NativeResult<bool> {
+        self.input.seal()
+    }
+
+    /// Wait until the resident worker has either restored the exact audio KV
+    /// checkpoint or committed to a full replay. Retry capture must not skip
+    /// samples until this acknowledgement supplies the authoritative offset.
+    pub fn wait_for_resume(&self) -> NativeResult<IncrementalAudioResume> {
+        self.resume.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("incremental audio worker dropped resume admission: {error}"),
+            )
+        })?
+    }
+
+    pub fn finish(mut self) -> NativeResult<GenerationTicket> {
+        self.input.seal()?;
+        self.ticket.take().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio generation ticket was already consumed",
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.ticket
+            .as_ref()
+            .map(|ticket| ticket.request_id.as_str())
+    }
+}
+
+impl Drop for IncrementalAudioGeneration {
+    fn drop(&mut self) {
+        if self.ticket.is_some() {
+            self.input.abort();
+        }
+    }
 }
 
 impl GenerationTicket {
@@ -1150,6 +2286,17 @@ enum WorkerCommand {
         reasoning_force: Arc<AtomicBool>,
         request_lease: RequestLease,
     },
+    GenerateIncrementalAudio {
+        request: GenerationRequest,
+        resume_key: Option<String>,
+        audio: Arc<IncrementalAudioBuffer>,
+        resume_tx: Sender<NativeResult<IncrementalAudioResume>>,
+        event_tx: Sender<GenerationEvent>,
+        result_tx: Sender<NativeResult<GenerationCompletion>>,
+        cancellation: Arc<AtomicBool>,
+        reasoning_force: Arc<AtomicBool>,
+        request_lease: RequestLease,
+    },
     ControlledGenerate {
         submission: Box<ControlledGenerationSubmission>,
         admitted_request_sha256: String,
@@ -1400,6 +2547,64 @@ impl NativeModelHandle {
 
     pub fn generate(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
         self.generate_with_admission(request, GenerationAdmissionClass::Foreground)
+    }
+
+    /// Begin one audio-native chat turn before the microphone has closed.
+    ///
+    /// The request supplies the stable conversation and response policy but no
+    /// completed media payload. PCM blocks are projected into the same sequence
+    /// as they arrive; `finish` appends the assistant suffix and starts decode.
+    pub fn generate_incremental_audio(
+        &self,
+        request: GenerationRequest,
+    ) -> NativeResult<IncrementalAudioGeneration> {
+        self.generate_incremental_audio_resumable(request, None)
+    }
+
+    pub fn generate_incremental_audio_resumable(
+        &self,
+        request: GenerationRequest,
+        resume_key: Option<String>,
+    ) -> NativeResult<IncrementalAudioGeneration> {
+        validate_incremental_audio_request(&request, &self.status())?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let reasoning_force = Arc::new(AtomicBool::new(false));
+        let audio = Arc::new(IncrementalAudioBuffer::new());
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (result_tx, result_rx) = bounded(1);
+        let (resume_tx, resume_rx) = bounded(1);
+        let request_id = request.request_id.clone();
+        let control = self.inner.admit_generation(
+            GenerationAdmissionClass::Foreground,
+            request_id.clone(),
+            RequestClass::Generation,
+            RequestControls::Generation {
+                cancellations: vec![("assistant".to_owned(), Arc::clone(&cancellation))],
+                reasoning_forces: vec![("assistant".to_owned(), Arc::clone(&reasoning_force))],
+            },
+            |request_lease| WorkerCommand::GenerateIncrementalAudio {
+                request,
+                resume_key,
+                audio: Arc::clone(&audio),
+                resume_tx,
+                event_tx,
+                result_tx,
+                cancellation,
+                reasoning_force,
+                request_lease,
+            },
+            "submitting incremental audio generation",
+        )?;
+        Ok(IncrementalAudioGeneration {
+            input: audio,
+            resume: resume_rx,
+            ticket: Some(GenerationTicket {
+                request_id,
+                events: event_rx,
+                result: result_rx,
+                control,
+            }),
+        })
     }
 
     /// Submit one preemptible generation to the resident worker's single
@@ -1819,6 +3024,7 @@ impl ModelArtifactGuard {
         path: &std::path::Path,
         label: &'static str,
         caller_expected_sha256: Option<&str>,
+        caller_expected_file_identity: Option<&str>,
     ) -> NativeResult<Self> {
         let file = open_guarded_artifact(path).map_err(|error| {
             NativeError::new(
@@ -1860,12 +3066,24 @@ impl ModelArtifactGuard {
         let lock_error = Fs4FileExt::try_lock_shared(&file)
             .err()
             .map(|error| format!("cooperative shared lock unavailable: {error}"));
+        let observed_file_identity = artifact_file_identity(&initial_state);
         #[cfg(all(test, unix))]
         let payload_bytes_read = std::sync::atomic::AtomicU64::new(0);
+        let reusable_digest = caller_expected_sha256
+            .zip(caller_expected_file_identity)
+            .and_then(|(digest, identity)| {
+                (identity == observed_file_identity).then(|| digest.to_owned())
+            });
         #[cfg(all(test, unix))]
-        let expected_sha256 = hash_open_artifact(&file, label, path, &payload_bytes_read)?;
+        let expected_sha256 = match reusable_digest {
+            Some(digest) => digest,
+            None => hash_open_artifact(&file, label, path, &payload_bytes_read)?,
+        };
         #[cfg(not(all(test, unix)))]
-        let expected_sha256 = hash_open_artifact(&file, label, path)?;
+        let expected_sha256 = match reusable_digest {
+            Some(digest) => digest,
+            None => hash_open_artifact(&file, label, path)?,
+        };
         let state_after_hash = file
             .metadata()
             .map(|value| artifact_file_state(&value))
@@ -1882,7 +3100,8 @@ impl ModelArtifactGuard {
                 "identity or metadata changed while computing the initial SHA-256",
             ));
         }
-        if let Some(expected) = caller_expected_sha256
+        if caller_expected_file_identity.is_none()
+            && let Some(expected) = caller_expected_sha256
             && expected != expected_sha256
         {
             return Err(NativeError::new(
@@ -1973,6 +3192,7 @@ impl ModelArtifactGuards {
             &config.model_path,
             "model",
             config.expected_model_sha256.as_deref(),
+            config.expected_model_file_identity.as_deref(),
         )?;
         let projector = config
             .mmproj_path
@@ -1982,6 +3202,7 @@ impl ModelArtifactGuards {
                     path,
                     "multimodal projector",
                     config.expected_mmproj_sha256.as_deref(),
+                    config.expected_mmproj_file_identity.as_deref(),
                 )
             })
             .transpose()?;
@@ -2021,6 +3242,13 @@ impl ModelArtifactGuards {
         self.model.verify_identity()?;
         Ok(())
     }
+}
+
+fn artifact_file_identity(state: &ArtifactFileState) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"llama-native-artifact-file-identity-v1\0");
+    hasher.update(format!("{state:?}").as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(unix)]
@@ -2212,6 +3440,7 @@ fn run_worker(
     status: Arc<RwLock<ResidentModelStatus>>,
     worker_identity: Arc<WorkerIdentity>,
 ) {
+    let load_started = Instant::now();
     let _decode_lifetime = worker_identity.cooperative_decodes.worker_lifetime();
     let _export_lifetime = state_buffer::bind_worker_exports(&worker_identity.exports);
     let WorkerLanes {
@@ -2221,6 +3450,7 @@ fn run_worker(
         admission,
         speculative_admission,
     } = lanes;
+    let backend_started = Instant::now();
     let backend = match backend() {
         Ok(backend) => backend,
         Err(error) => {
@@ -2229,6 +3459,7 @@ fn run_worker(
             return;
         }
     };
+    let backend_us = elapsed_micros(backend_started);
     let configured_gpu_layers = if config.gpu_layers < 0 {
         u32::MAX
     } else {
@@ -2272,6 +3503,7 @@ fn run_worker(
             }
         };
     }
+    let artifact_open_started = Instant::now();
     let artifacts = match ModelArtifactGuards::open(&config) {
         Ok(artifacts) => artifacts,
         Err(error) => {
@@ -2280,6 +3512,8 @@ fn run_worker(
             return;
         }
     };
+    let artifact_open_us = elapsed_micros(artifact_open_started);
+    let model_load_started = Instant::now();
     let model = match LlamaModel::load_from_file(backend, &artifacts.model.load_path, &model_params)
     {
         Ok(model) => model,
@@ -2293,6 +3527,8 @@ fn run_worker(
             return;
         }
     };
+    let model_load_us = elapsed_micros(model_load_started);
+    let projector_load_started = Instant::now();
     let multimodal = match artifacts.projector.as_ref() {
         Some(artifact) => {
             let Some(load_path) = artifact.load_path.to_str() else {
@@ -2327,11 +3563,15 @@ fn run_worker(
         }
         None => None,
     };
+    let projector_load_us = elapsed_micros(projector_load_started);
+    let artifact_verify_started = Instant::now();
     if let Err(error) = artifacts.verify_loaded_identities() {
         set_status_state(&status, ModelRuntimeState::Failed, 0);
         let _ = ready_tx.send(Err(error));
         return;
     }
+    let artifact_verify_us = elapsed_micros(artifact_verify_started);
+    let context_create_started = Instant::now();
     let context_tokens = config.context_tokens.min(model.n_ctx_train()).max(512);
     let context_params = generation_context_params(&config, context_tokens);
     let (rope_config_sha256, kv_layout_sha256) = context_fingerprints(&context_params);
@@ -2347,6 +3587,8 @@ fn run_worker(
             return;
         }
     };
+    let context_create_us = elapsed_micros(context_create_started);
+    let fingerprint_started = Instant::now();
     let fingerprint = match fingerprint_model(
         &config,
         &model,
@@ -2363,12 +3605,34 @@ fn run_worker(
             return;
         }
     };
+    let fingerprint_us = elapsed_micros(fingerprint_started);
+    let load_metrics = NativeModelLoadMetrics {
+        total_us: elapsed_micros(load_started),
+        backend_us,
+        artifact_open_us,
+        model_load_us,
+        projector_load_us,
+        artifact_verify_us,
+        context_create_us,
+        fingerprint_us,
+    };
     if let Ok(mut current) = status.write() {
         let media_kinds = multimodal
             .as_ref()
             .map_or_else(Vec::new, media_kinds_for_context);
         current.state = ModelRuntimeState::Ready;
-        current.descriptor = Some(describe_model(&config, &model, &fingerprint, media_kinds));
+        current.descriptor = Some(describe_model(
+            &config,
+            &model,
+            &fingerprint,
+            media_kinds,
+            load_metrics,
+            artifact_file_identity(&artifacts.model.initial_state),
+            artifacts
+                .projector
+                .as_ref()
+                .map(|artifact| artifact_file_identity(&artifact.initial_state)),
+        ));
         current.fingerprint = Some(fingerprint.clone());
     }
     let _ = ready_tx.send(Ok(()));
@@ -2376,6 +3640,8 @@ fn run_worker(
     let mut sequence_token_ids = HashMap::<i32, Vec<i32>>::new();
     let resident_prefix_binding = ResidentTextPrefixBinding::new(&fingerprint, &worker_identity);
     let mut resident_text_prefix = ResidentTextPrefixCache::new(resident_prefix_binding.clone());
+    let mut resident_audio_checkpoint: Option<ResidentAudioCheckpoint> = None;
+    let mut resident_audio_text_prefix: Option<ResidentAudioTextPrefix> = None;
     let mut controlled_token_contract = None;
     let mut embedding_call_sequence = 0_u64;
     let mut controlled_call_sequence = 0_u64;
@@ -2402,6 +3668,24 @@ fn run_worker(
             }
         };
         let _speculative_permit = speculative_permit;
+        if !matches!(&command, WorkerCommand::GenerateIncrementalAudio { .. }) {
+            invalidate_resident_audio_checkpoint(&mut context, &mut resident_audio_checkpoint);
+        }
+        // Tokenization, prepared-input rendering, identity inspection, and
+        // snapshots do not mutate the model context. Voice admission performs
+        // prepared-input work between consecutive microphone turns, so
+        // revoking the resident text prefix for those read-only commands made
+        // the otherwise valid fourth sequence lane unreachable in product.
+        if !matches!(
+            &command,
+            WorkerCommand::GenerateIncrementalAudio { .. }
+                | WorkerCommand::InspectControlledIdentity { .. }
+                | WorkerCommand::Snapshot { .. }
+                | WorkerCommand::Tokenize { .. }
+                | WorkerCommand::PrepareInput { .. }
+        ) {
+            invalidate_resident_audio_text_prefix(&mut context, &mut resident_audio_text_prefix);
+        }
         // Admission sends the command and commits any exact speculative
         // preemption while holding this lock. A dequeued worker crosses the
         // same boundary before publishing Running, so measurement cannot race
@@ -2857,6 +4141,56 @@ fn run_worker(
                 let _ = result_tx
                     .send(result.map(|output| GenerationCompletion::unverified(vec![output])));
             }
+            WorkerCommand::GenerateIncrementalAudio {
+                request,
+                resume_key,
+                audio,
+                resume_tx,
+                event_tx,
+                result_tx,
+                cancellation,
+                reasoning_force,
+                request_lease,
+            } => {
+                resident_text_prefix.invalidate();
+                if let Err(error) =
+                    begin_generation_command(&request_lease, command_class, &speculative_admission)
+                {
+                    let _ = result_tx.send(Err(error));
+                    continue;
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let result = generate_incremental_audio(
+                    &model,
+                    &mut context,
+                    multimodal.as_ref(),
+                    &fingerprint,
+                    &request,
+                    resume_key.as_deref(),
+                    &audio,
+                    &resume_tx,
+                    &mut resident_audio_checkpoint,
+                    &mut resident_audio_text_prefix,
+                    fingerprint.max_sequences == 1
+                        || (worker_identity.kv_unified && fingerprint.max_sequences >= 2),
+                    SingleSequenceSupervision {
+                        event_tx: &event_tx,
+                        cancellation: &cancellation,
+                        reasoning_force: &reasoning_force,
+                    },
+                    SequenceTracking {
+                        token_counts: &mut sequence_token_counts,
+                        token_ids: &mut sequence_token_ids,
+                    },
+                );
+                if result.is_err() {
+                    emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Failed);
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(result.is_ok());
+                let _ = result_tx
+                    .send(result.map(|output| GenerationCompletion::unverified(vec![output])));
+            }
             WorkerCommand::ControlledGenerate {
                 submission,
                 admitted_request_sha256,
@@ -3212,6 +4546,20 @@ fn reject_queued_command(command: WorkerCommand) {
             cancellation,
             reasoning_force: _,
             request_lease,
+        } => {
+            cancellation.store(true, Ordering::Release);
+            emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
+            let _ = request_lease.cancel_queued();
+            let _ = result_tx.send(Err(cancelled()));
+        }
+        WorkerCommand::GenerateIncrementalAudio {
+            request,
+            event_tx,
+            result_tx,
+            cancellation,
+            reasoning_force: _,
+            request_lease,
+            ..
         } => {
             cancellation.store(true, Ordering::Release);
             emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
@@ -5541,6 +6889,986 @@ fn prefill_shared_prefix(
     state_buffer::export_sequence(context, fingerprint, 0, tokens.len(), token_ids)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidentAudioCheckpoint {
+    sequence_id: i32,
+    resume_key: String,
+    request_sha256: String,
+    next_position: i32,
+    prompt_tokens: usize,
+    projected_samples: usize,
+}
+
+/// Text-only prompt state retained inside the live Gemma worker for the next
+/// microphone turn. Keeping this sequence resident avoids exporting and then
+/// importing hundreds of megabytes of hybrid recurrent state merely to reuse
+/// a persona/history prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidentAudioTextPrefix {
+    sequence_id: i32,
+    token_ids: Vec<i32>,
+}
+
+impl ResidentAudioTextPrefix {
+    fn reusable_tokens(&self, rendered_prefix: &[i32]) -> usize {
+        // Leave at least one token for ordinary evaluation. This matches the
+        // text-generation resident cache and prevents a fully cached prompt
+        // from reaching decode without logits for its terminal token.
+        let limit = rendered_prefix.len().saturating_sub(1);
+        self.token_ids
+            .iter()
+            .zip(rendered_prefix)
+            .take(limit)
+            .take_while(|(cached, rendered)| cached == rendered)
+            .count()
+    }
+}
+
+const RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE: i32 = 3;
+
+fn invalidate_resident_audio_text_prefix(
+    context: &mut LlamaContext<'_>,
+    prefix: &mut Option<ResidentAudioTextPrefix>,
+) {
+    if let Some(prefix) = prefix.take() {
+        let _ = context.clear_kv_cache_seq(Some(prefix.sequence_id as u32), None, None);
+    }
+}
+
+fn clear_audio_working_sequences(
+    context: &mut LlamaContext<'_>,
+    max_sequences: u32,
+    retained_sequence: Option<i32>,
+) -> NativeResult<()> {
+    for sequence in 0..max_sequences {
+        let sequence = i32::try_from(sequence).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "resident sequence identifier exceeded the native sequence API",
+            )
+        })?;
+        if retained_sequence == Some(sequence) {
+            continue;
+        }
+        context
+            .clear_kv_cache_seq(Some(sequence as u32), None, None)
+            .map_err(|error| {
+                native_decode_error("failed to clear an audio work sequence", error)
+            })?;
+    }
+    Ok(())
+}
+
+fn retain_incremental_audio_text_prefix(
+    context: &mut LlamaContext<'_>,
+    source_sequence_id: i32,
+    token_ids: &[i32],
+    prefix: &mut Option<ResidentAudioTextPrefix>,
+) -> NativeResult<()> {
+    let destination = RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE;
+    if source_sequence_id == destination || token_ids.is_empty() {
+        invalidate_resident_audio_text_prefix(context, prefix);
+        return Ok(());
+    }
+    // From this point the old destination is being mutated. Revoke its local
+    // reuse authority before touching native state so a failed clear or copy
+    // cannot leave a stale token description attached to uncertain KV cells.
+    prefix.take();
+    context
+        .clear_kv_cache_seq(Some(destination as u32), None, None)
+        .map_err(|error| native_decode_error("failed to clear the resident audio prefix", error))?;
+    let end = u32::try_from(token_ids.len()).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            "incremental audio prefix exceeded the native sequence API",
+        )
+    })?;
+    context
+        .copy_kv_cache_seq(source_sequence_id, destination, Some(0), Some(end))
+        .map_err(|error| {
+            native_decode_error("failed to retain the resident audio prefix", error)
+        })?;
+    *prefix = Some(ResidentAudioTextPrefix {
+        sequence_id: destination,
+        token_ids: token_ids.to_vec(),
+    });
+    Ok(())
+}
+
+fn invalidate_resident_audio_checkpoint(
+    context: &mut LlamaContext<'_>,
+    checkpoint: &mut Option<ResidentAudioCheckpoint>,
+) {
+    if let Some(checkpoint) = checkpoint.take() {
+        let _ = context.clear_kv_cache_seq(Some(checkpoint.sequence_id as u32), None, None);
+    }
+}
+
+fn incremental_audio_request_sha256(request: &GenerationRequest) -> NativeResult<String> {
+    // The native prefix can be hundreds of megabytes. Cloned retries retain
+    // the same Arc, so bind its live allocation identity and size while
+    // serializing only borrowed request metadata. Retaining the Arc in both
+    // the prepared request and queued command prevents allocator-address
+    // reuse; borrowing avoids a second deep clone of the chat and token IDs.
+    let prefix_binding = request.cached_prefix.as_ref().map(|state| {
+        (
+            state.sequence_id,
+            state.token_count,
+            state.token_ids.as_slice(),
+            Arc::as_ptr(&state.bytes) as usize,
+            state.bytes.len(),
+        )
+    });
+    let binding = (
+        request.model_id.as_str(),
+        &request.input,
+        &request.sampling,
+        request.media.as_slice(),
+        prefix_binding,
+    );
+    let encoded = serde_json::to_vec(&binding).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            format!("failed to bind incremental audio retry: {error}"),
+        )
+    });
+    Ok(format!("{:x}", Sha256::digest(encoded?)))
+}
+
+fn fork_resident_audio_checkpoint(
+    context: &mut LlamaContext<'_>,
+    source_sequence_id: i32,
+    resume_key: &str,
+    request_sha256: &str,
+    next_position: i32,
+    prompt_tokens: usize,
+    projected_samples: usize,
+) -> NativeResult<ResidentAudioCheckpoint> {
+    let destination_sequence_id = alternate_checkpoint_sequence(source_sequence_id)?;
+    let copy_end = u32::try_from(next_position).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "incremental audio checkpoint position exceeded the native sequence API",
+        )
+    })?;
+    context
+        .clear_kv_cache_seq(Some(destination_sequence_id as u32), None, None)
+        .map_err(|error| {
+            native_decode_error("failed to clear the prior audio checkpoint", error)
+        })?;
+    context
+        .copy_kv_cache_seq(
+            source_sequence_id,
+            destination_sequence_id,
+            Some(0),
+            Some(copy_end),
+        )
+        .map_err(|error| native_decode_error("failed to fork the audio KV checkpoint", error))?;
+    Ok(ResidentAudioCheckpoint {
+        sequence_id: destination_sequence_id,
+        resume_key: resume_key.to_owned(),
+        request_sha256: request_sha256.to_owned(),
+        next_position,
+        prompt_tokens,
+        projected_samples,
+    })
+}
+
+fn capture_resident_audio_checkpoint(
+    context: &mut LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    source_sequence_id: i32,
+    resume_key: &str,
+    request_sha256: &str,
+    next_position: i32,
+    prompt_tokens: usize,
+    projected_samples: usize,
+) -> NativeResult<ResidentAudioCheckpoint> {
+    if fingerprint.max_sequences >= 2 {
+        return fork_resident_audio_checkpoint(
+            context,
+            source_sequence_id,
+            resume_key,
+            request_sha256,
+            next_position,
+            prompt_tokens,
+            projected_samples,
+        );
+    }
+    Ok(ResidentAudioCheckpoint {
+        sequence_id: source_sequence_id,
+        resume_key: resume_key.to_owned(),
+        request_sha256: request_sha256.to_owned(),
+        next_position,
+        prompt_tokens,
+        projected_samples,
+    })
+}
+
+fn publish_cancelled_audio_checkpoint(
+    context: &mut LlamaContext<'_>,
+    active_sequence_id: i32,
+    checkpoint: ResidentAudioCheckpoint,
+    resident_audio_checkpoint: &mut Option<ResidentAudioCheckpoint>,
+) -> NativeResult<()> {
+    if checkpoint.sequence_id == active_sequence_id {
+        let crop_start = u32::try_from(checkpoint.next_position).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio checkpoint position exceeded the native sequence API",
+            )
+        })?;
+        context
+            .clear_kv_cache_seq(Some(active_sequence_id as u32), Some(crop_start), None)
+            .map_err(|error| {
+                native_decode_error("failed to roll back speculative audio decode", error)
+            })?;
+    } else {
+        let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+    }
+    *resident_audio_checkpoint = Some(checkpoint);
+    Ok(())
+}
+
+fn alternate_checkpoint_sequence(source_sequence_id: i32) -> NativeResult<i32> {
+    match source_sequence_id {
+        0 => Ok(1),
+        1 => Ok(0),
+        _ => Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "incremental audio checkpoint source was outside the two-sequence pool",
+        )),
+    }
+}
+
+fn generate_incremental_audio(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    multimodal: Option<&MtmdContext>,
+    fingerprint: &ModelFingerprint,
+    request: &GenerationRequest,
+    resume_key: Option<&str>,
+    audio: &IncrementalAudioBuffer,
+    resume_tx: &Sender<NativeResult<IncrementalAudioResume>>,
+    resident_audio_checkpoint: &mut Option<ResidentAudioCheckpoint>,
+    resident_audio_text_prefix: &mut Option<ResidentAudioTextPrefix>,
+    audio_checkpoint_supported: bool,
+    supervision: SingleSequenceSupervision<'_>,
+    tracking: SequenceTracking<'_>,
+) -> NativeResult<GenerationOutput> {
+    let Some(multimodal) = multimodal else {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "incremental audio generation requires a loaded mmproj GGUF",
+        ));
+    };
+    if !media_kinds_for_context(multimodal).contains(&MediaKind::Audio) {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "the loaded multimodal projector does not accept audio",
+        ));
+    }
+    let started = Instant::now();
+    let marker = mtmd_default_marker();
+    let marker_media = MediaInput {
+        id: "live-microphone".to_string(),
+        kind: MediaKind::Audio,
+        mime: "audio/pcm;rate=16000;channels=1".to_string(),
+        sha256: String::new(),
+        bytes: Vec::new(),
+    };
+    let rendered = render_multimodal_case_prompt(model, &[marker_media], &request.input)?;
+    let Some((prefix, suffix)) = rendered.text.split_once(marker) else {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "incremental audio prompt did not contain its reserved media marker",
+        ));
+    };
+    emit_generation_state(
+        supervision.event_tx,
+        request,
+        0,
+        GenerationState::Prefilling,
+    );
+    let no_bitmaps: Vec<&MtmdBitmap> = Vec::new();
+    let prefix_started_us = audio.elapsed_us();
+    let prefix_started = Instant::now();
+    let prefix_chunks = multimodal
+        .tokenize(
+            MtmdInputText {
+                text: prefix.to_string(),
+                add_special: rendered.add_special,
+                parse_special: true,
+            },
+            &no_bitmaps,
+        )
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to tokenize incremental audio prefix: {error}"),
+            )
+        })?;
+    let mut prefix_token_ids = Vec::with_capacity(prefix_chunks.total_tokens());
+    for index in 0..prefix_chunks.len() {
+        let chunk = prefix_chunks.get(index).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio prefix chunk disappeared during validation",
+            )
+        })?;
+        let Some(tokens) = chunk.text_tokens() else {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "incremental audio prefix unexpectedly contained media",
+            ));
+        };
+        prefix_token_ids.extend(tokens.iter().map(|token| token.0));
+    }
+    if prefix_token_ids.len() != prefix_chunks.total_tokens() {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "incremental audio prefix token accounting changed during validation",
+        ));
+    }
+    let cached_prefix = request.cached_prefix.as_ref();
+    if let Some(state) = cached_prefix {
+        validate_incremental_audio_prefix_tokens(state, &prefix_token_ids)?;
+        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+    }
+
+    // Token and fingerprint validation above is read-only. Mutate resident KV
+    // state only after the supplied prefix is proven to match this audio turn.
+    let binding_started = Instant::now();
+    let request_sha256 = incremental_audio_request_sha256(request)?;
+    let binding_us = binding_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let prior_audio = resident_audio_checkpoint.take();
+    let checkpoint_available = prior_audio.is_some();
+    let resume_key_matched = prior_audio
+        .as_ref()
+        .is_some_and(|checkpoint| resume_key == Some(checkpoint.resume_key.as_str()));
+    let request_matched = prior_audio
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.request_sha256 == request_sha256);
+    tracking.token_counts.clear();
+    tracking.token_ids.clear();
+    let matched_audio = prior_audio.filter(|checkpoint| {
+        audio_checkpoint_supported
+            && resume_key == Some(checkpoint.resume_key.as_str())
+            && checkpoint.request_sha256 == request_sha256
+    });
+    let resident_text_prefix_supported = audio_checkpoint_supported
+        && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32;
+    if !resident_text_prefix_supported {
+        invalidate_resident_audio_text_prefix(context, resident_audio_text_prefix);
+    }
+    let resident_prefix_tokens = if matched_audio.is_none() && cached_prefix.is_none() {
+        resident_audio_text_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.reusable_tokens(&prefix_token_ids))
+    } else {
+        0
+    };
+    let restore_started = Instant::now();
+    let (
+        active_sequence_id,
+        mut next_position,
+        restored_prefix_kind,
+        mut prompt_tokens,
+        mut projected_full_samples,
+    ) = if let Some(checkpoint) = matched_audio.as_ref() {
+        tracking.token_counts.insert(
+            checkpoint.sequence_id,
+            checkpoint.next_position.max(0) as usize,
+        );
+        tracking
+            .token_ids
+            .insert(checkpoint.sequence_id, Vec::new());
+        (
+            checkpoint.sequence_id,
+            checkpoint.next_position,
+            cached_prefix.map(|_| SequenceRestoreKind::NativeState),
+            checkpoint.prompt_tokens,
+            checkpoint.projected_samples,
+        )
+    } else if let Some(state) = cached_prefix {
+        invalidate_resident_audio_text_prefix(context, resident_audio_text_prefix);
+        context.clear_kv_cache();
+        let kind = restore_saved_sequence(model, context, fingerprint, state, 0)?;
+        let remaining = prefix_token_ids[state.token_count..]
+            .iter()
+            .copied()
+            .map(LlamaToken)
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            let restored_position = i32::try_from(state.token_count).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "saved incremental audio prefix exceeded the native position range",
+                )
+            })?;
+            decode_tokens_chunked(context, &remaining, 0, restored_position, false)?;
+        }
+        let next_position = i32::try_from(prefix_token_ids.len()).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "incremental audio prefix exceeded the native position range",
+            )
+        })?;
+        if resident_text_prefix_supported {
+            retain_incremental_audio_text_prefix(
+                context,
+                0,
+                &prefix_token_ids,
+                resident_audio_text_prefix,
+            )?;
+        }
+        (
+            0,
+            next_position,
+            Some(kind),
+            prefix_chunks.total_tokens(),
+            0,
+        )
+    } else {
+        let retained_sequence = resident_audio_text_prefix
+            .as_ref()
+            .map(|prefix| prefix.sequence_id);
+        clear_audio_working_sequences(context, fingerprint.max_sequences, retained_sequence)?;
+        // Decode the known text-only prefix through the ordinary token
+        // path. mtmd_helper_eval_chunks returns a chunk-relative position
+        // for split text prompts; feeding that value into the first audio
+        // embedding restarts near position zero and violates recurrent KV
+        // continuity.
+        if resident_prefix_tokens > 0 {
+            let retained = resident_audio_text_prefix.as_ref().ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "resident audio prefix disappeared before reuse",
+                )
+            })?;
+            let end = u32::try_from(resident_prefix_tokens).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "resident audio prefix exceeded the native sequence API",
+                )
+            })?;
+            context
+                .copy_kv_cache_seq(retained.sequence_id, 0, Some(0), Some(end))
+                .map_err(|error| {
+                    native_decode_error("failed to reuse the resident audio prefix", error)
+                })?;
+        }
+        let prefix_tokens = prefix_token_ids[resident_prefix_tokens..]
+            .iter()
+            .copied()
+            .map(LlamaToken::new)
+            .collect::<Vec<_>>();
+        decode_tokens_chunked(
+            context,
+            &prefix_tokens,
+            0,
+            i32::try_from(resident_prefix_tokens).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "resident audio prefix exceeded the native position range",
+                )
+            })?,
+            false,
+        )?;
+        let position = i32::try_from(prefix_token_ids.len()).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "incremental audio prefix exceeded the native position range",
+            )
+        })?;
+        if resident_text_prefix_supported {
+            retain_incremental_audio_text_prefix(
+                context,
+                0,
+                &prefix_token_ids,
+                resident_audio_text_prefix,
+            )?;
+        }
+        (0, position, None, prefix_chunks.total_tokens(), 0)
+    };
+    let resume = IncrementalAudioResume {
+        reused: matched_audio.is_some(),
+        sample_offset: projected_full_samples,
+        resident_max_sequences: fingerprint.max_sequences,
+        checkpoint_supported: audio_checkpoint_supported,
+        checkpoint_available,
+        resume_key_matched,
+        request_matched,
+        binding_us,
+        restore_us: restore_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64,
+    };
+    let _ = resume_tx.send(Ok(resume));
+    audio.record_prefix(
+        prefix_started_us,
+        prefix_started.elapsed(),
+        prefix_token_ids.len(),
+        cached_prefix.map_or(resident_prefix_tokens, |state| {
+            usize::from(restored_prefix_kind == Some(SequenceRestoreKind::NativeState))
+                * state.token_count
+        }),
+    );
+    let mut audio_block = Vec::with_capacity(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
+    let mut admitted_audio = projected_full_samples != 0;
+    let mut deferred_audio_end: Vec<MtmdInputChunk> = Vec::new();
+    let mut next_checkpoint = None;
+    loop {
+        if supervision.cancellation.load(Ordering::Acquire) {
+            audio.record_cancellation_observed();
+            if audio_checkpoint_supported && let Some(resume_key) = resume_key {
+                let checkpoint = match next_checkpoint.take() {
+                    Some(checkpoint) => checkpoint,
+                    None => capture_resident_audio_checkpoint(
+                        context,
+                        fingerprint,
+                        active_sequence_id,
+                        resume_key,
+                        &request_sha256,
+                        next_position,
+                        prompt_tokens,
+                        projected_full_samples,
+                    )?,
+                };
+                publish_cancelled_audio_checkpoint(
+                    context,
+                    active_sequence_id,
+                    checkpoint,
+                    resident_audio_checkpoint,
+                )?;
+                return Err(NativeError::new(
+                    NativeErrorCode::Cancelled,
+                    "incremental audio generation was cancelled",
+                ));
+            }
+            let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+            return Err(NativeError::new(
+                NativeErrorCode::Cancelled,
+                "incremental audio generation was cancelled",
+            ));
+        }
+        let read = match audio.read_into(&mut audio_block, supervision.cancellation) {
+            Ok(read) => read,
+            Err(error) => {
+                if error.code == NativeErrorCode::Cancelled
+                    && audio_checkpoint_supported
+                    && let Some(resume_key) = resume_key
+                {
+                    let checkpoint = match next_checkpoint.take() {
+                        Some(checkpoint) => checkpoint,
+                        None => capture_resident_audio_checkpoint(
+                            context,
+                            fingerprint,
+                            active_sequence_id,
+                            resume_key,
+                            &request_sha256,
+                            next_position,
+                            prompt_tokens,
+                            projected_full_samples,
+                        )?,
+                    };
+                    publish_cancelled_audio_checkpoint(
+                        context,
+                        active_sequence_id,
+                        checkpoint,
+                        resident_audio_checkpoint,
+                    )?;
+                    return Err(error);
+                }
+                let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+                return Err(error);
+            }
+        };
+        match read {
+            true => {
+                audio.record_first_read();
+                let projector_started_us = audio.elapsed_us();
+                let projector_started = Instant::now();
+                let tail = audio_block.len() < INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
+                if tail
+                    && next_checkpoint.is_none()
+                    && audio_checkpoint_supported
+                    && let Some(resume_key) = resume_key
+                {
+                    next_checkpoint = Some(capture_resident_audio_checkpoint(
+                        context,
+                        fingerprint,
+                        active_sequence_id,
+                        resume_key,
+                        &request_sha256,
+                        next_position,
+                        prompt_tokens,
+                        projected_full_samples,
+                    )?);
+                }
+                let bitmap = MtmdBitmap::from_audio_data(&audio_block).map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::InvalidConfig,
+                        format!("failed to construct incremental audio bitmap: {error}"),
+                    )
+                })?;
+                let audio_chunks = multimodal
+                    .tokenize(
+                        MtmdInputText {
+                            text: marker.to_string(),
+                            add_special: false,
+                            parse_special: true,
+                        },
+                        &[&bitmap],
+                    )
+                    .map_err(|error| {
+                        NativeError::new(
+                            NativeErrorCode::ModelInvalid,
+                            format!("failed to tokenize incremental audio block: {error}"),
+                        )
+                    })?;
+                let chunk_types = (0..audio_chunks.len())
+                    .filter_map(|index| audio_chunks.get(index).map(|chunk| chunk.chunk_type()))
+                    .collect::<Vec<_>>();
+                let Some(first_audio) = chunk_types
+                    .iter()
+                    .position(|kind| *kind == MtmdInputChunkType::Audio)
+                else {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        "incremental audio tokenization produced no audio chunk",
+                    ));
+                };
+                let last_audio = chunk_types
+                    .iter()
+                    .rposition(|kind| *kind == MtmdInputChunkType::Audio)
+                    .unwrap_or(first_audio);
+                if chunk_types
+                    .iter()
+                    .any(|kind| *kind == MtmdInputChunkType::Image)
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        "incremental audio tokenization produced an image chunk",
+                    ));
+                }
+                let first_block = !admitted_audio;
+                for index in 0..audio_chunks.len() {
+                    let chunk = audio_chunks.get(index).ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::Internal,
+                            "incremental audio chunk disappeared during evaluation",
+                        )
+                    })?;
+                    let evaluate = chunk.chunk_type() == MtmdInputChunkType::Audio
+                        || (first_block
+                            && chunk.chunk_type() == MtmdInputChunkType::Text
+                            && index < first_audio);
+                    if deferred_audio_end.is_empty()
+                        && chunk.chunk_type() == MtmdInputChunkType::Text
+                        && index > last_audio
+                    {
+                        deferred_audio_end.push(chunk.copy().map_err(|error| {
+                            NativeError::new(
+                                NativeErrorCode::Internal,
+                                format!("failed to retain incremental audio boundary: {error}"),
+                            )
+                        })?);
+                    }
+                    if !evaluate {
+                        continue;
+                    }
+                    let chunk_tokens = chunk.n_tokens();
+                    if prompt_tokens
+                        .saturating_add(chunk_tokens)
+                        .saturating_add(request.sampling.max_tokens as usize)
+                        > context.n_ctx() as usize
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::PromptTooLarge,
+                            "incremental audio and completion exceed the native context",
+                        ));
+                    }
+                    if chunk.chunk_type() == MtmdInputChunkType::Text {
+                        // The upstream single-chunk helper reports a text
+                        // chunk's relative token count rather than the new
+                        // absolute n_past. Accepting that return value resets
+                        // the following audio embedding to position one after
+                        // `<|audio>`, while the prefix remains at (for example)
+                        // position nine. Decode boundary tokens through the
+                        // ordinary path so the one authoritative absolute
+                        // position advances monotonically.
+                        let tokens = chunk.text_tokens().ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::ModelInvalid,
+                                "incremental audio boundary was not text",
+                            )
+                        })?;
+                        decode_tokens_chunked(
+                            context,
+                            tokens,
+                            active_sequence_id,
+                            next_position,
+                            false,
+                        )?;
+                        next_position =
+                            next_position
+                                .saturating_add(i32::try_from(tokens.len()).map_err(|_| {
+                                NativeError::new(
+                                    NativeErrorCode::PromptTooLarge,
+                                    "incremental audio boundary exceeded the native position range",
+                                )
+                            })?);
+                    } else {
+                        next_position = chunk
+                            .eval(
+                                multimodal,
+                                context,
+                                next_position,
+                                active_sequence_id,
+                                context.n_batch() as i32,
+                                false,
+                            )
+                            .map_err(|error| {
+                                NativeError::new(
+                                    NativeErrorCode::DecodeFailed,
+                                    format!(
+                                        "failed to prefill incremental audio block at position {next_position} after {prompt_tokens} prompt tokens (chunk tokens: {chunk_tokens}, cached prefix tokens: {}): {error}",
+                                        cached_prefix.map_or(0, |state| state.token_count),
+                                    ),
+                                )
+                            })?;
+                    }
+                    prompt_tokens = prompt_tokens.saturating_add(chunk_tokens);
+                }
+                admitted_audio = true;
+                tracking
+                    .token_counts
+                    .insert(active_sequence_id, next_position.max(0) as usize);
+                audio.record_projector(
+                    projector_started_us,
+                    projector_started.elapsed(),
+                    audio_block.len(),
+                    tail,
+                );
+                if !tail {
+                    projected_full_samples =
+                        projected_full_samples.saturating_add(audio_block.len());
+                }
+            }
+            false => break,
+        }
+    }
+    if !admitted_audio {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "incremental audio generation received no voiced PCM",
+        ));
+    }
+    if next_checkpoint.is_none()
+        && audio_checkpoint_supported
+        && let Some(resume_key) = resume_key
+    {
+        next_checkpoint = Some(capture_resident_audio_checkpoint(
+            context,
+            fingerprint,
+            active_sequence_id,
+            resume_key,
+            &request_sha256,
+            next_position,
+            prompt_tokens,
+            projected_full_samples,
+        )?);
+    }
+    if deferred_audio_end.is_empty() {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "incremental audio tokenization omitted its closing boundary",
+        ));
+    }
+    for chunk in &deferred_audio_end {
+        let tokens = chunk.text_tokens().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "incremental audio closing boundary was not text",
+            )
+        })?;
+        let chunk_tokens = tokens.len();
+        if prompt_tokens
+            .saturating_add(chunk_tokens)
+            .saturating_add(request.sampling.max_tokens as usize)
+            > context.n_ctx() as usize
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "incremental audio and completion exceed the native context",
+            ));
+        }
+        decode_tokens_chunked(context, tokens, active_sequence_id, next_position, false)?;
+        next_position =
+            next_position.saturating_add(i32::try_from(chunk_tokens).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "incremental audio closing boundary exceeded the native position range",
+                )
+            })?);
+        prompt_tokens = prompt_tokens.saturating_add(chunk_tokens);
+    }
+    audio.record_closing_boundary_finish();
+    let suffix_chunks = multimodal
+        .tokenize(
+            MtmdInputText {
+                text: suffix.to_string(),
+                add_special: false,
+                parse_special: true,
+            },
+            &no_bitmaps,
+        )
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to tokenize incremental audio suffix: {error}"),
+            )
+        })?;
+    let mut suffix_tokens = Vec::with_capacity(suffix_chunks.total_tokens());
+    for index in 0..suffix_chunks.len() {
+        let chunk = suffix_chunks.get(index).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "incremental audio suffix chunk disappeared during evaluation",
+            )
+        })?;
+        let tokens = chunk.text_tokens().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "incremental audio suffix unexpectedly contained media",
+            )
+        })?;
+        suffix_tokens.extend_from_slice(tokens);
+    }
+    audio.record_suffix_tokenize_finish();
+    prompt_tokens = prompt_tokens.saturating_add(suffix_tokens.len());
+    if prompt_tokens.saturating_add(request.sampling.max_tokens as usize) > context.n_ctx() as usize
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            "incremental audio and completion exceed the native context",
+        ));
+    }
+    decode_tokens_chunked(
+        context,
+        &suffix_tokens,
+        active_sequence_id,
+        next_position,
+        true,
+    )?;
+    next_position =
+        next_position.saturating_add(i32::try_from(suffix_tokens.len()).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "incremental audio suffix exceeded the native position range",
+            )
+        })?);
+    tracking
+        .token_counts
+        .insert(active_sequence_id, next_position.max(0) as usize);
+    audio.record_suffix_eval_finish();
+    emit_generation_state(
+        supervision.event_tx,
+        request,
+        1,
+        GenerationState::Generating,
+    );
+    let completion = complete_multimodal_generation(
+        model,
+        context,
+        request,
+        supervision,
+        tracking,
+        prompt_tokens,
+        next_position,
+        active_sequence_id,
+        started,
+        2,
+        Some(audio),
+    );
+    let mut output = match completion {
+        Ok(output) => output,
+        Err(error) => {
+            // An errored decode cannot be resumed safely because it may have
+            // mutated the active sequence after the immutable audio fork. Leave no invisible
+            // resident branch behind for a later request to consume.
+            if let Some(checkpoint) = next_checkpoint.as_ref() {
+                let _ = context.clear_kv_cache_seq(Some(checkpoint.sequence_id as u32), None, None);
+            }
+            let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+            *resident_audio_checkpoint = None;
+            return Err(error);
+        }
+    };
+    if output.state == GenerationState::Cancelled {
+        audio.record_cancellation_observed();
+        // Resumed speech deliberately cancels decode after the block-aligned
+        // audio prefix was forked. Publish that exact fork only now, once the
+        // cancelled request has stopped touching the shared context.
+        if let Some(checkpoint) = next_checkpoint {
+            publish_cancelled_audio_checkpoint(
+                context,
+                active_sequence_id,
+                checkpoint,
+                resident_audio_checkpoint,
+            )?;
+        } else {
+            let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+            *resident_audio_checkpoint = None;
+        }
+    } else {
+        if let Some(checkpoint) = next_checkpoint.as_ref() {
+            let _ = context.clear_kv_cache_seq(Some(checkpoint.sequence_id as u32), None, None);
+        }
+        let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
+        *resident_audio_checkpoint = None;
+    }
+    if let Some(state) = cached_prefix {
+        output.metrics.cache.supplied_prefix_tokens = state.token_count;
+        match restored_prefix_kind {
+            Some(SequenceRestoreKind::NativeState) => {
+                output.metrics.cache.restored_prefix_tokens = state.token_count;
+                output.metrics.shared_prefix_tokens = state.token_count;
+            }
+            Some(SequenceRestoreKind::TokenReplay) => {
+                output.metrics.cache.replayed_prefix_tokens = state.token_count;
+            }
+            None => {}
+        }
+    } else if resident_prefix_tokens > 0 {
+        output.metrics.cache.resident_prefix_tokens = resident_prefix_tokens;
+        output.metrics.shared_prefix_tokens = resident_prefix_tokens;
+    }
+    Ok(output)
+}
+
+fn validate_incremental_audio_prefix_tokens(
+    state: &SequenceStateBlob,
+    rendered_prefix: &[i32],
+) -> NativeResult<()> {
+    if state.token_count == 0
+        || state.token_count != state.token_ids.len()
+        || state.token_count > rendered_prefix.len()
+        || state.token_ids.as_slice() != &rendered_prefix[..state.token_count]
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "saved KV prefix does not match the rendered incremental audio prefix",
+        ));
+    }
+    Ok(())
+}
+
 fn generate_multimodal(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -5596,7 +7924,7 @@ fn generate_multimodal(
         0,
         GenerationState::Prefilling,
     );
-    let mut next_position = chunks
+    let next_position = chunks
         .eval_chunks(multimodal, context, 0, 0, context.n_batch() as i32, true)
         .map_err(|error| {
             NativeError::new(
@@ -5613,17 +7941,51 @@ fn generate_multimodal(
         1,
         GenerationState::Generating,
     );
+    complete_multimodal_generation(
+        model,
+        context,
+        request,
+        supervision,
+        tracking,
+        prompt_tokens,
+        next_position,
+        0,
+        started,
+        2,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_multimodal_generation(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    request: &GenerationRequest,
+    supervision: SingleSequenceSupervision<'_>,
+    tracking: SequenceTracking<'_>,
+    prompt_tokens: usize,
+    mut next_position: i32,
+    sequence_id: i32,
+    started: Instant,
+    mut event_index: u64,
+    audio: Option<&IncrementalAudioBuffer>,
+) -> NativeResult<GenerationOutput> {
+    if let Some(audio) = audio {
+        audio.record_sampler_start();
+    }
     let mut sampler = build_sampler(model, &request.sampling);
+    if let Some(audio) = audio {
+        audio.record_sampler_ready();
+    }
     let mut decoder = UTF_8.new_decoder();
     let mut text = String::new();
     let mut generated_token_ids = Vec::with_capacity(request.sampling.max_tokens as usize);
     let mut generated = 0_usize;
-    let mut event_index = 2_u64;
     let mut first_token_ms = None;
     let mut forced_tokens = VecDeque::new();
     let finish_reason = loop {
         if supervision.cancellation.load(Ordering::Acquire) {
-            let _ = context.clear_kv_cache_seq(Some(0), None, None);
+            let _ = context.clear_kv_cache_seq(Some(sequence_id as u32), None, None);
             break "cancelled".to_string();
         }
         if supervision.reasoning_force.load(Ordering::Acquire)
@@ -5643,12 +8005,22 @@ fn generate_multimodal(
         }
         // `sample` samples and accepts. Only an externally forced token needs
         // an explicit accept here; accepting again corrupts stateful samplers.
+        if first_token_ms.is_none()
+            && let Some(audio) = audio
+        {
+            audio.record_sample_start();
+        }
         let token = if let Some(token) = forced_tokens.pop_front() {
             sampler.accept(token);
             token
         } else {
             sampler.sample(context, -1)
         };
+        if first_token_ms.is_none()
+            && let Some(audio) = audio
+        {
+            audio.record_sample_finish();
+        }
         if model.is_eog_token(token) {
             break "end_of_generation".to_string();
         }
@@ -5660,6 +8032,9 @@ fn generate_multimodal(
             )
         })?;
         let piece = decode_generated_utf8_piece(&mut decoder, &bytes, false)?;
+        if let Some(audio) = audio {
+            audio.record_token_piece(!piece.is_empty());
+        }
         if first_token_ms.is_none() {
             first_token_ms = Some(started.elapsed().as_millis());
         }
@@ -5671,12 +8046,17 @@ fn generate_multimodal(
                 GenerationEvent {
                     request_id: request.request_id.clone(),
                     branch_id: "assistant".to_string(),
-                    sequence_id: 0,
+                    sequence_id,
                     input_index: 0,
                     event_index,
                     event: GenerationEventKind::Delta { text: piece },
                 },
             );
+            if first_token_ms.is_some()
+                && let Some(audio) = audio
+            {
+                audio.record_token_event();
+            }
             event_index += 1;
         }
         if apply_stop_sequences(&mut text, &request.sampling.stop) {
@@ -5687,15 +8067,28 @@ fn generate_multimodal(
         }
         let mut batch = LlamaBatch::new(1, 1);
         batch
-            .add(token, next_position, &[0], true)
+            .add(token, next_position, &[sequence_id], true)
             .map_err(|error| {
                 native_decode_error("failed to build multimodal decode batch", error)
             })?;
+        if !yield_to_scheduled_compute(&request.request_id, supervision.cancellation) {
+            let _ = context.clear_kv_cache_seq(Some(sequence_id as u32), None, None);
+            break "cancelled".to_string();
+        }
+        if let Some(audio) = audio {
+            audio.record_continuation_decode_start();
+        }
+        let decode_started = Instant::now();
         context
             .decode(&mut batch)
             .map_err(|error| native_decode_error("failed to continue multimodal decode", error))?;
+        if let Some(audio) = audio {
+            audio.record_continuation_decode_finish(decode_started.elapsed());
+        }
         next_position += 1;
-        tracking.token_counts.insert(0, next_position as usize);
+        tracking
+            .token_counts
+            .insert(sequence_id, next_position as usize);
     };
     let final_piece =
         finalize_generated_text(&mut decoder, &mut text, finish_reason == "stop_sequence")?;
@@ -5705,7 +8098,7 @@ fn generate_multimodal(
             GenerationEvent {
                 request_id: request.request_id.clone(),
                 branch_id: "assistant".to_string(),
-                sequence_id: 0,
+                sequence_id,
                 input_index: 0,
                 event_index,
                 event: GenerationEventKind::Delta { text: final_piece },
@@ -6303,7 +8696,7 @@ fn apply_model_chat_template(
         ChatTemplateChoice::Gemma4NonThinking => {
             return render_gemma4_non_thinking(&messages, add_assistant);
         }
-        ChatTemplateChoice::ModelDefault => {
+        ChatTemplateChoice::ModelDefault | ChatTemplateChoice::PreferNonThinking => {
             let template = model.chat_template(None).map_err(|error| {
                 NativeError::new(
                     NativeErrorCode::ModelInvalid,
@@ -6838,6 +9231,50 @@ fn validate_generation_request(
     Ok(())
 }
 
+fn validate_incremental_audio_request(
+    request: &GenerationRequest,
+    status: &ResidentModelStatus,
+) -> NativeResult<()> {
+    if request.model_id != status.model_id {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelNotLoaded,
+            format!("model {} is not resident", request.model_id),
+        ));
+    }
+    if !request.media.is_empty() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "incremental audio owns its live media stream and does not accept completed media",
+        ));
+    }
+    if !matches!(request.input, GenerationInput::Chat { .. }) {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "incremental audio generation requires chat input",
+        ));
+    }
+    request.sampling.validate()?;
+    if request.sampling.max_tokens == 0 {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "incremental audio generation requires a positive token limit",
+        ));
+    }
+    let supports_audio = status.descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor
+            .capabilities
+            .media_kinds
+            .contains(&MediaKind::Audio)
+    });
+    if !supports_audio {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "the resident model does not declare native audio input",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_generation_batch_request(
     request: &GenerationBatchRequest,
     status: &ResidentModelStatus,
@@ -7057,6 +9494,10 @@ fn native_thread_count() -> i32 {
         .unwrap_or(4)
 }
 
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 fn fingerprint_model(
     config: &NativeModelConfig,
     model: &LlamaModel,
@@ -7124,6 +9565,9 @@ fn describe_model(
     model: &LlamaModel,
     fingerprint: &ModelFingerprint,
     media_kinds: Vec<MediaKind>,
+    load_metrics: NativeModelLoadMetrics,
+    model_file_identity: String,
+    mmproj_file_identity: Option<String>,
 ) -> NativeModelDescriptor {
     let declared_name = model
         .meta_val_str("general.name")
@@ -7170,6 +9614,9 @@ fn describe_model(
         },
         max_sequences: fingerprint.max_sequences,
         backend: fingerprint.backend.clone(),
+        load_metrics,
+        model_file_identity,
+        mmproj_file_identity,
         capabilities: ModelCapabilities {
             prompt_forms,
             chat_template_available,
@@ -7477,6 +9924,376 @@ mod tests {
     use llama_cpp_2::token::data_array::LlamaTokenDataArray;
     use llama_native_types::EmbeddingInput;
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
+
+    #[test]
+    fn realtime_compute_lease_yields_generation_without_losing_cancellation() {
+        let lease = acquire_realtime_compute();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            entered_tx
+                .send(())
+                .expect("worker announces token boundary");
+            finished_tx
+                .send(yield_to_scheduled_compute("", &worker_cancellation))
+                .expect("worker reports released boundary");
+        });
+
+        entered_rx
+            .recv()
+            .expect("worker reaches the token boundary");
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "generation must not cross a leased compute boundary"
+        );
+        let metrics = lease.finish();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("generation resumes after lease release")
+        );
+        worker.join().expect("boundary worker exits cleanly");
+        assert!(metrics.generation_yields >= 1);
+        assert!(metrics.generation_yield_us >= 15_000);
+
+        let fair_lease = acquire_realtime_compute();
+        let fair_cancellation = Arc::clone(&cancellation);
+        let (fair_tx, fair_rx) = std::sync::mpsc::sync_channel(0);
+        let fair_worker = thread::spawn(move || {
+            fair_tx
+                .send(yield_to_scheduled_compute("", &fair_cancellation))
+                .expect("fair worker reports bounded priority expiry");
+        });
+        assert!(
+            fair_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("generation receives a bounded fair decode opportunity")
+        );
+        fair_worker.join().expect("fair worker exits cleanly");
+        let fair_metrics = fair_lease.finish();
+        assert!(fair_metrics.generation_yields >= 1);
+        assert!(fair_metrics.generation_fair_passes >= 1);
+
+        let cancelled_lease = acquire_realtime_compute();
+        cancellation.store(true, Ordering::Release);
+        assert!(!yield_to_scheduled_compute("", &cancellation));
+        drop(cancelled_lease);
+
+        cancellation.store(false, Ordering::Release);
+        let semantic_lease = acquire_generation_backpressure("voice-request-a")
+            .expect("bounded request acquires semantic backpressure");
+        assert!(
+            yield_to_scheduled_compute("voice-request-b", &cancellation),
+            "an unrelated request must not inherit semantic backpressure"
+        );
+        let semantic_cancellation = Arc::clone(&cancellation);
+        let (semantic_tx, semantic_rx) = std::sync::mpsc::sync_channel(0);
+        let semantic_worker = thread::spawn(move || {
+            semantic_tx
+                .send(yield_to_scheduled_compute(
+                    "voice-request-a",
+                    &semantic_cancellation,
+                ))
+                .expect("semantic worker reports release");
+        });
+        assert!(semantic_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        let semantic_metrics = semantic_lease.finish();
+        assert!(
+            semantic_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("exact request resumes after semantic lead is consumed")
+        );
+        semantic_worker
+            .join()
+            .expect("semantic worker exits cleanly");
+        assert!(semantic_metrics.generation_yields >= 1);
+        assert!(semantic_metrics.generation_yield_us >= 15_000);
+    }
+
+    #[test]
+    fn pcm_ring_retains_consumed_audio_in_one_fixed_storage_allocation() {
+        let mut ring = PcmRing::new(8);
+        let storage = ring.data.as_ptr();
+        assert!(ring.push(&[0.0, 1.0, 2.0, 3.0]));
+        let mut output = Vec::with_capacity(8);
+        ring.pop_into(2, &mut output);
+        assert_eq!(output, [0.0, 1.0]);
+        assert!(ring.push(&[4.0, 5.0, 6.0, 7.0]));
+        assert_eq!(ring.data.as_ptr(), storage);
+        ring.pop_into(8, &mut output);
+        assert_eq!(output, [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert!(ring.is_empty());
+        assert_eq!(ring.retained(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(ring.remaining(), 0);
+        assert!(!ring.push(&[8.0]));
+    }
+
+    #[test]
+    fn incremental_audio_ring_preserves_order_and_drains_a_short_tail() {
+        let ring = Arc::new(IncrementalAudioBuffer::new());
+        let archive = IncrementalAudioMonitor {
+            input: Arc::clone(&ring),
+        };
+        let first = (0..INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES + 320)
+            .map(|sample| sample as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(ring.push(&first).expect("ring accepts PCM"), first.len());
+
+        let cancelled = AtomicBool::new(false);
+        let mut output = Vec::new();
+        assert!(
+            ring.read_into(&mut output, &cancelled)
+                .expect("first read succeeds")
+        );
+        assert_eq!(output, first[..INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES]);
+
+        assert!(ring.seal().expect("producer closes cleanly"));
+        assert!(!ring.seal().expect("repeated seal is idempotent"));
+        assert_eq!(
+            ring.push(&[0.0])
+                .expect_err("sealed producer refuses more PCM")
+                .code,
+            NativeErrorCode::WorkerStopped
+        );
+        assert!(
+            ring.read_into(&mut output, &cancelled)
+                .expect("short terminal tail is drained")
+        );
+        assert_eq!(output, first[INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES..]);
+        assert!(
+            !ring
+                .read_into(&mut output, &cancelled)
+                .expect("finished empty ring reaches EOF")
+        );
+        let stats = ring.stats();
+        assert_eq!(stats.accepted_samples, first.len() as u64);
+        assert_eq!(stats.consumed_samples, first.len() as u64);
+        assert_eq!(stats.chunks, 2);
+        assert_eq!(stats.high_water_samples, first.len());
+        assert_eq!(stats.reader_notifications, 1);
+
+        let wav = archive.wav_bytes().expect("deferred archive becomes a WAV");
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(wav.len(), 44 + first.len() * 2);
+        assert_eq!(i16::from_le_bytes([wav[44], wav[45]]), 0);
+        assert_eq!(i16::from_le_bytes([wav[46], wav[47]]), i16::MAX);
+    }
+
+    #[test]
+    fn incremental_audio_ring_has_exact_bounded_backpressure() {
+        let ring = IncrementalAudioBuffer::new();
+        assert_eq!(
+            ring.push(&vec![0.0; INCREMENTAL_AUDIO_RING_SAMPLES])
+                .expect("exact ring capacity is accepted"),
+            INCREMENTAL_AUDIO_RING_SAMPLES
+        );
+        assert_eq!(
+            ring.push(&[0.0])
+                .expect_err("one sample beyond capacity is refused")
+                .code,
+            NativeErrorCode::QueueFull
+        );
+    }
+
+    #[test]
+    fn incremental_audio_cache_requires_an_exact_nonempty_token_prefix() {
+        let exact = SequenceStateBlob {
+            sequence_id: 0,
+            token_count: 3,
+            token_ids: vec![11, 22, 33],
+            bytes: vec![1].into(),
+        };
+        validate_incremental_audio_prefix_tokens(&exact, &[11, 22, 33, 44])
+            .expect("an exact leading token sequence is reusable");
+
+        let mut mismatch = exact.clone();
+        mismatch.token_ids[2] = 34;
+        assert_eq!(
+            validate_incremental_audio_prefix_tokens(&mismatch, &[11, 22, 33, 44])
+                .expect_err("a different rendered prefix must be rejected")
+                .code,
+            NativeErrorCode::CacheIncompatible
+        );
+
+        let mut malformed = exact.clone();
+        malformed.token_count = 2;
+        assert_eq!(
+            validate_incremental_audio_prefix_tokens(&malformed, &[11, 22, 33, 44])
+                .expect_err("state accounting must remain exact")
+                .code,
+            NativeErrorCode::CacheIncompatible
+        );
+
+        let empty = SequenceStateBlob {
+            sequence_id: 0,
+            token_count: 0,
+            token_ids: Vec::new(),
+            bytes: vec![1].into(),
+        };
+        assert_eq!(
+            validate_incremental_audio_prefix_tokens(&empty, &[11])
+                .expect_err("empty sequence state has no reusable KV prefix")
+                .code,
+            NativeErrorCode::CacheIncompatible
+        );
+    }
+
+    #[test]
+    fn incremental_audio_retry_binding_ignores_only_request_identity() {
+        let mut first = admission_generation_request("first-attempt");
+        first.cached_prefix = Some(SequenceStateBlob {
+            sequence_id: 0,
+            token_count: 2,
+            token_ids: vec![11, 22],
+            bytes: Arc::new(vec![7; 1024 * 1024]),
+        });
+        let mut retry = first.clone();
+        retry.request_id = "retry-attempt".to_owned();
+        assert_eq!(
+            incremental_audio_request_sha256(&first).expect("first binding"),
+            incremental_audio_request_sha256(&retry).expect("retry binding"),
+            "a replacement request may change only its cancellation identity"
+        );
+
+        let mut detached_prefix = retry.clone();
+        let prefix = detached_prefix
+            .cached_prefix
+            .as_mut()
+            .expect("fixture has a prefix");
+        prefix.bytes = Arc::new(prefix.bytes.as_ref().clone());
+        assert_ne!(
+            incremental_audio_request_sha256(&first).expect("first binding"),
+            incremental_audio_request_sha256(&detached_prefix).expect("detached binding"),
+            "byte-identical state without the same resident allocation must fall back"
+        );
+
+        retry.sampling.max_tokens = retry.sampling.max_tokens.saturating_add(1);
+        assert_ne!(
+            incremental_audio_request_sha256(&first).expect("first binding"),
+            incremental_audio_request_sha256(&retry).expect("changed binding"),
+            "changed generation policy must never consume resident audio KV"
+        );
+    }
+
+    #[test]
+    fn incremental_audio_checkpoints_ping_pong_between_resident_sequences() {
+        assert_eq!(alternate_checkpoint_sequence(0).expect("sequence zero"), 1);
+        assert_eq!(alternate_checkpoint_sequence(1).expect("sequence one"), 0);
+        assert_eq!(
+            alternate_checkpoint_sequence(-1)
+                .expect_err("negative sequence must fail")
+                .code,
+            NativeErrorCode::Internal
+        );
+        assert_eq!(
+            alternate_checkpoint_sequence(2)
+                .expect_err("third sequence must fail")
+                .code,
+            NativeErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn incremental_audio_reader_uses_preprocessor_aligned_blocks() {
+        let ring = IncrementalAudioBuffer::new();
+        ring.push(&vec![
+            0.0;
+            INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES * 2 + 320
+        ])
+        .expect("ring accepts a projector backlog");
+        let cancelled = AtomicBool::new(false);
+        let mut output = Vec::new();
+
+        assert!(
+            ring.read_into(&mut output, &cancelled)
+                .expect("prompt read")
+        );
+        assert_eq!(output.len(), INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
+        assert!(
+            ring.read_into(&mut output, &cancelled)
+                .expect("catch-up read")
+        );
+        assert_eq!(output.len(), INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
+        assert!(ring.seal().expect("producer closes cleanly"));
+        assert!(ring.read_into(&mut output, &cancelled).expect("tail read"));
+        assert_eq!(output.len(), 320);
+    }
+
+    #[test]
+    fn incremental_audio_reader_is_not_woken_for_partial_producer_writes() {
+        let ring = IncrementalAudioBuffer::new();
+        for _ in 0..4 {
+            ring.push(&[0.0; 160]).expect("10 ms publication");
+        }
+        assert_eq!(ring.stats().reader_notifications, 1);
+        assert_eq!(ring.stats().accepted_samples, 640);
+
+        let cancelled = AtomicBool::new(false);
+        let mut output = Vec::new();
+        assert!(
+            ring.read_into(&mut output, &cancelled)
+                .expect("aligned read")
+        );
+        assert_eq!(output.len(), INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
+
+        for _ in 0..3 {
+            ring.push(&[0.0; 160]).expect("partial next block");
+        }
+        assert_eq!(ring.stats().reader_notifications, 1);
+        ring.push(&[0.0; 160]).expect("next boundary");
+        assert_eq!(ring.stats().reader_notifications, 2);
+    }
+
+    #[test]
+    fn incremental_audio_abort_wakes_a_waiting_reader() {
+        let ring = Arc::new(IncrementalAudioBuffer::new());
+        let reader = Arc::clone(&ring);
+        let joined = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            reader.read_into(&mut output, &AtomicBool::new(false))
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ring.stats().reader_waits == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "reader never reached its condition wait"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(ring.stats().reader_wakeups, 0);
+        ring.abort();
+        assert_eq!(
+            joined
+                .join()
+                .expect("reader does not panic")
+                .expect_err("abort cancels the reader")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        let stats = ring.stats();
+        assert_eq!(stats.reader_waits, 1);
+        assert_eq!(stats.reader_wakeups, 1);
+    }
+
+    #[test]
+    fn incremental_audio_abort_remains_authoritative_after_seal() {
+        let ring = IncrementalAudioBuffer::new();
+        ring.push(&[0.25; 160]).expect("short tail is retained");
+        assert!(ring.seal().expect("silence seals the producer"));
+        ring.abort();
+        let mut output = Vec::new();
+        assert_eq!(
+            ring.read_into(&mut output, &AtomicBool::new(false))
+                .expect_err("resumed speech cancels the sealed attempt")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn request_level_cache_is_selected_for_every_shared_prefix_branch() {
@@ -9031,17 +11848,35 @@ mod tests {
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
-        let pinned_manifest_lines = |package: &str| {
-            let prefix = format!("{package} = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\"");
+        assert_eq!(
             manifest
                 .lines()
-                .filter(|line| line.starts_with(&prefix))
-                .filter(|line| line.contains("git = "))
+                .filter(|line| line.starts_with("llama-cpp-2 = "))
+                .filter(|line| line.contains("path = \"../llama-cpp-2\""))
+                .count(),
+            2
+        );
+        let pinned_sys_lines = manifest
+            .lines()
+            .filter(|line| {
+                line.starts_with(&format!(
+                    "llama-cpp-sys-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
+                ))
+            })
+            .filter(|line| line.contains("git = "))
+            .filter(|line| line.contains(&format!("rev = \"{LLAMA_CPP_BINDING_REV}\"")))
+            .count();
+        assert_eq!(pinned_sys_lines, 1);
+        let wrapper_manifest = include_str!("../../llama-cpp-2/Cargo.toml");
+        assert!(wrapper_manifest.contains(&format!("version = \"{LLAMA_CPP_BINDING_VERSION}\"")));
+        assert_eq!(
+            wrapper_manifest
+                .lines()
+                .filter(|line| line.starts_with("llama-cpp-sys-2 = "))
                 .filter(|line| line.contains(&format!("rev = \"{LLAMA_CPP_BINDING_REV}\"")))
-                .count()
-        };
-        assert_eq!(pinned_manifest_lines("llama-cpp-2"), 2);
-        assert_eq!(pinned_manifest_lines("llama-cpp-sys-2"), 1);
+                .count(),
+            2
+        );
         assert_eq!(
             manifest
                 .lines()
@@ -9064,7 +11899,7 @@ mod tests {
         let lock = include_str!("../../../../../Cargo.lock");
         let locked_source_suffix =
             format!("?rev={LLAMA_CPP_BINDING_REV}#{LLAMA_CPP_BINDING_REV}\"");
-        assert_eq!(lock.matches(&locked_source_suffix).count(), 2);
+        assert_eq!(lock.matches(&locked_source_suffix).count(), 1);
         for package in ["llama-cpp-2", "llama-cpp-sys-2"] {
             let package_name = format!("name = \"{package}\"");
             let mut matching_blocks = lock
@@ -9074,8 +11909,12 @@ mod tests {
                 .next()
                 .expect("binding package must be locked");
             assert!(matching_blocks.next().is_none());
-            assert!(block.contains("source = \"git+"));
-            assert!(block.contains(&locked_source_suffix));
+            if package == "llama-cpp-2" {
+                assert!(!block.contains("source = "));
+            } else {
+                assert!(block.contains("source = \"git+"));
+                assert!(block.contains(&locked_source_suffix));
+            }
         }
 
         let private_build_digest = LLAMA_NATIVE_BUILD_MANIFEST_SHA256;
@@ -10470,7 +13309,7 @@ mod tests {
         let directory = TestArtifactDirectory::new("windows-legacy-only");
         let configured_path = directory.join("model.gguf");
         std::fs::write(&configured_path, b"model").expect("write model artifact");
-        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None, None)
             .expect("Windows deny-sharing still supports legacy model loading");
         assert_eq!(guard.load_path, configured_path);
         let error = guard
@@ -10494,7 +13333,7 @@ mod tests {
         std::fs::write(&configured_path, b"model-a").expect("write original artifact");
         std::fs::write(&replacement_path, b"model-b").expect("write replacement artifact");
 
-        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None, None)
             .expect("regular local files support a pinned guarded open");
         guard
             .verify_strict_unchanged()
@@ -10523,7 +13362,7 @@ mod tests {
         let directory = TestArtifactDirectory::new("in-place-change");
         let configured_path = directory.join("model.gguf");
         std::fs::write(&configured_path, b"alpha").expect("write original artifact");
-        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None, None)
             .expect("regular local files support a pinned guarded open");
         let payload_bytes_read = guard.payload_bytes_read();
 
@@ -10555,7 +13394,7 @@ mod tests {
         let directory = TestArtifactDirectory::new("metadata-only-verification");
         let configured_path = directory.join("model.gguf");
         std::fs::write(&configured_path, b"immutable model bytes").expect("write artifact");
-        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None, None)
             .expect("regular local files support guarded verification");
         let after_initial_hash = guard.payload_bytes_read();
         assert_eq!(after_initial_hash, 21);
@@ -10579,10 +13418,49 @@ mod tests {
         let configured_path = directory.join("model.gguf");
         std::fs::write(&configured_path, b"artifact").expect("write artifact");
         let wrong_sha256 = "0".repeat(64);
-        let error = ModelArtifactGuard::open(&configured_path, "model", Some(&wrong_sha256))
+        let error = ModelArtifactGuard::open(&configured_path, "model", Some(&wrong_sha256), None)
             .expect_err("trusted expected digest must reject different bytes");
         assert_eq!(error.code, NativeErrorCode::ModelInvalid);
         assert!(error.message.contains("expected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_file_identity_reuses_digest_without_rereading_payload() {
+        let directory = TestArtifactDirectory::new("verified-identity-cache");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"artifact bytes").expect("write artifact");
+        let first = ModelArtifactGuard::open(&configured_path, "model", None, None)
+            .expect("initial verification");
+        let digest = first.expected_sha256.clone();
+        let identity = artifact_file_identity(&first.initial_state);
+        drop(first);
+
+        let reused =
+            ModelArtifactGuard::open(&configured_path, "model", Some(&digest), Some(&identity))
+                .expect("unchanged verified identity");
+        assert_eq!(reused.expected_sha256, digest);
+        assert_eq!(reused.payload_bytes_read(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_file_identity_forces_payload_reverification() {
+        let directory = TestArtifactDirectory::new("stale-identity-cache");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"artifact-a").expect("write artifact");
+        let first = ModelArtifactGuard::open(&configured_path, "model", None, None)
+            .expect("initial verification");
+        let digest = first.expected_sha256.clone();
+        let identity = artifact_file_identity(&first.initial_state);
+        drop(first);
+        std::fs::write(&configured_path, b"artifact-bb").expect("replace artifact bytes");
+
+        let refreshed =
+            ModelArtifactGuard::open(&configured_path, "model", Some(&digest), Some(&identity))
+                .expect("stale cache triggers a fresh verification");
+        assert_ne!(refreshed.expected_sha256, digest);
+        assert_eq!(refreshed.payload_bytes_read(), 11);
     }
 
     #[test]
@@ -10987,6 +13865,19 @@ mod tests {
 
         let one_short_prompt = vec![vec![1, 2, 3].into_iter().map(LlamaToken::new).collect()];
         assert_eq!(cache.reusable_tokens(&binding, &one_short_prompt), 2);
+    }
+
+    #[test]
+    fn resident_audio_prefix_reuse_is_token_exact_and_keeps_one_token_live() {
+        let prefix = ResidentAudioTextPrefix {
+            sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+            token_ids: vec![1, 2, 3, 4, 90],
+        };
+
+        assert_eq!(prefix.reusable_tokens(&[1, 2, 3, 4, 5]), 4);
+        assert_eq!(prefix.reusable_tokens(&[1, 2, 8, 4, 5]), 2);
+        assert_eq!(prefix.reusable_tokens(&[1, 2, 3]), 2);
+        assert_eq!(prefix.reusable_tokens(&[]), 0);
     }
 
     #[test]
@@ -12511,5 +15402,544 @@ mod tests {
             SpeculativeAdmissionStatus::Available,
             "only actual executor release retires this preemption watch"
         );
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MTP_ASSISTANT_PATH"]
+    fn real_gemma4_mtp_assistant_reports_acceptance_and_throughput()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use llama_cpp_2::context::params::LlamaContextType;
+        use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
+
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
+        let model_path = PathBuf::from(std::env::var("MOM_LLAMA_MODEL_PATH")?);
+        let assistant_path = PathBuf::from(std::env::var("MOM_LLAMA_MTP_ASSISTANT_PATH")?);
+        let backend = backend()?;
+        let gpu_layers = if backend.supports_gpu_offload() {
+            u32::MAX
+        } else {
+            0
+        };
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        let target_model = LlamaModel::load_from_file(backend, &model_path, &model_params)?;
+        let assistant_model = LlamaModel::load_from_file(backend, &assistant_path, &model_params)?;
+        let target_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(2048))
+            .with_n_batch(256)
+            .with_n_ubatch(256)
+            .with_n_seq_max(1)
+            .with_n_threads(native_thread_count())
+            .with_n_threads_batch(native_thread_count())
+            .with_kv_unified(true)
+            .with_no_perf(false);
+        let target_context = target_model.new_context(backend, target_params.clone())?;
+        let assistant_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(2048))
+            .with_n_batch(256)
+            .with_n_ubatch(256)
+            .with_n_seq_max(1)
+            .with_n_threads(native_thread_count())
+            .with_n_threads_batch(native_thread_count())
+            .with_kv_unified(true)
+            .with_no_perf(false)
+            .with_context_type(LlamaContextType::Mtp);
+        let assistant_context = assistant_model.new_context_with_ctx_other(
+            backend,
+            assistant_params,
+            &target_context,
+        )?;
+        let mtp_max = std::env::var("MOM_LLAMA_MTP_MAX")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(3);
+        let mut speculative = MtpSpeculative::new(
+            target_context,
+            assistant_context,
+            MtpSpeculativeParams {
+                n_max: mtp_max,
+                n_min: 0,
+                p_min: 0.0,
+            },
+        )?;
+
+        let prompt = "<start_of_turn>user\nReply with one friendly sentence about listening carefully.<end_of_turn>\n<start_of_turn>model\n";
+        let prompt_tokens = target_model.str_to_token(prompt, AddBos::Always)?;
+        let mut prompt_batch = LlamaBatch::new(prompt_tokens.len(), 1);
+        for (position, token) in prompt_tokens.iter().copied().enumerate() {
+            prompt_batch.add(
+                token,
+                position as i32,
+                &[0],
+                position + 1 == prompt_tokens.len(),
+            )?;
+        }
+        speculative.begin(&prompt_tokens)?;
+        let prefill_started = Instant::now();
+        speculative.target_context_mut().decode(&mut prompt_batch)?;
+        speculative.process(&prompt_batch)?;
+        let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1_000.0;
+
+        let sampling = SamplingConfig {
+            seed: 0x4d54_5031,
+            temperature: 1.0,
+            max_tokens: 48,
+            ..SamplingConfig::default()
+        };
+        let mut sampler = build_sampler(&target_model, &sampling);
+        let decode_started = Instant::now();
+        let mut id_last = sampler.sample(speculative.target_context(), -1);
+        let first_token_ms = decode_started.elapsed().as_secs_f64() * 1_000.0;
+        let mut output_tokens = vec![id_last];
+        let mut n_past = i32::try_from(prompt_tokens.len())?;
+        let mut proposed = 0_usize;
+        let mut accepted = 0_usize;
+        let mut verification_steps = 0_usize;
+
+        while output_tokens.len() < sampling.max_tokens as usize
+            && !target_model.is_eog_token(id_last)
+        {
+            let draft = speculative.draft(n_past, id_last, &[])?;
+            proposed = proposed.saturating_add(draft.len());
+            verification_steps = verification_steps.saturating_add(1);
+            let mut batch = LlamaBatch::new(draft.len() + 1, 1);
+            batch.add(id_last, n_past, &[0], true)?;
+            for (offset, token) in draft.iter().copied().enumerate() {
+                batch.add(token, n_past + 1 + offset as i32, &[0], true)?;
+            }
+            speculative.target_context_mut().decode(&mut batch)?;
+            speculative.process(&batch)?;
+
+            let mut sampled = Vec::with_capacity(draft.len() + 1);
+            for row in 0..=draft.len() {
+                let token = sampler.sample(speculative.target_context(), row as i32);
+                sampled.push(token);
+                if row == draft.len() || token != draft[row] {
+                    break;
+                }
+            }
+            let accepted_now = sampled.len().saturating_sub(1);
+            accepted = accepted.saturating_add(accepted_now);
+            speculative.accept(u16::try_from(accepted_now)?)?;
+            let rollback_from = n_past
+                .saturating_add(1)
+                .saturating_add(i32::try_from(accepted_now)?);
+            if accepted_now < draft.len() {
+                let removed = speculative.target_context_mut().clear_kv_cache_seq(
+                    Some(0),
+                    Some(u32::try_from(rollback_from)?),
+                    None,
+                )?;
+                if !removed {
+                    return Err("target context refused MTP rollback".into());
+                }
+            }
+            n_past = n_past.saturating_add(i32::try_from(sampled.len())?);
+            for token in sampled {
+                id_last = token;
+                output_tokens.push(token);
+                if output_tokens.len() >= sampling.max_tokens as usize
+                    || target_model.is_eog_token(token)
+                {
+                    break;
+                }
+            }
+        }
+        let decode_ms = decode_started.elapsed().as_secs_f64() * 1_000.0;
+        let text = output_tokens
+            .iter()
+            .take_while(|token| !target_model.is_eog_token(**token))
+            .map(|token| generated_token_piece(&target_model, *token))
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
+        let text = String::from_utf8_lossy(&text).into_owned();
+
+        let mut baseline_context = target_model.new_context(backend, target_params)?;
+        let mut baseline_batch = LlamaBatch::new(prompt_tokens.len(), 1);
+        for (position, token) in prompt_tokens.iter().copied().enumerate() {
+            baseline_batch.add(
+                token,
+                position as i32,
+                &[0],
+                position + 1 == prompt_tokens.len(),
+            )?;
+        }
+        baseline_context.decode(&mut baseline_batch)?;
+        let mut baseline_sampler = build_sampler(&target_model, &sampling);
+        let baseline_started = Instant::now();
+        let mut baseline_tokens = Vec::with_capacity(sampling.max_tokens as usize);
+        let mut baseline_position = i32::try_from(prompt_tokens.len())?;
+        while baseline_tokens.len() < sampling.max_tokens as usize {
+            let token = baseline_sampler.sample(&baseline_context, -1);
+            if target_model.is_eog_token(token) {
+                break;
+            }
+            baseline_tokens.push(token);
+            let mut batch = LlamaBatch::new(1, 1);
+            batch.add(token, baseline_position, &[0], true)?;
+            baseline_context.decode(&mut batch)?;
+            baseline_position = baseline_position.saturating_add(1);
+        }
+        let baseline_decode_ms = baseline_started.elapsed().as_secs_f64() * 1_000.0;
+        let baseline_tokens_per_second =
+            baseline_tokens.len() as f64 / (baseline_decode_ms / 1000.0);
+        let mtp_tokens_per_second = output_tokens.len() as f64 / (decode_ms / 1000.0);
+        println!(
+            "GEMMA4_MTP_BENCHMARK {}",
+            serde_json::to_string(&serde_json::json!({
+                "assistant_path": assistant_path,
+                "temperature": sampling.temperature,
+                "prefill_ms": prefill_ms,
+                "first_token_ms": first_token_ms,
+                "decode_ms": decode_ms,
+                "completion_tokens": output_tokens.len(),
+                "tokens_per_second": mtp_tokens_per_second,
+                "baseline_decode_ms": baseline_decode_ms,
+                "baseline_completion_tokens": baseline_tokens.len(),
+                "baseline_tokens_per_second": baseline_tokens_per_second,
+                "mtp_speedup": mtp_tokens_per_second / baseline_tokens_per_second,
+                "draft_tokens_proposed": proposed,
+                "draft_tokens_accepted": accepted,
+                "draft_acceptance_rate": if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 },
+                "verification_steps": verification_steps,
+                "text": text,
+            }))?
+        );
+        assert!(!output_tokens.is_empty());
+        assert!(proposed > 0, "MTP assistant proposed no tokens");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the real Gemma 4 model, MTP assistant, projector, and audio WAV"]
+    fn real_gemma4_mtp_audio_reports_silence_to_streamed_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use llama_cpp_2::context::params::LlamaContextType;
+        use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
+
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
+        let model_path = PathBuf::from(std::env::var("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?);
+        let assistant_path = PathBuf::from(std::env::var("MOM_LLAMA_MTP_ASSISTANT_PATH")?);
+        let projector_path = std::env::var("MOM_LLAMA_MM_PROJ_PATH")?;
+        let wav_path = PathBuf::from(std::env::var("MOM_LLAMA_TEST_VOICE_WAV")?);
+        let wav = std::fs::read(&wav_path)?;
+        let data_marker = wav
+            .windows(4)
+            .position(|window| window == b"data")
+            .ok_or("benchmark WAV omitted its data chunk")?;
+        let data_start = data_marker.saturating_add(8);
+        let pcm = wav
+            .get(data_start..)
+            .ok_or("benchmark WAV data chunk was truncated")?
+            .chunks_exact(2)
+            .take(4 * 16_000)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        if pcm.len() != 4 * 16_000 {
+            return Err("benchmark WAV contains less than four seconds of PCM".into());
+        }
+        let backend = backend()?;
+        let gpu_layers = if backend.supports_gpu_offload() {
+            u32::MAX
+        } else {
+            0
+        };
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        let target_model = LlamaModel::load_from_file(backend, &model_path, &model_params)?;
+        let assistant_model = LlamaModel::load_from_file(backend, &assistant_path, &model_params)?;
+        let multimodal = MtmdContext::init_from_file(
+            &projector_path,
+            &target_model,
+            &MtmdContextParams {
+                use_gpu: backend.supports_gpu_offload(),
+                n_threads: native_thread_count(),
+                ..MtmdContextParams::default()
+            },
+        )?;
+        let target_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(8192))
+            .with_n_batch(256)
+            .with_n_ubatch(256)
+            .with_n_seq_max(1)
+            .with_n_threads(native_thread_count())
+            .with_n_threads_batch(native_thread_count())
+            .with_kv_unified(true)
+            .with_no_perf(false);
+        let target_context = target_model.new_context(backend, target_params)?;
+        let assistant_context = assistant_model.new_context_with_ctx_other(
+            backend,
+            LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(8192))
+                .with_n_batch(256)
+                .with_n_ubatch(256)
+                .with_n_seq_max(1)
+                .with_n_threads(native_thread_count())
+                .with_n_threads_batch(native_thread_count())
+                .with_kv_unified(true)
+                .with_no_perf(false)
+                .with_context_type(LlamaContextType::Mtp),
+            &target_context,
+        )?;
+        let mtp_max = std::env::var("MOM_LLAMA_MTP_MAX")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(3);
+        let mut speculative = MtpSpeculative::new(
+            target_context,
+            assistant_context,
+            MtpSpeculativeParams {
+                n_max: mtp_max,
+                n_min: 0,
+                p_min: 0.0,
+            },
+        )?;
+
+        let marker = mtmd_default_marker();
+        let audio_instruction = std::env::var("MOM_LLAMA_MTP_AUDIO_INSTRUCTION")
+            .unwrap_or_else(|_| "Reply briefly and naturally to what you hear.".to_string());
+        let rendered = render_multimodal_case_prompt(
+            &target_model,
+            &[MediaInput {
+                id: "phone-audio".to_string(),
+                kind: MediaKind::Audio,
+                mime: "audio/wav".to_string(),
+                sha256: format!("{:x}", Sha256::digest(&wav)),
+                bytes: Vec::new(),
+            }],
+            &GenerationInput::Chat {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: audio_instruction,
+                }],
+                template: ChatTemplateChoice::ModelDefault,
+            },
+        )?;
+        let (prefix, suffix) = rendered
+            .text
+            .split_once(marker)
+            .ok_or("audio prompt omitted its marker")?;
+        let no_bitmaps: Vec<&MtmdBitmap> = Vec::new();
+        let prefix_chunks = multimodal.tokenize(
+            MtmdInputText {
+                text: prefix.to_string(),
+                add_special: rendered.add_special,
+                parse_special: true,
+            },
+            &no_bitmaps,
+        )?;
+        let mut prefix_tokens = Vec::new();
+        for index in 0..prefix_chunks.len() {
+            let chunk = prefix_chunks
+                .get(index)
+                .ok_or("audio prefix chunk disappeared")?;
+            prefix_tokens.extend_from_slice(
+                chunk
+                    .text_tokens()
+                    .ok_or("audio prefix unexpectedly contained media")?,
+            );
+        }
+        decode_tokens_chunked(
+            speculative.target_context_mut(),
+            &prefix_tokens,
+            0,
+            0,
+            false,
+        )?;
+        let bitmap = MtmdBitmap::from_audio_data(&pcm)?;
+        let audio_chunks = multimodal.tokenize(
+            MtmdInputText {
+                text: marker.to_string(),
+                add_special: false,
+                parse_special: true,
+            },
+            &[&bitmap],
+        )?;
+        let next_position = audio_chunks.eval_chunks(
+            &multimodal,
+            speculative.target_context_mut(),
+            i32::try_from(prefix_tokens.len())?,
+            0,
+            256,
+            false,
+        )?;
+        let suffix_chunks = multimodal.tokenize(
+            MtmdInputText {
+                text: suffix.to_string(),
+                add_special: false,
+                parse_special: true,
+            },
+            &no_bitmaps,
+        )?;
+        let mut suffix_tokens = Vec::new();
+        for index in 0..suffix_chunks.len() {
+            let chunk = suffix_chunks
+                .get(index)
+                .ok_or("audio suffix chunk disappeared")?;
+            suffix_tokens.extend_from_slice(
+                chunk
+                    .text_tokens()
+                    .ok_or("audio suffix unexpectedly contained media")?,
+            );
+        }
+        if suffix_tokens.is_empty() {
+            return Err("audio suffix produced no tokens".into());
+        }
+        speculative.begin(&prefix_tokens)?;
+        let silence_started = Instant::now();
+        let mut suffix_batch = LlamaBatch::new(suffix_tokens.len(), 1);
+        for (offset, token) in suffix_tokens.iter().copied().enumerate() {
+            suffix_batch.add(
+                token,
+                next_position + i32::try_from(offset)?,
+                &[0],
+                offset + 1 == suffix_tokens.len(),
+            )?;
+        }
+        speculative.target_context_mut().decode(&mut suffix_batch)?;
+        speculative.process(&suffix_batch)?;
+
+        let sampling = SamplingConfig {
+            seed: 0x4155_4449,
+            temperature: 1.0,
+            max_tokens: 48,
+            ..SamplingConfig::default()
+        };
+        let mut sampler = build_sampler(&target_model, &sampling);
+        let mut id_last = sampler.sample(speculative.target_context(), -1);
+        let first_token_ms = silence_started.elapsed().as_secs_f64() * 1_000.0;
+        let mut output_tokens = vec![id_last];
+        let mut n_past = next_position.saturating_add(i32::try_from(suffix_tokens.len())?);
+        let mut proposed = 0_usize;
+        let mut accepted = 0_usize;
+        let mtp_enabled = std::env::var("MOM_LLAMA_MTP_DRAFT")
+            .map_or(true, |value| value != "0" && value != "false");
+        let mtp_warmup_tokens = std::env::var("MOM_LLAMA_MTP_WARMUP_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let emit = |token: LlamaToken| -> Result<(), Box<dyn std::error::Error>> {
+            if target_model.is_eog_token(token) {
+                return Ok(());
+            }
+            let text =
+                String::from_utf8_lossy(&generated_token_piece(&target_model, token)?).into_owned();
+            println!(
+                "VOICE_MTP_DELTA_BENCHMARK {}",
+                serde_json::to_string(&serde_json::json!({
+                    "silence_elapsed_ms": silence_started.elapsed().as_secs_f64() * 1_000.0,
+                    "delta": text,
+                }))?
+            );
+            Ok(())
+        };
+        emit(id_last)?;
+        if mtp_enabled && mtp_warmup_tokens > 1 {
+            let catchup_capacity = mtp_warmup_tokens.saturating_sub(1);
+            let mut assistant_catchup = LlamaBatch::new(catchup_capacity, 1);
+            let mut catchup_tokens = 0_usize;
+            while output_tokens.len() < mtp_warmup_tokens
+                && output_tokens.len() < sampling.max_tokens as usize
+                && !target_model.is_eog_token(id_last)
+            {
+                assistant_catchup.add(id_last, n_past, &[0], true)?;
+                catchup_tokens = catchup_tokens.saturating_add(1);
+                let mut target_batch = LlamaBatch::new(1, 1);
+                target_batch.add(id_last, n_past, &[0], true)?;
+                speculative.target_context_mut().decode(&mut target_batch)?;
+                n_past = n_past.saturating_add(1);
+                id_last = sampler.sample(speculative.target_context(), -1);
+                output_tokens.push(id_last);
+                emit(id_last)?;
+            }
+            if catchup_tokens > 0 {
+                speculative.process(&assistant_catchup)?;
+            }
+        }
+        while mtp_enabled
+            && output_tokens.len() < sampling.max_tokens as usize
+            && !target_model.is_eog_token(id_last)
+        {
+            let draft = speculative.draft(n_past, id_last, &[])?;
+            proposed = proposed.saturating_add(draft.len());
+            let mut batch = LlamaBatch::new(draft.len() + 1, 1);
+            batch.add(id_last, n_past, &[0], true)?;
+            for (offset, token) in draft.iter().copied().enumerate() {
+                batch.add(token, n_past + 1 + i32::try_from(offset)?, &[0], true)?;
+            }
+            speculative.target_context_mut().decode(&mut batch)?;
+            speculative.process(&batch)?;
+            let mut sampled = Vec::with_capacity(draft.len() + 1);
+            for row in 0..=draft.len() {
+                let token = sampler.sample(speculative.target_context(), i32::try_from(row)?);
+                sampled.push(token);
+                if row == draft.len() || token != draft[row] {
+                    break;
+                }
+            }
+            let accepted_now = sampled.len().saturating_sub(1);
+            accepted = accepted.saturating_add(accepted_now);
+            speculative.accept(u16::try_from(accepted_now)?)?;
+            if accepted_now < draft.len() {
+                let rollback_from = n_past
+                    .saturating_add(1)
+                    .saturating_add(i32::try_from(accepted_now)?);
+                if !speculative.target_context_mut().clear_kv_cache_seq(
+                    Some(0),
+                    Some(u32::try_from(rollback_from)?),
+                    None,
+                )? {
+                    return Err("target context refused MTP rollback".into());
+                }
+            }
+            n_past = n_past.saturating_add(i32::try_from(sampled.len())?);
+            for token in sampled {
+                id_last = token;
+                output_tokens.push(token);
+                emit(token)?;
+                if output_tokens.len() >= sampling.max_tokens as usize
+                    || target_model.is_eog_token(token)
+                {
+                    break;
+                }
+            }
+        }
+        while !mtp_enabled
+            && output_tokens.len() < sampling.max_tokens as usize
+            && !target_model.is_eog_token(id_last)
+        {
+            let mut batch = LlamaBatch::new(1, 1);
+            batch.add(id_last, n_past, &[0], true)?;
+            speculative.target_context_mut().decode(&mut batch)?;
+            n_past = n_past.saturating_add(1);
+            id_last = sampler.sample(speculative.target_context(), -1);
+            output_tokens.push(id_last);
+            emit(id_last)?;
+        }
+        let total_ms = silence_started.elapsed().as_secs_f64() * 1_000.0;
+        println!(
+            "GEMMA4_MTP_AUDIO_BENCHMARK {}",
+            serde_json::to_string(&serde_json::json!({
+                "audio_samples": pcm.len(),
+                "mtp_enabled": mtp_enabled,
+                "mtp_max": mtp_max,
+                "mtp_warmup_tokens": mtp_warmup_tokens,
+                "temperature": sampling.temperature,
+                "silence_to_first_token_ms": first_token_ms,
+                "silence_to_completion_ms": total_ms,
+                "completion_tokens": output_tokens.len(),
+                "tokens_per_second": output_tokens.len() as f64 / (total_ms / 1000.0),
+                "draft_tokens_proposed": proposed,
+                "draft_tokens_accepted": accepted,
+                "draft_acceptance_rate": if proposed == 0 { 0.0 } else { accepted as f64 / proposed as f64 },
+            }))?
+        );
+        if mtp_enabled {
+            assert!(
+                proposed > 0,
+                "MTP assistant proposed no audio-response tokens"
+            );
+        }
+        Ok(())
     }
 }

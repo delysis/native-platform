@@ -22,7 +22,7 @@ nonisolated public class ELUActivation: Module, UnaryLayer {
 // MARK: - MimiConv1d (Causal Conv1d matching HuggingFace MimiConv1d)
 
 nonisolated public class MimiConv1d: Module {
-    let conv: Conv1d
+    @ModuleInfo var conv: Conv1d
     let paddingLeft: Int
     let paddingRight: Int
     let stride: Int
@@ -86,7 +86,7 @@ nonisolated public class MimiConv1d: Module {
 // MARK: - MimiResnetBlock
 
 nonisolated public class MimiResnetBlock: Module {
-    let block: [Module]
+    @ModuleInfo var block: [Module]
 
     public init(dim: Int, dilations: [Int] = [1, 1], compress: Int = 2) {
         let hiddenDim = dim / compress
@@ -115,7 +115,7 @@ nonisolated public class MimiResnetBlock: Module {
 // MARK: - MimiSEANetEncoder
 
 nonisolated public class MimiSEANetEncoder: Module {
-    let layers: [Module]
+    @ModuleInfo var layers: [Module]
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         var layerList: [Module] = []
@@ -193,10 +193,10 @@ nonisolated public class EncoderAttention: Module {
     let numKVHeads: Int
     let scale: Float
 
-    let qProj: Linear
-    let kProj: Linear
-    let vProj: Linear
-    let oProj: Linear
+    @ModuleInfo var qProj: Linear
+    @ModuleInfo var kProj: Linear
+    @ModuleInfo var vProj: Linear
+    @ModuleInfo var oProj: Linear
 
     public init(config: Qwen3TTSTokenizerEncoderConfig, layerIdx: Int) {
         self.headDim = config.head_dim
@@ -243,8 +243,8 @@ nonisolated public class EncoderAttention: Module {
 // MARK: - Encoder MLP (fc1/fc2 with GELU, NOT gate/up/down SiLU)
 
 nonisolated public class EncoderMLP: Module {
-    let fc1: Linear
-    let fc2: Linear
+    @ModuleInfo var fc1: Linear
+    @ModuleInfo var fc2: Linear
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         let quantization = config.quantizationSettings
@@ -261,12 +261,12 @@ nonisolated public class EncoderMLP: Module {
 // MARK: - Encoder Transformer Layer
 
 nonisolated public class EncoderTransformerLayer: Module {
-    let inputLayernorm: LayerNorm
-    let postAttentionLayernorm: LayerNorm
-    let selfAttn: EncoderAttention
-    let mlp: EncoderMLP
-    let selfAttnLayerScale: LayerScale
-    let mlpLayerScale: LayerScale
+    @ModuleInfo var inputLayernorm: LayerNorm
+    @ModuleInfo var postAttentionLayernorm: LayerNorm
+    @ModuleInfo var selfAttn: EncoderAttention
+    @ModuleInfo var mlp: EncoderMLP
+    @ModuleInfo var selfAttnLayerScale: LayerScale
+    @ModuleInfo var mlpLayerScale: LayerScale
 
     public init(config: Qwen3TTSTokenizerEncoderConfig, layerIdx: Int) {
         self.inputLayernorm = LayerNorm(dimensions: config.hidden_size, eps: config.norm_eps)
@@ -301,8 +301,8 @@ nonisolated public class EncoderTransformerLayer: Module {
 // MARK: - Encoder Transformer
 
 nonisolated public class EncoderTransformer: Module {
-    let layers: [EncoderTransformerLayer]
-    let rotaryEmb: DecoderRotaryEmbedding
+    @ModuleInfo var layers: [EncoderTransformerLayer]
+    @ModuleInfo var rotaryEmb: DecoderRotaryEmbedding
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         self.layers = (0..<config.num_hidden_layers).map { i in
@@ -338,7 +338,7 @@ nonisolated public class EncoderTransformer: Module {
 // MARK: - Encoder Downsample
 
 nonisolated public class EncoderDownsample: Module {
-    let conv: MimiConv1d
+    @ModuleInfo var conv: MimiConv1d
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         // Conv1d(512→512, kernel=2*compress, stride=compress) for 2× temporal compression
@@ -360,7 +360,7 @@ nonisolated public class EncoderDownsample: Module {
 // MARK: - Encoder Vector Quantization
 
 nonisolated public class EncoderVectorQuantization: Module {
-    let codebook: EuclideanCodebook
+    @ModuleInfo var codebook: EuclideanCodebook
 
     public init(dim: Int, codebookSize: Int) {
         self.codebook = EuclideanCodebook(dim: dim, codebookSize: codebookSize)
@@ -380,9 +380,9 @@ nonisolated public class EncoderVectorQuantization: Module {
 // MARK: - Encoder Residual Vector Quantizer
 
 nonisolated public class EncoderResidualVectorQuantizer: Module {
-    let inputProj: Conv1d
-    let outputProj: Conv1d
-    let layers: [EncoderVectorQuantization]
+    @ModuleInfo var inputProj: Conv1d
+    @ModuleInfo var outputProj: Conv1d
+    @ModuleInfo var layers: [EncoderVectorQuantization]
 
     public init(numQuantizers: Int, dim: Int, inputDim: Int, codebookSize: Int) {
         // inputProj/outputProj are Conv1d with kernel=1, matching HF's MimiResidualVectorQuantizer
@@ -418,8 +418,8 @@ nonisolated public class EncoderResidualVectorQuantizer: Module {
 // MARK: - Encoder Split Residual Vector Quantizer
 
 nonisolated public class EncoderSplitResidualVectorQuantizer: Module {
-    let semanticResidualVectorQuantizer: EncoderResidualVectorQuantizer
-    let acousticResidualVectorQuantizer: EncoderResidualVectorQuantizer
+    @ModuleInfo var semanticResidualVectorQuantizer: EncoderResidualVectorQuantizer
+    @ModuleInfo var acousticResidualVectorQuantizer: EncoderResidualVectorQuantizer
 
     public init(config: Qwen3TTSTokenizerEncoderConfig) {
         let nQSemantic = config.num_semantic_quantizers
@@ -461,53 +461,30 @@ nonisolated public class EncoderSplitResidualVectorQuantizer: Module {
 /// Architecture: MimiModel encoder (SEANet pattern)
 /// Forward pass: audio [B, 1, L] -> CNN encoder -> transformer -> downsample -> quantizer -> codes [B, 16, T]
 nonisolated public class Qwen3TTSAudioEncoder: Module {
-    private var encoder: MimiSEANetEncoder?
-    private var encoderTransformer: EncoderTransformer?
-    private var downsample: EncoderDownsample?
-    private var quantizer: EncoderSplitResidualVectorQuantizer?
-    private var validNumQuantizers: Int = 16
+    @ModuleInfo private var encoder: MimiSEANetEncoder
+    @ModuleInfo private var encoderTransformer: EncoderTransformer
+    @ModuleInfo private var downsample: EncoderDownsample
+    @ModuleInfo private var quantizer: EncoderSplitResidualVectorQuantizer
+    private let validNumQuantizers: Int
 
-    public override init() {
+    public init(config: Qwen3TTSTokenizerEncoderConfig, validNumQuantizers: Int = 16) {
+        self.encoder = MimiSEANetEncoder(config: config)
+        self.encoderTransformer = EncoderTransformer(config: config)
+        self.downsample = EncoderDownsample(config: config)
+        self.quantizer = EncoderSplitResidualVectorQuantizer(config: config)
+        self.validNumQuantizers = validNumQuantizers
         super.init()
     }
 
     /// Load encoder weights from the speech tokenizer safetensors file.
-    public func loadWeights(from weightsURL: URL, configURL: URL) throws {
-        // Parse encoder config from the speech tokenizer config
-        let configData = try Data(contentsOf: configURL)
-        let tokenizerConfig = try JSONDecoder().decode(AudioDecoderConfig.self, from: configData)
-
-        let encoderConfig: Qwen3TTSTokenizerEncoderConfig
-        if let ec = tokenizerConfig.encoder_config {
-            encoderConfig = ec
-        } else {
-            encoderConfig = Qwen3TTSTokenizerEncoderConfig()
-        }
-
-        self.validNumQuantizers = tokenizerConfig.encoder_valid_num_quantizers ?? 16
-
-        // Create modules
-        let enc = MimiSEANetEncoder(config: encoderConfig)
-        let transformer = EncoderTransformer(config: encoderConfig)
-        let ds = EncoderDownsample(config: encoderConfig)
-        let quant = EncoderSplitResidualVectorQuantizer(config: encoderConfig)
-
+    public func loadWeights(from weightsURL: URL) throws {
         // Evaluate random init weights first
-        eval(enc.parameters())
-        eval(transformer.parameters())
-        eval(ds.parameters())
-        eval(quant.parameters())
+        eval(parameters())
         Memory.clearCache()
 
         // Load and sanitize weights
         let allWeights = try MLX.loadArrays(url: weightsURL, stream: .cpu)
         let sanitized = Qwen3TTSAudioEncoder.sanitizeEncoderWeights(allWeights)
-
-        // Load into a container module that holds all submodules
-        self.encoder = enc
-        self.encoderTransformer = transformer
-        self.downsample = ds
-        self.quantizer = quant
 
         let parameters = ModuleParameters.unflattened(sanitized)
         try self.update(parameters: parameters, verify: .noUnusedKeys)
@@ -523,13 +500,6 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        guard let encoder = encoder,
-              let encoderTransformer = encoderTransformer,
-              let downsample = downsample,
-              let quantizer = quantizer else {
-            return x
-        }
-
         // Ensure input is [B, 1, L]
         var h = x
         if h.ndim == 2 {
@@ -588,9 +558,11 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
 
             let workingKey = String(key.dropFirst("encoder.".count))
 
-            // Handle codebook data (cluster_usage + embedding_sum -> embed.weight)
-            if workingKey.contains("_codebook.cluster_usage") || workingKey.contains("_codebook.embedding_sum") {
-                let parts = workingKey.components(separatedBy: "._codebook.")
+            // The Mimi checkpoints persist EMA codebook state rather than a
+            // direct embedding. Reconstruct only the inference weight and do
+            // not leak training-only counters into the module update.
+            if workingKey.contains(".codebook.cluster_usage") || workingKey.contains(".codebook.embed_sum") {
+                let parts = workingKey.components(separatedBy: ".codebook.")
                 if parts.count == 2 {
                     let basePath = parts[0]
                     if codebookData[basePath] == nil {
@@ -599,9 +571,12 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
                     if workingKey.contains("cluster_usage") {
                         codebookData[basePath]?["cluster_usage"] = v
                     } else {
-                        codebookData[basePath]?["embedding_sum"] = v
+                        codebookData[basePath]?["embed_sum"] = v
                     }
                 }
+                continue
+            }
+            if workingKey.hasSuffix(".codebook.initialized") {
                 continue
             }
 
@@ -611,7 +586,15 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
                 if Int(component) != nil { return component }
                 return snakeToCamel(component)
             }
-            let newKey = camelComponents.joined(separator: ".")
+            var newKey = camelComponents.joined(separator: ".")
+            // EncoderDownsample wraps its causal convolution in MimiConv1d,
+            // while the checkpoint flattens that wrapper level.
+            if newKey.hasPrefix("downsample.conv.") {
+                newKey = newKey.replacingOccurrences(
+                    of: "downsample.conv.",
+                    with: "downsample.conv.conv."
+                )
+            }
 
             // Transpose conv weights: safetensors stores [out, in, k], MLX Conv1d wants [out, k, in]
             if workingKey.contains("conv") && workingKey.hasSuffix(".weight") && v.ndim == 3 {
@@ -628,7 +611,7 @@ nonisolated public class Qwen3TTSAudioEncoder: Module {
         let eps: Float = 1e-5
         for (basePath, data) in codebookData {
             if let clusterUsage = data["cluster_usage"],
-               let embeddingSum = data["embedding_sum"] {
+               let embeddingSum = data["embed_sum"] {
                 let usage = clip(clusterUsage, min: eps, max: Float.greatestFiniteMagnitude)
                 let embedding = embeddingSum / usage.expandedDimensions(axis: -1)
 

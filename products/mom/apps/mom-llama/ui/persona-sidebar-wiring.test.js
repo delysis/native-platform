@@ -55,10 +55,10 @@ test("Persona menu actions move focus out of the hidden menu", () => {
     '"persona-menu-start": async () => {',
     '\n    "persona-menu-removal-preview":',
   );
-  assert.ok(actions.includes("await openNewDraft(persona);"));
+  assert.ok(actions.includes("await openPersonaConversation(persona);"));
   const draft = between(client, "const openNewDraft =", "const actionHandlers =");
   assert.ok(draft.indexOf("await refreshConversationProjection();") < draft.indexOf("focusComposer();"));
-  assert.ok(draft.includes("await retainComposerDraft();"));
+  assert.ok(draft.includes("void retainComposerDraft().catch(reportError);"));
   assert.ok(draft.includes('invoke("mom_llama_conversation_draft_open", { persona })'));
   assert.ok(!draft.includes("instantiatePersona"));
   assert.ok(actions.includes('formField(document.getElementById("persona-editor"), "persona_name")?.focus();'));

@@ -24,6 +24,8 @@ tauri-build = { version = "2", features = [] }
 desktop-speech.workspace = true
 operation-lifecycle.workspace = true
 anyhow = "1"
+cpal = "=0.16.0"
+crossbeam-channel.workspace = true
 mom-llama-runtime.workspace = true
 llama-native-types = { workspace = true }
 llama-native-host = { workspace = true }

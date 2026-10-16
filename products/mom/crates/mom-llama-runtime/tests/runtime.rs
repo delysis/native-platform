@@ -16,9 +16,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
     \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
@@ -130,6 +128,7 @@ fn attributed_history_fixture(id: &str) -> Conversation {
         version: 1,
         invocation_id: "shared-invocation".to_string(),
         target_order: order,
+        incomplete: false,
     };
     Conversation {
         id: id.to_string(),
@@ -944,7 +943,13 @@ fn blocked_chat_stream_never_claims_native_engine_invocation() -> Result<()> {
         },
     )?;
     assert_eq!(result.status, "blocked");
-    assert_eq!(result.readiness, "blocked_missing_model");
+    assert!(
+        matches!(
+            result.readiness.as_str(),
+            "blocked_missing_model" | "blocked_native_runtime"
+        ),
+        "the configured host must remain an explicit native blocker"
+    );
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event, "started");
     assert_eq!(events[1].event, "failed");
@@ -2020,12 +2025,23 @@ fn conversations_search_skills_and_settings_survive_restart() -> Result<()> {
         Some("Friendly guide")
     );
     mom_llama_runtime::skill_store::skill_apply(&conversation.id, &skill.id)?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
+    let settings_update = mom_llama_runtime::settings_update(SettingsUpdate {
         temperature: Some(0.25),
         context_tokens: Some(4096),
         max_parallel_sequences: Some(4),
         ..SettingsUpdate::default()
     })?;
+    let effective_settings = settings_update.result.ok_or_else(|| {
+        anyhow!(
+            "voice latency benchmark settings were blocked: {:#?}",
+            settings_update.blocker
+        )
+    })?;
+    anyhow::ensure!(
+        effective_settings.max_parallel_sequences == 4,
+        "voice latency benchmark requested four sequences but resolved {}",
+        effective_settings.max_parallel_sequences
+    );
 
     set_data_dir_override_for_tests(None);
     mom_llama_runtime::unload_resident_model(&scope);
@@ -2785,7 +2801,9 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         max_tokens: Some(1),
         context_tokens: Some(2048),
         batch_tokens: Some(128),
-        max_parallel_sequences: Some(1),
+        // Match the application profile so cancelled turns exercise the
+        // alternate-sequence resident audio checkpoint used for fast resume.
+        max_parallel_sequences: Some(4),
         upstream_settings: Some(BTreeMap::from([(
             "disableReasoningParsing".to_string(),
             json!(true),
@@ -2876,6 +2894,52 @@ fn one_second_tone_wav() -> Vec<u8> {
         wav.extend_from_slice(&value.to_le_bytes());
     }
     wav
+}
+
+fn pcm16_mono_16khz_wav_samples(path: &Path) -> Result<Vec<f32>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read benchmark WAV {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "benchmark audio must be a RIFF/WAVE file"
+    );
+    let mut cursor = 12usize;
+    let mut format = None;
+    let mut data = None;
+    while cursor.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_len = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into()?) as usize;
+        let chunk_start = cursor + 8;
+        let chunk_end = chunk_start
+            .checked_add(chunk_len)
+            .ok_or_else(|| anyhow!("benchmark WAV chunk length overflow"))?;
+        anyhow::ensure!(chunk_end <= bytes.len(), "truncated benchmark WAV chunk");
+        match chunk_id {
+            b"fmt " if chunk_len >= 16 => {
+                format = Some((
+                    u16::from_le_bytes(bytes[chunk_start..chunk_start + 2].try_into()?),
+                    u16::from_le_bytes(bytes[chunk_start + 2..chunk_start + 4].try_into()?),
+                    u32::from_le_bytes(bytes[chunk_start + 4..chunk_start + 8].try_into()?),
+                    u16::from_le_bytes(bytes[chunk_start + 14..chunk_start + 16].try_into()?),
+                ));
+            }
+            b"data" => data = Some(&bytes[chunk_start..chunk_end]),
+            _ => {}
+        }
+        cursor = chunk_end + (chunk_len & 1);
+    }
+    let (encoding, channels, sample_rate, bits) =
+        format.ok_or_else(|| anyhow!("benchmark WAV has no fmt chunk"))?;
+    anyhow::ensure!(
+        (encoding, channels, sample_rate, bits) == (1, 1, 16_000, 16),
+        "benchmark WAV must be PCM16 mono 16 kHz; got encoding={encoding}, channels={channels}, sample_rate={sample_rate}, bits={bits}"
+    );
+    let data = data.ok_or_else(|| anyhow!("benchmark WAV has no data chunk"))?;
+    anyhow::ensure!(data.len() % 2 == 0, "benchmark WAV has a partial sample");
+    Ok(data
+        .chunks_exact(2)
+        .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32_768.0)
+        .collect())
 }
 
 #[cfg(unix)]
@@ -3158,6 +3222,336 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
             .windows(audio_bytes.len())
             .any(|window| window == audio_bytes)
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the real audio model, matching projector, and a PCM16 mono 16 kHz WAV"]
+fn real_incremental_voice_prefill_reports_silence_to_first_token() -> Result<()> {
+    let model_path = std::env::var_os("MOM_LLAMA_MULTIMODAL_MODEL_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MULTIMODAL_MODEL_PATH must point to a real GGUF"))?;
+    let mmproj_path = std::env::var_os("MOM_LLAMA_MM_PROJ_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MM_PROJ_PATH must point to its audio projector"))?;
+    let wav_path = std::env::var_os("MOM_LLAMA_TEST_VOICE_WAV")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_TEST_VOICE_WAV must point to a local WAV"))?;
+    let samples = pcm16_mono_16khz_wav_samples(&wav_path)?;
+    let samples = &samples[..samples.len().min(4 * 16_000)];
+    anyhow::ensure!(
+        samples.len() >= 640,
+        "benchmark WAV must contain at least one 640-sample projector frame"
+    );
+
+    let _session = TestSession::new("real-incremental-voice-latency")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: Some(Some(model_path)),
+        mmproj_path: Some(Some(mmproj_path)),
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        max_tokens: Some(32),
+        batch_tokens: Some(128),
+        // Match the packaged call runtime. The fourth resident lane retains
+        // the token-exact text prefix while the first two lanes ping-pong
+        // incremental audio checkpoints.
+        max_parallel_sequences: Some(4),
+        upstream_settings: Some(BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(true),
+        )])),
+        ..SettingsUpdate::default()
+    })?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let cold_warm = mom_llama_runtime::runtime_warm(&scope)?;
+    anyhow::ensure!(
+        cold_warm
+            .result
+            .as_ref()
+            .is_some_and(|warm| warm.model_loaded && warm.audio_projector_warmed),
+        "cold runtime warm did not load and compile the voice model: result={:#?}, blocker={:#?}",
+        cold_warm.result,
+        cold_warm.blocker,
+    );
+    drop(scope);
+    drop(native_owner);
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let cached_warm = mom_llama_runtime::runtime_warm(&scope)?;
+    let cached_load = cached_warm
+        .result
+        .as_ref()
+        .and_then(|warm| warm.model_load.clone());
+    println!(
+        "VOICE_ARTIFACT_CACHE_BENCHMARK {}",
+        serde_json::to_string(&json!({
+            "model_acquire_us": cached_warm.result.as_ref().map(|warm| warm.model_acquire_us),
+            "audio_projector_warm_us": cached_warm.result.as_ref().map(|warm| warm.audio_projector_warm_us),
+            "audio_projector_warmed": cached_warm.result.as_ref().map(|warm| warm.audio_projector_warmed),
+            "model_load": cached_load,
+        }))?
+    );
+    anyhow::ensure!(
+        cached_warm
+            .result
+            .as_ref()
+            .is_some_and(|warm| warm.model_loaded && warm.audio_projector_warmed),
+        "verified artifact cache did not reload and compile the voice model: result={:#?}, blocker={:#?}",
+        cached_warm.result,
+        cached_warm.blocker,
+    );
+    let conversation = mom_llama_runtime::conversation_new(Some("Voice latency benchmark".into()))?
+        .result
+        .ok_or_else(|| anyhow!("voice latency benchmark conversation missing"))?;
+
+    // Exercise the application lifecycle boundary that live calls use when
+    // resumed speech (or hang-up) abandons a speculative incremental turn.
+    // The next voice note must be admitted against the same resident model
+    // even when cancellation lands after the projector has mutated KV state.
+    let abandoned = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &conversation.id,
+        "[Phone call] Reply briefly and naturally to what you hear.",
+    )?;
+    let abandoned_preparation = abandoned.prepared_turn();
+    abandoned.wait_for_resume()?;
+    for chunk in samples[..16_000].chunks(160) {
+        abandoned.push_pcm(chunk)?;
+    }
+    let abandon_deadline = Instant::now() + Duration::from_secs(5);
+    while abandoned.audio_monitor().stats().projected_blocks == 0 {
+        anyhow::ensure!(
+            Instant::now() < abandon_deadline,
+            "abandoned voice turn never projected its admitted PCM"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let cancellation_started = Instant::now();
+    abandoned.cancel();
+    drop(abandoned);
+    let resumed =
+        mom_llama_runtime::voice_audio_restart_prepared_in_scope(&scope, abandoned_preparation)?;
+    let resume = resumed.wait_for_resume()?;
+    let cancellation_to_resume_us = cancellation_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let model_load = mom_llama_runtime::resident_status(&scope)
+        .and_then(|status| status.descriptor)
+        .map(|descriptor| descriptor.load_metrics);
+    println!(
+        "VOICE_RESUME_BENCHMARK {}",
+        serde_json::to_string(&json!({
+            "reused": resume.reused,
+            "sample_offset": resume.sample_offset,
+            "resident_max_sequences": resume.resident_max_sequences,
+            "checkpoint_supported": resume.checkpoint_supported,
+            "checkpoint_available": resume.checkpoint_available,
+            "resume_key_matched": resume.resume_key_matched,
+            "request_matched": resume.request_matched,
+            "binding_us": resume.binding_us,
+            "restore_us": resume.restore_us,
+            "cancellation_to_resume_us": cancellation_to_resume_us,
+            "model_load": model_load,
+        }))?
+    );
+    anyhow::ensure!(
+        resume.reused
+            && resume.sample_offset > 0
+            && resume.sample_offset <= 16_000
+            && resume.sample_offset % 640 == 0,
+        "cancelled voice checkpoint was not reused exactly: {resume:?}"
+    );
+    for chunk in samples[resume.sample_offset..16_000].chunks(160) {
+        resumed.push_pcm(chunk)?;
+    }
+    resumed.seal_input()?;
+    let resumed_output = mom_llama_runtime::voice_audio_finish_in_scope(
+        resumed,
+        ChatSendOptions {
+            timeout_s: 600.0,
+            fake_fixture: false,
+        },
+        None::<fn(mom_llama_runtime::ChatStreamEvent) -> anyhow::Result<()>>,
+    )?;
+    anyhow::ensure!(
+        resumed_output.result.as_ref().is_some_and(|output| {
+            !output.assistant_text.trim().is_empty()
+                && output.voice_audio_metrics.as_ref().is_some_and(|audio| {
+                    resume.sample_offset
+                        + usize::try_from(audio.projected_samples).unwrap_or(usize::MAX)
+                        == 16_000
+                })
+        }),
+        "resumed voice turn did not replay its exact tail and complete: result={:#?}, blocker={:#?}",
+        resumed_output.result,
+        resumed_output.blocker,
+    );
+
+    // Short acknowledgements are the hardest overlap case: prompt-prefix
+    // evaluation has much less microphone time in which to finish before the
+    // silence edge. Exercise both that case and an ordinary four-second turn.
+    let short_samples = &samples[..samples.len().min(8_000)];
+    for (turn, turn_samples) in [(1, short_samples), (2, samples)] {
+        let begin_wall = Instant::now();
+        // The packaged Tauri command admits every microphone turn on a fresh
+        // supervised blocking worker. Exercise that thread boundary here as
+        // well: a direct test-thread begin would miss thread-local or unwind
+        // failures at the exact boundary that previously failed in product.
+        let begin_scope = scope.clone();
+        let begin_conversation = conversation.id.clone();
+        // The isolated test store override is intentionally thread-local so
+        // parallel tests cannot collide. Product workers all resolve the same
+        // application data directory; explicitly carry this test-only value
+        // across the worker boundary to preserve that product invariant.
+        let begin_data_dir = _session.path().to_path_buf();
+        let voice = std::thread::Builder::new()
+            .name(format!("voice-prefill-benchmark-{turn}"))
+            .spawn(move || {
+                set_data_dir_override_for_tests(Some(begin_data_dir));
+                let result = mom_llama_runtime::voice_audio_begin_in_scope(
+                    &begin_scope,
+                    &begin_conversation,
+                    "[Phone call] Reply briefly and naturally to what you hear.",
+                );
+                set_data_dir_override_for_tests(None);
+                result
+            })
+            .map_err(|error| anyhow!("voice begin worker could not start: {error}"))?
+            .join()
+            .map_err(|_| anyhow!("voice begin worker panicked"))??;
+        let begin_wall_ms = begin_wall.elapsed().as_millis();
+        let begin_metrics = voice.begin_metrics().clone();
+        let monitor = voice.audio_monitor();
+        for chunk in turn_samples.chunks(160) {
+            voice.push_pcm(chunk)?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let silence_wall = Instant::now();
+        voice.seal_input()?;
+        let mut first_delta_wall_ms = None;
+        let finished = mom_llama_runtime::voice_audio_finish_in_scope(
+            voice,
+            ChatSendOptions {
+                timeout_s: 600.0,
+                fake_fixture: false,
+            },
+            Some(|event: mom_llama_runtime::ChatStreamEvent| {
+                if matches!(event.event.as_str(), "delta" | "reasoning_delta")
+                    && let Some(delta) = event.delta.as_deref()
+                    && !delta.is_empty()
+                {
+                    println!(
+                        "VOICE_CONTENT_DELTA_BENCHMARK {}",
+                        serde_json::to_string(&json!({
+                            "turn": turn,
+                            "silence_elapsed_ms": silence_wall.elapsed().as_millis(),
+                            "event": event.event,
+                            "delta": delta,
+                        }))?
+                    );
+                }
+                if first_delta_wall_ms.is_none()
+                    && matches!(event.event.as_str(), "delta" | "reasoning_delta")
+                {
+                    let elapsed_ms = silence_wall.elapsed().as_millis();
+                    first_delta_wall_ms = Some(elapsed_ms);
+                    println!(
+                        "VOICE_FIRST_TOKEN_BENCHMARK {}",
+                        serde_json::to_string(&json!({
+                            "turn": turn,
+                            "silence_to_first_token_ms": elapsed_ms,
+                        }))?
+                    );
+                }
+                Ok(())
+            }),
+        )?;
+        let output = finished.result.ok_or_else(|| {
+            anyhow!(
+                "voice benchmark turn {turn} blocked: {:#?}",
+                finished.blocker
+            )
+        })?;
+        let audio = output
+            .voice_audio_metrics
+            .as_ref()
+            .ok_or_else(|| anyhow!("voice benchmark turn {turn} omitted audio metrics"))?;
+        let live = monitor.stats();
+        let silence_to_first_token_ms = first_delta_wall_ms.or_else(|| {
+            output
+                .first_token_ms
+                .and_then(|first| first.checked_sub(u128::from(audio.finish_ms.unwrap_or(0))))
+        });
+        let prefix_receipt = json!({
+            "start_us": audio.prefix_start_us,
+            "finish_us": audio.prefix_finish_us,
+            "duration_us": audio.prefix_us,
+            "tokens": audio.prefix_tokens,
+            "restored_tokens": audio.restored_prefix_tokens,
+        });
+        println!(
+            "VOICE_LATENCY_BENCHMARK {}",
+            serde_json::to_string(&json!({
+                "turn": turn,
+                "audio_ms": turn_samples.len() as f64 / 16.0,
+                "begin_wall_ms": begin_wall_ms,
+                "resident_context_tokens": begin_metrics.resident_context_tokens,
+                "settings_cache_hit": begin_metrics.settings_cache_hit,
+                "model_resident_hit": begin_metrics.model_resident_hit,
+                "prepared_reuse": begin_metrics.prepared_reuse,
+                "begin_total_us": begin_metrics.total_us,
+                "model_acquire_us": begin_metrics.model_acquire_us,
+                "generation_admission_us": begin_metrics.generation_admission_us,
+                "first_accept_us": audio.first_accept_us,
+                "first_read_us": audio.first_read_us,
+                "first_projector_start_us": audio.first_projector_start_us,
+                "first_projector_finish_us": audio.first_projector_finish_us,
+                "last_projector_finish_us": audio.last_projector_finish_us,
+                "finish_us": audio.finish_us,
+                "decode_start_us": audio.decode_start_us,
+                "prefix": prefix_receipt,
+                "first_token_ms_from_engine_start": output.first_token_ms,
+                "silence_to_first_token_ms": silence_to_first_token_ms,
+                "silence_to_finish_ms": silence_wall.elapsed().as_millis(),
+                "projector_us": audio.projector_us,
+                "projector_max_us": audio.projector_max_us,
+                "projected_blocks": audio.projected_blocks,
+                "projected_samples": audio.projected_samples,
+                "tail_samples": audio.tail_samples,
+                "producer_lock_wait_us": audio.producer_lock_wait_us,
+                "producer_lock_wait_max_us": audio.producer_lock_wait_max_us,
+                "ring_write_us": audio.ring_write_us,
+                "ring_write_max_us": audio.ring_write_max_us,
+                "consumer_lock_wait_us": audio.consumer_lock_wait_us,
+                "consumer_lock_wait_max_us": audio.consumer_lock_wait_max_us,
+                "ring_read_us": audio.ring_read_us,
+                "ring_read_max_us": audio.ring_read_max_us,
+                "reader_notifications": live.reader_notifications,
+                "reader_waits": live.reader_waits,
+                "reader_wakeups": live.reader_wakeups,
+                "completion_tokens": output.completion_tokens,
+                "duration_ms": output.duration_ms,
+                "assistant_text": output.assistant_text,
+            }))?
+        );
+        anyhow::ensure!(
+            audio.projected_blocks > 0,
+            "turn {turn} projected no audio blocks"
+        );
+        anyhow::ensure!(
+            silence_to_first_token_ms.is_some(),
+            "turn {turn} produced no observable first token"
+        );
+        anyhow::ensure!(
+            audio.restored_prefix_tokens > 0,
+            "turn {turn} did not reuse the resident text prefix"
+        );
+    }
     Ok(())
 }
 

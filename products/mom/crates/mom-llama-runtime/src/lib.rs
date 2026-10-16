@@ -28,14 +28,17 @@ pub use attachments::{
     AttachmentPreviewKind, AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
     AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
     AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
-    attachment_import_pasted_text, attachment_library_input, attachment_list, attachment_preview,
-    attachment_preview_content, attachment_preview_media, attachment_transcription_input,
-    prepare_document_chat_in_scope,
+    attachment_import_pasted_text, attachment_import_voice_message, attachment_library_input,
+    attachment_list, attachment_preview, attachment_preview_content, attachment_preview_media,
+    attachment_transcription_input, prepare_document_chat_in_scope,
 };
 pub use chat::{
     ChatCancelOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ChatSkipReasoningOutput,
-    ChatStreamEvent, chat_cancel_in_scope, chat_continue_in_scope, chat_regenerate_in_scope,
-    chat_send_in_scope, chat_send_stream_in_scope, chat_skip_reasoning_in_scope,
+    ChatStreamEvent, VoiceAudioPreparedTurn, VoiceAudioSession, chat_cancel_in_scope,
+    chat_continue_in_scope, chat_regenerate_in_scope, chat_send_in_scope,
+    chat_send_stream_in_scope, chat_skip_reasoning_in_scope, voice_audio_begin_in_scope,
+    voice_audio_finish_in_scope, voice_audio_finish_with_precommit_in_scope,
+    voice_audio_restart_prepared_in_scope,
 };
 pub use composer::{
     ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
@@ -48,19 +51,28 @@ pub use config::{
 };
 pub use conversation_store::{
     ChatTemplatePolicy, Conversation, ConversationBranchSibling, ConversationExecutionProfile,
-    ConversationExportFormat, ConversationKind, ConversationMutation, ConversationSearchHit,
-    DraftMessage, DraftRecipients, Message, MessageAttribution, MessageBranchSet,
-    MessageBranchSibling, MessageCopy, MessageRole, MessageSpeakerKind, TextAttachmentImport,
-    ToolBinding, conversation_delete, conversation_draft_open, conversation_draft_preview,
-    conversation_draft_recipients, conversation_draft_recipients_update, conversation_draft_submit,
-    conversation_export, conversation_fork, conversation_import_file, conversation_import_json,
-    conversation_list, conversation_new, conversation_rename, conversation_search,
-    conversation_select, conversation_siblings, conversation_system_message_update, draft_clear,
-    draft_get, draft_update, message_branch_select, message_branches, message_copy, message_delete,
-    message_edit, text_attachment_import,
+    ConversationExportFormat, ConversationKind, ConversationMutation, ConversationPersonaIdentity,
+    ConversationSearchHit, DraftMessage, DraftRecipients, Message, MessageAttribution,
+    MessageBranchSet, MessageBranchSibling, MessageCopy, MessageRole, MessageSpeakerKind,
+    TextAttachmentImport, ToolBinding, conversation_delete, conversation_draft_call_start,
+    conversation_draft_open, conversation_draft_preview, conversation_draft_recipients,
+    conversation_draft_recipients_update, conversation_draft_submit, conversation_export,
+    conversation_fork, conversation_import_file, conversation_import_json, conversation_list,
+    conversation_new, conversation_persona_identity, conversation_rename,
+    conversation_resume_existing_for_empty_draft, conversation_search, conversation_select,
+    conversation_siblings, conversation_system_message_update, draft_clear, draft_get,
+    draft_update, message_branch_select, message_branches, message_copy, message_delete,
+    message_edit, message_record_call_transcript, text_attachment_import,
 };
-pub use engine::{EngineCheckOptions, engine_check, engine_status};
+pub use engine::{
+    EngineCheckOptions, RuntimeWarmOutput, engine_check, engine_status, runtime_warm,
+    runtime_warm_until_cancelled,
+};
 pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_status};
+pub use llama_native_engine::{
+    GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,
+    RealtimeComputeMetrics, acquire_generation_backpressure, acquire_realtime_compute,
+};
 pub use mcp::{
     McpCallToolOutput, McpGetPromptOutput, McpPrompt, McpPromptArgument, McpReadResourceOutput,
     McpResource, McpResourceContent, McpServerConfig, McpStatus, McpTool, mcp_call_tool_in_scope,

@@ -1,10 +1,18 @@
-use crate::config::{Settings, resolve_settings};
+use crate::config::{
+    Settings, VerifiedArtifactDigest, VerifiedModelArtifacts, persist_verified_model_artifacts,
+    resolve_settings,
+};
 use crate::native_runtime::{resident_model, resident_slots, resident_status};
 use crate::receipts::{Blocker, CommandResult};
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
+use llama_native_types::{
+    ChatMessage, ChatRole, ChatTemplateChoice, GenerationInput, GenerationRequest, MediaKind,
+    NativeModelLoadMetrics, SamplingConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineCheckOptions {
@@ -20,6 +28,206 @@ pub struct EngineCheckOutput {
     pub transport: String,
     pub binding_version: String,
     pub backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWarmOutput {
+    pub model_loaded: bool,
+    pub audio_projector_warmed: bool,
+    pub audio_projector_warm_us: u64,
+    pub persona_prefixes_ready: usize,
+    pub persona_prefixes_reused: usize,
+    pub settings_us: u64,
+    pub model_acquire_us: u64,
+    pub model_load: Option<NativeModelLoadMetrics>,
+}
+
+/// Loads the configured model as soon as the shell exists.
+///
+/// Persona prefixes are built on first use and retained in the resident memory
+/// cache. Walking every Persona here serialized and encrypted hundreds of
+/// megabytes per prefix for long-context hybrid models, turning startup into a
+/// minute-long CPU job and delaying foreground calls behind background work.
+pub fn runtime_warm(scope: &crate::OperationScope) -> Result<CommandResult<RuntimeWarmOutput>> {
+    runtime_warm_until_cancelled(scope, None)
+}
+
+pub fn runtime_warm_until_cancelled(
+    scope: &crate::OperationScope,
+    cancellation: Option<&AtomicBool>,
+) -> Result<CommandResult<RuntimeWarmOutput>> {
+    if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+        return Ok(runtime_warm_result(false, false, 0, 0, 0, 0, 0, None));
+    }
+    let settings_started = std::time::Instant::now();
+    let settings = resolve_settings()?;
+    let settings_us = settings_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let acquire_started = std::time::Instant::now();
+    let handle = match resident_model(scope, &settings) {
+        Ok(handle) => handle,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.runtime_warm",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
+    let model_acquire_us = acquire_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let status = handle.status();
+    let model_load = status
+        .descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.load_metrics.clone());
+    if let (Some(descriptor), Some(fingerprint), Some(model_path)) = (
+        status.descriptor.as_ref(),
+        status.fingerprint.as_ref(),
+        settings.model_path.as_ref(),
+    ) && !descriptor.model_file_identity.is_empty()
+    {
+        let projector = settings
+            .mmproj_path
+            .as_ref()
+            .zip(fingerprint.multimodal_projector_sha256.as_ref())
+            .zip(descriptor.mmproj_file_identity.as_ref())
+            .map(|((path, sha256), file_identity)| VerifiedArtifactDigest {
+                path: path.clone(),
+                sha256: sha256.clone(),
+                file_identity: file_identity.clone(),
+            });
+        persist_verified_model_artifacts(
+            &settings,
+            VerifiedModelArtifacts {
+                model: VerifiedArtifactDigest {
+                    path: model_path.clone(),
+                    sha256: fingerprint.model_sha256.clone(),
+                    file_identity: descriptor.model_file_identity.clone(),
+                },
+                projector,
+            },
+        )?;
+    }
+    let audio_warm_started = std::time::Instant::now();
+    let supports_audio = status.descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor
+            .capabilities
+            .media_kinds
+            .contains(&MediaKind::Audio)
+    });
+    let audio_projector_warmed = if supports_audio {
+        warm_audio_projector(&handle, cancellation)?
+    } else {
+        false
+    };
+    let audio_projector_warm_us = if audio_projector_warmed {
+        audio_warm_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
+    } else {
+        0
+    };
+    drop(handle);
+    Ok(runtime_warm_result(
+        true,
+        audio_projector_warmed,
+        audio_projector_warm_us,
+        0,
+        0,
+        settings_us,
+        model_acquire_us,
+        model_load,
+    ))
+}
+
+fn runtime_warm_result(
+    model_loaded: bool,
+    audio_projector_warmed: bool,
+    audio_projector_warm_us: u64,
+    persona_prefixes_ready: usize,
+    persona_prefixes_reused: usize,
+    settings_us: u64,
+    model_acquire_us: u64,
+    model_load: Option<NativeModelLoadMetrics>,
+) -> CommandResult<RuntimeWarmOutput> {
+    CommandResult::passed(
+        "mom_llama.runtime_warm",
+        "host_integrated",
+        RuntimeWarmOutput {
+            model_loaded,
+            audio_projector_warmed,
+            audio_projector_warm_us,
+            persona_prefixes_ready,
+            persona_prefixes_reused,
+            settings_us,
+            model_acquire_us,
+            model_load,
+        },
+        Vec::new(),
+        Vec::new(),
+        true,
+        false,
+    )
+}
+
+/// Compile the audio projector and its first recurrent-model evaluation before
+/// the application advertises voice readiness. Loading GGUF weights alone does
+/// not compile Metal pipelines; without this probe the caller's first 40 ms
+/// frame can stall for hundreds of milliseconds after they stop speaking.
+fn warm_audio_projector(
+    handle: &llama_native_engine::NativeModelHandle,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool> {
+    let mut sampling = SamplingConfig::default();
+    sampling.max_tokens = 1;
+    sampling.temperature = 0.0;
+    let generation = handle.generate_incremental_audio(GenerationRequest {
+        request_id: format!("runtime-audio-warm-{}", uuid::Uuid::new_v4()),
+        model_id: handle.status().model_id,
+        input: GenerationInput::Chat {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Warm the live audio path.".to_string(),
+            }],
+            template: ChatTemplateChoice::PreferNonThinking,
+        },
+        sampling,
+        media: Vec::new(),
+        cached_prefix: None,
+    })?;
+    generation.wait_for_resume()?;
+    let frame = (0..640)
+        .map(|index| {
+            let phase = index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0;
+            phase.sin() * 0.01
+        })
+        .collect::<Vec<_>>();
+    generation.push_pcm(&frame)?;
+    generation.seal_input()?;
+    let monitor = generation.monitor();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while monitor.stats().projected_blocks == 0 {
+        if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+            generation.cancel();
+            let _ = generation.finish().and_then(|ticket| ticket.wait());
+            return Ok(false);
+        }
+        if std::time::Instant::now() >= deadline {
+            generation.cancel();
+            let _ = generation.finish().and_then(|ticket| ticket.wait());
+            anyhow::bail!("the live audio projector did not warm before its bounded deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    generation.cancel();
+    let _ = generation.finish().and_then(|ticket| ticket.wait());
+    Ok(true)
 }
 
 pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
@@ -217,8 +425,24 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::validate_model_path;
+    use super::{runtime_warm_until_cancelled, validate_model_path};
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn cancelled_background_warm_never_touches_the_model() {
+        let cancellation = AtomicBool::new(true);
+        let output =
+            runtime_warm_until_cancelled(&crate::OperationScope::detached(), Some(&cancellation))
+                .expect("cancelled warm should be a cheap successful no-op")
+                .result
+                .expect("cancelled warm output");
+        assert!(!output.model_loaded);
+        assert!(!output.audio_projector_warmed);
+        assert_eq!(output.audio_projector_warm_us, 0);
+        assert_eq!(output.persona_prefixes_ready, 0);
+        assert_eq!(output.persona_prefixes_reused, 0);
+    }
 
     #[test]
     fn model_path_blockers_are_friendly_and_never_echo_raw_paths() {

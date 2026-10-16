@@ -8,6 +8,16 @@ enum KeyCreation {
     AlreadyExists,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeychainInteraction {
+    /// Startup and background work must never summon SecurityAgent. A caller
+    /// that needs authorization receives a normal startup failure instead.
+    Suppress,
+    /// Granted only by the user's explicit startup Retry action.
+    AllowOnce,
+}
+
 fn decode_key(bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
@@ -20,8 +30,12 @@ fn load_or_create(
     generate: impl FnOnce() -> Result<[u8; 32]>,
     create: impl FnOnce(&[u8; 32]) -> Result<KeyCreation>,
 ) -> Result<[u8; 32]> {
-    if existing_store && let Some(key) = read()? {
-        return decode_key(key);
+    if existing_store {
+        return decode_key(read()?.ok_or_else(|| {
+            anyhow!(
+                "The encrypted local store needs Keychain approval; choose Retry to request it once"
+            )
+        })?);
     }
     // A fresh database needs only create-only insertion. An orphaned existing
     // credential or a concurrent creator is recovered on duplicate, never rotated.
@@ -35,14 +49,17 @@ fn load_or_create(
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> Result<[u8; 32]> {
-    use security_framework::passwords::get_generic_password;
+pub(super) fn load_or_create_macos_key(
+    account: &str,
+    existing_store: bool,
+    interaction: KeychainInteraction,
+) -> Result<[u8; 32]> {
     const ITEM_NOT_FOUND: i32 = -25300;
     load_or_create(
         existing_store,
         || {
             trace_keychain_request("read", account, "begin");
-            let result = get_generic_password(super::KEYCHAIN_SERVICE, account);
+            let result = read_macos_key(account, interaction);
             trace_keychain_request("read", account, "end");
             match result {
                 Ok(key) => Ok(Some(key)),
@@ -58,6 +75,35 @@ pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> R
         },
         |key| create_macos_key(account, key),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_key(
+    account: &str,
+    interaction: KeychainInteraction,
+) -> security_framework::base::Result<Vec<u8>> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    use security_framework::passwords::get_generic_password;
+
+    if interaction == KeychainInteraction::AllowOnce {
+        return get_generic_password(super::KEYCHAIN_SERVICE, account);
+    }
+
+    let mut query = ItemSearchOptions::new();
+    query
+        .class(ItemClass::generic_password())
+        .service(super::KEYCHAIN_SERVICE)
+        .account(account)
+        .load_data(true)
+        // kSecUseAuthenticationUISkip makes an automatic launch incapable of
+        // displaying or queueing a password dialog. An inaccessible matching
+        // item is reported as absent and converted above into a retryable,
+        // fail-closed startup error.
+        .skip_authenticated_items(true);
+    match query.search()?.into_iter().next() {
+        Some(SearchResult::Data(key)) => Ok(key),
+        Some(_) | None => Err(security_framework::base::Error::from_code(-25300)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -94,8 +140,7 @@ fn trace_keychain_request(operation: &str, account: &str, phase: &str) {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::sync::{Mutex, mpsc};
-    use std::time::Duration;
+    use std::sync::{Arc, Barrier, Mutex};
 
     #[test]
     fn fresh_store_creates_without_requesting_a_password_read() -> Result<()> {
@@ -142,47 +187,34 @@ mod tests {
     }
 
     #[test]
-    fn successful_creation_returns_the_published_candidate() -> Result<()> {
+    fn an_existing_store_without_its_key_fails_closed() {
         let calls = Cell::new(0);
-        let key = load_or_create(
+        let error = load_or_create(
             true,
             || Ok(None),
-            || Ok([3; 32]),
-            |candidate| {
+            || panic!("an existing encrypted store must never mint a replacement key"),
+            |_| {
                 calls.set(calls.get() + 1);
-                assert_eq!(candidate, &[3; 32]);
-                Ok(KeyCreation::Created)
+                panic!("an existing encrypted store must never publish a replacement key")
             },
-        )?;
-        assert_eq!(key, [3; 32]);
-        assert_eq!(calls.get(), 1);
-        Ok(())
+        )
+        .expect_err("missing key for an existing encrypted store");
+        assert_eq!(calls.get(), 0);
+        assert!(error.to_string().contains("needs Keychain approval"));
     }
 
     #[test]
     fn concurrent_absence_returns_one_winning_key_to_both_creators() {
         let published = Mutex::new(None::<Vec<u8>>);
-        let (observed, observations) = mpsc::channel();
-        let (release_first, first_ready) = mpsc::channel();
-        let (release_second, second_ready) = mpsc::channel();
+        let creators = Arc::new(Barrier::new(2));
         std::thread::scope(|scope| {
-            let run = |candidate: [u8; 32], ready: mpsc::Receiver<()>| {
-                let mut first_read = true;
+            let run = |candidate: [u8; 32], creators: Arc<Barrier>| {
                 load_or_create(
-                    true,
-                    || {
-                        let value = published.lock().expect("fixture key slot").clone();
-                        if first_read {
-                            first_read = false;
-                            observed.send(()).expect("coordinator is live");
-                            ready
-                                .recv_timeout(Duration::from_secs(5))
-                                .expect("both callers must observe absence before either creates");
-                        }
-                        Ok(value)
-                    },
+                    false,
+                    || Ok(published.lock().expect("fixture key slot").clone()),
                     || Ok(candidate),
                     |key| {
+                        creators.wait();
                         let mut value = published.lock().expect("fixture key slot");
                         if value.is_some() {
                             Ok(KeyCreation::AlreadyExists)
@@ -194,15 +226,10 @@ mod tests {
                 )
                 .expect("creator resolves the winning key")
             };
-            let first = scope.spawn(move || run([1; 32], first_ready));
-            let second = scope.spawn(move || run([2; 32], second_ready));
-            for _ in 0..2 {
-                observations
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("creator reached absent read");
-            }
-            release_first.send(()).expect("first caller is live");
-            release_second.send(()).expect("second caller is live");
+            let first_creators = Arc::clone(&creators);
+            let second_creators = Arc::clone(&creators);
+            let first = scope.spawn(move || run([1; 32], first_creators));
+            let second = scope.spawn(move || run([2; 32], second_creators));
             let first = first.join().expect("first creator joined");
             let second = second.join().expect("second creator joined");
             assert_eq!(first, second, "the losing candidate must never escape");
@@ -217,7 +244,7 @@ mod tests {
     fn duplicate_with_missing_winner_does_not_retry_creation() {
         let calls = Cell::new(0);
         let error = load_or_create(
-            true,
+            false,
             || Ok(None),
             || Ok([3; 32]),
             |_| {
@@ -247,17 +274,17 @@ mod tests {
 
             let mut reads = 0;
             let error = load_or_create(
-                true,
+                false,
                 || {
                     reads += 1;
-                    Ok((reads > 1).then(|| vec![7; length]))
+                    Ok(Some(vec![7; length]))
                 },
                 || Ok([3; 32]),
                 |_| Ok(KeyCreation::AlreadyExists),
             )
             .expect_err("invalid winning key");
             assert_eq!(error.to_string(), "Keychain key is not 32 bytes");
-            assert_eq!(reads, 2);
+            assert_eq!(reads, 1);
         }
     }
 
@@ -272,7 +299,7 @@ mod tests {
         .expect_err("read denial");
         assert_eq!(read.to_string(), "read denied");
         let random = load_or_create(
-            true,
+            false,
             || Ok(None),
             || Err(anyhow!("randomness unavailable")),
             |_| panic!("failed generation must not create"),
@@ -281,7 +308,7 @@ mod tests {
         assert_eq!(random.to_string(), "randomness unavailable");
         let calls = Cell::new(0);
         let create = load_or_create(
-            true,
+            false,
             || {
                 calls.set(calls.get() + 1);
                 Ok(None)
@@ -291,23 +318,19 @@ mod tests {
         )
         .expect_err("create denial");
         assert_eq!(create.to_string(), "create denied");
-        assert_eq!(calls.get(), 1, "only a duplicate permits winner lookup");
+        assert_eq!(calls.get(), 0, "only a duplicate permits winner lookup");
         let mut reads = 0;
         let winner = load_or_create(
-            true,
+            false,
             || {
                 reads += 1;
-                if reads == 1 {
-                    Ok(None)
-                } else {
-                    Err(anyhow!("winner read denied"))
-                }
+                Err(anyhow!("winner read denied"))
             },
             || Ok([3; 32]),
             |_| Ok(KeyCreation::AlreadyExists),
         )
         .expect_err("winner read denial");
         assert_eq!(winner.to_string(), "winner read denied");
-        assert_eq!(reads, 2);
+        assert_eq!(reads, 1);
     }
 }

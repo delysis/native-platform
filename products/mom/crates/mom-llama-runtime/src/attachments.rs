@@ -364,6 +364,38 @@ pub fn attachment_import(
     attachment_import_with_identity(scope, conversation_id, path, None)
 }
 
+pub fn attachment_import_voice_message(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    bytes: Vec<u8>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let host = attachment_host()?;
+    let provided = match ProvidedAttachment::read_bounded(
+        format!("voice-message-{}.wav", uuid::Uuid::new_v4().simple()),
+        Some("audio/wav".to_string()),
+        std::io::Cursor::new(bytes),
+        host_config().inspection.limits.max_root_bytes,
+    ) {
+        Ok(provided) => provided,
+        Err(error) => {
+            return Ok(attachment_error_result(
+                "mom_llama.voice_message_import",
+                error,
+            ));
+        }
+    };
+    canonicalize_and_stage(
+        scope,
+        conversation_id,
+        "microphone://voice-message".to_string(),
+        provided,
+        "mom_llama.voice_message_import",
+        &host,
+        None,
+        Some("[Voice note]"),
+    )
+}
+
 fn attachment_import_with_identity(
     scope: &crate::OperationScope,
     conversation_id: &str,
@@ -430,6 +462,7 @@ fn attachment_import_with_identity(
         "mom_llama.attachment_import",
         &host,
         attachment_id,
+        None,
     )
 }
 
@@ -477,6 +510,7 @@ pub fn attachment_import_pasted_text(
         provided,
         "mom_llama.attachment_import_paste",
         &host,
+        None,
         None,
     )
 }
@@ -563,6 +597,7 @@ fn canonicalize_and_stage(
     command: &str,
     host: &AttachmentHost,
     attachment_id: Option<&str>,
+    internal_draft_marker: Option<&str>,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
     let file_name = provided.display_name.clone();
     let canonicalized = match host.inspect_and_canonicalize(provided) {
@@ -589,6 +624,21 @@ fn canonicalize_and_stage(
     attachment_db.attachments.insert(0, record.clone());
     let mut draft_db = load_drafts()?;
     stage_in_draft(&mut draft_db, conversation_id, &id);
+    if let Some(marker) = internal_draft_marker {
+        if let Some(draft) = draft_db
+            .drafts
+            .iter_mut()
+            .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
+        {
+            // Persist transport ownership in the same atomic document write as
+            // the captured attachment. A crash can therefore restore either
+            // the user's prior draft or a hidden voice transport draft, never
+            // a microphone file masquerading as a user-staged attachment.
+            if draft.message.trim().is_empty() {
+                draft.message = marker.to_string();
+            }
+        }
+    }
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     let mut documents = vec![
@@ -914,10 +964,8 @@ pub fn attachment_transcription_input(
             "Initial local transcription accepts only a canonical WAV audio artifact.".to_string(),
         )));
     }
-    // Generic attachment inspection may completely decode WAV samples, but
-    // Mom's product policy remains transcription-first. The validation grade
-    // proves the retained source bytes; it does not grant direct-model audio
-    // authority here.
+    // Explicit transcription remains available even though validated audio can
+    // also be sent directly to an audio-capable selected model.
     if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
         return Ok(Err(preview_blocker(&problem.code, problem.message)));
     }
@@ -3166,6 +3214,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 0,
+            incomplete: false,
         });
         current.messages.push(source);
         current.selected_model_path = Some(PathBuf::from("   "));
@@ -4326,6 +4375,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 0,
+            incomplete: false,
         });
         let mut second = first.clone();
         second.id = "mention-second".to_string();
@@ -4338,6 +4388,7 @@ mod tests {
             version: 1,
             invocation_id: "invocation".to_string(),
             target_order: 1,
+            incomplete: false,
         });
         generated.messages = vec![user.clone(), first, second.clone()];
         generated.active_leaf_message_id = Some(second.id.clone());
@@ -4796,7 +4847,7 @@ mod tests {
     }
 
     #[test]
-    fn structurally_valid_audio_requires_transcription_before_native_input() {
+    fn structurally_valid_audio_enters_native_model_input() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("structure-only-audio");
         let audio_path = resolve_settings()
@@ -4812,13 +4863,12 @@ mod tests {
         assert!(!imported.multimodal_ready);
         assert!(imported.multimodal_blocker.is_none());
 
-        let blocked = prepare_chat_attachments("chat", &[], None)
+        let prepared = prepare_chat_attachments("chat", &[], None)
             .expect("preparation must return a typed result")
-            .expect_err("structure-only audio must require transcription");
-        assert_eq!(
-            blocked.blocker.code,
-            "attachment_audio_transcription_required"
-        );
+            .expect("validated audio must enter native model input");
+        assert_eq!(prepared.media.len(), 1);
+        assert_eq!(prepared.media[0].kind, MediaKind::Audio);
+        assert_eq!(prepared.media[0].mime, "audio/wav");
     }
 
     #[test]

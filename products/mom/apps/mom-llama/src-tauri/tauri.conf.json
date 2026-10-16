@@ -1,9 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Mom Llama",
+  "productName": "Blessenger",
   "version": "0.1.0",
   "identifier": "com.delysis.llama-native-kit.mom-llama",
   "build": {
+    "beforeBuildCommand": "pnpm run build:qwen-helper",
     "frontendDist": "../ui"
   },
   "app": {
@@ -11,7 +12,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mom Llama",
+        "title": "Blessenger",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "decorations": true,
@@ -19,7 +20,8 @@
         "height": 860,
         "minWidth": 640,
         "minHeight": 480,
-        "resizable": true
+        "resizable": true,
+        "useHttpsScheme": true
       }
     ],
     "security": {
@@ -32,7 +34,9 @@
     "externalBin": ["binaries/qwen3-tts-helper", "binaries/mlx.metallib"],
     "icon": ["icons/icon.png"],
     "macOS": {
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "entitlements": "MomLlama.entitlements",
+      "infoPlist": "Info.plist"
     }
   }
 }
