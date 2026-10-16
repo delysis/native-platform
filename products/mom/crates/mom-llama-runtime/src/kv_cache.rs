@@ -501,7 +501,13 @@ fn compatible_cached_prefix_for_owner(
     owner_id: Option<&str>,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
     let settings = resolve_settings()?;
-    compatible_cached_prefix_for_owner_with_settings(handle, messages, owner_id, &settings)
+    compatible_cached_prefix_for_owner_with_settings(
+        handle,
+        messages,
+        owner_id,
+        &settings,
+        ChatTemplateChoice::ModelDefault,
+    )
 }
 
 pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
@@ -509,6 +515,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     messages: &[ChatMessage],
     owner_id: Option<&str>,
     settings: &Settings,
+    template: ChatTemplateChoice,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
     if messages.is_empty() {
         return Ok(None);
@@ -518,7 +525,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     }
     let fingerprint = cache_fingerprint(handle)?;
     let tokenized = handle
-        .tokenize_messages(messages.to_vec())
+        .tokenize_messages_with_template(messages.to_vec(), template.clone())
         .map_err(|error| anyhow!(error))?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     let Some(lease) = MomCachePromotionLease::acquire(&store, owner_id)? else {

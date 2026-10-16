@@ -2198,6 +2198,7 @@
         prompt_tokens: output?.prompt_tokens,
         completion_tokens: output?.completion_tokens,
         cache_reused: output?.cache_reused === true,
+        cache_metrics: output?.cache_metrics || null,
       });
       // Stream events are the low-latency authority. Some successful native
       // turns deliberately omit the duplicated final assistant_text envelope;
@@ -3939,6 +3940,15 @@
         ? Number(generation.completion_tokens) : null,
       generation_cache_reused: typeof generation?.cache_reused === "boolean"
         ? generation.cache_reused : null,
+      generation_cache_resident_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.resident_prefix_tokens))
+          ? Number(generation.cache_metrics.resident_prefix_tokens) : null,
+      generation_cache_restored_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.restored_prefix_tokens))
+          ? Number(generation.cache_metrics.restored_prefix_tokens) : null,
+      generation_cache_replayed_prefix_tokens:
+        Number.isFinite(Number(generation?.cache_metrics?.replayed_prefix_tokens))
+          ? Number(generation.cache_metrics.replayed_prefix_tokens) : null,
       call_request_to_playback_ms: delta(
         "call_requested",
         playbackRendered ? "playback_render_started" : "playback_started",
@@ -6604,6 +6614,7 @@
         speculation: speculation.id,
         native_duration_ms: response.result.duration_ms,
         first_token_ms: response.result.first_token_ms,
+        cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
       indexVoiceTurn(live.conversation, response.result);
@@ -8499,6 +8510,7 @@
               markVoiceLatency("generation_finished", {
                 native_duration_ms: output?.duration_ms,
                 first_token_ms: output?.first_token_ms,
+                cache_metrics: output?.cache_metrics || null,
                 voice_audio: output?.voice_audio_metrics,
               });
             }

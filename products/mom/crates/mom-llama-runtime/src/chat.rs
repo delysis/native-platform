@@ -21,9 +21,9 @@ use llama_native_engine::{
     IncrementalAudioMonitor, IncrementalAudioResume, NativeModelHandle,
 };
 use llama_native_types::{
-    ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
-    GenerationOutput, GenerationRequest, GenerationState, NativeError, NativeErrorCode,
-    SequenceStateBlob,
+    ChatMessage, ChatRole, ChatTemplateChoice, GenerationCacheMetrics, GenerationEventKind,
+    GenerationInput, GenerationOutput, GenerationRequest, GenerationState, NativeError,
+    NativeErrorCode, SequenceStateBlob,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -299,6 +299,8 @@ pub struct ChatSendOutput {
     pub completion_tokens: usize,
     pub cache_id: Option<String>,
     pub cache_reused: bool,
+    #[serde(default)]
+    pub cache_metrics: GenerationCacheMetrics,
     /// Present only for an audio-native turn whose microphone attachment was
     /// persisted concurrently with generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -744,7 +746,14 @@ pub fn voice_audio_begin_in_scope(
             skill_prompt.cache_owner_id.is_some(),
             skill_prompt.cache_owner_id.as_deref(),
         );
-        longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, true)?
+        longest_cached_prefix_for_owners(
+            &handle,
+            &messages,
+            &owner_ids,
+            &settings,
+            true,
+            ChatTemplateChoice::PreferNonThinking,
+        )?
     } else {
         None
     };
@@ -1041,6 +1050,7 @@ where
         completion_tokens: output.metrics.completion_tokens,
         cache_id: prepared.cache_id.clone().filter(|_| cache_reused),
         cache_reused,
+        cache_metrics: output.metrics.cache.clone(),
         voice_attachment_id,
         voice_audio_metrics: Some(VoiceAudioMetrics {
             begin: session.begin_metrics,
@@ -1386,6 +1396,7 @@ where
         first_token_ms,
         cache_id,
         cache_reused,
+        cache_metrics,
     ) = if options.fake_fixture {
         (
             "Fixture assistant response.".to_string(),
@@ -1397,6 +1408,7 @@ where
             None,
             None,
             false,
+            GenerationCacheMetrics::default(),
         )
     } else {
         if stream.cancellation_requested() {
@@ -1425,6 +1437,16 @@ where
         if stream.cancellation_requested() {
             return stream.finish_cancelled();
         }
+        let request_template = if phone_call || voice_note {
+            ChatTemplateChoice::PreferNonThinking
+        } else {
+            match &conversation.execution_profile.chat_template {
+                ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
+                ChatTemplatePolicy::FrozenSource(template) => {
+                    ChatTemplateChoice::Override(template.clone())
+                }
+            }
+        };
         let cached_prefix = if media.is_empty() && default_template {
             let owner_ids = reusable_prefix_owner_ids(
                 &conversation.id,
@@ -1433,7 +1455,14 @@ where
                 skill_prompt.cache_owner_id.is_some(),
                 skill_prompt.cache_owner_id.as_deref(),
             );
-            longest_cached_prefix_for_owners(&handle, &messages, &owner_ids, &settings, false)?
+            longest_cached_prefix_for_owners(
+                &handle,
+                &messages,
+                &owner_ids,
+                &settings,
+                false,
+                request_template.clone(),
+            )?
         } else {
             None
         };
@@ -1447,16 +1476,7 @@ where
             model_id: status.model_id.clone(),
             input: GenerationInput::Chat {
                 messages: messages.clone(),
-                template: if phone_call || voice_note {
-                    ChatTemplateChoice::PreferNonThinking
-                } else {
-                    match &conversation.execution_profile.chat_template {
-                        ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
-                        ChatTemplatePolicy::FrozenSource(template) => {
-                            ChatTemplateChoice::Override(template.clone())
-                        }
-                    }
-                },
+                template: request_template.clone(),
             },
             sampling: sampling.clone(),
             media: media.clone(),
@@ -1545,6 +1565,7 @@ where
             output.metrics.first_token_ms,
             attempted_cache_id.filter(|_| cache_reused),
             cache_reused,
+            output.metrics.cache.clone(),
         )
     };
     if stream.arbitrate_terminal() {
@@ -1655,6 +1676,7 @@ where
         completion_tokens,
         cache_id,
         cache_reused,
+        cache_metrics,
         voice_attachment_id: None,
         voice_audio_metrics: None,
     };
@@ -2132,6 +2154,7 @@ fn longest_cached_prefix_for_owners(
     owner_ids: &[&str],
     settings: &crate::config::Settings,
     require_live_receipt: bool,
+    template: ChatTemplateChoice,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
     let mut longest: Option<(String, SequenceStateBlob)> = None;
     for owner_id in owner_ids {
@@ -2140,6 +2163,7 @@ fn longest_cached_prefix_for_owners(
             messages,
             Some(owner_id),
             settings,
+            template.clone(),
         )?;
         if let Some(candidate) = candidate.filter(|(_, sequence)| {
             !require_live_receipt || handle.has_live_sequence_receipt(&sequence.export_receipt())
