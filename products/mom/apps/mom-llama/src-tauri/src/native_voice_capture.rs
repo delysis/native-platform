@@ -256,6 +256,8 @@ pub(crate) enum NativeVoiceCaptureError {
     Stream(String),
     #[error("audio arrived faster than the bounded native capture could consume it")]
     QueueOverflow,
+    #[error("the recorded voice exceeded the supported two-hour duration")]
+    TooLong,
     #[error("the native voice capture controller is unavailable: {0}")]
     ControllerUnavailable(String),
     #[error("the native voice capture owner stopped unexpectedly")]
@@ -442,6 +444,7 @@ struct Active {
     pre_roll: VecDeque<f32>,
     settle_samples_remaining: usize,
     samples: Vec<f32>,
+    capture_too_long: bool,
     // First retained sample not yet published to the current model ring.
     // Keeping a cursor into `samples` avoids a second staging copy for every
     // microphone sample while preserving bounded 10 ms publications.
@@ -970,6 +973,10 @@ impl Active {
             .pre_roll
             .len()
             .min(MAX_SAMPLES.saturating_sub(self.samples.len()));
+        if count < self.pre_roll.len() {
+            self.mark_capture_too_long();
+            return;
+        }
         let start = self.samples.len();
         let copy_started = Instant::now();
         self.samples.extend(self.pre_roll.drain(..count));
@@ -985,6 +992,9 @@ impl Active {
     }
 
     fn append_content(&mut self, samples: &[f32], prefill: bool) {
+        if self.capture_too_long {
+            return;
+        }
         if !prefill && self.target.is_some() && self.terminal_error.is_none() {
             // Publish everything through the content boundary *before* adding
             // this retention-only tail. The old order appended a 1 ms silence
@@ -996,23 +1006,19 @@ impl Active {
             let _ = self.flush_prefill();
         }
         let available = MAX_SAMPLES.saturating_sub(self.samples.len());
-        if samples.len() > available
-            && let Some(source) = &mut self.transcription
-        {
-            // The existing recording cap remains unchanged, but a transcript
-            // must not silently certify a source whose physical tail was lost.
-            source.reject(IngressFailure::TooLong);
+        if samples.len() > available {
+            self.mark_capture_too_long();
+            return;
         }
-        let kept = &samples[..samples.len().min(available)];
         let copy_started = Instant::now();
-        self.samples.extend_from_slice(kept);
+        self.samples.extend_from_slice(samples);
         self.publish_transcription();
         self.record_retained_copy(copy_started);
         if !prefill {
             self.metrics.retained_only_samples = self
                 .metrics
                 .retained_only_samples
-                .saturating_add(kept.len() as u64);
+                .saturating_add(samples.len() as u64);
         }
         if prefill && self.target.is_some() && self.terminal_error.is_none() {
             if self.samples.len().saturating_sub(self.prefill_cursor) >= PREFILL_BATCH_SAMPLES {
@@ -1024,6 +1030,21 @@ impl Active {
             // `samples` if speech resumes.
             self.prefill_cursor = self.samples.len();
         }
+    }
+
+    fn mark_capture_too_long(&mut self) {
+        if self.capture_too_long {
+            return;
+        }
+        self.capture_too_long = true;
+        if let Some(source) = &mut self.transcription {
+            source.reject(IngressFailure::TooLong);
+        }
+        self.emit(
+            CaptureEventKind::Failed,
+            0.0,
+            Some(NativeVoiceCaptureError::TooLong.to_string()),
+        );
     }
 
     fn publish_transcription(&mut self) {
@@ -1383,6 +1404,7 @@ fn begin(
         pre_roll: VecDeque::with_capacity(PRE_ROLL_SAMPLES),
         settle_samples_remaining: CAPTURE_SETTLE_SAMPLES,
         samples: Vec::with_capacity(INITIAL_CAPTURE_CAPACITY_SAMPLES),
+        capture_too_long: false,
         prefill_cursor: 0,
         silence_gate: None,
         speculation_released: false,
@@ -1523,6 +1545,9 @@ fn finish(mut active: Active) -> Result<CaptureOutput, NativeVoiceCaptureError> 
     let drain_started = Instant::now();
     while let Ok(chunk) = active.audio_rx.try_recv() {
         active.push(chunk);
+    }
+    if active.capture_too_long {
+        return Err(NativeVoiceCaptureError::TooLong);
     }
     active.metrics.finish_drain_us = drain_started
         .elapsed()
