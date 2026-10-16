@@ -32,6 +32,8 @@ pub const QWEN_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-voice-design-4bit";
 pub const QWEN_MODEL_REVISION: &str = "5c390979e4b93af5f2932f90742ca99c7dd04687";
 pub const QWEN_ICL_MODEL_ID: &str = "qwen3-tts-1.7b-base-icl-mlx-audio";
 pub const QWEN_ICL_MODEL_DIRECTORY: &str = "qwen3-tts-1.7b-base-bf16";
+pub const QWEN_ICL_MODEL_REPOSITORY: &str = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16";
+pub const QWEN_ICL_MODEL_REVISION: &str = "a6eb4f68e4b056f1215157bb696209bc82a6db48";
 const ICL_VOICE_PREFIX: &str = "mom.qwen.icl.";
 const ICL_HELPER_PROTOCOL: &str = "mom-qwen3-tts-resident-v2";
 const ICL_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -461,6 +463,7 @@ fn model_admitted(model_dir: &Path) -> bool {
         "generation_config.json",
         "model.safetensors",
         "model.safetensors.index.json",
+        "preprocessor_config.json",
         "tokenizer_config.json",
         "vocab.json",
         "merges.txt",
@@ -487,12 +490,24 @@ fn discover_icl_config(
     helper: &Path,
 ) -> Option<QwenIclConfig> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let default_model = home
+    let cached_model = desktop_model_defaults::hugging_face_hub_cache_dir()
+        .map(|cache| {
+            cache
+                .join(format!(
+                    "models--{}",
+                    QWEN_ICL_MODEL_REPOSITORY.replace('/', "--")
+                ))
+                .join("snapshots")
+                .join(QWEN_ICL_MODEL_REVISION)
+        })
+        .filter(|path| base_model_admitted(path));
+    let legacy_model = home
         .join("Library/Caches/delysis/voice-ab/models")
         .join(QWEN_ICL_MODEL_DIRECTORY);
     let model_dir = std::env::var_os("MOM_QWEN3_TTS_BASE_MODEL")
         .map(PathBuf::from)
-        .unwrap_or(default_model);
+        .or(cached_model)
+        .unwrap_or(legacy_model);
     let colocated_reference_root = managed_model_root
         .and_then(Path::parent)
         .map(|data_dir| data_dir.join("speech-voices/qwen-icl"))
@@ -608,14 +623,27 @@ fn helper_supports_icl_protocol(helper: &Path) -> bool {
 }
 
 fn base_model_admitted(model_dir: &Path) -> bool {
-    ["config.json", "model.safetensors", "tokenizer_config.json"]
-        .into_iter()
-        .all(|relative| {
-            model_dir
-                .join(relative)
-                .metadata()
-                .is_ok_and(|metadata| metadata.len() > 0)
-        })
+    [
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "preprocessor_config.json",
+        "speech_tokenizer/config.json",
+        "speech_tokenizer/configuration.json",
+        "speech_tokenizer/model.safetensors",
+        "speech_tokenizer/preprocessor_config.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    ]
+    .into_iter()
+    .all(|relative| {
+        model_dir
+            .join(relative)
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > 0)
+    })
 }
 
 fn icl_voice_id(persona_id: &str) -> String {

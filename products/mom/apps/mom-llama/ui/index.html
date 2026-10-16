@@ -14,12 +14,17 @@
 <body>
   <main id="app" data-runtime="tauri-maud-htmx" data-native-core-only="true">
     <section class="boot">
+      <div id="startup-card" class="startup-card">
+      <h1 id="startup-greeting" hidden>Hi Jan — I’m getting Blessenger ready.</h1>
       <p id="startup-status" role="status">Opening</p>
+      <progress id="startup-progress" max="100" value="0" hidden></progress>
+      <p id="startup-persona" hidden></p>
       <button id="startup-retry" class="primary-button" type="button" hidden>Retry</button>
       <details id="startup-details" hidden>
         <summary>Details</summary>
         <pre id="startup-error"></pre>
       </details>
+      </div>
     </section>
   </main>
 </body>

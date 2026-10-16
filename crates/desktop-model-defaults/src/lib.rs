@@ -14,6 +14,13 @@ pub const GEMMA_PROJECTOR_DOWNLOAD_URL: &str = "https://huggingface.co/google/ge
 pub const GEMMA_PROJECTOR_SHA256: &str =
     "cb018338a7538a9814d994bfe54644c71eb7ed54e31eae2f721e45fd3c260da7";
 pub const GEMMA_PROJECTOR_BYTES: u64 = 175_115_616;
+pub const GEMMA_MTP_REPOSITORY: &str = "unsloth/gemma-4-12B-it-qat-GGUF";
+pub const GEMMA_MTP_REVISION: &str = "980b060c40a8539ac159e0501a3e0f66a6365af3";
+pub const GEMMA_MTP_ARTIFACT_NAME: &str = "mtp-gemma-4-12B-it.gguf";
+pub const GEMMA_MTP_DOWNLOAD_URL: &str = "https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF/resolve/980b060c40a8539ac159e0501a3e0f66a6365af3/mtp-gemma-4-12B-it.gguf?download=true";
+pub const GEMMA_MTP_SHA256: &str =
+    "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6";
+pub const GEMMA_MTP_BYTES: u64 = 253_708_800;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedDefaultModel {
@@ -21,6 +28,9 @@ pub struct CachedDefaultModel {
     /// cache's content-addressed blob symlink.
     pub model: PathBuf,
     pub projector: Option<PathBuf>,
+    /// Exact Gemma 4 assistant used by the qualified MTP route. It lives in a
+    /// separately pinned Hub repository and is never inferred from siblings.
+    pub mtp_assistant: Option<PathBuf>,
 }
 
 #[must_use]
@@ -59,9 +69,18 @@ pub fn cached_default_model(cache: &Path) -> Option<CachedDefaultModel> {
         return None;
     }
     let projector = snapshot.join(GEMMA_PROJECTOR_NAME);
+    let mtp_assistant = cache
+        .join(format!(
+            "models--{}",
+            GEMMA_MTP_REPOSITORY.replace('/', "--")
+        ))
+        .join("snapshots")
+        .join(GEMMA_MTP_REVISION)
+        .join(GEMMA_MTP_ARTIFACT_NAME);
     Some(CachedDefaultModel {
         model,
         projector: projector.is_file().then_some(projector),
+        mtp_assistant: mtp_assistant.is_file().then_some(mtp_assistant),
     })
 }
 
@@ -119,7 +138,8 @@ mod tests {
             cached_default_model(&temporary),
             Some(CachedDefaultModel {
                 model: model.clone(),
-                projector: None
+                projector: None,
+                mtp_assistant: None,
             })
         );
         let projector = snapshot.join(GEMMA_PROJECTOR_NAME);
@@ -128,7 +148,8 @@ mod tests {
             cached_default_model(&temporary),
             Some(CachedDefaultModel {
                 model,
-                projector: Some(projector)
+                projector: Some(projector),
+                mtp_assistant: None,
             })
         );
         std::fs::remove_file(blob).expect("remove blob");

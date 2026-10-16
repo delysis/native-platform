@@ -59,9 +59,12 @@ products/mom/scripts/check-persona-product-ux.sh
 
 ## Run the app
 
-Fresh setup selects Google's Gemma 4 12B instruction model, first-party QAT
-Q4_0, when its pinned artifact is already in the Hugging Face cache. The matching
-cached projector is paired automatically. Nothing is downloaded on startup.
+Fresh setup acquires and verifies the pinned Gemma 4 12B QAT Q4_0 model, its
+matching audio projector and MTP assistant, plus the complete pinned Qwen3-TTS
+Base stack. Downloads resume after interruption and are published through the
+standard Hugging Face cache only after size and SHA-256 verification. The app
+also verifies every packaged persona voice before it becomes ready. Existing
+explicit GGUF settings remain authoritative.
 Choose another GGUF from the composer dropdown (or **Choose GGUF file…**) at any
 time. Run:
 
