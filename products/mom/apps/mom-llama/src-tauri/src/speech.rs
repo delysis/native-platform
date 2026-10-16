@@ -796,6 +796,51 @@ impl MomSpeech {
         .await
         .map_err(|error| format!("Local speech registration failed: {error}"))?;
 
+        // Discovery verifies only the on-disk shape. The first transcription
+        // otherwise pays several seconds to load the CPU model while the
+        // microphone is already filling a bounded live ingress queue. Start
+        // one stream during app setup so the same host owns a resident model
+        // before a call can begin. Missing optional speech assets do not make
+        // text chat unavailable; live capture reports that route separately.
+        if select_parakeet(&host.descriptors().map_err(|error| error.to_string())?).is_ok() {
+            let warm_started = Instant::now();
+            let request = TranscriptionRequest {
+                context: request_context(
+                    SpeechRequestId("mom-startup-parakeet-warm".to_string()),
+                    SpeechRouteSelector::ExactBackend {
+                        backend_id: PARAKEET_BACKEND_ID.to_string(),
+                        model_id: Some(PARAKEET_MODEL_ID.to_string()),
+                        voice_id: None,
+                    },
+                    90_000,
+                ),
+                input: TranscriptionInput::Stream {
+                    stream_id: "mom-startup-parakeet-warm".to_string(),
+                    format: live_pcm_format(),
+                },
+                language: Some("en".to_string()),
+                task: TranscriptionTask::Transcribe,
+                timestamps: TimestampGranularity::None,
+                diarization: DiarizationPolicy::Disabled,
+                partial_results: false,
+                punctuation: true,
+                hotwords: Vec::new(),
+            };
+            match host.transcribe(request).await {
+                Ok(ticket) => {
+                    // Admission completes after the deferred backend load.
+                    // Dropping this empty probe cancels only its request; the
+                    // verified model remains in this host for live turns.
+                    drop(ticket);
+                    eprintln!(
+                        "mom-llama parakeet resident warm: {} ms",
+                        warm_started.elapsed().as_millis()
+                    );
+                }
+                Err(error) => eprintln!("mom-llama parakeet resident warm failed: {error}"),
+            }
+        }
+
         let executor = HostSpeechExecutor::new(host)
             .map_err(|error| format!("Local speech inventory failed: {error}"))?;
         Ok(Arc::new(Self {
