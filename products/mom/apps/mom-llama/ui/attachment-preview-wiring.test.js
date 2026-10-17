@@ -419,7 +419,7 @@ const speechDeferred = () => {
   const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 };
-const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null, playbackResumeGate = null } = {}) => {
+const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null, playbackResumeGate = null, suspendGate = null } = {}) => {
   const pending = [];
   const calls = [];
   const hashes = [];
@@ -435,6 +435,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   let mediaReadyState = 3;
   let playbackResumeError = null;
   let playbackResumePending = false;
+  let suspendGateEnabled = false;
   const element = () => ({
     dataset: {}, children: [], attributes: new Map(), isConnected: true, style: {}, clientWidth: 0,
     append(...children) { this.children.push(...children); },
@@ -529,7 +530,11 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
       if (playbackResumeGate) await playbackResumeGate.promise;
       this.state = "running";
     }
-    async suspend() { this.state = "suspended"; }
+    async suspend() {
+      this.suspendCalled = true;
+      if (suspendGate && suspendGateEnabled) await suspendGate.promise;
+      this.state = "suspended";
+    }
     async close() { this.closed = true; this.state = "closed"; }
     createAnalyser() {
       return { fftSize: 0, connect() {}, getFloatTimeDomainData(samples) { samples.fill(0); } };
@@ -622,17 +627,18 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     for (const reply of hashes) reply.resolve("fixture-wav");
   };
   const settle = () => { void context.api.stopSpeechPlayback({ notifyNative: false }); for (const reply of pending) reply.resolve({ status: "passed" }); for (const reply of hashes) reply.resolve("fixture-wav"); };
-  const pcmFrame = (payload = new Uint8Array([0, 0]), sequence = 0, end = true) => {
+  const pcmFrame = (payload = new Uint8Array([0, 0]), sequence = 0, end = true, sampleOffset = 0) => {
     const samples = payload.byteLength % 2 === 0 ? payload : new Uint8Array([0, 0]);
     const frame = new Uint8Array(32 + samples.byteLength); const view = new DataView(frame.buffer);
     frame.set([0x4d, 0x50, 0x43, 0x4d, 1, end ? 3 : 2, 1, 1]);
     view.setUint32(8, 24000, true); view.setBigUint64(12, BigInt(sequence), true);
-    view.setBigUint64(20, 0n, true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
+    view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
   return { ...context.api, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
+    holdSuspend() { suspendGateEnabled = true; },
     hangPlaybackResume() { playbackResumePending = true; },
     navigate() { selected = "fixture-other-conversation"; } };
 };
@@ -1249,4 +1255,49 @@ test("Stop transport errors remain observable without clearing newer ownership",
     stop.reply.reject(new Error("fixture-stop-refused")); await failure;
     assert.equal(h.button.dataset.operation, "fixture-new-operation");
   } finally { h.settle(); }
+});
+
+test("late worklet callbacks after stop neither schedule stale PCM nor update owner feedback", async () => {
+  const suspendGate = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, suspendGate });
+  const lateUnderruns = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onUnderrun: (gapMs) => lateUnderruns.push(gapMs),
+  });
+  const oneSecond = new Uint8Array(24_000 * 2);
+  for (let packet = 0; packet < 8; packet += 1) {
+    controller.push(h.pcmFrame(oneSecond, packet, false, packet * 24_000));
+  }
+
+  const playing = controller.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await playing, true);
+  const node = h.workletNodes[0];
+  assert.equal(node.port.messages.filter((message) => message.type === "pcm").length, 8);
+
+  // Fill the 8-second ring and leave one packet queued in the main-thread
+  // buffer. A consumed callback arriving after stop must not schedule it.
+  controller.push(h.pcmFrame(oneSecond, 8, false, 8 * 24_000));
+  assert.equal(h.audioContexts[0].sources.length, 0);
+  h.holdSuspend();
+  let stopped = false;
+  const stopping = controller.stop().then(() => { stopped = true; });
+  for (let attempt = 0; attempt < 100 && !h.audioContexts[0].suspendCalled; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(h.audioContexts[0].suspendCalled, true);
+  assert.equal(stopped, false, "the simulated context suspension is still pending");
+
+  node.port.onmessage({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
+  node.port.onmessage({ data: { type: "underrun", missingFrames: 240 } });
+  const observed = {
+    staleBufferSources: h.audioContexts[0].sources.length,
+    lateUnderrunFeedback: lateUnderruns.length,
+  };
+  suspendGate.resolve();
+  await stopping;
+  assert.equal(stopped, true);
+  assert.deepEqual(observed, { staleBufferSources: 0, lateUnderrunFeedback: 0 });
 });

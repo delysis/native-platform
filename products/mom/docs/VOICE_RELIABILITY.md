@@ -200,6 +200,33 @@ These repairs require their own exact component and packaged qualification;
 candidate 05 remains a failed acceptance attempt. Physical speaker/double-talk,
 long-call continuity and the actual 32 GB M2 remain separate gates.
 
+## Candidate 06 observation and queued playback regression
+
+The exact `a51965bf` component gate passed all 64 records. Candidate 06 used
+that clean source. A later callback audit reproduced another stale-audio path:
+with the eight-second worklet ring full and additional PCM pending, Stop cleared
+the worklet then awaited context suspension. An already queued `consumed` event
+could schedule that pending PCM as a fallback BufferSource. A queued underrun
+could also change global buffering calibration after cancellation. The regression
+produced one stale source and one stale underrun callback before the repair.
+Scheduling, queued worklet callbacks and late synthesis completion now reject
+stopped owners. The actual controller regression holds suspension open and
+requires both counts to remain zero; a new exact gate/package is required.
+
+Candidate 06 was launched during conflicting qualification instructions despite
+a hold for that repair. No synthetic fixture was played; the user made a call.
+Launch ownership is now retained by the root integrator, separate from delegated
+build ownership, so prior delegation cannot implicitly authorize another launch.
+The user reported a very responsive conversation after Preparing cleared.
+Greeting trace `76c044b2-765a-44fb-8ec4-983ba757482c` measured 20.172 seconds
+waiting for an already running startup warm, 177 milliseconds for exact call
+preparation, ringing at 20.350 seconds and playback at 33.789 seconds from the
+call request. Startup itself took 31.988 seconds, including 28.452 seconds of
+cold persona prefill. Greeting reused 11,205 of 13,706 prompt positions;
+remaining history was processed after dispatch. This native build differed
+from earlier candidates. Same-build saved-session restart remains the decisive
+cache-resumption check; this first cold run does not establish it.
+
 ## Inference-window behavior
 
 Voice preparation measures the complete text and audio prompt against the

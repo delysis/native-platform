@@ -924,6 +924,7 @@
     };
 
     const schedule = (frame) => {
+      if (stopped) return false;
       const scheduleStarted = rendererNow();
       const frames = validateFrame(frame);
       if (frames === 0) return true;
@@ -1007,6 +1008,7 @@
     };
 
     const schedulePending = () => {
+      if (stopped) return;
       while (chunkHead < chunks.length) {
         const frame = chunks[chunkHead];
         const seconds = frame.data.byteLength / (2 * frame.channels * frame.sampleRate);
@@ -1099,6 +1101,7 @@
         });
         rendererMetrics.worklet = true;
         workletNode.port.onmessage = ({ data }) => {
+          if (stopped) return;
           const audioContextMs = Number(data?.audioContextFrame || 0) * 1_000 / format.sampleRate;
           if (data?.type === "packet_admitted") {
             onRendererEvent?.({
@@ -5811,6 +5814,7 @@
       });
       activeSynthesis = synthesis;
       synthesis.then((response) => {
+        if (stopped || activeOperation !== operation) return;
         if (response?.status === "blocked" || !response?.result) {
           throw new Error(response?.blocker?.message || "Voice synthesis stopped.");
         }
