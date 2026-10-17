@@ -86,6 +86,53 @@ the old application-directory receipt is left untouched.
 
 ## Sentence prosody and streaming PCM continuity
 
+The vocoder decodes generated acoustic codes only. Speaker conditioning belongs
+to the talker; unrelated reference-waveform codes must not fill an initial or
+expanding decoder window. Filling the early 32-frame window with reference codes
+introduced a repeatable onset pulse. Same-code comparisons against a full causal
+decode isolated this effect without changing sampling, sentence boundaries,
+emission cadence, overlap, or playback scheduling. Keep the accepted executable
+and profile as the comparison baseline; removal of the artificial line-noise
+feature predates this repair and must not be presented as a new change.
+
+The opt-in real-model regression is
+`Qwen3TTSTests.EmbeddingOnlyReferenceDecoderParityTests/testReferenceCodesDoNotChangeEmbeddingOnlyPCM`.
+It holds the extracted speaker embedding, text, and MLX seed constant, then
+compares PCM with no decoder reference codes and synthetic 16-by-32 and
+16-by-80 code matrices. Supply a private JSON file with `model_path`,
+`reference_wav_path`, `output_path`, and `seed` fields, then run:
+
+```sh
+QWEN_ONSET_FIX_DIAGNOSTIC_JSON=/absolute/path/to/input.json \
+  swift test --package-path products/mom/apps/mom-llama/qwen3-tts-helper \
+  --filter EmbeddingOnlyReferenceDecoderParityTests/testReferenceCodesDoNotChangeEmbeddingOnlyPCM
+```
+
+Without the environment variable the test is skipped. The diagnostic source
+contains only generic text and synthetic codec IDs; model and reference paths
+belong in the external input file. On the qualified local model, the d416
+baseline failed both equality comparisons (maximum absolute differences 0.204
+and 0.367); the onset fix passed both with zero difference across 122,880
+samples. This verifies decoder independence for this fixed-seed input, not
+general audio quality or physical playback smoothness.
+
+Long quiet tails are a separate, still-open acoustic defect. A fixed-seed
+29-word reproduction reached its 157-frame budget with 3.73 seconds of terminal
+low-energy PCM in all three decodes: reference-padded, generated-only rolling,
+and full-prefix causal. There were no nonfinite raw decoder samples. That
+isolates this reproduction to the generated sequence, but does not locate the
+earlier call's aggregate 4.69-second low-energy interval. Do not promote a
+blanket silence filter on this evidence: it can remove quiet speech, and holding
+PCM until EOF can starve otherwise continuous playback. Numeric signal evidence
+and zero underruns do not establish a successful human listening test.
+
+A temporary sampler ledger reproduced the same 157 frames byte-for-byte. All
+text had been supplied by step 36. During the terminal quiet interval, EOS was
+unsuppressed and ranked 2–9; every step retained 50 finite, valid candidates.
+Generation exhausted its frame budget without selecting EOS. This rules out
+an empty sampling set and unintended EOS suppression for this reproduction,
+not for every possible input. The diagnostic instrumentation is not shipped.
+
 Call speech normally submits one complete sentence per Qwen request. It does
 not start a fresh acoustic trajectory after six words or at ordinary commas.
 Only an unusually long/unpunctuated sentence reaches the 64-complete-word cap;

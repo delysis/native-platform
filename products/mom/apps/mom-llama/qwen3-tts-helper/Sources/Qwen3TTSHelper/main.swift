@@ -287,7 +287,7 @@ private enum Qwen3TTSHelperMain {
                 let voice = lookup.voice
                 let preparedPrefixKey = "\(request.persona_id):\(request.ref_sha256)"
                 if request.warm_only == true {
-                    // Prime the fixed-shape talker and vocoder graphs once
+                    // Prime the talker and first vocoder emission once
                     // during background startup. Reference warmup alone left
                     // their first compilation on the user's first reply.
                     if warmedPrefixKeys.insert(preparedPrefixKey).inserted {
@@ -362,9 +362,9 @@ private enum Qwen3TTSHelperMain {
                         text: textChunk,
                         speakerEmbedding: voice.speakerEmbedding,
                         referenceTranscript: nil,
-                        // Keep embedding-only identity conditioning, while
-                        // giving every rolling vocoder window the tail of the
-                        // exact reference audio as stable decoder context.
+                        // Identity is embedding-only without a transcript.
+                        // The decoder renders generated codes only; reference
+                        // waveforms must never be spliced into its onset.
                         referenceAudioCodes: voice.decoderContext,
                         // The native sampler has less numerical headroom than
                         // the reference CUDA path. This temperature preserves

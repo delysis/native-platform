@@ -617,15 +617,6 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     let samplesPerFrame = 1920
                     let overlapSamples = 512
 
-                    let referenceFrames: [[Int32]] = {
-                        guard let referenceAudioCodes,
-                              referenceAudioCodes.count == numCodeGroups,
-                              let frameCount = referenceAudioCodes.map({ $0.count }).min(),
-                              frameCount > 0 else { return [] }
-                        return (0..<frameCount).map { frame in
-                            referenceAudioCodes.map { $0[frame] }
-                        }
-                    }()
                     var generatedCodes: [[Int32]] = []
                     var emittedFrames = 0
                     var pcmOverlap = StreamingPCMOverlap(overlapSamples: overlapSamples)
@@ -643,11 +634,10 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     func decodeWindow(end: Int, newFrames: Int, windowSize: Int) -> [Float] {
                         guard end > 0, newFrames > 0 else { return [] }
                         let start = max(0, end - windowSize)
-                        var decodeInput = Array(generatedCodes[start..<end])
-                        let referenceSpace = max(0, windowSize - decodeInput.count)
-                        if referenceSpace > 0, !referenceFrames.isEmpty {
-                            decodeInput = Array(referenceFrames.suffix(referenceSpace)) + decodeInput
-                        }
+                        // Speaker/reference conditioning belongs to the talker.
+                        // Prepending unrelated reference codes here leaks their
+                        // waveform into the causal decoder's new-audio onset.
+                        let decodeInput = Array(generatedCodes[start..<end])
                         let allSamples = Device.withDefaultDevice(capturedDevice) { () -> [Float] in
                             defer { DeviceSelector.synchronizeIfNeeded(device: capturedDevice) }
                             let flatCodes: [Int32] = decodeInput.flatMap { $0 }
