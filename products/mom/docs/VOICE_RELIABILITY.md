@@ -1,21 +1,30 @@
 # Voice reliability qualification
 
-## Current status — 16 October 2026
+## Evidence snapshot — 16 October 2026
 
-The current source has runtime evidence for bounded voice-history rollover on
-an M4 Max with synthetic input. Under a manual 21,845 MiB memory budget, the
-initial 8,192-token setting resolves to 18,944 native context cells in this run. It is not an
-M2 measurement or packaged-call acceptance. The current tree has not passed the
-settled-tree `local-ci` gate and no candidate bundle has been built.
+This is a dated implementation and evidence snapshot, not a live qualification
+declaration. Each local gate, candidate build, and device run applies only to
+the exact source SHA and tree recorded in its receipt or manifest; a later
+receipt supersedes an earlier one only for its own exact identity.
 
-Opportunistic ASR slotting is implemented. The earlier full frontend receipt passes
-240/240; the final consolidated gate covers subsequent scheduling fixes. A low-priority resident-only Parakeet slot runs during
-the targetless interval with playback fully buffered. A finalized transcript
+The M4 Max runtime evidence below covers bounded voice-history rollover with
+synthetic input. Under a manual 21,845 MiB memory budget, the initial
+8,192-token setting resolved to 18,944 native context cells in that run. It is
+not an M2 measurement or packaged-call acceptance. The two latest consolidated
+gate attempts documented below failed for separate workspace issues. Consult
+the newest exact local-ci receipt before making a gate claim. Candidate identity
+and packaging evidence belong to the generated candidate manifest, not this
+document.
+
+Opportunistic ASR slotting is implemented. The latest focused Mom frontend
+receipt recorded 244/244 passing tests before the consolidated gate attempts.
+A low-priority resident-only Parakeet slot runs during the targetless interval
+with playback fully buffered. A finalized transcript
 replaces that older audio only in future model input; the original recording
 remains attached for playback and provenance. This can reduce history pressure
-before rolling the inference boundary. Microphone PCM stays detached from Gemma
-until its transcript is complete. Caller onset cancels the exact ASR operation
-and waits for its terminal acknowledgement before Gemma preparation. A slot
+before rolling the inference boundary. Live microphone PCM flows to Gemma's
+bounded prefill queue; caller onset cancels the exact idle ASR operation and
+waits for its terminal acknowledgement before Gemma preparation. A slot
 exceeding 500 ms disables later in-call slots, and cold Parakeet loading is
 skipped. A real Parakeet active-cancel test passed 20/20, with 32.55 ms median
 and 33.22 ms maximum terminal latency. This verifies the transcription
@@ -94,18 +103,20 @@ resident tokens and retained the existing restore/replay checks; a packaged
 call still needs request-scoped filesystem evidence for the no-disk-I/O
 boundary. No automatic full-conversation KV checkpoint at hangup is claimed.
 
-Live transcription remains bounded to 40,960 samples (2.56 s at 16 kHz),
-including in-flight audio. Overflow and stalled native acknowledgements fail
-explicitly. Deferred PCM replay is tested for exactly-once delivery, including
-chunks received during an asynchronous drain. The saved recording remains
-authoritative. Older statements that live ASR fan-out was removed describe a
-previous source snapshot.
+The optional staged Parakeet transcription tap remains bounded to 40,960
+samples (2.56 s at 16 kHz), including in-flight audio; it is not a live ASR
+fan-out on the Gemma microphone path. A live call sends microphone PCM through
+the bounded Gemma prefill queue, with the saved recording retained as recovery
+source. Overflow and stalled native acknowledgements fail explicitly. Deferred
+PCM replay is tested for exactly-once delivery, including chunks received
+during an asynchronous drain. The saved recording remains authoritative.
 
 ## Evidence history and limitations
 
-The focused current-tree checks passed: all-target check for engine, runtime,
-CLI, and app; all-target Clippy with warnings denied; runtime integration tests
-(39 passed, 17 ignored); app tests (166 passed, 3 ignored); and frontend tests (240/240).
+The focused integrated-source checks recorded: all-target check for engine,
+runtime, CLI, and app; all-target Clippy with warnings denied; runtime
+integration tests (39 passed, 17 ignored); app tests (166 passed, 3 ignored);
+and frontend tests (244/244).
 The engine focused suite passed 225 tests (15 ignored), and runtime unit tests
 passed 310. These focused checks are not the settled-tree `local-ci` gate. The
 M4 20-cycle audio run, 5,270-token edited-prompt four-path parity run,
@@ -208,3 +219,15 @@ required the generated Loom Signal helper before the runner built it. The
 runner now provisions that isolated workspace and macOS smoke support first,
 and installs WebKit before browser tests. Failed attempt evidence remains at
 `/Users/george/.codex/evidence/local-ci-d4cb3a33-attempt-01`.
+
+The clean d1157b1d attempt reached workspace tests and found a missing
+`state_cache_directory` initializer in Loom's `NativeModelConfig`; the narrow
+initializer was added in 5140b8ed. That clean gate then exposed two Loom
+media-admission failures: the shared identity ledger had applied Mom's
+256-audio history allowance to ordinary mixed media, allowing 33 distinct
+payloads where Loom's contract remains 32. The full receipts remain at
+`/Users/george/.codex/evidence/local-ci-d1157b1d-attempt-01` and
+`/Users/george/.codex/evidence/local-ci-5140b8ed-attempt-01`. The repair keeps
+the default ledger aggregate limit at 32 and opts in only Mom's committed
+history emitter to the bounded audio-history allowance. These receipts remain
+failures even if a later exact-tree gate passes.

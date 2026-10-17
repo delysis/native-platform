@@ -107,7 +107,10 @@ pub(crate) fn prepare_scoped_chat_attachments(
     let mut sources_by_message_id = HashMap::new();
     let mut media_by_message_id = HashMap::new();
     let mut media = Vec::new();
-    let mut emitted_media = llama_native_types::media_identity::MediaIdentityLedger::default();
+    // This ledger spans committed history; current/staged uploads keep their
+    // separate ordinary request limits in the attachment budget.
+    let mut emitted_media =
+        llama_native_types::media_identity::MediaIdentityLedger::for_historical_audio();
     let mut budget = ActiveAttachmentBudget::default();
     let mut resolution = AttachmentResolution {
         store: &store,

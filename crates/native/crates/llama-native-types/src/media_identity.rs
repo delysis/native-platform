@@ -64,18 +64,31 @@ struct Identity {
     mime: String,
 }
 
-/// Request-local bookkeeping, not a transferable validation capability. Native
-/// admission still validates the final request after the caller takes its bytes.
+/// Request-local bookkeeping, not a transferable validation capability. The
+/// default policy caps distinct payloads at `MAX_MEDIA_PAYLOADS` across kinds;
+/// committed history can opt into the larger audio-only limit. Native admission
+/// still validates the final request after the caller takes its bytes.
 #[derive(Debug, Default)]
 pub struct MediaIdentityLedger {
     identities: BTreeMap<String, Identity>,
     payloads: BTreeMap<(MediaKind, String), String>,
+    historical_audio_capacity: bool,
     bytes: usize,
     occurrences: usize,
     verified_bytes: u64,
 }
 
 impl MediaIdentityLedger {
+    /// Create a ledger for committed conversation history, where archived audio
+    /// can outnumber ordinary per-request media. This does not relax byte,
+    /// occurrence, verification-work, or non-audio payload limits.
+    pub fn for_historical_audio() -> Self {
+        Self {
+            historical_audio_capacity: true,
+            ..Self::default()
+        }
+    }
+
     /// Validate every occurrence before sharing its payload. On error none of
     /// the admitted identities or budgets changes; callers abort the request.
     pub fn admit(&mut self, item: &MediaInput) -> Result<MediaAdmission, MediaIdentityError> {
@@ -139,15 +152,20 @@ impl MediaIdentityLedger {
             None => MediaAdmission::NewPayload,
         };
         let bytes = if admission == MediaAdmission::NewPayload {
-            let count = self
-                .payloads
-                .keys()
-                .filter(|(existing, _)| *existing == kind)
-                .count();
-            let limit = if kind == MediaKind::Audio {
-                MAX_AUDIO_PAYLOADS
+            let (count, limit) = if self.historical_audio_capacity {
+                let limit = if kind == MediaKind::Audio {
+                    MAX_AUDIO_PAYLOADS
+                } else {
+                    MAX_MEDIA_PAYLOADS
+                };
+                let count = self
+                    .payloads
+                    .keys()
+                    .filter(|(existing, _)| *existing == kind)
+                    .count();
+                (count, limit)
             } else {
-                MAX_MEDIA_PAYLOADS
+                (self.payloads.len(), MAX_MEDIA_PAYLOADS)
             };
             if count >= limit {
                 return Err(MediaIdentityError::PayloadLimit);
@@ -328,6 +346,72 @@ mod tests {
             Err(MediaIdentityError::ByteLimit)
         );
         assert_eq!(ledger.payload_count(), 0);
+    }
+
+    #[test]
+    fn default_limit_is_aggregate_across_modalities_and_failure_is_atomic() {
+        let mut ledger = MediaIdentityLedger::default();
+        for index in 0..MAX_MEDIA_PAYLOADS / 2 {
+            ledger
+                .admit(&item(&format!("image-{index}"), &[index as u8]))
+                .expect("image within aggregate cap");
+        }
+        for index in 0..MAX_MEDIA_PAYLOADS / 2 {
+            let mut audio = item(&format!("audio-{index}"), &[index as u8, 0xA5]);
+            audio.kind = MediaKind::Audio;
+            audio.mime = "audio/wav".into();
+            ledger.admit(&audio).expect("audio within aggregate cap");
+        }
+        let before = counts(&ledger);
+        let mut extra = item("audio-overflow", b"overflow");
+        extra.kind = MediaKind::Audio;
+        extra.mime = "audio/wav".into();
+        assert_eq!(ledger.admit(&extra), Err(MediaIdentityError::PayloadLimit));
+        assert_eq!(counts(&ledger), before);
+    }
+
+    #[test]
+    fn historical_audio_capacity_is_explicit_and_keeps_other_budgets() {
+        let mut ledger = MediaIdentityLedger::for_historical_audio();
+        for index in 0..MAX_AUDIO_PAYLOADS {
+            let bytes = (index as u16).to_le_bytes();
+            let mut audio = item(&format!("audio-{index}"), &bytes);
+            audio.kind = MediaKind::Audio;
+            audio.mime = "audio/wav".into();
+            ledger.admit(&audio).expect("history audio within cap");
+        }
+        assert_eq!(ledger.payload_count(), MAX_AUDIO_PAYLOADS);
+        let before = counts(&ledger);
+        let mut extra = item("audio-overflow", b"overflow");
+        extra.kind = MediaKind::Audio;
+        extra.mime = "audio/wav".into();
+        assert_eq!(ledger.admit(&extra), Err(MediaIdentityError::PayloadLimit));
+        assert_eq!(counts(&ledger), before);
+
+        let mut full_bytes = MediaIdentityLedger {
+            historical_audio_capacity: true,
+            bytes: MAX_MEDIA_BYTES,
+            ..MediaIdentityLedger::default()
+        };
+        let before = counts(&full_bytes);
+        let mut audio = item("audio-byte-overflow", b"x");
+        audio.kind = MediaKind::Audio;
+        audio.mime = "audio/wav".into();
+        assert_eq!(full_bytes.admit(&audio), Err(MediaIdentityError::ByteLimit));
+        assert_eq!(counts(&full_bytes), before);
+
+        let mut non_audio = MediaIdentityLedger::for_historical_audio();
+        for index in 0..MAX_MEDIA_PAYLOADS {
+            non_audio
+                .admit(&item(&format!("image-{index}"), &index.to_le_bytes()))
+                .expect("non-audio within its ordinary cap");
+        }
+        let before = counts(&non_audio);
+        assert_eq!(
+            non_audio.admit(&item("image-overflow", b"extra")),
+            Err(MediaIdentityError::PayloadLimit)
+        );
+        assert_eq!(counts(&non_audio), before);
     }
 
     #[test]
