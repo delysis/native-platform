@@ -530,6 +530,9 @@ const speechLifetimeHarness = ({ worklet = false } = {}) => {
     }
     async suspend() { this.state = "suspended"; }
     async close() { this.closed = true; this.state = "closed"; }
+    createAnalyser() {
+      return { fftSize: 0, connect() {}, getFloatTimeDomainData(samples) { samples.fill(0); } };
+    }
     createBuffer(channels, length, sampleRate) {
       return { channels, length, sampleRate, duration: length / sampleRate, copyToChannel() {} };
     }
@@ -904,7 +907,7 @@ test("live voice synthesis has an idle-progress deadline after first PCM", () =>
   assert.doesNotMatch(live, /if \(!deferProgressWatchdog\) armAudioProgressWatchdog\(\)/);
   assert.match(live, /running = true;[\s\S]*?armAudioProgressWatchdog\(\);/);
   assert.match(live, /audioProgressWatchdog = null;\s*watchdogActive = false;/);
-  assert.match(live, /if \(decoded\.data\.byteLength > 0\) armAudioProgressWatchdog\(\)/);
+  assert.match(live, /if \(decoded\.data\.byteLength > 0\) \{\s*playback\.lastProgressAt = performance\.now\(\);\s*armAudioProgressWatchdog\(\);/);
   assert.doesNotMatch(live, /controller\.pushSegment\(frame, operation\);\s*armAudioProgressWatchdog\(\)/);
   assert.doesNotMatch(live, /onPlayable: \(\) => \{\s*window\.clearTimeout\(audioProgressWatchdog\)/);
   assert.match(live, /voice_reply_timeout: Voice synthesis stopped making progress\./);

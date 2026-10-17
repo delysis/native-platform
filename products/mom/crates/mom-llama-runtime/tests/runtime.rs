@@ -4194,6 +4194,15 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     let _session = configured_real_session("real-cache")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(1),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        ..SettingsUpdate::default()
+    })?;
     let native_owner = initialize_product_runtime()?;
     let scope = native_owner.operation_scope();
     let skill = mom_llama_runtime::skill_store::skill_create(
@@ -4215,6 +4224,150 @@ fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     let restored = mom_llama_runtime::kv_cache_restore(&scope, Some(cache_id))?;
     assert_eq!(restored.readiness, "prompt_smoke_verified");
     assert!(restored.receipt.real_engine_invoked);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_restart() -> Result<()>
+{
+    let session = configured_real_session("real-large-voice-cache-reload")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(2),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        max_tokens: Some(8),
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let source = mom_llama_runtime::conversation_new(Some("Long cache source".into()))?
+        .result
+        .ok_or_else(|| anyhow!("long cache source conversation missing"))?;
+    let long_persona = "You are a concise, careful assistant. Preserve names and chronology, answer in one short sentence, ask one gentle question only when a key detail is missing, and do not invent memories. ".repeat(150);
+    mom_llama_runtime::conversation_system_message_update(&source.id, Some(long_persona))?;
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: source.id.clone(),
+            message: "Acknowledge this isolated cache test.".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    let source = mom_llama_runtime::conversation_select(&source.id)?
+        .result
+        .ok_or_else(|| anyhow!("long cache source reload missing"))?;
+    let leaf = source
+        .active_leaf_message_id
+        .clone()
+        .ok_or_else(|| anyhow!("long cache source leaf missing"))?;
+    let persona = mom_llama_runtime::persona_freeze(PersonaFreezeInput {
+        conversation_id: source.id.clone(),
+        message_id: leaf,
+        name: "Long cache witness".into(),
+        mention_handle: "long-cache-witness".into(),
+        history_mode: PersonaHistoryMode::SystemOnly,
+    })?
+    .result
+    .ok_or_else(|| anyhow!("long cache persona missing"))?;
+
+    let prepare_started = Instant::now();
+    let prepared = mom_llama_runtime::kv_cache_save_voice_persona(&scope, &persona.id)?
+        .result
+        .ok_or_else(|| anyhow!("long voice persona cache preparation failed"))?;
+    let metadata = &prepared.metadata;
+    assert!(
+        metadata.token_ids.len() > 4_000,
+        "persona cache prefix was not long enough to exercise SWA retention: {}",
+        metadata.token_ids.len()
+    );
+    assert!(
+        metadata.state_bytes > 1_000_000_000,
+        "real native state did not exceed SQLite's single-value range: {} bytes",
+        metadata.state_bytes
+    );
+    let cache_id = metadata.id.clone();
+    let blob_base = format!("kv-cache.v3.blob.{cache_id}");
+    let connection = rusqlite::Connection::open(session.path().join("runtime.sqlite3"))?;
+    let mut statement = connection.prepare(
+        "SELECT namespace FROM encrypted_documents WHERE namespace LIKE ?1 ORDER BY namespace",
+    )?;
+    let chunk_names = statement
+        .query_map([format!("{blob_base}%")], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let chunk_count = chunk_names.len();
+    assert!(
+        chunk_count >= 2,
+        "large state was not stored in multiple encrypted parts"
+    );
+    assert!(chunk_names.contains(&format!("{blob_base}.part-1")));
+    println!(
+        "VOICE_LARGE_CACHE_PERSIST {}",
+        serde_json::to_string(&json!({
+            "model_sha256": metadata.fingerprint.model_sha256,
+            "token_count": metadata.token_ids.len(),
+            "state_bytes": metadata.state_bytes,
+            "encrypted_parts": chunk_count,
+            "prepare_ms": prepare_started.elapsed().as_millis(),
+            "persisted": prepared.persisted,
+        }))?
+    );
+    drop(scope);
+    drop(native_owner);
+
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    let restore_started = Instant::now();
+    let restored = mom_llama_runtime::kv_cache_restore(&restored_scope, Some(cache_id.clone()))?;
+    assert_eq!(
+        restored.readiness, "prompt_smoke_verified",
+        "persistent chunk restore failed: {:#?}",
+        restored.blocker
+    );
+    assert!(restored.receipt.real_engine_invoked);
+    assert!(
+        restored
+            .receipt
+            .artifacts_produced
+            .iter()
+            .any(|artifact| artifact.contains("authenticated")
+                && artifact.contains("native KV state")),
+        "restart restored by native state import, not token replay: {:?}",
+        restored.receipt.artifacts_produced
+    );
+    assert!(
+        !restored
+            .receipt
+            .artifacts_produced
+            .iter()
+            .any(|artifact| artifact.contains("token IDs")),
+        "large-state restart unexpectedly fell back to token replay: {:?}",
+        restored.receipt.artifacts_produced
+    );
+    assert_eq!(
+        restored.result.as_ref().map(|entry| entry.id.as_str()),
+        Some(cache_id.as_str())
+    );
+    println!(
+        "VOICE_LARGE_CACHE_RELOAD {}",
+        serde_json::to_string(&json!({
+            "cache_id": cache_id,
+            "model_sha256": metadata.fingerprint.model_sha256,
+            "state_bytes": metadata.state_bytes,
+            "encrypted_parts": chunk_count,
+            "restore_ms": restore_started.elapsed().as_millis(),
+            "readiness": restored.readiness,
+            "real_engine_invoked": restored.receipt.real_engine_invoked,
+            "restore_evidence": restored.receipt.artifacts_produced,
+        }))?
+    );
     Ok(())
 }
 

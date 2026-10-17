@@ -188,6 +188,20 @@ impl DocumentSnapshot<'_, '_, '_> {
     {
         get_document(self.store, self.transaction, namespace)
     }
+
+    pub(crate) fn get_bytes(&self, namespace: &str) -> Result<Option<Vec<u8>>> {
+        let encrypted = self
+            .transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        encrypted
+            .map(|(nonce, ciphertext)| self.store.decrypt_bytes(namespace, &nonce, &ciphertext))
+            .transpose()
+    }
 }
 
 impl DocumentMutations<'_, '_, '_> {
@@ -201,6 +215,27 @@ impl DocumentMutations<'_, '_, '_> {
     pub(crate) fn put_bytes(&mut self, namespace: &str, value: &[u8]) -> Result<()> {
         let (nonce, ciphertext) = self.store.encrypt_bytes(namespace, value)?;
         self.writes.push((namespace.to_string(), nonce, ciphertext));
+        self.deletes.retain(|candidate| candidate != namespace);
+        Ok(())
+    }
+
+    /// Encrypt and write one bounded blob part directly into this mutation's
+    /// transaction. Large cache values are stored as independently
+    /// authenticated parts, so retaining every encrypted part in `writes`
+    /// would multiply peak memory by the full cache size.
+    pub(crate) fn put_bytes_streamed(&mut self, namespace: &str, value: &[u8]) -> Result<()> {
+        let (nonce, ciphertext) = self.store.encrypt_bytes(namespace, value)?;
+        self.transaction.execute(
+            "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace) DO UPDATE SET
+               nonce = excluded.nonce,
+               ciphertext = excluded.ciphertext,
+               updated_at = excluded.updated_at",
+            params![namespace, nonce, ciphertext, timestamp_i64()],
+        )?;
+        self.writes
+            .retain(|(candidate, _, _)| candidate != namespace);
         self.deletes.retain(|candidate| candidate != namespace);
         Ok(())
     }
@@ -1283,6 +1318,61 @@ mod tests {
         );
         assert_eq!(store.get_bytes("blob.old")?, Some(b"old bytes".to_vec()));
         assert_eq!(store.get_bytes("blob.new")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_blob_writes_follow_mutation_order_and_roll_back_atomically() -> Result<()> {
+        let data_dir = test_dir("streamed-blob-mutations");
+        let store = RuntimeStore::open_with_key(&data_dir, [52_u8; 32])?;
+        store.put_bytes("blob.part-0", b"old")?;
+
+        let failed: Result<()> =
+            store.mutate_documents("metadata", SecretDocument::default, |_, documents| {
+                documents.put_bytes_streamed("blob.part-0", b"rolled-back")?;
+                documents.put_bytes_streamed("blob.part-1", b"new-part")?;
+                Err(anyhow!("force streamed rollback"))
+            });
+        assert!(failed.is_err());
+        assert_eq!(store.get_bytes("blob.part-0")?, Some(b"old".to_vec()));
+        assert_eq!(store.get_bytes("blob.part-1")?, None);
+
+        store.mutate_documents("metadata", SecretDocument::default, |_, documents| {
+            documents.put_bytes("blob.part-0", b"queued")?;
+            documents.put_bytes_streamed("blob.part-0", b"streamed-last")?;
+            documents.put_bytes_streamed("blob.part-1", b"part-one")?;
+            Ok(())
+        })?;
+        assert_eq!(
+            store.get_bytes("blob.part-0")?,
+            Some(b"streamed-last".to_vec())
+        );
+        assert_eq!(store.get_bytes("blob.part-1")?, Some(b"part-one".to_vec()));
+
+        store.mutate_documents("metadata", SecretDocument::default, |_, documents| {
+            documents.put_bytes_streamed("blob.part-0", b"streamed-first")?;
+            documents.put_bytes("blob.part-0", b"queued-last")?;
+            Ok(())
+        })?;
+        assert_eq!(
+            store.get_bytes("blob.part-0")?,
+            Some(b"queued-last".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn document_snapshot_reads_blob_bytes_from_one_sqlite_snapshot() -> Result<()> {
+        let store = RuntimeStore::open_with_key(&test_dir("blob-read-snapshot"), [53_u8; 32])?;
+        store.put_bytes("blob", b"before")?;
+
+        store.read_documents(|snapshot| {
+            assert_eq!(snapshot.get_bytes("blob")?, Some(b"before".to_vec()));
+            store.put_bytes("blob", b"after")?;
+            assert_eq!(snapshot.get_bytes("blob")?, Some(b"before".to_vec()));
+            Ok(())
+        })?;
+        assert_eq!(store.get_bytes("blob")?, Some(b"after".to_vec()));
         Ok(())
     }
 

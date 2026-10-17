@@ -26,6 +26,12 @@ impl LlamaStateSeqFlags {
     /// prior states obtained for that `seq_id` with this flag set.
     pub const ON_DEVICE: LlamaStateSeqFlags = LlamaStateSeqFlags(2);
 
+    /// Retain every resident sliding-window attention cell in a sequence export.
+    /// Required when the imported state may be cropped to an earlier prefix.
+    /// The pinned native overlay implements bit 4; full history also requires
+    /// a context configured with `swa_full`.
+    pub const KEEP_ALL_SWA_CELLS: LlamaStateSeqFlags = LlamaStateSeqFlags(4);
+
     /// Create an empty flags set.
     pub const fn empty() -> LlamaStateSeqFlags {
         LlamaStateSeqFlags(0)

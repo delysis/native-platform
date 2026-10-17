@@ -54,3 +54,17 @@ crates live under the monorepo `crates/` tree. FTE remains a separate product.
 
 Run the commands listed in `README.md`. Real-model, cache-restart and Tauri
 bundle gates are explicit opt-in acceptance proofs.
+
+For voice changes, follow `docs/VOICE_RELIABILITY.md`. Keep the installed app and
+user state stable while developing in an isolated checkout. One integrator owns
+the source and serialized model/build slot. Preserve failing receipts; a short
+CPU test cannot qualify long Metal cache reuse. Require long-prefix native
+import/edit parity, repeated cancellation, and persisted-cache restart evidence
+for affected cache changes. Bind every measurement to its source, model, device
+and executable; never infer the running binary from the latest build directory.
+Build review candidates with `scripts/build-voice-candidate.mjs` after the exact
+clean-tree component gate. Candidate app identity and state stay separate from
+the installed app. Component success does not authorize promotion as a tested
+voice release: packaged call, physical echo/double-talk, sustained-call soak and
+target-device results remain distinct acceptance records. Never replace the
+user's working app based only on unit tests or a successful launch.

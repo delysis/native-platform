@@ -216,6 +216,18 @@ pub fn longest_compatible_prefix_for_owner(
     )
 }
 
+/// Number of evaluated positions shared with a new prompt. Leave the final
+/// token live so generation has logits even for an entirely cached prompt.
+#[must_use]
+pub fn common_prefix_tokens(cached: &[i32], prompt: &[i32]) -> usize {
+    cached
+        .iter()
+        .zip(prompt)
+        .take(prompt.len().saturating_sub(1))
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 #[must_use]
 pub fn longest_compatible_prefix_for_scope(
     entries: &[PrefixCacheMetadata],
@@ -229,13 +241,16 @@ pub fn longest_compatible_prefix_for_scope(
             entry.is_valid()
                 && &entry.fingerprint == fingerprint
                 && owner_scope.matches(entry.owner_id.as_deref())
-                && entry.token_ids.len() < prompt_token_ids.len()
-                && prompt_token_ids.starts_with(&entry.token_ids)
         })
-        .max_by(|left, right| {
-            left.token_ids
-                .len()
-                .cmp(&right.token_ids.len())
+        .map(|entry| {
+            (
+                entry,
+                common_prefix_tokens(&entry.token_ids, prompt_token_ids),
+            )
+        })
+        .filter(|(_, matched)| *matched > 0)
+        .max_by(|(left, l), (right, r)| {
+            l.cmp(r)
                 .then_with(|| {
                     left.tier
                         .lookup_priority()
@@ -244,11 +259,11 @@ pub fn longest_compatible_prefix_for_scope(
                 .then_with(|| left.last_used_at_ms.cmp(&right.last_used_at_ms))
                 .then_with(|| left.id.cmp(&right.id))
         })
-        .map(|entry| CacheMatch {
+        .map(|(entry, matched)| CacheMatch {
             id: entry.id.clone(),
             tier: entry.tier,
-            matched_tokens: entry.token_ids.len(),
-            exact: entry.token_ids.len().saturating_add(1) == prompt_token_ids.len(),
+            matched_tokens: matched,
+            exact: matched + 1 == prompt_token_ids.len(),
         })
 }
 
@@ -536,29 +551,26 @@ impl MemoryPrefixCache {
         self.values
             .values()
             .filter(|cached| {
-                let entry = &cached.value.metadata;
-                &entry.fingerprint == fingerprint
-                    && owner_scope.matches(entry.owner_id.as_deref())
-                    && entry.token_ids.len() < prompt_token_ids.len()
-                    && prompt_token_ids.starts_with(&entry.token_ids)
+                &cached.value.metadata.fingerprint == fingerprint
+                    && owner_scope.matches(cached.value.metadata.owner_id.as_deref())
             })
-            .max_by(|left, right| {
-                left.value
-                    .metadata
-                    .token_ids
-                    .len()
-                    .cmp(&right.value.metadata.token_ids.len())
+            .map(|cached| {
+                (
+                    cached,
+                    common_prefix_tokens(&cached.value.metadata.token_ids, prompt_token_ids),
+                )
+            })
+            .filter(|(_, matched)| *matched > 0)
+            .max_by(|(left, l), (right, r)| {
+                l.cmp(r)
                     .then_with(|| left.last_used_at_ms.cmp(&right.last_used_at_ms))
                     .then_with(|| left.value.metadata.id.cmp(&right.value.metadata.id))
             })
-            .map(|cached| {
-                let entry = &cached.value.metadata;
-                CacheMatch {
-                    id: entry.id.clone(),
-                    tier: entry.tier,
-                    matched_tokens: entry.token_ids.len(),
-                    exact: entry.token_ids.len().saturating_add(1) == prompt_token_ids.len(),
-                }
+            .map(|(cached, matched)| CacheMatch {
+                id: cached.value.metadata.id.clone(),
+                tier: cached.value.metadata.tier,
+                matched_tokens: matched,
+                exact: matched + 1 == prompt_token_ids.len(),
             })
     }
 
@@ -848,17 +860,16 @@ mod tests {
     }
 
     #[test]
-    fn revised_persona_prompt_cannot_reuse_a_stale_incompatible_prefix() {
+    fn revised_persona_prompt_reuses_only_its_exact_common_prefix() {
         let stale = value("persona-v1", CacheTier::PersonaPack, &[10, 20, 30], 3, 1).metadata;
-        assert!(
-            longest_compatible_prefix(
-                std::slice::from_ref(&stale),
-                &fingerprint(),
-                &[10, 20, 31, 40],
-            )
-            .is_none(),
-            "a changed persona token must invalidate the old cached prefix"
-        );
+        let revised = longest_compatible_prefix(
+            std::slice::from_ref(&stale),
+            &fingerprint(),
+            &[10, 20, 31, 40],
+        )
+        .expect("the unchanged leading tokens remain reusable");
+        assert_eq!(revised.matched_tokens, 2);
+        assert!(!revised.exact);
         let compatible = longest_compatible_prefix(
             std::slice::from_ref(&stale),
             &fingerprint(),
@@ -867,6 +878,34 @@ mod tests {
         .expect("an unchanged prefix may be extended safely");
         assert_eq!(compatible.id, "persona-v1");
         assert_eq!(compatible.matched_tokens, 3);
+    }
+
+    #[test]
+    fn longest_shared_prefix_beats_a_longer_stored_entry() {
+        let longer_but_divergent = value(
+            "long-stale",
+            CacheTier::PersonaPack,
+            &[1, 2, 99, 4, 5, 6],
+            3,
+            10,
+        )
+        .metadata;
+        let shorter_and_matching = value(
+            "short-match",
+            CacheTier::SessionPersistent,
+            &[1, 2, 3, 4, 5],
+            3,
+            1,
+        )
+        .metadata;
+        let matched = longest_compatible_prefix(
+            &[longer_but_divergent, shorter_and_matching],
+            &fingerprint(),
+            &[1, 2, 3, 4, 5, 6],
+        )
+        .expect("a compatible cached prefix exists");
+        assert_eq!(matched.id, "short-match");
+        assert_eq!(matched.matched_tokens, 5);
     }
 
     #[test]

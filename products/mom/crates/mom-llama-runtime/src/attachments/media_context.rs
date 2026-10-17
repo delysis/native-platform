@@ -98,7 +98,10 @@ pub(super) fn resolve_attachment_set(
         // The reference budget bounds material admitted to this request. A
         // historical audio-only occurrence contributes neither text nor media
         // on the voice path, even though its manifest is still verified.
-        if (materialize_media || !canonical.is_empty())
+        let history_audio =
+            expected_state == AttachmentState::Committed && record.kind == AttachmentKind::Audio;
+        if !history_audio
+            && (materialize_media || !canonical.is_empty())
             && let Err(blocked) = resolution.budget.reserve_reference()
         {
             return Ok(Err(blocked));
@@ -182,12 +185,36 @@ pub(super) fn resolve_attachment_set(
             // Even a shared payload remains an available representation for
             // this exact record. Its occurrence stays in message/draft evidence.
             has_representation = true;
+            // Keep every occurrence at its chronological message boundary,
+            // even when its payload bytes are shared. The digest and modality
+            // make duplicate references explicit without copying their bytes.
+            let kind_label = match item.kind {
+                MediaKind::Image => "image",
+                MediaKind::Audio => "audio",
+            };
+            let occurrence = match admission {
+                MediaAdmission::NewPayload => format!(
+                    "[{kind_label} payload sha256:{}] [[native-media:{}]]",
+                    item.sha256, item.id
+                ),
+                MediaAdmission::DuplicatePayload => format!(
+                    "[{kind_label} occurrence references the same previously supplied payload sha256:{}]",
+                    item.sha256
+                ),
+            };
+            text.push(occurrence);
             references.push(AttachmentMediaReference::from_verified(
                 record, artifact, &item,
             ));
             if admission == MediaAdmission::NewPayload {
-                // Preserve Mom's stricter 16-object policy, not Loom's 32.
-                if let Err(blocked) = resolution.budget.reserve_media(blob.byte_len) {
+                // A conversation recording is bounded by audio bytes and the
+                // native context, independently of a single upload's count.
+                let reserved = if history_audio {
+                    resolution.budget.reserve_history_audio(blob.byte_len)
+                } else {
+                    resolution.budget.reserve_media(blob.byte_len)
+                };
+                if let Err(blocked) = reserved {
                     return Ok(Err(blocked));
                 }
                 media.push(item);

@@ -25,7 +25,9 @@ use uuid::Uuid;
 const KV_CACHE_NAMESPACE: &str = "kv-cache.v3";
 const KV_CACHE_BLOB_PREFIX: &str = "kv-cache.v3.blob.";
 const DEFAULT_MEMORY_CACHE_BYTES: usize = 512 * 1024 * 1024;
-const DEFAULT_PERSISTENT_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_PERSISTENT_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+// SQLite limits individual values; keep encryption scratch bounded as well.
+const CACHE_BLOB_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_PERSISTENT_CACHE_ENTRIES: usize = 64;
 const AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const BUILTIN_CACHE_OWNER: &str = "builtin:kind-local-assistant";
@@ -447,7 +449,7 @@ pub fn kv_cache_prepare_voice_persona_resident(
     let tokenized = handle
         .tokenize_messages_with_template(messages.clone(), template.clone())
         .map_err(|error| anyhow!(error))?;
-    let live_value = {
+    let mut live_value = {
         let mut memory = memory_cache()
             .lock()
             .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?;
@@ -456,12 +458,56 @@ pub fn kv_cache_prepare_voice_persona_resident(
             .best_match_for_owner(&fingerprint, &tokenized.token_ids, &persona.id)
             .and_then(|matched| memory.cache.get(&matched.id, now_ms()))
     };
+    if live_value.is_none() {
+        let store = RuntimeStore::open(&settings.data_dir)?;
+        let db = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .unwrap_or_default();
+        if let Some(candidate) = longest_compatible_prefix_for_owner(
+            &db.entries,
+            &fingerprint,
+            &tokenized.token_ids,
+            &persona.id,
+        ) && let Some(metadata) = db.entries.iter().find(|entry| entry.id == candidate.id)
+        {
+            if tokenized
+                .resident_text_prefix_tokens
+                .max(tokenized.resident_media_prefix_tokens)
+                >= metadata.token_ids.len()
+                && tokenized.token_ids.starts_with(&metadata.token_ids)
+            {
+                return Ok(CommandResult::passed(
+                    operation,
+                    "prompt_smoke_verified",
+                    VoicePersonaPrefixPreparation {
+                        metadata: metadata.clone(),
+                        prefill_us: 0,
+                        verification_us: 0,
+                        persistence_us: 0,
+                        promotion_us: 0,
+                        persisted: false,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                    false,
+                ));
+            }
+            live_value = load_persistent_value_or_invalidate(&settings, metadata, &handle)?;
+        }
+    }
     if let Some(value) = live_value.filter(|value| {
         // The shared-prefix prefill intentionally leaves the branch boundary
         // unevaluated. The exact token-prefix match was already established by
         // best_match_for_owner above; requiring equal lengths rejects it.
-        handle.has_live_sequence_receipt(&value.sequence.export_receipt())
+        handle.has_reusable_sequence(&value.sequence)
+            && tokenized.token_ids.starts_with(&value.sequence.token_ids)
     }) {
+        if tokenized.resident_text_prefix_tokens < value.sequence.token_count {
+            handle
+                .restore_sequence(value.sequence.clone(), 0)
+                .map_err(|error| anyhow!(error))?;
+        }
         return Ok(CommandResult::passed(
             operation,
             "prompt_smoke_verified",
@@ -515,7 +561,7 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ),
         ));
     };
-    if !lease.promote(value.clone())? {
+    if !lease.promote(value.clone())? && !lease.current_for(value.metadata.owner_id.as_deref())? {
         return Ok(CommandResult::blocked(
             operation,
             "stub_blocked",
@@ -527,6 +573,13 @@ pub fn kv_cache_prepare_voice_persona_resident(
         ));
     }
     let promotion_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    drop(lease);
+    let persistence_started = std::time::Instant::now();
+    let persisted = persist_value(&settings, &value)?;
+    let persistence_us = persistence_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
     Ok(CommandResult::passed(
         operation,
         "prompt_smoke_verified",
@@ -534,9 +587,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
             metadata: value.metadata.clone(),
             prefill_us,
             verification_us,
-            persistence_us: 0,
+            persistence_us,
             promotion_us,
-            persisted: false,
+            persisted,
         },
         Vec::new(),
         Vec::new(),
@@ -689,7 +742,10 @@ pub fn kv_cache_restore(
         .restore_sequence(value.sequence.clone(), 0)
         .map_err(|error| anyhow!(error))?;
     let restored = value.metadata.clone();
-    if !lease.promote(value)? {
+    // Native KV is already restored in the model worker. A full persona
+    // snapshot can legitimately exceed the separate serialized-state LRU;
+    // failure to duplicate it there must not undo a valid disk restore.
+    if !lease.promote(value)? && !lease.current_for(restored.owner_id.as_deref())? {
         return Ok(CommandResult::blocked(
             "mom_llama.kv_cache_restore",
             "stub_blocked",
@@ -713,7 +769,7 @@ pub fn kv_cache_restore(
         ],
         vec![match restore_kind {
             llama_native_types::SequenceRestoreKind::NativeState => {
-                "Restored native KV state from the live exporting worker.".to_string()
+                "Restored authenticated or live-receipted native KV state.".to_string()
             }
             llama_native_types::SequenceRestoreKind::TokenReplay => {
                 "Recomputed the saved prefix from token IDs; no native KV cache hit was claimed."
@@ -734,7 +790,7 @@ pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvC
         KvCacheDb::default,
         |db: &mut KvCacheDb, documents| {
             for entry in &db.entries {
-                documents.delete(&blob_namespace(&entry.id));
+                delete_cache_bytes(documents, entry);
             }
             db.entries.clear();
             Ok(())
@@ -783,6 +839,7 @@ fn compatible_cached_prefix_for_owner(
         owner_id,
         &settings,
         ChatTemplateChoice::ModelDefault,
+        0,
     )
 }
 
@@ -792,6 +849,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     owner_id: Option<&str>,
     settings: &Settings,
     template: ChatTemplateChoice,
+    resident_prefix_tokens: usize,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
     if messages.is_empty() {
         return Ok(None);
@@ -832,20 +890,21 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
             owner,
         ),
         None => longest_compatible_prefix(&db.entries, &fingerprint, &tokenized.token_ids),
-    }
-    .filter(|candidate| {
-        db.entries
-            .iter()
-            .find(|entry| entry.id == candidate.id)
-            .is_none_or(|entry| {
-                entry.tier != CacheTier::PersonaPack
-                    || entry.state_bytes <= AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES
-            })
-    });
+    };
     let selected = choose_match(memory_match, persistent_match);
     let Some(selected) = selected else {
         return Ok(None);
     };
+    // Do not decrypt/copy gigabytes merely to pass back a prefix the worker
+    // already owns. This is a cache hit in the engine's resident lane.
+    if resident_prefix_tokens > 0
+        && resident_prefix_tokens
+            >= selected
+                .matched_tokens
+                .min(tokenized.token_ids.len().saturating_sub(1))
+    {
+        return Ok(None);
+    }
     if selected.tier == CacheTier::MemoryLru {
         if !lease.validate()? {
             return Ok(None);
@@ -879,9 +938,11 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     let Some(value) = touch_persistent_value_for_promotion(&store, &value, now)? else {
         return Ok(None);
     };
-    if !lease.promote(value.clone())? {
+    let promoted = lease.promote(value.clone())?;
+    if !promoted && !lease.current_for(value.metadata.owner_id.as_deref())? {
         return Ok(None);
     }
+    // A valid disk entry need not fit the optional RAM LRU to be reusable.
     Ok(Some((value.metadata.id, value.sequence)))
 }
 
@@ -925,9 +986,12 @@ pub fn persist_session_checkpoint(
     if !settings.kv_cache_policy.persists_conversation_checkpoints() {
         return Ok(None);
     }
-    let state = handle
-        .snapshot_sequence(0)
-        .map_err(|error| anyhow!(error))?;
+    let Some(state) = handle
+        .snapshot_sequence_if_fits(0, AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES)
+        .map_err(|error| anyhow!(error))?
+    else {
+        return Ok(None);
+    };
     if state.token_ids.is_empty() || state.bytes.is_empty() {
         return Ok(None);
     }
@@ -949,21 +1013,7 @@ pub fn persist_session_checkpoint(
     if !value.is_valid() {
         return Ok(None);
     }
-    // Conversation checkpoints are produced automatically on the latency-
-    // sensitive reply path. Hybrid recurrent models can export a checkpoint
-    // hundreds of megabytes large even for a short turn. Encrypting that blob
-    // synchronously monopolizes a CPU core and can make the application appear
-    // hung. Retain oversized checkpoints in the resident LRU; explicit cache
-    // saves remain durable.
-    let promoted = if value.metadata.state_bytes > AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES {
-        let store = RuntimeStore::open(&settings.data_dir)?;
-        let Some(lease) = MomCachePromotionLease::acquire(&store, Some(conversation_id))? else {
-            return Ok(None);
-        };
-        lease.promote(value.clone())?
-    } else {
-        persist_value(&settings, &value)?
-    };
+    let promoted = persist_value(&settings, &value)?;
     if !promoted {
         return Ok(None);
     }
@@ -988,8 +1038,21 @@ fn create_prefix_value(
     stable_messages: &[ChatMessage],
     template: ChatTemplateChoice,
 ) -> Result<PrefixCacheValue> {
+    let settings = resolve_settings()?;
+    let cached_prefix = compatible_cached_prefix_for_owner_with_settings(
+        handle,
+        stable_messages,
+        owner_id.as_deref(),
+        &settings,
+        template.clone(),
+        0,
+    )?
+    .map(|(_, state)| state);
     let branches = ["alpha", "beta"]
         .into_iter()
+        // The shared messages define the prefix even on a single-sequence
+        // profile. Cache preparation must respect that profile's admission.
+        .take(handle.status().max_sequences as usize)
         .map(|probe| {
             let mut messages = stable_messages.to_vec();
             messages.push(ChatMessage {
@@ -1013,7 +1076,7 @@ fn create_prefix_value(
             common_messages: stable_messages.to_vec(),
             chat_template: template,
             branches,
-            cached_prefix: None,
+            cached_prefix,
         })
         .map_err(|error| anyhow!(error))?;
     let mut metadata = PrefixCacheMetadata::new(
@@ -1250,6 +1313,10 @@ impl MomCachePromotionLease {
         }
     }
 
+    fn current_for(&self, owner_id: Option<&str>) -> Result<bool> {
+        Ok(self.validate()? && memory_generation(owner_id)? == self.memory_generation)
+    }
+
     fn promote(&self, value: PrefixCacheValue) -> Result<bool> {
         if !self.validate()? {
             return Ok(false);
@@ -1281,7 +1348,7 @@ fn persist_value_with_promotion_hook(
         return Ok(false);
     }
     before_promotion();
-    if lease.promote(value.clone())? {
+    if lease.promote(value.clone())? || lease.current_for(value.metadata.owner_id.as_deref())? {
         return Ok(true);
     }
     invalidate_persistent_entry_in_store(store, &value.metadata.id)?;
@@ -1327,12 +1394,12 @@ fn persist_value_to_store(
                             && entry.owner_id == value.metadata.owner_id
                             && entry.fingerprint == value.metadata.fingerprint)
                 })
-                .map(|entry| entry.id.clone())
+                .cloned()
                 .collect::<Vec<_>>();
-            for id in replaced_ids {
-                documents.delete(&blob_namespace(&id));
+            for entry in replaced_ids {
+                delete_cache_bytes(documents, &entry);
             }
-            documents.put_bytes(&blob_namespace(&value.metadata.id), &value.sequence.bytes)?;
+            write_cache_bytes(documents, &value.metadata.id, &value.sequence.bytes)?;
             db.entries.retain(|entry| {
                 entry.id != value.metadata.id
                     && !(entry.tier == value.metadata.tier
@@ -1342,8 +1409,12 @@ fn persist_value_to_store(
             db.entries.insert(0, value.metadata.clone());
             let evicted =
                 persistent_eviction_ids(&db.entries, &value.metadata.id, max_entries, max_bytes);
-            for id in &evicted {
-                documents.delete(&blob_namespace(id));
+            for entry in db
+                .entries
+                .iter()
+                .filter(|entry| evicted.contains(&entry.id))
+            {
+                delete_cache_bytes(documents, entry);
             }
             db.entries.retain(|entry| !evicted.contains(&entry.id));
             Ok(true)
@@ -1379,11 +1450,15 @@ pub(crate) fn remove_persona_cache_from_documents(
         .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
         .unwrap_or_default();
     let removed = cache_ids_for_owner(&db, owner_id);
+    for entry in db
+        .entries
+        .iter()
+        .filter(|entry| removed.contains(&entry.id))
+    {
+        delete_cache_bytes(documents, entry);
+    }
     db.entries
         .retain(|entry| entry.owner_id.as_deref() != Some(owner_id));
-    for id in &removed {
-        documents.delete(&blob_namespace(id));
-    }
     documents.put_bytes(KV_CACHE_NAMESPACE, &serde_json::to_vec(&db)?)?;
     Ok(removed)
 }
@@ -1427,7 +1502,11 @@ fn load_persistent_value_or_invalidate_from_store(
         invalidate_persistent_entry_in_store(store, &metadata.id)?;
         return Ok(None);
     };
-    if !has_live_receipt(&reconstruction.export_receipt) {
+    // Authenticated exports survive worker/process restart. Their full
+    // bytes must reach the engine's signature and fingerprint check; replacing
+    // them with token replay here destroyed the durable KV cache on launch.
+    let authenticated_export = reconstruction.header.starts_with(b"native-seq-v2\0\0\0");
+    if !authenticated_export && !has_live_receipt(&reconstruction.export_receipt) {
         let Some(value) = metadata.replay_value() else {
             invalidate_persistent_entry_in_store(store, &metadata.id)?;
             return Ok(None);
@@ -1448,13 +1527,14 @@ fn load_persistent_value_or_invalidate_from_store(
             }
             // Expired native bytes are overwritten directly, never materialized.
             if value.metadata.state_bytes != metadata.state_bytes {
-                documents.put_bytes(&blob_namespace(&metadata.id), &value.sequence.bytes)?;
+                delete_cache_bytes(documents, metadata);
+                write_cache_bytes(documents, &metadata.id, &value.sequence.bytes)?;
                 *current = value.metadata.clone();
             }
             Ok(Some(value.clone()))
         });
     }
-    let loaded = store.get_bytes(&blob_namespace(&metadata.id));
+    let loaded = read_cache_bytes(store, metadata);
     let value = match loaded {
         Ok(Some(bytes)) => PrefixCacheValue {
             metadata: metadata.clone(),
@@ -1553,8 +1633,8 @@ fn invalidate_persistent_entry_in_store(store: &RuntimeStore, cache_id: &str) ->
         |db: &mut KvCacheDb, documents| {
             if let Some(entry) = db.entries.iter_mut().find(|entry| entry.id == cache_id) {
                 entry.state = CacheEntryState::Invalidated;
+                delete_cache_bytes(documents, entry);
             }
-            documents.delete(&blob_namespace(cache_id));
             Ok(())
         },
     )
@@ -1640,14 +1720,15 @@ fn selected_memory_value(
     drop(state);
     let mut value = (*shared).clone();
     value.metadata.last_used_at_ms = now;
-    let matched_tokens = value.metadata.token_ids.len();
+    let matched_tokens =
+        llama_native_cache::common_prefix_tokens(&value.metadata.token_ids, prompt_token_ids);
     (value.metadata.id == selected.id
         && value.metadata.tier == selected.tier
         && value.metadata.owner_id.as_deref() == owner_id
         && &value.metadata.fingerprint == fingerprint
         && matched_tokens == selected.matched_tokens
         && matched_tokens < prompt_token_ids.len()
-        && prompt_token_ids.starts_with(&value.metadata.token_ids)
+        && matched_tokens > 0
         && selected.exact == (matched_tokens.saturating_add(1) == prompt_token_ids.len()))
     .then_some(value)
 }
@@ -1698,6 +1779,65 @@ fn choose_match(memory: Option<CacheMatch>, persistent: Option<CacheMatch>) -> O
 
 fn blob_namespace(id: &str) -> String {
     format!("{KV_CACHE_BLOB_PREFIX}{id}")
+}
+
+fn blob_chunk_namespace(id: &str, index: usize) -> String {
+    if index == 0 {
+        blob_namespace(id)
+    } else {
+        format!("{}.part-{index}", blob_namespace(id))
+    }
+}
+
+fn write_cache_bytes(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    id: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    for (index, chunk) in bytes.chunks(CACHE_BLOB_CHUNK_BYTES).enumerate() {
+        documents.put_bytes_streamed(&blob_chunk_namespace(id, index), chunk)?;
+    }
+    Ok(())
+}
+
+fn delete_cache_bytes(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    metadata: &PrefixCacheMetadata,
+) {
+    // Invalid metadata must never create an unbounded cleanup loop.
+    let chunks = metadata
+        .state_bytes
+        .min(DEFAULT_PERSISTENT_CACHE_BYTES)
+        .div_ceil(CACHE_BLOB_CHUNK_BYTES)
+        .max(1);
+    for index in 0..chunks {
+        documents.delete(&blob_chunk_namespace(&metadata.id, index));
+    }
+}
+
+fn read_cache_bytes(
+    store: &RuntimeStore,
+    metadata: &PrefixCacheMetadata,
+) -> Result<Option<Vec<u8>>> {
+    if metadata.state_bytes == 0 || metadata.state_bytes > DEFAULT_PERSISTENT_CACHE_BYTES {
+        return Ok(None);
+    }
+    store.read_documents(|snapshot| {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(metadata.state_bytes)?;
+        for index in 0..metadata.state_bytes.div_ceil(CACHE_BLOB_CHUNK_BYTES) {
+            let Some(chunk) = snapshot.get_bytes(&blob_chunk_namespace(&metadata.id, index))?
+            else {
+                return Ok(None);
+            };
+            let expected = (metadata.state_bytes - bytes.len()).min(CACHE_BLOB_CHUNK_BYTES);
+            if chunk.len() != expected {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
+    })
 }
 
 fn encrypted_blob_uri(id: &str) -> String {
@@ -1774,6 +1914,55 @@ mod tests {
                 token_ids: vec![1],
             },
         }
+    }
+
+    #[test]
+    fn encrypted_cache_parts_round_trip_and_replacement_removes_the_tail() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("mom-cache-parts-{}", Uuid::new_v4()));
+        let store = RuntimeStore::open_with_key(&root, [67; 32])?;
+        let mut value = test_cache_value("chunked", "model");
+        let mut bytes = vec![7; CACHE_BLOB_CHUNK_BYTES + 23];
+        bytes[CACHE_BLOB_CHUNK_BYTES] = 9;
+        value.sequence.bytes = bytes.clone().into();
+        value.metadata.state_bytes = bytes.len();
+        assert!(persist_value_to_store(&store, &value, 4, bytes.len() * 2)?);
+        assert_eq!(read_cache_bytes(&store, &value.metadata)?, Some(bytes));
+        assert_eq!(
+            store
+                .get_bytes(&blob_chunk_namespace("chunked", 1))?
+                .ok_or_else(|| anyhow!("second encrypted cache part is missing"))?
+                .len(),
+            23
+        );
+        // A missing part is an incomplete cache, never a partially accepted state.
+        store.mutate_documents(KV_CACHE_NAMESPACE, KvCacheDb::default, |_, documents| {
+            documents.delete(&blob_chunk_namespace("chunked", 1));
+            Ok(())
+        })?;
+        assert!(read_cache_bytes(&store, &value.metadata)?.is_none());
+        assert!(persist_value_to_store(
+            &store,
+            &value,
+            4,
+            value.metadata.state_bytes * 2
+        )?);
+        value.sequence.bytes = vec![3; 9].into();
+        value.metadata.state_bytes = 9;
+        assert!(persist_value_to_store(
+            &store,
+            &value,
+            4,
+            CACHE_BLOB_CHUNK_BYTES * 2
+        )?);
+        assert_eq!(read_cache_bytes(&store, &value.metadata)?, Some(vec![3; 9]));
+        assert!(
+            store
+                .get_bytes(&blob_chunk_namespace("chunked", 1))?
+                .is_none()
+        );
+        drop(store);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

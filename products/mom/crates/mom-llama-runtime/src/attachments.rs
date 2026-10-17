@@ -292,9 +292,29 @@ struct ActiveAttachmentBudget {
     text_bytes: u64,
     media_objects: u32,
     media_bytes: u64,
+    history_audio_objects: usize,
 }
 
 impl ActiveAttachmentBudget {
+    fn reserve_history_audio(
+        &mut self,
+        bytes: u64,
+    ) -> std::result::Result<(), AttachmentContextBlocker> {
+        let count = self.history_audio_objects.saturating_add(1);
+        let total = self.media_bytes.saturating_add(bytes);
+        if count > llama_native_types::media_identity::MAX_AUDIO_PAYLOADS
+            || total > MAX_ACTIVE_ATTACHMENT_MEDIA_BYTES
+        {
+            return Err(context_blocker(
+                "attachment_context_media_bytes_exceeded",
+                "Recorded conversation exceeds the bounded audio history budget.".into(),
+            ));
+        }
+        self.history_audio_objects = count;
+        self.media_bytes = total;
+        Ok(())
+    }
+
     fn reserve_reference(&mut self) -> std::result::Result<(), AttachmentContextBlocker> {
         let next = self.references.saturating_add(1);
         if next > MAX_ACTIVE_ATTACHMENT_REFERENCES {
@@ -5098,12 +5118,84 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_audio_occurrences_keep_chronology_with_one_payload() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("duplicate-audio-occurrences");
+        let path = resolve_settings()
+            .expect("settings")
+            .data_dir
+            .join("same-recording.wav");
+        std::fs::write(&path, STRUCTURALLY_VALID_WAV).expect("write recording");
+        let first = attachment_import(&scope, "chat", &path)
+            .expect("import first occurrence")
+            .result
+            .expect("first recording result")
+            .attachment;
+        let second = attachment_import(&scope, "chat", &path)
+            .expect("import second occurrence")
+            .result
+            .expect("second recording result")
+            .attachment;
+        assert_eq!(first.sha256, second.sha256);
+        assert_ne!(first.id, second.id);
+
+        let store = RuntimeStore::current().expect("store");
+        let mut db = load_attachment_db().expect("attachment db");
+        for (attachment, message_id) in [(&first, "first-turn"), (&second, "second-turn")] {
+            let record = db
+                .attachments
+                .iter_mut()
+                .find(|record| record.id == attachment.id)
+                .expect("imported recording");
+            record.state = AttachmentState::Committed;
+            record.message_id = message_id.to_string();
+        }
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit recordings");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear draft");
+
+        let turns = [
+            message("first-turn", vec![first.id.clone()]),
+            message("second-turn", vec![second.id.clone()]),
+        ];
+        let context = prepare_live_audio_history("chat", &turns)
+            .expect("prepare duplicate history")
+            .expect("both occurrences are valid");
+        assert_eq!(
+            context.media.len(),
+            1,
+            "identical payload bytes stay shared"
+        );
+        assert_eq!(context.media[0].sha256, first.sha256);
+        let first_text = context
+            .text_by_message_id
+            .get("first-turn")
+            .expect("first occurrence representation");
+        let second_text = context
+            .text_by_message_id
+            .get("second-turn")
+            .expect("second occurrence representation");
+        assert!(first_text.contains(&format!(
+            "[audio payload sha256:{}] [[native-media:{}]]",
+            first.sha256, context.media[0].id
+        )));
+        assert!(second_text.contains(&format!(
+            "[audio occurrence references the same previously supplied payload sha256:{}]",
+            second.sha256
+        )));
+        assert!(!second_text.contains("[[native-media:"));
+    }
+
+    #[test]
     fn live_audio_history_keeps_pending_audio_until_exact_transcripts_replace_it() {
         let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("voice-history-commit");
         let data_dir = resolve_settings().expect("settings").data_dir;
         let mut historical = Vec::new();
-        for index in 0..=MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS {
+        for index in 0..=32 {
             let mut wav = STRUCTURALLY_VALID_WAV.to_vec();
             *wav.last_mut().expect("sample byte") = index as u8;
             let path = data_dir.join(format!("recording-{index}.wav"));
@@ -5139,18 +5231,40 @@ mod tests {
             .collect::<Vec<_>>();
         let ordinary = prepare_chat_attachments("chat", &messages, None)
             .expect("ordinary preparation")
-            .expect_err("ordinary media admission must retain its limit");
-        assert_eq!(
-            ordinary.blocker.code,
-            "attachment_context_media_count_exceeded"
-        );
-        let pending = prepare_live_audio_history("chat", &messages)
+            .expect("committed history uses the bounded history-audio budget");
+        assert_eq!(ordinary.media.len(), 33);
+        for (media, message) in ordinary.media.iter().zip(&messages) {
+            assert!(
+                media
+                    .id
+                    .starts_with(&format!("{}:", message.attachment_ids[0])),
+                "ordinary history preparation must retain chronological media"
+            );
+        }
+        let first_seventeen = prepare_live_audio_history("chat", &messages[..17])
             .expect("live history preparation")
-            .expect_err("pending audio cannot silently disappear from live history");
-        assert_eq!(
-            pending.blocker.code,
-            "attachment_context_media_count_exceeded"
-        );
+            .expect("17 pending audio turns fit the separate history budget");
+        assert_eq!(first_seventeen.media.len(), 17);
+        for (media, attachment_id) in first_seventeen.media.iter().zip(&messages[..17]) {
+            assert!(
+                media
+                    .id
+                    .starts_with(&format!("{}:", attachment_id.attachment_ids[0])),
+                "audio history must preserve chronological attachment order"
+            );
+        }
+        let pending = prepare_live_audio_history("chat", &messages)
+            .expect("33-turn live history preparation")
+            .expect("33 pending audio turns cross the former native 32-payload cap");
+        assert_eq!(pending.media.len(), 33);
+        for (media, message) in pending.media.iter().zip(&messages) {
+            assert!(
+                media
+                    .id
+                    .starts_with(&format!("{}:", message.attachment_ids[0])),
+                "all retained audio placeholders must remain in chronological order"
+            );
+        }
         let greeting = prepare_call_greeting_history("chat", &messages)
             .expect("pickup preparation")
             .expect("a greeting does not require old recordings");

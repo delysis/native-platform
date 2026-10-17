@@ -94,6 +94,10 @@ pub enum NativeDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NativeModelConfig {
+    /// Application-owned private directory for authenticating durable native
+    /// state exports. None restricts raw restoration to this live worker.
+    #[serde(default)]
+    pub state_cache_directory: Option<PathBuf>,
     pub model_id: String,
     pub model_path: PathBuf,
     /// Optional trusted digest supplied by the caller. When present, the held
@@ -140,6 +144,7 @@ impl NativeModelConfig {
             .unwrap_or("local-model")
             .to_string();
         Self {
+            state_cache_directory: None,
             model_id,
             model_path,
             expected_model_sha256: None,
@@ -2873,8 +2878,8 @@ pub enum ModelRuntimeState {
     Stopped,
 }
 
-/// How a saved prefix was reconstructed. Durable snapshots do not authorize
-/// opaque native bytes after their exporting worker exits.
+/// How a saved prefix was reconstructed. Native restore requires a live export
+/// receipt or a verified persistent native-export signature.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceRestoreKind {
@@ -2892,7 +2897,7 @@ pub struct SequenceStateBlob {
 }
 
 /// The fixed configuration envelope is sufficient for checked token replay.
-/// The opaque native payload remains useful only to its exporting worker.
+/// Opaque native payloads require independent export authentication.
 pub const SEQUENCE_STATE_HEADER_BYTES: usize = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2934,10 +2939,17 @@ impl SequenceReconstruction {
         if self.header.is_empty() || self.header.len() > SEQUENCE_STATE_HEADER_BYTES {
             return None;
         }
+        // Reconstruction carries tokens and a configuration binding, never an
+        // authenticated native payload. Keep the stored header unchanged so
+        // persistence can still identify the original signed full snapshot.
+        let mut header = self.header.clone();
+        if header.starts_with(b"native-seq-v2\0\0\0") {
+            header[..16].copy_from_slice(b"native-seq-v1\0\0\0");
+        }
         Some(SequenceStateBlob {
             sequence_id: self.sequence_id,
             token_count: token_ids.len(),
-            bytes: self.header.clone().into(),
+            bytes: header.into(),
             token_ids,
         })
     }
@@ -2947,6 +2959,10 @@ impl SequenceReconstruction {
 pub struct TokenizedPrompt {
     pub rendered_sha256: String,
     pub token_ids: Vec<i32>,
+    /// Token-exact leading text already reusable by the next ordinary reply.
+    pub resident_text_prefix_tokens: usize,
+    /// Leading text already reusable by the next multimodal reply.
+    pub resident_media_prefix_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

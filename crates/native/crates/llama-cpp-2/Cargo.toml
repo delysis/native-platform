@@ -11,7 +11,7 @@ repository = "https://github.com/utilityai/llama-cpp-rs"
 
 [dependencies]
 enumflags2 = "0.7.12"
-llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "b508f1c7652c751513c361c7e4fdeb090fbed577" }
+llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "2cee3adbbad556a980daa9bda1887d4881e68b91" }
 thiserror = "2"
 tracing = "0.1"
 tracing-core = "0.1"
@@ -57,7 +57,7 @@ dynamic-backends = ["llama-cpp-sys-2/dynamic-backends"]
 
 
 [target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies]
-llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "b508f1c7652c751513c361c7e4fdeb090fbed577", features = [
+llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "2cee3adbbad556a980daa9bda1887d4881e68b91", features = [
     "metal",
 ] }
 

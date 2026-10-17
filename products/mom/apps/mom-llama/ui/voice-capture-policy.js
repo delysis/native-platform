@@ -9,6 +9,18 @@
   const PREFILL_MAX_BLOCK_SAMPLES = 640;
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
+  const voiceProgressDeadlineExpired = ({ now, started, lastProgress, idleMs,
+    maxElapsedMs = 120_000 } = {}) => {
+    const current = Number(now);
+    const start = Number(started);
+    const progress = Number(lastProgress);
+    const idle = Number(idleMs);
+    const maximum = Number(maxElapsedMs);
+    if (![current, start, progress, idle, maximum].every(Number.isFinite)) return true;
+    if (idle < 0 || maximum < 0 || progress < start) return true;
+    return current - start >= maximum || current - progress >= idle;
+  };
+
   const splitPrefillPcm = (samples) => {
     const blocks = [];
     for (let offset = 0; offset < samples.length; offset += PREFILL_MAX_BLOCK_SAMPLES) {
@@ -105,20 +117,87 @@
     candidateMs: 0,
   });
 
+  // WebKit owns acoustic cancellation. This bounded reference matcher stops
+  // correlated residual speaker audio from becoming a false barge-in. It uses
+  // actual rendered output, not TTS text or a guessed volume threshold.
+  const createPlaybackEchoMatcher = () => {
+    const rate = 2_000;
+    const microphone = new Float32Array(80); // 40 ms evidence; no capture delay
+    let written = 0;
+    let pending = 0;
+    let previous = null;
+    let result = null;
+    let lastLag = null;
+    return {
+      process(input, inputRate, reference, referenceRate) {
+        if (!reference?.length || !input?.length) return null;
+        // Capture at 48 kHz and playback at 24 kHz both divide this analysis
+        // rate exactly. Unsupported rates retain WebKit's unmodified signal.
+        const stride = inputRate / rate;
+        const referenceStride = referenceRate / rate;
+        if (!Number.isInteger(stride) || !Number.isInteger(referenceStride)) return null;
+        for (const value of input) {
+          pending += value;
+          written += 1;
+          if (written % stride === 0) {
+            microphone.copyWithin(0, 1);
+            microphone[microphone.length - 1] = pending / stride;
+            pending = 0;
+          }
+        }
+        if (written < stride * microphone.length) return null;
+        // Run at 50 Hz, rather than on every 256-frame renderer callback.
+        const epoch = Math.floor(written / (inputRate / 50));
+        if (previous === epoch) return result;
+        previous = epoch;
+        const count = Math.floor(reference.length / referenceStride);
+        const output = new Float32Array(count);
+        for (let i = 0; i < count; i += 1) {
+          let sum = 0;
+          for (let j = 0; j < referenceStride; j += 1) sum += reference[i * referenceStride + j];
+          output[i] = sum / referenceStride;
+        }
+        let power = 0;
+        for (const value of microphone) power += value * value;
+        if (power < 1e-8) return null;
+        let best = 0;
+        let lag = 0;
+        for (let start = 0; start + microphone.length <= count; start += 1) {
+          let cross = 0;
+          let energy = 0;
+          for (let i = 0; i < microphone.length; i += 1) {
+            const value = output[start + i];
+            cross += value * microphone[i];
+            energy += value * value;
+          }
+          const correlation = energy > 1e-8 ? cross * cross / (energy * power) : 0;
+          if (correlation > best) { best = correlation; lag = count - start - microphone.length; }
+        }
+        const stable = lastLag !== null && Math.abs(lag - lastLag) <= rate * .025;
+        lastLag = best >= .64 ? lag : null;
+        result = best >= .64 && stable ? {
+          correlation: Math.sqrt(best),
+          residualRms: Math.sqrt(Math.max(0, power * (1 - best)) / microphone.length),
+        } : null;
+        return result;
+      },
+    };
+  };
+
   const initialPlaybackEchoGuard = () => ({
     playbackMs: 0,
     residualRms: .003,
     aboveMs: 0,
   });
 
-  const updatePlaybackEchoGuard = (guard, rms, durationMs) => {
+  const updatePlaybackEchoGuard = (guard, rms, durationMs, { matchedEcho = true } = {}) => {
     const current = guard || initialPlaybackEchoGuard();
     const level = Math.max(0, Number(rms) || 0);
     const elapsed = Math.max(0, Number(durationMs) || 0);
     current.playbackMs += elapsed;
     const threshold = Math.max(.009, (current.residualRms * 2.8) + .001);
     const warming = current.playbackMs <= 250;
-    if (level < threshold || warming) {
+    if (matchedEcho && level < threshold) {
       // Learn only plausible residual echo. A caller who speaks during the
       // short convergence interval must not teach the guard to reject them.
       if (level < .012) current.residualRms = (current.residualRms * .92) + (level * .08);
@@ -126,12 +205,7 @@
       return { guard: current, suppressed: true, threshold, warming };
     }
     current.aboveMs += elapsed;
-    return {
-      guard: current,
-      suppressed: current.aboveMs < 48,
-      threshold,
-      warming: false,
-    };
+    return { guard: current, suppressed: current.aboveMs < 48, threshold, warming };
   };
 
   const createStreamingMonoResampler = (sourceRate, targetRate = 16000) => {
@@ -390,6 +464,7 @@
   };
 
   const api = {
+    createPlaybackEchoMatcher,
     createLiveTranscriptionTap,
     callPrefillRetryDecision,
     analyzeVoiceSamples,
@@ -400,6 +475,7 @@
     speechThreshold,
     splitPrefillPcm,
     updatePlaybackEchoGuard,
+    voiceProgressDeadlineExpired,
   };
   root.MomVoiceCapturePolicy = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

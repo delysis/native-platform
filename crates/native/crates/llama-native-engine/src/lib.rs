@@ -43,8 +43,8 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunk, MtmdInputChunkType, MtmdInputText,
-    mtmd_default_marker,
+    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunk, MtmdInputChunkType,
+    MtmdInputChunks, MtmdInputText, mtmd_default_marker,
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -82,7 +82,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "b508f1c7652c751513c361c7e4fdeb090fbed577";
+pub const LLAMA_CPP_BINDING_REV: &str = "2cee3adbbad556a980daa9bda1887d4881e68b91";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -1586,6 +1586,12 @@ impl Drop for IncrementalAudioGeneration {
 }
 
 impl GenerationTicket {
+    /// True while this exact request is deliberately paused by its consumer.
+    #[must_use]
+    pub fn is_backpressured(&self) -> bool {
+        generation_backpressure_active(&self.request_id)
+    }
+
     pub fn cancel_branch(&self, branch_id: &str) -> bool {
         self.control.cancel_named(branch_id)
     }
@@ -2037,6 +2043,7 @@ struct NativeModelInner {
 
 #[derive(Debug)]
 struct WorkerIdentity {
+    state_authority: Option<Arc<state_buffer::PersistentAuthority>>,
     cooperative_decodes: cooperative::DecodeHub,
     kv_unified: bool,
     exports: state_buffer::LiveExports,
@@ -2045,6 +2052,7 @@ struct WorkerIdentity {
 impl Default for WorkerIdentity {
     fn default() -> Self {
         Self {
+            state_authority: None,
             cooperative_decodes: cooperative::DecodeHub::default(),
             kv_unified: true,
             exports: state_buffer::LiveExports::default(),
@@ -2313,7 +2321,8 @@ enum WorkerCommand {
     },
     Snapshot {
         sequence_id: i32,
-        response: Sender<NativeResult<SequenceStateBlob>>,
+        max_bytes: usize,
+        response: Sender<NativeResult<Option<SequenceStateBlob>>>,
     },
     Restore {
         state: SequenceStateBlob,
@@ -2391,6 +2400,11 @@ impl NativeModelHandle {
         }));
         let worker_status = Arc::clone(&status);
         let worker_identity = Arc::new(WorkerIdentity {
+            state_authority: config
+                .state_cache_directory
+                .as_deref()
+                .map(state_buffer::PersistentAuthority::open)
+                .transpose()?,
             kv_unified: config.kv_unified,
             ..WorkerIdentity::default()
         });
@@ -2474,6 +2488,17 @@ impl NativeModelHandle {
     /// Storage hint only: a live receipt can justify reading a same-worker spill.
     /// Native import independently checks full bytes, binding, and worker identity.
     #[must_use]
+    pub fn has_reusable_sequence(&self, state: &SequenceStateBlob) -> bool {
+        self.inner.ensure_accepting().is_ok()
+            && (self
+                .inner
+                .worker_identity
+                .state_authority
+                .as_ref()
+                .is_some_and(|key| key.verifies(state))
+                || self.has_live_sequence_receipt(&state.export_receipt()))
+    }
+
     pub fn has_live_sequence_receipt(&self, receipt: &[u8; 32]) -> bool {
         self.inner.ensure_accepting().is_ok()
             && self
@@ -2906,11 +2931,28 @@ impl NativeModelHandle {
     }
 
     pub fn snapshot_sequence(&self, sequence_id: i32) -> NativeResult<SequenceStateBlob> {
+        self.snapshot_sequence_if_fits(sequence_id, usize::MAX)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::CacheIncompatible,
+                    "sequence exceeds addressable memory",
+                )
+            })
+    }
+
+    /// Checks the native export size before allocating or copying any KV bytes.
+    /// Oversized automatic checkpoints leave the resident sequence untouched.
+    pub fn snapshot_sequence_if_fits(
+        &self,
+        sequence_id: i32,
+        max_bytes: usize,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
         self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
             WorkerCommand::Snapshot {
                 sequence_id,
+                max_bytes,
                 response: response_tx,
             },
             "submitting a sequence snapshot",
@@ -2953,12 +2995,9 @@ impl NativeModelHandle {
         self.require_unified_kv()?;
         self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
-        if request.branches.len() < 2 {
-            return Err(NativeError::new(
-                NativeErrorCode::InvalidConfig,
-                "prefix prefill requires two probe branches",
-            ));
-        }
+        // The explicit common_messages define this snapshot; we do not infer
+        // it by intersecting probe branches. One admitted branch is enough
+        // for a single-sequence profile (the validator still rejects zero).
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
             WorkerCommand::PrefillPrefix {
@@ -3445,6 +3484,7 @@ fn run_worker(
     let load_started = Instant::now();
     let _decode_lifetime = worker_identity.cooperative_decodes.worker_lifetime();
     let _export_lifetime = state_buffer::bind_worker_exports(&worker_identity.exports);
+    state_buffer::bind_persistent_authority(worker_identity.state_authority.clone());
     let WorkerLanes {
         command_rx,
         speculative_rx,
@@ -3670,7 +3710,14 @@ fn run_worker(
             }
         };
         let _speculative_permit = speculative_permit;
-        if !matches!(&command, WorkerCommand::GenerateIncrementalAudio { .. }) {
+        if !matches!(
+            &command,
+            WorkerCommand::GenerateIncrementalAudio { .. }
+                | WorkerCommand::InspectControlledIdentity { .. }
+                | WorkerCommand::Snapshot { .. }
+                | WorkerCommand::Tokenize { .. }
+                | WorkerCommand::PrepareInput { .. }
+        ) {
             invalidate_resident_audio_checkpoint(&mut context, &mut resident_audio_checkpoint);
         }
         // Tokenization, prepared-input rendering, identity inspection, and
@@ -3681,6 +3728,8 @@ fn run_worker(
         if !matches!(
             &command,
             WorkerCommand::GenerateIncrementalAudio { .. }
+                | WorkerCommand::GenerateMultimodal { .. }
+                | WorkerCommand::GenerateBatch { .. }
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Tokenize { .. }
@@ -3941,6 +3990,40 @@ fn run_worker(
                 let generated = if request.media.is_empty() {
                     prepare_generation_batch(&model, &request).and_then(
                         |(normalized, token_sets)| {
+                            // A text greeting after a call can reuse the leading
+                            // persona text retained with the audio history.
+                            if resident_text_prefix.token_ids.is_empty()
+                                && let Some(prefix) = resident_audio_text_prefix.as_ref()
+                                && !prefix.token_ids.is_empty()
+                            {
+                                let cleared =
+                                    context.clear_kv_cache_seq(Some(0), None, None).map_err(
+                                        |e| native_decode_error("clear text transition lane", e),
+                                    )?;
+                                if cleared {
+                                    context
+                                        .copy_kv_cache_seq(
+                                            prefix.sequence_id,
+                                            0,
+                                            Some(0),
+                                            Some(prefix.token_ids.len() as u32),
+                                        )
+                                        .map_err(|e| {
+                                            native_decode_error("reuse leading media text", e)
+                                        })?;
+                                    sequence_token_counts.insert(0, prefix.token_ids.len());
+                                    sequence_token_ids.insert(0, prefix.token_ids.clone());
+                                    resident_text_prefix.commit(
+                                        &resident_prefix_binding,
+                                        Some(prefix.token_ids.len()),
+                                        Some(&prefix.token_ids),
+                                    );
+                                }
+                            }
+                            invalidate_resident_audio_text_prefix(
+                                &mut context,
+                                &mut resident_audio_text_prefix,
+                            );
                             generate_batch(
                                 &model,
                                 &mut context,
@@ -3978,6 +4061,9 @@ fn run_worker(
                         &model,
                         &mut context,
                         multimodal.as_ref(),
+                        &fingerprint,
+                        &mut resident_audio_text_prefix,
+                        worker_identity.kv_unified,
                         &request,
                         BatchSupervision {
                             event_tx: &event_tx,
@@ -3999,6 +4085,7 @@ fn run_worker(
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
+                    resident_audio_text_prefix = None;
                     emit_failed_case_events(&event_tx, &request);
                 }
                 // A one-branch text reply can be followed immediately by a
@@ -4158,6 +4245,10 @@ fn run_worker(
                     &model,
                     &mut context,
                     multimodal.as_ref(),
+                    &fingerprint,
+                    &mut resident_audio_text_prefix,
+                    worker_identity.kv_unified
+                        && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32,
                     &request,
                     SingleSequenceSupervision {
                         event_tx: &event_tx,
@@ -4356,13 +4447,14 @@ fn run_worker(
             }
             WorkerCommand::Snapshot {
                 sequence_id,
+                max_bytes,
                 response,
             } => {
                 let token_count = sequence_token_counts
                     .get(&sequence_id)
                     .copied()
                     .unwrap_or_default();
-                let _ = response.send(state_buffer::export_sequence(
+                let _ = response.send(state_buffer::export_sequence_bounded(
                     &context,
                     &fingerprint,
                     sequence_id,
@@ -4371,6 +4463,7 @@ fn run_worker(
                         .get(&sequence_id)
                         .cloned()
                         .unwrap_or_default(),
+                    max_bytes,
                 ));
             }
             WorkerCommand::Restore {
@@ -4409,6 +4502,27 @@ fn run_worker(
                             sequence_token_counts.get(&0).copied(),
                             sequence_token_ids.get(&0),
                         );
+                        if destination_sequence_id == 0
+                            && worker_identity.kv_unified
+                            && fingerprint.max_sequences
+                                > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+                            && !resident_text_prefix.token_ids.is_empty()
+                            && multimodal.as_ref().is_some_and(|projector| {
+                                media_kinds_for_context(projector).contains(&MediaKind::Audio)
+                            })
+                            && retain_incremental_audio_text_prefix(
+                                &mut context,
+                                0,
+                                &resident_text_prefix.token_ids,
+                                &mut resident_audio_text_prefix,
+                            )
+                            .is_err()
+                        {
+                            invalidate_resident_audio_text_prefix(
+                                &mut context,
+                                &mut resident_audio_text_prefix,
+                            );
+                        }
                     } else {
                         // Raw import and decode may fail after partial mutation.
                         // Discard every sequence, including valid peer sequences,
@@ -4440,7 +4554,22 @@ fn run_worker(
                 chat_template,
                 response,
             } => {
-                let _ = response.send(tokenize_messages(&model, messages, &chat_template));
+                let result =
+                    tokenize_messages(&model, messages, &chat_template).map(|mut prompt| {
+                        prompt.resident_text_prefix_tokens = resident_text_prefix.reusable_tokens(
+                            &resident_prefix_binding,
+                            &[prompt.token_ids.iter().copied().map(LlamaToken).collect()],
+                        );
+                        prompt.resident_media_prefix_tokens = resident_audio_text_prefix
+                            .as_ref()
+                            .map_or(0, |prefix| prefix.reusable_tokens(&prompt.token_ids));
+                        if resident_text_prefix.token_ids.is_empty() {
+                            prompt.resident_text_prefix_tokens =
+                                prompt.resident_media_prefix_tokens;
+                        }
+                        prompt
+                    });
+                let _ = response.send(result);
             }
             WorkerCommand::PrepareInput { input, response } => {
                 let _ = response.send(prepare_input(&model, input));
@@ -4666,6 +4795,8 @@ fn generation_context_params(
         .with_n_ctx(NonZeroU32::new(context_tokens))
         .with_n_batch(config.batch_tokens)
         .with_n_ubatch(config.batch_tokens.min(512))
+        // Prefix edits may rewind anywhere in the retained context.
+        .with_swa_full(true)
         .with_n_seq_max(config.max_sequences)
         .with_n_threads(native_thread_count())
         .with_n_threads_batch(native_thread_count())
@@ -5251,9 +5382,12 @@ fn generate_batch(
         0
     };
     let resident_prefix = if single_branch
-        && cached_states[0]
-            .is_some_and(|state| resident_prefix_wins(resident_candidate, state.token_count))
-    {
+        && cached_states[0].is_some_and(|state| {
+            resident_prefix_wins(
+                resident_candidate,
+                reusable_saved_tokens(state, &token_sets[0]),
+            )
+        }) {
         cached_states[0] = None;
         resident_candidate
     } else if cached_states[0].is_none() {
@@ -5272,25 +5406,15 @@ fn generate_batch(
         let Some(state) = state else {
             continue;
         };
-        if state.token_count == 0
-            || state.token_count != state.token_ids.len()
-            || state.token_count >= token_sets[index].len()
-            || !token_sets[index]
-                .iter()
-                .take(state.token_count)
-                .map(|token| token.0)
-                .eq(state.token_ids.iter().copied())
-        {
+        let matched = reusable_saved_tokens(state, &token_sets[index]);
+        if matched == 0 || (exact_cell_budget.is_some() && matched != state.token_count) {
             return Err(NativeError::new(
                 NativeErrorCode::CacheIncompatible,
-                format!(
-                    "saved KV prefix does not match rendered branch `{}`",
-                    request.branches[index].branch_id
-                ),
+                "saved KV has no compatible prefix for this generation contract",
             ));
         }
         validate_saved_sequence(state, index as i32, model.n_vocab(), fingerprint)?;
-        prefix_lengths[index] = state.token_count;
+        prefix_lengths[index] = matched;
     }
     let (shared_uncached_prefix, required_tokens) = if let Some(budget) = exact_cell_budget {
         exact_budget_execution_values(
@@ -5388,9 +5512,17 @@ fn generate_batch(
     tracking.token_ids.clear();
     for (index, state) in cached_states.iter().enumerate() {
         if let Some(state) = state {
-            let kind = restore_saved_sequence(model, context, fingerprint, state, index as i32)?;
+            let kind = restore_saved_prefix(
+                model,
+                context,
+                fingerprint,
+                state,
+                index as i32,
+                prefix_lengths[index],
+                || supervision.cancellations[index].load(Ordering::Acquire),
+            )?;
             if kind == SequenceRestoreKind::TokenReplay {
-                replayed_prefix_lengths[index] = state.token_count;
+                replayed_prefix_lengths[index] = prefix_lengths[index];
             }
         }
     }
@@ -5401,12 +5533,13 @@ fn generate_batch(
         let source = uncached_indices[0];
         let decode_start = if source == 0 { resident_prefix } else { 0 };
         if decode_start < shared_uncached_prefix {
-            decode_tokens_chunked(
+            decode_tokens_chunked_cancellable(
                 context,
                 &token_sets[source][decode_start..shared_uncached_prefix],
                 source as i32,
                 decode_start as i32,
                 false,
+                || supervision.cancellations[source].load(Ordering::Acquire),
             )?;
         }
         for destination in uncached_indices.iter().copied().skip(1) {
@@ -5429,7 +5562,14 @@ fn generate_batch(
         let prefix = prefix_lengths[sequence_id];
         let suffix = &tokens[prefix..tokens.len() - 1];
         if !suffix.is_empty() {
-            decode_tokens_chunked(context, suffix, sequence_id as i32, prefix as i32, false)?;
+            decode_tokens_chunked_cancellable(
+                context,
+                suffix,
+                sequence_id as i32,
+                prefix as i32,
+                false,
+                || supervision.cancellations[sequence_id].load(Ordering::Acquire),
+            )?;
         }
     }
     let mut final_prompt_batch = LlamaBatch::new(request.branches.len(), 1);
@@ -5692,8 +5832,7 @@ fn generate_batch(
                 cache: if let Some(state) = cached_states[branch.sequence_id as usize] {
                     GenerationCacheMetrics {
                         supplied_prefix_tokens: state.token_count,
-                        restored_prefix_tokens: state
-                            .token_count
+                        restored_prefix_tokens: prefix_lengths[branch.sequence_id as usize]
                             .saturating_sub(replayed_prefix_lengths[branch.sequence_id as usize]),
                         replayed_prefix_tokens: replayed_prefix_lengths
                             [branch.sequence_id as usize],
@@ -5730,10 +5869,14 @@ fn generate_batch(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_multimodal_batch(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     multimodal: Option<&MtmdContext>,
+    fingerprint: &ModelFingerprint,
+    resident: &mut Option<ResidentAudioTextPrefix>,
+    kv_unified: bool,
     request: &GenerationBatchRequest,
     mut supervision: BatchSupervision<'_>,
     mut tracking: SequenceTracking<'_>,
@@ -5744,7 +5887,6 @@ fn generate_multimodal_batch(
             "multimodal batch generation requires a loaded mmproj GGUF",
         ));
     };
-    context.clear_kv_cache();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
 
@@ -5828,14 +5970,67 @@ fn generate_multimodal_batch(
         supervision.emit_state(&normalized, branch, index, 0, GenerationState::Prefilling);
     }
     let started = Instant::now();
-    let next_position = chunks
-        .eval_chunks(multimodal, context, 0, 0, context.n_batch() as i32, true)
-        .map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::DecodeFailed,
-                format!("failed to evaluate multimodal batch prompt: {error}"),
-            )
-        })?;
+    let leading_tokens = multimodal_prefix_cells(&chunks)?
+        .into_iter()
+        .take_while(|cell| matches!(cell, MultimodalPrefixCell::Text(_)))
+        .filter_map(|cell| {
+            if let MultimodalPrefixCell::Text(token) = cell {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let cached_prefix = request
+        .cases
+        .iter()
+        .filter_map(|case| case.cached_prefix.as_ref())
+        .max_by_key(|state| {
+            state
+                .token_ids
+                .iter()
+                .zip(&leading_tokens)
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .cloned();
+    let first = &request.cases[0];
+    let prefill_request = GenerationRequest {
+        request_id: request.request_id.clone(),
+        model_id: request.model_id.clone(),
+        input: first.input.clone(),
+        sampling: first.sampling.clone(),
+        media: Vec::new(),
+        cached_prefix,
+    };
+    let retain = kv_unified
+        && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+        && request.cases.len() <= RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as usize;
+    let (next_position, restore_kind, matched) = prefill_multimodal_cached(
+        model,
+        context,
+        multimodal,
+        fingerprint,
+        &prefill_request,
+        &chunks,
+        resident,
+        kv_unified && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32,
+        || {
+            supervision
+                .cancellations
+                .iter()
+                .all(|flag| flag.load(Ordering::Acquire))
+        },
+        true,
+    )?;
+    if !retain {
+        invalidate_resident_audio_text_prefix(context, resident);
+    }
+    let reused = if restore_kind == Some(SequenceRestoreKind::TokenReplay) {
+        0
+    } else {
+        matched
+    };
     let copy_end = u32::try_from(next_position).map_err(|_| {
         NativeError::new(
             NativeErrorCode::DecodeFailed,
@@ -6097,11 +6292,26 @@ fn generate_multimodal_batch(
                 first_token_ms: branch.first_token_ms,
                 tokens_per_second,
                 cache: GenerationCacheMetrics {
-                    supplied_prefix_tokens: 0,
-                    restored_prefix_tokens: 0,
-                    replayed_prefix_tokens: 0,
-                    batch_shared_prefix_tokens: prompt_tokens,
-                    resident_prefix_tokens: 0,
+                    supplied_prefix_tokens: prefill_request
+                        .cached_prefix
+                        .as_ref()
+                        .map_or(0, |state| state.token_count),
+                    restored_prefix_tokens: if restore_kind
+                        == Some(SequenceRestoreKind::NativeState)
+                    {
+                        reused
+                    } else {
+                        0
+                    },
+                    replayed_prefix_tokens: if restore_kind
+                        == Some(SequenceRestoreKind::TokenReplay)
+                    {
+                        matched
+                    } else {
+                        0
+                    },
+                    batch_shared_prefix_tokens: prompt_tokens.saturating_sub(reused),
+                    resident_prefix_tokens: if restore_kind.is_none() { reused } else { 0 },
                 },
             },
             real_engine_invoked: true,
@@ -6826,6 +7036,63 @@ static SAVED_PREFIX_REPLAY_DECODES: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static FAIL_NEXT_REPLAY_AFTER_DECODE: AtomicBool = AtomicBool::new(false);
 
+fn reusable_saved_tokens(state: &SequenceStateBlob, prompt: &[LlamaToken]) -> usize {
+    state
+        .token_ids
+        .iter()
+        .zip(prompt)
+        .take(prompt.len().saturating_sub(1))
+        .take_while(|(a, b)| **a == b.0)
+        .count()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_saved_prefix(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    state: &SequenceStateBlob,
+    destination: i32,
+    matched: usize,
+    cancelled: impl Fn() -> bool,
+) -> NativeResult<SequenceRestoreKind> {
+    validate_saved_sequence(state, destination, model.n_vocab(), fingerprint)?;
+    if matched == 0 || matched > state.token_count {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "empty or oversized shared cache prefix",
+        ));
+    }
+    if cancelled() {
+        return Err(NativeError::new(
+            NativeErrorCode::Cancelled,
+            "cancelled before cache restore",
+        ));
+    }
+    if state_buffer::import_sequence(context, fingerprint, state, destination)?
+        && (matched == state.token_count
+            || context
+                .clear_kv_cache_seq(Some(destination as u32), Some(matched as u32), None)
+                .map_err(|e| native_decode_error("failed to crop restored prefix", e))?)
+    {
+        return Ok(SequenceRestoreKind::NativeState);
+    }
+    // Some recurrent architectures cannot roll back arbitrary positions. Only
+    // report native reuse if the backend actually retained the common prefix.
+    let cleared = context
+        .clear_kv_cache_seq(Some(destination as u32), None, None)
+        .map_err(|e| native_decode_error("failed to clear replay sequence", e))?;
+    let tokens = state.token_ids[..matched]
+        .iter()
+        .copied()
+        .map(LlamaToken)
+        .collect::<Vec<_>>();
+    replay_after_sequence_clear(cleared, || {
+        decode_tokens_chunked_cancellable(context, &tokens, destination, 0, false, cancelled)
+    })?;
+    Ok(SequenceRestoreKind::TokenReplay)
+}
+
 fn restore_saved_sequence(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -6856,7 +7123,14 @@ fn restore_saved_sequence(
     replay_after_sequence_clear(cleared, || {
         #[cfg(test)]
         SAVED_PREFIX_REPLAY_DECODES.fetch_add(1, Ordering::SeqCst);
-        decode_tokens_chunked(context, &tokens, destination_sequence_id, 0, false)
+        decode_tokens_chunked_cancellable(
+            context,
+            &tokens,
+            destination_sequence_id,
+            0,
+            false,
+            || false,
+        )
     })?;
     #[cfg(test)]
     if FAIL_NEXT_REPLAY_AFTER_DECODE.swap(false, Ordering::SeqCst) {
@@ -6913,7 +7187,6 @@ fn prefill_shared_prefix(
     sequence_token_counts: &mut HashMap<i32, usize>,
     sequence_token_ids: &mut HashMap<i32, Vec<i32>>,
 ) -> NativeResult<SequenceStateBlob> {
-    context.clear_kv_cache();
     sequence_token_counts.clear();
     sequence_token_ids.clear();
     let prompt = render_messages_prompt_with_template(
@@ -6936,11 +7209,267 @@ fn prefill_shared_prefix(
             "the common messages produced no reusable rendered prompt prefix",
         ));
     }
-    decode_tokens_chunked(context, &tokens, 0, 0, false)?;
+    let matched = request
+        .cached_prefix
+        .as_ref()
+        .map_or(0, |state| reusable_saved_tokens(state, &tokens));
+    if let Some(state) = request.cached_prefix.as_ref().filter(|_| matched > 0) {
+        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+    }
+    context.clear_kv_cache();
+    if let Some(state) = request.cached_prefix.as_ref().filter(|_| matched > 0) {
+        restore_saved_prefix(model, context, fingerprint, state, 0, matched, || false)?;
+    }
+    decode_tokens_chunked_cancellable(
+        context,
+        &tokens[matched..],
+        0,
+        matched as i32,
+        false,
+        || false,
+    )?;
     let token_ids = tokens.iter().map(|token| token.0).collect::<Vec<_>>();
     sequence_token_counts.insert(0, tokens.len());
     sequence_token_ids.insert(0, token_ids.clone());
     state_buffer::export_sequence(context, fingerprint, 0, tokens.len(), token_ids)
+}
+
+// Cache keys describe evaluated positions, including verified media content.
+// Text substitution stops reuse at the first changed token; an unchanged audio
+// chunk is reusable only in full, never from a partially matched embedding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultimodalPrefixCell {
+    Text(i32),
+    Media {
+        digest: [u8; 32],
+        chunk: usize,
+        offset: usize,
+    },
+}
+
+fn multimodal_prefix_cells(chunks: &MtmdInputChunks) -> NativeResult<Vec<MultimodalPrefixCell>> {
+    let mut cells = Vec::with_capacity(chunks.total_tokens());
+    let mut media_parts = HashMap::<String, usize>::new();
+    for index in 0..chunks.len() {
+        let chunk = chunks
+            .get(index)
+            .ok_or_else(|| native_decode_error("missing prompt chunk", index))?;
+        if let Some(tokens) = chunk.text_tokens() {
+            cells.extend(
+                tokens
+                    .iter()
+                    .map(|token| MultimodalPrefixCell::Text(token.0)),
+            );
+        } else {
+            // Image position encodings need their own cache contract. Retain
+            // the proven prefix before them, never invent linear positions.
+            if chunk.chunk_type() != MtmdInputChunkType::Audio {
+                break;
+            }
+            let Some(id) = chunk.id().filter(|id| !id.is_empty()) else {
+                break;
+            };
+            let part = media_parts.entry(id.clone()).or_default();
+            let digest = Sha256::digest(id.as_bytes()).into();
+            cells.extend(
+                (0..chunk.n_tokens()).map(|offset| MultimodalPrefixCell::Media {
+                    digest,
+                    chunk: *part,
+                    offset,
+                }),
+            );
+            *part += 1;
+        }
+    }
+    Ok(cells)
+}
+
+fn common_multimodal_prefix(
+    cached: &[MultimodalPrefixCell],
+    prompt: &[MultimodalPrefixCell],
+    final_logits: bool,
+) -> usize {
+    let limit = prompt.len().saturating_sub(usize::from(final_logits));
+    let mut matched = cached
+        .iter()
+        .zip(prompt)
+        .take(limit)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // If a media chunk changes length, its common cells are not an authorized
+    // partial projection. Crop back to its beginning.
+    if let Some(MultimodalPrefixCell::Media { offset, .. }) = prompt.get(matched) {
+        matched = matched.saturating_sub(*offset);
+    }
+    matched
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_multimodal_cached(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    multimodal: &MtmdContext,
+    fingerprint: &ModelFingerprint,
+    request: &GenerationRequest,
+    chunks: &MtmdInputChunks,
+    resident: &mut Option<ResidentAudioTextPrefix>,
+    cache_supported: bool,
+    cancelled: impl Fn() -> bool,
+    final_logits: bool,
+) -> NativeResult<(i32, Option<SequenceRestoreKind>, usize)> {
+    let cells = multimodal_prefix_cells(chunks)?;
+    let leading_text = cells
+        .iter()
+        .take_while(|cell| matches!(cell, MultimodalPrefixCell::Text(_)))
+        .filter_map(|cell| {
+            if let MultimodalPrefixCell::Text(token) = cell {
+                Some(*token)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let resident_tokens = if cache_supported {
+        resident.as_ref().map_or(0, |prefix| {
+            common_multimodal_prefix(&prefix.cells, &cells, final_logits)
+        })
+    } else {
+        0
+    };
+    let supplied_tokens = request.cached_prefix.as_ref().map_or(0, |state| {
+        state
+            .token_ids
+            .iter()
+            .zip(&leading_text)
+            .take(leading_text.len().saturating_sub(usize::from(final_logits)))
+            .take_while(|(a, b)| a == b)
+            .count()
+    });
+    let supplied = request
+        .cached_prefix
+        .as_ref()
+        .filter(|_| supplied_tokens > resident_tokens);
+    if let Some(state) = supplied {
+        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+    }
+    if cancelled() {
+        return Err(NativeError::new(
+            NativeErrorCode::Cancelled,
+            "cancelled before media prefill",
+        ));
+    }
+    let (mut position, kind, reused) = if let Some(state) = supplied {
+        // Restoring a sequence does not require clearing unrelated retained
+        // lanes. Those remain a valid fallback until this prefix is complete.
+        clear_audio_working_sequences(
+            context,
+            fingerprint.max_sequences,
+            resident.as_ref().map(|p| p.sequence_id),
+        )?;
+        let kind = restore_saved_prefix(
+            model,
+            context,
+            fingerprint,
+            state,
+            0,
+            supplied_tokens,
+            &cancelled,
+        )?;
+        (supplied_tokens, Some(kind), supplied_tokens)
+    } else {
+        clear_audio_working_sequences(
+            context,
+            fingerprint.max_sequences,
+            resident.as_ref().map(|p| p.sequence_id),
+        )?;
+        if resident_tokens > 0 {
+            context
+                .copy_kv_cache_seq(
+                    RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+                    0,
+                    Some(0),
+                    Some(resident_tokens as u32),
+                )
+                .map_err(|e| native_decode_error("failed to reuse media prefix", e))?;
+        }
+        (resident_tokens, None, resident_tokens)
+    };
+    let mut chunk_start = 0;
+    for index in 0..chunks.len() {
+        if cancelled() {
+            return Err(NativeError::new(
+                NativeErrorCode::Cancelled,
+                "cancelled during media prefill",
+            ));
+        }
+        let chunk = chunks
+            .get(index)
+            .ok_or_else(|| native_decode_error("missing prompt chunk", index))?;
+        let end = chunk_start + chunk.n_tokens();
+        if end <= position {
+            chunk_start = end;
+            continue;
+        }
+        if end.saturating_add(request.sampling.max_tokens as usize) > context.n_ctx() as usize {
+            return Err(NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "media prompt and completion exceed the native context",
+            ));
+        }
+        if let Some(tokens) = chunk.text_tokens() {
+            let offset = position.saturating_sub(chunk_start);
+            decode_tokens_chunked_cancellable(
+                context,
+                &tokens[offset..],
+                0,
+                position as i32,
+                final_logits && index + 1 == chunks.len(),
+                &cancelled,
+            )?;
+            position = end;
+        } else {
+            if position != chunk_start {
+                return Err(NativeError::new(
+                    NativeErrorCode::CacheIncompatible,
+                    "cached prefix splits a media chunk",
+                ));
+            }
+            position = chunk
+                .eval(
+                    multimodal,
+                    context,
+                    position as i32,
+                    0,
+                    context.n_batch() as i32,
+                    final_logits && index + 1 == chunks.len(),
+                )
+                .map_err(|e| native_decode_error("failed to evaluate media chunk", e))?
+                .max(0) as usize;
+        }
+        chunk_start = position;
+    }
+    if cache_supported && !cells.is_empty() {
+        // Promote only after successful evaluation; a cancelled prefill never
+        // makes metadata describe cells that were not actually decoded.
+        resident.take();
+        context
+            .clear_kv_cache_seq(Some(RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32), None, None)
+            .map_err(|e| native_decode_error("failed to clear media prefix", e))?;
+        context
+            .copy_kv_cache_seq(
+                0,
+                RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+                Some(0),
+                Some(cells.len() as u32),
+            )
+            .map_err(|e| native_decode_error("failed to retain media prefix", e))?;
+        *resident = Some(ResidentAudioTextPrefix {
+            sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+            token_ids: leading_text,
+            cells,
+        });
+    }
+    Ok((position as i32, kind, reused))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6953,14 +7482,15 @@ struct ResidentAudioCheckpoint {
     projected_samples: usize,
 }
 
-/// Text-only prompt state retained inside the live Gemma worker for the next
-/// microphone turn. Keeping this sequence resident avoids exporting and then
+/// Verified text/audio prompt state retained inside the live Gemma worker for
+/// the next microphone turn. Keeping this sequence resident avoids exporting and then
 /// importing hundreds of megabytes of hybrid recurrent state merely to reuse
 /// a persona/history prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResidentAudioTextPrefix {
     sequence_id: i32,
     token_ids: Vec<i32>,
+    cells: Vec<MultimodalPrefixCell>,
 }
 
 impl ResidentAudioTextPrefix {
@@ -7045,6 +7575,11 @@ fn retain_incremental_audio_text_prefix(
     *prefix = Some(ResidentAudioTextPrefix {
         sequence_id: destination,
         token_ids: token_ids.to_vec(),
+        cells: token_ids
+            .iter()
+            .copied()
+            .map(MultimodalPrefixCell::Text)
+            .collect(),
     });
     Ok(())
 }
@@ -7320,7 +7855,8 @@ fn generate_incremental_audio(
         audio_checkpoint_supported && resume_key_matched && request_matched;
     let resident_text_prefix_supported = audio_checkpoint_supported
         && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32;
-    let resident_prefix_tokens = if !audio_checkpoint_matches && resident_text_prefix_supported {
+    let mut resident_prefix_tokens = if !audio_checkpoint_matches && resident_text_prefix_supported
+    {
         resident_audio_text_prefix
             .as_ref()
             .map_or(0, |prefix| prefix.reusable_tokens(&prefix_token_ids))
@@ -7330,14 +7866,7 @@ fn generate_incremental_audio(
     // The runtime's saved prefix may predate the resident text prefix. Use
     // whichever covers more of this exact rendered prompt; importing a shorter
     // saved state would discard useful KV already in the worker.
-    let cached_prefix = request
-        .cached_prefix
-        .as_ref()
-        .filter(|state| !resident_prefix_wins(resident_prefix_tokens, state.token_count));
-    if let Some(state) = cached_prefix {
-        validate_incremental_audio_prefix_tokens(state, &prefix_token_ids)?;
-        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
-    }
+    let cached_prefix = request.cached_prefix.as_ref();
     let prior_audio = resident_audio_checkpoint.take();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
@@ -7363,222 +7892,25 @@ fn generate_incremental_audio(
         (
             checkpoint.sequence_id,
             checkpoint.next_position,
-            cached_prefix.map(|_| SequenceRestoreKind::NativeState),
+            None,
             checkpoint.prompt_tokens,
             checkpoint.projected_samples,
         )
-    } else if let Some(state) = cached_prefix {
-        invalidate_resident_audio_text_prefix(context, resident_audio_text_prefix);
-        context.clear_kv_cache();
-        let kind = restore_saved_sequence(model, context, fingerprint, state, 0)?;
-        let remaining = prefix_token_ids[state.token_count..]
-            .iter()
-            .copied()
-            .map(LlamaToken)
-            .collect::<Vec<_>>();
-        if !remaining.is_empty() {
-            let restored_position = i32::try_from(state.token_count).map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::PromptTooLarge,
-                    "saved incremental audio prefix exceeded the native position range",
-                )
-            })?;
-            decode_tokens_chunked(context, &remaining, 0, restored_position, false)?;
-        }
-        let next_position = i32::try_from(prefix_token_ids.len()).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::PromptTooLarge,
-                "incremental audio prefix exceeded the native position range",
-            )
-        })?;
-        if resident_text_prefix_supported {
-            retain_incremental_audio_text_prefix(
-                context,
-                0,
-                &prefix_token_ids,
-                resident_audio_text_prefix,
-            )?;
-        }
-        (
-            0,
-            next_position,
-            Some(kind),
-            prefix_chunks.total_tokens(),
-            0,
-        )
-    } else if !request.media.is_empty() {
-        let retained_sequence = resident_audio_text_prefix
-            .as_ref()
-            .map(|prefix| prefix.sequence_id);
-        clear_audio_working_sequences(context, fingerprint.max_sequences, retained_sequence)?;
-        if resident_prefix_tokens > 0 {
-            let retained = resident_audio_text_prefix.as_ref().ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "resident audio prefix disappeared before reuse",
-                )
-            })?;
-            let end = u32::try_from(resident_prefix_tokens).map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::PromptTooLarge,
-                    "resident audio prefix exceeded the native sequence API",
-                )
-            })?;
-            context
-                .copy_kv_cache_seq(retained.sequence_id, 0, Some(0), Some(end))
-                .map_err(|error| {
-                    native_decode_error("failed to reuse the resident audio prefix", error)
-                })?;
-        }
-        let mut position = 0_i32;
-        for index in 0..prefix_chunks.len() {
-            let chunk = prefix_chunks.get(index).ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "historical audio prefix chunk disappeared during evaluation",
-                )
-            })?;
-            let chunk_tokens = chunk.n_tokens();
-            if position.max(0) as usize + chunk_tokens + request.sampling.max_tokens as usize
-                > context.n_ctx() as usize
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::PromptTooLarge,
-                    "historical audio prefix and completion exceed the native context",
-                ));
-            }
-            let chunk_start = position;
-            if chunk.chunk_type() == MtmdInputChunkType::Text {
-                let tokens = chunk.text_tokens().ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ModelInvalid,
-                        "historical audio prefix text chunk contained no tokens",
-                    )
-                })?;
-                let reused_here = resident_prefix_tokens
-                    .saturating_sub(chunk_start.max(0) as usize)
-                    .min(tokens.len());
-                if reused_here < tokens.len() {
-                    decode_tokens_chunked(
-                        context,
-                        &tokens[reused_here..],
-                        0,
-                        position.saturating_add(i32::try_from(reused_here).map_err(|_| {
-                            NativeError::new(
-                                NativeErrorCode::PromptTooLarge,
-                                "resident audio prefix exceeded the native position range",
-                            )
-                        })?),
-                        false,
-                    )?;
-                }
-                position = position.saturating_add(i32::try_from(tokens.len()).map_err(|_| {
-                    NativeError::new(
-                        NativeErrorCode::PromptTooLarge,
-                        "historical audio prefix exceeded the native position range",
-                    )
-                })?);
-            } else if chunk.chunk_type() == MtmdInputChunkType::Audio {
-                if resident_prefix_tokens > chunk_start.max(0) as usize {
-                    return Err(NativeError::new(
-                        NativeErrorCode::CacheIncompatible,
-                        "resident text prefix crossed a historical audio boundary",
-                    ));
-                }
-                position = chunk
-                    .eval(
-                        multimodal,
-                        context,
-                        position,
-                        0,
-                        context.n_batch() as i32,
-                        false,
-                    )
-                    .map_err(|error| {
-                        NativeError::new(
-                            NativeErrorCode::DecodeFailed,
-                            format!(
-                                "failed to prefill historical audio at position {position}: {error}"
-                            ),
-                        )
-                    })?;
-            } else {
-                return Err(NativeError::new(
-                    NativeErrorCode::UnsupportedMedia,
-                    "incremental audio history only accepts audio media",
-                ));
-            }
-        }
-        if resident_text_prefix_supported {
-            retain_incremental_audio_text_prefix(
-                context,
-                0,
-                &prefix_token_ids,
-                resident_audio_text_prefix,
-            )?;
-        }
-        (0, position, None, prefix_chunks.total_tokens(), 0)
     } else {
-        let retained_sequence = resident_audio_text_prefix
-            .as_ref()
-            .map(|prefix| prefix.sequence_id);
-        clear_audio_working_sequences(context, fingerprint.max_sequences, retained_sequence)?;
-        // Decode the known text-only prefix through the ordinary token
-        // path. mtmd_helper_eval_chunks returns a chunk-relative position
-        // for split text prompts; feeding that value into the first audio
-        // embedding restarts near position zero and violates recurrent KV
-        // continuity.
-        if resident_prefix_tokens > 0 {
-            let retained = resident_audio_text_prefix.as_ref().ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "resident audio prefix disappeared before reuse",
-                )
-            })?;
-            let end = u32::try_from(resident_prefix_tokens).map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::PromptTooLarge,
-                    "resident audio prefix exceeded the native sequence API",
-                )
-            })?;
-            context
-                .copy_kv_cache_seq(retained.sequence_id, 0, Some(0), Some(end))
-                .map_err(|error| {
-                    native_decode_error("failed to reuse the resident audio prefix", error)
-                })?;
-        }
-        let prefix_tokens = prefix_token_ids[resident_prefix_tokens..]
-            .iter()
-            .copied()
-            .map(LlamaToken::new)
-            .collect::<Vec<_>>();
-        decode_tokens_chunked(
+        let (position, kind, reused) = prefill_multimodal_cached(
+            model,
             context,
-            &prefix_tokens,
-            0,
-            i32::try_from(resident_prefix_tokens).map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::PromptTooLarge,
-                    "resident audio prefix exceeded the native position range",
-                )
-            })?,
+            multimodal,
+            fingerprint,
+            request,
+            &prefix_chunks,
+            resident_audio_text_prefix,
+            resident_text_prefix_supported,
+            || supervision.cancellation.load(Ordering::Acquire),
             false,
         )?;
-        let position = i32::try_from(prefix_token_ids.len()).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::PromptTooLarge,
-                "incremental audio prefix exceeded the native position range",
-            )
-        })?;
-        if resident_text_prefix_supported {
-            retain_incremental_audio_text_prefix(
-                context,
-                0,
-                &prefix_token_ids,
-                resident_audio_text_prefix,
-            )?;
-        }
-        (0, position, None, prefix_chunks.total_tokens(), 0)
+        resident_prefix_tokens = reused;
+        (0, position, kind, prefix_chunks.total_tokens(), 0)
     };
     let resume = IncrementalAudioResume {
         reused: matched_audio.is_some(),
@@ -7599,10 +7931,11 @@ fn generate_incremental_audio(
         prefix_started_us,
         prefix_started.elapsed(),
         prefix_chunks.total_tokens(),
-        cached_prefix.map_or(resident_prefix_tokens, |state| {
-            usize::from(restored_prefix_kind == Some(SequenceRestoreKind::NativeState))
-                * state.token_count
-        }),
+        if restored_prefix_kind == Some(SequenceRestoreKind::TokenReplay) {
+            0
+        } else {
+            resident_prefix_tokens
+        },
     );
     let mut audio_block = Vec::with_capacity(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES);
     let mut admitted_audio = projected_full_samples != 0;
@@ -7791,12 +8124,13 @@ fn generate_incremental_audio(
                                 "incremental audio boundary was not text",
                             )
                         })?;
-                        decode_tokens_chunked(
+                        decode_tokens_chunked_cancellable(
                             context,
                             tokens,
                             active_sequence_id,
                             next_position,
                             false,
+                            || supervision.cancellation.load(Ordering::Acquire),
                         )?;
                         next_position =
                             next_position
@@ -7891,7 +8225,14 @@ fn generate_incremental_audio(
                 "incremental audio and completion exceed the native context",
             ));
         }
-        decode_tokens_chunked(context, tokens, active_sequence_id, next_position, false)?;
+        decode_tokens_chunked_cancellable(
+            context,
+            tokens,
+            active_sequence_id,
+            next_position,
+            false,
+            || supervision.cancellation.load(Ordering::Acquire),
+        )?;
         next_position =
             next_position.saturating_add(i32::try_from(chunk_tokens).map_err(|_| {
                 NativeError::new(
@@ -7942,12 +8283,13 @@ fn generate_incremental_audio(
             "incremental audio and completion exceed the native context",
         ));
     }
-    decode_tokens_chunked(
+    decode_tokens_chunked_cancellable(
         context,
         &suffix_tokens,
         active_sequence_id,
         next_position,
         true,
+        || supervision.cancellation.load(Ordering::Acquire),
     )?;
     next_position =
         next_position.saturating_add(i32::try_from(suffix_tokens.len()).map_err(|_| {
@@ -8016,15 +8358,15 @@ fn generate_incremental_audio(
         let _ = context.clear_kv_cache_seq(Some(active_sequence_id as u32), None, None);
         *resident_audio_checkpoint = None;
     }
-    if let Some(state) = cached_prefix {
+    if let Some(state) = cached_prefix.filter(|_| restored_prefix_kind.is_some()) {
         output.metrics.cache.supplied_prefix_tokens = state.token_count;
         match restored_prefix_kind {
             Some(SequenceRestoreKind::NativeState) => {
-                output.metrics.cache.restored_prefix_tokens = state.token_count;
-                output.metrics.shared_prefix_tokens = state.token_count;
+                output.metrics.cache.restored_prefix_tokens = resident_prefix_tokens;
+                output.metrics.shared_prefix_tokens = resident_prefix_tokens;
             }
             Some(SequenceRestoreKind::TokenReplay) => {
-                output.metrics.cache.replayed_prefix_tokens = state.token_count;
+                output.metrics.cache.replayed_prefix_tokens = resident_prefix_tokens;
             }
             None => {}
         }
@@ -8035,6 +8377,7 @@ fn generate_incremental_audio(
     Ok(output)
 }
 
+#[cfg(test)]
 fn validate_incremental_audio_prefix_tokens(
     state: &SequenceStateBlob,
     rendered_prefix: &[i32],
@@ -8052,10 +8395,14 @@ fn validate_incremental_audio_prefix_tokens(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_multimodal(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     multimodal: Option<&MtmdContext>,
+    fingerprint: &ModelFingerprint,
+    resident_prefix: &mut Option<ResidentAudioTextPrefix>,
+    cache_supported: bool,
     request: &GenerationRequest,
     supervision: SingleSequenceSupervision<'_>,
     tracking: SequenceTracking<'_>,
@@ -8066,7 +8413,6 @@ fn generate_multimodal(
             "multimodal generation requires a loaded mmproj GGUF",
         ));
     };
-    context.clear_kv_cache();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
     let started = Instant::now();
@@ -8107,14 +8453,18 @@ fn generate_multimodal(
         0,
         GenerationState::Prefilling,
     );
-    let next_position = chunks
-        .eval_chunks(multimodal, context, 0, 0, context.n_batch() as i32, true)
-        .map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::DecodeFailed,
-                format!("failed to evaluate multimodal prompt: {error}"),
-            )
-        })?;
+    let (next_position, restore_kind, reused) = prefill_multimodal_cached(
+        model,
+        context,
+        multimodal,
+        fingerprint,
+        request,
+        &chunks,
+        resident_prefix,
+        cache_supported,
+        || supervision.cancellation.load(Ordering::Acquire),
+        true,
+    )?;
     tracking
         .token_counts
         .insert(0, next_position.max(0) as usize);
@@ -8124,7 +8474,7 @@ fn generate_multimodal(
         1,
         GenerationState::Generating,
     );
-    complete_multimodal_generation(
+    let mut output = complete_multimodal_generation(
         model,
         context,
         request,
@@ -8136,7 +8486,25 @@ fn generate_multimodal(
         started,
         2,
         None,
-    )
+    )?;
+    output.metrics.cache.supplied_prefix_tokens = request
+        .cached_prefix
+        .as_ref()
+        .map_or(0, |state| state.token_count);
+    match restore_kind {
+        Some(SequenceRestoreKind::NativeState) => {
+            output.metrics.cache.restored_prefix_tokens = reused;
+            output.metrics.shared_prefix_tokens = reused;
+        }
+        Some(SequenceRestoreKind::TokenReplay) => {
+            output.metrics.cache.replayed_prefix_tokens = reused
+        }
+        None => {
+            output.metrics.cache.resident_prefix_tokens = reused;
+            output.metrics.shared_prefix_tokens = reused;
+        }
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8597,12 +8965,14 @@ fn media_bitmap(
         )
     })?;
     validate_decoded_media_kind(&media.id, media.kind, bitmap.is_audio())?;
-    bitmap.set_id(&media.sha256).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::InvalidConfig,
-            format!("invalid media identity {}: {error}", media.id),
-        )
-    })?;
+    bitmap
+        .set_id(&format!("{:x}", Sha256::digest(&media.bytes)))
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!("invalid media identity {}: {error}", media.id),
+            )
+        })?;
     Ok(bitmap)
 }
 
@@ -8634,22 +9004,66 @@ fn render_multimodal_case_prompt(
         ));
     };
     let mut messages = messages.clone();
-    let markers = media
-        .iter()
-        .map(|media| format!("{}\n{}", media.id, mtmd_default_marker()))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if let Some(message) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.role == ChatRole::User)
-    {
-        message.content = format!("{markers}\n\n{}", message.content);
-    } else {
-        messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: markers,
-        });
+    // Product-authored, source-bound placeholders keep recordings in the
+    // turn which owns them. Unplaced media (including the live microphone)
+    // goes at the current user boundary. Require one occurrence and native
+    // payload order so textual markup cannot reorder opaque media inputs.
+    let mut unplaced = Vec::new();
+    let mut previous = None;
+    let mut placements = Vec::new();
+    for item in media {
+        let placeholder = format!("[[native-media:{}]]", item.id);
+        let occurrences = messages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, message)| {
+                message
+                    .content
+                    .match_indices(&placeholder)
+                    .map(move |(offset, _)| (index, offset))
+            })
+            .collect::<Vec<_>>();
+        if occurrences.len() > 1 {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedPromptForm,
+                "media placeholder must occur once",
+            ));
+        }
+        if let Some(&(index, offset)) = occurrences.first() {
+            if previous.is_some_and(|prior| prior > (index, offset)) || !unplaced.is_empty() {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedPromptForm,
+                    "media placeholders do not follow payload order",
+                ));
+            }
+            previous = Some((index, offset));
+            placements.push((index, placeholder));
+        } else {
+            unplaced.push(format!("{}\n{}", item.id, mtmd_default_marker()));
+        }
+    }
+    // Validate every offset against the original strings; replacing a long
+    // marker first must not make later markers appear to move backwards.
+    for (index, placeholder) in placements {
+        messages[index].content =
+            messages[index]
+                .content
+                .replacen(&placeholder, mtmd_default_marker(), 1);
+    }
+    if !unplaced.is_empty() {
+        let markers = unplaced.join("\n\n");
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == ChatRole::User)
+        {
+            message.content = format!("{}\n\n{markers}", message.content);
+        } else {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: markers,
+            });
+        }
     }
     Ok(RenderedMultimodalPrompt {
         text: render_messages_prompt_with_template(model, messages, true, template)?,
@@ -9057,6 +9471,8 @@ fn tokenize_messages(
         })?;
     Ok(TokenizedPrompt {
         rendered_sha256: format!("{:x}", Sha256::digest(rendered.as_bytes())),
+        resident_text_prefix_tokens: 0,
+        resident_media_prefix_tokens: 0,
         token_ids: tokens.into_iter().map(|token| token.0).collect(),
     })
 }
@@ -9385,12 +9801,6 @@ fn validate_generation_request(
     }
     validate_multimodal_input(&request.input, request.media.len())?;
     request.sampling.validate()?;
-    if request.cached_prefix.is_some() {
-        return Err(NativeError::new(
-            NativeErrorCode::UnsupportedParameter,
-            "caller-supplied cached state is unavailable for multimodal generation",
-        ));
-    }
     if request.sampling.max_tokens == 0 {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
@@ -9558,16 +9968,6 @@ fn validate_generation_batch_request(
     if !request.media.is_empty() {
         for case in &request.cases {
             validate_multimodal_input(&case.input, request.media.len())?;
-        }
-        if request
-            .cases
-            .iter()
-            .any(|case| case.cached_prefix.is_some())
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::UnsupportedParameter,
-                "caller-supplied cached state is unavailable for multimodal batches",
-            ));
         }
         let supported_media_kinds = status
             .descriptor
@@ -12049,7 +12449,7 @@ mod tests {
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "b508f1c7652c751513c361c7e4fdeb090fbed577"
+            "2cee3adbbad556a980daa9bda1887d4881e68b91"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
@@ -14077,6 +14477,10 @@ mod tests {
         let prefix = ResidentAudioTextPrefix {
             sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
             token_ids: vec![1, 2, 3, 4, 90],
+            cells: vec![1, 2, 3, 4, 90]
+                .into_iter()
+                .map(MultimodalPrefixCell::Text)
+                .collect(),
         };
 
         assert_eq!(prefix.reusable_tokens(&[1, 2, 3, 4, 5]), 4);
@@ -14237,6 +14641,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
         let mut config = NativeModelConfig::local(std::env::var("MOM_LLAMA_MODEL_PATH")?.into());
+        let state_directory = RealTestDirectory::new();
+        config.state_cache_directory = Some(state_directory.0.clone());
         config.device = NativeDevice::Cpu;
         config.context_tokens = 512;
         config.batch_tokens = 128;
@@ -14391,16 +14797,23 @@ mod tests {
         );
         assert_eq!(
             handle.restore_sequence(prefix.clone(), 0)?,
-            SequenceRestoreKind::TokenReplay,
-            "failed mutation also retires old raw-import receipts"
+            SequenceRestoreKind::NativeState,
+            "an authenticated persisted prefix survives uncertain in-memory mutation"
         );
         assert_eq!(handle.snapshot_sequence(0)?.token_ids, prefix.token_ids);
         let serialized = serde_json::to_vec(&compact)?;
+        let serialized_native = serde_json::to_vec(&prefix)?;
         owner.shutdown_joined()?;
         assert!(!handle.has_live_sequence_receipt(&export_receipt));
         drop(handle);
         let owner = NativeModelOwner::load(config.clone())?;
         let handle = owner.handle();
+        let signed: SequenceStateBlob = serde_json::from_slice(&serialized_native)?;
+        assert_eq!(
+            handle.restore_sequence(signed, 0)?,
+            SequenceRestoreKind::NativeState,
+            "authenticated native state must restore in a new model worker"
+        );
         assert!(!handle.has_live_sequence_receipt(&export_receipt));
         let durable: SequenceStateBlob = serde_json::from_slice(&serialized)?;
         assert_eq!(
@@ -14547,6 +14960,200 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
+    fn real_edited_prompt_restores_the_longest_shared_native_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
+        let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
+        let state_directory = RealTestDirectory::new();
+        let mut warm_config = NativeModelConfig::local(PathBuf::from(&model_path));
+        warm_config.device = NativeDevice::Auto;
+        warm_config.context_tokens = 8192;
+        warm_config.batch_tokens = 512;
+        warm_config.max_sequences = 1;
+        warm_config.state_cache_directory = Some(state_directory.0.clone());
+        let owner = NativeModelOwner::load(warm_config.clone())?;
+        let handle = owner.handle();
+        let model_id = handle.status().model_id;
+        let stable_persona = "You are a concise assistant. Preserve names and chronology, answer in one short sentence, ask one gentle question only when a key detail is missing, and do not invent memories. ".repeat(150);
+        let original = format!(
+            "{stable_persona} The brass observatory overlooks the winter harbor. Describe the old dome:"
+        );
+        let edited = format!(
+            "{stable_persona} The brass observatory overlooks the winter harbor. Describe the copper dome:"
+        );
+        let request = |request_id: &str, prompt: &str, cached_prefix: Option<SequenceStateBlob>| {
+            GenerationRequest {
+                request_id: request_id.to_owned(),
+                model_id: model_id.clone(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Text {
+                        text: prompt.to_owned(),
+                        special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                    }],
+                },
+                sampling: SamplingConfig {
+                    seed: 321,
+                    temperature: 0.0,
+                    max_tokens: 6,
+                    ..SamplingConfig::default()
+                },
+                media: Vec::new(),
+                cached_prefix,
+            }
+        };
+        let warm_started = Instant::now();
+        let warm = require_ready(
+            handle
+                .generate(request("edited-prompt-warm", &original, None))?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(warm.len(), 1);
+        let prefix = handle.snapshot_sequence(0)?;
+        assert!(
+            prefix.token_count > 3_000,
+            "warm persona prompt should retain a multi-thousand-token prefix, got {}",
+            prefix.token_count
+        );
+        let warm_elapsed = warm_started.elapsed();
+
+        let resident_started = Instant::now();
+        let resident = require_ready(
+            handle
+                .generate(request("edited-prompt-resident", &edited, None))?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        let resident_elapsed = resident_started.elapsed();
+
+        let compact = prefix
+            .reconstruction()
+            .sequence(prefix.token_ids.clone())
+            .expect("compact replay prefix reconstruction");
+
+        owner.shutdown_joined()?;
+        drop(handle);
+
+        let imported_owner = NativeModelOwner::load(warm_config.clone())?;
+        let imported_handle = imported_owner.handle();
+        let imported_started = Instant::now();
+        let imported = require_ready(
+            imported_handle
+                .generate(request(
+                    "edited-prompt-imported",
+                    &edited,
+                    Some(prefix.clone()),
+                ))?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        let imported_elapsed = imported_started.elapsed();
+        let cache_metrics = &imported[0].metrics.cache;
+        assert!(
+            cache_metrics.restored_prefix_tokens + cache_metrics.replayed_prefix_tokens > 0,
+            "changed prompt should import and reuse its longest shared native prefix: {cache_metrics:?}"
+        );
+        imported_owner.shutdown_joined()?;
+        drop(imported_handle);
+
+        let replay_owner = NativeModelOwner::load(warm_config.clone())?;
+        let replay_handle = replay_owner.handle();
+        let replay_started = Instant::now();
+        let replay = require_ready(
+            replay_handle
+                .generate(request(
+                    "edited-prompt-compact-replay",
+                    &edited,
+                    Some(compact),
+                ))?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        let replay_elapsed = replay_started.elapsed();
+        replay_owner.shutdown_joined()?;
+        drop(replay_handle);
+
+        let mut cold_config = NativeModelConfig::local(PathBuf::from(model_path));
+        cold_config.device = NativeDevice::Auto;
+        cold_config.context_tokens = 8192;
+        cold_config.batch_tokens = 512;
+        cold_config.max_sequences = 1;
+        let cold_owner = NativeModelOwner::load(cold_config)?;
+        let cold_handle = cold_owner.handle();
+        let cold_started = Instant::now();
+        let cold = require_ready(
+            cold_handle
+                .generate(request("edited-prompt-cold", &edited, None))?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        let cold_elapsed = cold_started.elapsed();
+        println!(
+            "real edited prompt four-path diagnostic: prefix_tokens={} shared_tokens={} snapshot_bytes={} warm_ms={} resident_ms={} imported_ms={} replay_ms={} cold_ms={} resident_cache={:?} imported_cache={:?} replay_cache={:?} cold_cache={:?}",
+            prefix.token_count,
+            imported[0].metrics.shared_prefix_tokens,
+            prefix.bytes.len(),
+            warm_elapsed.as_millis(),
+            resident_elapsed.as_millis(),
+            imported_elapsed.as_millis(),
+            replay_elapsed.as_millis(),
+            cold_elapsed.as_millis(),
+            resident[0].metrics.cache,
+            imported[0].metrics.cache,
+            replay[0].metrics.cache,
+            cold[0].metrics.cache,
+        );
+        for (label, output) in [
+            ("resident", &resident[0]),
+            ("imported", &imported[0]),
+            ("compact_replay", &replay[0]),
+            ("cold", &cold[0]),
+        ] {
+            println!(
+                "real edited prompt {label}: tokens={:?} text={:?}",
+                output.generated_token_ids, output.text
+            );
+        }
+        assert_eq!(
+            resident[0].generated_token_ids, imported[0].generated_token_ids,
+            "resident and authenticated imported KV outputs differ"
+        );
+        assert_eq!(
+            imported[0].generated_token_ids, replay[0].generated_token_ids,
+            "authenticated imported KV and compact token replay outputs differ"
+        );
+        assert_eq!(
+            replay[0].generated_token_ids, cold[0].generated_token_ids,
+            "replay and cold prompt outputs differ"
+        );
+        assert_eq!(resident[0].text, imported[0].text);
+        assert_eq!(imported[0].text, replay[0].text);
+        assert_eq!(replay[0].text, cold[0].text);
+        cold_owner.shutdown_joined()?;
+        Ok(())
+    }
+
+    struct RealTestDirectory(PathBuf);
+
+    impl RealTestDirectory {
+        fn new() -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "llama-native-real-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create test state directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for RealTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn one_second_tone_wav() -> Vec<u8> {
         const SAMPLE_RATE: u32 = 16_000;
         const SAMPLE_COUNT: u32 = SAMPLE_RATE;
@@ -14691,54 +15298,203 @@ mod tests {
                 })?
                 .wait_timeout(Duration::from_mins(2))?,
         )?;
-        let audio = handle.generate_incremental_audio(GenerationRequest {
-            request_id: "native-audio-with-history".to_string(),
+        let mut messages = vec![
+            prior_user,
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: greeting[0].text.clone(),
+            },
+        ];
+        let mut media = Vec::new();
+        for index in 0..24 {
+            let id = format!("earlier-recording-{index}");
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: format!("Caller turn {index}: [[native-media:{id}]]"),
+            });
+            messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: format!("I heard what you said in turn {index}."),
+            });
+            media.push(MediaInput {
+                id,
+                kind: MediaKind::Audio,
+                mime: "audio/wav".to_string(),
+                sha256: format!("{:x}", Sha256::digest(&wav)),
+                bytes: wav.clone(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "[Phone call] Please explain how I can organize a small garden. Give a thoughtful answer in several full sentences.".to_string(),
+        });
+        let request = GenerationRequest {
+            request_id: "native-audio-with-history-baseline".to_string(),
             model_id: handle.status().model_id,
             input: GenerationInput::Chat {
-                messages: vec![
-                    prior_user,
-                    ChatMessage {
-                        role: ChatRole::Assistant,
-                        content: greeting[0].text.clone(),
-                    },
-                    ChatMessage {
-                        role: ChatRole::User,
-                        content: "[Phone call] Listen to what I say next.".to_string(),
-                    },
-                ],
+                messages,
                 template: ChatTemplateChoice::PreferNonThinking,
             },
             sampling: SamplingConfig {
                 seed: 17,
-                temperature: 1.0,
-                max_tokens: 16,
+                temperature: 0.0,
+                max_tokens: 96,
                 ..SamplingConfig::default()
             },
-            media: (0..2)
-                .map(|index| MediaInput {
-                    id: format!("earlier-recording-{index}"),
-                    kind: MediaKind::Audio,
-                    mime: "audio/wav".to_string(),
-                    sha256: format!("{:x}", Sha256::digest(&wav)),
-                    bytes: wav.clone(),
-                })
-                .collect(),
+            media,
             cached_prefix: None,
-        })?;
-        let resumed = audio.wait_for_resume()?;
-        assert!(!resumed.reused);
+        };
+        let samples = vec![0.0_f32; 16_000 * 5];
+        let mut baseline_request = request.clone();
+        baseline_request.request_id = "native-audio-with-history-cold".to_string();
+        let baseline_audio = handle.generate_incremental_audio(baseline_request)?;
+        let baseline_monitor = baseline_audio.monitor();
+        baseline_audio.wait_for_resume()?;
         assert!(
-            audio.monitor().stats().restored_prefix_tokens > 0,
-            "historical recordings must not discard the shared greeting KV"
+            baseline_monitor.stats().restored_prefix_tokens > 0,
+            "the 24-turn history must preserve the shared greeting prefix"
         );
-        let samples = vec![0.0_f32; 16_000];
         for chunk in samples.chunks(160) {
+            baseline_audio.push_pcm(chunk)?;
+        }
+        let baseline = require_ready(
+            baseline_audio
+                .finish()?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(baseline.len(), 1);
+
+        let mut cancel_to_terminal_ms = Vec::with_capacity(20);
+        let mut resumed_prefix_count = 0usize;
+        for attempt in 0..20 {
+            let mut retry_request = request.clone();
+            retry_request.request_id = format!("native-audio-with-history-cancel-{attempt}");
+            let retry_request_id = retry_request.request_id.clone();
+            let audio = handle.generate_incremental_audio_resumable(
+                retry_request,
+                Some("sustained-24-audio-turn-call".to_string()),
+            )?;
+            let resumed = audio.wait_for_resume()?;
+            assert_eq!(resumed.reused, attempt > 0);
+            if attempt > 0 {
+                resumed_prefix_count += usize::from(resumed.sample_offset > 0);
+                assert!(
+                    resumed.sample_offset > 0,
+                    "resume must not replay projected PCM"
+                );
+            }
+            let monitor = audio.monitor();
+            let start = resumed.sample_offset.min(samples.len());
+            let end = (start + 3_200).min(samples.len());
+            for chunk in samples[start..end].chunks(160) {
+                audio.push_pcm(chunk)?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while monitor.stats().projected_samples == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                monitor.stats().projected_samples > 0,
+                "audio block must reach projector"
+            );
+            let ticket = audio.finish()?;
+            let events = ticket.events.clone();
+            let first_token_deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let Some(event) = events.recv_timeout(Duration::from_millis(100)).ok() else {
+                    if Instant::now() >= first_token_deadline {
+                        return Err(std::io::Error::other(
+                            "speculative decoding did not emit a token in time",
+                        )
+                        .into());
+                    }
+                    continue;
+                };
+                if event.request_id != retry_request_id {
+                    continue;
+                }
+                match event.event {
+                    GenerationEventKind::Delta { text } if !text.is_empty() => break,
+                    GenerationEventKind::State {
+                        state: GenerationState::Completed,
+                    } => {
+                        return Err(std::io::Error::other(
+                            "speculative generation completed before it could be cancelled",
+                        )
+                        .into());
+                    }
+                    _ => {}
+                }
+            }
+            let cancel_started = Instant::now();
+            assert_eq!(ticket.cancel_all(), 1, "one speculative branch is active");
+            let terminal_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let Some(event) = events.recv_timeout(Duration::from_millis(100)).ok() else {
+                    if Instant::now() >= terminal_deadline {
+                        return Err(std::io::Error::other(
+                            "speculative cancellation did not reach a terminal event",
+                        )
+                        .into());
+                    }
+                    continue;
+                };
+                if event.request_id != retry_request_id {
+                    continue;
+                }
+                match event.event {
+                    GenerationEventKind::State {
+                        state: GenerationState::Cancelled,
+                    } => break,
+                    GenerationEventKind::State {
+                        state: GenerationState::Completed,
+                    } => {
+                        return Err(std::io::Error::other(
+                            "speculative generation completed instead of cancelling",
+                        )
+                        .into());
+                    }
+                    _ => {}
+                }
+            }
+            let cancel_elapsed = cancel_started.elapsed();
+            assert!(
+                cancel_elapsed < Duration::from_secs(1),
+                "cancel-to-terminal should stay below one second without contention: {cancel_elapsed:?}"
+            );
+            cancel_to_terminal_ms.push(cancel_elapsed.as_secs_f64() * 1_000.0);
+        }
+        cancel_to_terminal_ms.sort_by(f64::total_cmp);
+        let p50 = cancel_to_terminal_ms[(cancel_to_terminal_ms.len() - 1) * 50 / 100];
+        let p95 = cancel_to_terminal_ms[(cancel_to_terminal_ms.len() - 1) * 95 / 100];
+        let max = *cancel_to_terminal_ms
+            .last()
+            .expect("20 cancellation cycles");
+        println!(
+            "real audio qualification: history_items=24 cancel_cycles={} resumed_prefixes={}/{} cancel_to_terminal_ms_p50={p50:.3} p95={p95:.3} max={max:.3}",
+            cancel_to_terminal_ms.len(),
+            resumed_prefix_count,
+            19
+        );
+
+        let mut final_request = request;
+        final_request.request_id = "native-audio-with-history-resumed-final".to_string();
+        let audio = handle.generate_incremental_audio_resumable(
+            final_request,
+            Some("sustained-24-audio-turn-call".to_string()),
+        )?;
+        let resumed = audio.wait_for_resume()?;
+        assert!(resumed.reused);
+        assert!(resumed.sample_offset > 0);
+        for chunk in samples[resumed.sample_offset.min(samples.len())..].chunks(160) {
             audio.push_pcm(chunk)?;
         }
-        let ticket = audio.finish()?;
-        let output = require_ready(ticket.wait_timeout(Duration::from_mins(2))?)?;
-        assert_eq!(output.len(), 1);
-        assert!(output[0].metrics.prompt_tokens > 0);
+        let output = require_ready(audio.finish()?.wait_timeout(Duration::from_mins(2))?)?;
+        assert_eq!(
+            output[0].generated_token_ids,
+            baseline[0].generated_token_ids
+        );
+        assert_eq!(output[0].text, baseline[0].text);
         Ok(())
     }
 

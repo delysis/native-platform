@@ -4889,7 +4889,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=b508f1c7652c751513c361c7e4fdeb090fbed577#b508f1c7652c751513c361c7e4fdeb090fbed577"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=2cee3adbbad556a980daa9bda1887d4881e68b91#2cee3adbbad556a980daa9bda1887d4881e68b91"
 dependencies = [
  "bindgen",
  "cc",
@@ -4916,6 +4916,8 @@ dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "fs4",
+ "getrandom 0.3.4",
+ "hmac",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "llama-native-types",

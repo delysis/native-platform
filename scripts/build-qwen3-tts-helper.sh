@@ -8,6 +8,7 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
   echo "Qwen3 TTS helper currently supports Apple Silicon macOS" >&2
   exit 1
 fi
+mkdir -p "$(dirname -- "$DEST")"
 swift build --package-path "$PACKAGE" -c release --disable-sandbox
 cp "$PACKAGE/.build/release/Qwen3TTSHelper" "$DEST"
 cp "$PACKAGE/.build/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" "$METAL_DEST"

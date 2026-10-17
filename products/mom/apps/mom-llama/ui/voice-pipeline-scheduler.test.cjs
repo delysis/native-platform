@@ -148,6 +148,72 @@ test("near-real-time TTS uses a larger quantum to amortize switching", () => {
   assert.equal(lead.chunkWordLimit({ first: true, bufferedMs: 0 }), 4);
 });
 
+test("complete buffering activates after sustained slow segments or one severe first segment", () => {
+  const sustained = new AdaptiveVoiceLeadController();
+  assert.equal(sustained.shouldBufferCompleteReply(), false);
+  sustained.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  assert.equal(sustained.shouldBufferCompleteReply(), false);
+  sustained.noteSegment({ synthesisMs: 1_060, audioMs: 1_000 });
+  assert.equal(sustained.shouldBufferCompleteReply(), true);
+
+  const severe = new AdaptiveVoiceLeadController();
+  severe.noteSegment({ synthesisMs: 1_450, audioMs: 1_000 });
+  assert.equal(severe.shouldBufferCompleteReply(), true);
+});
+
+test("complete buffering recovers only after healthy segments and survives reply calibration", () => {
+  const slowReply = new AdaptiveVoiceLeadController();
+  slowReply.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  slowReply.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  assert.equal(slowReply.shouldBufferCompleteReply(), true);
+
+  const firstBufferedReply = new AdaptiveVoiceLeadController(slowReply.calibration());
+  assert.equal(firstBufferedReply.shouldBufferCompleteReply(), true);
+  firstBufferedReply.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
+  const stillBuffered = new AdaptiveVoiceLeadController(firstBufferedReply.calibration());
+  assert.equal(stillBuffered.shouldBufferCompleteReply(), true);
+  assert.equal(stillBuffered.snapshot().healthy_segment_count, 1);
+
+  stillBuffered.noteSegment({ synthesisMs: 800, audioMs: 1_000 });
+  assert.equal(stillBuffered.shouldBufferCompleteReply(), false);
+  const recoveredReply = new AdaptiveVoiceLeadController(stillBuffered.calibration());
+  assert.equal(recoveredReply.shouldBufferCompleteReply(), false);
+});
+
+test("an uncalibrated first call buffers once, then healthy cadence restores streaming", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
+  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true\s*\}/);
+
+  const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true });
+  assert.equal(cold.shouldBufferCompleteReply(), true);
+  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
+  assert.equal(cold.shouldBufferCompleteReply(), true);
+  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
+  assert.equal(cold.shouldBufferCompleteReply(), false);
+
+  const healthyHandoff = new AdaptiveVoiceLeadController(cold.calibration());
+  assert.equal(healthyHandoff.shouldBufferCompleteReply(), false);
+});
+
+test("progress timeout grows with measured slow-machine cadence and stays bounded", () => {
+  const healthy = new AdaptiveVoiceLeadController();
+  assert.equal(healthy.progressTimeoutMs(), 20_000);
+
+  const slower = new AdaptiveVoiceLeadController({
+    initialFirstAudioMs: 3_000,
+    initialMaximumPacketGapMs: 4_500,
+  });
+  assert.equal(slower.progressTimeoutMs(), 36_000);
+
+  const verySlow = new AdaptiveVoiceLeadController({
+    initialFirstAudioMs: 15_000,
+    initialMaximumPacketGapMs: 20_000,
+  });
+  assert.equal(verySlow.progressTimeoutMs(), 60_000);
+});
+
 test("speech-rate observations tune segment size without escaping hard bounds", () => {
   const lead = new AdaptiveVoiceLeadController();
   lead.noteSegment({ synthesisMs: 400, audioMs: 1_000, firstAudioMs: 90, words: 5 });

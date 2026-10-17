@@ -4823,6 +4823,7 @@ mod tests {
         handle.inner.send_command(
             WorkerCommand::Snapshot {
                 sequence_id: 0,
+                max_bytes: 0,
                 response: pause_tx,
             },
             "placing the cancellation test queue barrier",
@@ -4852,6 +4853,7 @@ mod tests {
         handle.inner.send_command(
             WorkerCommand::Snapshot {
                 sequence_id: 0,
+                max_bytes: 0,
                 response: pause_tx,
             },
             "placing the verified cancellation test queue barrier",

@@ -142,6 +142,7 @@ pub struct ChatSendInput {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChatSendOptions {
+    /// Maximum lack of generation progress, excluding consumer backpressure.
     pub timeout_s: f64,
     pub fake_fixture: bool,
 }
@@ -743,6 +744,7 @@ pub fn voice_audio_begin_in_scope(
         &messages,
         &owner_ids,
         &settings,
+        true,
         true,
         ChatTemplateChoice::PreferNonThinking,
     )?;
@@ -1432,10 +1434,6 @@ where
             }
         };
         let status = handle.status();
-        let default_template = matches!(
-            conversation.execution_profile.chat_template,
-            ChatTemplatePolicy::ModelDefault
-        );
         if stream.cancellation_requested() {
             return stream.finish_cancelled();
         }
@@ -1449,7 +1447,9 @@ where
                 }
             }
         };
-        let cached_prefix = if media.is_empty() && default_template {
+        // Lookup tokenizes with the actual template. Exact shared token IDs,
+        // not the template's friendly name, decide whether cached KV is valid.
+        let cached_prefix = {
             let owner_ids = reusable_prefix_owner_ids(
                 &conversation.id,
                 conversation.source_conversation_id.as_deref(),
@@ -1463,10 +1463,9 @@ where
                 &owner_ids,
                 &settings,
                 false,
+                !media.is_empty(),
                 request_template.clone(),
             )?
-        } else {
-            None
         };
         let mut sampling =
             settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
@@ -1549,10 +1548,7 @@ where
         if output.state == GenerationState::Cancelled {
             return stream.finish_cancelled();
         }
-        if media.is_empty()
-            && default_template
-            && settings.kv_cache_policy.persists_conversation_checkpoints()
-        {
+        if media.is_empty() && settings.kv_cache_policy.persists_conversation_checkpoints() {
             let _ = persist_session_checkpoint(&conversation.id, &handle)?;
         }
         let parsed = parse_reasoning_output(&output.text, parse_reasoning);
@@ -1999,17 +1995,30 @@ where
 {
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(options.timeout_s.max(0.001));
+    let mut last_progress = started;
+    let maximum_lifetime = timeout
+        .saturating_mul(20)
+        .min(Duration::from_secs(600))
+        .max(timeout);
     let mut timed_out = false;
     let mut reasoning_parser = parse_reasoning.then(ReasoningStreamParser::default);
     let mut first_content_emitted = false;
     loop {
-        if !timed_out && started.elapsed() >= timeout {
+        if ticket.is_backpressured() {
+            last_progress = Instant::now();
+        }
+        if !timed_out
+            && (last_progress.elapsed() >= timeout || started.elapsed() >= maximum_lifetime)
+        {
             timed_out = true;
             ticket.cancel_all();
         }
         match ticket.events.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => match event.event {
                 GenerationEventKind::Delta { text } => {
+                    if !text.is_empty() {
+                        last_progress = Instant::now();
+                    }
                     if let Some(parser) = reasoning_parser.as_mut() {
                         for routed in parser.push(&text) {
                             let content = routed.target == ReasoningTarget::Content;
@@ -2055,6 +2064,7 @@ where
                         _ => None,
                     };
                     if let Some(stage) = stage {
+                        last_progress = Instant::now();
                         let mut event =
                             stream_event(request_id, conversation_id, stage, None, None, options);
                         event.emitted_at_unix_us = Some(unix_now_us());
@@ -2100,12 +2110,10 @@ where
         }
     }
     match ticket.wait() {
-        Err(error) if timed_out && error.code == NativeErrorCode::Cancelled => {
-            Err(ChatTicketError::Callback(anyhow::anyhow!(
-                "generation timed out after {:.1} seconds",
-                options.timeout_s
-            )))
-        }
+        _ if timed_out => Err(ChatTicketError::Callback(anyhow::anyhow!(
+            "generation stopped progressing for {:.1} seconds or exceeded its bounded lifetime",
+            options.timeout_s
+        ))),
         result => result.map_err(ChatTicketError::Native),
     }
 }
@@ -2174,9 +2182,14 @@ fn longest_cached_prefix_for_owners(
     owner_ids: &[&str],
     settings: &crate::config::Settings,
     require_live_receipt: bool,
+    multimodal: bool,
     template: ChatTemplateChoice,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
+    let prompt = handle
+        .tokenize_messages_with_template(messages.to_vec(), template.clone())
+        .map_err(|error| anyhow::anyhow!(error))?;
     let mut longest: Option<(String, SequenceStateBlob)> = None;
+    let mut longest_match = 0;
     for owner_id in owner_ids {
         let candidate = compatible_cached_prefix_for_owner_with_settings(
             handle,
@@ -2184,16 +2197,27 @@ fn longest_cached_prefix_for_owners(
             Some(owner_id),
             settings,
             template.clone(),
+            if multimodal {
+                prompt.resident_media_prefix_tokens
+            } else {
+                prompt.resident_text_prefix_tokens
+            },
         )?;
-        if let Some(candidate) = candidate.filter(|(_, sequence)| {
-            !require_live_receipt || handle.has_live_sequence_receipt(&sequence.export_receipt())
-        }) {
-            longest = prefer_longer_prefix(longest, candidate);
+        if let Some(candidate) = candidate
+            .filter(|(_, sequence)| !require_live_receipt || handle.has_reusable_sequence(sequence))
+        {
+            let matched =
+                llama_native_cache::common_prefix_tokens(&candidate.1.token_ids, &prompt.token_ids);
+            if matched > longest_match {
+                longest_match = matched;
+                longest = Some(candidate);
+            }
         }
     }
     Ok(longest)
 }
 
+#[cfg(test)]
 fn prefer_longer_prefix(
     current: Option<(String, SequenceStateBlob)>,
     candidate: (String, SequenceStateBlob),

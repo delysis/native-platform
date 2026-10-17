@@ -19,6 +19,9 @@
       initialProductionRtf = 0.7,
       initialSpeechMsPerWord = 400,
       initialUnderrunPenaltyMs = 0,
+      initialSlowSegmentCount = 0,
+      initialHealthySegmentCount = 0,
+      initialBufferComplete = false,
       minimumTargetMs = 180,
       maximumTargetMs = 1_200,
     } = {}) {
@@ -33,6 +36,10 @@
       this.minimumTargetMs = minimumTargetMs;
       this.maximumTargetMs = maximumTargetMs;
       this.underrunPenaltyMs = initialUnderrunPenaltyMs;
+      this.slowSegmentCount = initialSlowSegmentCount;
+      this.healthySegmentCount = initialHealthySegmentCount;
+      this.bufferComplete = initialBufferComplete;
+      this.replySegmentCount = 0;
       this.waits = 0;
       this.waitMs = 0;
       this.maximumRunwayMs = 0;
@@ -70,6 +77,27 @@
       if (Number.isFinite(synthesisMs) && Number.isFinite(audioMs) && audioMs > 0) {
         const observed = clamp(synthesisMs / audioMs, 0.05, 4);
         this.productionRtf = this.productionRtf * 0.7 + observed * 0.3;
+        if (this.bufferComplete) {
+          if (observed <= 0.85) {
+            this.healthySegmentCount += 1;
+            if (this.healthySegmentCount >= 2) {
+              this.bufferComplete = false;
+              this.slowSegmentCount = 0;
+              this.healthySegmentCount = 0;
+            }
+          } else {
+            this.healthySegmentCount = 0;
+          }
+        } else if (observed >= 1.05) {
+          this.slowSegmentCount += 1;
+          if ((this.replySegmentCount === 0 && observed >= 1.4) || this.slowSegmentCount >= 2) {
+            this.bufferComplete = true;
+            this.healthySegmentCount = 0;
+          }
+        } else if (observed <= 0.85) {
+          this.slowSegmentCount = 0;
+        }
+        this.replySegmentCount += 1;
       }
       if (Number.isFinite(words) && words > 0 && Number.isFinite(audioMs) && audioMs > 0) {
         const observed = clamp(audioMs / words, 180, 900);
@@ -154,6 +182,20 @@
       return bufferedMs >= Math.max(240, this.targetRunwayMs());
     }
 
+    shouldBufferCompleteReply() {
+      return this.bufferComplete;
+    }
+
+    progressTimeoutMs() {
+      // Allow a cold/slower machine proportionally more time when its observed
+      // first audio or packet cadence is high, while retaining a hard bound.
+      return Math.round(clamp(
+        Math.max(20_000, this.firstAudioMs * 8, this.maximumPacketGapMs * 8),
+        20_000,
+        60_000,
+      ));
+    }
+
     chunkWordLimit({ first = false, bufferedMs = 0 } = {}) {
       if (first) return 4;
       const runway = Number.isFinite(bufferedMs) ? Math.max(0, bufferedMs) : 0;
@@ -188,6 +230,9 @@
         observed_max_packet_gap_ms: Math.round(this.maximumPacketGapMs * 100) / 100,
         observed_max_boundary_gap_ms: Math.round(this.maximumBoundaryGapMs * 100) / 100,
         observed_production_rtf: Math.round(this.productionRtf * 10_000) / 10_000,
+        buffer_complete_reply: this.bufferComplete,
+        slow_segment_count: this.slowSegmentCount,
+        healthy_segment_count: this.healthySegmentCount,
         observed_speech_ms_per_word: Math.round(this.speechMsPerWord * 100) / 100,
         underrun_penalty_ms: Math.round(this.underrunPenaltyMs * 100) / 100,
         waits: this.waits,
@@ -206,6 +251,9 @@
         initialProductionRtf: this.productionRtf,
         initialSpeechMsPerWord: this.speechMsPerWord,
         initialUnderrunPenaltyMs: this.underrunPenaltyMs,
+        initialSlowSegmentCount: this.slowSegmentCount,
+        initialHealthySegmentCount: this.healthySegmentCount,
+        initialBufferComplete: this.bufferComplete,
         minimumTargetMs: this.minimumTargetMs,
         maximumTargetMs: this.maximumTargetMs,
       };

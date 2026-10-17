@@ -12,6 +12,8 @@ use thiserror::Error;
 use crate::{MediaInput, MediaKind};
 
 pub const MAX_MEDIA_PAYLOADS: usize = 32;
+/// Short conversational recordings share the unchanged aggregate byte budget.
+pub const MAX_AUDIO_PAYLOADS: usize = 256;
 pub const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_MEDIA_OCCURRENCES: usize = MAX_MEDIA_PAYLOADS * 257;
 /// Include repeated bytes in the work budget even when their payload is shared.
@@ -137,7 +139,17 @@ impl MediaIdentityLedger {
             None => MediaAdmission::NewPayload,
         };
         let bytes = if admission == MediaAdmission::NewPayload {
-            if self.payloads.len() >= MAX_MEDIA_PAYLOADS {
+            let count = self
+                .payloads
+                .keys()
+                .filter(|(existing, _)| *existing == kind)
+                .count();
+            let limit = if kind == MediaKind::Audio {
+                MAX_AUDIO_PAYLOADS
+            } else {
+                MAX_MEDIA_PAYLOADS
+            };
+            if count >= limit {
                 return Err(MediaIdentityError::PayloadLimit);
             }
             self.bytes

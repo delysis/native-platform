@@ -521,6 +521,7 @@ fn unchecked_model_configuration_for_profile(
 ) -> Result<NativeModelConfig, ValidationBlocker> {
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
+    config.state_cache_directory = Some(settings.data_dir.join("native-state-authority"));
     desktop_generation_policy::ModelExecutionLimits {
         context_tokens: settings.context_tokens,
         batch_tokens: settings.batch_tokens,

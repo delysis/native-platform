@@ -1375,9 +1375,20 @@
       "package": "llama-native-engine",
       "target": "lib",
       "source": "crates/native/crates/llama-native-engine/src/lib.rs",
-      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector",
+      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector; exercises 24 ordered synthetic audio-history turns, 20 cancellation/resume cycles with terminal timings, and deterministic output parity",
       "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH"],
       "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "tests::real_edited_prompt_restores_the_longest_shared_native_prefix",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF; tests signed prefix import across worker restart with a multi-thousand-token persona and late prompt edit",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
       "platforms": ["linux", "macos", "windows"]
     },
@@ -1443,6 +1454,17 @@
         "macos",
         "windows"
       ]
+    },
+    {
+      "test_id": "real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_restart",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires a real local GGUF; builds a >1 GB voice persona prefix, verifies encrypted multi-part storage, then reloads and checks cached-versus-cold continuation after worker restart",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["macos"]
     }
   ]
 }

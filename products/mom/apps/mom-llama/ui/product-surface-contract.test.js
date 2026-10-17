@@ -551,7 +551,10 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(greeting.includes('mode: "call"'));
   assert.ok(greeting.includes('invoke("mom_llama_chat_send"'));
   assert.ok(!greeting.includes('invoke("mom_llama_chat_dispatch"'));
-  assert.ok(greeting.includes("onFirstChunk"));
+  assert.ok(
+    greeting.includes("onPlaybackStarted"),
+    "pickup stays on the ring until the ordinary reply buffer actually starts playback",
+  );
   assert.ok(greeting.includes("stopCallBed()"));
   assert.ok(!greeting.includes("beginCallNoiseFloor(epoch)"));
   assert.ok(greeting.includes("tts.text.trim()"));
@@ -731,8 +734,9 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(!live.includes("if (!deferProgressWatchdog) armAudioProgressWatchdog();"));
   assert.ok(live.includes("running = true;\n      // The audio watchdog covers only time owned by an active synthesis"));
   assert.ok(live.includes("watchdogActive = false;"));
-  assert.ok(live.includes("if (decoded.data.byteLength > 0) armAudioProgressWatchdog();"));
-  assert.ok(live.includes('mode === "call" ? 8_000 : 12_000'));
+  assert.ok(live.includes("if (decoded.data.byteLength > 0) {"));
+  assert.ok(live.includes("playback.lastProgressAt = performance.now();\n            armAudioProgressWatchdog();"));
+  assert.ok(live.includes("leadController.progressTimeoutMs()"));
   assert.ok(live.includes("const ttsLatencyTrace = voiceLatencyTrace"));
   assert.ok(live.includes("markVoiceLatencyIn(ttsLatencyTrace, stage, detail)"));
   assert.ok(live.includes("onPlayable: () => {"));
@@ -1271,7 +1275,8 @@ test("call generation cannot stall forever or disappear without a visible termin
   assert.ok(bridge.includes('"voice_generation_timeout: The contact stopped making progress while preparing a reply."'));
   assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "generation_timeout"'));
   assert.ok(bridge.includes('void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});'));
-  assert.ok(bridge.includes("speculation.generationReleased.then(() => withDeadline("));
+  assert.ok(bridge.includes("speculation.generationReleased.then(() => withProgressDeadline("));
+  assert.ok(bridge.includes("voiceProgressDeadlineExpired({"));
   assert.ok(bridge.includes("speculation.releaseGeneration?.();"));
   assert.ok(bridge.includes('latestAttemptStage("native_audio_finish_failed")'));
   assert.ok(bridge.includes('payload.detail && typeof payload.detail === "object"'));

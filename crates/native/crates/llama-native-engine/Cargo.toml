@@ -14,8 +14,10 @@ crossbeam-channel.workspace = true
 encoding_rs = "0.8"
 fs4 = "1.1.0"
 llama-cpp-2 = { path = "../llama-cpp-2", default-features = false, features = ["common", "sampler", "mtmd"] }
-llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "b508f1c7652c751513c361c7e4fdeb090fbed577", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "2cee3adbbad556a980daa9bda1887d4881e68b91", default-features = false }
 sha2.workspace = true
+hmac = "0.12"
+getrandom.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
