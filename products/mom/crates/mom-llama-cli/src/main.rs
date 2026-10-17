@@ -919,6 +919,12 @@ enum KvCacheCommand {
         #[arg(long)]
         json: bool,
     },
+    PrepareVoice {
+        #[arg(long, alias = "conversation")]
+        persona: String,
+        #[arg(long)]
+        json: bool,
+    },
     Restore {
         #[arg(long)]
         cache: Option<String>,
@@ -1763,6 +1769,13 @@ fn run() -> Result<()> {
             }
             KvCacheCommand::Save { skill, json } => print_result(
                 mom_llama_runtime::kv_cache_save(&operation_scope, skill)?,
+                json,
+            ),
+            KvCacheCommand::PrepareVoice { persona, json } => print_result(
+                mom_llama_runtime::kv_cache_prepare_voice_persona_resident(
+                    &operation_scope,
+                    &persona,
+                )?,
                 json,
             ),
             KvCacheCommand::Restore { cache, json } => print_result(

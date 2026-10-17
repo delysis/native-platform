@@ -75,7 +75,25 @@
   };
   const wait = (milliseconds) =>
     new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-  const withDeadline = async (promise, milliseconds, message) => {
+  const withProgressDeadline = async (promise, idleMs, progress, message) => {
+    const started = performance.now();
+    let timer = null;
+    try {
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = window.setInterval(() => {
+          if (globalThis.MomVoiceCapturePolicy.voiceProgressDeadlineExpired({
+            now: performance.now(), started, lastProgress: Math.max(started, progress()),
+            idleMs, maxElapsedMs: 120_000,
+          })) {
+            const error = new Error(message);
+            error.code = "voice_generation_timeout";
+            reject(error);
+          }
+        }, 100);
+      })]);
+    } finally { if (timer !== null) window.clearInterval(timer); }
+  };
+  const withDeadline = async (promise, milliseconds, message, code = "voice_generation_timeout") => {
     let timeout = null;
     try {
       return await Promise.race([
@@ -83,7 +101,7 @@
         new Promise((_, reject) => {
           timeout = window.setTimeout(() => {
             const error = new Error(message);
-            error.code = "voice_generation_timeout";
+            error.code = code;
             reject(error);
           }, milliseconds);
         }),
@@ -325,6 +343,50 @@
     const value = globalThis.crypto?.randomUUID?.();
     if (!value) throw new Error("Secure opaque speech operation IDs are unavailable.");
     return value;
+  };
+  const createVoiceCallActivityGuard = (sessionId) => {
+    let active = false;
+    let clearPromise = null;
+    let activation;
+    try {
+      activation = invoke("mom_llama_kv_cache_set_voice_call_activity", {
+        sessionId,
+        active: true,
+      });
+    } catch (error) {
+      activation = Promise.reject(error);
+    }
+    const ready = Promise.resolve(activation).then((response) => {
+      if (response?.status === "blocked") {
+        throw new Error(response?.blocker?.message || "Voice cache activity could not be recorded.");
+      }
+      active = true;
+      return true;
+    });
+    return {
+      sessionId,
+      ready,
+      clear: async () => {
+        await ready.catch(() => false);
+        if (!active) return false;
+        if (!clearPromise) {
+          clearPromise = Promise.resolve().then(() => invoke("mom_llama_kv_cache_set_voice_call_activity", {
+            sessionId,
+            active: false,
+          })).then((response) => {
+            if (response?.status === "blocked") {
+              throw new Error(response?.blocker?.message || "Voice cache activity could not be cleared.");
+            }
+            active = false;
+            return true;
+          }).catch((error) => {
+            clearPromise = null;
+            throw error;
+          });
+        }
+        return clearPromise;
+      },
+    };
   };
   const sha256Hex = async (bytes) => {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
@@ -739,6 +801,7 @@
     retainHistory = true,
     startupBufferMs = 120,
     startupDelayMs = 0,
+    waitForCompletion = false,
     onFirstChunk,
     onPlayable,
     onPlaybackStarted,
@@ -774,6 +837,8 @@
     let pendingSeconds = 0;
     const sources = new Set();
     let format = null;
+    let echoReference = null;
+    let echoReferenceSamples = null;
     let expectedSequence = 0;
     let expectedSampleOffset = 0;
     let context = null;
@@ -787,6 +852,8 @@
     let starting = null;
     let ended = false;
     let stopped = false;
+    let startCancellationResolve = null;
+    const startCancellation = new Promise((resolve) => { startCancellationResolve = resolve; });
     let endGeneration = 0;
     let scheduledAudio = false;
     let workletNode = null;
@@ -795,6 +862,8 @@
     let workletCapacityFrames = 0;
     let workletQueuedFrames = 0;
     let rendererPacketIndex = 0;
+    const rendererPacketOwners = new Map();
+    const RENDERER_PACKET_OWNER_LIMIT = 512;
     let metricsReported = false;
     const rendererMetrics = {
       packets: 0,
@@ -812,6 +881,16 @@
       worklet_min_buffered_frames: null,
       worklet_first_receive_context_frame: null,
       worklet_first_render_context_frame: null,
+      worklet_final_metrics_received: false,
+      worklet_pcm_signal_frames: null,
+      worklet_pcm_signal_rms: null,
+      worklet_pcm_signal_peak: null,
+      worklet_pcm_signal_min_quantum_rms: null,
+      worklet_pcm_signal_max_quantum_rms: null,
+      worklet_pcm_low_energy_threshold_rms: null,
+      worklet_pcm_low_energy_frames: null,
+      worklet_pcm_low_energy_quanta: null,
+      worklet_pcm_max_low_energy_frames: null,
     };
     const rendererNow = () => globalThis.performance?.now?.() ?? Date.now();
     const segmentSequences = new Map();
@@ -856,7 +935,8 @@
       }, remainingMs + 12);
     };
 
-    const schedule = (frame) => {
+    const schedule = (frame, operationId = null) => {
+      if (stopped) return false;
       const scheduleStarted = rendererNow();
       const frames = validateFrame(frame);
       if (frames === 0) return true;
@@ -864,6 +944,11 @@
       if (workletNode) {
         if (workletQueuedFrames + frames > workletCapacityFrames) return false;
         const packetIndex = rendererPacketIndex++;
+        if (rendererPacketOwners.size >= RENDERER_PACKET_OWNER_LIMIT) {
+          rendererPacketOwners.delete(rendererPacketOwners.keys().next().value);
+          rendererMetrics.operation_owner_evictions = (rendererMetrics.operation_owner_evictions || 0) + 1;
+        }
+        rendererPacketOwners.set(packetIndex, operationId);
         const enqueuedContextTimeMs = context.currentTime * 1_000;
         const buffer = frame.data.buffer;
         if (!(buffer instanceof ArrayBuffer)) {
@@ -898,6 +983,8 @@
           frames,
           queued_frames: workletQueuedFrames,
           audio_context_ms: Math.round(enqueuedContextTimeMs * 100) / 100,
+          operation_id: operationId,
+          operation_owner_missing: !operationId,
         });
         return true;
       }
@@ -936,14 +1023,39 @@
     const reportRendererMetrics = (reason) => {
       if (metricsReported) return;
       metricsReported = true;
-      onRendererMetrics?.({ ...rendererMetrics, reason });
+      const workletMetricsStatus = !rendererMetrics.worklet
+        ? "not_applicable"
+        : rendererMetrics.worklet_final_metrics_received ? "complete" : "unreported";
+      const finalOnlyMetrics = [
+        "worklet_render_quanta", "worklet_max_buffered_frames", "underruns",
+        "worklet_recoveries", "worklet_rebuffered_frames",
+        "worklet_min_buffered_frames", "worklet_first_receive_context_frame",
+        "worklet_pcm_signal_frames", "worklet_pcm_signal_rms",
+        "worklet_pcm_signal_peak", "worklet_pcm_signal_min_quantum_rms",
+        "worklet_pcm_signal_max_quantum_rms", "worklet_pcm_low_energy_threshold_rms",
+        "worklet_pcm_low_energy_frames", "worklet_pcm_low_energy_quanta",
+        "worklet_pcm_max_low_energy_frames",
+      ];
+      const metrics = { ...rendererMetrics, reason, worklet_metrics_status: workletMetricsStatus };
+      if (rendererMetrics.worklet) {
+        metrics.worklet_final_metrics_received = rendererMetrics.worklet_final_metrics_received;
+        metrics.worklet_underrun_events_observed = rendererMetrics.underruns;
+        if (!rendererMetrics.worklet_final_metrics_received) {
+          for (const key of finalOnlyMetrics) metrics[key] = null;
+        }
+      }
+      // Queue depth and first-render frame are main-thread observations and
+      // remain available when stopped playback never reports its final drain.
+      onRendererMetrics?.(metrics);
     };
 
     const schedulePending = () => {
+      if (stopped) return;
       while (chunkHead < chunks.length) {
-        const frame = chunks[chunkHead];
+        const queued = chunks[chunkHead];
+        const { frame, operationId } = queued;
         const seconds = frame.data.byteLength / (2 * frame.channels * frame.sampleRate);
-        if (!schedule(frame)) break;
+        if (!schedule(frame, operationId)) break;
         chunkHead += 1;
         pendingSeconds -= seconds;
       }
@@ -993,6 +1105,7 @@
 
     const startPlayback = async () => {
       if (stopped || playing) return false;
+      const isStartCurrent = () => !stopped;
       if (startupDelayTimer !== null) {
         window.clearTimeout(startupDelayTimer);
         startupDelayTimer = null;
@@ -1006,9 +1119,14 @@
       // on the renderer thread. `pushDecoded` copies history before `schedule`
       // transfers the packet, so voice notes and calls can share the same
       // preallocated audio-thread ring without sacrificing durable playback.
-      const engine = await preparePcmWorklet(format.sampleRate);
-      if (engine && !pcmWorkletEngine.owner) {
-        context = engine.context;
+      const cancelledStart = {};
+      const preparedEngine = await Promise.race([
+        preparePcmWorklet(format.sampleRate),
+        startCancellation.then(() => cancelledStart),
+      ]);
+      if (preparedEngine === cancelledStart || !isStartCurrent()) return false;
+      if (preparedEngine && !pcmWorkletEngine.owner) {
+        context = preparedEngine.context;
         workletOwner = {};
         pcmWorkletEngine.owner = workletOwner;
         workletCapacityFrames = format.sampleRate * 8;
@@ -1026,11 +1144,16 @@
         });
         rendererMetrics.worklet = true;
         workletNode.port.onmessage = ({ data }) => {
+          if (stopped) return;
           const audioContextMs = Number(data?.audioContextFrame || 0) * 1_000 / format.sampleRate;
           if (data?.type === "packet_admitted") {
+            const packetIndex = Number(data.packetIndex || 0);
+            const operationOwnerKnown = rendererPacketOwners.has(packetIndex);
+            const operationId = operationOwnerKnown ? rendererPacketOwners.get(packetIndex) : null;
+            rendererPacketOwners.delete(packetIndex);
             onRendererEvent?.({
               type: "packet_admitted",
-              packet_index: Number(data.packetIndex || 0),
+              packet_index: packetIndex,
               sequence: Number(data.sequence || 0),
               sample_offset: Number(data.sampleOffset || 0),
               frames: Number(data.frames || 0),
@@ -1040,6 +1163,8 @@
                 0,
                 audioContextMs - Number(data.enqueuedContextTimeMs || 0),
               ) * 100) / 100,
+              operation_id: operationId,
+              operation_owner_missing: !operationOwnerKnown || !operationId,
             });
           } else if (data?.type === "render_started") {
             rendererMetrics.worklet_first_render_context_frame = Number(data.audioContextFrame || 0);
@@ -1078,16 +1203,40 @@
           } else if (data?.type === "error") {
             onPlaybackError?.(new Error(`speech_stream_worklet_failed: ${data.message || "PCM output failed."}`));
           } else if (data?.type === "drained" && playing && !stopped) {
-            rendererMetrics.worklet_render_quanta = Number(data.renderQuanta || 0);
-            rendererMetrics.worklet_max_buffered_frames = Number(data.maxBufferedFrames || 0);
-            rendererMetrics.underruns = Math.max(rendererMetrics.underruns, Number(data.underruns || 0));
-            rendererMetrics.worklet_recoveries = Number(data.recoveries || 0);
-            rendererMetrics.worklet_rebuffered_frames = Number(data.rebufferedFrames || 0);
-            rendererMetrics.worklet_min_buffered_frames = Number.isFinite(Number(data.minBufferedFrames))
+            rendererMetrics.worklet_final_metrics_received = true;
+            rendererMetrics.worklet_pcm_signal_frames = Number.isFinite(data.pcmSignalFrames)
+              ? Number(data.pcmSignalFrames) : null;
+            rendererMetrics.worklet_pcm_signal_rms = Number.isFinite(data.pcmSignalRms)
+              ? Number(data.pcmSignalRms) : null;
+            rendererMetrics.worklet_pcm_signal_peak = Number.isFinite(data.pcmSignalPeak)
+              ? Number(data.pcmSignalPeak) : null;
+            rendererMetrics.worklet_pcm_signal_min_quantum_rms = Number.isFinite(data.pcmSignalMinQuantumRms)
+              ? Number(data.pcmSignalMinQuantumRms) : null;
+            rendererMetrics.worklet_pcm_signal_max_quantum_rms = Number.isFinite(data.pcmSignalMaxQuantumRms)
+              ? Number(data.pcmSignalMaxQuantumRms) : null;
+            rendererMetrics.worklet_pcm_low_energy_threshold_rms = Number.isFinite(data.pcmLowEnergyThresholdRms)
+              ? Number(data.pcmLowEnergyThresholdRms) : null;
+            rendererMetrics.worklet_pcm_low_energy_frames = Number.isFinite(data.pcmLowEnergyFrames)
+              ? Number(data.pcmLowEnergyFrames) : null;
+            rendererMetrics.worklet_pcm_low_energy_quanta = Number.isFinite(data.pcmLowEnergyQuanta)
+              ? Number(data.pcmLowEnergyQuanta) : null;
+            rendererMetrics.worklet_pcm_max_low_energy_frames = Number.isFinite(data.pcmMaxLowEnergyFrames)
+              ? Number(data.pcmMaxLowEnergyFrames) : null;
+            rendererMetrics.worklet_render_quanta = Number.isFinite(data.renderQuanta)
+              ? Number(data.renderQuanta) : null;
+            rendererMetrics.worklet_max_buffered_frames = Number.isFinite(data.maxBufferedFrames)
+              ? Number(data.maxBufferedFrames) : null;
+            rendererMetrics.underruns = Number.isFinite(data.underruns)
+              ? Number(data.underruns) : null;
+            rendererMetrics.worklet_recoveries = Number.isFinite(data.recoveries)
+              ? Number(data.recoveries) : null;
+            rendererMetrics.worklet_rebuffered_frames = Number.isFinite(data.rebufferedFrames)
+              ? Number(data.rebufferedFrames) : null;
+            rendererMetrics.worklet_min_buffered_frames = Number.isFinite(data.minBufferedFrames)
               ? Number(data.minBufferedFrames) : null;
-            rendererMetrics.worklet_first_receive_context_frame = Number.isFinite(Number(data.firstReceiveContextFrame))
+            rendererMetrics.worklet_first_receive_context_frame = Number.isFinite(data.firstReceiveContextFrame)
               ? Number(data.firstReceiveContextFrame) : null;
-            rendererMetrics.worklet_first_render_context_frame = Number.isFinite(Number(data.firstRenderContextFrame))
+            rendererMetrics.worklet_first_render_context_frame = Number.isFinite(data.firstRenderContextFrame)
               ? Number(data.firstRenderContextFrame) : rendererMetrics.worklet_first_render_context_frame;
             playing = false;
             workletNode.disconnect();
@@ -1102,16 +1251,37 @@
             onEnded?.();
           }
         };
-        workletNode.connect(context.destination);
+        echoReference = context.createAnalyser();
+        echoReference.fftSize = 8192;
+        echoReferenceSamples = new Float32Array(echoReference.fftSize);
+        workletNode.connect(echoReference);
+        echoReference.connect(context.destination);
       } else {
         context = new AudioContext({ latencyHint: "interactive", sampleRate: format.sampleRate });
       }
+      const startContext = context;
+      const startOwner = workletOwner;
       playing = true;
       nextStart = context.currentTime + 0.035;
       schedulePending();
       const resumeStarted = rendererNow();
       try {
-        await resumeContext(context);
+        const resume = resumeContext(startContext);
+        const resumeResult = await Promise.race([
+          resume.then(() => "resumed"),
+          startCancellation.then(() => "cancelled"),
+        ]);
+        if (resumeResult === "cancelled" || !isStartCurrent()) {
+          // stop() has already torn down this renderer. A resume that settles
+          // afterward can wake its AudioContext again, so put it back to sleep
+          // only while the shared worklet context is still ours (or unowned).
+          void resume.then(async () => {
+            if (startOwner && pcmWorkletEngine.owner && pcmWorkletEngine.owner !== startOwner) return;
+            if (startOwner) await startContext.suspend().catch(() => {});
+            else await startContext.close().catch(() => {});
+          }).catch(() => {});
+          return false;
+        }
       } catch (error) {
         playing = false;
         sources.forEach((source) => { try { source.stop(); } catch (_) {} });
@@ -1144,6 +1314,7 @@
 
     const maybeStartPlayback = () => {
       if (stopped || playing || starting || !playWhenReady || chunks.length === 0) return starting;
+      if (!ended && (typeof waitForCompletion === "function" ? waitForCompletion() : waitForCompletion)) return null;
       if (!ended && bufferedSeconds() < startupBufferSeconds()) return null;
       const delayRemainingMs = firstChunkAt === null
         ? 0 : startupDelayMilliseconds() - (rendererNow() - firstChunkAt);
@@ -1168,8 +1339,24 @@
       if (context?.state === "suspended") {
         playing = true;
         playWhenReady = true;
+        const resumedContext = context;
+        const resumedOwner = workletOwner;
         try {
-          await resumeContext(context);
+          const resume = resumeContext(resumedContext);
+          const resumeResult = await Promise.race([
+            resume.then(() => true),
+            startCancellation.then(() => false),
+          ]);
+          if (!resumeResult || stopped || !playing || context !== resumedContext) {
+            playing = false;
+            void resume.then(async () => {
+              if (resumedOwner && pcmWorkletEngine.owner
+                  && pcmWorkletEngine.owner !== resumedOwner) return;
+              if (resumedOwner) await resumedContext.suspend().catch(() => {});
+              else await resumedContext.close().catch(() => {});
+            }).catch(() => {});
+            return false;
+          }
           schedulePending();
           onPlaybackStarted?.({
             renderer: workletNode ? "audio_worklet_ring" : "audio_buffer_source",
@@ -1189,7 +1376,10 @@
         // AudioWorklet transfer detaches the scheduled packet's ArrayBuffer.
         // History is the durable replay source, so each replay gets its own
         // transferable copy and the retained frames remain intact forever.
-        chunks.push(...history.map((frame) => ({ ...frame, data: frame.data.slice() })));
+        chunks.push(...history.map((frame) => ({
+          frame: { ...frame, data: frame.data.slice() },
+          operationId: null,
+        })));
         pendingSeconds = history.reduce((seconds, frame) => (
           seconds + (frame.data.byteLength / (2 * frame.channels * frame.sampleRate))
         ), 0);
@@ -1242,7 +1432,7 @@
           history.push({ ...frame, data: frame.data.slice() });
           rendererMetrics.retained_bytes += frame.data.byteLength;
         }
-        chunks.push(frame);
+        chunks.push({ frame, operationId: typeof sequenceKey === "string" ? sequenceKey : null });
         pendingSeconds += frame.data.byteLength / (2 * frame.channels * frame.sampleRate);
         if (!receivedAudio) {
           receivedAudio = true;
@@ -1274,6 +1464,8 @@
 
     const stop = async () => {
       stopped = true;
+      startCancellationResolve?.();
+      startCancellationResolve = null;
       playing = false;
       if (startupDelayTimer !== null) {
         window.clearTimeout(startupDelayTimer);
@@ -1295,6 +1487,7 @@
       }
       workletOwner = null;
       context = null;
+      rendererPacketOwners.clear();
       reportRendererMetrics("stopped");
     };
 
@@ -1331,7 +1524,14 @@
       pause,
       stop,
       wavBytes,
+      reconsiderStartup: maybeStartPlayback,
+      echoReference() {
+        if (!playing || !echoReference || !echoReferenceSamples || !context) return null;
+        echoReference.getFloatTimeDomainData(echoReferenceSamples);
+        return { samples: echoReferenceSamples, sampleRate: context.sampleRate };
+      },
       get playing() { return playing; },
+      get starting() { return starting !== null; },
       get ready() { return playable; },
       bufferedMs: () => Math.round(bufferedPlaybackSeconds() * 100_000) / 100,
       metrics: () => ({ ...rendererMetrics }),
@@ -2122,8 +2322,24 @@
 
   const startCallRinging = async (epoch) => {
     await stopCallBed();
+    if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
     const context = new AudioContext();
-    await context.resume();
+    // Request resume synchronously on the user-gesture path, then let the
+    // Calling surface cross a paint boundary before scheduling audible tones.
+    const resumeResult = context.resume().then(
+      () => ({ ok: true }),
+      (error) => ({ error }),
+    );
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const resumed = await resumeResult;
+    if (resumed.error) {
+      await context.close().catch(() => {});
+      throw resumed.error;
+    }
+    if (voiceCallEpoch !== epoch || !voiceCallActive) {
+      await context.close().catch(() => {});
+      return false;
+    }
     const gain = context.createGain();
     gain.gain.value = 0.035;
     gain.connect(context.destination);
@@ -2145,6 +2361,78 @@
     };
     ring();
     voiceCallAudio = { context, ringTimer: window.setInterval(ring, 1250), nodes: [] };
+    return true;
+  };
+
+  const prepareVoicePersonaForCall = async (recipientId, epoch) => {
+    if (!recipientId) throw new Error("The selected contact is unavailable for voice preparation.");
+    const isCurrent = () => voiceCallEpoch === epoch && voiceCallActive;
+    if (!isCurrent()) return false;
+    const started = performance.now();
+    markVoiceLatency("call_persona_prepare_started", { persona_id: recipientId });
+    let response;
+    try {
+      response = await invoke("mom_llama_voice_persona_prepare", { personaId: recipientId });
+    } catch (error) {
+      if (isCurrent()) {
+        markVoiceLatency("call_persona_prepare_failed", {
+          persona_id: recipientId,
+          elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+          message: errorMessage(error),
+        });
+      }
+      throw error;
+    }
+    if (!isCurrent()) return false;
+    if (response?.status === "blocked" || !response?.result?.audio_projector_warmed) {
+      const error = new Error(response?.blocker?.message || "The selected contact could not be prepared for voice.");
+      markVoiceLatency("call_persona_prepare_failed", {
+        persona_id: recipientId,
+        elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+        status: response?.status || "missing_result",
+        message: error.message,
+      });
+      throw error;
+    }
+    markVoiceLatency("call_persona_prepare_completed", {
+      persona_id: recipientId,
+      elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+      prefix_cache_id: response.result.metadata?.id || null,
+      resident_prefix_tokens: Number(response.result.resident_prefix_tokens || 0),
+      prefill_us: Number(response.result.prefill_us || 0),
+      verification_us: Number(response.result.verification_us || 0),
+      persisted: response.result.persisted === true,
+    });
+    return true;
+  };
+
+  const stopSpeechOperationAndWait = async (
+    operation,
+    reason,
+    { allowColdTranscriptionSettlement = false } = {},
+  ) => {
+    if (!operation) return;
+    const started = performance.now();
+    markVoiceLatency("speech_preemption_started", { reason });
+    try {
+      const response = await invoke("mom_llama_speech_stop_and_wait", {
+        operation,
+        allowColdTranscriptionSettlement,
+      });
+      if (response?.status === "blocked" || response?.result?.terminal_acknowledged !== true) {
+        throw new Error(response?.blocker?.message || "Speech transcription did not confirm that it stopped.");
+      }
+    } catch (error) {
+      // An unacknowledged stop is not evidence of safe future preemption.
+      voiceCallTranscriptSlotsDisabled = true;
+      throw error;
+    }
+    markVoiceLatency("speech_preemption_acknowledged", {
+      reason,
+      elapsed_ms: Math.round((performance.now() - started) * 100) / 100,
+      operation,
+    });
+    return performance.now() - started;
   };
 
   const startStreamedCallGreeting = async (epoch, conversation) => {
@@ -2156,15 +2444,16 @@
     const tts = beginLiveVoiceTts({
       conversation,
       mode: "call",
-      allowRequestBinding: true,
+      clientRequest: speechOperationToken(),
       callEpoch: epoch,
-      onFirstChunk: () => {
+      onPlaybackStarted: () => {
         if (voiceCallEpoch === epoch && voiceCallActive) {
           // Ring until the shared reply buffer has actual audio. The call is
           // answered at this boundary, not at generation dispatch.
           // A persistent synthetic line bed is audible to the native
           // microphone and was cancelling the greeting as a false barge-in.
           void stopCallBed().catch(reportError);
+          setText("voice-call-title", "Call");
         }
       },
       // The call action owns teardown and error presentation. Closing here
@@ -2179,12 +2468,14 @@
       // the saved recipient through the multi-consultant mention dispatcher,
       // whose differently shaped stream/result previously stranded pickup.
       markVoiceLatencyIn(greetingTrace, "generation_dispatched", { purpose: "call_greeting" });
-      const response = await withDeadline(
+      const response = await withProgressDeadline(
         invoke("mom_llama_chat_send", {
           conversation,
+          clientRequest: tts.clientRequest,
           message: "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
         }),
-        12_000,
+        30_000,
+        () => tts.lastProgressAt,
         "call_reply_timeout: The contact did not finish answering the call.",
       );
       if (voiceCallEpoch !== epoch || !voiceCallActive || liveVoiceTts !== tts) return false;
@@ -2208,6 +2499,10 @@
       const greeting = output?.assistant_text?.trim() || tts.text.trim();
       if (!greeting) throw new Error("The contact did not answer the call.");
       const synthesized = await tts.finish(greeting);
+      // The caller may speak over the greeting as soon as its first packet is
+      // audible. That intentionally stops this TTS controller; the listener
+      // is already running and the interrupted pickup is still a valid call.
+      if (!synthesized && tts.interruptedForSpeech) return true;
       if (!synthesized) {
         throw greetingFailure
           || new Error("The contact answered, but their voice could not be produced.");
@@ -2219,7 +2514,7 @@
       // acknowledgement, not a user-visible failure.
       if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
       if (error?.code === "voice_generation_timeout") {
-        markVoiceLatencyIn(greetingTrace, "generation_timeout", { phase: "call_greeting", timeout_ms: 12_000 });
+        markVoiceLatencyIn(greetingTrace, "generation_timeout", { phase: "call_greeting", timeout_ms: 30_000 });
         void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});
       }
       throw error;
@@ -2265,7 +2560,10 @@
       reused: false,
       permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       source_rate_hz: settings.sampleRate || null,
-      echo_cancellation: settings.echoCancellation ?? true,
+      echo_cancellation: settings.echoCancellation ?? null,
+      noise_suppression: settings.noiseSuppression ?? null,
+      auto_gain_control: settings.autoGainControl ?? null,
+      graph_rate_hz: context.sampleRate,
       graph_state: context.state,
     };
   };
@@ -2289,10 +2587,75 @@
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
     if (!modal || !recipient || voiceCallActive || voiceCallPreparing) return;
-    voiceCallPreparing = true;
-    let epoch = null;
-    startVoiceLatency("call_greeting", "call_requested");
+    const recipientId = recipient.dataset.recipientId || "";
+    if (!recipientId) {
+      reportError(new Error("The selected contact is unavailable for voice preparation."));
+      return;
+    }
+    let activityGuard;
     try {
+      activityGuard = createVoiceCallActivityGuard(speechOperationToken());
+    } catch (error) {
+      reportError(error);
+      return;
+    }
+    voiceCallActivityGuard = activityGuard;
+    voiceCallPreparing = true;
+    const epoch = {};
+    voiceCallEpoch = epoch;
+    voiceCallActive = true;
+    voiceCallConversation = null;
+    let releaseHistoryRecovery = null;
+    startVoiceLatency("call_greeting", "call_requested");
+    const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
+    const sourceAvatar = recipient.querySelector(".contact-avatar");
+    const targetAvatar = modal.querySelector("#voice-call-avatar");
+    if (sourceAvatar && targetAvatar) {
+      targetAvatar.className = sourceAvatar.className.replace(/\bcontact-avatar\b/g, "").trim();
+      targetAvatar.classList.add("contact-avatar", "voice-call-avatar");
+      targetAvatar.setAttribute("style", sourceAvatar.getAttribute("style") || "");
+      targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
+    }
+    modal.dataset.voicePersona = recipientId;
+    modal.dataset.callState = "ringing";
+    modal.setAttribute("aria-label", `Calling ${name}`);
+    setText("voice-call-title", "Calling");
+    setText("voice-call-name", name);
+    setModalVisibility("voice-call-modal", true);
+    modal.querySelector('[data-action="voice-call-close"]')?.focus();
+    // Request audio resume on the gesture path. The helper waits for the
+    // Calling surface to paint before it schedules tones; call preparation
+    // then proceeds while the ring and setup waits settle.
+    const ringingReady = startCallRinging(epoch).then(
+      (started) => {
+        if (started && voiceCallEpoch === epoch && voiceCallActive) {
+          markVoiceLatency("call_ringing_started");
+        }
+        return { started };
+      },
+      (error) => ({ error }),
+    );
+    try {
+      const activityGuardWaitStartedAt = performance.now();
+      markVoiceLatency("call_activity_guard_wait_started");
+      await activityGuard.ready;
+      markVoiceLatency("call_activity_guard_ready", {
+        wait_ms: Math.max(0, Math.round(performance.now() - activityGuardWaitStartedAt)),
+      });
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      const ringResult = await ringingReady;
+      if (ringResult.error) throw ringResult.error;
+      if (!ringResult.started || voiceCallEpoch !== epoch || !voiceCallActive) return;
+      // Do not admit Gemma warming or microphone setup while an idle Parakeet
+      // ticket is still processing. The stop result is only a request; this
+      // wait must observe the matching backend operation leave the registry.
+      const recoverySuspendWaitStartedAt = performance.now();
+      markVoiceLatency("call_history_recovery_suspend_wait_started");
+      releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
+      markVoiceLatency("call_history_recovery_suspend_wait_finished", {
+        wait_ms: Math.max(0, Math.round(performance.now() - recoverySuspendWaitStartedAt)),
+      });
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Start independent resident/worklet readiness while the required
       // microphone authorization and first CoreAudio callback are pending.
       // Recording either only after that await falsely charged microphone
@@ -2309,34 +2672,19 @@
       // this exact stream for the whole call so WebKit can continuously apply
       // acoustic echo cancellation while contact audio is playing.
       const microphone = await prepareCallMicrophoneStream();
+      if (voiceCallEpoch !== epoch || !voiceCallActive) {
+        releaseCallMicrophoneStream();
+        return;
+      }
       markVoiceLatency("call_microphone_ready", microphone);
-      const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
-      const recipientId = recipient.dataset.recipientId || "";
-      const sourceAvatar = recipient.querySelector(".contact-avatar");
-      const targetAvatar = modal.querySelector("#voice-call-avatar");
-      if (sourceAvatar && targetAvatar) {
-        targetAvatar.className = sourceAvatar.className.replace(/\bcontact-avatar\b/g, "").trim();
-        targetAvatar.classList.add("contact-avatar", "voice-call-avatar");
-        targetAvatar.setAttribute("style", sourceAvatar.getAttribute("style") || "");
-        targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
-      }
-      modal.dataset.voicePersona = recipientId;
-      setText("voice-call-name", name);
-      setModalVisibility("voice-call-modal", true);
-      modal.querySelector('[data-action="voice-call-close"]')?.focus();
-      epoch = {};
-      voiceCallEpoch = epoch;
-      voiceCallActive = true;
-      // Permission/device readiness has already completed. Ring now, while
-      // conversation materialization and resident-model admission continue
-      // behind the ring.
-      await startCallRinging(epoch);
-      markVoiceLatency("call_ringing_started");
-      const warm = await warmReady;
+      // A cold local engine is still preparation, not a ringing contact.
+      // Keep measuring the entire request-to-playback interval; do not hide
+      // initialization time by redefining the latency clock at readiness.
+      await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
-      if (warm.status !== "ready" || !warm.model_loaded || !warm.audio_projector_warmed) {
-        throw new Error(warm.message || "The voice model did not become ready for the call.");
-      }
+      // Startup is opportunistic and can be superseded by foreground model
+      // selection. The exact conversation preparation below owns call readiness
+      // and warms its own audio encoder; a stale startup failure is not final.
       let conversation = selectedConversation();
       if (conversation === "default") {
         const started = await invoke("mom_llama_conversation_draft_call_start");
@@ -2359,8 +2707,12 @@
         chat().dataset.currentConversation = conversation;
         chat().dataset.conversationKind = "chat";
       }
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       voiceCallConversation = conversation;
       markVoiceLatency("call_conversation_ready", { conversation });
+      // Use the actual frozen call profile. It may differ from its source contact.
+      const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
+      if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // The first model reply uses the same token -> TTS -> PCM buffer as every
       // later call turn. Its first PCM frame stops ringing; playback startup
       // opens continuous listening, while model attachment waits until Qwen
@@ -2377,10 +2729,13 @@
       throw error;
     } finally {
       voiceCallPreparing = false;
+      releaseHistoryRecovery?.();
     }
   };
 
   const closeVoiceCallSurface = async () => {
+    const activityGuard = voiceCallActivityGuard;
+    voiceCallActivityGuard = null;
     const conversation = voiceCallConversation;
     const microphoneStream = voiceCallMicrophoneStream;
     const callTts = liveVoiceTts?.mode === "call" ? liveVoiceTts : null;
@@ -2393,15 +2748,20 @@
     voiceCallActive = false;
     voiceCallEpoch = null;
     voiceCallConversation = null;
+    retryCallPrefillAfterTranscript = null;
     voiceReplyConversation = null;
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
     activeCallPlayback = null;
+    // Dismiss the call immediately. Some local stop paths touch Web Audio or
+    // native cancellation before their first await; neither owns the UI.
+    setModalVisibility("voice-call-modal", false);
 
     // Each stop function severs its local Web Audio nodes before its first
-    // await. Start all of them before hiding the surface or waiting on IPC.
+    // await. Start all of them before waiting on IPC.
     const stops = [
-      stopVoiceCapture({ discard: true }),
+      stopVoiceCapture({ discard: true, reason: "call_closed" }),
+      stopCallTranscriptForClose(),
       callTts?.stop(),
       audibleCall && audibleCall !== callTts ? audibleCall.stop() : null,
       stopSpeechPlayback(),
@@ -2410,9 +2770,23 @@
     if (cancelGeneration) {
       stops.push(invoke("mom_llama_chat_cancel", { conversation }).catch(() => {}));
     }
-    setModalVisibility("voice-call-modal", false);
     await Promise.allSettled(stops.filter(Boolean));
     releaseCallMicrophoneStream(microphoneStream);
+    if (activityGuard) {
+      try {
+        await activityGuard.clear();
+      } catch (error) {
+        console.warn("voice cache activity guard could not be cleared", error);
+      }
+    }
+    if (conversation) {
+      // The call surface is already dismissed and native stop/cancel work has
+      // settled. Checkpointing can serialize a large state, so keep it off the
+      // UI path and let the runtime skip it if the request is still active.
+      void invoke("mom_llama_kv_cache_checkpoint_voice_session", { conversation })
+        .catch((error) => console.warn("voice session checkpoint unavailable", error));
+    }
+    void recoverPendingVoiceHistory().catch(() => {});
   };
 
   const setText = (id, value) => {
@@ -2708,6 +3082,7 @@
       && replacement?.dataset.currentConversation === conversation) {
       requestAnimationFrame(() => requestAnimationFrame(() => {
         recordConversationSwitchPaint(startedAt, performance.now());
+        void recoverPendingVoiceHistory().catch(() => {});
       }));
     }
     // Sidebar and settings carry secondary state. Refresh them after the chat
@@ -3640,7 +4015,7 @@
   const appendLiveVoiceReply = (id) => {
     const card = appendLiveMessage("assistant", "", id);
     const row = card?.closest(".message-row");
-    if (!card || !row) return;
+    if (!card || !row) return null;
     row.classList.add("voice-reply-row", "voice-reply-pending");
     // A bare portrait reads as a broken message. Publish the speaker only
     // when PCM exists; until then the compact typing bubble is the complete
@@ -3648,6 +4023,7 @@
     row.querySelector?.(".message-speaker-avatar")?.remove();
     card.replaceChildren(pendingVoiceReply());
     row.hidden = false;
+    return row;
   };
 
   const keepLiveTailVisible = (element) => {
@@ -3664,9 +4040,12 @@
   let callReplyConversation = null;
   let voiceCallPreparing = false;
   let voiceCallActive = false;
+  let voiceCallTranscriptSlotsDisabled = false;
   let voiceCallEpoch = null;
+  let voiceCallActivityGuard = null;
   let voiceCallAudio = null;
   let voiceCallConversation = null;
+  let retryCallPrefillAfterTranscript = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
   let pendingVoiceAudioSession = null;
@@ -3826,7 +4205,11 @@
     // suffix, sampler, or first-token stalls in real packaged calls.
     const nativeAudioTerminal = latestAttemptStage("native_audio_finish_failed")
       || latestAttemptStage("native_audio_finish_returned");
-    const audio = generation?.voice_audio || nativeAudioTerminal?.audio || null;
+    const nativeDecodeAudio = [...indexedStages].reverse().find(({ entry }) =>
+      entry.stage === "native_chat_stream_event" && entry.event === "decode_started"
+        && entry.audio && (!currentSpeculation || entry.speculation === currentSpeculation)
+    )?.entry.audio || null;
+    const audio = generation?.voice_audio || nativeAudioTerminal?.audio || nativeDecodeAudio;
     const cancelledAudio = latestAttemptStage("native_audio_finish_failed")?.audio || null;
     const captureStarted = firstIndexed("native_capture_requested")
       || firstIndexed("capture_started");
@@ -3869,6 +4252,10 @@
     const nextPrefillStarted = latestSinceAttempt("next_turn_prefill_started");
     const nextPrefillReady = latestSinceAttempt("next_turn_prefill_ready");
     const playbackRenderer = latestSinceAttempt("playback_renderer");
+    const playbackWorkletMetricsReported = playbackRenderer?.worklet === true
+      && playbackRenderer?.worklet_final_metrics_received === true;
+    const playbackRendererCountersKnown = playbackRenderer?.worklet !== true
+      || playbackWorkletMetricsReported;
     const playbackUnderrun = latestSinceAttempt("playback_underrun");
     const playbackStarted = latestSinceAttempt("playback_started");
     const playbackRendered = latestSinceAttempt("playback_render_started");
@@ -3882,9 +4269,11 @@
       const coarse = Number(audio?.[`${name}_ms`]);
       return Number.isFinite(coarse) ? coarse : null;
     };
-    const captureMetricMs = (name) => {
+    const captureMetricMs = (name, browserName = null) => {
       const precise = Number(capture?.[`${name}_us`]);
-      return Number.isFinite(precise) ? Math.round(precise / 10) / 100 : null;
+      if (Number.isFinite(precise)) return Math.round(precise / 10) / 100;
+      const browser = browserName === null ? NaN : Number(capture?.[browserName]);
+      return Number.isFinite(browser) ? browser : null;
     };
     const firstProjectorFinish = metricMs("first_projector_finish");
     const lastProjectorFinish = metricMs("last_projector_finish");
@@ -3927,6 +4316,10 @@
       : null;
     return {
       call_request_to_ringing_ms: delta("call_requested", "call_ringing_started"),
+      call_activity_guard_wait_ms: delta("call_activity_guard_wait_started", "call_activity_guard_ready"),
+      call_history_recovery_suspend_wait_ms: delta(
+        "call_history_recovery_suspend_wait_started", "call_history_recovery_suspend_wait_finished",
+      ),
       call_request_to_microphone_ready_ms: delta("call_requested", "call_microphone_ready"),
       microphone_ready_to_ringing_ms: delta("call_microphone_ready", "call_ringing_started"),
       microphone_native_first_sample_ms:
@@ -3972,6 +4365,13 @@
         typeof runtimeWarm?.audio_projector_warmed === "boolean"
           ? runtimeWarm.audio_projector_warmed
           : null,
+      runtime_warm_persona_prefix_ms:
+        Number.isFinite(Number(runtimeWarm?.persona_prefix_warm_us))
+          ? Math.round(Number(runtimeWarm.persona_prefix_warm_us) / 10) / 100 : null,
+      runtime_warm_persona_prefix_status: runtimeWarm?.persona_prefix_warm_status || null,
+      runtime_warm_persona_prefixes_ready:
+        Number.isFinite(Number(runtimeWarm?.persona_prefixes_ready))
+          ? Number(runtimeWarm.persona_prefixes_ready) : null,
       model_load_total_ms: Number.isFinite(Number(modelLoad?.total_us))
         ? Math.round(Number(modelLoad.total_us) / 10) / 100 : null,
       model_load_backend_ms: Number.isFinite(Number(modelLoad?.backend_us))
@@ -4002,12 +4402,21 @@
       capture_callback_frames_max: Number.isFinite(Number(capture?.callback_frames_max))
         ? Number(capture.callback_frames_max)
         : null,
-      capture_processing_cpu_ms: captureMetricMs("processing_cpu"),
-      capture_processing_max_ms: captureMetricMs("processing_max"),
-      capture_resample_cpu_ms: captureMetricMs("resample_cpu"),
+      capture_processing_cpu_ms: captureMetricMs("processing_cpu", "callback_cpu_ms"),
+      capture_processing_max_ms: captureMetricMs("processing_max", "callback_max_ms"),
+      capture_resample_cpu_ms: captureMetricMs("resample_cpu", "resample_cpu_ms"),
       capture_resample_max_ms: captureMetricMs("resample_max"),
-      capture_detector_cpu_ms: captureMetricMs("detector_cpu"),
+      capture_detector_cpu_ms: captureMetricMs("detector_cpu", "detector_cpu_ms"),
       capture_detector_max_ms: captureMetricMs("detector_max"),
+      capture_prefill_ipc_queue_high_water_ms:
+        capture && Number.isFinite(Number(capture.prefill_ipc_queue_high_water_samples))
+          ? Number(capture.prefill_ipc_queue_high_water_samples) / 16 : null,
+      capture_prefill_ipc_queued_at_stop_ms:
+        capture && Number.isFinite(Number(capture.prefill_ipc_queued_samples))
+          ? Number(capture.prefill_ipc_queued_samples) / 16 : null,
+      capture_prefill_suppressed_silence_ms:
+        capture && Number.isFinite(Number(capture.prefill_suppressed_silence_samples))
+          ? Number(capture.prefill_suppressed_silence_samples) / 16 : null,
       capture_vad_voice_onsets: Number.isFinite(Number(capture?.vad_voice_onsets))
         ? Number(capture.vad_voice_onsets) : null,
       capture_vad_settle_ms: Number.isFinite(Number(capture?.vad_settle_samples))
@@ -4158,6 +4567,10 @@
       prompt_prefix_start_ms: metricMs("prefix_start"),
       prompt_prefix_finish_ms: metricMs("prefix_finish"),
       prompt_prefix_cpu_ms: metricMs("prefix"),
+      prompt_prefix_tokens: Number.isFinite(Number(audio?.prefix_tokens))
+        ? Number(audio.prefix_tokens) : null,
+      prompt_prefix_restored_tokens: Number.isFinite(Number(audio?.restored_prefix_tokens))
+        ? Number(audio.restored_prefix_tokens) : null,
       projector_first_start_ms: metricMs("first_projector_start"),
       projector_first_finish_ms: firstProjectorFinish,
       projector_last_finish_ms: lastProjectorFinish,
@@ -4486,6 +4899,9 @@
       playback_renderer_worklet: typeof playbackRenderer?.worklet === "boolean"
         ? playbackRenderer.worklet
         : null,
+      playback_renderer_reason: typeof playbackRenderer?.reason === "string"
+        ? playbackRenderer.reason
+        : null,
       playback_renderer_packets: Number.isFinite(Number(playbackRenderer?.packets))
         ? Number(playbackRenderer.packets)
         : null,
@@ -4498,32 +4914,59 @@
       playback_renderer_schedule_max_ms: Number.isFinite(Number(playbackRenderer?.schedule_max_us))
         ? Math.round(Number(playbackRenderer.schedule_max_us) / 10) / 100
         : null,
-      playback_renderer_underruns: Number.isFinite(Number(playbackRenderer?.underruns))
-        ? Number(playbackRenderer.underruns)
-        : null,
-      playback_renderer_recoveries: Number.isFinite(Number(playbackRenderer?.worklet_recoveries))
-        ? Number(playbackRenderer.worklet_recoveries)
-        : null,
-      playback_renderer_rebuffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_rebuffered_frames))
-        ? Number(playbackRenderer.worklet_rebuffered_frames)
-        : null,
-      playback_renderer_max_buffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_max_buffered_frames))
-        ? Number(playbackRenderer.worklet_max_buffered_frames)
-        : null,
-      playback_renderer_max_queued_frames: Number.isFinite(Number(playbackRenderer?.worklet_max_queued_frames))
-        ? Number(playbackRenderer.worklet_max_queued_frames)
-        : null,
-      playback_renderer_min_buffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_min_buffered_frames))
-        ? Number(playbackRenderer.worklet_min_buffered_frames)
-        : null,
-      playback_renderer_first_receive_context_frame:
-        Number.isFinite(Number(playbackRenderer?.worklet_first_receive_context_frame))
-          ? Number(playbackRenderer.worklet_first_receive_context_frame)
-          : null,
-      playback_renderer_first_render_context_frame:
-        Number.isFinite(Number(playbackRenderer?.worklet_first_render_context_frame))
-          ? Number(playbackRenderer.worklet_first_render_context_frame)
-          : null,
+      // These samples reached the AudioWorklet output only; they do not
+      // establish what reached the physical speaker.
+      playback_renderer_metrics_complete: playbackRenderer?.worklet === true
+        ? playbackWorkletMetricsReported : null,
+      playback_renderer_underruns: playbackRendererCountersKnown
+        && typeof playbackRenderer?.underruns === "number" && Number.isFinite(playbackRenderer.underruns)
+        ? playbackRenderer.underruns : null,
+      playback_renderer_pcm_signal_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_frames)
+        ? playbackRenderer.worklet_pcm_signal_frames : null,
+      playback_renderer_pcm_signal_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_rms)
+        ? playbackRenderer.worklet_pcm_signal_rms : null,
+      playback_renderer_pcm_signal_peak: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_peak)
+        ? playbackRenderer.worklet_pcm_signal_peak : null,
+      playback_renderer_pcm_signal_min_quantum_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_min_quantum_rms)
+        ? playbackRenderer.worklet_pcm_signal_min_quantum_rms : null,
+      playback_renderer_pcm_signal_max_quantum_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_max_quantum_rms)
+        ? playbackRenderer.worklet_pcm_signal_max_quantum_rms : null,
+      playback_renderer_pcm_low_energy_threshold_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_threshold_rms)
+        ? playbackRenderer.worklet_pcm_low_energy_threshold_rms : null,
+      playback_renderer_pcm_low_energy_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_frames)
+        ? playbackRenderer.worklet_pcm_low_energy_frames : null,
+      playback_renderer_pcm_low_energy_quanta: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_quanta)
+        ? playbackRenderer.worklet_pcm_low_energy_quanta : null,
+      playback_renderer_pcm_max_low_energy_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_max_low_energy_frames)
+        ? playbackRenderer.worklet_pcm_max_low_energy_frames : null,
+      playback_renderer_recoveries: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_recoveries)
+        ? playbackRenderer.worklet_recoveries : null,
+      playback_renderer_rebuffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_rebuffered_frames)
+        ? playbackRenderer.worklet_rebuffered_frames : null,
+      playback_renderer_max_buffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_max_buffered_frames)
+        ? playbackRenderer.worklet_max_buffered_frames : null,
+      playback_renderer_max_queued_frames: typeof playbackRenderer?.worklet_max_queued_frames === "number" && Number.isFinite(playbackRenderer.worklet_max_queued_frames)
+        ? playbackRenderer.worklet_max_queued_frames : null,
+      playback_renderer_min_buffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_min_buffered_frames)
+        ? playbackRenderer.worklet_min_buffered_frames : null,
+      playback_renderer_first_receive_context_frame: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_first_receive_context_frame)
+        ? playbackRenderer.worklet_first_receive_context_frame : null,
+      playback_renderer_first_render_context_frame: typeof playbackRenderer?.worklet_first_render_context_frame === "number" && Number.isFinite(playbackRenderer.worklet_first_render_context_frame)
+        ? playbackRenderer.worklet_first_render_context_frame : null,
       playback_underrun_occurrences: Number.isFinite(Number(playbackUnderrun?.occurrences))
         ? Number(playbackUnderrun.occurrences)
         : 0,
@@ -4555,9 +4998,11 @@
       // Multiple marks for one trace intentionally coalesce to the newest
       // checkpoint; the stage array still contains every individual timing.
       const snapshot = JSON.parse(JSON.stringify(trace));
-      const serialized = JSON.stringify({ ...snapshot, summary: voiceLatencySummary(snapshot) });
-      if (serialized.length > 64 * 1024) return;
-      voiceLatencyHistory.push(snapshot);
+      // Derive metrics before byte compaction so a bounded receipt keeps the
+      // complete summary even when repetitive detail must be omitted.
+      const summary = voiceLatencySummary(snapshot);
+      const serialized = compactVoiceLatencySnapshot(snapshot, summary);
+      voiceLatencyHistory.push(JSON.parse(serialized));
       if (voiceLatencyHistory.length > 20) voiceLatencyHistory.splice(0, voiceLatencyHistory.length - 20);
       persistVoiceLatency(serialized);
     });
@@ -4578,6 +5023,313 @@
   // first-voice milestone is coalesced.
   const COALESCED_VOICE_LATENCY_STAGES = new Set(["voice_activity_first_detected"]);
   const VOICE_LATENCY_STAGE_LIMIT = 512;
+  const VOICE_LATENCY_TRACE_BYTE_LIMIT = 64 * 1024;
+  const VOICE_LATENCY_OWNER_BUCKET_LIMIT = 128;
+  const VOICE_LATENCY_HIGH_VOLUME_STAGES = new Set([
+    "native_chat_stream_event",
+    "chat_stream_event_received",
+    "chat_stream_route_decision",
+    "playback_packet_enqueued",
+    "playback_packet_admitted",
+  ]);
+  const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
+    "call_requested", "call_ringing_started", "call_activity_guard_wait_started",
+    "call_activity_guard_ready", "call_history_recovery_suspend_wait_started",
+    "call_history_recovery_suspend_wait_finished", "call_conversation_ready",
+    "audio_prefill_begin_requested", "audio_prefill_session_ready",
+    "audio_prefill_begin_failed", "audio_prefill_push_failed",
+    "audio_prefill_wait_expired", "audio_prefill_drain_failed",
+    "audio_prefill_producer_overflow", "native_capture_started", "capture_stopped",
+    "capture_processing", "voice_inference_archive", "native_capture_failed",
+    "generation_dispatched", "speculation_dispatch_started", "native_silence_armed",
+    "native_silence_released", "native_generation_worker_started", "generation_finished",
+    "voice_transcript_started", "voice_transcript_inference_started",
+    "voice_transcript_inference_finished", "voice_transcript_finished",
+    "voice_transcript_skipped", "voice_transcript_failed", "first_content_delta",
+    "first_content_delta_received", "tts_first_chunk_ready", "tts_native_dispatched",
+    "tts_first_pcm", "tts_segment_finished", "tts_all_segments_finished",
+    "tts_segment_dispatched", "tts_segment_first_pcm", "tts_segment_pcm_complete",
+    "tts_segment_receipt_received",
+    "next_turn_prefill_started", "next_turn_prefill_ready", "next_turn_prefill_failed",
+    "barge_in_detected", "barge_in_playback_stopped", "barge_in_playback_stop_failed",
+    "playable", "playback_started", "playback_render_started",
+    "playback_underrun_started", "playback_underrun_recovered", "durable_voice_audio_ready",
+    "durable_voice_audio_failed", "playback_underrun", "playback_renderer",
+    "speculation_handoff_ready", "speculation_handoff_failed", "failed",
+  ]);
+  const VOICE_LATENCY_LIFECYCLE_EVENTS = new Set([
+    "started", "prefill_started", "decode_started", "completed", "cancelled", "failed",
+  ]);
+
+  const voiceLatencyUtf8Bytes = (value) => new TextEncoder().encode(value).byteLength;
+
+  const noteVoiceLatencyCompaction = (trace, field, amount = 1) => {
+    trace.compaction ||= {};
+    trace.compaction[field] = (Number(trace.compaction[field]) || 0) + Math.max(0, Number(amount) || 0);
+  };
+
+  const isVoiceLatencyCriticalRecord = (record) => {
+    if (VOICE_LATENCY_CHECKPOINT_STAGES.has(record.stage)) return true;
+    if (record.stage === "native_chat_stream_event"
+      || record.stage === "chat_stream_event_received" || record.stage === "chat_stream_route_decision") {
+      return VOICE_LATENCY_LIFECYCLE_EVENTS.has(record.event);
+    }
+    return false;
+  };
+
+  const appendVoiceLatencyStage = (trace, record) => {
+    if (trace.stages.length >= VOICE_LATENCY_STAGE_LIMIT) {
+      let removeAt = trace.stages.findIndex((entry) => entry.voice_latency_aggregate === true);
+      if (removeAt < 0 && isVoiceLatencyCriticalRecord(record)) {
+        removeAt = trace.stages.findIndex((entry) => !isVoiceLatencyCriticalRecord(entry));
+      }
+      if (removeAt < 0 && isVoiceLatencyCriticalRecord(record)) removeAt = 0;
+      if (removeAt < 0) {
+        noteVoiceLatencyCompaction(trace, "stage_limit_events_omitted");
+        return null;
+      }
+      const [removed] = trace.stages.splice(removeAt, 1);
+      noteVoiceLatencyCompaction(trace, "stage_limit_records_omitted");
+      noteVoiceLatencyCompaction(trace, "stage_limit_events_omitted", removed?.occurrences || 1);
+    }
+    trace.stages.push(record);
+    return record;
+  };
+
+  const aggregateVoiceLatencyStage = (trace, stage, detail, elapsedMs, observedAtUnixUs) => {
+    const isStream = stage === "native_chat_stream_event"
+      || stage === "chat_stream_event_received" || stage === "chat_stream_route_decision";
+    if (isStream && !["delta", "reasoning_delta"].includes(detail.event)) return { handled: false };
+    if (!VOICE_LATENCY_HIGH_VOLUME_STAGES.has(stage)) return { handled: false };
+    const ownerType = isStream ? "request" : "operation";
+    const rawOwner = isStream ? detail.request_id : detail.operation_id;
+    if (!rawOwner) noteVoiceLatencyCompaction(trace,
+      isStream ? "unowned_stream_events" : "unowned_packet_events");
+    const ownerId = typeof rawOwner === "string" && rawOwner.length <= 128
+      ? rawOwner : (rawOwner ? String(rawOwner).slice(0, 128) : "unattributed");
+    let recorded = trace.stages.find((entry) => entry.voice_latency_aggregate === true
+      && entry.stage === stage && entry.owner_type === ownerType && entry.owner_id === ownerId);
+    if (!recorded) {
+      const ownerCount = new Set(trace.stages
+        .filter((entry) => entry.voice_latency_aggregate === true && entry.stage === stage)
+        .map((entry) => `${entry.owner_type}:${entry.owner_id}`)).size;
+      if (ownerCount >= VOICE_LATENCY_OWNER_BUCKET_LIMIT) {
+        noteVoiceLatencyCompaction(trace, "owner_bucket_events_omitted");
+        return { handled: true, recorded: null };
+      }
+      recorded = appendVoiceLatencyStage(trace, {
+        stage,
+        owner_type: ownerType,
+        owner_id: ownerId,
+        request_id: isStream ? ownerId : null,
+        operation_id: isStream ? null : ownerId,
+        conversation_id: detail.conversation_id || null,
+        event: detail.event || null,
+        first_elapsed_ms: elapsedMs,
+        first_observed_at_unix_us: observedAtUnixUs,
+        elapsed_ms: elapsedMs,
+        observed_at_unix_us: observedAtUnixUs,
+        occurrences: 0,
+        voice_latency_aggregate: true,
+      });
+      if (!recorded) return { handled: true, recorded: null };
+    }
+    recorded.elapsed_ms = elapsedMs;
+    recorded.observed_at_unix_us = observedAtUnixUs;
+    recorded.last_event = detail.event || recorded.last_event || null;
+    recorded.occurrences += 1;
+    if (stage === "chat_stream_route_decision") {
+      recorded.same_live_conversation_true = (recorded.same_live_conversation_true || 0)
+        + (detail.same_live_conversation ? 1 : 0);
+      recorded.owns_live_voice_true = (recorded.owns_live_voice_true || 0)
+        + (detail.owns_live_voice ? 1 : 0);
+      recorded.last_live_request_id = detail.live_request_id || null;
+    } else if (stage === "native_chat_stream_event") {
+      recorded.total_delta_bytes = (recorded.total_delta_bytes || 0) + Math.max(0, Number(detail.delta_bytes) || 0);
+      recorded.last_kind = detail.kind || recorded.last_kind || null;
+      const nativeTime = Number(detail.native_emitted_at_unix_us);
+      if (Number.isFinite(nativeTime)) {
+        recorded.first_native_emitted_at_unix_us ??= nativeTime;
+        recorded.last_native_emitted_at_unix_us = nativeTime;
+      }
+    } else if (stage === "playback_packet_enqueued" || stage === "playback_packet_admitted") {
+      const frames = Math.max(0, Number(detail.frames) || 0);
+      recorded.total_frames = (recorded.total_frames || 0) + frames;
+      recorded.packet_count = (recorded.packet_count || 0) + 1;
+      recorded.first_packet_index ??= Number(detail.packet_index) || 0;
+      recorded.first_sequence ??= Number(detail.sequence) || 0;
+      recorded.first_sample_offset ??= Number(detail.sample_offset) || 0;
+      recorded.last_packet_index = Number(detail.packet_index) || 0;
+      recorded.last_sequence = Number(detail.sequence) || 0;
+      recorded.last_sample_offset = Number(detail.sample_offset) || 0;
+      const audioContextMs = Number(detail.audio_context_ms);
+      if (Number.isFinite(audioContextMs)) {
+        recorded.first_audio_context_ms ??= audioContextMs;
+        recorded.last_audio_context_ms = audioContextMs;
+      }
+      const queued = Number(detail.queued_frames);
+      const buffered = Number(detail.buffered_frames);
+      const delay = Number(detail.enqueue_to_admission_ms);
+      if (Number.isFinite(queued)) recorded.max_queued_frames = Math.max(recorded.max_queued_frames || 0, queued);
+      if (Number.isFinite(buffered)) recorded.max_buffered_frames = Math.max(recorded.max_buffered_frames || 0, buffered);
+      if (Number.isFinite(delay)) recorded.max_enqueue_to_admission_ms = Math.max(recorded.max_enqueue_to_admission_ms || 0, delay);
+      if (detail.operation_owner_missing) recorded.operation_owner_missing_packets = (recorded.operation_owner_missing_packets || 0) + 1;
+    }
+    return { handled: true, recorded };
+  };
+
+  const compactVoiceLatencySnapshot = (snapshot, summary) => {
+    const serialize = () => JSON.stringify({ ...snapshot, summary });
+    const envelopeBytes = () => voiceLatencyUtf8Bytes(JSON.stringify({ ...snapshot, stages: [], summary }));
+    const stageBytes = () => snapshot.stages.map((entry) => voiceLatencyUtf8Bytes(JSON.stringify(entry)));
+    const estimatedBytes = () => {
+      const sizes = stageBytes();
+      return envelopeBytes() + sizes.reduce((total, bytes) => total + bytes, 0) + Math.max(0, sizes.length - 1);
+    };
+
+    // High-volume detail has already been aggregated by owner. Under receipt
+    // pressure discard aggregate buckets first, then noncritical diagnostics,
+    // without serializing the full trace once per discarded stage.
+    let sizes = stageBytes();
+    const dropSelected = (predicate) => {
+      const kept = [];
+      let removedRecords = 0;
+      let removedEvents = 0;
+      snapshot.stages.forEach((entry, index) => {
+        if (predicate(entry)) {
+          removedRecords += 1;
+          removedEvents += Number(entry?.occurrences) || 1;
+        } else {
+          kept.push(entry);
+        }
+      });
+      if (removedRecords) {
+        snapshot.stages = kept;
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_records_omitted", removedRecords);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_events_omitted", removedEvents);
+      }
+    };
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      dropSelected((entry) => entry.voice_latency_aggregate === true);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      sizes = stageBytes();
+      let bytesToRemove = estimatedBytes() - VOICE_LATENCY_TRACE_BYTE_LIMIT;
+      let removeBytes = 0;
+      let removeCount = 0;
+      for (let index = 0; index < snapshot.stages.length && removeBytes < bytesToRemove; index += 1) {
+        if (!isVoiceLatencyCriticalRecord(snapshot.stages[index])) {
+          removeBytes += (sizes[index] || 0) + 1;
+          removeCount += 1;
+        }
+      }
+      let remaining = removeCount;
+      dropSelected((entry) => !isVoiceLatencyCriticalRecord(entry) && remaining-- > 0);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      // Preserve lifecycle identity/timing while discarding only verbose
+      // metric fields. These receipts explicitly mark that detail was omitted.
+      const keep = new Set([
+        "stage", "elapsed_ms", "observed_at_unix_us", "native_emitted_at_unix_us",
+        "first_elapsed_ms", "first_observed_at_unix_us", "request_id", "operation_id",
+        "conversation_id", "event", "owner_type", "owner_id", "occurrences",
+      ]);
+      let fieldsRemoved = 0;
+      for (const entry of snapshot.stages) {
+        for (const key of Object.keys(entry)) {
+          if (!keep.has(key)) {
+            delete entry[key];
+            fieldsRemoved += 1;
+          }
+        }
+      }
+      if (fieldsRemoved) noteVoiceLatencyCompaction(snapshot, "byte_limit_detail_fields_omitted", fieldsRemoved);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT && snapshot.stages.length > 1) {
+      // As a last pressure step retain the latest lifecycle milestone.
+      sizes = stageBytes();
+      let bytesToRemove = estimatedBytes() - VOICE_LATENCY_TRACE_BYTE_LIMIT;
+      let removeCount = 0;
+      for (let index = 0; index < snapshot.stages.length - 1 && bytesToRemove > 0; index += 1) {
+        bytesToRemove -= (sizes[index] || 0) + 1;
+        removeCount += 1;
+      }
+      if (removeCount) {
+        const removed = snapshot.stages.splice(0, removeCount);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_records_omitted", removed.length);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_events_omitted",
+          removed.reduce((total, entry) => total + (Number(entry?.occurrences) || 1), 0));
+      }
+    }
+
+    if (Object.values(snapshot.compaction || {}).some((count) => Number(count) > 0)) {
+      summary.incomplete = true;
+    }
+    let serialized = serialize();
+    if (voiceLatencyUtf8Bytes(serialized) > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      // The fixed summary is normally small. If a malformed/custom summary
+      // itself exceeds the receipt budget, retain core scalar outcomes and
+      // make the summary loss explicit rather than looping or dropping it.
+      const compactSummary = {};
+      for (const key of [
+        "silence_to_first_content_ms", "silence_to_first_token_ms", "silence_to_tts_pcm_ms",
+        "generation_first_token_ms", "generation_finish_ms", "capture_to_first_sample_ms",
+        "barge_in_playback_stop_ms", "call_activity_guard_wait_ms",
+        "call_history_recovery_suspend_wait_ms", "playback_underrun_total_gap_ms",
+        "playback_underrun_max_gap_ms", "playback_renderer_metrics_complete",
+        "playback_renderer_underruns", "playback_renderer_pcm_signal_frames",
+        "playback_renderer_pcm_signal_rms", "playback_renderer_pcm_signal_peak",
+        "playback_renderer_pcm_signal_min_quantum_rms",
+        "playback_renderer_pcm_signal_max_quantum_rms",
+        "playback_renderer_pcm_low_energy_threshold_rms",
+        "playback_renderer_pcm_low_energy_frames",
+        "playback_renderer_pcm_low_energy_quanta",
+        "playback_renderer_pcm_max_low_energy_frames",
+        "playback_renderer_recoveries", "playback_renderer_rebuffered_frames",
+        "playback_renderer_max_buffered_frames", "playback_renderer_max_queued_frames",
+        "playback_renderer_min_buffered_frames", "playback_renderer_first_receive_context_frame",
+        "playback_renderer_first_render_context_frame", "tts_segments", "tts_total_ms",
+      ]) {
+        const value = summary?.[key];
+        if (value === null || typeof value === "number" || typeof value === "boolean") compactSummary[key] = value;
+      }
+      compactSummary.incomplete = true;
+      snapshot.compaction ||= {};
+      snapshot.compaction.summary_fields_omitted = Object.keys(summary || {}).length - Object.keys(compactSummary).length + 1;
+      const lastStage = snapshot.stages.at(-1);
+      const minimal = {
+        id: snapshot.id,
+        mode: snapshot.mode,
+        began_at: snapshot.began_at,
+        checkpoint: snapshot.checkpoint,
+        compaction: snapshot.compaction,
+        stages: lastStage ? [{
+          stage: lastStage.stage,
+          elapsed_ms: lastStage.elapsed_ms,
+          observed_at_unix_us: lastStage.observed_at_unix_us,
+          request_id: lastStage.request_id,
+          operation_id: lastStage.operation_id,
+          occurrences: lastStage.occurrences,
+        }] : [],
+        summary: compactSummary,
+      };
+      serialized = JSON.stringify(minimal);
+      if (voiceLatencyUtf8Bytes(serialized) > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+        // This final form contains only bounded generated identifiers and
+        // scalar fields; it is a defensive guarantee against a future schema
+        // accidentally making the summary or trace envelope unbounded.
+        serialized = JSON.stringify({
+          id: String(snapshot.id || "").slice(0, 64),
+          mode: String(snapshot.mode || "").slice(0, 64),
+          checkpoint: Number(snapshot.checkpoint) || 0,
+          compaction: { receipt_fallback: true, records_omitted: snapshot.compaction?.byte_limit_records_omitted || 0 },
+          stages: [],
+          summary: { incomplete: true },
+        });
+      }
+    }
+    return serialized;
+  };
 
   const markVoiceLatencyIn = (trace, stage, detail = {}) => {
     if (!trace) return;
@@ -4589,18 +5341,21 @@
       : Date.now() * 1000;
     let recorded = null;
     let firstOccurrence = true;
-    if (stage === "playback_consumed") {
+    const aggregation = aggregateVoiceLatencyStage(trace, stage, detail, elapsedMs, observedAtUnixUs);
+    recorded = aggregation.recorded || null;
+    if (aggregation.handled) {
+      firstOccurrence = false;
+    } else if (stage === "playback_consumed") {
       let consumed = trace.stages.find((entry) => entry.stage === stage);
       const frames = Math.max(0, Number(detail.frames) || 0);
       const buffered = Math.max(0, Number(detail.buffered_frames) || 0);
-      if (!consumed && trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
-        consumed = {
+      if (!consumed) {
+        consumed = appendVoiceLatencyStage(trace, {
           stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs,
           first_elapsed_ms: elapsedMs, first_observed_at_unix_us: observedAtUnixUs,
           occurrences: 0, total_frames: 0,
           min_buffered_frames: buffered, max_buffered_frames: buffered,
-        };
-        trace.stages.push(consumed);
+        });
       }
       if (consumed) {
         consumed.elapsed_ms = elapsedMs;
@@ -4617,9 +5372,11 @@
     } else if (stage === "playback_underrun") {
       let underrun = trace.stages.find((entry) => entry.stage === stage);
       if (!underrun) {
-        underrun = { stage, elapsed_ms: elapsedMs, occurrences: 0, total_gap_ms: 0, max_gap_ms: 0 };
-        trace.stages.push(underrun);
+        underrun = appendVoiceLatencyStage(trace, {
+          stage, elapsed_ms: elapsedMs, occurrences: 0, total_gap_ms: 0, max_gap_ms: 0,
+        });
       }
+      if (!underrun) return;
       const gapMs = Math.max(0, Number(detail.gap_ms) || 0);
       underrun.elapsed_ms = elapsedMs;
       underrun.occurrences += 1;
@@ -4639,64 +5396,20 @@
           first_observed_at_unix_us: firstObservedAtUnixUs,
           occurrences: (recorded.occurrences || 1) + 1,
         });
-      } else if (trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
+      } else {
         recorded = { stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs,
           first_elapsed_ms: elapsedMs, first_observed_at_unix_us: observedAtUnixUs,
           occurrences: 1, ...detail };
-        trace.stages.push(recorded);
+        recorded = appendVoiceLatencyStage(trace, recorded);
       }
-    } else if (trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
+    } else {
       recorded = { stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs, ...detail };
-      trace.stages.push(recorded);
+      recorded = appendVoiceLatencyStage(trace, recorded);
     }
-    const checkpoint = [
-      "call_requested",
-      "call_ringing_started",
-      "call_conversation_ready",
-      "audio_prefill_begin_requested",
-      "audio_prefill_session_ready",
-      "audio_prefill_begin_failed",
-      "audio_prefill_push_failed",
-      "native_capture_started",
-      "capture_processing",
-      "native_capture_failed",
-      "generation_dispatched",
-      "speculation_dispatch_started",
-      "native_silence_armed",
-      "native_silence_released",
-      "native_generation_worker_started",
-      "generation_finished",
-      "voice_transcript_started",
-      "voice_transcript_inference_started",
-      "voice_transcript_inference_finished",
-      "voice_transcript_finished",
-      "voice_transcript_failed",
-      "first_content_delta",
-      "first_content_delta_received",
-      "tts_first_chunk_ready",
-      "tts_native_dispatched",
-      "tts_first_pcm",
-      "tts_segment_finished",
-      "tts_all_segments_finished",
-      "next_turn_prefill_started",
-      "next_turn_prefill_ready",
-      "next_turn_prefill_failed",
-      "barge_in_detected",
-      "barge_in_playback_stopped",
-      "barge_in_playback_stop_failed",
-      "playable",
-      "playback_started",
-      "playback_render_started",
-      "playback_underrun_started",
-      "playback_underrun_recovered",
-      "durable_voice_audio_ready",
-      "durable_voice_audio_failed",
-      "playback_underrun",
-      "playback_renderer",
-      "speculation_handoff_ready",
-      "speculation_handoff_failed",
-      "failed",
-    ].includes(stage);
+    const lifecycleStreamEvent = (stage === "native_chat_stream_event"
+      || stage === "chat_stream_event_received" || stage === "chat_stream_route_decision")
+      && VOICE_LATENCY_LIFECYCLE_EVENTS.has(detail.event);
+    const checkpoint = VOICE_LATENCY_CHECKPOINT_STAGES.has(stage) || lifecycleStreamEvent;
     if (checkpoint && (firstOccurrence || !COALESCED_VOICE_LATENCY_STAGES.has(stage))) {
       trace.checkpoint = (trace.checkpoint || 0) + 1;
       queueVoiceLatencyCheckpoint(trace);
@@ -4724,62 +5437,48 @@
     text,
     flush = false,
     first = false,
-    wordLimit = null,
     speechMode = "call",
   ) => {
     const words = [...text.matchAll(/\S+/g)];
-    // Qwen streams PCM within each request. Restarting it every four words
-    // creates an audible prosody reset and costs more than waiting briefly for
-    // a clause. Calls retain a shorter first runway; voice notes favor complete
-    // phrases because they do not need sub-second interruption boundaries.
-    const voiceNote = speechMode === "voice_note";
-    const requestedMaximum = Number.isFinite(wordLimit) ? Math.floor(wordLimit) : null;
-    const maximum = voiceNote
-      ? (first ? 20 : 28)
-      : (first
-        ? Math.min(16, Math.max(6, requestedMaximum ?? 16))
-        : Math.min(24, Math.max(8, requestedMaximum ?? 24)));
-    const minimum = first ? (voiceNote ? 10 : 6) : Math.min(voiceNote ? 12 : 8, maximum);
-    // A voice note can afford to collect a full phrase. Qwen starts a fresh
-    // acoustic trajectory per request, so honoring every short generated
-    // sentence as its own request creates the conspicuous four-word cadence
-    // the UI used to produce. Calls retain short punctuation boundaries for
-    // responsiveness; voice notes do not split before their prosody runway.
-    const sentenceBoundaryMinimum = voiceNote ? minimum : (first ? 2 : 3);
-    const weakBoundaryMinimum = voiceNote ? minimum : (first ? 3 : Math.min(6, minimum));
     if (!words.length) return null;
-    const limit = Math.min(words.length, maximum);
-    for (let index = 0; index < limit; index += 1) {
-      const completeSentence = /[.!?][\]"')]*$/.test(words[index][0])
-        && ((!voiceNote && flush) || index >= sentenceBoundaryMinimum - 1);
-      const weakBoundary = /[;:,][\]"')]*$/.test(words[index][0])
-        && index >= weakBoundaryMinimum - 1;
-      if (completeSentence || weakBoundary) {
-        const end = words[index].index + words[index][0].length;
-        return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+    const splitAt = (index, boundary) => {
+      const end = words[index].index + words[index][0].length;
+      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart(), boundary };
+    };
+    if (speechMode === "call") {
+      // Each Qwen request starts a fresh acoustic trajectory. Let it see a
+      // complete sentence; audio runway controls dispatch, not text phrasing.
+      // A completed-word cap bounds exceptionally long/unpunctuated output.
+      const maximum = 64;
+      const completeWords = words.length - (!flush && !/\s$/.test(text) ? 1 : 0);
+      const limit = Math.min(completeWords, maximum);
+      let clause = -1;
+      for (let index = 0; index < limit; index += 1) {
+        const word = words[index][0];
+        const abbreviation = /^(?:[A-Za-z]\.)+$/.test(word)
+          || /^(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e)\.$/i.test(word)
+          || /^\d+\.$/.test(word);
+        if (/[.!?…][\]"')”’]*$/u.test(word) && !abbreviation) {
+          return splitAt(index, "sentence");
+        }
+        if (index >= 15 && /[;:,][\]"')”’]*$/u.test(word)) clause = index;
       }
+      if (completeWords >= maximum) {
+        return splitAt(clause >= 0 ? clause : maximum - 1,
+          clause >= 0 ? "limit_clause" : "limit_words");
+      }
+      return flush ? splitAt(words.length - 1, "end") : null;
     }
-    if (!flush && words.length < minimum) return null;
-    // Streaming deltas can end in the middle of a word. A trailing separator
-    // proves the runway's final word is complete; otherwise wait for the next
-    // token before cutting the phrase.
-    if (!voiceNote && first && !flush && words.length === minimum && /\s$/.test(text)) {
-      const end = words[minimum - 1].index + words[minimum - 1][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
-    }
-    if (!voiceNote && first && !flush && words.length > minimum) {
-      const end = words[minimum - 1].index + words[minimum - 1][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+    // Voice notes join short sentences into a phrase before starting Qwen.
+    const maximum = first ? 20 : 28;
+    const minimum = first ? 10 : 12;
+    const limit = Math.min(words.length, maximum);
+    for (let index = minimum - 1; index < limit; index += 1) {
+      if (/[.!?;:,][\]"')]*$/.test(words[index][0])) return splitAt(index, "phrase");
     }
     if (words.length >= maximum || flush) {
-      if (first && !flush && words.length === maximum && !/\s$/.test(text)) return null;
-      // Closing the text stream makes a short tail dispatchable; it does not
-      // suspend the segment bound. Sending an entire completed reply as one
-      // Qwen request can synthesize seconds ahead of playback and removes the
-      // scheduler's next opportunity to yield compute or honor interruption.
-      const index = Math.min(words.length, maximum) - 1;
-      const end = words[index].index + words[index][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+      if (!flush && words.length === maximum && !/\s$/.test(text)) return null;
+      return splitAt(Math.min(words.length, maximum) - 1, flush ? "end" : "limit_words");
     }
     return null;
   };
@@ -4788,21 +5487,29 @@
     conversation,
     mode,
     requestId = null,
-    allowRequestBinding = false,
+    clientRequest = null,
     button: initialButton = null,
     callEpoch = null,
     deferPlayback = false,
     onFirstChunk = null,
+    onPlaybackStarted = null,
     onFailure = null,
   }) => {
+    if (requestId) rememberVoiceStreamRequest(requestId);
     let pendingText = "";
     let streamedText = "";
     let running = false;
     let closed = false;
     let stopped = false;
+    let interruptedForSpeech = false;
     let firstRequest = true;
     let activeOperation = null;
+    let activeSynthesis = null;
+    let cancelPcmDelivery = null;
     let nextCallPrefill = null;
+    let callTranscriptResidentCheck = null;
+    let nextCallPrefillRetryPending = false;
+    let retryHook = null;
     let nextCallPrefillHandedOff = false;
     let callCaptureStarted = false;
     let settleNextCallPrefillGate = null;
@@ -4844,7 +5551,7 @@
       markVoiceLatencyIn(ttsLatencyTrace, stage, detail);
     };
     const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController(
-      voiceLeadCalibration || undefined,
+      voiceLeadCalibration || { initialBufferComplete: true, initialProbePending: true },
     );
     const semanticLeadController = new globalThis.MomVoicePipelineScheduler.SemanticLeadController();
     const mountVoiceReplyPlayer = () => {
@@ -4931,9 +5638,9 @@
       const words = pendingWordCount();
       // Eight words of hysteresis gives Gemma a useful decode quantum between
       // handoffs. Never pause unless the queued text contains a chunk the TTS
-      // pump can actually consume; this makes an unpunctuated partial segment
-      // release Gemma instead of deadlocking below the 24-word boundary.
-      const readyChunk = takeLiveSpeechChunk(pendingText, false, firstRequest, null, mode);
+      // pump can actually consume. A partial sentence must keep Gemma running
+      // until punctuation (or the bounded long-sentence fallback) arrives.
+      const readyChunk = takeLiveSpeechChunk(pendingText, false, firstRequest, mode);
       semanticBackpressureDesired = semanticLeadController.shouldPause({
         queuedWords: words,
         readyChunk: Boolean(readyChunk),
@@ -4952,7 +5659,8 @@
         buffered_runway_ms: controller.bufferedMs(),
       });
       const startedAt = performance.now();
-      nextCallPrefill = startVoicePrefill(conversation, true).then(async (live) => {
+      nextCallPrefill = startVoicePrefill(conversation, true, ttsLatencyTrace).then(async (live) => {
+        if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
         if ((stopped && !nextCallPrefillHandedOff)
             || !voiceCallActive || voiceCallEpoch !== callEpoch) {
           if (live?.session) {
@@ -4964,9 +5672,57 @@
           duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
           buffered_runway_ms: controller.bufferedMs(),
         });
+        if (retryCallPrefillAfterTranscript === retryHook) retryCallPrefillAfterTranscript = null;
         return live;
       }).catch((error) => {
-        markTtsLatency("next_turn_prefill_failed", { message: errorMessage(error) });
+        if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
+        const message = errorMessage(error);
+        markTtsLatency("next_turn_prefill_failed", { message });
+        if (message.includes("voice_audio_pending_history_requires_complete_media_fallback")) {
+          retryHook = (settledConversation) => {
+            const recording = callCaptureStarted ? voiceRecording : null;
+            const decision = globalThis.MomVoiceCapturePolicy.callPrefillRetryDecision({
+              expectedConversation: conversation, settledConversation,
+              callActive: voiceCallActive, expectedEpoch: callEpoch,
+              currentEpoch: voiceCallEpoch, captureStarted: callCaptureStarted, recording,
+            });
+            if (decision === "stale") return;
+            if (retryCallPrefillAfterTranscript === retryHook) retryCallPrefillAfterTranscript = null;
+            if (decision === "capture_advanced") {
+              markTtsLatency("next_turn_prefill_retry_skipped", { reason: "capture_advanced" });
+              return;
+            }
+            nextCallPrefill = null;
+            nextCallPrefillRetryPending = true;
+            const retry = startNextCallPrefill("transcript_committed");
+            if (recording) {
+              // Failed admission consumed no microphone PCM. Rebind before
+              // onset; the capture's pre-roll remains available to the retry.
+              recording.prefillEpoch += 1;
+              const epoch = recording.prefillEpoch;
+              recording.prefillFailed = false;
+              recording.prefillPending = true;
+              recording.prefillRetryPending = true;
+              recording.prefillSession = retry.then((replacement) => {
+                if (recording.prefillEpoch !== epoch || recording.sending
+                    || voiceRecording !== recording) {
+                  if (replacement?.session) {
+                    void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
+                  }
+                  return null;
+                }
+                recording.prefillPending = false;
+                recording.prefillRetryPending = false;
+                if (!replacement?.session) {
+                  recording.prefillFailed = true;
+                }
+                return replacement;
+              });
+              markVoiceLatencyIn(recording.trace, "audio_prefill_retry_after_transcript");
+            }
+          };
+          retryCallPrefillAfterTranscript = retryHook;
+        }
         return null;
       });
       settleNextCallPrefillGate?.(nextCallPrefill);
@@ -4978,10 +5734,17 @@
           || voiceCallEpoch !== callEpoch) return;
       callCaptureStarted = true;
       nextCallPrefillHandedOff = true;
+      const deferPrefill = pendingCallTranscriptJobs.length > 0 || Boolean(activeCallTranscriptJob);
       void beginVoiceCapture({
         call: true,
-        prefillSession: nextCallPrefillGate,
-        onVoiceOnset: () => startNextCallPrefill("caller_voice_onset"),
+        prefillSession: deferPrefill ? null : (nextCallPrefill || nextCallPrefillGate),
+        prefillRetryPending: nextCallPrefillRetryPending,
+        deferPrefill,
+        onVoiceOnset: (recording) => preemptCallTranscriptForSpeech(recording, startNextCallPrefill),
+      }).then(() => {
+        // The transcript slot requires an attached live capture with no Gemma
+        // session. Recheck after asynchronous microphone admission completes.
+        startBufferedNextCallPrefill();
       }).catch((error) => {
         callCaptureStarted = false;
         reportError(error);
@@ -5009,6 +5772,7 @@
       retainHistory: mode !== "call",
       startupBufferMs: mode === "call" ? () => leadController.startupRunwayMs() : 120,
       startupDelayMs: mode === "call" ? () => leadController.startupDelayMs() : 0,
+      waitForCompletion: () => mode === "call" && leadController.shouldBufferCompleteReply(),
       onFirstChunk: (firstPcm) => {
         firstPcmSeen = true;
         markTtsLatency("tts_first_pcm", {
@@ -5028,6 +5792,7 @@
       },
       onPlaybackStarted: (metrics = {}) => {
         markTtsLatency("playback_started", metrics);
+        onPlaybackStarted?.(metrics);
         if (mode === "call" && voiceCallActive && voiceCallEpoch === callEpoch) {
           activeCallPlayback = playback;
         }
@@ -5084,27 +5849,119 @@
           // Playback may end before the start callback on an exceptionally
           // short terminal packet. Keep a single idempotent fallback here.
           startCallCapture();
+          startBufferedNextCallPrefill();
         }
         if (mode === "call" && liveVoiceTts === playback) liveVoiceTts = null;
       },
     });
 
     const startBufferedNextCallPrefill = () => {
-      if (mode !== "call" || !closed || stopped || !controller.playing) return;
+      const bufferedPlaybackFinished = !controller.playing && controller.bufferedMs() <= 0;
+      if (mode !== "call" || !closed || stopped
+          || (!controller.playing && !bufferedPlaybackFinished)
+          || running || pendingText.trim()) return;
       // The completed Gemma reply has released its worker. Begin the next
-      // microphone prefix while already-rendering PCM can absorb the brief
-      // GPU handoff, without starving Qwen's first playable packet.
-      if (!leadController.shouldPrepareNextCall({
+      // microphone prefix during the final PCM tail only after Qwen has
+      // released its active segment. Competing prefill can otherwise turn a
+      // sub-real-time TTS segment into repeated playback underruns.
+      if (!bufferedPlaybackFinished && !leadController.shouldPrepareNextCall({
         generationComplete: closed,
         playing: controller.playing,
         bufferedMs: controller.bufferedMs(),
       })) return;
+      if (activeCallTranscriptTask) return;
+      if (pendingCallTranscriptJobs.length) {
+        const recording = voiceRecording;
+        if (!recording || recording.prefillDeferred !== true) return;
+        if (recording?.voiceActivity?.heardVoice || recording?.sending || recording?.speculation) return;
+        if (voiceCallTranscriptSlotsDisabled) {
+          markTtsLatency("call_transcript_slot_skipped", { reason: "slow_cancel_or_cold_model" });
+          void startNextCallPrefill("transcript_slot_disabled").then((live) => {
+            if (recording?.prefillDeferred && live?.session) {
+              return recording.resumeDeferredPrefill(live);
+            }
+            return false;
+          }).catch((error) => reportError(error));
+          return;
+        }
+        if (callTranscriptResidentCheck) return;
+        callTranscriptResidentCheck = invoke("mom_llama_speech_parakeet_resident").then(async (status) => {
+          if (status?.status === "blocked" || status?.result !== true) {
+            markTtsLatency("call_transcript_slot_skipped", { reason: "parakeet_not_resident" });
+            const live = await startNextCallPrefill("transcript_model_not_resident");
+            if (recording?.prefillDeferred && live?.session) await recording.resumeDeferredPrefill(live);
+            return;
+          }
+          if (!voiceCallActive || voiceCallEpoch !== callEpoch || recording?.sending
+              || recording?.speculation || recording?.voiceActivity?.heardVoice) return;
+          const playbackSafe = bufferedPlaybackFinished || leadController.shouldPrepareNextCall({
+            generationComplete: closed,
+            playing: controller.playing,
+            bufferedMs: controller.bufferedMs(),
+          });
+          if (!globalThis.MomVoicePipelineScheduler.shouldRunCallTranscriptSlot({
+            generationComplete: closed,
+            playbackSafe,
+            qwenIdle: !running && !pendingText.trim(),
+            captureUnattached: recording.prefillDeferred === true,
+            callerVoiced: Boolean(recording?.voiceActivity?.heardVoice),
+            parakeetResident: true,
+            transcriptSlotActive: Boolean(activeCallTranscriptTask),
+            disabled: voiceCallTranscriptSlotsDisabled,
+          })) return;
+        markTtsLatency("call_transcript_slot_started", {
+          queued: pendingCallTranscriptJobs.length,
+          buffered_runway_ms: controller.bufferedMs(),
+          capture_unprepared: Boolean(recording?.call && recording.prefillDeferred),
+        });
+        const transcriptTask = startPendingCallTranscriptSlot();
+        if (transcriptTask) {
+          const transcriptJob = activeCallTranscriptJob;
+          await transcriptTask.then(async (outcome) => {
+            if (outcome.cancelledByCaller) return;
+            if (!voiceCallActive || voiceCallEpoch !== callEpoch || recording?.sending) return;
+            const live = await startNextCallPrefill(outcome.committed
+              ? "transcript_committed" : "transcript_unavailable");
+            if (recording?.prefillDeferred && live?.session) {
+              const replayed = await recording.resumeDeferredPrefill(live);
+              markTtsLatency("call_transcript_slot_prefill_replayed", {
+                committed: outcome.committed,
+                replayed,
+                samples: recording.capturedSamples,
+              });
+            }
+          }).catch((error) => {
+            markTtsLatency("call_transcript_slot_failed", { message: errorMessage(error) });
+            reportError(error);
+          }).finally(() => {
+            // Keep this slot reserved through the post-transcript handoff so
+            // buffer callbacks cannot overlap Parakeet with Gemma preparation.
+            if (activeCallTranscriptJob === transcriptJob) activeCallTranscriptJob = null;
+            if (activeCallTranscriptTask === transcriptTask) activeCallTranscriptTask = null;
+            activeCallTranscriptOperation = null;
+          });
+        }
+        }).catch((error) => {
+          markTtsLatency("call_transcript_slot_skipped", {
+            reason: "parakeet_residency_check_failed",
+            message: errorMessage(error),
+          });
+          return startNextCallPrefill("transcript_residency_check_failed").then((live) => {
+            if (recording?.prefillDeferred && live?.session) {
+              return recording.resumeDeferredPrefill(live);
+            }
+            return false;
+          });
+        }).finally(() => { callTranscriptResidentCheck = null; });
+        return;
+      }
       startNextCallPrefill("generation_complete_buffered_playback");
     };
 
     const fail = (error) => {
       if (stopped) return;
       stopped = true;
+      cancelPcmDelivery?.();
       if (activeCallPlayback === playback) activeCallPlayback = null;
       updateSemanticBackpressure({ terminal: true });
       window.clearTimeout(audioProgressWatchdog);
@@ -5112,6 +5969,7 @@
       window.clearTimeout(schedulerWakeTimer);
       schedulerWakeTimer = null;
       const operation = activeOperation;
+      const synthesis = activeSynthesis;
       activeOperation = null;
       const continueCall = !onFailure && mode === "call"
         && voiceCallActive && voiceCallEpoch === callEpoch;
@@ -5119,7 +5977,7 @@
       const releaseProducer = Promise.allSettled([
         controller.stop(),
         operation ? invoke("mom_llama_speech_stop", { operation }) : Promise.resolve(),
-      ]);
+      ]).then(() => synthesis ? Promise.allSettled([synthesis]) : null);
       if (button) voiceReplyPlayback.delete(button);
       if (button) settleUnavailableVoiceReply(button);
       else if (mode === "voice_note") {
@@ -5150,7 +6008,7 @@
       window.clearTimeout(audioProgressWatchdog);
       audioProgressWatchdog = window.setTimeout(() => {
         fail(new Error("voice_reply_timeout: Voice synthesis stopped making progress."));
-      }, mode === "call" ? 8_000 : 12_000);
+      }, leadController.progressTimeoutMs());
     };
 
     // Model generation owns its own bounded lifetime. Do not call a reply a
@@ -5163,11 +6021,7 @@
     pump = () => {
       if (running || stopped) return;
       const bufferedRunwayMs = controller.bufferedMs();
-      const chunkWordLimit = leadController.chunkWordLimit({
-        first: firstRequest,
-        bufferedMs: bufferedRunwayMs,
-      });
-      const next = takeLiveSpeechChunk(pendingText, closed, firstRequest, chunkWordLimit, mode);
+      const next = takeLiveSpeechChunk(pendingText, closed, firstRequest, mode);
       if (!next) {
         if (closed) {
           window.clearTimeout(audioProgressWatchdog);
@@ -5253,8 +6107,21 @@
       const operation = speechOperationToken();
       activeOperation = operation;
       const segment = ++segmentIndex;
+      // Tauri delivers large binary channel packets through asynchronous
+      // fetches. The command result can overtake that channel's last packets.
+      // Keep this segment's owner until both native success and validated PCM
+      // EOF arrive; otherwise the next segment discards the old audio tail.
+      let pcmEndSeen = false;
+      let settlePcmDelivery;
+      const pcmDelivered = new Promise((resolve) => { settlePcmDelivery = resolve; });
+      const cancelThisPcmDelivery = () => settlePcmDelivery(false);
+      cancelPcmDelivery = cancelThisPcmDelivery;
+      const segmentDispatchedAt = performance.now();
+      markTtsLatency("tts_segment_dispatched", {
+        segment, operation_id: operation, request_id: requestId,
+      });
       const wordCount = next.chunk.match(/\S+/g)?.length || 1;
-      const maxSegmentFrames = Math.ceil(Math.min(20, Math.max(2.5, wordCount / 2 + 1)) * 24000);
+      const maxSegmentFrames = Math.ceil(Math.min(40, Math.max(2.5, wordCount / 2 + 1)) * 24000);
       let segmentFrames = 0;
       let segmentPcmPackets = 0;
       let segmentPcmAudioMs = 0;
@@ -5269,13 +6136,16 @@
           overlap: "content_delta",
           characters: next.chunk.length,
           words: wordCount,
-          chunk_word_limit: chunkWordLimit,
+          segmentation_boundary: next.boundary,
         });
         markTtsLatency("tts_started", { overlap: "content_delta" });
       }
       const stream = pcmChannel((frame) => {
         if (stopped || activeOperation !== operation) return;
         try {
+          if (pcmEndSeen) {
+            throw new Error("speech_stream_after_end: PCM arrived after its segment ended.");
+          }
           const decoded = decodePcmFrame(frame);
           const packetFrames = decoded.data.byteLength / (2 * decoded.channels);
           segmentFrames += packetFrames;
@@ -5284,6 +6154,12 @@
           }
           if (packetFrames > 0) {
             const packetAt = performance.now();
+            if (segmentFirstPacketAt === null) {
+              markTtsLatency("tts_segment_first_pcm", {
+                segment, operation_id: operation, request_id: requestId,
+                dispatch_to_pcm_ms: Math.round(packetAt - segmentDispatchedAt),
+              });
+            }
             const packetAudioMs = packetFrames * 1000 / decoded.sampleRate;
             segmentPcmPackets += 1;
             segmentPcmAudioMs += packetAudioMs;
@@ -5331,22 +6207,45 @@
               ? aggregateLead : Math.min(ttsMinimumProducerLeadMs, aggregateLead);
           }
           controller.pushSegment(frame, operation);
+          if (decoded.end) {
+            pcmEndSeen = true;
+            markTtsLatency("tts_segment_pcm_complete", {
+              segment, operation_id: operation, request_id: requestId,
+              frames: segmentFrames, packets: segmentPcmPackets,
+            });
+            settlePcmDelivery(true);
+          }
           // Transport heartbeats and terminal empty packets are not synthesis
           // progress. Only actual PCM earns more time; otherwise an unhealthy
           // producer can keep a pending bubble alive forever without audio.
-          if (decoded.data.byteLength > 0) armAudioProgressWatchdog();
+          if (decoded.data.byteLength > 0) {
+            playback.lastProgressAt = performance.now();
+            armAudioProgressWatchdog();
+          }
         } catch (error) { fail(error); }
       });
       if (segment === 1) markTtsLatency("tts_native_dispatched", { characters: next.chunk.length });
-      invoke("mom_llama_speech_precommit_synthesize", {
+      const synthesis = invoke("mom_llama_speech_precommit_synthesize", {
         conversation,
         operation,
         text: next.chunk,
         pcmStream: stream,
-      }).then((response) => {
+      });
+      activeSynthesis = synthesis;
+      synthesis.then(async (response) => {
+        if (stopped || activeOperation !== operation) return;
         if (response?.status === "blocked" || !response?.result) {
           throw new Error(response?.blocker?.message || "Voice synthesis stopped.");
         }
+        const receiptAt = performance.now();
+        markTtsLatency("tts_segment_receipt_received", {
+          segment, operation_id: operation, request_id: requestId,
+          pcm_complete: pcmEndSeen,
+        });
+        // The existing audio-progress watchdog also bounds a missing channel
+        // EOF. Stop/failure settles this delivery wait immediately, while
+        // activeSynthesis separately tracks the actual native producer.
+        if (!await pcmDelivered || stopped || activeOperation !== operation) return;
         const binding = response.result.binding || {};
         const synthesisMs = Number(binding.tts_total_ms);
         const outputAudioMs = Number(binding.duration_ms);
@@ -5359,11 +6258,17 @@
           words: wordCount,
         });
         voiceLeadCalibration = leadController.calibration();
+        // Completion of the cold probe can release playback without waiting
+        // for another PCM packet (or the entire reply) to wake the player.
+        if (mode === "call") void controller.reconsiderStartup();
         markTtsLatency("tts_segment_finished", {
           segment,
+          operation_id: operation,
+          request_id: requestId,
+          transport_drain_ms: Math.round(performance.now() - receiptAt),
           characters: next.chunk.length,
           words: wordCount,
-          chunk_word_limit: chunkWordLimit,
+          segmentation_boundary: next.boundary,
           queue_ms: binding.tts_queue_ms ?? null,
           queue_us: binding.tts_queue_us ?? null,
           host_route_us: binding.tts_host_route_us ?? null,
@@ -5423,6 +6328,8 @@
         audioProgressWatchdog = null;
         watchdogActive = false;
         if (activeOperation === operation) activeOperation = null;
+        if (activeSynthesis === synthesis) activeSynthesis = null;
+        if (cancelPcmDelivery === cancelThisPcmDelivery) cancelPcmDelivery = null;
         running = false;
         pump();
       });
@@ -5432,17 +6339,27 @@
       conversation,
       mode,
       trace: ttsLatencyTrace,
+      firstDeltaSeen: false,
+      lastProgressAt: performance.now(),
       get requestId() { return requestId; },
-      acceptsRequest(candidate, eventName = "") {
-        if (!candidate) return false;
+      clientRequest,
+      acceptsRequest(candidate, eventName = "", candidateClientRequest = null) {
+        if (stopped || !candidate) return false;
         if (requestId) return requestId === candidate;
-        if (!allowRequestBinding || eventName !== "started") return false;
+        if (!clientRequest || candidateClientRequest !== clientRequest
+            || eventName !== "started" || voiceStreamRequestIds.has(candidate)) return false;
         requestId = candidate;
+        rememberVoiceStreamRequest(candidate);
         void reconcileSemanticBackpressure();
         return true;
       },
       get button() { return button; },
       get audible() { return controller.playing; },
+      get interruptedForSpeech() { return interruptedForSpeech; },
+      interruptForSpeech() {
+        interruptedForSpeech = true;
+        return this.stop();
+      },
       bindPendingRow() {
         if (!voiceNoteComplete) return button;
         const voiceButton = mountVoiceReplyPlayer();
@@ -5471,6 +6388,7 @@
       get text() { return streamedText; },
       push(delta) {
         if (closed || stopped || !delta) return;
+        this.lastProgressAt = performance.now();
         pendingText += delta;
         streamedText += delta;
         pump();
@@ -5524,6 +6442,7 @@
       async cancel() {
         if (stopped) return;
         stopped = true;
+        cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);
@@ -5531,7 +6450,11 @@
         window.clearTimeout(schedulerWakeTimer);
         schedulerWakeTimer = null;
         abortUnclaimedCallPrefill();
+        const synthesis = activeSynthesis;
+        const operation = activeOperation;
         await controller.stop();
+        if (operation) await invoke("mom_llama_speech_stop", { operation }).catch(() => {});
+        if (synthesis) await Promise.allSettled([synthesis]);
         if (button) {
           voiceReplyPlayback.delete(button);
           settleUnavailableVoiceReply(button);
@@ -5549,6 +6472,7 @@
       async stop() {
         if (stopped) return;
         stopped = true;
+        cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);
@@ -5556,6 +6480,7 @@
         window.clearTimeout(schedulerWakeTimer);
         schedulerWakeTimer = null;
         const operation = activeOperation;
+        const synthesis = activeSynthesis;
         activeOperation = null;
         abortUnclaimedCallPrefill();
         // Silence the speaker first. Native cancellation can take longer and
@@ -5569,6 +6494,10 @@
         } else {
           await stoppedController;
         }
+        // Cancellation acknowledgement is not backend completion. The next
+        // Qwen request must not enter its bounded queue until this producer
+        // has actually released the backend lease.
+        if (synthesis) await Promise.allSettled([synthesis]);
         if (button) {
           voiceReplyPlayback.delete(button);
           settleUnavailableVoiceReply(button);
@@ -5710,24 +6639,68 @@
     return new Uint8Array(buffer);
   };
 
+  // Live inference and its retained derivative share the same integer PCM16
+  // samples; the policy module owns the canonical quantizer/encoder.
+  const { quantizeInferencePcm16, truncateInferencePcm16, encodeInferencePcm16Wav,
+    appendInferenceSourceRange, sliceInferenceSourceRanges, inferenceSourceOffset }
+    = globalThis.MomVoiceCapturePolicy;
+
   const voiceModePrompt = (call) => call
     ? "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
     : "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
 
-  const enqueueVoicePrefill = (recording, samples, flush = false) => {
+  const enqueueVoicePrefill = (recording, samples, flush = false,
+    sourceStart = recording.capturedSamples - (samples?.length || 0)) => {
     if (recording.prefillFailed || (!samples?.length && !flush)) return;
     if (samples?.length) {
+      if (!Number.isSafeInteger(sourceStart) || sourceStart < recording.prefillLastSourceEnd
+          || sourceStart + samples.length > recording.capturedSamples) {
+        throw new Error("Voice prefill does not match the captured source.");
+      }
+      if (recording.prefillInputStartSample === null) recording.prefillInputStartSample = sourceStart;
+      appendInferenceSourceRange(recording.prefillSourceRanges, sourceStart, samples.length);
+      recording.prefillLastSourceEnd = sourceStart + samples.length;
       recording.prefillParts.push(samples);
       recording.prefillSamples += samples.length;
     }
-    // Keep publication aligned with the projector's 40 ms audio frame; an
-    // onset-of-silence flush still sends any short tail immediately.
-    if (!flush && recording.prefillSamples < 640) return;
-    if (!recording.prefillSamples) return;
+    // The native consumer has a 30-second ring. Bound the browser IPC queue
+    // and deferred caller input together; keep the physical archive separate.
+    const queueLimitSamples = 16_000 * 30;
+    if (recording.prefillQueuedSamples + recording.prefillSamples > queueLimitSamples) {
+      recording.prefillFailed = true;
+      recording.modelInputReliable = false;
+      recording.prefillEpoch += 1;
+      markVoiceLatencyIn(recording.trace, "audio_prefill_producer_overflow", {
+        queued_samples: recording.prefillQueuedSamples,
+        incoming_samples: recording.prefillSamples,
+        limit_samples: queueLimitSamples,
+      });
+      void recording.prefillSession.then((live) => live?.session
+        ? invoke("mom_llama_voice_audio_abort", { session: live.session })
+        : null).catch(() => {});
+      return;
+    }
+    // Queue only VAD-admitted caller input during compute handoff. Replaying
+    // all captured PCM here used to insert playback and idle room audio, then
+    // lose the exact derivative when its guessed contiguous origin disagreed.
+    if (recording.prefillDeferred || (!flush && recording.prefillSamples < 640)
+        || !recording.prefillSamples) return;
     const block = mergeFloat32(recording.prefillParts);
+    const sourceRanges = recording.prefillSourceRanges;
     recording.prefillParts = [];
+    recording.prefillSourceRanges = [];
     recording.prefillSamples = 0;
-    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block);
+    let blockOffset = 0;
+    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block).map((chunk) => {
+      const quantized = quantizeInferencePcm16(chunk);
+      const ranges = sliceInferenceSourceRanges(sourceRanges, blockOffset, chunk.length);
+      blockOffset += chunk.length;
+      return { ...quantized, ranges };
+    });
+    const queuedSamples = block.length;
+    recording.prefillQueuedSamples += queuedSamples;
+    recording.prefillQueueHighWaterSamples = Math.max(
+      recording.prefillQueueHighWaterSamples, recording.prefillQueuedSamples);
     const epoch = recording.prefillEpoch;
     const session = recording.prefillSession;
     recording.pushChain = recording.pushChain.then(async () => {
@@ -5738,11 +6711,17 @@
         const pushStarted = performance.now();
         const accepted = await invoke("mom_llama_voice_audio_push", {
           session: live.session,
-          samples: Array.from(chunk),
+          samples: Array.from(chunk.decoded),
         });
         if (recording.prefillEpoch !== epoch) return;
+        recording.modelInputPcm16Parts.push(chunk.pcm16);
+        recording.modelInputSampleCount += chunk.pcm16.length;
+        for (const range of chunk.ranges) {
+          appendInferenceSourceRange(recording.modelInputSourceRanges,
+            range.start, range.end_exclusive - range.start);
+        }
         recording.prefillPushes += 1;
-        recording.prefillAcceptedSamples += chunk.length;
+        recording.prefillAcceptedSamples += chunk.pcm16.length;
         const pushMs = performance.now() - pushStarted;
         recording.prefillIpcMs += pushMs;
         recording.prefillMaxIpcMs = Math.max(recording.prefillMaxIpcMs, pushMs);
@@ -5752,8 +6731,8 @@
         );
         if (!recording.firstPrefillChunkAccepted) {
           recording.firstPrefillChunkAccepted = true;
-          markVoiceLatency("audio_prefill_first_chunk_accepted", {
-            samples: chunk.length,
+          markVoiceLatencyIn(recording.trace, "audio_prefill_first_chunk_accepted", {
+            samples: chunk.pcm16.length,
             native_buffered_samples: accepted?.buffered_samples,
           });
         }
@@ -5761,7 +6740,8 @@
     }).catch(async (error) => {
       if (recording.prefillEpoch !== epoch) return;
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_push_failed", {
+      recording.modelInputReliable = false;
+      markVoiceLatencyIn(recording.trace, "audio_prefill_push_failed", {
         message: errorMessage(error),
         producer_pushes: recording.prefillPushes || 0,
         producer_accepted_samples: recording.prefillAcceptedSamples || 0,
@@ -5770,30 +6750,91 @@
       if (live?.session) {
         await invoke("mom_llama_voice_audio_abort", { session: live.session }).catch(() => {});
       }
+    }).finally(() => {
+      if (recording.prefillEpoch === epoch) {
+        recording.prefillQueuedSamples = Math.max(0, recording.prefillQueuedSamples - queuedSamples);
+      }
     });
   };
 
   const prepareVoicePrefill = async (recording) => {
-    const sourceConversation = recording.call && voiceCallConversation
-      ? voiceCallConversation
-      : recording.sourceConversation;
-    let conversation = sourceConversation;
-    if (sourceConversation !== "default" && recording.sourceKind === "persona_template") {
-      const instantiated = await instantiatePersona(sourceConversation);
-      if (instantiated?.status === "blocked" || !instantiated?.result?.id) return null;
-      conversation = instantiated.result.id;
-      if (selectedConversation() === sourceConversation) {
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
+    // Capture is already running and retaining PCM. Foreground model work
+    // waits for the exact archival ASR terminal, never its stop request alone.
+    const releaseHistoryRecovery = recording.call ? null
+      : await suspendVoiceHistoryRecoveryForForeground("voice_capture");
+    try {
+      if (recording.discarded) return null;
+      const sourceConversation = recording.call && voiceCallConversation
+        ? voiceCallConversation
+        : recording.sourceConversation;
+      let conversation = sourceConversation;
+      if (sourceConversation !== "default" && recording.sourceKind === "persona_template") {
+        const instantiated = await instantiatePersona(sourceConversation);
+        if (instantiated?.status === "blocked" || !instantiated?.result?.id) return null;
+        conversation = instantiated.result.id;
+        if (selectedConversation() === sourceConversation) {
+          chat().dataset.currentConversation = conversation;
+          chat().dataset.conversationKind = "chat";
+        }
       }
+      return await startVoicePrefill(conversation, recording.call, recording.trace);
+    } finally {
+      // Dispatch completion or confirmed cancellation resumes recovery. Do
+      // not restart ASR between capture stop and submission of retained PCM.
+      releaseHistoryRecovery?.({ resume: false });
     }
-    return startVoicePrefill(conversation, recording.call);
   };
 
-  const indexVoiceTurn = (conversation, output, fallbackAttachment = null) => {
+  let pendingCallTranscriptJobs = [];
+  let activeCallTranscriptJob = null;
+  let activeCallTranscriptTask = null;
+  let activeCallTranscriptOperation = null;
+  const idleVoiceTranscriptJobs = new Set();
+
+  const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null,
+    sourceTrace = null, { allowActiveCall = false, callJob = null } = {}) => {
     const attachment = output?.voice_attachment_id || fallbackAttachment;
     const messageId = output?.user_message_id;
-    const trace = voiceLatencyTrace;
+    // Playback may have opened the next microphone turn already. Backfill
+    // stages belong to the physical turn that produced this recording.
+    const trace = sourceTrace || sourceCapture?.trace || voiceLatencyTrace;
+    // A prepared conversation snapshot stays fixed for its current turn.
+    // Saved recordings may be indexed in a bounded idle slot while the next
+    // Gemma session is still unattached; idle recovery handles any remainder.
+    if ((voiceCallActive || voiceCallPreparing) && !allowActiveCall) {
+      if (voiceCallActive && attachment && messageId) {
+        const intent = globalThis.MomVoicePipelineScheduler.createCallTranscriptIntent({
+          conversation,
+          output,
+          fallbackAttachment,
+          sourceTrace: trace,
+        });
+        if (globalThis.MomVoicePipelineScheduler.enqueueCallTranscriptIntent(
+          pendingCallTranscriptJobs, intent, 64)) {
+          markVoiceLatencyIn(trace, "voice_transcript_queued_for_idle_playback", {
+            queued: pendingCallTranscriptJobs.length,
+          });
+        } else {
+          markVoiceLatencyIn(trace, "voice_transcript_queue_deferred_overflow", {
+            limit: 64,
+            queued: pendingCallTranscriptJobs.length,
+          });
+        }
+      } else {
+        markVoiceLatencyIn(trace, "voice_transcript_deferred");
+      }
+      return Promise.resolve();
+    }
+    // Ordinary dispatch holds a recovery suspension through its speech drain.
+    // Its release will revisit this saved recording. Never start a second
+    // archival reader alongside recovery or a new microphone turn.
+    if (!callJob && (voiceHistoryRecoverySuspensions > 0 || voiceRecording || voiceHistoryRecovery)) {
+      markVoiceLatencyIn(trace, "voice_transcript_deferred", { reason: "foreground_or_recovery" });
+      return Promise.resolve();
+    }
+    const idleJob = callJob ? null : { operation: null, task: null, cancelledByForeground: false };
+    if (idleJob) idleVoiceTranscriptJobs.add(idleJob);
+    const preempted = () => callJob?.cancelledByCaller || idleJob?.cancelledByForeground;
     const started = performance.now();
     markVoiceLatencyIn(trace, "voice_transcript_started", {
       source: output?.voice_attachment_id ? "live" : "fallback",
@@ -5802,9 +6843,14 @@
       if (!attachment || !messageId) {
         throw new Error("voice_transcript_source_missing: The saved voice turn has no recording identity.");
       }
+      // Speculative generation can finish before the first audible packet.
+      // Its recording becomes authoritative only after confirmation commits.
+      const physicalCapture = await Promise.resolve(sourceCapture);
+      if (preempted() || (sourceCapture && !physicalCapture)) return false;
       const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
         attachment,
       }));
+      if (preempted()) return false;
       const primary = catalog.primary;
       if (!primary || primary.kind !== "audio") {
         throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
@@ -5814,21 +6860,72 @@
       });
       const inferenceStarted = performance.now();
       markVoiceLatencyIn(trace, "voice_transcript_inference_started");
-      const transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
-        conversation,
-        ...attachmentPreviewAnchor(catalog, primary),
-        operation: speechOperationToken(),
-      });
+      let transcribed = null;
+      if (!callJob && physicalCapture?.transcription && typeof physicalCapture.samples === "function") {
+        try {
+          const live = await physicalCapture.transcription.finished;
+          const samples = physicalCapture.samples();
+          const identity = physicalCapture.transcription.metrics();
+          const source = live?.source;
+          // The same resampled PCM chunks are retained in capturedPcm and
+          // appended to the native transcription producer. Its completed
+          // receipt binds that accepted stream to this capture identity/count.
+          // Hash the archival WAV below to bind the durable attachment; avoid
+          // rescanning the same PCM buffer in JavaScript.
+          const archivedWavSha256 = await sha256Hex(encodePcmWav(samples));
+          if (source?.identity?.turn !== identity.turn
+              || source?.identity?.capture !== identity.capture
+              || source?.identity?.conversation !== conversation
+              || source?.samples !== samples.length
+              || catalog.root_sha256 !== archivedWavSha256) {
+            throw new Error("live_transcription_source_mismatch");
+          }
+          transcribed = { status: "contracted", result: { transcript: live.transcript } };
+          markVoiceLatencyIn(trace, "voice_transcript_live_verified", {
+            samples: source.samples,
+            ...(source.metrics || {}),
+          });
+        } catch (error) {
+          // The saved WAV remains authoritative. A failed parallel reader may
+          // be retried from that recording without delaying the reply.
+          markVoiceLatencyIn(trace, "voice_transcript_live_failed", { message: errorMessage(error) });
+        }
+      }
+      if (!transcribed) {
+        if (preempted()) return false;
+        const operation = speechOperationToken();
+        if (idleJob) idleJob.operation = operation;
+        if (callJob && voiceCallActive && activeCallTranscriptJob === callJob) {
+          activeCallTranscriptOperation = operation;
+        }
+        try {
+          transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+            conversation,
+            ...attachmentPreviewAnchor(catalog, primary),
+            operation,
+          });
+        } finally {
+          if (activeCallTranscriptOperation === operation) activeCallTranscriptOperation = null;
+          if (idleJob?.operation === operation) idleJob.operation = null;
+        }
+      }
+      if (preempted()) return false;
       markVoiceLatencyIn(trace, "voice_transcript_inference_finished", {
         duration_ms: Math.round((performance.now() - inferenceStarted) * 100) / 100,
         ...(transcribed?.result?.timing || {}),
       });
-      if (transcribed?.status !== "passed") {
+      if (transcribed?.status === "blocked" || !transcribed?.result) {
         throw new Error(`${transcribed?.blocker?.code || "voice_transcript_blocked"}: ${transcribed?.blocker?.message || "The recorded voice could not be transcribed."}`);
       }
       const transcript = transcribed?.result?.transcript?.trim();
       if (!transcript) {
-        throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
+        // Archival enrichment is optional. Silence or an ASR miss leaves the
+        // original recording authoritative for the next prompt and idle retry.
+        markVoiceLatencyIn(trace, "voice_transcript_skipped", {
+          reason: "empty_transcript",
+          recording_retained: true,
+        });
+        return false;
       }
       const recordStarted = performance.now();
       markVoiceLatencyIn(trace, "voice_transcript_record_started");
@@ -5838,14 +6935,21 @@
       markVoiceLatencyIn(trace, "voice_transcript_record_finished", {
         duration_ms: Math.round((performance.now() - recordStarted) * 100) / 100,
       });
-      if (recorded?.status !== "passed") {
+      if (recorded?.status === "blocked" || !recorded?.result) {
         throw new Error(`${recorded?.blocker?.code || "voice_transcript_record_failed"}: ${recorded?.blocker?.message || "The voice transcript could not be saved."}`);
       }
-    })();
-    void task.then(() => {
+      if (callJob) callJob.committed = true;
+      return true;
+    })().finally(() => {
+      if (idleJob) idleVoiceTranscriptJobs.delete(idleJob);
+    });
+    if (idleJob) idleJob.task = task;
+    void task.then((committed) => {
+      if (committed !== true) return;
       markVoiceLatencyIn(trace, "voice_transcript_finished", {
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
       });
+      retryCallPrefillAfterTranscript?.(conversation);
     }, (error) => {
       // Transcription enriches history when it succeeds. A failed or slow
       // transcriber must never hold the live listener or the next reply.
@@ -5853,51 +6957,310 @@
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
         message: errorMessage(error),
       });
-      reportError(error);
+      if (!preempted()) reportError(error);
     });
     return task;
   };
 
-  const startVoicePrefill = async (conversation, call) => {
-    markVoiceLatency("audio_prefill_begin_requested", { conversation, call });
+  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish) => {
+    if (callTurn) index();
+    const synthesized = await finish();
+    if (synthesized && !callTurn) index();
+    return synthesized;
+  };
+
+  const startPendingCallTranscriptSlot = () => {
+    if (!voiceCallActive || activeCallTranscriptTask || !pendingCallTranscriptJobs.length) return null;
+    const job = pendingCallTranscriptJobs.shift();
+    job.cancelledByCaller = false;
+    activeCallTranscriptJob = job;
+    const task = indexVoiceTurn(job.conversation, job.output, job.fallbackAttachment,
+      job.sourceCapture, job.sourceTrace, { allowActiveCall: true, callJob: job });
+    const slotTask = task.then(
+      () => ({ committed: job.committed === true, cancelledByCaller: job.cancelledByCaller === true }),
+      () => ({ committed: job.committed === true, cancelledByCaller: job.cancelledByCaller === true }),
+    );
+    activeCallTranscriptTask = slotTask;
+    return slotTask;
+  };
+
+  const preemptCallTranscriptForSpeech = async (recording, startNextCallPrefill) => {
+    const job = activeCallTranscriptJob;
+    const operation = activeCallTranscriptOperation;
+    if (job) {
+      job.cancelledByCaller = true;
+      if (operation) {
+        const elapsed = await stopSpeechOperationAndWait(operation, "caller_speech_onset");
+        if (globalThis.MomVoicePipelineScheduler.shouldDisableCallTranscriptSlotsAfterStop(elapsed)) {
+          voiceCallTranscriptSlotsDisabled = true;
+        }
+      }
+      await activeCallTranscriptTask?.catch(() => {});
+      if (!job.committed) pendingCallTranscriptJobs.unshift(job);
+      if (activeCallTranscriptJob === job) activeCallTranscriptJob = null;
+      if (activeCallTranscriptTask) activeCallTranscriptTask = null;
+      activeCallTranscriptOperation = null;
+    }
+    const live = await startNextCallPrefill("caller_voice_onset");
+    if (recording?.prefillDeferred && live?.session) {
+      await recording.resumeDeferredPrefill(live);
+    }
+  };
+
+  const stopCallTranscriptForClose = async () => {
+    const operation = activeCallTranscriptOperation;
+    const job = activeCallTranscriptJob;
+    if (job) job.cancelledByCaller = true;
+    let stopError = null;
+    if (operation) {
+      try {
+        await stopSpeechOperationAndWait(operation, "call_closed");
+      } catch (error) {
+        stopError = error;
+      }
+    }
+    await activeCallTranscriptTask?.catch(() => {});
+    if (activeCallTranscriptJob === job) activeCallTranscriptJob = null;
+    activeCallTranscriptTask = null;
+    activeCallTranscriptOperation = null;
+    // The saved recording remains the source of truth; idle recovery will
+    // rediscover any turn whose transcript did not commit before hang-up.
+    pendingCallTranscriptJobs = [];
+    if (stopError) throw stopError;
+  };
+
+  // Saved recordings are authoritative until a complete transcript replaces
+  // their model-context representation. A crashed/older client can leave more
+  // pending recordings than one Gemma request may admit, so resume that work
+  // from the active chain without ever dropping or truncating its history.
+  let voiceHistoryRecovery = null;
+  let voiceHistoryRecoveryOperation = null;
+  let voiceHistoryRecoveryStage = "idle";
+  let voiceHistoryRecoveryColdInitialization = false;
+  let voiceHistoryRecoverySuspensions = 0;
+  const canContinueVoiceHistoryRecovery = () => globalThis.MomVoicePipelineScheduler.canContinueVoiceHistoryRecovery({
+    suspended: voiceHistoryRecoverySuspensions > 0,
+    foregroundDispatch: activeDispatchConversation !== null,
+    callActive: voiceCallActive,
+    callPreparing: voiceCallPreparing,
+    recording: Boolean(voiceRecording) || idleVoiceTranscriptJobs.size > 0,
+  });
+  const recoverPendingVoiceHistory = () => {
+    if (!canContinueVoiceHistoryRecovery()) return Promise.resolve();
+    // Selection or call teardown can arrive while an earlier conversation is
+    // still being examined. Revisit the current selection after that pass;
+    // otherwise its recordings can remain forever on the slow media path.
+    if (voiceHistoryRecovery) return voiceHistoryRecovery.then(() => recoverPendingVoiceHistory());
+    voiceHistoryRecovery = (async () => {
+      voiceHistoryRecoveryStage = "listing";
+      const listed = await invoke("mom_llama_conversation_list");
+      if (!canContinueVoiceHistoryRecovery()) return;
+      if (listed?.status === "blocked" || !Array.isArray(listed?.result)) return;
+      const selected = selectedConversation();
+      for (const conversation of listed.result.filter((item) => item.id === selected)) {
+        const messages = new Map((conversation.messages || []).map((message) => [message.id, message]));
+        const active = [];
+        const seen = new Set();
+        let id = conversation.active_leaf_message_id;
+        while (id && !seen.has(id) && messages.has(id)) {
+          seen.add(id);
+          const message = messages.get(id);
+          active.push(message);
+          id = message.parent_id;
+        }
+        for (const message of active.reverse()) {
+          if (!canContinueVoiceHistoryRecovery()) return;
+          if (message.role !== "user"
+              || ![voiceModePrompt(true), voiceModePrompt(false)].includes(message.content)
+              || message.attachment_ids?.length !== 1) continue;
+          // Live turns take priority. Recovery only uses idle time and never
+          // holds generation or the microphone on Parakeet.
+          if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
+          const attachment = message.attachment_ids[0];
+          try {
+            voiceHistoryRecoveryStage = "metadata";
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_started", {
+              conversation: conversation.id, message: message.id, attachment,
+            });
+            const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
+              attachment,
+            }));
+            if (!canContinueVoiceHistoryRecovery()) return;
+            if (catalog.primary?.kind !== "audio") {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id, reason: "not_audio",
+              });
+              continue;
+            }
+            if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
+            const residency = await invoke("mom_llama_speech_parakeet_resident");
+            if (!canContinueVoiceHistoryRecovery()) return;
+            voiceHistoryRecoveryColdInitialization = residency?.result !== true;
+            const operation = speechOperationToken();
+            voiceHistoryRecoveryOperation = operation;
+            voiceHistoryRecoveryStage = "transcription";
+            let transcribed;
+            try {
+              transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
+                conversation: conversation.id,
+                ...attachmentPreviewAnchor(catalog, catalog.primary),
+                operation,
+              });
+            } finally {
+              if (voiceHistoryRecoveryOperation === operation) voiceHistoryRecoveryOperation = null;
+            }
+            if (!canContinueVoiceHistoryRecovery()) return;
+            if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id,
+                reason: transcribed?.blocker?.code || "empty_transcript",
+              });
+              continue;
+            }
+            if (!canContinueVoiceHistoryRecovery()) return;
+            voiceHistoryRecoveryStage = "recording_commit";
+            const recorded = await invoke("mom_llama_message_record_voice_transcript", {
+              conversation: conversation.id,
+              message: message.id,
+              attachment,
+              transcript: transcribed.result.transcript.trim(),
+            });
+            if (!canContinueVoiceHistoryRecovery()) return;
+            if (recorded?.status === "blocked" || !recorded?.result) {
+              markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
+                message: message.id,
+                reason: recorded?.blocker?.code || "record_failed",
+              });
+              continue;
+            }
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_finished", {
+              message: message.id,
+            });
+          } catch (error) {
+            markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_failed", {
+              message: message.id, reason: errorMessage(error),
+            });
+            console.warn("Voice history recovery paused", errorMessage(error));
+            return;
+          }
+        }
+      }
+    })().finally(() => {
+      voiceHistoryRecovery = null;
+      voiceHistoryRecoveryOperation = null;
+      voiceHistoryRecoveryStage = "idle";
+      voiceHistoryRecoveryColdInitialization = false;
+    });
+    return voiceHistoryRecovery;
+  };
+
+  const suspendVoiceHistoryRecoveryForForeground = async (reason) => {
+    voiceHistoryRecoverySuspensions += 1;
+    try {
+      const idleJobs = [...idleVoiceTranscriptJobs];
+      // Mark every owner before awaiting anything: jobs still reading source
+      // metadata must not admit a new backend operation after this snapshot.
+      for (const job of idleJobs) job.cancelledByForeground = true;
+      for (const job of idleJobs) {
+        if (job.operation) {
+          await stopSpeechOperationAndWait(job.operation, reason, {
+            allowColdTranscriptionSettlement: true,
+          });
+        }
+      }
+      // A transcript commit that already began must settle before Gemma reads
+      // the next history. Failed/cancelled readers keep their source recording.
+      await Promise.all(idleJobs.map((job) => job.task?.catch(() => {})));
+      const operation = voiceHistoryRecoveryOperation;
+      const coldInitialization = voiceHistoryRecoveryColdInitialization;
+      if (operation) {
+        const elapsed = await stopSpeechOperationAndWait(operation, reason, {
+          allowColdTranscriptionSettlement: coldInitialization,
+        });
+        if (globalThis.MomVoicePipelineScheduler.shouldDisableCallTranscriptSlotsAfterStop(elapsed)) {
+          voiceCallTranscriptSlotsDisabled = true;
+        }
+      }
+      if (globalThis.MomVoicePipelineScheduler.shouldWaitForVoiceHistoryRecovery({
+        operation,
+        stage: voiceHistoryRecoveryStage,
+      })) {
+        await voiceHistoryRecovery?.catch(() => {});
+      }
+    } catch (error) {
+      voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
+      throw error;
+    }
+    let released = false;
+    return ({ resume = true } = {}) => {
+      if (released) return;
+      released = true;
+      voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
+      if (resume && voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
+        void recoverPendingVoiceHistory().catch(() => {});
+      }
+    };
+  };
+
+  const startVoicePrefill = async (conversation, call, trace) => {
+    markVoiceLatencyIn(trace, "audio_prefill_begin_requested", { conversation, call });
     const live = await invoke("mom_llama_voice_audio_begin", {
       conversation,
       message: voiceModePrompt(call),
     });
-    markVoiceLatency("audio_prefill_session_ready", { begin: live?.begin_metrics || null });
+    markVoiceLatencyIn(trace, "audio_prefill_session_ready", { begin: live?.begin_metrics || null });
     return { ...live, conversation };
   };
 
-  const stopVoiceCapture = async ({ discard = false, abortPrefill = true, flushPrefill = true } = {}) => {
+  const abortStoppedVoicePrefill = (recording, abortPrefill) => {
+    const cancelled = recording.speculation && !recording.speculation.confirmed
+      ? abortCallSpeculation(recording)
+      : abortPrefill ? recording.prefillSession.then((live) => live?.session
+        ? invoke("mom_llama_voice_audio_abort", { session: live.session }) : null)
+        : Promise.resolve();
+    // Keep the gesture responsive, but do not restart archival compute until
+    // the cancelled model owner has acknowledged the stop.
+    void Promise.resolve(cancelled).then(() => {
+      if (!recording.call) void recoverPendingVoiceHistory().catch(() => {});
+    }, (error) => {
+      markVoiceLatencyIn(recording.trace, "voice_capture_prefill_abort_failed", {
+        message: errorMessage(error),
+      });
+    });
+  };
+
+  const stopVoiceCapture = async ({ discard = false, abortPrefill = true,
+    flushPrefill = true, reason = "sent" } = {}) => {
     const recording = voiceRecording;
     voiceRecording = null;
     if (!recording) return null;
+    if (discard) recording.discarded = true;
+    markVoiceLatencyIn(recording.trace, "capture_stopped", {
+      reason, discard, producer: recording.native ? "native_ring" : "browser_capture",
+    });
     clearTimeout(recording.limit);
     if (recording.native) {
       setVoiceRecordingVisible(false);
       await recording.startPromise;
       if (discard) {
-        recording.discarded = true;
-        if (recording.speculation && !recording.speculation.confirmed) {
-          void abortCallSpeculation(recording);
-        } else if (abortPrefill) {
-          void recording.prefillSession.then((live) => live?.session
-            ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-            : null).catch(() => {});
-        }
+        abortStoppedVoicePrefill(recording, abortPrefill);
         await invoke("mom_llama_voice_capture_cancel", { capture: recording.capture });
         return null;
       }
       await recording.targetChain.catch(() => null);
       const stopped = await invoke("mom_llama_voice_capture_stop", { capture: recording.capture });
-      const wavBytes = stopped instanceof ArrayBuffer
-        ? new Uint8Array(stopped)
-        : (ArrayBuffer.isView(stopped) ? new Uint8Array(stopped.buffer, stopped.byteOffset, stopped.byteLength)
-          : Uint8Array.from(stopped || []));
+      const wavBytes = ipcBinaryBytes(stopped?.wav, 16 * 1024 * 1024, "Native voice recording");
+      const modelInputWavBytes = stopped?.inference_wav == null
+        ? null : ipcBinaryBytes(stopped.inference_wav, 16 * 1024 * 1024, "Native model-input recording");
       return {
-        heardVoice: wavBytes.byteLength > 44,
-        metrics: recording.nativeMetrics || {},
+        heardVoice: stopped?.heard_voice === true,
+        metrics: stopped?.metrics || recording.nativeMetrics || {},
         wavBytes,
+        modelInputWavBytes,
+        sourceSampleCount: stopped?.inference_source_sample_count,
+        modelInputSampleCount: stopped?.inference_accepted_sample_count,
+        modelInputSourceRanges: stopped?.inference_source_ranges,
+        trace: recording.trace,
       };
     }
     recording.processor.onaudioprocess = null;
@@ -5920,17 +7283,17 @@
       echo_guard_suppressed_callbacks: recording.echoGuardSuppressedCallbacks || 0,
       echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
       echo_guard_threshold: recording.echoGuardThreshold || 0,
+      echo_reference_callbacks: recording.echoReferenceCallbacks || 0,
+      echo_matched_callbacks: recording.echoMatchedCallbacks || 0,
+      prefill_ipc_queued_samples: recording.prefillQueuedSamples || 0,
+      prefill_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
+      prefill_suppressed_silence_samples: recording.prefillSuppressedSilenceSamples || 0,
+      prefill_failed: recording.prefillFailed === true,
     };
-    markVoiceLatency("capture_processing", captureMetrics);
+    markVoiceLatencyIn(recording.trace, "capture_processing", { ...captureMetrics, reason, discard });
     if (discard) {
       recording.transcription?.cancel();
-      if (recording.speculation && !recording.speculation.confirmed) {
-        void abortCallSpeculation(recording);
-      } else if (abortPrefill) {
-        void recording.prefillSession.then((live) => live?.session
-          ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-          : null).catch(() => {});
-      }
+      abortStoppedVoicePrefill(recording, abortPrefill);
       return null;
     }
     // Physical stop seals the transcript independently. Never await Parakeet
@@ -5938,11 +7301,27 @@
     recording.transcription?.seal();
     if (flushPrefill) {
       enqueueVoicePrefill(recording, new Float32Array(), true);
-      await recording.pushChain;
     }
+    await recording.pushChain;
+    const modelInputWavBytes = recording.modelInputReliable && !recording.prefillFailed
+      && recording.modelInputSourceRanges.length > 0
+      ? encodeInferencePcm16Wav(recording.modelInputPcm16Parts, recording.modelInputSampleCount)
+      : null;
+    markVoiceLatencyIn(recording.trace, "voice_inference_archive", {
+      source_samples: recording.capturedSamples,
+      accepted_samples: recording.modelInputSampleCount,
+      source_ranges: recording.modelInputSourceRanges.length,
+      exact_derivative: Boolean(modelInputWavBytes),
+    });
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
+      transcription: recording.transcription,
+      trace: recording.trace,
+      modelInputWavBytes,
+      modelInputSourceRanges: recording.modelInputSourceRanges,
+      modelInputSampleCount: recording.modelInputSampleCount,
+      sourceSampleCount: recording.capturedSamples,
       // The saved turn is the physical microphone stream. Editing it here
       // would make the archive differ from Parakeet's parallel PCM consumer.
       samples: () => mergeFloat32(recording.capturedPcm),
@@ -5957,17 +7336,55 @@
     // the later Gemma result with nowhere to send audio.
     if (!reply?.audible) return;
     const startedAt = performance.now();
-    markVoiceLatency("barge_in_detected", detail);
-    void reply.stop().then(() => {
-      markVoiceLatency("barge_in_playback_stopped", {
+    const replyTrace = reply.trace;
+    const replyTraceId = replyTrace?.id || null;
+    const replyRequestId = reply.requestId || null;
+    const captureTraceId = recording.trace?.id || null;
+    const replyOwnership = {
+      reply_trace_id: replyTraceId,
+      reply_request_id: replyRequestId,
+    };
+    const captureOwnership = {
+      ...replyOwnership,
+      capture_trace_id: captureTraceId,
+    };
+    markVoiceLatencyIn(recording.trace, "barge_in_detected", {
+      ...detail,
+      ...replyOwnership,
+    });
+    if (replyTrace && replyTrace !== recording.trace) {
+      markVoiceLatencyIn(replyTrace, "barge_in_detected", captureOwnership);
+    }
+    void reply.interruptForSpeech().then(() => {
+      const stopped = {
+        ...replyOwnership,
         duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
-      });
+      };
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stopped", stopped);
+      if (replyTrace && replyTrace !== recording.trace) {
+        markVoiceLatencyIn(replyTrace, "barge_in_playback_stopped", {
+          ...stopped,
+          capture_trace_id: captureTraceId,
+        });
+      }
     }).catch((error) => {
-      markVoiceLatency("barge_in_playback_stop_failed", { message: errorMessage(error) });
+      const failure = {
+        ...replyOwnership,
+        message: errorMessage(error),
+      };
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stop_failed", failure);
+      if (replyTrace && replyTrace !== recording.trace) {
+        markVoiceLatencyIn(replyTrace, "barge_in_playback_stop_failed", {
+          ...failure,
+          capture_trace_id: captureTraceId,
+        });
+      }
     });
   };
 
-  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null, transcription = null, onVoiceOnset = null } = {}) => {
+  const beginBrowserVoiceCapture = async ({ call = false, prefillSession = null,
+    prefillRetryPending = false, transcription = null, onVoiceOnset = null,
+    deferPrefill = false } = {}) => {
     if (voiceRecording) throw new Error("Voice capture is already active.");
     // The call controller opens the next microphone turn as playback starts so
     // speech can stop the speaker locally. Its model target is attached when
@@ -6000,10 +7417,13 @@
     const capturedPcm = [];
     const recording = {
       stream, context, source, processor, silence, capturedPcm,
+      trace: voiceLatencyTrace,
       // Optional staged tap. Default callers remain unchanged until the native
-      // owner/command and exact saved-source binding are implemented.
+      // owner/command and derived-input source binding are implemented.
       transcription,
       capturedSamples: 0, prefillInputStartSample: null,
+      modelInputPcm16Parts: [], modelInputSampleCount: 0, modelInputReliable: true,
+      modelInputSourceRanges: [], prefillSourceRanges: [], prefillLastSourceEnd: 0,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
       resampler: globalThis.MomVoiceCapturePolicy.createStreamingMonoResampler(context.sampleRate),
@@ -6013,44 +7433,129 @@
       voiceActivity: globalThis.MomVoiceCapturePolicy.initialVoiceActivity(),
       preRoll: [], preRollSamples: 0, prefillParts: [], prefillSamples: 0,
       pushChain: Promise.resolve(), prefillFailed: false, prefillSession: null,
+      prefillPending: deferPrefill,
+      prefillDeferred: deferPrefill,
+      prefillRetryPending,
       prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
-      speculationReleaseMs: 180,
+      // Give a caller a natural pause before spending compute on a reply.
+      // Keep VAD onset/resume fast so speech still cancels speculation promptly.
+      speculationReleaseMs: 350,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
+      prefillQueuedSamples: 0, prefillQueueHighWaterSamples: 0,
+      prefillSuppressedSilenceSamples: 0,
       prefillIpcMs: 0, prefillMaxIpcMs: 0,
       captureCallbacks: 0, captureCpuMs: 0, captureMaxCpuMs: 0,
       detectorCpuMs: 0, detectorSubframes: 0, resampleCpuMs: 0,
       echoGuard: globalThis.MomVoiceCapturePolicy.initialPlaybackEchoGuard(),
+      echoMatcher: globalThis.MomVoiceCapturePolicy.createPlaybackEchoMatcher(),
       echoGuardCallbacks: 0,
       echoGuardSuppressedCallbacks: 0, echoGuardPeakRms: 0,
       echoGuardThreshold: 0,
+      echoReferenceCallbacks: 0, echoMatchedCallbacks: 0, echoEvidence: null,
       detectorSilence: new Float32Array(processor.bufferSize),
     };
+    // Transcription is an idle archival operation. The live microphone has
+    // one inference consumer, so a slower Mac cannot accumulate parallel ASR
+    // work or rewrite history under the prepared Gemma request.
     const initialPrefillEpoch = recording.prefillEpoch;
-    recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
-      if (recording.prefillEpoch === initialPrefillEpoch) {
-        recording.prefillFailed = true;
-        markVoiceLatency("audio_prefill_begin_failed", { message: errorMessage(error) });
+    recording.prefillSession = deferPrefill
+      ? Promise.resolve(null)
+      : (prefillSession || prepareVoicePrefill(recording)).then((live) => {
+        if (recording.prefillEpoch !== initialPrefillEpoch) {
+          if (live?.session) {
+            void invoke("mom_llama_voice_audio_abort", { session: live.session }).catch(() => {});
+          }
+          return null;
+        }
+        recording.prefillPending = false;
+        recording.prefillRetryPending = false;
+        if (!live?.session) {
+          recording.prefillFailed = true;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
+            message: "The live audio session was unavailable; the saved recording will carry this turn.",
+          });
+        }
+        return live;
+      }).catch((error) => {
+        if (recording.prefillEpoch === initialPrefillEpoch) {
+          recording.prefillPending = false;
+          recording.prefillRetryPending = false;
+          recording.prefillFailed = true;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", { message: errorMessage(error) });
+        }
+        return null;
+      });
+    recording.resumeDeferredPrefill = (live) => {
+      if (recording.deferredResume) return recording.deferredResume;
+      if (!recording.prefillDeferred || !live?.session || voiceRecording !== recording) {
+        return Promise.resolve(false);
       }
-      return null;
-    });
+      const resume = (async () => {
+        recording.prefillPending = true;
+        recording.prefillFailed = false;
+        recording.prefillSession = Promise.resolve(live);
+        // The deferred queue contains only source ranges admitted by the
+        // detector. Attach it synchronously before awaiting IPC so later
+        // callbacks append in order, without replaying the physical archive.
+        recording.prefillDeferred = false;
+        recording.prefillPending = false;
+        recording.prefillRetryPending = false;
+        const replayedSamples = recording.prefillSamples;
+        enqueueVoicePrefill(recording, new Float32Array(), true);
+        await recording.pushChain;
+        if (recording.prefillFailed) return false;
+        markVoiceLatencyIn(recording.trace, "audio_prefill_deferred_pcm_replayed", {
+          samples: replayedSamples,
+          captured_samples: recording.capturedSamples,
+        });
+        return true;
+      })();
+      recording.deferredResume = resume;
+      void resume.then(() => {
+        if (recording.deferredResume === resume) recording.deferredResume = null;
+      }, () => {
+        if (recording.deferredResume === resume) recording.deferredResume = null;
+      });
+      return resume;
+    };
     processor.onaudioprocess = (event) => {
       const callbackStarted = performance.now();
       const chunk = event.inputBuffer.getChannelData(0);
       const previousActivity = recording.voiceActivity;
-      const playbackAudible = recording.call && liveVoiceTts?.mode === "call"
-        && liveVoiceTts.audible;
+      const audibleReply = recording.call ? activeCallPlayback : null;
+      const playbackAudible = Boolean(audibleReply?.audible);
       let detectorChunk = chunk;
       if (playbackAudible) {
         let power = 0;
         for (let index = 0; index < chunk.length; index += 1) power += chunk[index] * chunk[index];
         const rawRms = Math.sqrt(power / Math.max(1, chunk.length));
         const durationMs = chunk.length * 1000 / context.sampleRate;
+        const reference = audibleReply?.controller?.echoReference();
+        if (reference) recording.echoReferenceCallbacks += 1;
+        const matchedEcho = reference ? recording.echoMatcher.process(chunk, context.sampleRate,
+          reference.samples, reference.sampleRate) : null;
         const echo = globalThis.MomVoiceCapturePolicy.updatePlaybackEchoGuard(
           recording.echoGuard,
-          rawRms,
+          matchedEcho ? matchedEcho.residualRms : rawRms,
           durationMs,
+          { matchedEcho: Boolean(matchedEcho) },
         );
+        if (matchedEcho) recording.echoMatchedCallbacks += 1;
+        recording.echoEvidence = {
+          reference_available: Boolean(reference),
+          matched: Boolean(matchedEcho),
+          correlation: matchedEcho?.correlation ?? null,
+          residual_rms: matchedEcho?.residualRms ?? null,
+          raw_rms: rawRms,
+          guard_threshold: echo.threshold,
+          suppressed: echo.suppressed,
+          source_rate_hz: context.sampleRate,
+          reference_rate_hz: reference?.sampleRate ?? null,
+          matcher: recording.echoMatcher.snapshot(),
+          callback_lag_ms: Number.isFinite(event.playbackTime)
+            ? (context.currentTime - event.playbackTime) * 1000 : null,
+        };
         recording.echoGuard = echo.guard;
         recording.echoGuardCallbacks += 1;
         recording.echoGuardPeakRms = Math.max(recording.echoGuardPeakRms, rawRms);
@@ -6059,9 +7564,11 @@
           recording.echoGuardSuppressedCallbacks += 1;
           detectorChunk = recording.detectorSilence;
         }
-      } else {
+      } else if (recording.echoPlaybackActive) {
         recording.echoGuard = globalThis.MomVoiceCapturePolicy.initialPlaybackEchoGuard();
+        recording.echoMatcher = globalThis.MomVoiceCapturePolicy.createPlaybackEchoMatcher();
       }
+      recording.echoPlaybackActive = playbackAudible;
       const detectorStarted = performance.now();
       const analysis = globalThis.MomVoiceCapturePolicy.analyzeVoiceSamples(
         previousActivity,
@@ -6096,22 +7603,35 @@
       // replay only the PCM beyond the native audio checkpoint.
       if (!recording.speculation && analysis.hadVoiced) {
         if (!previousActivity.heardVoice) {
-          if (recording.prefillInputStartSample === null) {
-            recording.prefillInputStartSample = Math.max(0,
-              recording.capturedSamples - recording.preRollSamples - pcm.length);
-          }
           interruptCallPlaybackForSpeech(recording, {
             producer: "browser_capture",
             onset_sample: analysis.voiceOnsetSample,
+            echo: recording.echoEvidence,
           });
           // A real caller takes priority over finishing the contact's voice.
           // Release the prefetched-session gate at onset so PCM enters Gemma
           // while the caller is speaking, even if Qwen still has a tail.
-          if (onVoiceOnset) queueMicrotask(onVoiceOnset);
-          recording.preRoll.forEach((part) => enqueueVoicePrefill(recording, part));
+          if (onVoiceOnset) {
+            queueMicrotask(() => {
+              void Promise.resolve(onVoiceOnset(recording)).catch((error) => {
+                recording.computePreemptionBlocked = true;
+                recording.prefillPending = true;
+                recording.prefillFailed = true;
+                markVoiceLatencyIn(recording.trace, "voice_onset_prefill_failed", {
+                  message: errorMessage(error),
+                });
+                reportError(error);
+              });
+            });
+          }
+          let preRollStart = recording.capturedSamples - pcm.length - recording.preRollSamples;
+          recording.preRoll.forEach((part) => {
+            enqueueVoicePrefill(recording, part, false, preRollStart);
+            preRollStart += part.length;
+          });
           recording.preRoll = [];
           recording.preRollSamples = 0;
-          markVoiceLatency("voice_activity_first_detected", {
+          markVoiceLatencyIn(recording.trace, "voice_activity_first_detected", {
             onset_sample: analysis.voiceOnsetSample,
             rms,
             threshold,
@@ -6119,7 +7639,14 @@
         }
         enqueueVoicePrefill(recording, pcm);
       } else if (!recording.speculation && activity.heardVoice) {
-        if (activity.silentMs <= 600) enqueueVoicePrefill(recording, pcm);
+        // The first silence edge has already flushed the model input. Further
+        // silence belongs only to the physical recording; pushing it after
+        // speculative decode starts can race native end-of-input.
+        if (!recording.speculationStarting && activity.silentMs <= 600) {
+          enqueueVoicePrefill(recording, pcm);
+        } else {
+          recording.prefillSuppressedSilenceSamples += pcm.length;
+        }
       } else if (!recording.speculation) {
         recording.preRoll.push(pcm);
         recording.preRollSamples += pcm.length;
@@ -6131,19 +7658,30 @@
           && activity.silentMs >= (recording.call ? recording.speculationReleaseMs : 20)
           && voiceRecording === recording
           && !recording.sending && !recording.speculation && !recording.speculationStarting
-          && !recording.prefillFailed) {
-        markVoiceLatency("silence_onset", {
+          && !recording.prefillFailed && !recording.prefillPending) {
+        markVoiceLatencyIn(recording.trace, "silence_onset", {
           silence_ms: activity.silentMs,
           onset_sample: analysis.silenceOnsetSample,
           rms,
           threshold,
         });
         void startVoiceSpeculation(recording).catch(reportError);
-      } else if (recording.call && recording.prefillFailed && activity.heardVoice
+      } else if ((recording.prefillFailed || recording.prefillPending)
+          && !recording.computePreemptionBlocked
+          && activity.heardVoice
           && activity.silentMs >= 900 && voiceRecording === recording && !recording.sending) {
-        // Incremental audio cannot admit a still-pending historical WAV.
+        if (recording.prefillPending) {
+          const retry = recording.prefillRetryPending;
+          recording.prefillPending = false;
+          recording.prefillRetryPending = false;
+          recording.prefillFailed = true;
+          recording.prefillEpoch += 1;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_wait_expired", {
+            silence_ms: activity.silentMs, retry,
+          });
+        }
         // The physical recording can use the complete-media chat path without
-        // waiting for Parakeet or leaving the call stuck at a silence edge.
+        // waiting for Parakeet or leaving the turn stuck at a silence edge.
         void sendVoiceCapture(recording).catch(reportError);
       } else if (!recording.call && activity.heardVoice && activity.silentMs >= 900
           && voiceRecording === recording && !recording.sending) {
@@ -6162,11 +7700,6 @@
       source.connect(processor); processor.connect(silence); silence.connect(context.destination);
     }
     voiceRecording = recording;
-    voiceRecording.limit = window.setTimeout(() => {
-      if (voiceRecording === recording && !recording.sending && !recording.speculation) {
-        void sendVoiceCapture(recording).catch(reportError);
-      }
-    }, 29000);
     if (!call) setVoiceRecordingVisible(true);
     return recording;
   };
@@ -6183,6 +7716,7 @@
     if (!preserveLatencyTrace) startVoiceLatency(call ? "call" : "voice_note");
     const recording = {
       native: true,
+      trace: voiceLatencyTrace,
       capture: crypto.randomUUID(),
       call,
       sourceConversation: selectedConversation(),
@@ -6210,14 +7744,14 @@
     // 2.96 seconds while its 1,643-token prefix was restored. Capture retains
     // this head in fixed native storage and retarget replays it exactly once,
     // so listening can begin immediately while preparation runs in parallel.
-    markVoiceLatency("native_capture_requested");
+    markVoiceLatencyIn(recording.trace, "native_capture_requested");
     recording.startPromise = invoke("mom_llama_voice_capture_start", {
       capture: recording.capture,
       call,
     });
     recording.prefillSession = (prefillSession || prepareVoicePrefill(recording)).catch((error) => {
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_begin_failed", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
         producer: "native_ring",
         message: errorMessage(error),
       });
@@ -6231,7 +7765,7 @@
         capture: recording.capture,
         session: live.session,
       });
-      markVoiceLatency("audio_prefill_native_targeted", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_native_targeted", {
         session: live.session,
         round_trip_ms: Math.round((performance.now() - targetedAt) * 100) / 100,
         native_elapsed_us: targeted?.native_elapsed_us || null,
@@ -6248,7 +7782,7 @@
       return targeted;
     }).catch((error) => {
       recording.prefillFailed = true;
-      markVoiceLatency("audio_prefill_target_failed", {
+      markVoiceLatencyIn(recording.trace, "audio_prefill_target_failed", {
         producer: "native_ring",
         message: errorMessage(error),
       });
@@ -6256,20 +7790,14 @@
     });
     try {
       await recording.startPromise;
-      markVoiceLatency("native_capture_started");
+      markVoiceLatencyIn(recording.trace, "native_capture_started");
     } catch (error) {
+      recording.discarded = true;
       if (voiceRecording === recording) voiceRecording = null;
       setVoiceRecordingVisible(false);
-      void recording.prefillSession.then((live) => live?.session
-        ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-        : null).catch(() => {});
+      abortStoppedVoicePrefill(recording, true);
       throw error;
     }
-    recording.limit = window.setTimeout(() => {
-      if (voiceRecording === recording && !recording.sending && !recording.speculation) {
-        void sendVoiceCapture(recording).catch(reportError);
-      }
-    }, 29000);
     return recording;
   };
 
@@ -6294,20 +7822,29 @@
 
   const resumeBrowserVoicePrefill = (recording, replacement) => {
     if (voiceRecording !== recording || (recording.call && !voiceCallActive)) return;
-    if (recording.native || !replacement?.session || replacement.resume_reused !== true) {
+    const resumeOffset = Number(replacement?.resume_sample_offset);
+    if (recording.native || !replacement?.session
+        || !Number.isSafeInteger(resumeOffset) || resumeOffset < 0
+        || (replacement.resume_reused !== true && resumeOffset !== 0)) {
       throw new Error("The live audio checkpoint could not be resumed.");
     }
     recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
     const captured = mergeFloat32(recording.capturedPcm);
-    const origin = recording.prefillInputStartSample ?? 0;
-    const resumeOffset = Number(replacement.resume_sample_offset || 0);
-    if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0
-        || origin + resumeOffset > captured.length) {
-      throw new Error("The voice checkpoint is outside the captured audio.");
+    const sourceOffset = recording.modelInputSourceRanges.length
+      ? inferenceSourceOffset(recording.modelInputSourceRanges, resumeOffset)
+      : (resumeOffset === 0 ? recording.prefillInputStartSample : null);
+    if (!Number.isSafeInteger(sourceOffset) || sourceOffset < 0 || sourceOffset > captured.length
+        || resumeOffset > recording.modelInputSampleCount) {
+      throw new Error("The voice checkpoint is outside the acknowledged audio.");
     }
-    const priorAudio = captured.subarray(origin + resumeOffset);
+    truncateInferencePcm16(recording, resumeOffset);
+    const priorAudio = captured.subarray(sourceOffset);
     recording.prefillParts = [];
+    recording.prefillSourceRanges = [];
+    recording.prefillLastSourceEnd = sourceOffset;
     recording.prefillSamples = 0;
+    recording.prefillQueuedSamples = 0;
+    recording.prefillQueueHighWaterSamples = 0;
     recording.pushChain = Promise.resolve();
     recording.prefillFailed = false;
     recording.firstPrefillChunkAccepted = false;
@@ -6322,8 +7859,8 @@
       conversation: replacement.conversation_id || voiceCallConversation || recording.sourceConversation,
       begin_metrics: replacement.begin_metrics || null,
     });
-    enqueueVoicePrefill(recording, priorAudio, true);
-    markVoiceLatency("speculation_handoff_replay_enqueued", {
+    enqueueVoicePrefill(recording, priorAudio, true, sourceOffset);
+    markVoiceLatencyIn(recording.trace, "speculation_handoff_replay_enqueued", {
       checkpoint_samples: resumeOffset,
       replay_samples: priorAudio.length,
       captured_samples: captured.length,
@@ -6334,7 +7871,8 @@
     const speculation = recording?.speculation;
     if (!speculation || speculation.confirmed || speculation.aborting) return;
     speculation.aborting = true;
-    markVoiceLatency("speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
+    speculation.resolveCapture?.(null);
+    markVoiceLatencyIn(recording.trace, "speculation_aborted", { reason: restartPrefill ? "speech_resumed" : "capture_stopped" });
     if (!recording.native && recording.call && restartPrefill) {
       // A short intra-utterance pause can cross the first speculative edge.
       // Repeated belays are direct evidence that this caller needs a longer
@@ -6348,7 +7886,7 @@
     // independently while native capture is retargeted.
     const ttsStopAt = performance.now();
     void speculation.tts.stop().catch(() => {}).finally(() => {
-      markVoiceLatency("speculation_tts_stopped", {
+      markVoiceLatencyIn(recording.trace, "speculation_tts_stopped", {
         duration_ms: Math.round((performance.now() - ttsStopAt) * 100) / 100,
       });
     });
@@ -6357,7 +7895,7 @@
     let replacementError = null;
     const nativeAbortAt = performance.now();
     if (restartPrefill) {
-      markVoiceLatency("speculation_handoff_started");
+      markVoiceLatencyIn(recording.trace, "speculation_handoff_started");
       try {
         await withDeadline(speculation.admissionReady, 2_000,
           "voice_speculation_admission_timeout: The call turn could not be prepared for interruption.");
@@ -6376,7 +7914,7 @@
         recording.prefillFailed = false;
         recording.prefillSession = Promise.resolve(live);
         recording.targetChain = Promise.resolve(replacement);
-        markVoiceLatency("speculation_handoff_ready", {
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_ready", {
           round_trip_ms: Math.round((performance.now() - nativeAbortAt) * 100) / 100,
           abort_ms: Math.round(Number(replacement.abort_us || 0) / 10) / 100,
           begin_ms: Math.round(Number(replacement.begin_us || 0) / 10) / 100,
@@ -6402,14 +7940,14 @@
       } catch (error) {
         replacementError = error;
         recording.prefillFailed = true;
-        markVoiceLatency("speculation_handoff_failed", { message: errorMessage(error) });
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_failed", { message: errorMessage(error) });
       }
     } else {
       await invoke("mom_llama_voice_audio_speculation_abort", {
         speculation: speculation.id,
         conversation: speculation.conversation,
       }).catch((error) => { replacementError = error; });
-      markVoiceLatency("speculation_native_abort_complete", {
+      markVoiceLatencyIn(recording.trace, "speculation_native_abort_complete", {
         duration_ms: Math.round((performance.now() - nativeAbortAt) * 100) / 100,
       });
     }
@@ -6426,7 +7964,7 @@
         void invoke("mom_llama_voice_audio_abort", { session: replacement.session }).catch(() => {});
         replacementError = error;
         recording.prefillFailed = true;
-        markVoiceLatency("speculation_handoff_failed", { message: errorMessage(error) });
+        markVoiceLatencyIn(recording.trace, "speculation_handoff_failed", { message: errorMessage(error) });
         replacement = null;
       }
     }
@@ -6446,7 +7984,7 @@
             && (!recording.call || voiceCallActive)) {
           if (!recording.native && (recording.voiceActivity.voiced
               || recording.silentMs < recording.speculationReleaseMs)) return;
-          markVoiceLatency("speculation_handoff_rearmed", {
+          markVoiceLatencyIn(recording.trace, "speculation_handoff_rearmed", {
             silent_ms: recording.silentMs || 0,
           });
           void startVoiceSpeculation(recording,
@@ -6468,11 +8006,56 @@
     return Array.from(bytes);
   };
 
+  const sealedVoiceInferenceRecording = (capture) => {
+    const bytes = capture?.modelInputWavBytes;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength <= 44) return null;
+    const sourceSampleCount = Number(capture.sourceSampleCount);
+    const acceptedSampleCount = Number(capture.modelInputSampleCount);
+    if (!Number.isSafeInteger(sourceSampleCount) || sourceSampleCount <= 0
+        || !Number.isSafeInteger(acceptedSampleCount) || acceptedSampleCount <= 0) return null;
+    const sourceRanges = Array.isArray(capture.modelInputSourceRanges)
+      ? capture.modelInputSourceRanges.map((range) => ({
+        start: Number(range?.start),
+        end_exclusive: Number(range?.end_exclusive),
+      }))
+      : null;
+    const sourceStartSample = Number(capture.modelInputStartSample);
+    if (sourceRanges) {
+      let previousEnd = 0;
+      let rangeSamples = 0;
+      if (sourceRanges.length === 0) return null;
+      for (const range of sourceRanges) {
+        if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end_exclusive)
+            || range.start < previousEnd || range.start >= range.end_exclusive
+            || range.end_exclusive > sourceSampleCount) return null;
+        rangeSamples += range.end_exclusive - range.start;
+        previousEnd = range.end_exclusive;
+      }
+      if (rangeSamples !== acceptedSampleCount) return null;
+    } else if (!Number.isSafeInteger(sourceStartSample) || sourceStartSample < 0
+        || sourceStartSample + acceptedSampleCount > sourceSampleCount) return null;
+    return {
+      recording: Array.from(bytes),
+      sourceSampleCount,
+      acceptedSampleCount,
+      ...(sourceRanges ? { sourceRanges } : { sourceStartSample }),
+    };
+  };
+
   const confirmRecordedSpeculation = (speculation, stoppedCapture) => stoppedCapture
-    .then((capture) => invoke("mom_llama_voice_audio_speculation_confirm", {
-      speculation: speculation.id,
-      recording: sealedVoiceRecordingBytes(capture),
-    }))
+    .then((capture) => {
+      const modelInput = sealedVoiceInferenceRecording(capture);
+      return invoke("mom_llama_voice_audio_speculation_confirm", {
+        speculation: speculation.id,
+        recording: sealedVoiceRecordingBytes(capture),
+        ...(modelInput ? { modelInputRecording: modelInput.recording,
+          sourceSampleCount: modelInput.sourceSampleCount,
+          acceptedSampleCount: modelInput.acceptedSampleCount,
+          ...(modelInput.sourceRanges
+            ? { sourceRanges: modelInput.sourceRanges }
+            : { sourceStartSample: modelInput.sourceStartSample }) } : {}),
+      });
+    })
     .catch(async (error) => {
       await speculation.tts.stop().catch(() => {});
       await invoke("mom_llama_voice_audio_speculation_abort", {
@@ -6490,12 +8073,15 @@
       return;
     }
     speculation.confirmed = true;
-    markVoiceLatency("speculation_confirmed");
+    markVoiceLatencyIn(recording.trace, "speculation_confirmed");
     // Sever microphone capture synchronously at the commit boundary. The
     // native confirmation IPC must not leave a window in which resumed speech
     // is accidentally attributed to the reply that is already audible.
-    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false,
+      reason: "call_speculation_confirmed" });
+    speculation.capturePromise = stoppedCapture;
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
+    speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
     // Local capture is already severed before any promise is awaited. Start
     // the buffered reply now; native commit and recorder drain are bookkeeping
     // that can complete concurrently and must not extend time to first sound.
@@ -6509,14 +8095,15 @@
     speculation.confirmed = true;
     recording.sending = true;
     setVoiceRecordingVisible(false);
-    markVoiceLatency("capture_stopped", { speculative: true });
-    markVoiceLatency("speculation_confirmed", { mode: "voice_note" });
+    markVoiceLatencyIn(recording.trace, "speculation_confirmed", { mode: "voice_note" });
 
     // The reply has remained private while the user could still resume
     // speaking. Publish only after the send boundary, while capture drain and
     // WAV encoding continue concurrently with the native commit latch.
     const outgoing = appendOptimisticVoiceMessage();
-    appendLiveVoiceReply("live-voice-reply-pending");
+    const pendingReply = appendLiveVoiceReply("live-voice-reply-pending");
+    if (outgoing?.dataset) outgoing.dataset.voiceSpeculationId = speculation.id;
+    if (pendingReply?.dataset) pendingReply.dataset.voiceSpeculationId = speculation.id;
     const pendingButton = document.querySelector(
       "#live-voice-reply-pending [data-action='voice-reply-pending-play']",
     );
@@ -6525,15 +8112,86 @@
     voiceReplyConversation = speculation.conversation;
     liveVoiceTts = speculation.tts;
 
-    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false });
+    const stoppedCapture = stopVoiceCapture({ abortPrefill: false, flushPrefill: false,
+      reason: "voice_note_speculation_confirmed" });
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
-    const [capture] = await Promise.all([stoppedCapture, confirmed]);
-    if (capture?.wavBytes?.byteLength > 44) {
-      hydrateOptimisticVoiceMessage(outgoing, capture.wavBytes);
-    } else {
-      outgoing?.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+    speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
+    let capture = null;
+    let captureWavBytes = null;
+    let captureWavAttempted = false;
+    const materializeCaptureWav = () => {
+      if (captureWavAttempted) return captureWavBytes;
+      captureWavAttempted = true;
+      captureWavBytes = capture?.wavBytes
+        || (typeof capture?.samples === "function" ? encodePcmWav(capture.samples()) : null);
+      return captureWavBytes;
+    };
+    try {
+      [capture] = await Promise.all([stoppedCapture, confirmed]);
+      captureWavBytes = materializeCaptureWav();
+      if (captureWavBytes?.byteLength > 44) {
+        if (outgoing?.dataset?.voiceSpeculationId === speculation.id) {
+          hydrateOptimisticVoiceMessage(outgoing, captureWavBytes);
+        }
+      } else {
+        if (outgoing?.dataset?.voiceSpeculationId === speculation.id) {
+          outgoing.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+        }
+      }
+      return true;
+    } catch (error) {
+      // Confirmation can fail after the optimistic rows are visible (most
+      // commonly because the stopped capture contains no speech). Settle only
+      // these exact nodes and this speculation's controller: a later reply in
+      // the same conversation may already own the global routing state.
+      capture ??= await stoppedCapture.catch(() => null);
+      let captureWavError = null;
+      try {
+        materializeCaptureWav();
+      } catch (wavError) {
+        captureWavError = wavError;
+      }
+      const hasRecording = capture?.heardVoice === true
+        && captureWavBytes?.byteLength > 44;
+      const ownsOutgoing = outgoing?.dataset?.voiceSpeculationId === speculation.id;
+      const ownsPendingReply = pendingReply?.dataset?.voiceSpeculationId === speculation.id;
+      if (hasRecording) {
+        if (ownsOutgoing) {
+          try {
+            hydrateOptimisticVoiceMessage(outgoing, captureWavBytes);
+          } catch (hydrateError) {
+            markVoiceLatencyIn(recording.trace, "voice_note_recording_hydration_failed", {
+              message: errorMessage(hydrateError),
+            });
+            outgoing.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+          }
+        }
+        if (ownsPendingReply) {
+          const card = pendingReply.querySelector(".message-card");
+          if (card) card.replaceChildren(unavailableVoiceMessage());
+          pendingReply.hidden = false;
+          pendingReply.classList.remove("voice-reply-pending");
+        }
+      } else {
+        if (ownsOutgoing) {
+          if (outgoing.dataset.objectUrl) URL.revokeObjectURL(outgoing.dataset.objectUrl);
+          outgoing.remove();
+        }
+        if (ownsPendingReply) pendingReply.remove();
+      }
+      if (liveVoiceTts === speculation.tts) {
+        liveVoiceTts = null;
+        if (voiceReplyConversation === speculation.conversation) {
+          voiceReplyConversation = null;
+        }
+      }
+      markVoiceLatencyIn(recording.trace, "voice_note_confirmation_failed", {
+        heard_voice: hasRecording,
+        message: errorMessage(error),
+        ...(captureWavError ? { recording_encode_error: errorMessage(captureWavError) } : {}),
+      });
+      throw error;
     }
-    return true;
   };
 
   const startVoiceSpeculation = async (recording, { prearm = false } = {}) => {
@@ -6541,20 +8199,53 @@
         || recording.speculationStarting || recording.sending
         || (recording.call && !voiceCallActive)) return;
     recording.speculationStarting = true;
-    markVoiceLatency("prefill_flush_started");
+    markVoiceLatencyIn(recording.trace, "prefill_flush_started");
     if (recording.native) {
       await recording.targetChain;
     } else {
       enqueueVoicePrefill(recording, new Float32Array(), true);
-      await recording.pushChain;
+      try {
+        // This is a snapshot of pushes already queued at the silence edge.
+        // A stalled IPC/ring producer must not strand the entire call.
+        await withDeadline(recording.pushChain, recording.call ? 720 : 1_200,
+          "voice_audio_prefill_drain_timeout: The microphone audio stopped reaching the model.",
+          "voice_audio_prefill_drain_timeout");
+      } catch (error) {
+        recording.speculationStarting = false;
+        if (recording.voiceActivity.voiced) {
+          markVoiceLatencyIn(recording.trace, "audio_prefill_drain_deferred", {
+            message: errorMessage(error), reason: "speech_resumed",
+          });
+          return;
+        }
+        if (voiceRecording === recording) {
+          recording.prefillFailed = true;
+          recording.prefillEpoch += 1;
+          markVoiceLatencyIn(recording.trace, "audio_prefill_drain_failed", {
+            message: errorMessage(error),
+            producer_pushes: recording.prefillPushes || 0,
+            producer_accepted_samples: recording.prefillAcceptedSamples || 0,
+          });
+          void recording.prefillSession.then((live) => live?.session
+            ? invoke("mom_llama_voice_audio_abort", { session: live.session })
+            : null).catch(() => {});
+        }
+        return;
+      }
     }
-    markVoiceLatency("prefill_flush_accepted", {
+    markVoiceLatencyIn(recording.trace, "prefill_flush_accepted", {
       producer: recording.native ? "native_ring" : "renderer_ipc",
       producer_pushes: recording.prefillPushes || 0,
       producer_ipc_ms: Math.round(recording.prefillIpcMs || 0),
       producer_max_ipc_ms: Math.round(recording.prefillMaxIpcMs || 0),
     });
     const live = await recording.prefillSession.catch(() => null);
+    if (!live?.session && voiceRecording === recording && !recording.prefillFailed) {
+      recording.prefillFailed = true;
+      markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed", {
+        message: "The live audio session was unavailable; the saved recording will carry this turn.",
+      });
+    }
     if (!live?.session || recording.prefillFailed || voiceRecording !== recording
         || (!prearm && recording.voiceActivity.voiced)
         || (recording.call && !voiceCallActive)) {
@@ -6586,6 +8277,9 @@
     speculation.generationReleased = new Promise((resolve) => {
       speculation.releaseGeneration = resolve;
     });
+    speculation.captureReady = new Promise((resolve) => {
+      speculation.resolveCapture = resolve;
+    });
     const tts = beginLiveVoiceTts({
       conversation: live.conversation,
       mode: recording.call ? "call" : "voice_note",
@@ -6604,16 +8298,17 @@
     if (recording.call) callReplyConversation = live.conversation;
     else voiceReplyConversation = live.conversation;
     activeDispatchConversation = live.conversation;
-    markVoiceLatency(prearm ? "speculation_prearmed" : "speculation_started", {
+    markVoiceLatencyIn(recording.trace, prearm ? "speculation_prearmed" : "speculation_started", {
       speculation: speculation.id,
       producer: recording.native ? "native_ring" : "renderer_ipc",
       producer_pushes: recording.prefillPushes || 0,
       producer_accepted_samples: recording.prefillAcceptedSamples || 0,
       producer_high_water_samples: recording.prefillHighWaterSamples || 0,
+      producer_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
       producer_ipc_ms: Math.round(recording.prefillIpcMs || 0),
       producer_max_ipc_ms: Math.round(recording.prefillMaxIpcMs || 0),
     });
-    if (!prearm) markVoiceLatency("generation_dispatched", {
+    if (!prearm) markVoiceLatencyIn(recording.trace, "generation_dispatched", {
       speculative: true,
       speculation: speculation.id,
     });
@@ -6629,11 +8324,11 @@
       });
     }
     try {
-      markVoiceLatency("speculation_dispatch_started", {
+      markVoiceLatencyIn(recording.trace, "speculation_dispatch_started", {
         speculation: speculation.id,
         producer: recording.native ? "native_ring" : "renderer_ipc",
       });
-      const generationTimeoutMs = recording.call ? 10_000 : 20_000;
+      const generationTimeoutMs = 30_000;
       const rendererFailsafeMs = generationTimeoutMs + 2_000;
       const waitForNativeSilence = Boolean(prearm && recording.native);
       const generation = invoke("mom_llama_voice_audio_speculate", {
@@ -6650,22 +8345,24 @@
       const response = await (waitForNativeSilence
         ? Promise.race([
           generation,
-          speculation.generationReleased.then(() => withDeadline(
+          speculation.generationReleased.then(() => withProgressDeadline(
             generation,
             rendererFailsafeMs,
+            () => tts.lastProgressAt,
             "voice_generation_timeout: The contact stopped making progress while preparing a reply.",
           )),
         ])
-        : withDeadline(
+        : withProgressDeadline(
           generation,
           rendererFailsafeMs,
+          () => tts.lastProgressAt,
           "voice_generation_timeout: The contact stopped making progress while preparing a reply.",
         ));
       if (recording.speculation !== speculation || speculation.aborting) return;
       if (response?.status === "blocked" || !response?.result) {
         throw new Error(response?.blocker?.message || "The speculative call reply failed.");
       }
-      markVoiceLatency("generation_finished", {
+      markVoiceLatencyIn(recording.trace, "generation_finished", {
         speculative: true,
         speculation: speculation.id,
         native_duration_ms: response.result.duration_ms,
@@ -6673,8 +8370,10 @@
         cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
-      indexVoiceTurn(live.conversation, response.result);
-      const synthesized = await tts.finish(response.result.assistant_text || tts.text);
+      const synthesized = await finishVoiceReplyAndIndexTurn(recording.call,
+        () => indexVoiceTurn(live.conversation, response.result, null,
+          speculation.captureReady, recording.trace),
+        () => tts.finish(response.result.assistant_text || tts.text));
       if (!synthesized) {
         throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
       }
@@ -6683,10 +8382,10 @@
       }
     } catch (error) {
       if (error?.code === "voice_generation_timeout") {
-        markVoiceLatency("generation_timeout", {
+        markVoiceLatencyIn(recording.trace, "generation_timeout", {
           speculation: speculation.id,
           phase: recording.call ? "call_turn" : "voice_note",
-          timeout_ms: recording.call ? 12_000 : 22_000,
+          timeout_ms: 32_000,
         });
       }
       if (speculation.confirmed && !speculation.aborting) {
@@ -6708,6 +8407,7 @@
         throw error;
       }
     } finally {
+      if (!speculation.confirmed) speculation.resolveCapture?.(null);
       // All speculative attempts for one call share a conversation. Do not
       // let a superseded attempt clear the routing markers published by its
       // replacement after a resumed-speech handoff.
@@ -6723,6 +8423,9 @@
         voiceReplyConversation = null;
       }
       if (activeVoiceSpeculation === speculation) activeVoiceSpeculation = null;
+      if (!recording.call && stillOwnsDispatch) {
+        void recoverPendingVoiceHistory().catch(() => {});
+      }
     }
   };
 
@@ -6751,15 +8454,17 @@
     // shutdown, encoding, and persistence continue after the recorder is gone.
     setVoiceRecordingVisible(false);
     const call = Boolean(voiceRecording?.call);
-    markVoiceLatency("capture_stopped");
-    const capture = await stopVoiceCapture();
+    const capture = await stopVoiceCapture({ flushPrefill: !expectedRecording.prefillFailed });
     if (!capture?.heardVoice) {
       report({ status: "blocked", blocker: { code: "voice_message_silent", message: "No speech was detected." } });
       if (voiceCallActive) await beginVoiceCapture({ call: true });
       return;
     }
     const form = document.getElementById("chat-form");
-    const live = await expectedRecording.prefillSession.catch(() => null);
+    // Once a failed or expired incremental attempt chose recorded-audio
+    // fallback, its session may still be starting. It cannot hold this turn.
+    const live = expectedRecording.prefillFailed
+      ? null : await expectedRecording.prefillSession.catch(() => null);
     const sourceConversation = call && voiceCallConversation
       ? voiceCallConversation
       : expectedRecording.sourceConversation;
@@ -6771,10 +8476,12 @@
         conversation,
         requestId: live.request_id,
         recording: sealedVoiceRecordingBytes(capture),
+        modelInput: sealedVoiceInferenceRecording(capture),
+        sourceCapture: capture,
       };
     } else {
       const wav = capture.wavBytes || encodePcmWav(capture.samples());
-      markVoiceLatency("fallback_capture_encoded", { wav_bytes: wav.byteLength });
+      markVoiceLatencyIn(expectedRecording.trace, "fallback_capture_encoded", { wav_bytes: wav.byteLength });
       // Preserve the attachment if incremental audio admission failed. This is
       // an explicit degraded path; the normal path persists it concurrently
       // inside voice_audio_finish.
@@ -6782,7 +8489,7 @@
         conversation,
         bytes: Array.from(wav),
       });
-      markVoiceLatency("fallback_import_finished");
+      markVoiceLatencyIn(expectedRecording.trace, "fallback_import_finished");
       report(imported);
       if (imported?.status === "blocked") {
         if (voiceCallActive) await beginVoiceCapture({ call: true });
@@ -6792,6 +8499,7 @@
       pendingVoiceFallbackAttachment = imported.result?.attachment?.id ? {
         conversation,
         attachment: imported.result.attachment.id,
+        sourceCapture: capture,
       } : null;
     }
     if (call) callReplyConversation = conversation;
@@ -6806,7 +8514,7 @@
       // affordance is never shown in a disabled, misleading state.
       const replayStarted = performance.now();
       const replayBytes = capture.wavBytes || encodePcmWav(capture.samples());
-      markVoiceLatency("local_replay_encoded", {
+      markVoiceLatencyIn(expectedRecording.trace, "local_replay_encoded", {
         duration_ms: Math.round((performance.now() - replayStarted) * 100) / 100,
         wav_bytes: replayBytes.byteLength,
       });
@@ -6823,7 +8531,7 @@
       conversation,
       mode: call ? "call" : "voice_note",
       requestId: live?.request_id || null,
-      allowRequestBinding: !live?.request_id,
+      clientRequest: live?.request_id ? null : speechOperationToken(),
       button: pendingButton,
       callEpoch: call ? voiceCallEpoch : null,
     });
@@ -6865,6 +8573,19 @@
     renderChatBusyState();
   };
 
+  // A canceled voice request can emit a late terminal or delta after its
+  // controller is gone. Retain its identity so that event can neither create
+  // an ordinary text bubble nor enter the next physical turn's latency trace.
+  const voiceStreamRequestIds = new Set();
+  const rememberVoiceStreamRequest = (requestId) => {
+    if (!requestId) return;
+    voiceStreamRequestIds.delete(requestId);
+    voiceStreamRequestIds.add(requestId);
+    if (voiceStreamRequestIds.size > 512) {
+      voiceStreamRequestIds.delete(voiceStreamRequestIds.values().next().value);
+    }
+  };
+
   const chatRequestLease = (payload) => payload.request_id
     ? `chat-request:${payload.request_id}`
     : null;
@@ -6878,9 +8599,14 @@
     // even when that stale cleanup has already run.
     const sameLiveConversation = liveVoiceTts?.conversation === payload.conversation_id;
     const ownsLiveVoice = sameLiveConversation
-      && liveVoiceTts.acceptsRequest(payload.request_id, payload.event);
-    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : voiceLatencyTrace;
+      && liveVoiceTts.acceptsRequest(payload.request_id, payload.event, payload.client_request);
+    const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null;
     if (eventTrace) {
+      markVoiceLatencyIn(eventTrace, "chat_stream_event_received", {
+        event: payload.event,
+        request_id: payload.request_id,
+        conversation_id: payload.conversation_id,
+      });
       markVoiceLatencyIn(eventTrace, "chat_stream_route_decision", {
         event: payload.event,
         request_id: payload.request_id,
@@ -6893,7 +8619,7 @@
     }
     const voiceReply = ownsLiveVoice && liveVoiceTts.mode === "voice_note";
     const callReply = ownsLiveVoice && liveVoiceTts.mode === "call";
-    if (sameLiveConversation && !ownsLiveVoice) {
+    if ((sameLiveConversation || voiceStreamRequestIds.has(payload.request_id)) && !ownsLiveVoice) {
       if (["completed", "cancelled", "failed"].includes(payload.event)) {
         releaseChatBusy(chatRequestLease(payload));
       }
@@ -6916,8 +8642,8 @@
       const content = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-content`);
       appendLiveDelta(content, payload.delta);
     }
-    if (payload.event === "delta" && (voiceReply || callReply) && !eventTrace?.firstDeltaSeen) {
-      if (eventTrace) eventTrace.firstDeltaSeen = true;
+    if (payload.event === "delta" && (voiceReply || callReply) && !liveVoiceTts.firstDeltaSeen) {
+      liveVoiceTts.firstDeltaSeen = true;
       markVoiceLatencyIn(eventTrace, "first_content_delta", { observed_at_unix_us: payload.emitted_at_unix_us });
       markVoiceLatencyIn(eventTrace, "first_content_delta_received");
     }
@@ -6987,14 +8713,10 @@
       ? envelope.event
       : (envelope.request_id && envelope.conversation_id ? envelope : null);
     if (chatEvent) {
-      if (voiceLatencyTrace) {
-        markVoiceLatency("chat_stream_event_received", {
-          event: chatEvent.event,
-          request_id: chatEvent.request_id,
-          conversation_id: chatEvent.conversation_id,
-        });
-      }
-      onChatEvent({ payload: chatEvent });
+      const clientRequest = envelope.client_request ?? chatEvent.client_request;
+      onChatEvent({ payload: clientRequest === undefined
+        ? chatEvent
+        : { ...chatEvent, client_request: clientRequest } });
       return;
     }
     const payload = envelope.event || envelope;
@@ -7527,7 +9249,10 @@
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
     "voice-message-start": async () => beginVoiceCapture(),
-    "voice-message-cancel": async () => { await stopVoiceCapture({ discard: true }); focusComposer(); },
+    "voice-message-cancel": async () => {
+      await stopVoiceCapture({ discard: true, reason: "voice_note_cancelled" });
+      focusComposer();
+    },
     "voice-message-send": async () => sendVoiceCapture(),
     "voice-message-pending-play": async (button) => {
       const preview = button.closest(".voice-message-bubble");
@@ -7585,7 +9310,9 @@
     "message-read-aloud": async (button) => {
       const personaVoice = button.dataset.personaVoice === "true";
       if (activeSpeechPlayback?.button === button) {
-        if (activeSpeechPlayback.controller?.ready && !activeSpeechPlayback.controller.playing) {
+        if (activeSpeechPlayback.controller?.ready
+            && !activeSpeechPlayback.controller.playing
+            && !activeSpeechPlayback.controller.starting) {
           commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
           button.title = "Stop reading";
           button.setAttribute("aria-pressed", "true");
@@ -8469,7 +10196,9 @@
         const sourceConversation = selectedConversation();
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
+        let releaseHistoryRecovery = null;
         try {
+          releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("chat_send");
           if (exactRecipient) {
             await updateRecipients((ids) => ids.includes(exactRecipient.dataset.recipient)
               ? ids
@@ -8531,16 +10260,22 @@
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
           let voiceTranscriptAttachment = null;
+          let liveVoice = null;
+          let fallbackVoice = null;
+          let voiceDispatchTrace = voiceDispatch
+            ? (voiceTtsOwner?.trace || voiceLatencyTrace) : null;
           try {
-            if (voiceDispatch) markVoiceLatency("generation_dispatched");
-            const liveVoice = voiceDispatch
+            liveVoice = voiceDispatch
               && pendingVoiceAudioSession?.conversation === conversation
               ? pendingVoiceAudioSession
               : null;
-            const fallbackVoice = voiceDispatch
+            fallbackVoice = voiceDispatch
               && pendingVoiceFallbackAttachment?.conversation === conversation
               ? pendingVoiceFallbackAttachment
               : null;
+            voiceDispatchTrace = (liveVoice || fallbackVoice)?.sourceCapture?.trace
+              || voiceDispatchTrace;
+            if (voiceDispatch) markVoiceLatencyIn(voiceDispatchTrace, "generation_dispatched");
             if (liveVoice) pendingVoiceAudioSession = null;
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
@@ -8548,6 +10283,14 @@
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
                 recording: liveVoice.recording,
+                ...(liveVoice.modelInput ? {
+                  modelInputRecording: liveVoice.modelInput.recording,
+                  sourceSampleCount: liveVoice.modelInput.sourceSampleCount,
+                  acceptedSampleCount: liveVoice.modelInput.acceptedSampleCount,
+                  ...(liveVoice.modelInput.sourceRanges
+                    ? { sourceRanges: liveVoice.modelInput.sourceRanges }
+                    : { sourceStartSample: liveVoice.modelInput.sourceStartSample }),
+                } : {}),
               });
               result = finished?.result ? {
                 ...finished,
@@ -8561,11 +10304,14 @@
               if (fallbackVoice) {
                 await persistDraftNow(message, [fallbackVoice.attachment], conversation);
               }
-              result = await invoke("mom_llama_chat_dispatch", { conversation, message });
+              result = await invoke("mom_llama_chat_dispatch", {
+                conversation, message,
+                ...(voiceTtsOwner?.clientRequest ? { clientRequest: voiceTtsOwner.clientRequest } : {}),
+              });
             }
             if (voiceDispatch) {
               const output = result?.result?.output;
-              markVoiceLatency("generation_finished", {
+              markVoiceLatencyIn(voiceDispatchTrace, "generation_finished", {
                 native_duration_ms: output?.duration_ms,
                 first_token_ms: output?.first_token_ms,
                 cache_metrics: output?.cache_metrics || null,
@@ -8612,13 +10358,8 @@
             // the attachment fallback can commit valid assistant text while
             // that presentation-only tag is unavailable at this boundary.
             const output = result?.result?.output || null;
-            if (result?.status !== "blocked" && result?.result?.kind === "direct") {
-              // Backfill this exact turn after commit. The next Gemma prompt
-              // may proceed with its recorded audio if Parakeet is still busy.
-              indexVoiceTurn(conversation, output, voiceTranscriptAttachment);
-            }
             if (result?.status !== "blocked" && output?.assistant_text) {
-              markVoiceLatency("tts_text_admitted", {
+              markVoiceLatencyIn(voiceDispatchTrace, "tts_text_admitted", {
                 characters: output.assistant_text.length,
                 owner_bound: Boolean(voiceTtsOwner),
               });
@@ -8628,7 +10369,18 @@
               // A successful model result transfers this turn to the speech
               // drain. Keep that exact owner alive until every text segment
               // has either produced PCM or failed explicitly.
-              const synthesized = await voiceTtsOwner.finish(output.assistant_text);
+              const synthesized = await finishVoiceReplyAndIndexTurn(
+                callReplyConversation === conversation,
+                () => {
+                  if (result?.result?.kind === "direct") {
+                    // Keep call transcripts queued before the next capture;
+                    // voice-note backfill waits until durable speech succeeds.
+                    indexVoiceTurn(conversation, output, voiceTranscriptAttachment,
+                      (liveVoice || fallbackVoice)?.sourceCapture || null, voiceDispatchTrace);
+                  }
+                },
+                () => voiceTtsOwner.finish(output.assistant_text),
+              );
               if (!synthesized) {
                 throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
               }
@@ -8674,6 +10426,7 @@
           if (callReplyConversation === conversation) callReplyConversation = null;
           if (pendingVoiceTtsOwner?.conversation === conversation) pendingVoiceTtsOwner = null;
           releaseChatBusy(dispatchLease);
+          releaseHistoryRecovery?.();
         }
       }
       if (form.id === "conversation-rename-form") {
@@ -9328,6 +11081,8 @@
             audio_projector_warm_us: Number(response?.result?.audio_projector_warm_us || 0),
             persona_prefixes_ready: Number(response?.result?.persona_prefixes_ready || 0),
             persona_prefixes_reused: Number(response?.result?.persona_prefixes_reused || 0),
+            persona_prefix_warm_us: Number(response?.result?.persona_prefix_warm_us || 0),
+            persona_prefix_warm_status: response?.result?.persona_prefix_warm_status || "unknown",
             settings_us: Number(response?.result?.settings_us || 0),
             model_acquire_us: Number(response?.result?.model_acquire_us || 0),
             model_load: response?.result?.model_load || null,
@@ -9351,6 +11106,12 @@
 
         sizeComposer();
         await listen();
+        // Recovery is opportunistic and has no place on the call admission
+        // critical path. The installed CPU listener can work while Gemma is
+        // resident; a failed turn keeps its exact WAV for a later retry.
+        void runtimeWarmPromise.then(() => recoverPendingVoiceHistory()).catch((error) => {
+          console.warn("Voice history recovery unavailable", errorMessage(error));
+        });
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");

@@ -104,7 +104,10 @@ pub(crate) fn prepare_scoped_chat_attachments(
     let mut sources_by_message_id = HashMap::new();
     let mut media_by_message_id = HashMap::new();
     let mut media = Vec::new();
-    let mut emitted_media = llama_native_types::media_identity::MediaIdentityLedger::default();
+    // This ledger spans committed history; current/staged uploads keep their
+    // separate ordinary request limits in the attachment budget.
+    let mut emitted_media =
+        llama_native_types::media_identity::MediaIdentityLedger::for_historical_audio();
     let mut budget = ActiveAttachmentBudget::default();
     let mut resolution = AttachmentResolution {
         store: &store,
@@ -139,6 +142,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
         }
         let resolved = match resolve_attachment_set(
             conversation_id,
+            &format!("history:{}", message.id),
             &context_ids,
             AttachmentState::Committed,
             &records,
@@ -155,8 +159,16 @@ pub(crate) fn prepare_scoped_chat_attachments(
         sources_by_message_id.insert(message.id.clone(), resolved.sources);
         media.extend(resolved.context.media);
     }
+    let current_occurrence_scope = match current_selection {
+        CurrentAttachmentSelection::ExistingUser(id) => format!("current:{id}"),
+        CurrentAttachmentSelection::Draft | CurrentAttachmentSelection::DraftTextOnly => {
+            format!("draft:{conversation_id}")
+        }
+        CurrentAttachmentSelection::HistoryOnly => format!("history-current:{conversation_id}"),
+    };
     let current = match resolve_attachment_set(
         conversation_id,
+        &current_occurrence_scope,
         &current_ids,
         if matches!(
             current_selection,

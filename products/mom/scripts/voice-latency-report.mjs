@@ -81,6 +81,23 @@ export function latencyRow(snapshot) {
     "playback_started", "generation_finished", "failed", "durable_voice_audio_failed",
     "native_capture_failed", "generation_timeout",
   ].includes(entry.stage))?.stage ?? stages.at(-1)?.stage ?? null;
+  const renderer = lastStage("playback_renderer");
+  const playbackRendererReason = typeof summary.playback_renderer_reason === "string"
+    ? summary.playback_renderer_reason
+    : typeof renderer?.reason === "string" ? renderer.reason : null;
+  const bargeDetected = stages.find((entry) => entry.stage === "barge_in_detected"
+    && entry.reply_trace_id === trace.id);
+  const explicitBargeIn = Boolean(bargeDetected && stages.some((entry) => (
+    entry.stage === "barge_in_playback_stopped"
+      && entry.reply_trace_id === trace.id
+      && entry.reply_request_id === bargeDetected.reply_request_id
+  )));
+  const playbackCompletion = playbackRendererReason === "ended"
+    ? "natural"
+    : playbackRendererReason === "stopped" ? "stopped" : "unknown";
+  const playbackInterrupted = playbackCompletion === "stopped"
+    ? (explicitBargeIn ? true : null)
+    : playbackCompletion === "natural" ? false : null;
   const pick = (name) => number(summary[name]);
   const silenceStage = lastStage("silence_onset");
   const persistedSilenceDecisionMs = pick("silence_decision_delay_ms");
@@ -102,7 +119,12 @@ export function latencyRow(snapshot) {
   const handoffStage = lastStage("speculation_handoff_ready");
   const prefillFailure = [...stages].reverse().find(({ stage }) => (
     stage === "audio_prefill_begin_failed" || stage === "audio_prefill_push_failed"
+      || stage === "audio_prefill_wait_expired" || stage === "audio_prefill_drain_failed"
+      || stage === "audio_prefill_producer_overflow"
   ));
+  const prefillWaitExpired = lastStage("audio_prefill_wait_expired");
+  const prefillDrainFailed = lastStage("audio_prefill_drain_failed");
+  const prefillProducerOverflow = lastStage("audio_prefill_producer_overflow");
   const generationFinished = Boolean(generationStage);
   const firstPcmObserved = stages.some(({ stage }) => stage === "tts_first_pcm");
   const sumStageMetric = (name) => {
@@ -127,8 +149,15 @@ export function latencyRow(snapshot) {
     ?? (number(stage.total_ms) !== null && number(stage.output_audio_ms) > 0
       ? number(stage.total_ms) / number(stage.output_audio_ms) : null))
     .filter((value) => value !== null);
+  const stageDelta = (from, to) => nativeDelta(
+    number(lastStage(from)?.elapsed_ms), number(lastStage(to)?.elapsed_ms),
+  );
+  const transcriptFinished = number(lastStage("voice_transcript_finished")?.elapsed_ms);
+  const nextPrefillStarted = number(lastStage("next_turn_prefill_started")?.elapsed_ms);
   return {
     ...scalarSummary,
+    trace_incomplete: summary.incomplete === true
+      || Object.values(trace.compaction ?? {}).some((count) => Number(count) > 0),
     ...(foreignGreetingOnly ? {
       generation_prompt_tokens: null,
       generation_completion_tokens: null,
@@ -143,8 +172,19 @@ export function latencyRow(snapshot) {
     checkpoint: snapshot.checkpoint,
     stage_count: stages.length,
     terminal_stage: terminal,
+    playback_renderer_reason: playbackRendererReason,
+    playback_completion: playbackCompletion,
+    playback_interrupted: playbackInterrupted,
+    playback_stop_cause: playbackInterrupted === true ? "barge_in"
+      : playbackCompletion === "stopped" ? "unknown" : null,
     prefill_failure_stage: prefillFailure?.stage ?? null,
     prefill_failure_message: prefillFailure?.message ?? null,
+    prefill_wait_expired_ms: number(prefillWaitExpired?.silence_ms),
+    prefill_wait_expired_on_retry: prefillWaitExpired?.retry ?? null,
+    prefill_drain_to_failure_ms: prefillDrainFailed
+      ? stageDelta("prefill_flush_started", "audio_prefill_drain_failed") : null,
+    prefill_producer_overflow_samples: number(prefillProducerOverflow?.queued_samples),
+    prefill_producer_limit_samples: number(prefillProducerOverflow?.limit_samples),
     generation_finished_without_pcm: generationFinished && !firstPcmObserved,
     runtime_warm_total_ms: pick("runtime_warm_total_ms"),
     runtime_warm_settings_ms: pick("runtime_warm_settings_ms"),
@@ -313,6 +353,14 @@ export function latencyRow(snapshot) {
     next_prefill_prepare_ms: pick("next_prefill_prepare_ms"),
     next_prefill_buffered_ms: pick("next_prefill_buffered_runway_ms"),
     next_prefill_overlapped_tts: summary.next_prefill_overlapped_active_tts ?? null,
+    capture_stop_to_transcript_verified_ms:
+      stageDelta("capture_stopped", "voice_transcript_live_verified"),
+    capture_stop_to_transcript_committed_ms:
+      stageDelta("capture_stopped", "voice_transcript_finished"),
+    transcript_ready_before_next_prefill: transcriptFinished !== null && nextPrefillStarted !== null
+      ? transcriptFinished <= nextPrefillStarted : null,
+    transcript_to_next_prefill_ms: transcriptFinished !== null && nextPrefillStarted !== null
+      ? Math.round((nextPrefillStarted - transcriptFinished) * 100) / 100 : null,
     playback_underruns: pick("playback_underrun_occurrences"),
     path: snapshot.path,
   };
@@ -334,11 +382,15 @@ export function latencyDiagnosis(row) {
     ? Math.round((row.silence_to_playback_ms - accountedMs) * 100) / 100
     : null;
   const findings = [];
+  if (row.trace_incomplete) findings.push("trace_incomplete");
   if (row.voice_session_model_resident_hit === false) findings.push("model_not_resident");
   if (row.runtime_warm_audio_projector_ready === false) {
     findings.push("audio_projector_not_warmed");
   }
   if (row.prefill_failure_stage) findings.push("audio_prefill_failed");
+  if (row.prefill_wait_expired_ms != null) findings.push("audio_prefill_wait_expired");
+  if (row.prefill_drain_to_failure_ms != null) findings.push("audio_prefill_drain_stalled");
+  if (row.prefill_producer_overflow_samples != null) findings.push("audio_prefill_producer_overflow");
   if (row.generation_finished_without_pcm) findings.push("response_without_pcm");
   if (row.terminal_stage === "generation_timeout") {
     findings.push("generation_timeout");
@@ -375,6 +427,8 @@ export function latencyDiagnosis(row) {
     findings.push("continuous_prefill_backlog");
   }
   if ((row.playback_underruns ?? 0) > 0) findings.push("playback_underrun");
+  if (row.playback_completion === "stopped") findings.push("playback_stopped");
+  if (row.playback_interrupted === true) findings.push("playback_interrupted");
   if (row.tts_aggregate_rtf !== null && row.tts_aggregate_rtf >= 1) {
     findings.push("tts_slower_than_realtime");
   }
@@ -413,6 +467,7 @@ const aggregateMetricNames = [
   "call_request_to_playback_ms",
   "runtime_warm_total_ms",
   "runtime_warm_audio_projector_ms",
+  "runtime_warm_persona_prefix_ms",
   "capture_to_model_target_ms",
   "audio_backlog_ms",
   "projector_realtime_factor",
@@ -423,7 +478,13 @@ const aggregateMetricNames = [
   "speculation_handoff_replay_ms",
   "voice_cancel_to_observed_ms",
   "silence_event_delivery_ms",
+  "capture_processing_cpu_ms",
   "capture_processing_max_ms",
+  "capture_detector_cpu_ms",
+  "capture_resample_cpu_ms",
+  "capture_prefill_ipc_queue_high_water_ms",
+  "capture_prefill_ipc_queued_at_stop_ms",
+  "capture_prefill_suppressed_silence_ms",
   "capture_queue_delay_max_ms",
   "capture_prefill_push_max_ms",
   "capture_vad_latched_ms",
@@ -474,9 +535,22 @@ export function latencyAggregate(rows) {
   const findings = {};
   for (const row of rows) {
     const mode = row.mode ?? "unknown";
-    const entry = modes[mode] ??= { traces: 0, playback_started: 0, subsecond: 0 };
+    const entry = modes[mode] ??= {
+      traces: 0,
+      playback_started: 0,
+      playback_natural_completion: 0,
+      playback_stopped: 0,
+      playback_completion_unknown: 0,
+      playback_interrupted: 0,
+      subsecond: 0,
+    };
     entry.traces += 1;
     entry.playback_started += Number(row.terminal_stage === "playback_started");
+    const completion = row.playback_completion ?? "unknown";
+    entry.playback_natural_completion += Number(completion === "natural");
+    entry.playback_stopped += Number(completion === "stopped");
+    entry.playback_completion_unknown += Number(completion === "unknown");
+    entry.playback_interrupted += Number(row.playback_interrupted === true);
     entry.subsecond += Number(row.subsecond === true);
     for (const finding of row.findings ?? []) findings[finding] = (findings[finding] ?? 0) + 1;
   }

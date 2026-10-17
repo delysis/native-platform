@@ -65,16 +65,166 @@ impl fmt::Display for ModelArtifactError {
 
 impl std::error::Error for ModelArtifactError {}
 
+/// A manifest-verified model directory paired with the filesystem identity
+/// observed while its bytes were checked. The identity lets the loader prove
+/// that the exact admitted paths are still present without re-reading the
+/// 480 MB bundle immediately before and after ONNX initialization.
+pub(crate) struct PreparedModelDir {
+    path: PathBuf,
+    manifest: ModelManifest,
+    shared: bool,
+    identity: Option<ModelDirectoryIdentity>,
+}
+
+impl PreparedModelDir {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn validate_unchanged(&self) -> Result<(), ModelArtifactError> {
+        match &self.identity {
+            Some(identity) => identity.validate(&self.path, &self.manifest, self.shared),
+            // Platforms without a strong file identity retain content
+            // verification against the manifest captured at admission.
+            None if self.shared => verify_shared_model_dir(&self.path, &self.manifest),
+            None => verify_managed_model_dir(&self.path, &self.manifest),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ModelDirectoryIdentity {
+    directory_path: PathBuf,
+    directory: FilesystemIdentity,
+    files: Vec<(String, PathBuf, FilesystemIdentity)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FilesystemIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    length: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    links: u64,
+}
+
+impl FilesystemIdentity {
+    #[cfg(unix)]
+    fn from_metadata_strong(metadata: &fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata_strong(_metadata: &fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
+impl ModelDirectoryIdentity {
+    fn validate(
+        &self,
+        path: &Path,
+        manifest: &ModelManifest,
+        shared: bool,
+    ) -> Result<(), ModelArtifactError> {
+        let directory_path = fs::canonicalize(path).map_err(|error| {
+            artifact_error(format!(
+                "Could not resolve Parakeet model directory: {error}"
+            ))
+        })?;
+        let directory_metadata = fs::symlink_metadata(path).map_err(|error| {
+            artifact_error(format!(
+                "Could not inspect Parakeet model directory: {error}"
+            ))
+        })?;
+        if directory_path != self.directory_path
+            || !directory_metadata.is_dir()
+            || FilesystemIdentity::from_metadata_strong(&directory_metadata).as_ref()
+                != Some(&self.directory)
+        {
+            return Err(artifact_error(
+                "Parakeet model directory changed after verification",
+            ));
+        }
+
+        if self.files.len() != manifest.files.len() {
+            return Err(artifact_error(
+                "Parakeet verified file identity set is incomplete",
+            ));
+        }
+        for ((expected_name, expected_path, expected_identity), expected) in
+            self.files.iter().zip(&manifest.files)
+        {
+            if expected_name != &expected.name {
+                return Err(artifact_error("Parakeet verified file order changed"));
+            }
+            let artifact_path = path.join(&expected.name);
+            let target_path = fs::canonicalize(&artifact_path).map_err(|error| {
+                artifact_error(format!("Could not resolve Parakeet artifact path: {error}"))
+            })?;
+            let path_metadata = if shared {
+                fs::metadata(&artifact_path)
+            } else {
+                fs::symlink_metadata(&artifact_path)
+            }
+            .map_err(|error| {
+                artifact_error(format!("Could not inspect Parakeet artifact: {error}"))
+            })?;
+            if target_path != *expected_path
+                || !path_metadata.is_file()
+                || path_metadata.len() != expected.bytes
+                || (!shared && managed_file_has_peer_links(&path_metadata))
+                || FilesystemIdentity::from_metadata_strong(&path_metadata).as_ref()
+                    != Some(expected_identity)
+            {
+                return Err(artifact_error(format!(
+                    "Parakeet model artifact {} changed after verification",
+                    expected.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn prepare_model_dir(
     explicit_candidate: Option<&Path>,
     explicit_managed_root: Option<&Path>,
-) -> Result<Option<PathBuf>, ModelArtifactError> {
+) -> Result<Option<PreparedModelDir>, ModelArtifactError> {
     let manifest = production_manifest()?;
     if let Some(cached) = discover_exact_hugging_face_candidate(&manifest)
         .filter(|cached| source_candidate(explicit_candidate, &manifest).as_ref() == Some(cached))
     {
-        verify_shared_model_dir(&cached, &manifest)?;
-        return Ok(Some(cached));
+        let identity = verify_shared_model_dir_with_identity(&cached, &manifest)?;
+        return Ok(Some(PreparedModelDir {
+            path: cached,
+            manifest,
+            shared: true,
+            identity,
+        }));
     }
     let managed_root = managed_model_root(explicit_managed_root).ok_or_else(|| {
         artifact_error(
@@ -84,22 +234,37 @@ pub(crate) fn prepare_model_dir(
     })?;
     let managed_dir = managed_model_dir(&managed_root, &manifest);
     if managed_dir.exists() {
-        confirm_managed_publication(&managed_dir, &manifest)?;
-        return Ok(Some(managed_dir));
+        let identity = confirm_managed_publication_with_identity(&managed_dir, &manifest)?;
+        return Ok(Some(PreparedModelDir {
+            path: managed_dir,
+            manifest,
+            shared: false,
+            identity,
+        }));
     }
 
     let candidate = source_candidate(explicit_candidate, &manifest);
     let Some(candidate) = candidate else {
         return Ok(None);
     };
-    copy_verified_candidate(&candidate, &managed_root, &manifest).map(Some)
+    copy_verified_candidate_with_identity(&candidate, &managed_root, &manifest).map(
+        |(path, identity)| {
+            Some(PreparedModelDir {
+                path,
+                manifest,
+                shared: false,
+                identity,
+            })
+        },
+    )
 }
 
 /// Cheap startup-only presence and shape probe.
 ///
 /// This deliberately reads metadata only. It cannot confer model-byte
-/// authority: first use still runs the full hash/load/hash admission in
-/// [`prepare_model_dir`] and [`verify_production_model_dir`].
+/// authority: first use still runs a full hash during [`prepare_model_dir`],
+/// then checks the bound file identities around model initialization. Platforms
+/// without strong identities retain content verification at both boundaries.
 pub(crate) fn probe_model_source(
     explicit_candidate: Option<&Path>,
     explicit_managed_root: Option<&Path>,
@@ -181,17 +346,11 @@ fn probe_model_dir_shape(
     Ok(())
 }
 
-pub(crate) fn verify_production_model_dir(path: &Path) -> Result<(), ModelArtifactError> {
-    let manifest = production_manifest()?;
-    if discover_exact_hugging_face_candidate(&manifest).is_some_and(|cached| cached == path) {
-        verify_shared_model_dir(path, &manifest)
-    } else {
-        verify_managed_model_dir(path, &manifest)
-    }
-}
-
 pub(crate) fn discover_default_model_dir() -> Option<PathBuf> {
-    prepare_model_dir(None, None).ok().flatten()
+    prepare_model_dir(None, None)
+        .ok()
+        .flatten()
+        .map(|prepared| prepared.path)
 }
 
 fn production_manifest() -> Result<ModelManifest, ModelArtifactError> {
@@ -305,11 +464,20 @@ fn exact_hugging_face_candidate_in_root(root: &Path, manifest: &ModelManifest) -
     candidate.is_dir().then_some(candidate)
 }
 
+#[cfg(test)]
 fn copy_verified_candidate(
     candidate: &Path,
     managed_root: &Path,
     manifest: &ModelManifest,
 ) -> Result<PathBuf, ModelArtifactError> {
+    copy_verified_candidate_with_identity(candidate, managed_root, manifest).map(|(path, _)| path)
+}
+
+fn copy_verified_candidate_with_identity(
+    candidate: &Path,
+    managed_root: &Path,
+    manifest: &ModelManifest,
+) -> Result<(PathBuf, Option<ModelDirectoryIdentity>), ModelArtifactError> {
     if !candidate.is_dir() {
         return Err(artifact_error(format!(
             "Parakeet model candidate is not a directory: {}",
@@ -327,8 +495,8 @@ fn copy_verified_candidate(
 
     let final_dir = managed_model_dir(managed_root, manifest);
     if final_dir.exists() {
-        confirm_managed_publication(&final_dir, manifest)?;
-        return Ok(final_dir);
+        let identity = confirm_managed_publication_with_identity(&final_dir, manifest)?;
+        return Ok((final_dir, identity));
     }
 
     let nonce = NEXT_STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -346,8 +514,10 @@ fn copy_verified_candidate(
     })?;
     set_private_directory(&staging)?;
 
-    let copied = copy_manifest_files(candidate, &staging, manifest)
-        .and_then(|()| verify_model_dir(&staging, manifest));
+    // `copy_manifest_files` hashes the exact source bytes as they are written.
+    // The final published tree is fully verified below; a separate full scan
+    // of the private staging tree would repeat that 480 MB read.
+    let copied = copy_manifest_files(candidate, &staging, manifest);
     if let Err(error) = copied {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
@@ -382,8 +552,8 @@ fn copy_verified_candidate(
                     ),
                 }
             })?;
-            confirm_managed_publication(&final_dir, manifest)?;
-            return Ok(final_dir);
+            let identity = confirm_managed_publication_with_identity(&final_dir, manifest)?;
+            return Ok((final_dir, identity));
         }
         Err(error) => {
             let _ = make_model_tree_writable(&staging, manifest);
@@ -393,27 +563,31 @@ fn copy_verified_candidate(
             )));
         }
     }
-    confirm_managed_publication(&final_dir, manifest)?;
-    Ok(final_dir)
+    let identity = confirm_managed_publication_with_identity(&final_dir, manifest)?;
+    Ok((final_dir, identity))
 }
 
 // Reused on initial publication and every managed-target retry: an earlier
 // parent-sync failure cannot turn into success just because the name exists.
-fn confirm_managed_publication(
+fn confirm_managed_publication_with_identity(
     final_dir: &Path,
     manifest: &ModelManifest,
-) -> Result<(), ModelArtifactError> {
-    verify_managed_model_dir(final_dir, manifest)
-        .and_then(|()| {
-            let parent = final_dir.parent().ok_or_else(|| {
-                artifact_error("Parakeet managed model publication has no parent directory")
-            })?;
-            sync_directory(parent)
-        })
-        .map_err(|error| ModelArtifactError::PublicationUnconfirmed {
-            destination: final_dir.to_path_buf(),
-            detail: error.to_string(),
-        })
+) -> Result<Option<ModelDirectoryIdentity>, ModelArtifactError> {
+    let identity =
+        verify_managed_model_dir_with_identity(final_dir, manifest).map_err(|error| {
+            ModelArtifactError::PublicationUnconfirmed {
+                destination: final_dir.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })?;
+    let parent = final_dir.parent().ok_or_else(|| {
+        artifact_error("Parakeet managed model publication has no parent directory")
+    })?;
+    sync_directory(parent).map_err(|error| ModelArtifactError::PublicationUnconfirmed {
+        destination: final_dir.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    Ok(identity)
 }
 
 fn copy_manifest_files(
@@ -515,10 +689,36 @@ fn copy_manifest_files(
 }
 
 fn verify_model_dir(path: &Path, manifest: &ModelManifest) -> Result<(), ModelArtifactError> {
+    verify_model_bytes(path, manifest, false).map(|_| ())
+}
+
+fn verify_model_dir_with_identity(
+    path: &Path,
+    manifest: &ModelManifest,
+) -> Result<Option<ModelDirectoryIdentity>, ModelArtifactError> {
     verify_model_bytes(path, manifest, false)
 }
 
 fn verify_shared_model_dir(
+    path: &Path,
+    manifest: &ModelManifest,
+) -> Result<(), ModelArtifactError> {
+    verify_shared_model_dir_with_identity(path, manifest).map(|_| ())
+}
+
+fn verify_shared_model_dir_with_identity(
+    path: &Path,
+    manifest: &ModelManifest,
+) -> Result<Option<ModelDirectoryIdentity>, ModelArtifactError> {
+    validate_shared_model_paths(path, manifest)?;
+    let identity = verify_model_bytes(path, manifest, true)?;
+    // Recheck the locator class after the byte scan so a concurrent snapshot
+    // alias swap cannot turn an external path into a verified shared source.
+    validate_shared_model_paths(path, manifest)?;
+    Ok(identity)
+}
+
+fn validate_shared_model_paths(
     path: &Path,
     manifest: &ModelManifest,
 ) -> Result<(), ModelArtifactError> {
@@ -561,14 +761,14 @@ fn verify_shared_model_dir(
             ));
         }
     }
-    verify_model_bytes(path, manifest, true)
+    Ok(())
 }
 
 fn verify_model_bytes(
     path: &Path,
     manifest: &ModelManifest,
     shared: bool,
-) -> Result<(), ModelArtifactError> {
+) -> Result<Option<ModelDirectoryIdentity>, ModelArtifactError> {
     let directory_metadata = fs::symlink_metadata(path).map_err(|error| {
         artifact_error(format!(
             "Could not inspect Parakeet managed model directory {}: {error}",
@@ -581,6 +781,13 @@ fn verify_model_bytes(
             path.display()
         )));
     }
+    let directory_path = fs::canonicalize(path).map_err(|error| {
+        artifact_error(format!(
+            "Could not resolve Parakeet model directory: {error}"
+        ))
+    })?;
+    let directory_identity_before = FilesystemIdentity::from_metadata_strong(&directory_metadata);
+    let mut file_identities = Vec::with_capacity(manifest.files.len());
     let mut combined = Sha256::new();
     let mut combined_bytes = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
@@ -618,6 +825,10 @@ fn verify_model_bytes(
                 expected.name
             )));
         }
+        let target_path_before = fs::canonicalize(&artifact_path).map_err(|error| {
+            artifact_error(format!("Could not resolve Parakeet artifact path: {error}"))
+        })?;
+        let identity_before = FilesystemIdentity::from_metadata_strong(&metadata);
         let mut individual = Sha256::new();
         let mut file_bytes = 0_u64;
         loop {
@@ -653,6 +864,35 @@ fn verify_model_bytes(
                 expected.name
             )));
         }
+        let metadata_after = artifact.metadata().map_err(|error| {
+            artifact_error(format!(
+                "Could not reinspect Parakeet model artifact: {error}"
+            ))
+        })?;
+        let path_metadata_after = fs::metadata(&artifact_path).map_err(|error| {
+            artifact_error(format!(
+                "Could not reinspect Parakeet artifact path: {error}"
+            ))
+        })?;
+        let target_path_after = fs::canonicalize(&artifact_path).map_err(|error| {
+            artifact_error(format!(
+                "Could not re-resolve Parakeet artifact path: {error}"
+            ))
+        })?;
+        if target_path_before != target_path_after
+            || identity_before.as_ref()
+                != FilesystemIdentity::from_metadata_strong(&metadata_after).as_ref()
+            || identity_before.as_ref()
+                != FilesystemIdentity::from_metadata_strong(&path_metadata_after).as_ref()
+        {
+            return Err(artifact_error(format!(
+                "Parakeet model artifact {} changed while being verified",
+                expected.name
+            )));
+        }
+        if let Some(identity) = identity_before {
+            file_identities.push((expected.name.clone(), target_path_before, identity));
+        }
     }
     if combined_bytes != manifest.combined_bytes || digest_hex(combined) != manifest.combined_sha256
     {
@@ -660,7 +900,36 @@ fn verify_model_bytes(
             "Parakeet model bundle failed exact combined length/SHA-256 verification",
         ));
     }
-    Ok(())
+    let directory_metadata_after = fs::symlink_metadata(path).map_err(|error| {
+        artifact_error(format!(
+            "Could not reinspect Parakeet model directory: {error}"
+        ))
+    })?;
+    let directory_path_after = fs::canonicalize(path).map_err(|error| {
+        artifact_error(format!(
+            "Could not re-resolve Parakeet model directory: {error}"
+        ))
+    })?;
+    let directory_identity_after =
+        FilesystemIdentity::from_metadata_strong(&directory_metadata_after);
+    if directory_path != directory_path_after
+        || directory_identity_before.as_ref() != directory_identity_after.as_ref()
+    {
+        return Err(artifact_error(
+            "Parakeet model directory changed while being verified",
+        ));
+    }
+    let identity = match (directory_identity_before, directory_identity_after) {
+        (Some(directory), Some(_)) if file_identities.len() == manifest.files.len() => {
+            Some(ModelDirectoryIdentity {
+                directory_path,
+                directory,
+                files: file_identities,
+            })
+        }
+        _ => None,
+    };
+    Ok(identity)
 }
 
 fn verify_managed_model_dir(
@@ -669,6 +938,15 @@ fn verify_managed_model_dir(
 ) -> Result<(), ModelArtifactError> {
     verify_model_dir(path, manifest)?;
     verify_managed_permissions(path, manifest)
+}
+
+fn verify_managed_model_dir_with_identity(
+    path: &Path,
+    manifest: &ModelManifest,
+) -> Result<Option<ModelDirectoryIdentity>, ModelArtifactError> {
+    let identity = verify_model_dir_with_identity(path, manifest)?;
+    verify_managed_permissions(path, manifest)?;
+    Ok(identity)
 }
 
 #[cfg(unix)]
@@ -924,6 +1202,88 @@ mod tests {
             combined_sha256: digest_hex(combined),
             files,
         }
+    }
+
+    fn prepared_fixture(root: &Path) -> (PreparedModelDir, ModelManifest, PathBuf) {
+        let candidate = root.join("candidate");
+        let managed = root.join("managed");
+        fs::create_dir_all(&candidate).expect("create candidate");
+        let files = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ];
+        for (name, bytes) in files {
+            fs::write(candidate.join(name), bytes).expect("write candidate artifact");
+        }
+        let manifest = fixture_manifest(&files);
+        let (path, identity) =
+            copy_verified_candidate_with_identity(&candidate, &managed, &manifest)
+                .expect("copy and verify fixture");
+        let prepared = PreparedModelDir {
+            path: path.clone(),
+            manifest: manifest.clone(),
+            shared: false,
+            identity,
+        };
+        (prepared, manifest, root.to_path_buf())
+    }
+
+    fn restore_managed_read_only(path: &Path, manifest: &ModelManifest) {
+        make_model_files_read_only(path, manifest).expect("restore read-only files");
+        set_read_only_directory(path).expect("restore read-only directory");
+    }
+
+    #[test]
+    fn prepared_identity_rejects_same_length_content_changes_before_load() {
+        let root = temporary_root("identity-bytes");
+        let (prepared, manifest, cleanup_root) = prepared_fixture(&root);
+        assert!(prepared.validate_unchanged().is_ok());
+
+        make_model_tree_writable(prepared.path(), &manifest).expect("make fixture writable");
+        fs::write(prepared.path().join("encoder.onnx"), b"encodex")
+            .expect("write same-length changed bytes");
+        restore_managed_read_only(prepared.path(), &manifest);
+        assert!(prepared.validate_unchanged().is_err());
+
+        make_model_tree_writable(prepared.path(), &manifest).expect("make fixture removable");
+        fs::remove_dir_all(cleanup_root).expect("remove fixture tree");
+    }
+
+    #[test]
+    fn prepared_identity_rejects_replaced_inode_with_identical_bytes() {
+        let root = temporary_root("identity-inode");
+        let (prepared, manifest, cleanup_root) = prepared_fixture(&root);
+        let target = prepared.path().join("encoder.onnx");
+        let replacement = prepared.path().join("encoder.replacement");
+
+        make_model_tree_writable(prepared.path(), &manifest).expect("make fixture writable");
+        fs::write(&replacement, b"encoder").expect("write exact replacement");
+        fs::rename(&target, prepared.path().join("encoder.original")).expect("move old inode");
+        fs::rename(&replacement, &target).expect("publish replacement inode");
+        restore_managed_read_only(prepared.path(), &manifest);
+
+        assert!(prepared.validate_unchanged().is_err());
+        make_model_tree_writable(prepared.path(), &manifest).expect("make fixture removable");
+        fs::remove_dir_all(cleanup_root).expect("remove fixture tree");
+    }
+
+    #[test]
+    fn prepared_identity_rejects_directory_path_replacement_after_load() {
+        let root = temporary_root("identity-path");
+        let (prepared, manifest, cleanup_root) = prepared_fixture(&root);
+        assert!(
+            prepared.validate_unchanged().is_ok(),
+            "pre-load identity is stable"
+        );
+        let moved = prepared.path().with_extension("moved");
+        fs::rename(prepared.path(), &moved).expect("move admitted directory");
+        assert!(
+            prepared.validate_unchanged().is_err(),
+            "post-load path change is rejected"
+        );
+        make_model_tree_writable(&moved, &manifest).expect("make fixture removable");
+        fs::remove_dir_all(cleanup_root).expect("remove fixture tree");
     }
 
     #[test]

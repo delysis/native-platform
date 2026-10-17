@@ -4822,7 +4822,11 @@ mod tests {
         let (pause_tx, pause_rx) = bounded(0);
         handle.inner.send_command(
             WorkerCommand::Snapshot {
+                foreground_waiters: None,
+                expected_request_id: None,
+                conversation: false,
                 sequence_id: 0,
+                max_bytes: 0,
                 response: pause_tx,
             },
             "placing the cancellation test queue barrier",
@@ -4851,7 +4855,11 @@ mod tests {
         let (pause_tx, pause_rx) = bounded(0);
         handle.inner.send_command(
             WorkerCommand::Snapshot {
+                foreground_waiters: None,
+                expected_request_id: None,
+                conversation: false,
                 sequence_id: 0,
+                max_bytes: 0,
                 response: pause_tx,
             },
             "placing the verified cancellation test queue barrier",

@@ -642,6 +642,7 @@ pub struct TransformProvenance {
 #[serde(rename_all = "snake_case")]
 pub enum TransformKind {
     RootInput,
+    VoiceInferenceAudio,
     ZipMember,
     TarMember,
     GzipPayload,

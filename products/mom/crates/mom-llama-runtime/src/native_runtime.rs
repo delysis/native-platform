@@ -74,6 +74,66 @@ pub(crate) enum NativeHostAccess {
     Shared(NativeClient),
 }
 
+/// A shutdown-only capability: it can export an exact committed request from
+/// an already resident worker, but cannot load a model or submit generation.
+/// Capture before cancelling the scope; consume only after its work drains.
+pub(crate) struct ResidentCheckpointAccess {
+    host: NativeHostAccess,
+    scope: OperationScope,
+}
+
+impl ResidentCheckpointAccess {
+    pub(crate) fn capture(scope: &OperationScope) -> Option<Self> {
+        Some(Self {
+            host: scope.native_access()?,
+            scope: scope.clone(),
+        })
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        settings: &Settings,
+        model_path: &Path,
+        mmproj_path: Option<&Path>,
+        request_id: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<
+        Option<(
+            llama_native_types::SequenceStateBlob,
+            llama_native_types::ModelFingerprint,
+        )>,
+    > {
+        anyhow::ensure!(
+            self.scope.cancellation_requested(),
+            "checkpoint drain requires a cancelled scope"
+        );
+        anyhow::ensure!(
+            self.scope.matches_native_key(&host_key(settings)),
+            "checkpoint host identity changed during shutdown"
+        );
+        let config = unchecked_model_configuration_for_profile(settings, model_path, mmproj_path)
+            .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
+        let Some(handle) = self
+            .host
+            .resident(&config)
+            .map_err(|error| anyhow::anyhow!(error))?
+        else {
+            return Ok(None);
+        };
+        let Some(state) = handle
+            .snapshot_conversation_for_request_if_fits(request_id, max_bytes)
+            .map_err(|error| anyhow::anyhow!(error))?
+        else {
+            return Ok(None);
+        };
+        let fingerprint = handle
+            .status()
+            .fingerprint
+            .ok_or_else(|| anyhow::anyhow!("resident model has no native fingerprint"))?;
+        Ok(Some((state, fingerprint)))
+    }
+}
+
 impl NativeHostAccess {
     fn acquire(&self, config: NativeModelConfig) -> Result<NativeModelHandle, NativeError> {
         match self {
@@ -293,6 +353,19 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
         namespace: &str,
         expected: &PrefixCacheMetadata,
     ) -> Result<Option<PrefixCacheValue>, NativeError> {
+        if !expected
+            .reconstruction
+            .as_ref()
+            .is_some_and(|reconstruction| {
+                reconstruction.header.len() == llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+                    && reconstruction
+                        .header
+                        .starts_with(llama_native_types::SEQUENCE_STATE_MAGIC)
+            })
+            || expected.state_bytes < llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+        {
+            return Ok(None);
+        }
         self.store
             .mutate_documents(
                 &Self::document(namespace),
@@ -313,8 +386,9 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
                         return Ok(None);
                     }
                     let Some(value) = expected.replay_value() else {
-                        documents.delete(&Self::entry(namespace, &expected.id));
-                        entries.retain(|entry| entry.id != expected.id);
+                        // An unsupported or incomplete reconstruction is not
+                        // evidence that the durable entry is corrupt. Preserve
+                        // its metadata and encrypted payload for a newer reader.
                         return Ok(None);
                     };
                     if current.state_bytes != value.metadata.state_bytes {
@@ -345,9 +419,15 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
         namespace: &str,
         id: &str,
     ) -> Result<Option<PrefixCacheValue>, NativeError> {
-        self.store
-            .get_disposable_cache(&Self::entry(namespace, id))
-            .map_err(prefix_store_error)
+        let value = self
+            .store
+            .get_disposable_cache::<PrefixCacheValue>(&Self::entry(namespace, id))
+            .map_err(prefix_store_error)?;
+        Ok(value.filter(PrefixCacheValue::is_valid).map(|mut value| {
+            // RuntimeStore authenticated the full serialized metadata/payload.
+            value.sequence.mark_authenticated_storage();
+            value
+        }))
     }
 
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -804,6 +884,45 @@ mod tests {
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
 
     #[test]
+    fn shutdown_checkpoint_access_cannot_load_or_reopen_generation() {
+        let directory = tempfile::tempdir().expect("isolated shutdown fixture");
+        let settings =
+            crate::config::Settings::defaults_for_data_dir(directory.path().to_path_buf());
+        let key = super::host_key(&settings);
+        let host = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let scope = crate::OperationScope::for_product_host(&host, key);
+        let checkpoint = super::ResidentCheckpointAccess::capture(&scope).expect("running scope");
+        let missing = directory.path().join("never-load.gguf");
+        assert!(
+            checkpoint
+                .snapshot(&settings, &missing, None, "committed", 1024)
+                .is_err()
+        );
+        scope.request_cancellation();
+        assert!(scope.native_access().is_none());
+        assert!(super::ResidentCheckpointAccess::capture(&scope).is_none());
+        let late = scope
+            .register_chat("late", "conversation")
+            .expect("cancelled late lease");
+        assert!(late.cancellation_requested());
+        assert!(
+            checkpoint
+                .snapshot(&settings, &missing, None, "committed", 1024)
+                .expect("resident lookup only")
+                .is_none()
+        );
+        assert!(host.slots().is_empty());
+        assert!(!missing.exists());
+        let mut changed = settings;
+        changed.data_dir = directory.path().join("different-host");
+        assert!(
+            checkpoint
+                .snapshot(&changed, &missing, None, "committed", 1024)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn invalid_execution_limits_are_refused_before_model_path_access() {
         let directory = tempfile::tempdir().expect("isolated admission fixture");
         let missing = directory.path().join("absent.gguf");
@@ -897,10 +1016,12 @@ mod tests {
                 1,
             ),
             sequence: SequenceStateBlob {
+                storage_proof: None,
                 sequence_id: 0,
                 token_count: token_ids.len(),
                 bytes: (vec![4, 5, 6]).into(),
                 token_ids,
+                cells: Vec::new(),
             },
         };
         value.bind_reconstruction();
@@ -1187,7 +1308,10 @@ mod tests {
         let connection = rusqlite::Connection::open(store.path()).expect("connection");
         let cache = ProductPrefixCacheStore { store };
         let mut value = cache_value();
-        value.sequence.bytes = vec![9; 64 * 1024].into();
+        let mut snapshot = vec![0; 64 * 1024];
+        snapshot[..llama_native_types::SEQUENCE_STATE_MAGIC.len()]
+            .copy_from_slice(llama_native_types::SEQUENCE_STATE_MAGIC);
+        value.sequence.bytes = snapshot.into();
         value.metadata.state_bytes = value.sequence.bytes.len();
         value.bind_reconstruction();
         cache.save("compact", &value).expect("save");
@@ -1235,6 +1359,39 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_reconstruction_header_preserves_persistent_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "mom-prefix-unsupported-header-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::RuntimeStore::open_with_key(&dir, [27; 32]).expect("store");
+        let cache = ProductPrefixCacheStore { store };
+        let mut value = cache_value();
+        let mut bytes = vec![0; 64 * 1024];
+        bytes[..16].copy_from_slice(b"native-seq-v1\0\0\0");
+        value.sequence.bytes = bytes.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        cache.save("unsupported", &value).expect("save");
+
+        assert!(
+            cache
+                .load_reconstruction("unsupported", &value.metadata)
+                .expect("unsupported header is a cache miss")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .load_entry("unsupported", &value.metadata.id)
+                .expect("entry remains readable"),
+            Some(value)
+        );
+
+        drop(cache);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn product_prefix_cache_round_trips_through_encrypted_storage() {
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-prefix-cache-test-{}",
@@ -1245,7 +1402,13 @@ mod tests {
         let cache = ProductPrefixCacheStore { store };
         let value = cache_value();
         cache.save("test", &value).expect("save prefix");
-        assert_eq!(cache.load("test").expect("load prefix"), vec![value]);
+        let loaded = cache.load("test").expect("load prefix");
+        assert_eq!(loaded, vec![value]);
+        assert!(loaded[0].sequence.has_authenticated_storage_proof());
+        let decoded: PrefixCacheValue =
+            serde_json::from_slice(&serde_json::to_vec(&loaded[0]).expect("serialize loaded"))
+                .expect("deserialize loaded");
+        assert!(!decoded.sequence.has_authenticated_storage_proof());
         cache
             .delete("test", "persistent-test")
             .expect("delete prefix");

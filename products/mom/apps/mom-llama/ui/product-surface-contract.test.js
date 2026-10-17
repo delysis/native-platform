@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const productRoot = path.resolve(__dirname, "../../..");
 const read = (relative) => fs.readFileSync(path.join(productRoot, relative), "utf8");
@@ -27,6 +28,7 @@ const backendOnlyCommandIds = [
   "mom_llama.engine_check",
   "mom_llama.engine_configure",
   "mom_llama.kv_cache_clear",
+  "mom_llama.kv_cache_prepare_voice_persona_resident",
   "mom_llama.kv_cache_restore",
   "mom_llama.kv_cache_save",
   "mom_llama.kv_cache_status",
@@ -277,21 +279,21 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   );
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
   assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
-  assert.match(submitHandler, /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"\) \{[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment\)/);
+  assert.match(submitHandler, /finishVoiceReplyAndIndexTurn\([\s\S]*callReplyConversation === conversation[\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
   const voiceTranscript = bridge.slice(
     bridge.indexOf("  const indexVoiceTurn ="),
     bridge.indexOf("  const stopVoiceCapture =", bridge.indexOf("  const indexVoiceTurn =")),
   );
   assert.ok(voiceTranscript.includes('invoke("mom_llama_speech_transcribe_attachment"'));
   assert.ok(voiceTranscript.includes('invoke("mom_llama_message_record_voice_transcript"'));
-  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call\) => \{[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
+  assert.match(voiceTranscript, /const startVoicePrefill = async \(conversation, call, trace\) => \{[\s\S]*invoke\("mom_llama_voice_audio_begin"/);
   assert.ok(!voiceTranscript.includes("waitForVoiceTranscript"), "new microphone turns cannot wait for transcription");
   assert.ok(!voiceTranscript.includes("await previous"), "one failed transcript cannot strand later backfills");
   const speculate = bridge.slice(
     bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
     bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
   );
-  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result\);\s*const synthesized = await tts\.finish/);
+  assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*indexVoiceTurn\(live\.conversation, response\.result, null,[\s\S]*speculation\.captureReady, recording\.trace\)[\s\S]*tts\.finish/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
@@ -444,7 +446,8 @@ test("voice PCM playback uses a prewarmed audio-thread ring while retaining repl
   assert.ok(playback.includes("workletCapacityFrames = format.sampleRate * 8"));
   assert.ok(playback.includes('data?.type === "consumed"'));
   assert.ok(playback.includes("}, [buffer])"));
-  assert.ok(playback.includes("const engine = await preparePcmWorklet(format.sampleRate)"));
+  assert.ok(playback.includes("const preparedEngine = await Promise.race(["));
+  assert.ok(playback.includes("startCancellation.then(() => cancelledStart)"));
   assert.ok(playback.includes("history.push({ ...frame, data: frame.data.slice() })"));
   assert.ok(playback.includes("onBufferLevel?.(bufferedPlaybackSeconds() * 1000)"));
   assert.ok(!playback.includes("retainHistory ? null : await preparePcmWorklet"));
@@ -471,10 +474,15 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(close.includes("stopSpeechPlayback()"));
   assert.ok(close.includes("stopCallBed()"));
   assert.ok(close.includes('invoke("mom_llama_chat_cancel", { conversation })'));
+  const stopSettlement = close.indexOf("await Promise.allSettled(stops.filter(Boolean))");
+  const activityClear = close.indexOf("await activityGuard.clear()");
+  const checkpoint = close.indexOf('invoke("mom_llama_kv_cache_checkpoint_voice_session"');
+  assert.ok(stopSettlement >= 0 && activityClear > stopSettlement && checkpoint > activityClear,
+    "the exact call activity guard must clear after all stop acknowledgements and before checkpointing");
   assert.ok(
     close.indexOf('setModalVisibility("voice-call-modal", false)')
-      < close.indexOf("await Promise.allSettled"),
-    "the red button must close immediately instead of waiting for native acknowledgements",
+      < close.indexOf("stopVoiceCapture({ discard: true"),
+    "the red button must close before local audio cleanup or native cancellation starts",
   );
 
   const liveStart = bridge.indexOf("  const beginLiveVoiceTts =");
@@ -488,6 +496,57 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
     "streamed call audio must stop locally before native cancellation",
   );
   assert.ok(live.includes("speech_stream_runaway"));
+});
+
+test("call starts ringing immediately while preparation remains cancellation guarded", () => {
+  const callStart = bridge.indexOf("  const openVoiceCallSurface = async");
+  const callEnd = bridge.indexOf("\n  const closeVoiceCallSurface = async", callStart);
+  const call = bridge.slice(callStart, callEnd);
+  const preempt = call.indexOf('suspendVoiceHistoryRecoveryForForeground("call_start")');
+  const activityStart = call.indexOf("createVoiceCallActivityGuard(speechOperationToken())");
+  const activityReady = call.indexOf("await activityGuard.ready");
+  const warm = call.indexOf('runtimeWarmPromise.then');
+  const microphone = call.indexOf('prepareCallMicrophoneStream()');
+  const visibleRinging = call.indexOf('modal.dataset.callState = "ringing"');
+  const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
+  const ringStart = call.indexOf("const ringingReady = startCallRinging(epoch)");
+  const ringAwait = call.indexOf("const ringResult = await ringingReady");
+  const cancellationGuard = call.indexOf('if (voiceCallEpoch !== epoch || !voiceCallActive) return;', preempt);
+
+  assert.ok(preempt >= 0, "call pickup must suspend and settle idle voice recovery");
+  assert.ok(activityStart >= 0 && activityReady > activityStart && activityReady < preempt,
+    "call activity must be registered before asynchronous setup and before warmup admission");
+  assert.ok(bridge.includes('await stopSpeechOperationAndWait(operation, reason, {'));
+  assert.ok(bridge.includes('allowColdTranscriptionSettlement: coldInitialization'));
+  assert.ok(preempt < warm && preempt < microphone,
+    "Gemma warmup and microphone setup must wait until the idle Parakeet operation settles");
+  assert.ok(visibleRinging >= 0 && visibleModal >= 0 && visibleRinging < visibleModal
+      && visibleModal < ringStart && ringStart < activityReady && activityReady < preempt,
+    "the modal and ring must start on the click path before setup waits on cold ASR");
+  assert.ok(ringAwait > activityReady && call.includes("if (ringResult.error) throw ringResult.error"),
+    "ring initialization failure must still stop admission before Gemma setup");
+  assert.ok(cancellationGuard > preempt && cancellationGuard < warm,
+    "closing the visible preparation surface must prevent later call warmup");
+  assert.ok(call.includes("modal.setAttribute(\"aria-label\", `Calling ${name}`)"));
+  assert.ok(call.includes('modal.querySelector(\'[data-action="voice-call-close"]\')?.focus()'));
+  assert.ok(!styles.includes('.voice-call-backdrop[data-call-state="preparing"]'),
+    "the call surface no longer exposes a separate preparing presentation");
+  assert.match(
+    bridge,
+    /invoke\("mom_llama_speech_stop_and_wait", \{\s*operation,\s*allowColdTranscriptionSettlement,/,
+  );
+});
+
+test("foreground chat sends suspend idle audio recovery before draft or model admission", () => {
+  const submitStart = bridge.indexOf('document.addEventListener("submit", async (event) => {');
+  const sendStart = bridge.indexOf('if (form.id === "chat-form")', submitStart);
+  const sendEnd = bridge.indexOf('if (form.id === "conversation-rename-form")', sendStart);
+  const send = bridge.slice(sendStart, sendEnd);
+  const suspend = send.indexOf('await suspendVoiceHistoryRecoveryForForeground("chat_send")');
+  const firstAwait = send.indexOf('await updateRecipients');
+  const dispatch = send.indexOf('invoke("mom_llama_chat_dispatch"');
+  assert.ok(suspend >= 0 && suspend < firstAwait && suspend < dispatch);
+  assert.ok(send.includes("releaseHistoryRecovery?.();"));
 });
 
 test("call capture remains live during playback through the shared echo-cancelled route", () => {
@@ -507,7 +566,8 @@ test("call capture remains live during playback through the shared echo-cancelle
   const playbackEndedAt = live.indexOf("onEnded: () => {");
   const playbackEnded = live.slice(playbackEndedAt, live.indexOf("    });", playbackEndedAt));
   assert.ok(playbackEnded.includes("startCallCapture();"));
-  assert.ok(live.includes("prefillSession: nextCallPrefillGate"));
+  assert.ok(live.includes("prefillSession: deferPrefill ? null : (nextCallPrefill || nextCallPrefillGate)"));
+  assert.ok(live.includes("deferPrefill,"));
   assert.ok(live.includes("startNextCallPrefill();\n          controller.finish();"));
   assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
   assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
@@ -515,8 +575,8 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
   assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
   assert.ok(live.includes("if (stopped || activeOperation !== operation) return;"));
-  assert.ok(interrupt.includes('markVoiceLatency("barge_in_detected"'));
-  assert.ok(interrupt.includes("void reply.stop()"));
+  assert.ok(interrupt.includes('markVoiceLatencyIn(recording.trace, "barge_in_detected"'));
+  assert.ok(interrupt.includes("void reply.interruptForSpeech()"));
   assert.ok(bridge.includes("interruptCallPlaybackForSpeech(recording"));
   assert.ok(bridge.includes("const sharedCallStream = call && voiceCallMicrophoneStream?.active"));
   assert.ok(bridge.includes("sharedCallStream: stream === voiceCallMicrophoneStream"));
@@ -536,7 +596,7 @@ test("native microphone admission precedes Gemma preparation", () => {
       < capture.indexOf("recording.prefillSession ="),
     "capture must retain the utterance while model preparation runs",
   );
-  assert.ok(capture.includes('markVoiceLatency("native_capture_requested")'));
+  assert.ok(capture.includes('markVoiceLatencyIn(recording.trace, "native_capture_requested")'));
 });
 
 test("pickup uses the ordinary streamed call reply buffer", () => {
@@ -551,7 +611,10 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(greeting.includes('mode: "call"'));
   assert.ok(greeting.includes('invoke("mom_llama_chat_send"'));
   assert.ok(!greeting.includes('invoke("mom_llama_chat_dispatch"'));
-  assert.ok(greeting.includes("onFirstChunk"));
+  assert.ok(
+    greeting.includes("onPlaybackStarted"),
+    "pickup stays on the ring until the ordinary reply buffer actually starts playback",
+  );
   assert.ok(greeting.includes("stopCallBed()"));
   assert.ok(!greeting.includes("beginCallNoiseFloor(epoch)"));
   assert.ok(greeting.includes("tts.text.trim()"));
@@ -564,15 +627,18 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
     "an intentional hang-up must consume the native cancellation acknowledgement",
   );
   assert.ok(open.includes("startCallRinging(epoch)"));
+  assert.ok(!open.includes("await startCallRinging(epoch)"));
   assert.ok(open.includes("startStreamedCallGreeting(epoch, conversation)"));
   assert.ok(open.includes("await prepareCallMicrophoneStream()"));
   assert.ok(
-    open.indexOf("await prepareCallMicrophoneStream()")
-      < open.indexOf('setModalVisibility("voice-call-modal", true)'),
-    "microphone permission and device readiness must precede the call modal",
+    open.indexOf("const ringingReady = startCallRinging(epoch)")
+      < open.indexOf("await activityGuard.ready")
+      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream()"),
+    "ringing starts on the user gesture while microphone and model setup remain guarded",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
-  assert.ok(open.includes("const warm = await warmReady;"));
+  assert.ok(open.includes("await warmReady;"));
+  assert.ok(!/if\s*\(warm\.status/.test(open), "opportunistic startup status must not decide call admission");
   assert.ok(
     open.indexOf("const warmReady = runtimeWarmPromise.then((warm) => {")
       < open.indexOf("await prepareCallMicrophoneStream()"),
@@ -583,7 +649,8 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
       < open.indexOf("await prepareCallMicrophoneStream()"),
     "the PCM renderer must warm under the required microphone readiness wait",
   );
-  assert.ok(open.includes("!warm.audio_projector_warmed"));
+  assert.ok(open.includes("await prepareVoicePersonaForCall(conversation, epoch)"));
+  assert.ok(bridge.includes("!response?.result?.audio_projector_warmed"), "exact call preparation must require the selected encoder before greeting");
   assert.ok(open.includes('markVoiceLatency("call_runtime_ready", warm)'));
   assert.ok(!bridge.includes("playPreparedCallSpeech"));
   assert.ok(!bridge.includes("activeCallSpeech"));
@@ -724,14 +791,16 @@ test("streamed voice playback is owned by the exact native request", () => {
 
   assert.ok(live.includes("acceptsRequest(candidate"));
   assert.ok(live.includes("return requestId === candidate"));
-  assert.ok(events.includes("liveVoiceTts.acceptsRequest(payload.request_id, payload.event)"));
-  assert.ok(events.includes("if (sameLiveConversation && !ownsLiveVoice)"));
+  assert.ok(events.includes("liveVoiceTts.acceptsRequest(payload.request_id, payload.event, payload.client_request)"));
+  assert.ok(events.includes("(sameLiveConversation || voiceStreamRequestIds.has(payload.request_id)) && !ownsLiveVoice"));
+  assert.ok(events.includes("const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null"));
   assert.ok(live.includes("voice_reply_timeout: Voice synthesis stopped making progress."));
   assert.ok(!live.includes("if (!deferProgressWatchdog) armAudioProgressWatchdog();"));
   assert.ok(live.includes("running = true;\n      // The audio watchdog covers only time owned by an active synthesis"));
   assert.ok(live.includes("watchdogActive = false;"));
-  assert.ok(live.includes("if (decoded.data.byteLength > 0) armAudioProgressWatchdog();"));
-  assert.ok(live.includes('mode === "call" ? 8_000 : 12_000'));
+  assert.ok(live.includes("if (decoded.data.byteLength > 0) {"));
+  assert.ok(live.includes("playback.lastProgressAt = performance.now();\n            armAudioProgressWatchdog();"));
+  assert.ok(live.includes("leadController.progressTimeoutMs()"));
   assert.ok(live.includes("const ttsLatencyTrace = voiceLatencyTrace"));
   assert.ok(live.includes("markVoiceLatencyIn(ttsLatencyTrace, stage, detail)"));
   assert.ok(live.includes("onPlayable: () => {"));
@@ -748,9 +817,9 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(!styles.includes("color: var(--accent);"));
   assert.ok(live.includes("finalText.startsWith(streamedText)"));
   assert.ok(bridge.includes("const voiceTtsOwner = voiceDispatch"));
-  assert.ok(bridge.includes("await voiceTtsOwner.finish(output.assistant_text)"));
+  assert.ok(bridge.includes("() => voiceTtsOwner.finish(output.assistant_text)"));
   assert.ok(bridge.includes("pendingVoiceTtsOwner"));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_session_ready", { begin: live?.begin_metrics || null })'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(trace, "audio_prefill_session_ready", { begin: live?.begin_metrics || null })'));
   assert.ok(live.includes('markTtsLatency("tts_segment_finished"'));
   assert.ok(live.includes("queue_us: binding.tts_queue_us"));
   assert.ok(live.includes("host_route_us: binding.tts_host_route_us"));
@@ -768,8 +837,9 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(live.includes('startNextCallPrefill("generation_complete_buffered_playback")'));
   assert.ok(live.includes('leadController.shouldPrepareNextCall({'));
   assert.ok(live.includes('startBufferedNextCallPrefill();'));
-  assert.ok(bridge.includes('onVoiceOnset: () => startNextCallPrefill("caller_voice_onset")'));
-  assert.ok(bridge.includes('if (onVoiceOnset) queueMicrotask(onVoiceOnset)'));
+  assert.ok(bridge.includes("onVoiceOnset: (recording) => preemptCallTranscriptForSpeech(recording, startNextCallPrefill)"));
+  assert.ok(bridge.includes("onVoiceOnset(recording)"));
+  assert.ok(bridge.includes("await stopSpeechOperationAndWait(operation, \"caller_speech_onset\")"));
   assert.ok(live.includes('markTtsLatency("tts_all_segments_finished"'));
   assert.ok(live.includes('markTtsLatency("next_turn_prefill_ready"'));
   assert.ok(live.includes("production_rtf: aggregateRtf"));
@@ -884,11 +954,14 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   assert.ok(bridge.includes("first_observed_at_unix_us"));
   assert.ok(bridge.includes("VOICE_LATENCY_STAGE_LIMIT = 512"));
   assert.ok(bridge.includes("trace.checkpoint = (trace.checkpoint || 0) + 1"));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_begin_failed"'));
-  assert.ok(bridge.includes('markVoiceLatency("audio_prefill_push_failed"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "audio_prefill_begin_failed"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "audio_prefill_push_failed"'));
+  const checkpointStart = bridge.indexOf("  const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([");
+  const checkpointEnd = bridge.indexOf("\n  ]);", checkpointStart);
+  const checkpointStages = bridge.slice(checkpointStart, checkpointEnd);
   for (const stage of ["audio_prefill_begin_requested", "audio_prefill_session_ready",
     "audio_prefill_begin_failed", "next_turn_prefill_failed"]) {
-    assert.ok(bridge.includes(`      "${stage}",`), `${stage} must persist a diagnostic checkpoint`);
+    assert.ok(checkpointStages.includes(`"${stage}"`), `${stage} must persist a diagnostic checkpoint`);
   }
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_state", runtimeWarmState)'));
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_completed", runtimeWarmState)'));
@@ -950,7 +1023,8 @@ test("voice latency summary uses native and absolute clocks across event deliver
     { stage: "barge_in_detected", elapsed_ms: 1_930 },
     { stage: "barge_in_playback_stopped", elapsed_ms: 1_948 },
     { stage: "playback_underrun", elapsed_ms: 900, occurrences: 2, total_gap_ms: 21.5, max_gap_ms: 14 },
-    { stage: "playback_renderer", elapsed_ms: 950, worklet: true, packets: 8, frames: 24_000,
+    { stage: "playback_renderer", elapsed_ms: 950, reason: "stopped", worklet: true,
+      worklet_final_metrics_received: true, packets: 8, frames: 24_000,
       schedule_cpu_us: 1_250, schedule_max_us: 310, underruns: 2, worklet_recoveries: 1,
       worklet_rebuffered_frames: 2_400, worklet_max_buffered_frames: 8_000,
       worklet_max_queued_frames: 9_000 },
@@ -1010,6 +1084,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.next_prefill_buffered_runway_ms, 582);
   assert.equal(summary.next_prefill_overlapped_active_tts, false);
   assert.equal(summary.barge_in_playback_stop_ms, 18);
+  assert.equal(summary.playback_renderer_reason, "stopped");
   assert.equal(summary.playback_renderer_worklet, true);
   assert.equal(summary.playback_renderer_packets, 8);
   assert.equal(summary.playback_renderer_frames, 24_000);
@@ -1023,6 +1098,158 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.playback_underrun_occurrences, 2);
   assert.equal(summary.playback_underrun_total_gap_ms, 21.5);
   assert.equal(summary.playback_underrun_max_gap_ms, 14);
+});
+
+test("voice latency recorder coalesces only high-volume deltas and packet events by owner", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const markVoiceLatency =", start);
+  assert.ok(start >= 0 && end > start);
+  let now = 10;
+  const context = {
+    TextEncoder,
+    Date,
+    Math,
+    Number,
+    Object,
+    Map,
+    Set,
+    performance: { now: () => now++, timeOrigin: 1_000 },
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    voiceLatencyPending: new Map(),
+    voiceLatencyHistory: [],
+    voiceLatencyFlushTimer: null,
+    voiceLatencyPersistence: Promise.resolve(),
+    invoke: async () => ({ ok: true }),
+  };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(start, end)}\nglobalThis.__helpers = { markVoiceLatencyIn };`, context);
+  const { markVoiceLatencyIn } = context.__helpers;
+  const trace = { id: "trace-owners", started: 0, stages: [] };
+
+  for (const requestId of ["request-a", "request-b"]) {
+    markVoiceLatencyIn(trace, "chat_stream_event_received", { request_id: requestId, event: "started" });
+    markVoiceLatencyIn(trace, "native_chat_stream_event", {
+      request_id: requestId, event: "started", native_emitted_at_unix_us: now * 1000,
+    });
+    for (let index = 0; index < 160; index += 1) {
+      markVoiceLatencyIn(trace, "chat_stream_event_received", { request_id: requestId, event: "delta" });
+      markVoiceLatencyIn(trace, "native_chat_stream_event", {
+        request_id: requestId, event: "delta", delta_bytes: 7, kind: "text",
+        native_emitted_at_unix_us: now * 1000,
+      });
+      markVoiceLatencyIn(trace, "chat_stream_route_decision", {
+        request_id: requestId, event: "reasoning_delta", same_live_conversation: index % 2 === 0,
+      });
+    }
+    markVoiceLatencyIn(trace, "native_chat_stream_event", {
+      request_id: requestId, event: "decode_started", kind: "text",
+    });
+    markVoiceLatencyIn(trace, "native_chat_stream_event", {
+      request_id: requestId, event: "completed", kind: "text",
+    });
+    markVoiceLatencyIn(trace, "chat_stream_event_received", { request_id: requestId, event: "completed" });
+  }
+  for (const operationId of ["tts-a", "tts-b"]) {
+    for (let index = 0; index < 120; index += 1) {
+      markVoiceLatencyIn(trace, "playback_packet_enqueued", {
+        operation_id: operationId, packet_index: index, sequence: index + 1,
+        sample_offset: index * 480, frames: 480, audio_context_ms: index * 30,
+      });
+      markVoiceLatencyIn(trace, "playback_packet_admitted", {
+        operation_id: operationId, packet_index: index, sequence: index + 1,
+        sample_offset: index * 480, frames: 480, audio_context_ms: index * 30 + 1,
+      });
+    }
+  }
+
+  const aggregates = trace.stages.filter((entry) => entry.voice_latency_aggregate);
+  assert.equal(aggregates.length, 10);
+  for (const owner of ["request-a", "request-b"]) {
+    assert.equal(trace.stages.filter((entry) => entry.stage === "chat_stream_event_received"
+      && entry.event === "started" && entry.request_id === owner).length, 1);
+    assert.equal(trace.stages.filter((entry) => entry.stage === "chat_stream_event_received"
+      && entry.event === "completed" && entry.request_id === owner).length, 1);
+    assert.equal(aggregates.find((entry) => entry.stage === "chat_stream_event_received"
+      && entry.owner_id === owner).occurrences, 160);
+    assert.equal(aggregates.find((entry) => entry.stage === "chat_stream_route_decision"
+      && entry.owner_id === owner).same_live_conversation_true, 80);
+    const native = aggregates.find((entry) => entry.stage === "native_chat_stream_event" && entry.owner_id === owner);
+    assert.equal(native.occurrences, 160);
+    assert.equal(native.total_delta_bytes, 160 * 7);
+    assert.equal(trace.stages.filter((entry) => entry.stage === "native_chat_stream_event"
+      && ["started", "decode_started", "completed"].includes(entry.event)
+      && entry.request_id === owner).length, 3);
+  }
+  for (const owner of ["tts-a", "tts-b"]) {
+    assert.equal(aggregates.find((entry) => entry.stage === "playback_packet_enqueued"
+      && entry.owner_id === owner).total_frames, 120 * 480);
+    assert.equal(aggregates.find((entry) => entry.stage === "playback_packet_admitted"
+      && entry.owner_id === owner).last_sample_offset, 119 * 480);
+    assert.equal(aggregates.find((entry) => entry.stage === "playback_packet_admitted"
+      && entry.owner_id === owner).last_audio_context_ms, 119 * 30 + 1);
+  }
+});
+
+test("voice latency recorder retains late lifecycle evidence under stage and UTF-8 byte pressure", async () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const markVoiceLatency =", start);
+  assert.ok(start >= 0 && end > start);
+  const persisted = [];
+  let now = 0;
+  let flushTimer = null;
+  const context = {
+    TextEncoder,
+    Date,
+    Math,
+    Number,
+    Object,
+    Map,
+    Set,
+    performance: { now: () => now++, timeOrigin: 1_000 },
+    window: { setTimeout: (callback) => { flushTimer = callback; return 1; }, clearTimeout: () => {} },
+    voiceLatencyPending: new Map(),
+    voiceLatencyHistory: [],
+    voiceLatencyFlushTimer: null,
+    voiceLatencyPersistence: Promise.resolve(),
+    invoke: async (_command, args) => { persisted.push(args.trace); return { ok: true }; },
+  };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(start, end)}\nglobalThis.__helpers = { markVoiceLatencyIn, flushVoiceLatencyCheckpoints, compactVoiceLatencySnapshot };`, context);
+  const trace = { id: "trace-pressure", mode: "call", began_at: 1, started: 0, stages: [] };
+  for (let index = 0; index < 620; index += 1) {
+    context.__helpers.markVoiceLatencyIn(trace, "debug_repetitive_event", { index });
+  }
+  context.__helpers.markVoiceLatencyIn(trace, "playback_renderer", {
+    status: "ended", operation_id: "late-terminal", renderer_underruns: 3,
+  });
+  assert.ok(trace.stages.length <= 512);
+  assert.ok(trace.compaction.stage_limit_events_omitted > 0);
+  assert.equal(trace.stages.at(-1).stage, "playback_renderer");
+
+  for (let index = 0; index < 18; index += 1) {
+    context.__helpers.markVoiceLatencyIn(trace, "generation_dispatched", {
+      request_id: `req-${index}`, diagnostic: "é🙂".repeat(3000), scheduler: { queue: "foreground" },
+    });
+  }
+  context.__helpers.flushVoiceLatencyCheckpoints();
+  await context.voiceLatencyPersistence;
+  assert.equal(typeof flushTimer, "function");
+  assert.equal(persisted.length, 1);
+  const serialized = persisted[0];
+  assert.ok(new TextEncoder().encode(serialized).byteLength <= 64 * 1024);
+  const receipt = JSON.parse(serialized);
+  assert.equal(typeof receipt.summary, "object");
+  assert.equal(receipt.summary.incomplete, true);
+  assert.equal(receipt.stages.at(-1).stage, "generation_dispatched");
+  assert.ok(receipt.compaction.byte_limit_records_omitted > 0
+    || receipt.compaction.byte_limit_detail_fields_omitted > 0);
+
+  const fallback = context.__helpers.compactVoiceLatencySnapshot(
+    { id: "oversize-summary", mode: "call", checkpoint: 9, stages: [] },
+    { oversized: "x".repeat(100_000) },
+  );
+  assert.ok(new TextEncoder().encode(fallback).byteLength <= 64 * 1024);
+  assert.equal(JSON.parse(fallback).summary.incomplete, true);
 });
 
 test("voice latency includes endpoint-decision time from the physical silence edge", () => {
@@ -1055,6 +1282,27 @@ test("voice latency includes endpoint-decision time from the physical silence ed
   assert.equal(summary.silence_to_tts_pcm_ms, 650);
   assert.equal(summary.silence_release_to_playback_ms, 500);
   assert.equal(summary.silence_to_playback_ms, 750);
+});
+
+test("browser microphone cost and queued PCM survive into the latency summary", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const summary = summarize({ stages: [
+    { stage: "capture_processing", callback_cpu_ms: 24.5, callback_max_ms: 1.25,
+      detector_cpu_ms: 8.5, resample_cpu_ms: 6,
+      prefill_ipc_queued_samples: 1_280, prefill_ipc_queue_high_water_samples: 4_800,
+      prefill_suppressed_silence_samples: 3_200 },
+  ] });
+  assert.equal(summary.capture_processing_cpu_ms, 24.5);
+  assert.equal(summary.capture_processing_max_ms, 1.25);
+  assert.equal(summary.capture_detector_cpu_ms, 8.5);
+  assert.equal(summary.capture_resample_cpu_ms, 6);
+  assert.equal(summary.capture_prefill_ipc_queued_at_stop_ms, 80);
+  assert.equal(summary.capture_prefill_ipc_queue_high_water_ms, 300);
+  assert.equal(summary.capture_prefill_suppressed_silence_ms, 200);
+  const absent = summarize({ stages: [] });
+  assert.equal(absent.capture_prefill_ipc_queued_at_stop_ms, null);
 });
 
 test("a late pickup result cannot become the next call turn's generation", () => {
@@ -1188,46 +1436,62 @@ test("next-turn prefetch is never charged to the current microphone session", ()
   assert.equal(ordinary.voice_session_handoff_ms, 11);
 });
 
-test("live speech uses punctuation or a mode-appropriate PCM runway", () => {
+test("call speech waits for sentence boundaries while voice notes retain phrase boundaries", () => {
   const start = bridge.indexOf("  const takeLiveSpeechChunk =");
   const end = bridge.indexOf("\n  const beginLiveVoiceTts =", start);
   assert.ok(start >= 0 && end > start);
   const chunk = Function(`${bridge.slice(start, end)}\nreturn takeLiveSpeechChunk;`)();
 
   assert.equal(chunk("One two three four five six", false, true), null);
-  assert.deepEqual(chunk("One two three four five six seven", false, true), {
-    chunk: "One two three four five six",
-    rest: "seven",
+  assert.deepEqual(chunk("One two three four five six. ", false, true), {
+    chunk: "One two three four five six.", rest: "", boundary: "sentence",
   });
-  assert.deepEqual(chunk("One two three,", false, true), {
-    chunk: "One two three,",
-    rest: "",
+  assert.equal(chunk("A partial sentence keeps arriving without punctuation", false, true), null);
+  assert.deepEqual(chunk("Dr. Smith works with the U.S. team on 3.14 meter samples. Next sentence. ", false, true), {
+    chunk: "Dr. Smith works with the U.S. team on 3.14 meter samples.",
+    rest: "Next sentence. ",
+    boundary: "sentence",
   });
-  assert.equal(chunk("One two thr", false, true), null);
-  assert.deepEqual(chunk("One two", true, true), {
-    chunk: "One two",
-    rest: "",
+  const sentenceStream = "First sentence ends. Second sentence ends. ";
+  const firstSentence = chunk(sentenceStream, false, true);
+  const secondSentence = chunk(firstSentence.rest, false, true);
+  assert.equal(firstSentence.boundary, "sentence");
+  assert.equal(secondSentence.boundary, "sentence");
+  assert.equal(`${firstSentence.chunk} ${secondSentence.chunk}`, sentenceStream.trim());
+  assert.deepEqual(chunk("The final line has no punctuation", true, true), {
+    chunk: "The final line has no punctuation", rest: "", boundary: "end",
   });
-  assert.equal(chunk("Yes. More text is arriving", false, true), null);
-  assert.deepEqual(chunk("Hello, Jan. How are you", false, true), {
-    chunk: "Hello, Jan.",
-    rest: "How are you",
+
+  const cappedClauseWords = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  cappedClauseWords[18] += ",";
+  const cappedClauseText = `${cappedClauseWords.join(" ")} `;
+  const clause = chunk(cappedClauseText, false, true);
+  assert.deepEqual(clause, {
+    chunk: cappedClauseWords.slice(0, 19).join(" "),
+    rest: `${cappedClauseWords.slice(19).join(" ")} `,
+    boundary: "limit_clause",
   });
-  assert.equal(chunk("Hello, Jan", false, true), null);
+  const cappedWordsText = `${Array.from({ length: 70 }, (_, index) => `word${index + 1}`).join(" ")} `;
+  const cappedWords = chunk(cappedWordsText, false, true);
+  assert.deepEqual(cappedWords, {
+    chunk: Array.from({ length: 64 }, (_, index) => `word${index + 1}`).join(" "),
+    rest: `${Array.from({ length: 6 }, (_, index) => `word${index + 65}`).join(" ")} `,
+    boundary: "limit_words",
+  });
   assert.equal(
-    chunk("One two three four five six seven eight nine ten", false, true, 10, "voice_note"),
+    chunk("One two three four five six seven eight nine ten", false, true, "voice_note"),
     null,
   );
   assert.equal(
-    chunk("Yes. This short sentence must not reset prosody", false, true, 10, "voice_note"),
+    chunk("Yes. This short sentence must not reset prosody", false, true, "voice_note"),
     null,
   );
   assert.deepEqual(
-    chunk("Yes. This short sentence joins the following complete phrase naturally.", false, true, 10, "voice_note"),
-    { chunk: "Yes. This short sentence joins the following complete phrase naturally.", rest: "" },
+    chunk("Yes. This short sentence joins the following complete phrase naturally.", false, true, "voice_note"),
+    { chunk: "Yes. This short sentence joins the following complete phrase naturally.", rest: "", boundary: "phrase" },
   );
   assert.equal(
-    chunk("One two three four five six seven eight nine ten eleven", false, true, 10, "voice_note"),
+    chunk("One two three four five six seven eight nine ten eleven", false, true, "voice_note"),
     null,
   );
 });
@@ -1238,15 +1502,68 @@ test("call barge-in can stop only an actually audible reply", () => {
   const interruption = bridge.slice(start, end);
   assert.ok(interruption.includes("if (!reply?.audible) return;"));
   assert.ok(bridge.includes("get audible() { return controller.playing; }"));
+  assert.ok(interruption.includes("reply.interruptForSpeech()"));
+  assert.ok(bridge.includes("if (!synthesized && tts.interruptedForSpeech) return true;"));
+});
+
+test("barge-in records the interrupted reply owner on both reply and capture traces", async () => {
+  const start = bridge.indexOf("  const interruptCallPlaybackForSpeech =");
+  const end = bridge.indexOf("\n  const beginBrowserVoiceCapture =", start);
+  assert.ok(start >= 0 && end > start);
+  let settleStop;
+  let stopCalls = 0;
+  const events = [];
+  const reply = {
+    audible: true,
+    trace: { id: "reply-trace" },
+    requestId: "reply-request",
+    interruptForSpeech() {
+      stopCalls += 1;
+      return new Promise((resolve) => { settleStop = resolve; });
+    },
+  };
+  let now = 10;
+  const context = {
+    activeCallPlayback: reply,
+    performance: { now: () => now++ },
+    errorMessage: (error) => error.message,
+    markVoiceLatencyIn: (trace, stage, detail) => events.push({ traceId: trace?.id, stage, detail }),
+  };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(start, end)}\nthis.interrupt = interruptCallPlaybackForSpeech;`, context);
+  const captureTrace = { id: "capture-trace" };
+  context.interrupt({ call: true, trace: captureTrace }, { producer: "browser_capture", onset_sample: 320 });
+
+  assert.equal(stopCalls, 1);
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.equal(event.stage, "barge_in_detected");
+    assert.equal(event.detail.reply_trace_id, "reply-trace");
+    assert.equal(event.detail.reply_request_id, "reply-request");
+  }
+  assert.deepEqual(events.map((event) => event.traceId).sort(), ["capture-trace", "reply-trace"]);
+  assert.equal(events.find((event) => event.traceId === "capture-trace").detail.onset_sample, 320);
+  assert.equal(events.find((event) => event.traceId === "reply-trace").detail.capture_trace_id, "capture-trace");
+
+  settleStop();
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopped = events.filter((event) => event.stage === "barge_in_playback_stopped");
+  assert.equal(stopped.length, 2);
+  assert.ok(stopped.every((event) => event.detail.reply_trace_id === "reply-trace"
+    && event.detail.reply_request_id === "reply-request"));
+  assert.ok(stopped.every((event) => event.detail.duration_ms >= 0));
+  assert.equal(stopped.find((event) => event.traceId === "reply-trace").detail.capture_trace_id, "capture-trace");
 });
 
 test("call generation cannot stall forever or disappear without a visible terminal error", () => {
-  assert.ok(bridge.includes('error.code = "voice_generation_timeout"'));
+  assert.ok(bridge.includes('code = "voice_generation_timeout"'));
+  assert.ok(bridge.includes("error.code = code"));
   assert.ok(bridge.includes('"call_reply_timeout: The contact did not finish answering the call."'));
   assert.ok(bridge.includes('"voice_generation_timeout: The contact stopped making progress while preparing a reply."'));
-  assert.ok(bridge.includes('markVoiceLatency("generation_timeout"'));
+  assert.ok(bridge.includes('markVoiceLatencyIn(recording.trace, "generation_timeout"'));
   assert.ok(bridge.includes('void invoke("mom_llama_chat_cancel", { conversation }).catch(() => {});'));
-  assert.ok(bridge.includes("speculation.generationReleased.then(() => withDeadline("));
+  assert.ok(bridge.includes("speculation.generationReleased.then(() => withProgressDeadline("));
+  assert.ok(bridge.includes("voiceProgressDeadlineExpired({"));
   assert.ok(bridge.includes("speculation.releaseGeneration?.();"));
   assert.ok(bridge.includes('latestAttemptStage("native_audio_finish_failed")'));
   assert.ok(bridge.includes('payload.detail && typeof payload.detail === "object"'));
@@ -1281,6 +1598,28 @@ test("failed voice generation retains partial native audio progress", () => {
   assert.equal(summary.projector_tail_to_decode_ms, 160);
   assert.equal(summary.projector_reader_waits, 19);
   assert.equal(summary.voice_cancel_to_observed_ms, 658.11);
+});
+
+test("decode boundary preserves prefix and projector timing before a reply completes", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const summary = summarize({ stages: [
+    { stage: "speculation_started", elapsed_ms: 100, speculation: "current" },
+    { stage: "native_chat_stream_event", event: "decode_started", elapsed_ms: 4_500,
+      speculation: "current", audio: {
+        accepted_samples: 16_000, consumed_samples: 16_000,
+        prefix_start_us: 100_000, prefix_finish_us: 3_100_000,
+        prefix_us: 3_000_000, prefix_tokens: 2_900, restored_prefix_tokens: 0,
+        projector_us: 900_000, projected_blocks: 25, projected_samples: 16_000,
+        first_projector_start_us: 3_110_000, last_projector_finish_us: 4_050_000,
+        finish_us: 4_100_000, decode_start_us: 4_300_000,
+      } },
+  ] });
+  assert.equal(summary.prompt_prefix_cpu_ms, 3_000);
+  assert.equal(summary.projector_cpu_ms, 900);
+  assert.equal(summary.projector_audio_ms, 1_000);
+  assert.equal(summary.audio_finish_to_decode_ms, 200);
 });
 
 test("voice latency exposes resumed-speech checkpoint and replay cost", () => {
@@ -1323,7 +1662,8 @@ test("voice controls publish play only with proven audio and never inherit a pre
   assert.ok(bridge.includes('button.dataset.audioProof = "pcm-complete"'));
   assert.ok(bridge.includes("!isCanonicalPcmWav(bytes)"));
   assert.ok(bridge.includes("settleUnavailableVoiceReply(button)"));
-  assert.ok(bridge.includes("history.map((frame) => ({ ...frame, data: frame.data.slice() }))"));
+  assert.ok(bridge.includes("chunks.push(...history.map((frame) => ({"));
+  assert.ok(bridge.includes("operationId: null,"), "historical replay audio must not inherit a live TTS owner");
   assert.ok(styles.includes('.voice-message-play[data-audio-state="ready"]::before'));
   assert.ok(styles.includes("background: var(--message-blue);"));
   assert.ok(styles.includes('.voice-message-play[data-audio-state="playing"]::before'));
@@ -1368,6 +1708,10 @@ test("a degraded voice import binds its exact private prompt before dispatch", (
 });
 
 test("the native presentation contains no Skills, cache, engine, or resident-slot panels", () => {
+  const rendererWithApprovedVoiceCheckpointLifecycle = [
+    "mom_llama_kv_cache_checkpoint_voice_session",
+    "mom_llama_kv_cache_set_voice_call_activity",
+  ].reduce((source, command) => source.replaceAll(command, ""), bridge);
   for (const marker of [
     'data-settings-card="skills"',
     'data-settings-card="cache"',
@@ -1404,7 +1748,10 @@ test("the native presentation contains no Skills, cache, engine, or resident-slo
     '"resident-slot-load"',
     '"resident-slot-unload"',
   ]) {
-    assert.ok(!bridge.includes(marker), `forbidden renderer bridge remains: ${marker}`);
+    assert.ok(
+      !rendererWithApprovedVoiceCheckpointLifecycle.includes(marker),
+      `forbidden renderer bridge remains: ${marker}`,
+    );
   }
 
   assert.ok(!index.includes("cache-inspector.js"));
@@ -1417,4 +1764,98 @@ test("the native presentation contains no Skills, cache, engine, or resident-slo
   ]) {
     assert.ok(!styles.includes(marker), `orphaned presentation style remains: ${marker}`);
   }
+});
+
+test("the frontend test command includes every UI test file", () => {
+  const uiRoot = path.join(productRoot, "apps/mom-llama/ui");
+  const packageJson = JSON.parse(read("apps/mom-llama/package.json"));
+  const testCommand = packageJson.scripts["test:frontend"];
+  const configuredUiTests = new Set(
+    testCommand
+      .split(/\s+/)
+      .filter((argument) => argument.startsWith("ui/") && /\.test\.(?:js|cjs)$/.test(argument)),
+  );
+  const discoveredUiTests = fs
+    .readdirSync(uiRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.test\.(?:js|cjs)$/.test(entry.name))
+    .map((entry) => `ui/${entry.name}`);
+  const omittedUiTests = discoveredUiTests.filter((testFile) => !configuredUiTests.has(testFile));
+
+  assert.deepEqual(omittedUiTests, [], "test:frontend must run every UI *.test.js and *.test.cjs file");
+});
+
+
+test("late same-conversation events cannot bind a replacement voice owner", () => {
+  const vm = require("node:vm");
+  const start = bridge.indexOf("      acceptsRequest(candidate");
+  const end = bridge.indexOf("      get button()", start);
+  const method = bridge.slice(start, end).trim().replace(/,$/, "");
+  const retired = new Set(["known-old"]);
+  const context = {
+    stopped: false, requestId: null, clientRequest: "dispatch-new",
+    voiceStreamRequestIds: retired,
+    rememberVoiceStreamRequest: (id) => retired.add(id),
+    reconcileSemanticBackpressure: () => Promise.resolve(),
+  };
+  const owner = vm.runInNewContext(`({${method}})`, context);
+  assert.equal(owner.acceptsRequest("unseen-old", "started", "dispatch-old"), false);
+  assert.equal(owner.acceptsRequest("unseen-old", "started"), false);
+  assert.equal(owner.acceptsRequest("known-old", "started", "dispatch-new"), false);
+  assert.equal(context.requestId, null);
+  assert.equal(owner.acceptsRequest("new-request", "started", "dispatch-new"), true);
+  assert.equal(owner.acceptsRequest("unseen-old", "delta", "dispatch-old"), false);
+  assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), true);
+  context.stopped = true;
+  assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), false);
+});
+
+test("playback renderer summary distinguishes missing drain metrics from drained zero and preserves observed facts", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  assert.ok(start >= 0 && end > start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stopped = summarize({ stages: [{ stage: "playback_renderer", elapsed_ms: 20,
+    worklet: true, worklet_metrics_status: "unreported",
+    worklet_final_metrics_received: false, underruns: null,
+    worklet_recoveries: null, worklet_pcm_signal_frames: null,
+    worklet_pcm_signal_rms: null, worklet_pcm_low_energy_frames: null,
+    worklet_max_queued_frames: 512, worklet_first_render_context_frame: 17,
+  }] });
+  const drained = summarize({ stages: [{ stage: "playback_renderer", elapsed_ms: 20,
+    worklet: true, worklet_metrics_status: "complete",
+    worklet_final_metrics_received: true, underruns: 0,
+    worklet_recoveries: 0, worklet_pcm_signal_frames: 0,
+    worklet_pcm_signal_rms: null, worklet_pcm_low_energy_frames: 0,
+    worklet_max_queued_frames: 512, worklet_first_render_context_frame: 17,
+  }] });
+  assert.equal(stopped.playback_renderer_metrics_complete, false);
+  assert.equal(stopped.playback_renderer_recoveries, null);
+  assert.equal(stopped.playback_renderer_pcm_signal_frames, null);
+  assert.equal(stopped.playback_renderer_pcm_low_energy_frames, null);
+  assert.equal(stopped.playback_renderer_max_queued_frames, 512);
+  assert.equal(stopped.playback_renderer_first_render_context_frame, 17);
+  assert.equal(drained.playback_renderer_metrics_complete, true);
+  assert.equal(drained.playback_renderer_recoveries, 0);
+  assert.equal(drained.playback_renderer_pcm_signal_frames, 0);
+  assert.equal(drained.playback_renderer_pcm_low_energy_frames, 0);
+  assert.equal(drained.playback_renderer_max_queued_frames, 512);
+
+  const compactionStart = bridge.indexOf("  const voiceLatencySummary =");
+  const compactionEnd = bridge.indexOf("\n  const markVoiceLatency =", compactionStart);
+  const context = { TextEncoder, Date, Math, Number, Object, Map, Set,
+    performance: { now: () => 1, timeOrigin: 0 },
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    voiceLatencyPending: new Map(), voiceLatencyHistory: [], voiceLatencyFlushTimer: null,
+    voiceLatencyPersistence: Promise.resolve(), invoke: async () => ({ ok: true }) };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(compactionStart, compactionEnd)}\nglobalThis.__helpers = { compactVoiceLatencySnapshot };`, context);
+  const compacted = JSON.parse(context.__helpers.compactVoiceLatencySnapshot(
+    { id: "unknown-drain", mode: "call", stages: [] },
+    { ...stopped, oversized: "x".repeat(100_000) },
+  ));
+  assert.equal(compacted.summary.playback_renderer_metrics_complete, false);
+  assert.equal(compacted.summary.playback_renderer_recoveries, null);
+  assert.equal(compacted.summary.playback_renderer_pcm_signal_frames, null);
+  assert.equal(compacted.summary.playback_renderer_max_queued_frames, 512);
+  assert.equal(compacted.summary.playback_renderer_first_render_context_frame, 17);
 });

@@ -9,12 +9,129 @@
   const PREFILL_MAX_BLOCK_SAMPLES = 640;
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
+  const voiceProgressDeadlineExpired = ({ now, started, lastProgress, idleMs,
+    maxElapsedMs = 120_000 } = {}) => {
+    const current = Number(now);
+    const start = Number(started);
+    const progress = Number(lastProgress);
+    const idle = Number(idleMs);
+    const maximum = Number(maxElapsedMs);
+    if (![current, start, progress, idle, maximum].every(Number.isFinite)) return true;
+    if (idle < 0 || maximum < 0 || progress < start) return true;
+    return current - start >= maximum || current - progress >= idle;
+  };
+
   const splitPrefillPcm = (samples) => {
     const blocks = [];
     for (let offset = 0; offset < samples.length; offset += PREFILL_MAX_BLOCK_SAMPLES) {
       blocks.push(samples.subarray(offset, offset + PREFILL_MAX_BLOCK_SAMPLES));
     }
     return blocks;
+  };
+
+  const quantizeInferencePcm16 = (samples) => {
+    const pcm16 = new Int16Array(samples.length);
+    const decoded = new Float32Array(samples.length);
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = clamp(Number(samples[index]) || 0, -1, 1);
+      const quantized = clamp(Math.round(sample * 32768), -32768, 32767);
+      pcm16[index] = quantized;
+      decoded[index] = quantized / 32768;
+    }
+    return { pcm16, decoded };
+  };
+
+  const appendInferenceSourceRange = (ranges, start, count) => {
+    if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count <= 0
+        || !Number.isSafeInteger(start + count)) throw new Error("Invalid inference source range");
+    const previous = ranges[ranges.length - 1];
+    if (previous && start < previous.end_exclusive) throw new Error("Inference source ranges overlap");
+    if (previous?.end_exclusive === start) previous.end_exclusive += count;
+    else ranges.push({ start, end_exclusive: start + count });
+  };
+
+  const sliceInferenceSourceRanges = (ranges, offset, count) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(count) || count < 0) {
+      throw new Error("Invalid inference source slice");
+    }
+    const result = [];
+    for (const range of ranges) {
+      const length = range.end_exclusive - range.start;
+      if (offset >= length) { offset -= length; continue; }
+      const take = Math.min(count, length - offset);
+      if (take) appendInferenceSourceRange(result, range.start + offset, take);
+      count -= take;
+      offset = 0;
+      if (!count) break;
+    }
+    if (count) throw new Error("Inference source slice exceeds acknowledged input");
+    return result;
+  };
+
+  const inferenceSourceOffset = (ranges, offset) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !ranges.length) {
+      throw new Error("Invalid inference checkpoint offset");
+    }
+    for (const range of ranges) {
+      const length = range.end_exclusive - range.start;
+      if (offset <= length) return range.start + offset;
+      offset -= length;
+    }
+    throw new Error("Inference checkpoint exceeds acknowledged input");
+  };
+
+  const truncateInferencePcm16 = (recording, sampleCount) => {
+    const target = clamp(Math.floor(Number(sampleCount) || 0), 0,
+      recording.modelInputSampleCount || 0);
+    let remaining = target;
+    const retained = [];
+    for (const part of recording.modelInputPcm16Parts || []) {
+      if (remaining <= 0) break;
+      if (part.length <= remaining) {
+        retained.push(part);
+        remaining -= part.length;
+      } else {
+        retained.push(part.subarray(0, remaining));
+        remaining = 0;
+      }
+    }
+    recording.modelInputPcm16Parts = retained;
+    recording.modelInputSampleCount = target - remaining;
+    if (recording.modelInputSourceRanges) {
+      recording.modelInputSourceRanges = sliceInferenceSourceRanges(
+        recording.modelInputSourceRanges, 0, recording.modelInputSampleCount);
+    }
+  };
+
+  const encodeInferencePcm16Wav = (parts, sampleCount) => {
+    const count = Math.max(0, Math.floor(Number(sampleCount) || 0));
+    const total = (parts || []).reduce((sum, part) => sum + part.length, 0);
+    if (!count || count !== total || count > Math.floor((0xffffffff - 36) / 2)) return null;
+    const buffer = new ArrayBuffer(44 + count * 2);
+    const view = new DataView(buffer);
+    const text = (offset, value) => [...value].forEach((character, index) => view.setUint8(offset + index, character.charCodeAt(0)));
+    text(0, "RIFF"); view.setUint32(4, 36 + count * 2, true); text(8, "WAVE");
+    text(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, 16000, true);
+    view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    text(36, "data"); view.setUint32(40, count * 2, true);
+    let offset = 44;
+    for (const part of parts || []) {
+      for (const sample of part) {
+        view.setInt16(offset, sample, true);
+        offset += 2;
+      }
+    }
+    return new Uint8Array(buffer);
+  };
+
+  const callPrefillRetryDecision = ({ expectedConversation, settledConversation,
+    callActive, expectedEpoch, currentEpoch, captureStarted, recording }) => {
+    if (!callActive || expectedEpoch !== currentEpoch
+        || expectedConversation !== settledConversation) return "stale";
+    if (captureStarted && (!recording?.call || recording.heardVoice
+        || recording.sending || recording.speculation)) return "capture_advanced";
+    return "retry";
   };
 
   const speechThreshold = (noiseFloor) => clamp(
@@ -96,20 +213,100 @@
     candidateMs: 0,
   });
 
+  // WebKit owns acoustic cancellation. This bounded reference matcher stops
+  // correlated residual speaker audio from becoming a false barge-in. It uses
+  // actual rendered output, not TTS text or a guessed volume threshold.
+  const createPlaybackEchoMatcher = () => {
+    const rate = 2_000;
+    const microphone = new Float32Array(80); // 40 ms evidence; no capture delay
+    let written = 0;
+    let pending = 0;
+    let previous = null;
+    let result = null;
+    let lastLag = null;
+    let diagnostic = { status: "unobserved" };
+    return {
+      snapshot() { return { ...diagnostic }; },
+      process(input, inputRate, reference, referenceRate) {
+        if (!reference?.length || !input?.length) return null;
+        // Capture at 48 kHz and playback at 24 kHz both divide this analysis
+        // rate exactly. Unsupported rates retain WebKit's unmodified signal.
+        const stride = inputRate / rate;
+        const referenceStride = referenceRate / rate;
+        if (!Number.isInteger(stride) || !Number.isInteger(referenceStride)) {
+          diagnostic = { status: "unsupported_rate", input_rate_hz: inputRate, reference_rate_hz: referenceRate };
+          return null;
+        }
+        for (const value of input) {
+          pending += value;
+          written += 1;
+          if (written % stride === 0) {
+            microphone.copyWithin(0, 1);
+            microphone[microphone.length - 1] = pending / stride;
+            pending = 0;
+          }
+        }
+        if (written < stride * microphone.length) return null;
+        // Run at 50 Hz, rather than on every 256-frame renderer callback.
+        const epoch = Math.floor(written / (inputRate / 50));
+        if (previous === epoch) return result;
+        previous = epoch;
+        const count = Math.floor(reference.length / referenceStride);
+        const output = new Float32Array(count);
+        for (let i = 0; i < count; i += 1) {
+          let sum = 0;
+          for (let j = 0; j < referenceStride; j += 1) sum += reference[i * referenceStride + j];
+          output[i] = sum / referenceStride;
+        }
+        let power = 0;
+        for (const value of microphone) power += value * value;
+        if (power < 1e-8) return null;
+        let best = 0;
+        let lag = 0;
+        for (let start = 0; start + microphone.length <= count; start += 1) {
+          let cross = 0;
+          let energy = 0;
+          for (let i = 0; i < microphone.length; i += 1) {
+            const value = output[start + i];
+            cross += value * microphone[i];
+            energy += value * value;
+          }
+          const correlation = energy > 1e-8 ? cross * cross / (energy * power) : 0;
+          if (correlation > best) { best = correlation; lag = count - start - microphone.length; }
+        }
+        const stable = lastLag !== null && Math.abs(lag - lastLag) <= rate * .025;
+        diagnostic = {
+          status: best >= .64 ? (stable ? "matched" : "unstable_lag") : "weak_correlation",
+          correlation: Math.sqrt(best),
+          lag_ms: lag * 1000 / rate,
+          stable,
+          microphone_rms: Math.sqrt(power / microphone.length),
+          reference_window_ms: reference.length * 1000 / referenceRate,
+        };
+        lastLag = best >= .64 ? lag : null;
+        result = best >= .64 && stable ? {
+          correlation: Math.sqrt(best),
+          residualRms: Math.sqrt(Math.max(0, power * (1 - best)) / microphone.length),
+        } : null;
+        return result;
+      },
+    };
+  };
+
   const initialPlaybackEchoGuard = () => ({
     playbackMs: 0,
     residualRms: .003,
     aboveMs: 0,
   });
 
-  const updatePlaybackEchoGuard = (guard, rms, durationMs) => {
+  const updatePlaybackEchoGuard = (guard, rms, durationMs, { matchedEcho = true } = {}) => {
     const current = guard || initialPlaybackEchoGuard();
     const level = Math.max(0, Number(rms) || 0);
     const elapsed = Math.max(0, Number(durationMs) || 0);
     current.playbackMs += elapsed;
     const threshold = Math.max(.009, (current.residualRms * 2.8) + .001);
     const warming = current.playbackMs <= 250;
-    if (level < threshold || warming) {
+    if (matchedEcho && level < threshold) {
       // Learn only plausible residual echo. A caller who speaks during the
       // short convergence interval must not teach the guard to reject them.
       if (level < .012) current.residualRms = (current.residualRms * .92) + (level * .08);
@@ -117,12 +314,7 @@
       return { guard: current, suppressed: true, threshold, warming };
     }
     current.aboveMs += elapsed;
-    return {
-      guard: current,
-      suppressed: current.aboveMs < 48,
-      threshold,
-      warming: false,
-    };
+    return { guard: current, suppressed: current.aboveMs < 48, threshold, warming };
   };
 
   const createStreamingMonoResampler = (sourceRate, targetRate = 16000) => {
@@ -325,7 +517,10 @@
           resolveFinal(result);
         }
       } catch (error) {
-        fail(error?.message || "live_transcription_failed");
+        // Tauri rejects commands with strings. Preserve that native reason in
+        // the turn trace so a failed parallel reader is diagnosable while the
+        // saved recording remains the authoritative fallback.
+        fail(error?.message || String(error ?? "live_transcription_failed"));
       } finally {
         running = false;
         if (queue.length && phase !== "failed" && phase !== "complete") schedule();
@@ -344,7 +539,9 @@
         if (phase !== "open") return phase === "failed" ? false : fail("live_transcription_source_after_seal");
         if (!(samples instanceof Float32Array)) return fail("live_transcription_invalid_pcm");
         if (!samples.length) return true;
-        if (accepted + samples.length > 16000 * 29) return fail("live_transcription_too_long");
+        // Keep the browser source bound aligned with the native streaming
+        // reader; a long physical turn must not drop its tail at 29 seconds.
+        if (accepted + samples.length > 16000 * 2 * 60 * 60) return fail("live_transcription_too_long");
         // Includes the in-flight packet and staging, not just queued packets.
         if (accepted - delivered + samples.length > maxQueuedSamples) return fail("live_transcription_overflow");
         if (samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {
@@ -376,15 +573,24 @@
   };
 
   const api = {
+    createPlaybackEchoMatcher,
     createLiveTranscriptionTap,
+    callPrefillRetryDecision,
     analyzeVoiceSamples,
     createStreamingMonoResampler,
     initialPlaybackEchoGuard,
     initialVoiceActivity,
     nextVoiceActivity,
+    quantizeInferencePcm16,
+    appendInferenceSourceRange,
+    sliceInferenceSourceRanges,
+    inferenceSourceOffset,
+    truncateInferencePcm16,
+    encodeInferencePcm16Wav,
     speechThreshold,
     splitPrefillPcm,
     updatePlaybackEchoGuard,
+    voiceProgressDeadlineExpired,
   };
   root.MomVoiceCapturePolicy = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

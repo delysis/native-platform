@@ -65,21 +65,34 @@ fn units<'a>(messages: &'a [Message], context: &'a ScopedChatAttachmentContext) 
         .iter()
         .map(|message| {
             let text = context.text_by_message_id.get(&message.id);
+            let media: &[AttachmentMediaReference] = context
+                .media_by_message_id
+                .get(&message.id)
+                .map_or(&[], Vec::as_slice);
             let mut enriched = message.clone();
             if let Some(text) = text {
-                enriched.content = append_attachment_context(&message.content, text);
+                let text = without_original_media_placeholders(text, media);
+                enriched.content = append_attachment_context(&message.content, &text);
             }
             Unit {
                 source: message,
                 messages: native_context_messages(&enriched, false),
-                media: context
-                    .media_by_message_id
-                    .get(&message.id)
-                    .map_or(&[], Vec::as_slice),
+                media,
                 canonical_text_bytes: text.map_or(0, String::len),
             }
         })
         .collect()
+}
+
+fn without_original_media_placeholders(
+    attachment_text: &str,
+    media: &[AttachmentMediaReference],
+) -> String {
+    media
+        .iter()
+        .fold(attachment_text.to_owned(), |text, reference| {
+            text.replace(&format!("[[native-media:{}]]", reference.media_id), "")
+        })
 }
 
 fn flattened(units: &[Unit<'_>]) -> Vec<ChatMessage> {
@@ -500,7 +513,11 @@ mod tests {
 
     #[test]
     fn attribution_and_attachment_text_remain_in_the_same_original_message_unit() {
-        let mut original = message("answer", "source", "exact answer\r\n");
+        let mut original = message(
+            "answer",
+            "source",
+            "exact answer\r\n[[native-media:caller-authored]]",
+        );
         original.role = MessageRole::Assistant;
         original.attribution = Some(MessageAttribution {
             kind: MessageSpeakerKind::Persona,
@@ -515,10 +532,10 @@ mod tests {
         original.attachment_ids = vec!["attachment".into()];
         let messages = [original.clone()];
         let mut prepared = context();
-        prepared
-            .context
-            .text_by_message_id
-            .insert("answer".into(), "@not-an-invocation\n[source p. 4]".into());
+        prepared.context.text_by_message_id.insert(
+            "answer".into(),
+            "@not-an-invocation\n[source p. 4]\n[[native-media:media-source-image]]".into(),
+        );
         prepared
             .media_by_message_id
             .insert("answer".into(), vec![media("source-image")]);
@@ -531,6 +548,39 @@ mod tests {
             selected[0].messages[1]
                 .content
                 .contains("@not-an-invocation")
+        );
+        assert!(selected[0].messages[1].content.contains("[source p. 4]"));
+        assert!(
+            selected[0].messages[1]
+                .content
+                .contains("[[native-media:caller-authored]]")
+        );
+        assert!(
+            !selected[0].messages[1]
+                .content
+                .contains("[[native-media:media-source-image]]"),
+            "the source occurrence marker is replaced by the consult media payload contract"
+        );
+        let framed = framed(
+            &None,
+            &selected,
+            &[],
+            &boundary(),
+            "addressed",
+            &[],
+            "host",
+            "new",
+        )
+        .expect("frame sanitized source unit");
+        assert!(framed.iter().all(|message| {
+            !message
+                .content
+                .contains("[[native-media:media-source-image]]")
+        }));
+        assert!(
+            framed
+                .iter()
+                .any(|message| { message.content.contains("[[native-media:caller-authored]]") })
         );
         assert_eq!(selected[0].media.len(), 1);
         assert!(std::ptr::eq(selected[0].source, &messages[0]));

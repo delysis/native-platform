@@ -347,6 +347,8 @@ mod tests {
             token_count: 2,
             bytes: (vec![1]).into(),
             token_ids: vec![1, 2],
+            cells: Vec::new(),
+            storage_proof: None,
         });
         let budget = exact_token_batch_cell_budget(&request(vec![
             cached,
@@ -384,6 +386,8 @@ mod tests {
             token_count: 2,
             bytes: (vec![1]).into(),
             token_ids: vec![1, 2],
+            cells: Vec::new(),
+            storage_proof: None,
         });
         assert!(matches!(
             exact_token_batch_cell_budget(&request(vec![invalid_cache])),

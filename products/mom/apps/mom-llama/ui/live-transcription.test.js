@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { createLiveTranscriptionTap } = require("./voice-capture-policy.js");
+const { callPrefillRetryDecision, createLiveTranscriptionTap } = require("./voice-capture-policy.js");
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => {
   let resolve; let reject;
@@ -13,6 +13,18 @@ const deferred = () => {
 const make = (overrides = {}) => createLiveTranscriptionTap({
   turn: "turn-a", capture: "capture-a", send: async () => {},
   finish: async () => ({ text: "Complete final.", final: true }), cancel: async () => {}, ...overrides,
+});
+
+test("a late transcript retries only the same idle call capture", () => {
+  const state = { expectedConversation: "chat-a", settledConversation: "chat-a",
+    callActive: true, expectedEpoch: "call-a", currentEpoch: "call-a",
+    captureStarted: true, recording: { call: true, heardVoice: false, sending: false } };
+  assert.equal(callPrefillRetryDecision(state), "retry");
+  assert.equal(callPrefillRetryDecision({ ...state, recording: { call: true, heardVoice: true } }),
+    "capture_advanced", "a speaking caller continues on the already chosen fallback");
+  assert.equal(callPrefillRetryDecision({ ...state, settledConversation: "chat-b" }), "stale");
+  assert.equal(callPrefillRetryDecision({ ...state, currentEpoch: "call-b" }), "stale");
+  assert.equal(callPrefillRetryDecision({ ...state, callActive: false }), "stale");
 });
 
 test("browser tap coalesces callbacks and delivers source offsets exactly once", async () => {
@@ -28,6 +40,20 @@ test("browser tap coalesces callbacks and delivers source offsets exactly once",
   assert.deepEqual(packets.flatMap((packet) => Array.from(packet.samples)), Array.from(expected));
   assert.deepEqual(sealed, { turn: "turn-a", capture: "capture-a", samples: 1603 });
   assert.equal(tap.metrics().backlog_samples, 0);
+});
+
+test("a spoken turn longer than 29 seconds keeps its complete transcription source", async () => {
+  let delivered = 0;
+  const tap = make({ send: async ({ samples }) => { delivered += samples.length; } });
+  const frame = new Float32Array(640).fill(0.25);
+  for (let index = 0; index < 750; index += 1) {
+    assert.equal(tap.append(frame), true);
+    await tick();
+  }
+  await tap.seal();
+  assert.equal(tap.metrics().phase, "complete");
+  assert.equal(delivered, 480_000);
+  assert.equal(tap.metrics().bridge_accepted_samples, 480_000);
 });
 
 test("delayed transcription leaves capture admission synchronous and final pending", async () => {
@@ -126,6 +152,20 @@ test("invalid PCM and empty turns fail without publishing text", async () => {
   await assert.rejects(invalid.finished, /invalid_pcm/);
   const empty = make();
   await assert.rejects(empty.seal(), /empty/);
+});
+
+test("native string failures retain the reason while audio remains authoritative", async () => {
+  const events = [];
+  const tap = make({
+    finish: async () => { throw "live_transcription_backend_unavailable"; },
+    onTrace: (event) => events.push(event),
+  });
+  tap.append(new Float32Array(640));
+  await assert.rejects(tap.seal(), /live_transcription_backend_unavailable/);
+  await tick();
+  assert.equal(tap.metrics().failure, "live_transcription_backend_unavailable");
+  assert.ok(events.some((event) => event.stage === "failed_audio_retained"
+    && event.failure === "live_transcription_backend_unavailable"));
 });
 
 test("source-bound hook is outside Gemma prefill and seals only at physical browser stop", () => {

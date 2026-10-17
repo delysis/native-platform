@@ -611,6 +611,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
       ["linux", "macos"],
     ],
     [
+      "tests::real_long_resident_prefix_separates_prefill_from_snapshot_export",
+      ["macos"],
+    ],
+    [
       "apple_backend::tests::real_apple_tts_returns_silent_wav_bytes_without_permission",
       ["macos"],
     ],
@@ -644,6 +648,14 @@ test("the only platform-limited tests match their source cfg gates", () => {
     ],
     [
       "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
+      ["macos"],
+    ],
+    [
+      "speech::tests::real_local_saved_voice_transcription_diagnostic",
+      ["macos"],
+    ],
+    [
+      "real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_restart",
       ["macos"],
     ],
   ]);

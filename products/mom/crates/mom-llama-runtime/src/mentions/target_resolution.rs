@@ -140,6 +140,7 @@ mod target_resolution_tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         }
     }
     fn persona(id: &str) -> Conversation {

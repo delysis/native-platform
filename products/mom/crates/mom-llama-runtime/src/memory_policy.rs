@@ -8,11 +8,19 @@ use llama_native_engine::{
 use llama_native_types::NativeModelConfig;
 use std::path::Path;
 
+const TTS_RESIDENT_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 pub(crate) fn prefix_cache_bytes(budget: u64) -> u64 {
     (budget / 16).min(256 * 1024 * 1024)
 }
 pub(crate) fn resident_budget(budget: u64) -> u64 {
     budget.saturating_sub(prefix_cache_bytes(budget))
+}
+
+fn llama_budget(budget: u64) -> Option<u64> {
+    // The installed Qwen ICL weights are about 4.2 GiB on disk. Reserve 5 GiB
+    // for their resident process and runtime headroom before fitting llama.
+    resident_budget(budget).checked_sub(TTS_RESIDENT_RESERVE_BYTES)
 }
 
 pub(crate) fn weights_fit(model: &Path, projector: Option<&Path>, ram: u64) -> bool {
@@ -50,7 +58,7 @@ pub(crate) fn plan_context(config: &NativeModelConfig, budget: u64) -> Option<u3
     context_from_cost(
         fixed,
         per_block,
-        resident_budget(budget),
+        llama_budget(budget)?,
         model_context_capacity(config)?,
     )
 }
@@ -151,5 +159,25 @@ mod tests {
         assert_eq!(context_from_cost(100, 20, 119, 4096), None);
         assert_eq!(context_from_cost(u64::MAX, 20, 1000, 4096), None);
         assert_eq!(resident_budget(1024) + prefix_cache_bytes(1024), 1024);
+        assert_eq!(llama_budget(5 * 1024 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn thirty_two_gib_budget_reserves_tts_and_uses_available_gemma_context() {
+        let gib = 1024_u64.pow(3);
+        let mib = 1024_u64.pow(2);
+        let ram = 32 * gib;
+        let auto_budget = ram - ram.div_ceil(3);
+        let available = llama_budget(auto_budget).expect("32 GiB leaves TTS reserve");
+        // The native log reports 2,688 MiB KV for 8,192 cells, or 168 MiB
+        // per 512-token block. The planner also charges 32 KiB/block for four
+        // sequence metadata lanes. Fixed model + workspace costs use the
+        // logged 6.48 GiB model plus the 3.24 GiB half-model workspace reserve.
+        let fixed = 972 * gib / 100;
+        let per_block = 168 * mib + 512 * 4 * 16;
+        assert_eq!(
+            context_from_cost(fixed, per_block, available, 262_144),
+            Some(19_456)
+        );
     }
 }

@@ -14,7 +14,10 @@ use tokio::sync::{mpsc, watch};
 
 pub(crate) const RATE: u32 = 16_000;
 pub(crate) const PACKET_SAMPLES: usize = 640;
-pub(crate) const MAX_TURN_SAMPLES: usize = RATE as usize * 29;
+// Match the streaming Parakeet backend's two-hour admission budget. The
+// former 29-second app limit ended the parallel reader during ordinary long
+// speech even though the backend could continue consuming it.
+pub(crate) const MAX_TURN_SAMPLES: usize = RATE as usize * 2 * 60 * 60;
 // 2.56 seconds, plus at most one in-flight packet. Overflow fails the whole
 // transcript, never the recording, and never produces a shortened final.
 const QUEUE_PACKETS: usize = 64;
@@ -466,6 +469,10 @@ pub(crate) struct SavedVoiceSource {
 }
 
 impl FinalTranscript {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
     pub(crate) fn from_complete(
         source: SourceReceipt,
         text: String,
@@ -537,6 +544,28 @@ mod tests {
         producer.seal(4).expect("test setup");
         assert_eq!(drain(&mut reader).await, [0.3, 0.4]);
         assert_eq!(reader.source_receipt().expect("test setup").samples, 4);
+    }
+    #[tokio::test]
+    async fn a_long_spoken_turn_delivers_its_final_source_past_29_seconds() {
+        let (mut producer, mut reader) = channel(identity()).expect("test setup");
+        let frame = [0.25; PACKET_SAMPLES];
+        for index in 0..750 {
+            let offset = index * PACKET_SAMPLES;
+            producer
+                .append_at(offset, &frame)
+                .expect("long source accepted");
+            let packet = reader.next().await.expect("reader healthy").expect("frame");
+            assert_eq!(packet.offset, offset);
+            reader.acknowledge(&packet).expect("frame acknowledged");
+        }
+        producer
+            .seal(750 * PACKET_SAMPLES)
+            .expect("complete source");
+        assert!(reader.next().await.expect("reader healthy").is_none());
+        assert_eq!(
+            reader.source_receipt().expect("final receipt").samples,
+            480_000
+        );
     }
     #[tokio::test]
     async fn delayed_consumer_and_full_queue_seal_deliver_every_sample_once() {

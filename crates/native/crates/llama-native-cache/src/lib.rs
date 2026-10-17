@@ -5,10 +5,9 @@
 //! fingerprint that encrypted persistent stores must bind.
 
 use llama_native_types::{
-    PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob,
+    PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob, SequenceStateCell,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -69,13 +68,15 @@ pub struct PrefixCacheMetadata {
     pub label: String,
     pub fingerprint: CacheFingerprint,
     pub token_ids: Vec<i32>,
-    pub token_sha256: String,
     pub state_bytes: usize,
     pub created_at_ms: u128,
     pub last_used_at_ms: u128,
     pub state: CacheEntryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconstruction: Option<SequenceReconstruction>,
+    /// Complete mixed prompt identity. Empty retains text-only cache metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<SequenceStateCell>,
 }
 
 impl PrefixCacheMetadata {
@@ -89,7 +90,6 @@ impl PrefixCacheMetadata {
         now_ms: u128,
     ) -> Self {
         let id = id.into();
-        let token_sha256 = token_sha256(&token_ids);
         Self {
             label: id.clone(),
             id,
@@ -97,19 +97,19 @@ impl PrefixCacheMetadata {
             owner_id: None,
             fingerprint,
             token_ids,
-            token_sha256,
             state_bytes,
             created_at_ms: now_ms,
             last_used_at_ms: now_ms,
             state: CacheEntryState::Ready,
             reconstruction: None,
+            cells: Vec::new(),
         }
     }
 
     /// Reconstruct without reading the potentially large native spill object.
     #[must_use]
     pub fn replay_value(&self) -> Option<PrefixCacheValue> {
-        if !self.is_valid() {
+        if !self.is_valid() || !self.cells.is_empty() {
             return None;
         }
         let sequence = self
@@ -136,9 +136,8 @@ impl PrefixCacheMetadata {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.state == CacheEntryState::Ready
-            && !self.token_ids.is_empty()
+            && (!self.token_ids.is_empty() || !self.cells.is_empty())
             && self.state_bytes > 0
-            && self.token_sha256 == token_sha256(&self.token_ids)
     }
 }
 
@@ -151,14 +150,39 @@ pub struct PrefixCacheValue {
 impl PrefixCacheValue {
     /// Bind the small disk index to the exported snapshot once, at publication.
     pub fn bind_reconstruction(&mut self) {
+        self.metadata.cells.clone_from(&self.sequence.cells);
         self.metadata.reconstruction = Some(self.sequence.reconstruction());
     }
 
     #[must_use]
     pub fn is_valid(&self) -> bool {
+        let leading_text: Vec<i32> = self
+            .sequence
+            .cells
+            .iter()
+            .take_while(|cell| matches!(cell, SequenceStateCell::Text(_)))
+            .filter_map(|cell| match cell {
+                SequenceStateCell::Text(token) => Some(*token),
+                _ => None,
+            })
+            .collect();
         self.metadata.is_valid()
-            && self.sequence.token_count == self.metadata.token_ids.len()
+            && self.sequence.token_count
+                == if self.sequence.cells.is_empty() {
+                    self.metadata.token_ids.len()
+                } else {
+                    self.sequence.cells.len()
+                }
             && self.sequence.token_ids == self.metadata.token_ids
+            && self.sequence.cells == self.metadata.cells
+            && (self.sequence.cells.is_empty() || self.sequence.token_ids == leading_text)
+            && self
+                .metadata
+                .reconstruction
+                .as_ref()
+                .is_none_or(|reconstruction| {
+                    reconstruction.token_replay_allowed == self.sequence.cells.is_empty()
+                })
             && self.sequence.bytes.len() == self.metadata.state_bytes
     }
 }
@@ -216,6 +240,18 @@ pub fn longest_compatible_prefix_for_owner(
     )
 }
 
+/// Number of evaluated positions shared with a new prompt. Leave the final
+/// token live so generation has logits even for an entirely cached prompt.
+#[must_use]
+pub fn common_prefix_tokens(cached: &[i32], prompt: &[i32]) -> usize {
+    cached
+        .iter()
+        .zip(prompt)
+        .take(prompt.len().saturating_sub(1))
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 #[must_use]
 pub fn longest_compatible_prefix_for_scope(
     entries: &[PrefixCacheMetadata],
@@ -229,13 +265,16 @@ pub fn longest_compatible_prefix_for_scope(
             entry.is_valid()
                 && &entry.fingerprint == fingerprint
                 && owner_scope.matches(entry.owner_id.as_deref())
-                && entry.token_ids.len() < prompt_token_ids.len()
-                && prompt_token_ids.starts_with(&entry.token_ids)
         })
-        .max_by(|left, right| {
-            left.token_ids
-                .len()
-                .cmp(&right.token_ids.len())
+        .map(|entry| {
+            (
+                entry,
+                common_prefix_tokens(&entry.token_ids, prompt_token_ids),
+            )
+        })
+        .filter(|(_, matched)| *matched > 0)
+        .max_by(|(left, l), (right, r)| {
+            l.cmp(r)
                 .then_with(|| {
                     left.tier
                         .lookup_priority()
@@ -244,11 +283,11 @@ pub fn longest_compatible_prefix_for_scope(
                 .then_with(|| left.last_used_at_ms.cmp(&right.last_used_at_ms))
                 .then_with(|| left.id.cmp(&right.id))
         })
-        .map(|entry| CacheMatch {
+        .map(|(entry, matched)| CacheMatch {
             id: entry.id.clone(),
             tier: entry.tier,
-            matched_tokens: entry.token_ids.len(),
-            exact: entry.token_ids.len().saturating_add(1) == prompt_token_ids.len(),
+            matched_tokens: matched,
+            exact: matched + 1 == prompt_token_ids.len(),
         })
 }
 
@@ -311,12 +350,12 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         label,
         fingerprint,
         token_ids,
-        token_sha256,
         state_bytes: _,
         created_at_ms: _,
         last_used_at_ms: _,
         state: _,
         reconstruction,
+        cells: metadata_cells,
     } = metadata;
     let CacheFingerprint {
         prompt_form: _,
@@ -340,12 +379,14 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         token_count: _,
         bytes,
         token_ids: sequence_tokens,
+        cells,
+        storage_proof: _,
     } = sequence;
     let reconstruction_bytes = match reconstruction {
         Some(SequenceReconstruction {
             sequence_id: _,
             header,
-            export_receipt: _,
+            token_replay_allowed: _,
         }) => header.capacity(),
         None => 0,
     };
@@ -359,11 +400,17 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         id.capacity(),
         owner_id.as_ref().map_or(0, String::capacity),
         label.capacity(),
-        token_sha256.capacity(),
         token_ids.capacity().checked_mul(size_of::<i32>())?,
         sequence_tokens.capacity().checked_mul(size_of::<i32>())?,
+        cells
+            .capacity()
+            .checked_mul(size_of::<llama_native_types::SequenceStateCell>())?,
+        metadata_cells
+            .capacity()
+            .checked_mul(size_of::<llama_native_types::SequenceStateCell>())?,
         bytes.capacity(),
         reconstruction_bytes,
+        sequence.storage_proof_metadata_bytes(),
         lora_adapters_sha256
             .capacity()
             .checked_mul(size_of::<String>())?,
@@ -536,29 +583,26 @@ impl MemoryPrefixCache {
         self.values
             .values()
             .filter(|cached| {
-                let entry = &cached.value.metadata;
-                &entry.fingerprint == fingerprint
-                    && owner_scope.matches(entry.owner_id.as_deref())
-                    && entry.token_ids.len() < prompt_token_ids.len()
-                    && prompt_token_ids.starts_with(&entry.token_ids)
+                &cached.value.metadata.fingerprint == fingerprint
+                    && owner_scope.matches(cached.value.metadata.owner_id.as_deref())
             })
-            .max_by(|left, right| {
-                left.value
-                    .metadata
-                    .token_ids
-                    .len()
-                    .cmp(&right.value.metadata.token_ids.len())
+            .map(|cached| {
+                (
+                    cached,
+                    common_prefix_tokens(&cached.value.metadata.token_ids, prompt_token_ids),
+                )
+            })
+            .filter(|(_, matched)| *matched > 0)
+            .max_by(|(left, l), (right, r)| {
+                l.cmp(r)
                     .then_with(|| left.last_used_at_ms.cmp(&right.last_used_at_ms))
                     .then_with(|| left.value.metadata.id.cmp(&right.value.metadata.id))
             })
-            .map(|cached| {
-                let entry = &cached.value.metadata;
-                CacheMatch {
-                    id: entry.id.clone(),
-                    tier: entry.tier,
-                    matched_tokens: entry.token_ids.len(),
-                    exact: entry.token_ids.len().saturating_add(1) == prompt_token_ids.len(),
-                }
+            .map(|(cached, matched)| CacheMatch {
+                id: cached.value.metadata.id.clone(),
+                tier: cached.value.metadata.tier,
+                matched_tokens: matched,
+                exact: matched + 1 == prompt_token_ids.len(),
             })
     }
 
@@ -637,15 +681,6 @@ impl MemoryPrefixCache {
     }
 }
 
-#[must_use]
-pub fn token_sha256(token_ids: &[i32]) -> String {
-    let mut hasher = Sha256::new();
-    for token in token_ids {
-        hasher.update(token.to_le_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,8 +726,41 @@ mod tests {
                 token_count: tokens.len(),
                 bytes: (vec![7; bytes]).into(),
                 token_ids: tokens.to_vec(),
+                cells: Vec::new(),
+                storage_proof: None,
             },
         }
+    }
+
+    #[test]
+    fn mixed_cells_round_trip_without_token_replay_authority() {
+        let mut value = value("mixed", CacheTier::SessionPersistent, &[7], 128, 1);
+        value.sequence.token_count = 3;
+        value.sequence.cells = vec![
+            SequenceStateCell::Text(7),
+            SequenceStateCell::Media {
+                digest: [0x41; 32],
+                chunk: 1,
+                offset: 640,
+            },
+            SequenceStateCell::AudioFrame { digest: [0x42; 32] },
+        ];
+        value.bind_reconstruction();
+        assert_eq!(
+            value
+                .metadata
+                .reconstruction
+                .as_ref()
+                .map(|reconstruction| reconstruction.token_replay_allowed),
+            Some(false)
+        );
+        assert!(value.is_valid());
+
+        let encoded = serde_json::to_vec(&value).expect("serialize mixed native value");
+        let decoded: PrefixCacheValue = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, value);
+        assert!(decoded.metadata.replay_value().is_none());
+        assert!(decoded.is_valid());
     }
 
     fn owned_value(
@@ -848,17 +916,16 @@ mod tests {
     }
 
     #[test]
-    fn revised_persona_prompt_cannot_reuse_a_stale_incompatible_prefix() {
+    fn revised_persona_prompt_reuses_only_its_exact_common_prefix() {
         let stale = value("persona-v1", CacheTier::PersonaPack, &[10, 20, 30], 3, 1).metadata;
-        assert!(
-            longest_compatible_prefix(
-                std::slice::from_ref(&stale),
-                &fingerprint(),
-                &[10, 20, 31, 40],
-            )
-            .is_none(),
-            "a changed persona token must invalidate the old cached prefix"
-        );
+        let revised = longest_compatible_prefix(
+            std::slice::from_ref(&stale),
+            &fingerprint(),
+            &[10, 20, 31, 40],
+        )
+        .expect("the unchanged leading tokens remain reusable");
+        assert_eq!(revised.matched_tokens, 2);
+        assert!(!revised.exact);
         let compatible = longest_compatible_prefix(
             std::slice::from_ref(&stale),
             &fingerprint(),
@@ -867,6 +934,34 @@ mod tests {
         .expect("an unchanged prefix may be extended safely");
         assert_eq!(compatible.id, "persona-v1");
         assert_eq!(compatible.matched_tokens, 3);
+    }
+
+    #[test]
+    fn longest_shared_prefix_beats_a_longer_stored_entry() {
+        let longer_but_divergent = value(
+            "long-stale",
+            CacheTier::PersonaPack,
+            &[1, 2, 99, 4, 5, 6],
+            3,
+            10,
+        )
+        .metadata;
+        let shorter_and_matching = value(
+            "short-match",
+            CacheTier::SessionPersistent,
+            &[1, 2, 3, 4, 5],
+            3,
+            1,
+        )
+        .metadata;
+        let matched = longest_compatible_prefix(
+            &[longer_but_divergent, shorter_and_matching],
+            &fingerprint(),
+            &[1, 2, 3, 4, 5, 6],
+        )
+        .expect("a compatible cached prefix exists");
+        assert_eq!(matched.id, "short-match");
+        assert_eq!(matched.matched_tokens, 5);
     }
 
     #[test]
@@ -981,7 +1076,7 @@ mod tests {
     fn corrupt_metadata_or_state_never_enters_memory_cache() {
         let mut cache = MemoryPrefixCache::new(64);
         let mut corrupt = value("corrupt", CacheTier::PersonaPack, &[1, 2], 4, 1);
-        corrupt.metadata.token_sha256 = "wrong".to_string();
+        corrupt.metadata.token_ids[0] = 99;
         assert_eq!(cache.insert(corrupt), CacheInsertOutcome::InvalidRejected);
         assert!(cache.is_empty());
     }

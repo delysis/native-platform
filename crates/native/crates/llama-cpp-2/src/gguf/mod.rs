@@ -6,6 +6,9 @@
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
+use std::slice;
+
+const MAX_TYPED_ARRAY_ITEMS: usize = 1_048_576;
 
 /// A safe wrapper around `gguf_context`.
 ///
@@ -60,6 +63,60 @@ impl GgufContext {
         unsafe { llama_cpp_sys_2::gguf_get_kv_type(self.ctx.as_ptr(), idx) }
     }
 
+    /// Return the element type of an array-valued metadata entry.
+    pub fn array_type(&self, idx: i64) -> Option<llama_cpp_sys_2::gguf_type> {
+        self.valid_array_len(idx)?;
+        Some(unsafe { llama_cpp_sys_2::gguf_get_arr_type(self.ctx.as_ptr(), idx) })
+    }
+
+    /// Copy a bounded `int32` metadata array into Rust-owned memory.
+    pub fn val_array_i32(&self, idx: i64) -> Option<Vec<i32>> {
+        let len = self.valid_array_len(idx)?;
+        if unsafe { llama_cpp_sys_2::gguf_get_arr_type(self.ctx.as_ptr(), idx) }
+            != llama_cpp_sys_2::GGUF_TYPE_INT32
+        {
+            return None;
+        }
+        let data = unsafe { llama_cpp_sys_2::gguf_get_arr_data(self.ctx.as_ptr(), idx) };
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        if data.is_null() {
+            return None;
+        }
+        // The checked GGUF element type guarantees aligned i32 storage, and
+        // the GGUF context owns this array for the duration of the copy.
+        Some(unsafe { slice::from_raw_parts(data.cast::<i32>(), len) }.to_vec())
+    }
+
+    /// Copy a bounded `bool` metadata array into Rust-owned memory.
+    pub fn val_array_bool(&self, idx: i64) -> Option<Vec<bool>> {
+        let len = self.valid_array_len(idx)?;
+        if unsafe { llama_cpp_sys_2::gguf_get_arr_type(self.ctx.as_ptr(), idx) }
+            != llama_cpp_sys_2::GGUF_TYPE_BOOL
+        {
+            return None;
+        }
+        let data = unsafe { llama_cpp_sys_2::gguf_get_arr_data(self.ctx.as_ptr(), idx) };
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        if data.is_null() {
+            return None;
+        }
+        // Read bool storage as bytes first so malformed metadata cannot create
+        // an invalid Rust `bool` value through the FFI boundary.
+        let values = unsafe { slice::from_raw_parts(data.cast::<u8>(), len) };
+        values
+            .iter()
+            .map(|value| match value {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Read a `uint32` value. Panics (inside llama.cpp) if the stored type is
     /// not `GGUF_TYPE_UINT32` — check `kv_type` first if unsure.
     pub fn val_u32(&self, idx: i64) -> u32 {
@@ -89,6 +146,14 @@ impl GgufContext {
     /// Total number of tensors described in the file.
     pub fn n_tensors(&self) -> i64 {
         unsafe { llama_cpp_sys_2::gguf_get_n_tensors(self.ctx.as_ptr()) }
+    }
+
+    fn valid_array_len(&self, idx: i64) -> Option<usize> {
+        if idx < 0 || idx >= self.n_kv() || self.kv_type(idx) != llama_cpp_sys_2::GGUF_TYPE_ARRAY {
+            return None;
+        }
+        let len = unsafe { llama_cpp_sys_2::gguf_get_arr_n(self.ctx.as_ptr(), idx) };
+        (len <= MAX_TYPED_ARRAY_ITEMS).then_some(len)
     }
 }
 

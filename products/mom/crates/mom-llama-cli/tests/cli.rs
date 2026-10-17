@@ -213,6 +213,19 @@ fn cache_policy_cli_uses_plain_names() -> Result<()> {
 }
 
 #[test]
+fn voice_persona_cache_preparation_is_cli_exercisable() -> Result<()> {
+    let root = data_dir("voice-persona-cache-help")?;
+    let output = cli(&root, &["kv-cache", "prepare-voice", "--help"])?;
+    anyhow::ensure!(output.status.success(), "prepare-voice help should parse");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--persona"),
+        "help should expose the persona selector"
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_imports_long_paste_directly_into_encrypted_storage() -> Result<()> {
     let root = data_dir("paste-attachment")?;
     let marker = "private-cli-paste-4271 ".repeat(120);

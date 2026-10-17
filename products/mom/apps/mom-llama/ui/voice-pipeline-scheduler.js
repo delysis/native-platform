@@ -5,6 +5,52 @@
 }(typeof globalThis === "object" ? globalThis : this, () => {
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
+  const shouldRunCallTranscriptSlot = ({
+    generationComplete = false,
+    playbackSafe = false,
+    qwenIdle = false,
+    captureUnattached = false,
+    callerVoiced = false,
+    parakeetResident = false,
+    transcriptSlotActive = false,
+    disabled = false,
+  } = {}) => generationComplete && playbackSafe && qwenIdle && captureUnattached
+    && !callerVoiced && parakeetResident && !transcriptSlotActive && !disabled;
+
+  // A cold/missing Parakeet model skips this one opportunity. Only a slow
+  // acknowledged preemption is evidence that future in-call slots are unsafe.
+  const shouldDisableCallTranscriptSlotsAfterStop = (elapsedMs) =>
+    Number.isFinite(elapsedMs) && elapsedMs > 500;
+
+  const canContinueVoiceHistoryRecovery = ({
+    suspended = false,
+    foregroundDispatch = false,
+    callActive = false,
+    callPreparing = false,
+    recording = false,
+  } = {}) => !suspended && !foregroundDispatch && !callActive && !callPreparing && !recording;
+
+  const shouldWaitForVoiceHistoryRecovery = ({ operation = null, stage = "idle" } = {}) =>
+    Boolean(operation) || stage === "recording_commit";
+
+  const createCallTranscriptIntent = ({ conversation, output, fallbackAttachment, sourceTrace }) => {
+    const attachment = output?.voice_attachment_id || fallbackAttachment || null;
+    const messageId = output?.user_message_id || null;
+    if (!conversation || !attachment || !messageId) return null;
+    return {
+      conversation,
+      output: { voice_attachment_id: attachment, user_message_id: messageId },
+      fallbackAttachment: fallbackAttachment || null,
+      sourceTrace: sourceTrace || null,
+    };
+  };
+
+  const enqueueCallTranscriptIntent = (queue, intent, limit = 64) => {
+    if (!intent || queue.length >= limit) return false;
+    queue.push(intent);
+    return true;
+  };
+
   class AdaptiveVoiceLeadController {
     constructor({
       startupMs = 120,
@@ -19,6 +65,10 @@
       initialProductionRtf = 0.7,
       initialSpeechMsPerWord = 400,
       initialUnderrunPenaltyMs = 0,
+      initialSlowSegmentCount = 0,
+      initialHealthySegmentCount = 0,
+      initialBufferComplete = false,
+      initialProbePending = false,
       minimumTargetMs = 180,
       maximumTargetMs = 1_200,
     } = {}) {
@@ -33,6 +83,11 @@
       this.minimumTargetMs = minimumTargetMs;
       this.maximumTargetMs = maximumTargetMs;
       this.underrunPenaltyMs = initialUnderrunPenaltyMs;
+      this.slowSegmentCount = initialSlowSegmentCount;
+      this.healthySegmentCount = initialHealthySegmentCount;
+      this.bufferComplete = initialBufferComplete;
+      this.probePending = initialProbePending;
+      this.replySegmentCount = 0;
       this.waits = 0;
       this.waitMs = 0;
       this.maximumRunwayMs = 0;
@@ -67,9 +122,44 @@
       if (Number.isFinite(firstAudioMs) && firstAudioMs > 0) {
         this.firstAudioMs = this.firstAudioMs * 0.7 + firstAudioMs * 0.3;
       }
-      if (Number.isFinite(synthesisMs) && Number.isFinite(audioMs) && audioMs > 0) {
+      if (Number.isFinite(synthesisMs) && synthesisMs >= 0 && Number.isFinite(audioMs) && audioMs > 0) {
         const observed = clamp(synthesisMs / audioMs, 0.05, 4);
         this.productionRtf = this.productionRtf * 0.7 + observed * 0.3;
+        if (this.probePending) {
+          this.probePending = false;
+          // A complete first segment provides measured production speed and
+          // real audio runway. Only a clearly healthy producer may start the
+          // cold call early; slow/unknown output retains full-reply buffering.
+          if (synthesisMs >= 0 && observed <= 0.85
+              && Number.isFinite(firstAudioMs) && firstAudioMs > 0
+              && audioMs >= Math.max(1_000, firstAudioMs * 2, this.targetRunwayMs() * 2)
+              && this.requiredStartupDelayMs <= 250 && this.underrunPenaltyMs === 0) {
+            this.bufferComplete = false;
+            this.healthySegmentCount = 0;
+            this.slowSegmentCount = 0;
+          }
+        }
+        if (this.bufferComplete) {
+          if (observed <= 0.85) {
+            this.healthySegmentCount += 1;
+            if (this.healthySegmentCount >= 2) {
+              this.bufferComplete = false;
+              this.slowSegmentCount = 0;
+              this.healthySegmentCount = 0;
+            }
+          } else {
+            this.healthySegmentCount = 0;
+          }
+        } else if (observed >= 1.05) {
+          this.slowSegmentCount += 1;
+          if ((this.replySegmentCount === 0 && observed >= 1.4) || this.slowSegmentCount >= 2) {
+            this.bufferComplete = true;
+            this.healthySegmentCount = 0;
+          }
+        } else if (observed <= 0.85) {
+          this.slowSegmentCount = 0;
+        }
+        this.replySegmentCount += 1;
       }
       if (Number.isFinite(words) && words > 0 && Number.isFinite(audioMs) && audioMs > 0) {
         const observed = clamp(audioMs / words, 180, 900);
@@ -154,20 +244,18 @@
       return bufferedMs >= Math.max(240, this.targetRunwayMs());
     }
 
-    chunkWordLimit({ first = false, bufferedMs = 0 } = {}) {
-      if (first) return 4;
-      const runway = Number.isFinite(bufferedMs) ? Math.max(0, bufferedMs) : 0;
-      const missingLeadMs = Math.max(0, this.targetRunwayMs() - runway);
-      // Each TTS invocation pays a first-audio/switching cost. Ask for enough
-      // speech to amortize roughly six such costs, but cap the net lead a fast
-      // producer can add before the scheduler gets another decision point.
-      const switchingQuantumMs = Math.max(1_200, this.firstAudioMs * 6);
-      const desiredLeadMs = Math.max(300, missingLeadMs + this.underrunPenaltyMs);
-      const leadGainPerWordMs = this.speechMsPerWord
-        * Math.max(0.05, 1 - Math.min(this.productionRtf, 0.95));
-      const switchingWords = Math.ceil(switchingQuantumMs / this.speechMsPerWord);
-      const leadWords = Math.ceil(desiredLeadMs / leadGainPerWordMs);
-      return Math.round(clamp(Math.max(switchingWords, leadWords), 4, 16));
+    shouldBufferCompleteReply() {
+      return this.bufferComplete;
+    }
+
+    progressTimeoutMs() {
+      // Allow a cold/slower machine proportionally more time when its observed
+      // first audio or packet cadence is high, while retaining a hard bound.
+      return Math.round(clamp(
+        Math.max(20_000, this.firstAudioMs * 8, this.maximumPacketGapMs * 8),
+        20_000,
+        60_000,
+      ));
     }
 
     noteWait(durationMs) {
@@ -188,6 +276,10 @@
         observed_max_packet_gap_ms: Math.round(this.maximumPacketGapMs * 100) / 100,
         observed_max_boundary_gap_ms: Math.round(this.maximumBoundaryGapMs * 100) / 100,
         observed_production_rtf: Math.round(this.productionRtf * 10_000) / 10_000,
+        buffer_complete_reply: this.bufferComplete,
+        startup_probe_pending: this.probePending,
+        slow_segment_count: this.slowSegmentCount,
+        healthy_segment_count: this.healthySegmentCount,
         observed_speech_ms_per_word: Math.round(this.speechMsPerWord * 100) / 100,
         underrun_penalty_ms: Math.round(this.underrunPenaltyMs * 100) / 100,
         waits: this.waits,
@@ -206,6 +298,10 @@
         initialProductionRtf: this.productionRtf,
         initialSpeechMsPerWord: this.speechMsPerWord,
         initialUnderrunPenaltyMs: this.underrunPenaltyMs,
+        initialSlowSegmentCount: this.slowSegmentCount,
+        initialHealthySegmentCount: this.healthySegmentCount,
+        initialBufferComplete: this.bufferComplete,
+        initialProbePending: this.probePending,
         minimumTargetMs: this.minimumTargetMs,
         maximumTargetMs: this.maximumTargetMs,
       };
@@ -242,5 +338,14 @@
     }
   }
 
-  return { AdaptiveVoiceLeadController, SemanticLeadController };
+  return {
+    AdaptiveVoiceLeadController,
+    SemanticLeadController,
+    shouldRunCallTranscriptSlot,
+    shouldDisableCallTranscriptSlotsAfterStop,
+    canContinueVoiceHistoryRecovery,
+    shouldWaitForVoiceHistoryRecovery,
+    createCallTranscriptIntent,
+    enqueueCallTranscriptIntent,
+  };
 }));

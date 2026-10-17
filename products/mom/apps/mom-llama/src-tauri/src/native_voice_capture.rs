@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -10,10 +11,13 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, after, bounded, never, s
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::live_transcription::{IngressFailure, IngressMetrics, PACKET_SAMPLES, PcmProducer};
+use crate::live_transcription::{
+    IngressFailure, IngressMetrics, MAX_TURN_SAMPLES, PACKET_SAMPLES, PcmProducer,
+};
 
 const OUTPUT_RATE: u32 = 16_000;
-const MAX_SAMPLES: usize = OUTPUT_RATE as usize * 29;
+const MAX_SAMPLES: usize = MAX_TURN_SAMPLES;
+const INITIAL_CAPTURE_CAPACITY_SAMPLES: usize = OUTPUT_RATE as usize * 29;
 const PRE_ROLL_SAMPLES: usize = OUTPUT_RATE as usize / 5;
 // Match the resident model's 40 ms audio-projector frame. The capture owner
 // can retain a much longer utterance, but every live or replay publication
@@ -147,6 +151,8 @@ type EventSink = Arc<dyn Fn(CaptureEvent) + Send + Sync>;
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct CaptureMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inference_derivative_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transcription_ingress: Option<IngressMetrics>,
     pub(crate) source_rate_hz: u32,
     pub(crate) requested_buffer_frames: u32,
@@ -221,8 +227,18 @@ pub(crate) struct PrepareMetrics {
 #[derive(Debug)]
 pub(crate) struct CaptureOutput {
     pub(crate) wav: Vec<u8>,
+    pub(crate) inference_wav: Option<Vec<u8>>,
+    pub(crate) inference_source_sample_count: u64,
+    pub(crate) inference_accepted_sample_count: u64,
+    pub(crate) inference_source_ranges: Vec<InferenceSourceRange>,
     pub(crate) heard_voice: bool,
     pub(crate) metrics: CaptureMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct InferenceSourceRange {
+    pub(crate) start: u64,
+    pub(crate) end_exclusive: u64,
 }
 
 #[derive(Debug, Error)]
@@ -253,6 +269,8 @@ pub(crate) enum NativeVoiceCaptureError {
     Stream(String),
     #[error("audio arrived faster than the bounded native capture could consume it")]
     QueueOverflow,
+    #[error("the recorded voice exceeded the supported two-hour duration")]
+    TooLong,
     #[error("the native voice capture controller is unavailable: {0}")]
     ControllerUnavailable(String),
     #[error("the native voice capture owner stopped unexpectedly")]
@@ -439,6 +457,8 @@ struct Active {
     pre_roll: VecDeque<f32>,
     settle_samples_remaining: usize,
     samples: Vec<f32>,
+    inference_ledger: AcceptedSourceLedger,
+    capture_too_long: bool,
     // First retained sample not yet published to the current model ring.
     // Keeping a cursor into `samples` avoids a second staging copy for every
     // microphone sample while preserving bounded 10 ms publications.
@@ -967,6 +987,10 @@ impl Active {
             .pre_roll
             .len()
             .min(MAX_SAMPLES.saturating_sub(self.samples.len()));
+        if count < self.pre_roll.len() {
+            self.mark_capture_too_long();
+            return;
+        }
         let start = self.samples.len();
         let copy_started = Instant::now();
         self.samples.extend(self.pre_roll.drain(..count));
@@ -982,6 +1006,9 @@ impl Active {
     }
 
     fn append_content(&mut self, samples: &[f32], prefill: bool) {
+        if self.capture_too_long {
+            return;
+        }
         if !prefill && self.target.is_some() && self.terminal_error.is_none() {
             // Publish everything through the content boundary *before* adding
             // this retention-only tail. The old order appended a 1 ms silence
@@ -993,23 +1020,19 @@ impl Active {
             let _ = self.flush_prefill();
         }
         let available = MAX_SAMPLES.saturating_sub(self.samples.len());
-        if samples.len() > available
-            && let Some(source) = &mut self.transcription
-        {
-            // The existing recording cap remains unchanged, but a transcript
-            // must not silently certify a source whose physical tail was lost.
-            source.reject(IngressFailure::TooLong);
+        if samples.len() > available {
+            self.mark_capture_too_long();
+            return;
         }
-        let kept = &samples[..samples.len().min(available)];
         let copy_started = Instant::now();
-        self.samples.extend_from_slice(kept);
+        self.samples.extend_from_slice(samples);
         self.publish_transcription();
         self.record_retained_copy(copy_started);
         if !prefill {
             self.metrics.retained_only_samples = self
                 .metrics
                 .retained_only_samples
-                .saturating_add(kept.len() as u64);
+                .saturating_add(samples.len() as u64);
         }
         if prefill && self.target.is_some() && self.terminal_error.is_none() {
             if self.samples.len().saturating_sub(self.prefill_cursor) >= PREFILL_BATCH_SAMPLES {
@@ -1021,6 +1044,21 @@ impl Active {
             // `samples` if speech resumes.
             self.prefill_cursor = self.samples.len();
         }
+    }
+
+    fn mark_capture_too_long(&mut self) {
+        if self.capture_too_long {
+            return;
+        }
+        self.capture_too_long = true;
+        if let Some(source) = &mut self.transcription {
+            source.reject(IngressFailure::TooLong);
+        }
+        self.emit(
+            CaptureEventKind::Failed,
+            0.0,
+            Some(NativeVoiceCaptureError::TooLong.to_string()),
+        );
     }
 
     fn publish_transcription(&mut self) {
@@ -1044,15 +1082,19 @@ impl Active {
             return Ok(());
         };
         loop {
-            let publication =
-                match publish_retained(&self.samples, &mut self.prefill_cursor, target) {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        self.terminal_error = Some(error.clone());
-                        self.emit(CaptureEventKind::Failed, 0.0, Some(error.clone()));
-                        return Err(NativeVoiceCaptureError::Prefill(error));
-                    }
-                };
+            let publication = match publish_retained_tracked(
+                &self.samples,
+                &mut self.prefill_cursor,
+                target,
+                &mut self.inference_ledger,
+            ) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.terminal_error = Some(error.clone());
+                    self.emit(CaptureEventKind::Failed, 0.0, Some(error.clone()));
+                    return Err(NativeVoiceCaptureError::Prefill(error));
+                }
+            };
             let Some(publication) = publication else {
                 break;
             };
@@ -1159,20 +1201,27 @@ impl Active {
                 ..RetargetMetrics::default()
             });
         }
-        let replay_samples = retained_replay(&self.samples, sample_offset)?;
+        let (source_cursor, replay_receipts) = match replay_retained_source(
+            &self.samples,
+            &mut self.inference_ledger,
+            &target,
+            sample_offset,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.target = None;
+                self.terminal_error = Some(error.to_string());
+                return Err(error);
+            }
+        };
         let mut metrics = RetargetMetrics {
-            replay_samples: replay_samples.len(),
+            replay_samples: self.samples.len().saturating_sub(source_cursor),
             ..RetargetMetrics::default()
         };
         self.target = Some(target.clone());
         self.terminal_error = None;
-        for chunk in replay_samples.chunks(RETARGET_REPLAY_BATCH_SAMPLES) {
-            let push_started = Instant::now();
-            let buffered = target
-                .sink
-                .push(chunk)
-                .map_err(NativeVoiceCaptureError::Prefill)?;
-            let push_us = push_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        for receipt in replay_receipts {
+            let push_us = receipt.push_us;
             metrics.replay_batches = metrics.replay_batches.saturating_add(1);
             metrics.replay_push_cpu_us = metrics.replay_push_cpu_us.saturating_add(push_us);
             metrics.replay_push_max_us = metrics.replay_push_max_us.max(push_us);
@@ -1180,9 +1229,14 @@ impl Active {
                 self.metrics.prefill_push_cpu_us.saturating_add(push_us);
             self.metrics.prefill_push_max_us = self.metrics.prefill_push_max_us.max(push_us);
             self.metrics.prefill_pushes += 1;
-            self.metrics.prefill_samples += chunk.len() as u64;
-            self.metrics.prefill_high_water_samples =
-                self.metrics.prefill_high_water_samples.max(buffered);
+            self.metrics.prefill_samples += receipt
+                .source_end_exclusive
+                .saturating_sub(receipt.source_start)
+                as u64;
+            self.metrics.prefill_high_water_samples = self
+                .metrics
+                .prefill_high_water_samples
+                .max(receipt.buffered);
         }
         self.prefill_cursor = self.samples.len();
         metrics.total_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1239,9 +1293,103 @@ fn retain_settling_frame(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RetainedPublication {
+    source_start: usize,
+    source_end_exclusive: usize,
     sample_count: usize,
     buffered: usize,
     push_us: u64,
+}
+
+/// Maps the model input sequence back to exact sample indices in the untouched
+/// physical capture. A failed or ambiguous publication makes the mapping
+/// unavailable; the physical WAV remains authoritative and is still returned.
+#[derive(Debug, Clone, Default)]
+struct AcceptedSourceLedger {
+    ranges: Vec<Range<usize>>,
+    valid: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplayBatchReceipt {
+    source_start: usize,
+    source_end_exclusive: usize,
+    buffered: usize,
+    push_us: u64,
+}
+
+struct InferenceArtifact {
+    wav: Vec<u8>,
+    sample_count: u64,
+    source_ranges: Vec<InferenceSourceRange>,
+}
+
+impl AcceptedSourceLedger {
+    fn new() -> Self {
+        Self {
+            ranges: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn accepted_samples(&self) -> Option<usize> {
+        if !self.valid {
+            return None;
+        }
+        self.ranges.iter().try_fold(0usize, |total, range| {
+            total.checked_add(range.end.checked_sub(range.start)?)
+        })
+    }
+
+    fn acknowledge(&mut self, range: Range<usize>) -> Result<(), ()> {
+        if !self.valid || range.start >= range.end {
+            self.valid = false;
+            return Err(());
+        }
+        if let Some(last) = self.ranges.last_mut() {
+            if range.start < last.end {
+                self.valid = false;
+                return Err(());
+            }
+            if range.start == last.end {
+                last.end = range.end;
+                return Ok(());
+            }
+        }
+        self.ranges.push(range);
+        Ok(())
+    }
+
+    /// Translate the model's accepted-sample count into the corresponding
+    /// physical source cursor, discarding any speculative suffix.
+    fn truncate_model_offset(&mut self, mut count: usize) -> Result<usize, ()> {
+        if !self.valid {
+            return Err(());
+        }
+        let mut retained = Vec::with_capacity(self.ranges.len());
+        let mut cursor = None;
+        for range in self.ranges.drain(..) {
+            let length = range.end.checked_sub(range.start).ok_or(())?;
+            if count >= length {
+                count -= length;
+                cursor = Some(range.end);
+                retained.push(range);
+            } else if count > 0 {
+                let end = range.start.checked_add(count).ok_or(())?;
+                cursor = Some(end);
+                retained.push(range.start..end);
+                count = 0;
+            } else {
+                cursor.get_or_insert(range.start);
+            }
+        }
+        if count != 0 {
+            self.ranges = retained;
+            self.valid = false;
+            return Err(());
+        }
+        self.ranges = retained;
+        Ok(cursor.unwrap_or(0))
+    }
 }
 
 fn target_already_attached(current: Option<&CaptureTarget>, next: &CaptureTarget) -> bool {
@@ -1267,10 +1415,27 @@ fn publish_retained(
     // A rejected publication therefore remains retryable and cannot drop PCM.
     *cursor = end;
     Ok(Some(RetainedPublication {
+        source_start: start,
+        source_end_exclusive: end,
         sample_count: end - start,
         buffered,
         push_us,
     }))
+}
+
+fn publish_retained_tracked(
+    samples: &[f32],
+    cursor: &mut usize,
+    target: &CaptureTarget,
+    ledger: &mut AcceptedSourceLedger,
+) -> Result<Option<RetainedPublication>, String> {
+    let publication = publish_retained(samples, cursor, target)?;
+    if let Some(publication) = publication {
+        ledger
+            .acknowledge(publication.source_start..publication.source_end_exclusive)
+            .map_err(|()| "inference source ledger became inconsistent".to_string())?;
+    }
+    Ok(publication)
 }
 
 fn publish_transcription_retained(
@@ -1303,6 +1468,87 @@ fn retained_replay(
             samples.len()
         ))
     })
+}
+
+fn replay_retained_source(
+    samples: &[f32],
+    ledger: &mut AcceptedSourceLedger,
+    target: &CaptureTarget,
+    model_offset: usize,
+) -> Result<(usize, Vec<ReplayBatchReceipt>), NativeVoiceCaptureError> {
+    let source_cursor = ledger.truncate_model_offset(model_offset).map_err(|_| {
+        NativeVoiceCaptureError::Prefill(
+            "resident audio checkpoint does not match acknowledged capture input".to_string(),
+        )
+    })?;
+    let replay = match retained_replay(samples, source_cursor) {
+        Ok(replay) => replay,
+        Err(error) => {
+            ledger.valid = false;
+            return Err(error);
+        }
+    };
+    let mut receipts = Vec::new();
+    for (batch_index, chunk) in replay.chunks(RETARGET_REPLAY_BATCH_SAMPLES).enumerate() {
+        let push_started = Instant::now();
+        let buffered = match target.sink.push(chunk) {
+            Ok(buffered) => buffered,
+            Err(error) => {
+                ledger.valid = false;
+                return Err(NativeVoiceCaptureError::Prefill(error));
+            }
+        };
+        let start = source_cursor + batch_index * RETARGET_REPLAY_BATCH_SAMPLES;
+        let end = start + chunk.len();
+        if ledger.acknowledge(start..end).is_err() {
+            return Err(NativeVoiceCaptureError::Prefill(
+                "inference source ledger became inconsistent".to_string(),
+            ));
+        }
+        receipts.push(ReplayBatchReceipt {
+            source_start: start,
+            source_end_exclusive: end,
+            buffered,
+            push_us: push_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        });
+    }
+    Ok((source_cursor, receipts))
+}
+
+fn inference_artifact(
+    samples: &[f32],
+    ledger: &AcceptedSourceLedger,
+) -> Result<Option<InferenceArtifact>, NativeVoiceCaptureError> {
+    let accepted_samples = ledger.accepted_samples().ok_or_else(|| {
+        NativeVoiceCaptureError::Prefill("inference source ledger was invalidated".to_string())
+    })?;
+    if accepted_samples == 0 {
+        return Ok(None);
+    }
+    let mut inference_samples = Vec::with_capacity(accepted_samples);
+    let mut source_ranges = Vec::with_capacity(ledger.ranges.len());
+    for range in &ledger.ranges {
+        let source = samples.get(range.clone()).ok_or_else(|| {
+            NativeVoiceCaptureError::Prefill(
+                "inference source ledger exceeds the retained capture".to_string(),
+            )
+        })?;
+        inference_samples.extend_from_slice(source);
+        source_ranges.push(InferenceSourceRange {
+            start: range.start as u64,
+            end_exclusive: range.end as u64,
+        });
+    }
+    if inference_samples.len() != accepted_samples {
+        return Err(NativeVoiceCaptureError::Prefill(
+            "inference source ledger sample count is inconsistent".to_string(),
+        ));
+    }
+    Ok(Some(InferenceArtifact {
+        wav: encode_inference_wav(&inference_samples)?,
+        sample_count: accepted_samples as u64,
+        source_ranges,
+    }))
 }
 
 fn begin(
@@ -1379,7 +1625,9 @@ fn begin(
         resampled: Vec::with_capacity(CALLBACK_CHUNK_FRAMES),
         pre_roll: VecDeque::with_capacity(PRE_ROLL_SAMPLES),
         settle_samples_remaining: CAPTURE_SETTLE_SAMPLES,
-        samples: Vec::with_capacity(MAX_SAMPLES),
+        samples: Vec::with_capacity(INITIAL_CAPTURE_CAPACITY_SAMPLES),
+        inference_ledger: AcceptedSourceLedger::new(),
+        capture_too_long: false,
         prefill_cursor: 0,
         silence_gate: None,
         speculation_released: false,
@@ -1521,6 +1769,9 @@ fn finish(mut active: Active) -> Result<CaptureOutput, NativeVoiceCaptureError> 
     while let Ok(chunk) = active.audio_rx.try_recv() {
         active.push(chunk);
     }
+    if active.capture_too_long {
+        return Err(NativeVoiceCaptureError::TooLong);
+    }
     active.metrics.finish_drain_us = drain_started
         .elapsed()
         .as_micros()
@@ -1557,8 +1808,27 @@ fn finish(mut active: Active) -> Result<CaptureOutput, NativeVoiceCaptureError> 
         let _ = source.seal(active.samples.len());
         active.metrics.transcription_ingress = Some(source.metrics());
     }
+    let inference_artifact = match inference_artifact(&active.samples, &active.inference_ledger) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            active.metrics.inference_derivative_error = Some(error.to_string());
+            None
+        }
+    };
+    let (inference_wav, inference_accepted_sample_count, inference_source_ranges) =
+        inference_artifact.map_or((None, 0, Vec::new()), |artifact| {
+            (
+                Some(artifact.wav),
+                artifact.sample_count,
+                artifact.source_ranges,
+            )
+        });
     Ok(CaptureOutput {
         wav,
+        inference_wav,
+        inference_source_sample_count: active.samples.len() as u64,
+        inference_accepted_sample_count,
+        inference_source_ranges,
         heard_voice: active.voice.heard_voice,
         metrics: active.metrics.clone(),
     })
@@ -1825,6 +2095,17 @@ impl Resampler {
 }
 
 fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, NativeVoiceCaptureError> {
+    encode_wav_with_quantizer(samples, false)
+}
+
+fn encode_inference_wav(samples: &[f32]) -> Result<Vec<u8>, NativeVoiceCaptureError> {
+    encode_wav_with_quantizer(samples, true)
+}
+
+fn encode_wav_with_quantizer(
+    samples: &[f32],
+    engine_q16: bool,
+) -> Result<Vec<u8>, NativeVoiceCaptureError> {
     let data_len = samples
         .len()
         .checked_mul(2)
@@ -1847,14 +2128,20 @@ fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, NativeVoiceCaptureError> {
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
     for &sample in samples {
-        let scaled = if sample.is_nan() {
-            0.0
-        } else if sample >= 0.0 {
-            sample.min(1.0) * f32::from(i16::MAX)
+        let pcm = if engine_q16 {
+            ((sample.clamp(-1.0, 1.0) * 32_768.0 + 0.5).floor())
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
         } else {
-            sample.max(-1.0) * 32_768.0
+            let scaled = if sample.is_nan() {
+                0.0
+            } else if sample >= 0.0 {
+                sample.min(1.0) * f32::from(i16::MAX)
+            } else {
+                sample.max(-1.0) * 32_768.0
+            };
+            scaled.round() as i16
         };
-        wav.extend_from_slice(&(scaled.round() as i16).to_le_bytes());
+        wav.extend_from_slice(&pcm.to_le_bytes());
     }
     Ok(wav)
 }
@@ -2399,6 +2686,192 @@ mod tests {
         );
         assert_eq!(cursor, samples.len());
         assert_eq!(*sink.samples.lock().expect("recorded samples"), samples);
+    }
+
+    #[test]
+    fn tracked_publication_keeps_a_45_second_source_in_bounded_batches() {
+        let sink = Arc::new(RecordingSink::default());
+        let target = recording_target("long-source", Arc::clone(&sink));
+        let samples = (0..OUTPUT_RATE as usize * 45)
+            .map(|sample| (sample % 997) as f32 / 997.0)
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        let mut ledger = AcceptedSourceLedger::new();
+        let mut maximum_push = 0;
+
+        while let Some(publication) =
+            publish_retained_tracked(&samples, &mut cursor, &target, &mut ledger)
+                .expect("acknowledged bounded publication")
+        {
+            maximum_push = maximum_push.max(publication.sample_count);
+            assert!(publication.sample_count <= PREFILL_BATCH_SAMPLES);
+        }
+
+        assert_eq!(cursor, samples.len());
+        assert_eq!(maximum_push, PREFILL_BATCH_SAMPLES);
+        assert_eq!(ledger.ranges.len(), 1);
+        assert_eq!(ledger.ranges[0].start, 0);
+        assert_eq!(ledger.ranges[0].end, samples.len());
+        assert_eq!(
+            *sink.samples.lock().expect("recorded samples"),
+            samples,
+            "long source remains ordered and complete"
+        );
+    }
+
+    #[test]
+    fn retarget_truncates_to_model_checkpoint_then_replays_retained_tail_once() {
+        let samples = (0..1_400).map(|sample| sample as f32).collect::<Vec<_>>();
+        let old_sink = Arc::new(RecordingSink::default());
+        let old_target = recording_target("speculation", Arc::clone(&old_sink));
+        let mut ledger = AcceptedSourceLedger::new();
+        let mut cursor = 0;
+        while cursor < 1_000 {
+            publish_retained_tracked(&samples[..1_000], &mut cursor, &old_target, &mut ledger)
+                .expect("speculative accepted input");
+        }
+        // The physical tail is retained during silence but has no target yet.
+        assert_eq!(ledger.ranges.len(), 1);
+        assert_eq!(ledger.ranges[0].start, 0);
+        assert_eq!(ledger.ranges[0].end, 1_000);
+
+        let resumed_sink = Arc::new(RecordingSink::default());
+        let resumed = recording_target("resumed", Arc::clone(&resumed_sink));
+        let (source_cursor, receipts) =
+            replay_retained_source(&samples, &mut ledger, &resumed, 800)
+                .expect("valid native model checkpoint");
+        assert_eq!(source_cursor, 800);
+        assert_eq!(
+            *resumed_sink.samples.lock().expect("recorded replay"),
+            samples[800..],
+            "replacement session receives checkpoint suffix plus retained silence tail"
+        );
+        assert!(receipts.iter().all(|receipt| {
+            receipt.source_end_exclusive - receipt.source_start <= RETARGET_REPLAY_BATCH_SAMPLES
+        }));
+        assert_eq!(ledger.ranges.len(), 1);
+        assert_eq!(ledger.ranges[0].start, 0);
+        assert_eq!(ledger.ranges[0].end, samples.len());
+
+        let artifact = inference_artifact(&samples, &ledger)
+            .expect("artifact construction")
+            .expect("acknowledged history exports");
+        assert_eq!(artifact.sample_count, samples.len() as u64);
+        assert_eq!(
+            artifact.source_ranges,
+            [InferenceSourceRange {
+                start: 0,
+                end_exclusive: samples.len() as u64,
+            }]
+        );
+        assert_eq!(
+            decode_pcm16_wav(&artifact.wav),
+            samples
+                .iter()
+                .map(|sample| canonical_q16(*sample))
+                .collect::<Vec<_>>(),
+            "speculative suffix was replaced rather than duplicated"
+        );
+    }
+
+    #[test]
+    fn cancelled_or_unconfirmed_capture_has_no_inference_derivative() {
+        let samples = vec![0.125, -0.25, 0.5];
+        let empty = AcceptedSourceLedger::new();
+        assert!(
+            inference_artifact(&samples, &empty)
+                .expect("unconfirmed capture is nonfatal")
+                .is_none()
+        );
+
+        let mut inconsistent = AcceptedSourceLedger::new();
+        inconsistent.acknowledge(0..2).expect("test setup");
+        inconsistent.valid = false;
+        assert!(inference_artifact(&samples, &inconsistent).is_err());
+    }
+
+    #[test]
+    fn discontiguous_ranges_map_model_offset_to_physical_cursor() {
+        let samples = (0..14).map(|sample| sample as f32).collect::<Vec<_>>();
+        let mut ledger = AcceptedSourceLedger::new();
+        ledger.acknowledge(0..4).expect("first accepted segment");
+        ledger.acknowledge(6..10).expect("second accepted segment");
+        let sink = Arc::new(RecordingSink::default());
+        let target = recording_target("resumed", Arc::clone(&sink));
+
+        // Six model samples comprise the first four source samples and two
+        // from the second segment, ending at physical source index 8.
+        let (physical_cursor, _) = replay_retained_source(&samples, &mut ledger, &target, 6)
+            .expect("valid discontiguous checkpoint");
+        assert_eq!(physical_cursor, 8);
+        assert_eq!(*sink.samples.lock().expect("recorded replay"), samples[8..]);
+        assert_eq!(ledger.ranges, [0..4, 6..samples.len()]);
+        let artifact = inference_artifact(&samples, &ledger)
+            .expect("artifact construction")
+            .expect("accepted input exists");
+        assert_eq!(
+            artifact.source_ranges,
+            [
+                InferenceSourceRange {
+                    start: 0,
+                    end_exclusive: 4
+                },
+                InferenceSourceRange {
+                    start: 6,
+                    end_exclusive: samples.len() as u64
+                },
+            ]
+        );
+        assert_eq!(
+            artifact.sample_count,
+            (4 + samples.len() - 6) as u64,
+            "the unaccepted physical gap is not fabricated into model input"
+        );
+    }
+
+    #[test]
+    fn failed_retarget_push_invalidates_the_derivative_receipt() {
+        let samples = (0..1_000).map(|sample| sample as f32).collect::<Vec<_>>();
+        let mut ledger = AcceptedSourceLedger::new();
+        ledger.acknowledge(0..800).expect("prior accepted input");
+        let sink = Arc::new(RecordingSink::default());
+        sink.fail.store(true, Ordering::Release);
+        let target = recording_target("failed-replay", Arc::clone(&sink));
+
+        assert!(replay_retained_source(&samples, &mut ledger, &target, 400).is_err());
+        assert!(ledger.accepted_samples().is_none());
+        assert!(inference_artifact(&samples, &ledger).is_err());
+        assert!(sink.samples.lock().expect("recorded samples").is_empty());
+    }
+
+    #[test]
+    fn inference_wav_uses_engine_q16_without_changing_physical_wav_encoding() {
+        let half_step = 0.5 / 32_768.0;
+        let samples = [-1.0, -half_step, 0.0, half_step, 0.25, 1.0];
+        let physical = encode_wav(&samples).expect("physical archive encoding");
+        let inference = encode_inference_wav(&samples).expect("inference encoding");
+
+        assert_eq!(
+            decode_pcm16_wav(&inference),
+            [-32_768, 0, 0, 1, 8_192, 32_767]
+        );
+        assert_eq!(
+            decode_pcm16_wav(&physical),
+            [-32_768, -1, 0, 0, 8_192, 32_767]
+        );
+    }
+
+    fn canonical_q16(sample: f32) -> i16 {
+        ((sample.clamp(-1.0, 1.0) * 32_768.0 + 0.5).floor())
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+    }
+
+    fn decode_pcm16_wav(wav: &[u8]) -> Vec<i16> {
+        assert!(wav.starts_with(b"RIFF"));
+        wav[44..]
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect()
     }
 
     #[test]

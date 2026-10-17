@@ -7,6 +7,7 @@ use llama_native_types::media_identity::MediaAdmission;
 
 pub(super) fn resolve_attachment_set(
     conversation_id: &str,
+    occurrence_scope_id: &str,
     ids: &[String],
     expected_state: AttachmentState,
     records: &HashMap<&str, &AttachmentRecord>,
@@ -17,6 +18,7 @@ pub(super) fn resolve_attachment_set(
     let mut media = Vec::new();
     let mut references = Vec::new();
     let mut sources = Vec::new();
+    let mut inference_audio_occurrence_index = 0usize;
     for id in ids {
         let Some(record) = records.get(id.as_str()).copied() else {
             return Ok(Err(context_blocker(
@@ -98,7 +100,18 @@ pub(super) fn resolve_attachment_set(
         // The reference budget bounds material admitted to this request. A
         // historical audio-only occurrence contributes neither text nor media
         // on the voice path, even though its manifest is still verified.
-        if (materialize_media || !canonical.is_empty())
+        let history_audio =
+            expected_state == AttachmentState::Committed && record.kind == AttachmentKind::Audio;
+        let inference_audio = if history_audio {
+            match selected_inference_audio_artifact(record, &manifest) {
+                Ok(artifact) => artifact,
+                Err(blocked) => return Ok(Err(blocked)),
+            }
+        } else {
+            None
+        };
+        if !history_audio
+            && (materialize_media || !canonical.is_empty())
             && let Err(blocked) = resolution.budget.reserve_reference()
         {
             return Ok(Err(blocked));
@@ -118,6 +131,14 @@ pub(super) fn resolve_attachment_set(
             let ArtifactPayload::Media { family, blob, .. } = &artifact.payload else {
                 continue;
             };
+            if let Some(inference_audio) = inference_audio
+                && *family == MediaFamily::Audio
+                && artifact.id != inference_audio.id
+            {
+                // The full source WAV remains attached and replayable; use only
+                // the separately retained exact model-input child for inference.
+                continue;
+            }
             if blob.byte_len > MAX_ACTIVE_ATTACHMENT_MEDIA_BYTES {
                 return Ok(Err(context_blocker(
                     "attachment_context_media_bytes_exceeded",
@@ -155,8 +176,34 @@ pub(super) fn resolve_attachment_set(
                     "Canonical media identity does not match its retained source.".into(),
                 )));
             }
+            if inference_audio.is_some_and(|selected| selected.id == artifact.id)
+                && manifest.inference_audio.as_ref().is_none_or(|selection| {
+                    validate_pcm16le_16khz_mono_wav(
+                        &bytes,
+                        selection.provenance.accepted_sample_count,
+                    )
+                    .is_err()
+                })
+            {
+                return Ok(Err(context_blocker(
+                    "attachment_inference_audio_invalid",
+                    "The selected model-input WAV no longer matches its recorded PCM sample provenance.".into(),
+                )));
+            }
+            let is_selected_inference_audio =
+                inference_audio.is_some_and(|selected| selected.id == artifact.id);
+            let id = if is_selected_inference_audio {
+                let id = format!(
+                    "{}:{}:{}:{}",
+                    occurrence_scope_id, record.id, artifact.id.0, inference_audio_occurrence_index
+                );
+                inference_audio_occurrence_index += 1;
+                id
+            } else {
+                format!("{}:{}", record.id, artifact.id.0)
+            };
             let item = MediaInput {
-                id: format!("{}:{}", record.id, artifact.id.0),
+                id,
                 kind: match family {
                     MediaFamily::Image => MediaKind::Image,
                     MediaFamily::Audio => MediaKind::Audio,
@@ -182,12 +229,45 @@ pub(super) fn resolve_attachment_set(
             // Even a shared payload remains an available representation for
             // this exact record. Its occurrence stays in message/draft evidence.
             has_representation = true;
+            // Keep every occurrence at its chronological message boundary,
+            // even when its payload bytes are shared. The digest and modality
+            // make duplicate references explicit without copying their bytes.
+            let kind_label = match item.kind {
+                MediaKind::Image => "image",
+                MediaKind::Audio => "audio",
+            };
+            let occurrence = if is_selected_inference_audio {
+                // Live requests use this same placeholder at the current
+                // message boundary. Native rendering strips the occurrence ID,
+                // so the committed audio exchange remains an exact text prefix.
+                format!("[[native-media:{}]]", item.id)
+            } else {
+                match admission {
+                    MediaAdmission::NewPayload => format!(
+                        "[{kind_label} payload sha256:{}] [[native-media:{}]]",
+                        item.sha256, item.id
+                    ),
+                    MediaAdmission::DuplicatePayload => format!(
+                        "[{kind_label} occurrence references the same previously supplied payload sha256:{}]",
+                        item.sha256
+                    ),
+                }
+            };
+            text.push(occurrence);
             references.push(AttachmentMediaReference::from_verified(
                 record, artifact, &item,
             ));
-            if admission == MediaAdmission::NewPayload {
-                // Preserve Mom's stricter 16-object policy, not Loom's 32.
-                if let Err(blocked) = resolution.budget.reserve_media(blob.byte_len) {
+            if admission == MediaAdmission::NewPayload || is_selected_inference_audio {
+                // A conversation recording is bounded by audio bytes and the
+                // native context, independently of a single upload's count.
+                // Selected inference audio remains occurrence-bound even when
+                // the identity ledger recognizes matching bytes elsewhere.
+                let reserved = if history_audio {
+                    resolution.budget.reserve_history_audio(blob.byte_len)
+                } else {
+                    resolution.budget.reserve_media(blob.byte_len)
+                };
+                if let Err(blocked) = reserved {
                     return Ok(Err(blocked));
                 }
                 media.push(item);

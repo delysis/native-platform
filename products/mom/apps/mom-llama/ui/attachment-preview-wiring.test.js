@@ -384,7 +384,8 @@ test("voice dispatch keeps its live PCM row mounted through completion", () => {
   );
   assert.match(submit, /if \(!voiceDispatch\) \{[\s\S]*await refreshConversationProjection\(\);[\s\S]*\} else \{[\s\S]*Keep the live audio rows mounted/);
   assert.match(submit, /const voiceTtsOwner = voiceDispatch/);
-  assert.match(submit, /await voiceTtsOwner\.finish\(output\.assistant_text\)/);
+  assert.match(submit, /finishVoiceReplyAndIndexTurn\([\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*\(\) => voiceTtsOwner\.finish\(output\.assistant_text\)/,
+    "call transcript indexing is admitted before TTS drains; voice-note backfill waits for the helper's successful finish");
   assert.match(submit, /voice_reply_owner_missing/);
   assert.match(submit, /refreshSidebar\(\), refreshConversationSettingsProjection\(\)/);
   assert.match(ui, /const replayBytes = capture\.wavBytes \|\| encodePcmWav\(capture\.samples\(\)\)/);
@@ -419,7 +420,7 @@ const speechDeferred = () => {
   const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 };
-const speechLifetimeHarness = ({ worklet = false } = {}) => {
+const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null, playbackResumeGate = null, suspendGate = null } = {}) => {
   const pending = [];
   const calls = [];
   const hashes = [];
@@ -435,6 +436,7 @@ const speechLifetimeHarness = ({ worklet = false } = {}) => {
   let mediaReadyState = 3;
   let playbackResumeError = null;
   let playbackResumePending = false;
+  let suspendGateEnabled = false;
   const element = () => ({
     dataset: {}, children: [], attributes: new Map(), isConnected: true, style: {}, clientWidth: 0,
     append(...children) { this.children.push(...children); },
@@ -520,16 +522,24 @@ const speechLifetimeHarness = ({ worklet = false } = {}) => {
       this.options = options; this.sampleRate = options?.sampleRate || 24_000;
       this.currentTime = 0; this.destination = {}; this.sources = [];
       this.closed = false; this.state = "running";
-      if (worklet) this.audioWorklet = { async addModule() {} };
+      if (worklet) this.audioWorklet = { addModule: () => workletPreparationGate?.promise || Promise.resolve() };
       audioContexts.push(this);
     }
     async resume() {
       if (playbackResumeError) throw playbackResumeError;
       if (playbackResumePending) return new Promise(() => {});
+      if (playbackResumeGate) await playbackResumeGate.promise;
       this.state = "running";
     }
-    async suspend() { this.state = "suspended"; }
+    async suspend() {
+      this.suspendCalled = true;
+      if (suspendGate && suspendGateEnabled) await suspendGate.promise;
+      this.state = "suspended";
+    }
     async close() { this.closed = true; this.state = "closed"; }
+    createAnalyser() {
+      return { fftSize: 0, connect() {}, getFloatTimeDomainData(samples) { samples.fill(0); } };
+    }
     createBuffer(channels, length, sampleRate) {
       return { channels, length, sampleRate, duration: length / sampleRate, copyToChannel() {} };
     }
@@ -618,17 +628,18 @@ const speechLifetimeHarness = ({ worklet = false } = {}) => {
     for (const reply of hashes) reply.resolve("fixture-wav");
   };
   const settle = () => { void context.api.stopSpeechPlayback({ notifyNative: false }); for (const reply of pending) reply.resolve({ status: "passed" }); for (const reply of hashes) reply.resolve("fixture-wav"); };
-  const pcmFrame = (payload = new Uint8Array([0, 0]), sequence = 0, end = true) => {
+  const pcmFrame = (payload = new Uint8Array([0, 0]), sequence = 0, end = true, sampleOffset = 0) => {
     const samples = payload.byteLength % 2 === 0 ? payload : new Uint8Array([0, 0]);
     const frame = new Uint8Array(32 + samples.byteLength); const view = new DataView(frame.buffer);
     frame.set([0x4d, 0x50, 0x43, 0x4d, 1, end ? 3 : 2, 1, 1]);
     view.setUint32(8, 24000, true); view.setBigUint64(12, BigInt(sequence), true);
-    view.setBigUint64(20, 0n, true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
+    view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
   return { ...context.api, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
+    holdSuspend() { suspendGateEnabled = true; },
     hangPlaybackResume() { playbackResumePending = true; },
     navigate() { selected = "fixture-other-conversation"; } };
 };
@@ -678,6 +689,120 @@ test("call playback releases scheduled IPC packets instead of retaining replay h
   assert.equal(h.audioContexts[0].sources.length, 1);
   assert.equal(controller.wavBytes(), null);
   await controller.stop();
+});
+
+test("a cold reply's pending segment stays gated until its measured completion reconsiders startup", async () => {
+  const h = speechLifetimeHarness();
+  let probePending = true;
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    waitForCompletion: () => probePending,
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.ready, true, "the first PCM is playable in size");
+  assert.equal(h.audioContexts.length, 0, "the cold probe still blocks audible playback");
+
+  probePending = false;
+  await controller.reconsiderStartup();
+  assert.equal(h.audioContexts.length, 1, "clearing the measured gate starts without another packet or reply finish");
+  assert.equal(h.audioContexts[0].sources.length, 1);
+  await controller.stop();
+});
+
+test("a stopped player cannot be woken by clearing its cold startup gate", async () => {
+  const h = speechLifetimeHarness();
+  let probePending = true;
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    waitForCompletion: () => probePending,
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.audioContexts.length, 0);
+
+  await controller.stop();
+  probePending = false;
+  await controller.reconsiderStartup();
+  assert.equal(h.audioContexts.length, 0, "stopped buffers cannot restart after late calibration");
+});
+
+test("stop during delayed worklet preparation settles queued playback without creating a renderer", async () => {
+  const preparation = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, workletPreparationGate: preparation });
+  const started = [];
+  const ended = [];
+  const firstChunks = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+    onEnded: () => ended.push(true),
+    onFirstChunk: (event) => firstChunks.push(event),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  const playback = controller.play();
+  controller.finish();
+  assert.equal(firstChunks.length, 1, "accepted PCM still settles first-chunk notification");
+  assert.equal(h.workletNodes.length, 0);
+
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles the queued start request");
+  preparation.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 0, "late preparation cannot create a capture-triggering renderer");
+  assert.deepEqual(started, []);
+  assert.deepEqual(ended, [], "stopped queued completion is not reported as natural playback end");
+});
+
+test("stop during delayed context resume prevents playback-start callbacks and re-suspends late resume", async () => {
+  const resume = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, playbackResumeGate: resume });
+  const started = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  const playback = controller.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 1);
+
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles even while browser resume is pending");
+  resume.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [], "stale resume cannot announce playback or open capture");
+  assert.equal(h.audioContexts[0].state, "suspended", "a late resume is returned to the stopped state");
+});
+
+test("stop during a paused-context resume cannot schedule queued PCM or announce playback", async () => {
+  const resumeGate = { promise: Promise.resolve() };
+  const h = speechLifetimeHarness({ playbackResumeGate: resumeGate });
+  const started = [];
+  const controller = h.createPcmPlaybackBuffer({
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  assert.equal(await controller.play(), true);
+  assert.deepEqual(started, [true]);
+  assert.equal(await controller.pause(), true);
+  const delayedResume = speechDeferred();
+  resumeGate.promise = delayedResume.promise;
+
+  const playback = controller.play();
+  await Promise.resolve();
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles the paused-context resume request");
+  delayedResume.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [true], "a stale resume cannot announce a second audible start");
+  assert.equal(h.audioContexts[0].closed, true, "late resume cannot leave the stopped context running");
+  assert.equal(h.audioContexts[0].sources.length, 1, "stale resume does not reschedule queued PCM");
 });
 
 test("call playback waits a bounded wall-clock guard without hoarding another PCM packet", async () => {
@@ -771,6 +896,64 @@ test("worklet playback joins producer, admission, render, and consumption on the
   assert.equal(metrics[0].worklet_min_buffered_frames, 128);
   assert.equal(metrics[0].worklet_first_receive_context_frame, 240);
   assert.equal(metrics[0].worklet_first_render_context_frame, 256);
+  await controller.stop();
+});
+
+test("stopped worklet reports unknown final counters but keeps observed queue and first render", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const receipts = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onRendererMetrics: (metrics) => receipts.push(metrics),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  node.port.onmessage({ data: {
+    type: "render_started", bufferedFrames: 3_000, audioContextFrame: 17,
+  } });
+  await controller.stop();
+  const receipt = receipts.at(-1);
+  assert.equal(receipt.worklet_metrics_status, "unreported");
+  assert.equal(receipt.worklet_final_metrics_received, false);
+  assert.equal(receipt.underruns, null);
+  assert.equal(receipt.worklet_underrun_events_observed, 0);
+  assert.equal(receipt.worklet_render_quanta, null);
+  assert.equal(receipt.worklet_pcm_low_energy_frames, null);
+  assert.equal(receipt.worklet_max_queued_frames, 3_000);
+  assert.equal(receipt.worklet_first_render_context_frame, 17);
+});
+
+test("drained worklet preserves measured zeros and an unknown nullable minimum", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const receipts = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onRendererMetrics: (metrics) => receipts.push(metrics),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  controller.finish();
+  node.port.onmessage({ data: {
+    type: "drained", renderQuanta: 0, maxBufferedFrames: 0,
+    underruns: 0, recoveries: 0, rebufferedFrames: 0,
+    minBufferedFrames: null, firstReceiveContextFrame: 0,
+    firstRenderContextFrame: null, pcmSignalFrames: 0, pcmSignalRms: null,
+    pcmSignalPeak: null, pcmSignalMinQuantumRms: null,
+    pcmSignalMaxQuantumRms: null, pcmLowEnergyThresholdRms: null,
+    pcmLowEnergyFrames: 0, pcmLowEnergyQuanta: 0,
+    pcmMaxLowEnergyFrames: 0,
+  } });
+  const receipt = receipts.at(-1);
+  assert.equal(receipt.worklet_metrics_status, "complete");
+  assert.equal(receipt.worklet_final_metrics_received, true);
+  assert.equal(receipt.underruns, 0);
+  assert.equal(receipt.worklet_render_quanta, 0);
+  assert.equal(receipt.worklet_pcm_low_energy_frames, 0);
+  assert.equal(receipt.worklet_min_buffered_frames, null);
+  assert.equal(receipt.worklet_first_receive_context_frame, 0);
+  assert.equal(receipt.worklet_first_render_context_frame, null);
   await controller.stop();
 });
 
@@ -904,11 +1087,241 @@ test("live voice synthesis has an idle-progress deadline after first PCM", () =>
   assert.doesNotMatch(live, /if \(!deferProgressWatchdog\) armAudioProgressWatchdog\(\)/);
   assert.match(live, /running = true;[\s\S]*?armAudioProgressWatchdog\(\);/);
   assert.match(live, /audioProgressWatchdog = null;\s*watchdogActive = false;/);
-  assert.match(live, /if \(decoded\.data\.byteLength > 0\) armAudioProgressWatchdog\(\)/);
+  assert.match(live, /if \(decoded\.data\.byteLength > 0\) \{\s*playback\.lastProgressAt = performance\.now\(\);\s*armAudioProgressWatchdog\(\);/);
   assert.doesNotMatch(live, /controller\.pushSegment\(frame, operation\);\s*armAudioProgressWatchdog\(\)/);
   assert.doesNotMatch(live, /onPlayable: \(\) => \{\s*window\.clearTimeout\(audioProgressWatchdog\)/);
   assert.match(live, /voice_reply_timeout: Voice synthesis stopped making progress\./);
   assert.match(live, /invoke\("mom_llama_speech_stop", \{ operation \}\)/);
+});
+
+const liveTtsTailHarness = () => {
+  const invocations = [];
+  const delivered = [];
+  const timers = new Map();
+  let operationNumber = 0;
+  let now = 0;
+  let timerNumber = 0;
+  class AdaptiveVoiceLeadController {
+    shouldDispatch() { return true; }
+    shouldBufferCompleteReply() { return false; }
+    shouldPrepareNextCall() { return false; }
+    startupRunwayMs() { return 0; }
+    startupDelayMs() { return 0; }
+    targetRunwayMs() { return 0; }
+    progressTimeoutMs() { return 60_000; }
+    notePacket() {}
+    noteSegment() {}
+    noteWait() {}
+    noteUnderrun() {}
+    calibration() { return {}; }
+    snapshot() { return {}; }
+  }
+  const controller = {
+    playing: false,
+    bufferedMs: () => 0,
+    reconsiderStartup: async () => false,
+    pushSegment(frame, operation) { delivered.push({ frame, operation }); },
+    finish() {},
+    stop: async () => {},
+  };
+  const setTimer = (callback) => {
+    const id = ++timerNumber;
+    timers.set(id, callback);
+    return id;
+  };
+  const clearTimer = (id) => timers.delete(id);
+  const context = {
+    window: { setTimeout: setTimer, clearTimeout: clearTimer },
+    performance: { now: () => ++now },
+    document: { createElement: () => ({ className: "" }), querySelector: () => null },
+    MomVoicePipelineScheduler: {
+      AdaptiveVoiceLeadController,
+      SemanticLeadController: class {
+        shouldPause() { return false; }
+        snapshot() { return {}; }
+      },
+    },
+    voiceLeadCalibration: null,
+    voiceLatencyTrace: { stages: [] },
+    markVoiceLatencyIn(trace, stage, detail) { trace.stages.push({ stage, ...detail }); },
+    decodePcmFrame: (frame) => frame,
+    pcmChannel: (onmessage) => ({ onmessage }),
+    createPcmPlaybackBuffer: () => controller,
+    speechOperationToken: () => `tts-op-${++operationNumber}`,
+    rememberVoiceStreamRequest() {},
+    voiceStreamRequestIds: new Set(),
+    voiceReplyPlayback: new WeakMap(),
+    voiceCallActive: false,
+    voiceCallEpoch: 0,
+    activeCallPlayback: null,
+    liveVoiceTts: null,
+    voiceReplyPlayRequested: false,
+    retryCallPrefillAfterTranscript: null,
+    pendingCallTranscriptJobs: [],
+    activeCallTranscriptJob: null,
+    activeCallTranscriptTask: null,
+    voiceCallTranscriptSlotsDisabled: false,
+    voiceRecording: null,
+    errorMessage: (error) => String(error),
+    reportError() {},
+    invoke(command, args) {
+      if (command === "mom_llama_speech_stop") {
+        invocations.push({ command, args, reply: null });
+        return Promise.resolve({ status: "passed" });
+      }
+      const reply = speechDeferred();
+      invocations.push({ command, args, reply });
+      return reply.promise;
+    },
+    queueMicrotask,
+  };
+  context.globalThis = context;
+  const chunkStart = ui.indexOf("  const takeLiveSpeechChunk =");
+  const chunkEnd = ui.indexOf("\n  const beginLiveVoiceTts =", chunkStart);
+  assert.ok(chunkStart >= 0 && chunkEnd > chunkStart);
+  speechVm.runInNewContext(
+    ui.slice(chunkStart, chunkEnd)
+      + block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =")
+      + "\nglobalThis.beginLiveVoiceTts = beginLiveVoiceTts;",
+    context,
+  );
+  const synthesis = () => invocations.filter(
+    (entry) => entry.command === "mom_llama_speech_precommit_synthesize",
+  );
+  const pcm = (label, end = false) => ({
+    data: new Uint8Array(end ? 0 : [label.charCodeAt(0), 0]),
+    sampleRate: 24_000,
+    channels: 1,
+    label,
+    end,
+  });
+  const fireLatestTimer = () => {
+    const entry = [...timers.entries()].at(-1);
+    assert.ok(entry, "a bounded PCM progress timer is armed");
+    timers.delete(entry[0]);
+    entry[1]();
+  };
+  return { context, invocations, delivered, synthesis, pcm, fireLatestTimer };
+};
+
+test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta. ");
+  const first = h.synthesis()[0];
+  assert.ok(first, "first synthesis segment is dispatched");
+  first.args.pcmStream.onmessage(h.pcm("head"));
+
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const prematureNextSegment = h.synthesis().length > 1;
+
+  // Tauri response and channel callbacks are separate transports: the final
+  // PCM and EOF may arrive after the response promise has already resolved.
+  first.args.pcmStream.onmessage(h.pcm("tail"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = h.synthesis()[1];
+  if (second) {
+    second.args.pcmStream.onmessage(h.pcm("next"));
+    second.args.pcmStream.onmessage(h.pcm("next-eof", true));
+    second.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  }
+  await completed;
+
+  assert.equal(prematureNextSegment, false, "next request must wait until prior-channel EOF");
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "tail", "eof", "next", "next-eof"]);
+});
+
+test("stopping live TTS releases promptly while it waits for channel EOF", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta. ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const stopping = playback.stop();
+  // If the pre-fix pump already started the queued segment, let its native
+  // response settle only after stop has claimed it. This verifies stop does
+  // not wait for the channel's missing EOF or dispatch more queued text.
+  const premature = h.synthesis()[1];
+  premature?.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  const stopSettled = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  assert.equal(stopSettled, true, "stop must not await the missing PCM EOF");
+  assert.equal(h.synthesis().length, 1, "stop must not dispatch queued text before old channel EOF");
+  assert.equal(await completed, false, "stop settles without waiting for channel EOF");
+});
+
+test("live TTS also waits for native success when channel EOF arrives first", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta. ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1, "terminal PCM alone cannot release the next synthesis request");
+
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = h.synthesis()[1];
+  assert.ok(second, "the next segment starts after both response and EOF");
+  second.args.pcmStream.onmessage(h.pcm("next"));
+  second.args.pcmStream.onmessage(h.pcm("next-eof", true));
+  second.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await completed;
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "eof", "next", "next-eof"]);
+});
+
+test("missing PCM EOF is bounded by the progress watchdog", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta. ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1, "the operation remains owned while EOF is outstanding");
+
+  h.fireLatestTimer();
+  assert.equal(await completed, false, "missing EOF fails the reply instead of hanging forever");
+  assert.equal(h.synthesis().length, 1);
+  assert.ok(h.invocations.some((entry) => entry.command === "mom_llama_speech_stop"));
+});
+
+test("PCM callbacks after terminal EOF fail the active segment instead of extending it", async () => {
+  const h = liveTtsTailHarness();
+  const failures = [];
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture", mode: "call", onFailure: (error) => failures.push(String(error)),
+  });
+  playback.push("alpha beta gamma delta epsilon zeta. ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  first.args.pcmStream.onmessage(h.pcm("late"));
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "eof"]);
+  assert.equal(failures.length, 1);
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  assert.equal(await completed, false);
+  assert.equal(h.synthesis().length, 1);
 });
 
 test("natural playback end clears pressed state and restores the Read Aloud button", async () => {
@@ -1131,4 +1544,49 @@ test("Stop transport errors remain observable without clearing newer ownership",
     stop.reply.reject(new Error("fixture-stop-refused")); await failure;
     assert.equal(h.button.dataset.operation, "fixture-new-operation");
   } finally { h.settle(); }
+});
+
+test("late worklet callbacks after stop neither schedule stale PCM nor update owner feedback", async () => {
+  const suspendGate = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, suspendGate });
+  const lateUnderruns = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onUnderrun: (gapMs) => lateUnderruns.push(gapMs),
+  });
+  const oneSecond = new Uint8Array(24_000 * 2);
+  for (let packet = 0; packet < 8; packet += 1) {
+    controller.push(h.pcmFrame(oneSecond, packet, false, packet * 24_000));
+  }
+
+  const playing = controller.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await playing, true);
+  const node = h.workletNodes[0];
+  assert.equal(node.port.messages.filter((message) => message.type === "pcm").length, 8);
+
+  // Fill the 8-second ring and leave one packet queued in the main-thread
+  // buffer. A consumed callback arriving after stop must not schedule it.
+  controller.push(h.pcmFrame(oneSecond, 8, false, 8 * 24_000));
+  assert.equal(h.audioContexts[0].sources.length, 0);
+  h.holdSuspend();
+  let stopped = false;
+  const stopping = controller.stop().then(() => { stopped = true; });
+  for (let attempt = 0; attempt < 100 && !h.audioContexts[0].suspendCalled; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(h.audioContexts[0].suspendCalled, true);
+  assert.equal(stopped, false, "the simulated context suspension is still pending");
+
+  node.port.onmessage({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
+  node.port.onmessage({ data: { type: "underrun", missingFrames: 240 } });
+  const observed = {
+    staleBufferSources: h.audioContexts[0].sources.length,
+    lateUnderrunFeedback: lateUnderruns.length,
+  };
+  suspendGate.resolve();
+  await stopping;
+  assert.equal(stopped, true);
+  assert.deepEqual(observed, { staleBufferSources: 0, lateUnderrunFeedback: 0 });
 });

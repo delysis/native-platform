@@ -175,6 +175,7 @@ fn attributed_history_fixture(id: &str) -> Conversation {
                 None,
             ),
         ],
+        inference_window: None,
     }
 }
 
@@ -1893,6 +1894,7 @@ fn system_and_tool_messages_reject_edits_without_mutating_the_conversation() -> 
         recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: vec![system.clone(), tool.clone()],
+        inference_window: None,
     };
     mom_llama_runtime::conversation_import_json(&serde_json::to_string(&fixture)?)?;
     let before = mom_llama_runtime::conversation_select(&fixture.id)?
@@ -2828,6 +2830,656 @@ fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires real Gemma GGUF, matching projector, and 16 kHz voice WAV"]
+fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
+    let _session = configured_real_session("real-voice-persona-prefix")?;
+    let projector = std::env::var_os("MOM_LLAMA_MMPROJ_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MMPROJ_PATH must point to the matching projector"))?;
+    let wav_path = std::env::var_os("MOM_LLAMA_TEST_VOICE_WAV")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_TEST_VOICE_WAV must point to a 16 kHz WAV"))?;
+    let samples = pcm16_mono_16khz_wav_samples(&wav_path)?;
+    anyhow::ensure!(samples.len() >= 8_000, "voice WAV needs 500 ms of PCM");
+    let configured_settings = mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        max_tokens: Some(8),
+        mmproj_path: Some(Some(projector)),
+        context_tokens: Some(8192),
+        batch_tokens: Some(256),
+        max_parallel_sequences: Some(4),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("voice context settings were not accepted"))?;
+    assert!(
+        (8192..=19_456).contains(&configured_settings.context_tokens),
+        "the manual memory cap should resolve a bounded context, got {}",
+        configured_settings.context_tokens
+    );
+    assert_eq!(
+        configured_settings.resident_memory_budget_bytes,
+        21_845 * 1024 * 1024
+    );
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let persona = mom_llama_runtime::persona_list()?
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no built-in persona"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
+    let started = std::time::Instant::now();
+    let warmed = mom_llama_runtime::runtime_warm(&scope)?;
+    let warmed = warmed
+        .result
+        .ok_or_else(|| anyhow!("runtime warm failed: {:?}", warmed.blocker))?;
+    eprintln!(
+        "VOICE_PERSONA_PREFIX_CACHE {{\"prepare_ms\":{},\"prefix_ms\":{},\"status\":\"{}\",\"ready\":{}}}",
+        started.elapsed().as_millis(),
+        warmed.persona_prefix_warm_us as f64 / 1000.0,
+        warmed.persona_prefix_warm_status,
+        warmed.persona_prefixes_ready
+    );
+    assert_eq!(warmed.persona_prefix_warm_status, "ready");
+    assert_eq!(warmed.persona_prefixes_ready, 1);
+    let warmed_again = mom_llama_runtime::runtime_warm(&scope)?
+        .result
+        .ok_or_else(|| anyhow!("second runtime warm failed"))?;
+    assert_eq!(
+        warmed_again.persona_prefix_warm_status, "blocked",
+        "startup warming must not supersede a worker after its first admitted prefix"
+    );
+    assert_eq!(warmed_again.persona_prefixes_ready, 0);
+    assert_eq!(warmed_again.persona_prefixes_reused, 0);
+    let resident = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona.id)?
+        .result
+        .ok_or_else(|| anyhow!("explicit resident persona preparation failed"))?;
+    assert!(resident.resident_prefix_tokens > 0);
+    assert!(resident.metadata.is_none());
+    assert!(!resident.persisted);
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;
+    let greeting_started = Instant::now();
+    let greeting = product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
+    )?;
+    eprintln!(
+        "VOICE_PERSONA_GREETING {}",
+        serde_json::to_string(&json!({
+            "wall_ms": greeting_started.elapsed().as_millis(),
+            "first_token_ms": greeting.first_token_ms,
+            "prompt_tokens": greeting.prompt_tokens,
+            "completion_tokens": greeting.completion_tokens,
+            "cache_reused": greeting.cache_reused,
+            "cache_metrics": greeting.cache_metrics,
+        }))?
+    );
+    assert!(
+        greeting.cache_reused,
+        "pickup greeting missed the prepared persona prefix"
+    );
+    let voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &conversation.id,
+        "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.",
+    )?;
+    assert!(
+        voice.begin_metrics().cached_prefix_found,
+        "first voice turn did not reuse the prepared persona cache: {:?}",
+        voice.begin_metrics()
+    );
+    let restored_tokens = voice.begin_metrics().cached_prefix_tokens;
+    voice.wait_for_resume()?;
+    let capture_started = Instant::now();
+    for (index, chunk) in samples[..8_000].chunks(160).enumerate() {
+        let deadline = capture_started + Duration::from_millis(index as u64 * 10);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        voice.push_pcm(chunk)?;
+    }
+    if let Some(wait) =
+        (capture_started + Duration::from_millis(500)).checked_duration_since(Instant::now())
+    {
+        std::thread::sleep(wait);
+    }
+    let silence = Instant::now();
+    voice.seal_input()?;
+    let mut first_token_ms = None;
+    let finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
+        voice,
+        ChatSendOptions {
+            timeout_s: 60.0,
+            fake_fixture: false,
+        },
+        Some(|event: mom_llama_runtime::ChatStreamEvent| {
+            if first_token_ms.is_none()
+                && matches!(event.event.as_str(), "delta" | "reasoning_delta")
+            {
+                first_token_ms = Some(silence.elapsed().as_millis());
+            }
+            Ok(())
+        }),
+        || {
+            let imported = mom_llama_runtime::attachment_import_voice_message(
+                &scope,
+                &conversation.id,
+                std::fs::read(&wav_path)?,
+            )?;
+            Ok(Some(
+                imported
+                    .result
+                    .ok_or_else(|| {
+                        anyhow!("voice attachment import failed: {:?}", imported.blocker)
+                    })?
+                    .attachment
+                    .id,
+            ))
+        },
+    )?;
+    let output = finished
+        .result
+        .ok_or_else(|| anyhow!("prepared first voice turn failed: {:#?}", finished.blocker))?;
+    let audio = output
+        .voice_audio_metrics
+        .as_ref()
+        .ok_or_else(|| anyhow!("prepared first voice turn omitted audio metrics"))?;
+    eprintln!(
+        "VOICE_PERSONA_FIRST_TURN {}",
+        serde_json::to_string(&json!({
+            "cached_prefix_tokens": restored_tokens,
+            "silence_to_first_token_ms": first_token_ms,
+            "prefix_us": audio.prefix_us,
+            "restored_prefix_tokens": audio.restored_prefix_tokens,
+            "projector_us": audio.projector_us,
+            "projector_max_us": audio.projector_max_us,
+            "last_projector_finish_us": audio.last_projector_finish_us,
+            "decode_start_us": audio.decode_start_us,
+        }))?
+    );
+    anyhow::ensure!(
+        first_token_ms.is_some(),
+        "prepared turn emitted no text token"
+    );
+    let following = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &conversation.id,
+        "[Phone call] Continue the conversation naturally.",
+    )?;
+    assert!(
+        !following.begin_metrics().attachment_free_fast_path,
+        "the prior user recording must still be present until transcription completes"
+    );
+    assert!(
+        following.begin_metrics().cached_prefix_found,
+        "pending historical audio must not bypass the resident text prefix: {:?}",
+        following.begin_metrics()
+    );
+    following.cancel();
+
+    let mut overflow = conversation.clone();
+    overflow.id = uuid::Uuid::new_v4().to_string();
+    overflow.title = "Voice context rollover proof".to_string();
+    let handle = overflow
+        .execution_profile
+        .mention_handle
+        .chars()
+        .take(32)
+        .collect::<String>();
+    overflow.execution_profile.mention_handle = format!("{handle}-rollover");
+    overflow.messages.clear();
+    overflow.branch_root_message_id = None;
+    overflow.active_leaf_message_id = None;
+    let mut parent_id = None;
+    for index in 0..24 {
+        let user_id = format!("rollover-user-{index}");
+        let assistant_id = format!("rollover-assistant-{index}");
+        overflow.messages.push(Message {
+            id: user_id.clone(),
+            conversation_id: overflow.id.clone(),
+            role: MessageRole::User,
+            content: format!(
+                "Historical user turn {index}: {}",
+                "Earlier detail remains in the original source record. ".repeat(64)
+            ),
+            created_at: index.to_string(),
+            parent_id: parent_id.take(),
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        });
+        overflow.messages.push(Message {
+            id: assistant_id.clone(),
+            conversation_id: overflow.id.clone(),
+            role: MessageRole::Assistant,
+            content: format!(
+                "Historical assistant turn {index}: {}",
+                "The full answer remains available in source history. ".repeat(64)
+            ),
+            created_at: index.to_string(),
+            parent_id: Some(user_id),
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        });
+        parent_id = Some(assistant_id);
+    }
+    overflow.active_leaf_message_id = parent_id;
+    let imported = mom_llama_runtime::conversation_import_json(&serde_json::to_string(&overflow)?)?
+        .result
+        .ok_or_else(|| anyhow!("large voice history import failed"))?;
+    let original_messages = imported.messages.clone();
+    let persona_system_message = imported.execution_profile.system_message.clone();
+    anyhow::ensure!(
+        !original_messages.is_empty(),
+        "rollover fixture must retain source messages"
+    );
+    anyhow::ensure!(
+        persona_system_message.is_some(),
+        "rollover fixture must retain the selected Persona's system prompt"
+    );
+    assert_eq!(
+        persona_system_message, conversation.execution_profile.system_message,
+        "importing the rollover fixture must preserve the Persona prompt"
+    );
+    assert_eq!(
+        imported.source_conversation_id, conversation.source_conversation_id,
+        "the rollover fixture must remain owned by the same Persona"
+    );
+
+    let rollover_voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &imported.id,
+        "[Phone call] Reply naturally and briefly to the latest message.",
+    )?;
+    let rollover_begin = rollover_voice.begin_metrics().clone();
+    let reserved_prompt_limit = rollover_begin.resident_context_tokens as usize
+        - (rollover_begin.resident_context_tokens as usize / 4).min(4096)
+        - 96
+        - 32;
+    eprintln!(
+        "VOICE_CONTEXT_ROLLOVER {}",
+        serde_json::to_string(&json!({
+            "profile": "32GB-manual-21845MiB",
+            "fixture": "24 synthetic source exchanges and synthetic 16kHz tone",
+            "source_messages": original_messages.len(),
+            "resident_context_tokens": rollover_begin.resident_context_tokens,
+            "measured_static_prompt_tokens": rollover_begin.measured_prompt_tokens,
+            "reserved_prompt_limit": reserved_prompt_limit,
+            "omitted_history_messages": rollover_begin.omitted_history_messages,
+            "cached_prefix_found": rollover_begin.cached_prefix_found,
+            "cached_prefix_tokens": rollover_begin.cached_prefix_tokens,
+        }))?
+    );
+    assert!(
+        rollover_begin.omitted_history_messages > 0,
+        "oversized retained history should be excluded from inference"
+    );
+    assert!(
+        rollover_begin.measured_prompt_tokens <= reserved_prompt_limit,
+        "measured prompt {} exceeded the voice context limit {reserved_prompt_limit} (context {})",
+        rollover_begin.measured_prompt_tokens,
+        rollover_begin.resident_context_tokens
+    );
+    assert!(
+        rollover_begin.cached_prefix_found,
+        "the rollover conversation should reuse the prepared Persona prefix"
+    );
+    rollover_voice.wait_for_resume()?;
+    let capture_started = Instant::now();
+    for (index, chunk) in samples[..8_000].chunks(160).enumerate() {
+        let deadline = capture_started + Duration::from_millis(index as u64 * 10);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        rollover_voice.push_pcm(chunk)?;
+    }
+    if let Some(wait) =
+        (capture_started + Duration::from_millis(500)).checked_duration_since(Instant::now())
+    {
+        std::thread::sleep(wait);
+    }
+    rollover_voice.seal_input()?;
+    let rollover_finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
+        rollover_voice,
+        ChatSendOptions {
+            timeout_s: 60.0,
+            fake_fixture: false,
+        },
+        None::<fn(mom_llama_runtime::ChatStreamEvent) -> Result<()>>,
+        || {
+            let imported_audio = mom_llama_runtime::attachment_import_voice_message(
+                &scope,
+                &imported.id,
+                std::fs::read(&wav_path)?,
+            )?;
+            Ok(Some(
+                imported_audio
+                    .result
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "rollover voice attachment import failed: {:?}",
+                            imported_audio.blocker
+                        )
+                    })?
+                    .attachment
+                    .id,
+            ))
+        },
+    )?;
+    let rollover_output = rollover_finished.result.ok_or_else(|| {
+        anyhow!(
+            "rollover voice turn failed: {:#?}",
+            rollover_finished.blocker
+        )
+    })?;
+    let rollover_audio = rollover_output
+        .voice_audio_metrics
+        .as_ref()
+        .ok_or_else(|| anyhow!("rollover turn omitted voice metrics"))?;
+    assert!(
+        rollover_audio.accepted_samples >= 8_000,
+        "the real voice path must accept the full synthetic PCM window"
+    );
+    let committed = mom_llama_runtime::conversation_select(&imported.id)?
+        .result
+        .ok_or_else(|| anyhow!("committed rollover conversation disappeared"))?;
+    anyhow::ensure!(
+        committed.messages.len() >= original_messages.len(),
+        "committing voice must retain every original source message"
+    );
+    for (saved, original) in committed.messages[..original_messages.len()]
+        .iter()
+        .zip(&original_messages)
+    {
+        assert_eq!(saved.id, original.id, "source message identity changed");
+        assert_eq!(saved.conversation_id, original.conversation_id);
+        assert_eq!(saved.role, original.role);
+        assert_eq!(
+            saved.content, original.content,
+            "source message text changed"
+        );
+        assert_eq!(saved.created_at, original.created_at);
+        assert_eq!(saved.parent_id, original.parent_id);
+        assert_eq!(saved.model, original.model);
+        assert_eq!(saved.receipt_id, original.receipt_id);
+        assert_eq!(saved.prompt_tokens, original.prompt_tokens);
+        assert_eq!(saved.completion_tokens, original.completion_tokens);
+        assert_eq!(saved.reasoning_content, original.reasoning_content);
+        assert_eq!(saved.reasoning_incomplete, original.reasoning_incomplete);
+        assert_eq!(saved.attribution, original.attribution);
+        assert_eq!(saved.attachment_ids, original.attachment_ids);
+    }
+    let saved_window = committed
+        .inference_window
+        .clone()
+        .ok_or_else(|| anyhow!("rollover boundary was not durably saved"))?;
+    assert!(
+        original_messages
+            .iter()
+            .any(|message| message.id == saved_window.covered_through_message_id),
+        "the saved boundary must point into the unchanged original source history"
+    );
+    assert_eq!(
+        rollover_audio.begin.omitted_history_messages,
+        rollover_begin.omitted_history_messages
+    );
+
+    let next_rollover_voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &imported.id,
+        "[Phone call] Reply naturally and briefly to the latest message.",
+    )?;
+    assert_eq!(
+        next_rollover_voice.begin_metrics().omitted_history_messages,
+        rollover_begin.omitted_history_messages,
+        "the following small turn should keep the saved context boundary"
+    );
+    assert!(
+        next_rollover_voice.begin_metrics().cached_prefix_found
+            && next_rollover_voice.begin_metrics().cached_prefix_tokens > 0,
+        "the following turn should reuse a resident Persona prefix: {:?}",
+        next_rollover_voice.begin_metrics()
+    );
+    eprintln!(
+        "VOICE_CONTEXT_NEXT_TURN {}",
+        serde_json::to_string(&json!({
+            "omitted_history_messages": next_rollover_voice.begin_metrics().omitted_history_messages,
+            "cached_prefix_found": next_rollover_voice.begin_metrics().cached_prefix_found,
+            "cached_prefix_tokens": next_rollover_voice.begin_metrics().cached_prefix_tokens,
+        }))?
+    );
+    next_rollover_voice.cancel();
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MM_PROJ_PATH for real Gemma audio"]
+fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
+    let _session = configured_real_session("real-shutdown-session-checkpoint")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(4),
+        max_tokens: Some(8),
+        mmproj_path: Some(Some(PathBuf::from(std::env::var(
+            "MOM_LLAMA_MM_PROJ_PATH",
+        )?))),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        upstream_settings: Some(BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(true),
+        )])),
+        ..SettingsUpdate::default()
+    })?;
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+    let persona = mom_llama_runtime::persona_list()?
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no built-in persona"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id))?;
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona call did not materialize"))?;
+    product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "Remember this phrase: copper heron.",
+    )?;
+    mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation.id)?;
+    let before = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("missing cache status"))?;
+    let older = before
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(&conversation.id)
+        })
+        .ok_or_else(|| anyhow!("missing first committed checkpoint"))?;
+    // Keep idle persistence out while a newer, divergent prompt becomes
+    // resident. Pickup must not overwrite it with the previous disk state.
+    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, "shutdown-witness", true)?;
+    mom_llama_runtime::conversation_system_message_update(&conversation.id, Some("You are a concise archivist. Retain the caller's exact invented phrases. Answer briefly.".into()))?;
+    let latest =
+        product_chat_cache_request(&scope, &conversation.id, "Now remember: violet badger.")?;
+    let warm =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &conversation.id)?
+            .result
+            .ok_or_else(|| anyhow!("missing resident preparation result"))?;
+    assert!(
+        warm.metadata.is_none(),
+        "new resident request must take precedence over older checkpoint {}",
+        older.id
+    );
+    assert_eq!(warm.prefill_us, 0);
+    assert!(warm.resident_prefix_tokens > 0);
+
+    // Launch warming is permitted only on a pristine worker. The selected
+    // materialized Chat owns a newer committed request, so this attempt must
+    // leave its exact resident revision and committed-prefix count untouched.
+    let settings = mom_llama_runtime::config::resolve_settings()?;
+    let handle = mom_llama_runtime::native_runtime::resident_model(&scope, &settings)?;
+    let before_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
+    let before_startup_state = handle
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .ok_or_else(|| anyhow!("latest committed request was not snapshot eligible"))?;
+    let startup_warm = mom_llama_runtime::runtime_warm(&scope)?
+        .result
+        .ok_or_else(|| anyhow!("startup warm returned no result"))?;
+    assert!(startup_warm.audio_projector_warmed);
+    assert_eq!(startup_warm.persona_prefix_warm_status, "blocked");
+    assert_eq!(startup_warm.persona_prefixes_ready, 0);
+    let after_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
+    assert_eq!(after_startup_warm.revision, before_startup_warm.revision);
+    assert_eq!(
+        after_startup_warm.committed_prefix_tokens,
+        before_startup_warm.committed_prefix_tokens
+    );
+    assert_eq!(
+        after_startup_warm.committed_prefix_tokens,
+        Some(before_startup_state.token_count)
+    );
+    // Verify the supported warm API still takes the resident path after
+    // opportunistic startup work.
+    let warm_after_startup =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &conversation.id)?
+            .result
+            .ok_or_else(|| anyhow!("latest resident prefix was not prepared"))?;
+    assert_eq!(warm_after_startup.prefill_us, 0);
+    assert_eq!(
+        warm_after_startup.resident_prefix_tokens,
+        warm.resident_prefix_tokens
+    );
+    let after_startup_state = handle
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .ok_or_else(|| anyhow!("startup warm lost the latest committed request"))?;
+    assert_eq!(
+        after_startup_state.cells, before_startup_state.cells,
+        "startup warm must not replace the latest committed KV cells"
+    );
+    assert!(handle.resident_conversation_covers_cells(after_startup_state.cells)?);
+    println!(
+        "STARTUP_WARM_PRESERVED_ACTIVE_SESSION {}",
+        json!({
+            "revision": after_startup_warm.revision,
+            "committed_prefix_tokens": after_startup_warm.committed_prefix_tokens,
+            "warm_status": startup_warm.persona_prefix_warm_status,
+        })
+    );
+    println!(
+        "PENDING_SESSION_RAM_HIT {}",
+        json!({"resident_prefix_tokens": warm.resident_prefix_tokens, "prefill_us": warm.prefill_us, "older_checkpoint": older.id})
+    );
+    let drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(&scope);
+    scope.request_cancellation();
+    assert!(scope.cancellation_requested());
+    let started = Instant::now();
+    let saved = drain.flush()?;
+    assert_eq!(
+        saved, 1,
+        "shutdown must persist the resident committed request"
+    );
+    let after = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("missing cache status"))?;
+    let checkpoint = after
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.id != older.id
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(&conversation.id)
+        })
+        .ok_or_else(|| anyhow!("shutdown omitted the conversation checkpoint"))?;
+    assert!(checkpoint.state_bytes > 0);
+    let cache_id = checkpoint.id.clone();
+    println!(
+        "SHUTDOWN_CHECKPOINT_SAVED {}",
+        json!({"saved": saved, "bytes": checkpoint.state_bytes, "elapsed_ms": started.elapsed().as_millis()})
+    );
+    drop(scope);
+    drop(owner);
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    // Session state is intentionally not exposed by the generic persona-cache
+    // restore command. Exercise the same conversation-scoped warm boundary as
+    // pickup; it accepts only authenticated native state, never token replay.
+    let restored = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(
+        &restored_scope,
+        &conversation.id,
+    )?;
+    assert_eq!(
+        restored.readiness, "resident_prefix_prepared",
+        "{:?}",
+        restored.blocker
+    );
+    let prepared = restored
+        .result
+        .ok_or_else(|| anyhow!("missing conversation restore result"))?;
+    let restored_metadata = prepared
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing exact session checkpoint"))?;
+    assert_eq!(restored_metadata.id, cache_id);
+    assert_eq!(
+        restored_metadata.owner_id.as_deref(),
+        Some(conversation.id.as_str())
+    );
+    assert_eq!(
+        prepared.prefill_us, 0,
+        "restart must not reprocess the prompt"
+    );
+    assert_eq!(
+        prepared.resident_prefix_tokens,
+        checkpoint.cells.len().max(checkpoint.token_ids.len())
+    );
+    assert!(prepared.resident_prefix_tokens > 0);
+    println!(
+        "SHUTDOWN_CHECKPOINT_RESTORED {}",
+        json!({
+            "readiness": restored.readiness,
+            "cache_id": restored_metadata.id,
+            "resident_prefix_tokens": prepared.resident_prefix_tokens,
+            "prefill_us": prepared.prefill_us,
+            "path": "conversation-scoped authenticated native restore"
+        })
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
@@ -2866,6 +3518,16 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         "cold generation must persist a real encrypted checkpoint"
     );
     let warm = product_chat_cache_request(&scope, &conversation.id, "Return the word warm.")?;
+    eprintln!(
+        "VOICE_TEXT_CACHE_POLICY_WARM {}",
+        serde_json::to_string(&json!({
+            "cold_reused": cold.cache_reused,
+            "cold_metrics": cold.cache_metrics,
+            "warm_reused": warm.cache_reused,
+            "warm_metrics": warm.cache_metrics,
+            "warm_cache_id": warm.cache_id,
+        }))?
+    );
     assert!(
         warm.cache_reused,
         "the second direct chat request must reuse its prefix"
@@ -2876,10 +3538,16 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
     assert!(cleared.blocker.is_none());
     let after_clear =
         product_chat_cache_request(&scope, &conversation.id, "Return the words after clear.")?;
-    assert!(
-        !after_clear.cache_reused,
-        "explicit clear must force a cold request"
+    assert_eq!(
+        after_clear.cache_id, None,
+        "explicit clear must revoke the product-managed cache entry"
     );
+    if after_clear.cache_reused {
+        assert!(
+            after_clear.cache_metrics.resident_prefix_tokens > 0,
+            "a post-clear hit must come only from exact cells still resident in the worker"
+        );
+    }
     let warm_after_clear =
         product_chat_cache_request(&scope, &conversation.id, "Return the words after warmup.")?;
     assert!(warm_after_clear.cache_reused);
@@ -2896,8 +3564,17 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         product_chat_cache_request(&scope, &conversation.id, "Caching is off, first request.")?;
     let off_second =
         product_chat_cache_request(&scope, &conversation.id, "Caching is off, second request.")?;
-    assert!(!off_first.cache_reused);
-    assert!(!off_second.cache_reused);
+    assert_eq!(off_first.cache_id, None);
+    assert_eq!(off_second.cache_id, None);
+    // Off removes the product-managed prefix tier. The native worker can still
+    // use token-exact cells from the immediately preceding request, and the
+    // public cache flag must report that physical reuse honestly.
+    assert_eq!(
+        off_second.cache_reused,
+        off_second.cache_metrics.resident_prefix_tokens > 0
+            || off_second.cache_metrics.restored_prefix_tokens > 0
+            || off_second.cache_metrics.batch_shared_prefix_tokens > 0
+    );
     assert!(
         !encrypted_document_snapshot(session.path())?
             .contains_key("native-host-prefix-cache.mom-llama"),
@@ -3991,6 +4668,15 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     let _session = configured_real_session("real-cache")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(1),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        ..SettingsUpdate::default()
+    })?;
     let native_owner = initialize_product_runtime()?;
     let scope = native_owner.operation_scope();
     let skill = mom_llama_runtime::skill_store::skill_create(
@@ -4012,6 +4698,153 @@ fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     let restored = mom_llama_runtime::kv_cache_restore(&scope, Some(cache_id))?;
     assert_eq!(restored.readiness, "prompt_smoke_verified");
     assert!(restored.receipt.real_engine_invoked);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_restart() -> Result<()>
+{
+    let session = configured_real_session("real-large-voice-cache-reload")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(2),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        max_tokens: Some(8),
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let source = mom_llama_runtime::conversation_new(Some("Long cache source".into()))?
+        .result
+        .ok_or_else(|| anyhow!("long cache source conversation missing"))?;
+    let long_persona = "You are a concise, careful assistant. Preserve names and chronology, answer in one short sentence, ask one gentle question only when a key detail is missing, and do not invent memories. ".repeat(150);
+    mom_llama_runtime::conversation_system_message_update(&source.id, Some(long_persona))?;
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: source.id.clone(),
+            message: "Acknowledge this isolated cache test.".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    let source = mom_llama_runtime::conversation_select(&source.id)?
+        .result
+        .ok_or_else(|| anyhow!("long cache source reload missing"))?;
+    let leaf = source
+        .active_leaf_message_id
+        .clone()
+        .ok_or_else(|| anyhow!("long cache source leaf missing"))?;
+    let persona = mom_llama_runtime::persona_freeze(PersonaFreezeInput {
+        conversation_id: source.id.clone(),
+        message_id: leaf,
+        name: "Long cache witness".into(),
+        mention_handle: "long-cache-witness".into(),
+        history_mode: PersonaHistoryMode::SystemOnly,
+    })?
+    .result
+    .ok_or_else(|| anyhow!("long cache persona missing"))?;
+
+    let prepare_started = Instant::now();
+    let prepared = mom_llama_runtime::kv_cache_save_voice_persona(&scope, &persona.id)?
+        .result
+        .ok_or_else(|| anyhow!("long voice persona cache preparation failed"))?;
+    let metadata = prepared
+        .metadata
+        .as_ref()
+        .expect("persisted preparation metadata");
+    assert!(
+        metadata.token_ids.len() > 4_000,
+        "persona cache prefix was not long enough to exercise SWA retention: {}",
+        metadata.token_ids.len()
+    );
+    assert!(
+        metadata.state_bytes > 1_000_000_000,
+        "real native state did not exceed SQLite's single-value range: {} bytes",
+        metadata.state_bytes
+    );
+    let cache_id = metadata.id.clone();
+    let blob_base = format!("kv-cache.v3.blob.{cache_id}");
+    let connection = rusqlite::Connection::open(session.path().join("runtime.sqlite3"))?;
+    let mut statement = connection.prepare(
+        "SELECT namespace FROM encrypted_documents WHERE namespace LIKE ?1 ORDER BY namespace",
+    )?;
+    let chunk_names = statement
+        .query_map([format!("{blob_base}%")], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let chunk_count = chunk_names.len();
+    assert!(
+        chunk_count >= 2,
+        "large state was not stored in multiple encrypted parts"
+    );
+    assert!(chunk_names.contains(&format!("{blob_base}.part-1")));
+    println!(
+        "VOICE_LARGE_CACHE_PERSIST {}",
+        serde_json::to_string(&json!({
+            "model_sha256": metadata.fingerprint.model_sha256,
+            "token_count": metadata.token_ids.len(),
+            "state_bytes": metadata.state_bytes,
+            "encrypted_parts": chunk_count,
+            "prepare_ms": prepare_started.elapsed().as_millis(),
+            "persisted": prepared.persisted,
+        }))?
+    );
+    drop(scope);
+    drop(native_owner);
+
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    let restore_started = Instant::now();
+    let restored = mom_llama_runtime::kv_cache_restore(&restored_scope, Some(cache_id.clone()))?;
+    assert_eq!(
+        restored.readiness, "prompt_smoke_verified",
+        "persistent chunk restore failed: {:#?}",
+        restored.blocker
+    );
+    assert!(restored.receipt.real_engine_invoked);
+    assert!(
+        restored
+            .receipt
+            .artifacts_produced
+            .iter()
+            .any(|artifact| artifact.contains("authenticated")
+                && artifact.contains("native KV state")),
+        "restart restored by native state import, not token replay: {:?}",
+        restored.receipt.artifacts_produced
+    );
+    assert!(
+        !restored
+            .receipt
+            .artifacts_produced
+            .iter()
+            .any(|artifact| artifact.contains("token IDs")),
+        "large-state restart unexpectedly fell back to token replay: {:?}",
+        restored.receipt.artifacts_produced
+    );
+    assert_eq!(
+        restored.result.as_ref().map(|entry| entry.id.as_str()),
+        Some(cache_id.as_str())
+    );
+    println!(
+        "VOICE_LARGE_CACHE_RELOAD {}",
+        serde_json::to_string(&json!({
+            "cache_id": cache_id,
+            "model_sha256": metadata.fingerprint.model_sha256,
+            "state_bytes": metadata.state_bytes,
+            "encrypted_parts": chunk_count,
+            "restore_ms": restore_started.elapsed().as_millis(),
+            "readiness": restored.readiness,
+            "real_engine_invoked": restored.receipt.real_engine_invoked,
+            "restore_evidence": restored.receipt.artifacts_produced,
+        }))?
+    );
     Ok(())
 }
 

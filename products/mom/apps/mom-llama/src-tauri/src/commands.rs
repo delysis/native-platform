@@ -21,12 +21,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{Emitter, Manager, State, Window};
 
-use crate::app_runtime::{AppRuntimeHandle, AppWorkLease, complete_voice_wav};
+use crate::app_runtime::{
+    AppRuntimeHandle, AppWorkLease, ConfirmedVoiceRecording, VoiceInferenceRecording,
+    complete_voice_wav, validate_voice_inference_recording,
+};
 use crate::command_registry::command_spec;
 use crate::information::{
     AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
     ManagedRemovalSelection,
 };
+use crate::live_transcription::TurnIdentity;
+use crate::live_transcription_owner::LiveTranscriptionOwner;
 use crate::native_voice_capture::{CaptureTarget, NativeVoiceCapture};
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
@@ -77,6 +82,63 @@ fn emit_voice_speculation_stage_with_detail(
             "detail": detail,
         }),
     );
+}
+
+fn emit_model_input_derivative_unavailable(window: &Window, reason: &str) {
+    let _ = window.emit(
+        "mom_llama_model_input_derivative_unavailable",
+        serde_json::json!({
+            "schema": "mom_llama.model_input_derivative_unavailable.v1",
+            "reason": reason,
+        }),
+    );
+}
+
+struct VoiceAttachmentImport {
+    imported: mom_llama_runtime::CommandResult<mom_llama_runtime::AttachmentImportOutput>,
+    derivative_unavailable_reason: Option<String>,
+}
+
+fn preserve_original_import_on_derivative_failure<T>(
+    original: T,
+    persist_derivative: impl FnOnce(&T) -> anyhow::Result<()>,
+) -> (T, Option<String>) {
+    match persist_derivative(&original) {
+        Ok(()) => (original, None),
+        Err(_) => (original, Some("derivative_persistence_failed".to_string())),
+    }
+}
+
+fn import_voice_message_with_inference(
+    operations: &mom_llama_runtime::OperationScope,
+    conversation: &str,
+    physical_wav: Vec<u8>,
+    inference: Option<VoiceInferenceRecording>,
+    mut derivative_unavailable_reason: Option<String>,
+) -> anyhow::Result<VoiceAttachmentImport> {
+    let imported =
+        mom_llama_runtime::attachment_import_voice_message(operations, conversation, physical_wav)?;
+    let (imported, derivative_failure) =
+        preserve_original_import_on_derivative_failure(imported, |original| {
+            if let (Some(attachment), Some(inference)) = (&original.result, inference) {
+                mom_llama_runtime::store_inference_audio_derivative(
+                    &attachment.attachment.id,
+                    &attachment.attachment.sha256,
+                    inference.wav,
+                    mom_llama_runtime::InferenceAudioProvenance {
+                        source_sample_count: inference.source_sample_count,
+                        accepted_sample_count: inference.accepted_sample_count,
+                        source_ranges: Some(inference.source_ranges),
+                    },
+                )?;
+            }
+            Ok(())
+        });
+    derivative_unavailable_reason = derivative_unavailable_reason.or(derivative_failure);
+    Ok(VoiceAttachmentImport {
+        imported,
+        derivative_unavailable_reason,
+    })
 }
 
 #[tauri::command]
@@ -517,6 +579,19 @@ pub async fn mom_llama_runtime_warm(runtime: State<'_, AppRuntimeHandle>) -> Res
 }
 
 #[tauri::command]
+pub async fn mom_llama_voice_persona_prepare(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona_id: String,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    let lease = runtime.admit(command_spec("mom_llama_voice_persona_prepare"))?;
+    blocking_command(lease, move || {
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub fn mom_llama_engine_configure(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
@@ -573,13 +648,44 @@ pub async fn mom_llama_model_select(
     .await
 }
 
+// A renderer nonce only correlates events to the dispatch that created them;
+// native request IDs retain cancellation and generation authority.
+fn validate_chat_client_request(request: Option<&str>) -> Result<(), String> {
+    if request.is_some_and(|request| {
+        request.is_empty()
+            || request.len() > 64
+            || !request
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
+    }
+    Ok(())
+}
+
+fn correlate_chat_event(
+    event: &impl serde::Serialize,
+    client_request: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut payload = to_value(event)?;
+    if let Some(request) = client_request {
+        payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("chat stream event must be an object"))?
+            .insert("client_request".into(), Value::String(request.to_owned()));
+    }
+    Ok(payload)
+}
+
 #[tauri::command]
 pub async fn mom_llama_chat_send(
     runtime: State<'_, AppRuntimeHandle>,
     window: Window,
     conversation: String,
     message: String,
+    client_request: Option<String>,
 ) -> Result<Value, String> {
+    validate_chat_client_request(client_request.as_deref())?;
     let lease = runtime.admit(command_spec("mom_llama_chat_send"))?;
     let operations = runtime.operation_scope();
     let events = window.clone();
@@ -593,7 +699,10 @@ pub async fn mom_llama_chat_send(
             ChatSendOptions::default(),
             move |event| {
                 events
-                    .emit("mom_llama_chat_stream", &event)
+                    .emit(
+                        "mom_llama_chat_stream",
+                        correlate_chat_event(&event, client_request.as_deref())?,
+                    )
                     .map_err(anyhow::Error::new)?;
                 Ok(())
             },
@@ -689,15 +798,7 @@ pub async fn mom_llama_chat_dispatch(
     message: String,
     client_request: Option<String>,
 ) -> Result<Value, String> {
-    if client_request.as_ref().is_some_and(|request| {
-        request.is_empty()
-            || request.len() > 64
-            || !request
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
-    }
+    validate_chat_client_request(client_request.as_deref())?;
     let stream_conversation = conversation.clone();
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
     let runtime = runtime.inner().clone();
@@ -711,7 +812,7 @@ pub async fn mom_llama_chat_dispatch(
         },
         Some(move |event| {
             events
-                .emit("mom_llama_chat_dispatch_stream", &event)
+                .emit("mom_llama_chat_dispatch_stream", correlate_chat_event(&event, client_request.as_deref())?)
                 .map_err(anyhow::Error::new)?;
             if let Some(request) = &client_request {
                 events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
@@ -1637,6 +1738,68 @@ pub async fn mom_llama_voice_capture_prepare(
 }
 
 #[tauri::command]
+pub fn mom_llama_live_transcription_begin(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    window: Window,
+    turn: String,
+    capture: String,
+    conversation: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_live_transcription_begin"))?;
+    owner.begin(
+        TurnIdentity {
+            turn: turn.clone(),
+            capture,
+            conversation,
+        },
+        operation,
+        runtime.speech(),
+        lease,
+        window,
+    )?;
+    Ok(serde_json::json!({ "turn": turn }))
+}
+
+#[tauri::command]
+pub fn mom_llama_live_transcription_push(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+    sample_offset: usize,
+    samples: Vec<f32>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_push"))?;
+    serde_json::to_value(owner.push(&turn, &capture, sample_offset, &samples)?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_live_transcription_finish(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+    samples: usize,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_finish"))?;
+    serde_json::to_value(owner.finish(&turn, &capture, samples).await?).map_err(to_error)
+}
+
+#[tauri::command]
+pub fn mom_llama_live_transcription_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+    owner: State<'_, LiveTranscriptionOwner>,
+    turn: String,
+    capture: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_live_transcription_cancel"))?;
+    owner.cancel(&turn, &capture)?;
+    Ok(serde_json::json!({ "turn": turn, "cancelled": true }))
+}
+
+#[tauri::command]
 pub async fn mom_llama_voice_capture_start(
     runtime: State<'_, AppRuntimeHandle>,
     capture_state: State<'_, NativeVoiceCapture>,
@@ -1723,7 +1886,7 @@ pub async fn mom_llama_voice_capture_stop(
     capture_state: State<'_, NativeVoiceCapture>,
     window: Window,
     capture: String,
-) -> Result<Response, String> {
+) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_capture_stop"))?;
     let controller = capture_state.inner().clone();
     lease
@@ -1735,10 +1898,20 @@ pub async fn mom_llama_voice_capture_stop(
                     "capture": capture,
                     "heard_voice": output.heard_voice,
                     "wav_bytes": output.wav.len(),
+                    "inference_wav_bytes": output.inference_wav.as_ref().map_or(0, Vec::len),
+                    "inference_accepted_samples": output.inference_accepted_sample_count,
                     "metrics": output.metrics,
                 }),
             );
-            Ok(Response::new(output.wav))
+            Ok(serde_json::json!({
+                "wav": output.wav,
+                "heard_voice": output.heard_voice,
+                "metrics": output.metrics,
+                "inference_wav": output.inference_wav,
+                "inference_source_sample_count": output.inference_source_sample_count,
+                "inference_accepted_sample_count": output.inference_accepted_sample_count,
+                "inference_source_ranges": output.inference_source_ranges,
+            }))
         })
         .await
 }
@@ -1787,17 +1960,34 @@ pub async fn mom_llama_voice_audio_push(
         .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes named source-capture metadata as IPC parameters"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_finish(
     runtime: State<'_, AppRuntimeHandle>,
     window: Window,
     session: String,
     recording: Vec<u8>,
+    model_input_recording: Option<Vec<u8>>,
+    source_sample_count: Option<u64>,
+    accepted_sample_count: Option<u64>,
+    source_start_sample: Option<u64>,
+    source_ranges: Option<Vec<mom_llama_runtime::InferenceAudioSampleRange>>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_audio_finish"))?;
     if !complete_voice_wav(&recording) {
         return Err("The voice turn has no complete recording".to_string());
     }
+    let (inference, inference_unavailable_reason) = validate_voice_inference_recording(
+        &recording,
+        model_input_recording,
+        source_sample_count,
+        accepted_sample_count,
+        source_start_sample,
+        source_ranges,
+    );
     let owner = runtime.inner().clone();
     let voice = owner.take_voice_audio_session(&session)?;
     let conversation = voice.conversation_id().to_string();
@@ -1805,16 +1995,19 @@ pub async fn mom_llama_voice_audio_finish(
     let import = std::thread::Builder::new()
         .name("mom-voice-attachment-import".to_string())
         .spawn(move || {
-            mom_llama_runtime::attachment_import_voice_message(
+            import_voice_message_with_inference(
                 &operations,
                 &conversation,
                 recording,
+                inference,
+                inference_unavailable_reason,
             )
         })
         .map_err(|error| format!("voice_attachment_import_spawn_failed: {error}"))?;
     let import = Arc::new(std::sync::Mutex::new(Some(import)));
     let precommit_import = Arc::clone(&import);
     let events = window.clone();
+    let derivative_events = window.clone();
     lease
         .run_blocking_with_cancellation_evidence(move || {
             let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
@@ -1834,10 +2027,14 @@ pub async fn mom_llama_voice_audio_finish(
                     let imported = handle
                         .join()
                         .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
-                    let attachment = imported.result.ok_or_else(|| {
+                    if let Some(reason) = imported.derivative_unavailable_reason.as_deref() {
+                        emit_model_input_derivative_unavailable(&derivative_events, reason);
+                    }
+                    let attachment = imported.imported.result.ok_or_else(|| {
                         anyhow::anyhow!(
                             "{}",
                             imported
+                                .imported
                                 .blocker
                                 .map(|blocker| blocker.message)
                                 .unwrap_or_else(|| "voice attachment import failed".to_string())
@@ -1949,6 +2146,7 @@ pub async fn mom_llama_voice_audio_speculate(
     let worker_control = Arc::clone(&control);
     let events = window.clone();
     let worker_events = window.clone();
+    let derivative_events = window.clone();
     let worker_speculation = speculation.clone();
     let result = lease
         .run_blocking_with_cancellation_evidence(move || {
@@ -2006,13 +2204,15 @@ pub async fn mom_llama_voice_audio_speculate(
             let import = match std::thread::Builder::new()
                 .name("mom-speculative-voice-import".to_string())
                 .spawn(move || {
-                    let recording = import_control
+                    let recording: ConfirmedVoiceRecording = import_control
                         .wait_for_confirmation()
                         .map_err(anyhow::Error::msg)?;
-                    mom_llama_runtime::attachment_import_voice_message(
+                    import_voice_message_with_inference(
                         &import_operations,
                         &import_conversation,
-                        recording,
+                        recording.physical_wav,
+                        recording.inference,
+                        recording.inference_unavailable_reason,
                     )
                 }) {
                 Ok(import) => import,
@@ -2032,6 +2232,7 @@ pub async fn mom_llama_voice_audio_speculate(
                 command_started,
             );
             let stream_speculation = worker_speculation.clone();
+            let stream_progress = progress.clone();
             let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
                 voice,
                 ChatSendOptions {
@@ -2039,13 +2240,35 @@ pub async fn mom_llama_voice_audio_speculate(
                     ..ChatSendOptions::default()
                 },
                 Some(move |event: mom_llama_runtime::ChatStreamEvent| {
-                    let detail = serde_json::json!({
+                    let mut detail = serde_json::json!({
                         "kind": "chat",
                         "event": &event.event,
                         "request_id": &event.request_id,
                         "conversation_id": &event.conversation_id,
                         "delta_bytes": event.delta.as_ref().map_or(0, String::len),
                     });
+                    if event.event == "decode_started" {
+                        let audio = stream_progress.stats();
+                        detail["audio"] = serde_json::json!({
+                            "accepted_samples": audio.accepted_samples,
+                            "consumed_samples": audio.consumed_samples,
+                            "prefix_start_us": audio.prefix_start_us,
+                            "prefix_finish_us": audio.prefix_finish_us,
+                            "prefix_us": audio.prefix_us,
+                            "prefix_tokens": audio.prefix_tokens,
+                            "restored_prefix_tokens": audio.restored_prefix_tokens,
+                            "projector_us": audio.projector_us,
+                            "projected_blocks": audio.projected_blocks,
+                            "projected_samples": audio.projected_samples,
+                            "first_projector_start_us": audio.first_projector_start_us,
+                            "last_projector_finish_us": audio.last_projector_finish_us,
+                            "finish_us": audio.finish_us,
+                            "closing_boundary_finish_us": audio.closing_boundary_finish_us,
+                            "suffix_tokenize_finish_us": audio.suffix_tokenize_finish_us,
+                            "suffix_eval_finish_us": audio.suffix_eval_finish_us,
+                            "decode_start_us": audio.decode_start_us,
+                        });
+                    }
                     emit_voice_speculation_stage_with_detail(
                         &events,
                         &stream_speculation,
@@ -2066,10 +2289,14 @@ pub async fn mom_llama_voice_audio_speculate(
                     let imported = handle
                         .join()
                         .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
-                    let attachment = imported.result.ok_or_else(|| {
+                    if let Some(reason) = imported.derivative_unavailable_reason.as_deref() {
+                        emit_model_input_derivative_unavailable(&derivative_events, reason);
+                    }
+                    let attachment = imported.imported.result.ok_or_else(|| {
                         anyhow::anyhow!(
                             "{}",
                             imported
+                                .imported
                                 .blocker
                                 .map(|blocker| blocker.message)
                                 .unwrap_or_else(|| "voice attachment import failed".to_string())
@@ -2197,15 +2424,40 @@ pub async fn mom_llama_voice_audio_speculate(
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes named source-capture metadata as IPC parameters"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_speculation_confirm(
     runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
     speculation: String,
     recording: Vec<u8>,
+    model_input_recording: Option<Vec<u8>>,
+    source_sample_count: Option<u64>,
+    accepted_sample_count: Option<u64>,
+    source_start_sample: Option<u64>,
+    source_ranges: Option<Vec<mom_llama_runtime::InferenceAudioSampleRange>>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_confirm"))?;
+    let (inference, inference_unavailable_reason) = validate_voice_inference_recording(
+        &recording,
+        model_input_recording,
+        source_sample_count,
+        accepted_sample_count,
+        source_start_sample,
+        source_ranges,
+    );
+    if let Some(reason) = inference_unavailable_reason.as_deref() {
+        emit_model_input_derivative_unavailable(&window, reason);
+    }
     Ok(serde_json::json!({
-        "confirmed": runtime.confirm_voice_speculation(&speculation, recording)?,
+        "confirmed": runtime.confirm_voice_speculation(&speculation, ConfirmedVoiceRecording {
+            physical_wav: recording,
+            inference,
+            inference_unavailable_reason,
+        })?,
     }))
 }
 
@@ -2278,9 +2530,14 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                     .map_err(to_error)?;
             let resume_wait_started = Instant::now();
             let resume = session.wait_for_resume().map_err(to_error)?;
-            if !resume.reused {
+            // Cancellation can arrive while historical input is still being
+            // prefetched, before a live-audio checkpoint exists. The worker
+            // then rebuilds the same prepared prompt and requests live input
+            // from sample zero. Keep streaming into that valid session instead
+            // of discarding it and falling back to a separate text request.
+            if !resume.reused && resume.sample_offset != 0 {
                 session.cancel();
-                return Err("voice_audio_checkpoint_unavailable: The live audio prefix could not be resumed".to_string());
+                return Err("voice_audio_resume_invalid: A fresh audio session cannot skip captured samples".to_string());
             }
             let resume_wait_us = resume_wait_started
                 .elapsed()
@@ -2468,6 +2725,23 @@ pub async fn mom_llama_speech_transcribe_attachment(
 }
 
 #[tauri::command]
+pub fn mom_llama_speech_parakeet_resident(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_parakeet_resident"))?;
+    let resident = runtime.speech().parakeet_is_resident().map_err(to_error)?;
+    command_value(Ok(mom_llama_runtime::CommandResult::passed(
+        "mom_llama.speech_parakeet_resident",
+        "host_integrated",
+        resident,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    )))
+}
+
+#[tauri::command]
 pub fn mom_llama_speech_stop(
     runtime: State<'_, AppRuntimeHandle>,
     operation: Option<String>,
@@ -2479,6 +2753,30 @@ pub fn mom_llama_speech_stop(
             .speech()
             .stop(operation.as_deref(), playback.as_deref()),
     )
+}
+
+#[tauri::command]
+pub async fn mom_llama_speech_stop_and_wait(
+    runtime: State<'_, AppRuntimeHandle>,
+    operation: String,
+    allow_cold_transcription_settlement: bool,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_stop_and_wait"))?;
+    let result = runtime
+        .speech()
+        .stop_and_wait(&operation, allow_cold_transcription_settlement)
+        .await
+        .map_err(anyhow::Error::msg)
+        .map_err(to_error)?;
+    command_value(Ok(mom_llama_runtime::CommandResult::passed(
+        "mom_llama.speech_stop_and_wait",
+        "host_integrated",
+        result,
+        Vec::new(),
+        vec![format!("speech-operation:{operation}")],
+        false,
+        false,
+    )))
 }
 
 fn attachment_preview_response(anchor: &AttachmentPreviewAnchor) -> Result<Response, String> {
@@ -2619,6 +2917,49 @@ pub async fn mom_llama_kv_cache_save(
     blocking_command(
         runtime.admit(command_spec("mom_llama_kv_cache_save"))?,
         move || mom_llama_runtime::kv_cache_save(&scope, skill),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_kv_cache_checkpoint_voice_session(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    blocking_value(
+        runtime.admit(command_spec("mom_llama_kv_cache_checkpoint_voice_session"))?,
+        move || {
+            mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation)
+                .map_err(to_error)
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_kv_cache_set_voice_call_activity(
+    runtime: State<'_, AppRuntimeHandle>,
+    session_id: String,
+    active: bool,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    blocking_value(
+        runtime.admit(command_spec("mom_llama_kv_cache_set_voice_call_activity"))?,
+        move || {
+            mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, &session_id, active)
+                .map_err(to_error)?;
+            to_value(mom_llama_runtime::CommandResult::passed(
+                "mom_llama.kv_cache_set_voice_call_activity",
+                "host_integrated",
+                (),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false,
+            ))
+            .map_err(to_error)
+        },
     )
     .await
 }
@@ -3016,10 +3357,35 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 mod tests {
     use super::{
         MAX_VOICE_LATENCY_STAGES, MAX_VOICE_LATENCY_TRACE_BYTES, path_setting_patch,
-        pcm_stream_frame, validate_voice_latency_trace,
+        pcm_stream_frame, preserve_original_import_on_derivative_failure,
+        validate_voice_latency_trace,
     };
     use speech_native_types::{AudioChunk, PcmFormat, PcmSampleFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn chat_correlation_preserves_native_authority_and_matches_dispatch_envelopes() {
+        let event = serde_json::json!({
+            "kind": "chat", "event": {
+                "request_id": "native-request", "conversation_id": "conversation",
+                "event": "started"
+            }
+        });
+        assert_eq!(
+            super::correlate_chat_event(&event, None)
+                .expect("an event without a client request remains valid"),
+            event
+        );
+        let correlated = super::correlate_chat_event(&event, Some("voice-turn-7"))
+            .expect("the correlated event should remain valid");
+        assert_eq!(correlated["client_request"], "voice-turn-7");
+        assert_eq!(correlated["event"], event["event"]);
+        for bad in ["", "with space", "line\nbreak", "../path"] {
+            assert!(super::validate_chat_client_request(Some(bad)).is_err());
+        }
+        assert!(super::validate_chat_client_request(Some(&"x".repeat(65))).is_err());
+        assert!(super::validate_chat_client_request(Some("voice-turn-7")).is_ok());
+    }
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
         let declaration = format!("pub async fn {name}");
@@ -3063,6 +3429,18 @@ mod tests {
                 .expect_err("oversized trace"),
             "voice latency trace exceeds its bounded size"
         );
+    }
+
+    #[test]
+    fn derivative_persistence_failure_keeps_the_staged_physical_voice_import() {
+        let staged_original = ("attachment-source-7", true);
+        let (retained, diagnostic) =
+            preserve_original_import_on_derivative_failure(staged_original, |_| {
+                Err(anyhow::anyhow!("simulated derivative storage failure"))
+            });
+
+        assert_eq!(retained, ("attachment-source-7", true));
+        assert_eq!(diagnostic.as_deref(), Some("derivative_persistence_failed"));
     }
 
     #[test]

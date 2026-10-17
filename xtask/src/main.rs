@@ -271,7 +271,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
             if let Some(repository) = table.get("git").and_then(toml::Value::as_str) {
                 let (name, revision) = match repository.trim_end_matches(".git") {
                     "https://github.com/delysis/llama-cpp-rs" => {
-                        ("llama-cpp-rs", "b508f1c7652c751513c361c7e4fdeb090fbed577")
+                        ("llama-cpp-rs", "ce39455a799de9e96e3cbd509dd117b3a6a55e9f")
                     }
                     "https://github.com/whisperfish/presage"
                         if manifest.ends_with("products/loom/signal/Cargo.toml") =>
@@ -326,6 +326,7 @@ fn visit_extension(directory: &Path, extension: &str, found: &mut BTreeSet<PathB
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             let ignored = entry.file_name() == ".git"
+                || entry.file_name() == ".build"
                 || entry.file_name() == "target"
                 || entry.file_name() == "node_modules";
             if !ignored {
@@ -344,6 +345,7 @@ fn visit(directory: &Path, name: &str, found: &mut BTreeSet<PathBuf>) -> Result<
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             let ignored = entry.file_name() == ".git"
+                || entry.file_name() == ".build"
                 || entry.file_name() == "target"
                 || entry.file_name() == "node_modules";
             if !ignored {
@@ -411,6 +413,37 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_checkouts_are_not_scanned_as_repository_sources() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let generated = root.path().join("package/.build/checkouts/dependency");
+        fs::create_dir_all(generated.join(".github/workflows")).expect("generated workflow dir");
+        fs::write(
+            generated.join("Cargo.toml"),
+            "[package]\nname='dependency'\n",
+        )
+        .expect("generated Cargo manifest");
+        fs::write(
+            generated.join(".github/workflows/pull_request.yml"),
+            "name: generated\n",
+        )
+        .expect("generated workflow");
+        let tracked = root.path().join("package/src");
+        fs::create_dir_all(&tracked).expect("source directory");
+        fs::write(tracked.join("Cargo.toml"), "[package]\nname='tracked'\n")
+            .expect("tracked Cargo manifest");
+
+        assert_eq!(
+            find_named(root.path(), "Cargo.toml").expect("scan manifests"),
+            BTreeSet::from([tracked.join("Cargo.toml")])
+        );
+        assert!(
+            find_extension(root.path(), "yml")
+                .expect("scan workflows")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn package_groups_must_cover_every_workspace_package_once() {
         let (mut groups, packages) = package_groups();
         groups
@@ -451,7 +484,7 @@ mod tests {
 
     #[test]
     fn external_ffi_git_dependency_requires_the_exact_revision() {
-        let revision = "b508f1c7652c751513c361c7e4fdeb090fbed577";
+        let revision = "ce39455a799de9e96e3cbd509dd117b3a6a55e9f";
         for suffix in ["", ".git"] {
             let source = format!(
                 "dependency = {{ git = \"https://github.com/delysis/llama-cpp-rs{suffix}\", rev = \"{revision}\" }}"

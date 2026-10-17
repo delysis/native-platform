@@ -2601,9 +2601,19 @@ impl HostLifecycle {
             lifecycle.cancel(&request_id, None);
         }
         let mut failures = Vec::new();
+        // These backends own independent workers and devices. Start every
+        // shutdown before awaiting one: a slow cancelled synthesis must not
+        // delay Parakeet's teardown (or vice versa) during application quit.
+        let mut backend_joins = Vec::with_capacity(backends.len());
         for (registration_id, backend) in backends {
+            backend_joins.push((
+                registration_id,
+                tokio::spawn(async move { backend.shutdown().await }),
+            ));
+        }
+        for (registration_id, joined) in backend_joins {
             let request_id = SpeechRequestId(format!("{registration_id}.shutdown"));
-            let error = match tokio::spawn(async move { backend.shutdown().await }).await {
+            let error = match joined.await {
                 Ok(result) => result.err(),
                 Err(join_error) => Some(SpeechError::unavailable(
                     &request_id,

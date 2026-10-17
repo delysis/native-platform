@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const composer = require("./composer-key-policy.js");
+const voiceCapturePolicy = require("./voice-capture-policy.js");
 
 const modifierNames = ["shiftKey", "altKey", "metaKey", "ctrlKey"];
 const modifiers = (mask) => Object.fromEntries(
@@ -42,6 +43,7 @@ const bridgeKey = async (key, fields, initialState = presentedState) => {
     localStorage: { getItem: () => null, setItem: () => {} },
     TextEncoder,
     TextDecoder,
+    MomVoiceCapturePolicy: voiceCapturePolicy,
     MomLlamaComposerKeyPolicy: {
       initialState,
       reduce: (state, event) => {

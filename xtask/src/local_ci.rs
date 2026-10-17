@@ -573,6 +573,7 @@ impl Tools {
             ("rustup", "rustup", vec!["--version"]),
             ("npm", "npm", vec!["--version"]),
             ("npx", "npx", vec!["--version"]),
+            ("protoc", "protoc", vec!["--version"]),
             ("macos", "sw_vers", vec![]),
             ("host", "uname", vec!["-m"]),
             ("swift", "xcrun", vec!["swiftc", "--version"]),
@@ -644,6 +645,14 @@ fn component_steps(log: &Recorder, tools: &Tools) -> Result<Vec<(&'static str, C
         command
     };
     let pnpm = |args: &[&str]| tools.pnpm_command(log, args);
+    let signal_target = log.root.join("products/loom/signal/target");
+    let signal_cargo = |args: &[&str]| {
+        let mut command = cargo(args);
+        // The Signal worker is an intentionally isolated Cargo workspace; keep its
+        // SQLCipher dependency graph and build artifacts separate from root rusqlite.
+        command.env("CARGO_TARGET_DIR", &signal_target);
+        command
+    };
     // Discover CI Node tests, not a second list of selected tests/packages. Serialize test
     // files too: some ask Cargo for metadata. Existing CI scripts own their selectors.
     let mut tests = fs::read_dir(log.root.join("scripts/ci"))?
@@ -667,6 +676,38 @@ fn component_steps(log: &Recorder, tools: &Tools) -> Result<Vec<(&'static str, C
         "macos-smoke-support",
     ]);
     helpers.arg(log.evidence.join("macos-smoke-support"));
+    let signal_fmt = signal_cargo(&[
+        "fmt",
+        "--manifest-path",
+        "products/loom/signal/Cargo.toml",
+        "--",
+        "--check",
+    ]);
+    let signal_tests = signal_cargo(&[
+        "test",
+        "--locked",
+        "--manifest-path",
+        "products/loom/signal/Cargo.toml",
+    ]);
+    let signal_clippy = signal_cargo(&[
+        "clippy",
+        "--locked",
+        "--manifest-path",
+        "products/loom/signal/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]);
+    let signal_build = node(&["scripts/build-loom-signal.mjs"]);
+    let playwright_install = pnpm(&[
+        "--filter",
+        "@delysis/loom",
+        "exec",
+        "playwright",
+        "install",
+        "webkit",
+    ]);
     // Full-workspace commands subsume package/group selection. Frontend-only commands
     // mirror ci-full.yml; do not substitute product scripts that recursively build Rust.
     Ok(vec![
@@ -684,6 +725,11 @@ fn component_steps(log: &Recorder, tools: &Tools) -> Result<Vec<(&'static str, C
             "sqlite-graph",
             cargo(&["tree", "--locked", "-i", "libsqlite3-sys"]),
         ),
+        ("signal-fmt", signal_fmt),
+        ("signal-tests", signal_tests),
+        ("signal-clippy", signal_clippy),
+        ("signal-build", signal_build),
+        ("macos-smoke-helpers", helpers),
         (
             "workspace-tests",
             cargo(&[
@@ -746,11 +792,11 @@ fn component_steps(log: &Recorder, tools: &Tools) -> Result<Vec<(&'static str, C
             "loom-build",
             pnpm(&["--filter", "@delysis/loom", "run", "build"]),
         ),
+        ("playwright-install", playwright_install),
         (
             "webkit",
             pnpm(&["--filter", "@delysis/loom", "run", "test:browser"]),
         ),
-        ("macos-smoke-helpers", helpers),
     ])
 }
 
@@ -1083,6 +1129,80 @@ mod tests {
                 .map(|arg| utf8(arg).expect("UTF-8 argument").to_owned())
                 .collect::<Vec<_>>()
         };
+        let position = |name: &str| {
+            steps
+                .iter()
+                .position(|(step, _)| *step == name)
+                .unwrap_or_else(|| panic!("planned step {name}"))
+        };
+        for prerequisite in [
+            "signal-fmt",
+            "signal-tests",
+            "signal-clippy",
+            "signal-build",
+            "macos-smoke-helpers",
+        ] {
+            assert!(
+                position(prerequisite) < position("workspace-tests"),
+                "{prerequisite} must precede the root workspace build"
+            );
+        }
+        assert!(position("playwright-install") < position("webkit"));
+        assert_eq!(
+            args("signal-fmt"),
+            [
+                "fmt",
+                "--manifest-path",
+                "products/loom/signal/Cargo.toml",
+                "--",
+                "--check"
+            ]
+        );
+        assert_eq!(
+            args("signal-tests"),
+            [
+                "test",
+                "--locked",
+                "--manifest-path",
+                "products/loom/signal/Cargo.toml"
+            ]
+        );
+        assert_eq!(
+            args("signal-clippy"),
+            [
+                "clippy",
+                "--locked",
+                "--manifest-path",
+                "products/loom/signal/Cargo.toml",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+        assert_eq!(args("signal-build"), ["scripts/build-loom-signal.mjs"]);
+        assert_eq!(
+            args("playwright-install"),
+            [
+                "--offline",
+                "--yes=false",
+                "pnpm@11.16.0",
+                "--fail-if-no-match",
+                "--filter",
+                "@delysis/loom",
+                "exec",
+                "playwright",
+                "install",
+                "webkit"
+            ]
+        );
+        let signal_test = &steps[position("signal-tests")].1;
+        let signal_target = signal_test
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new("CARGO_TARGET_DIR"))
+            .and_then(|(_, value)| value)
+            .expect("isolated Signal target");
+        assert!(Path::new(signal_target).ends_with("products/loom/signal/target"));
         assert!(args("workspace-tests").contains(&"--no-fail-fast".to_owned()));
         assert!(args("workspace-tests").contains(&"--all-targets".to_owned()));
         assert!(args("doctests").contains(&"--doc".to_owned()));

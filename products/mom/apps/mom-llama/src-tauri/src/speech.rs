@@ -30,11 +30,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use tokio::sync::watch;
 
 #[cfg(test)]
 use speech_native_types::PlatformTarget;
 const MOM_SPEECH_CLIENT_ID: &str = "mom-llama";
 const MAX_ACTIVE_SPEECH_OPERATIONS: usize = 4;
+const SPEECH_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const COLD_TRANSCRIPTION_STOP_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 const MAX_PENDING_CANCELS: usize = 32;
 const MAX_PLAYBACKS: usize = 2;
 const MAX_COMPLETE_WAV_BYTES: usize = 64 * 1024 * 1024;
@@ -422,6 +426,23 @@ pub struct SpeechStopOutput {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpeechStopWaitOutput {
+    pub stop: SpeechStopOutput,
+    pub terminal_acknowledged: bool,
+}
+
+fn speech_stop_wait_timeout(
+    request_id: &SpeechRequestId,
+    allow_cold_transcription_settlement: bool,
+) -> std::time::Duration {
+    if allow_cold_transcription_settlement && request_id.0.starts_with("mom-transcribe-") {
+        COLD_TRANSCRIPTION_STOP_WAIT_TIMEOUT
+    } else {
+        SPEECH_STOP_WAIT_TIMEOUT
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SpeechShutdown {
     pub host_joined: bool,
     pub active_operation_count: usize,
@@ -741,6 +762,7 @@ pub struct MomSpeech {
     _qwen: Option<Arc<QwenSpeechBackend>>,
     _qwen_startup_warm: Option<IclWarmStatus>,
     state: Mutex<SpeechState>,
+    operation_revision: watch::Sender<u64>,
     precommit_voices: RwLock<BTreeMap<String, String>>,
     generation_backpressure:
         Mutex<BTreeMap<String, mom_llama_runtime::GenerationBackpressureLease>>,
@@ -796,51 +818,6 @@ impl MomSpeech {
         .await
         .map_err(|error| format!("Local speech registration failed: {error}"))?;
 
-        // Discovery verifies only the on-disk shape. The first transcription
-        // otherwise pays several seconds to load the CPU model while the
-        // microphone is already filling a bounded live ingress queue. Start
-        // one stream during app setup so the same host owns a resident model
-        // before a call can begin. Missing optional speech assets do not make
-        // text chat unavailable; live capture reports that route separately.
-        if select_parakeet(&host.descriptors().map_err(|error| error.to_string())?).is_ok() {
-            let warm_started = Instant::now();
-            let request = TranscriptionRequest {
-                context: request_context(
-                    SpeechRequestId("mom-startup-parakeet-warm".to_string()),
-                    SpeechRouteSelector::ExactBackend {
-                        backend_id: PARAKEET_BACKEND_ID.to_string(),
-                        model_id: Some(PARAKEET_MODEL_ID.to_string()),
-                        voice_id: None,
-                    },
-                    90_000,
-                ),
-                input: TranscriptionInput::Stream {
-                    stream_id: "mom-startup-parakeet-warm".to_string(),
-                    format: live_pcm_format(),
-                },
-                language: Some("en".to_string()),
-                task: TranscriptionTask::Transcribe,
-                timestamps: TimestampGranularity::None,
-                diarization: DiarizationPolicy::Disabled,
-                partial_results: false,
-                punctuation: true,
-                hotwords: Vec::new(),
-            };
-            match host.transcribe(request).await {
-                Ok(ticket) => {
-                    // Admission completes after the deferred backend load.
-                    // Dropping this empty probe cancels only its request; the
-                    // verified model remains in this host for live turns.
-                    drop(ticket);
-                    eprintln!(
-                        "mom-llama parakeet resident warm: {} ms",
-                        warm_started.elapsed().as_millis()
-                    );
-                }
-                Err(error) => eprintln!("mom-llama parakeet resident warm failed: {error}"),
-            }
-        }
-
         let executor = HostSpeechExecutor::new(host)
             .map_err(|error| format!("Local speech inventory failed: {error}"))?;
         Ok(Arc::new(Self {
@@ -848,6 +825,7 @@ impl MomSpeech {
             _qwen: prepared_qwen,
             _qwen_startup_warm: qwen_startup_warm,
             state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
             precommit_voices: RwLock::new(BTreeMap::new()),
             generation_backpressure: Mutex::new(BTreeMap::new()),
         }))
@@ -862,6 +840,7 @@ impl MomSpeech {
             _qwen: None,
             _qwen_startup_warm: None,
             state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
             precommit_voices: RwLock::new(BTreeMap::new()),
             generation_backpressure: Mutex::new(BTreeMap::new()),
         })
@@ -1339,10 +1318,8 @@ impl MomSpeech {
         ))
     }
 
-    /// Staged capture-to-host API. The caller must own this future under an
-    /// AppWorkLease and persist trace events. This does NOT publish a transcript
-    /// or register a new command; the omitted save/KV owners are required first.
-    #[allow(dead_code)]
+    /// The live capture owner holds this future under an AppWorkLease. A final
+    /// result is still uncommitted until the exact saved turn is verified.
     pub(crate) async fn transcribe_live(
         &self,
         operation: &str,
@@ -1414,6 +1391,17 @@ impl MomSpeech {
             emit("failed_audio_retained", Some(error.clone()));
         }
         result
+    }
+
+    /// Reports whether the exact Parakeet model is already resident. Live
+    /// voice-call slots may only use a resident transcriber; loading it while
+    /// the caller is waiting would add an unbounded cold-start interval.
+    pub fn parakeet_is_resident(&self) -> Result<bool, String> {
+        let descriptors = self
+            .executor
+            .current_descriptors()
+            .map_err(|error| error.to_string())?;
+        Ok(select_resident_parakeet(&descriptors).is_ok())
     }
 
     pub async fn transcribe_attachment(
@@ -1620,6 +1608,65 @@ impl MomSpeech {
         ))
     }
 
+    /// Cancels one transcription and waits until its exact speech operation
+    /// has left the active registry. The host removes the operation only
+    /// after the backend ticket reaches its terminal, so foreground compute
+    /// must not start based on the cancellation request alone.
+    pub async fn stop_and_wait(
+        &self,
+        operation: &str,
+        allow_cold_transcription_settlement: bool,
+    ) -> Result<SpeechStopWaitOutput, String> {
+        validate_operation_token(operation).map_err(|error| error.to_string())?;
+        let stopped = self
+            .stop(Some(operation), None)
+            .map_err(|error| error.to_string())?
+            .result
+            .ok_or_else(|| "speech_stop_wait_receipt_missing".to_string())?;
+        let request_id = self
+            .state
+            .lock()
+            .map_err(|_| "Mom speech operation state is unavailable".to_string())?
+            .active
+            .get(operation)
+            .map(|active| active.request_id.clone());
+        let Some(request_id) = request_id else {
+            // If stop raced ahead of begin_operation, stop() retained an
+            // early-cancel fact; the future backend admission will be refused.
+            return Ok(SpeechStopWaitOutput {
+                stop: stopped,
+                terminal_acknowledged: true,
+            });
+        };
+
+        let mut changed = self.operation_revision.subscribe();
+        let timeout = speech_stop_wait_timeout(&request_id, allow_cold_transcription_settlement);
+        tokio::time::timeout(timeout, async {
+            loop {
+                let settled = self
+                    .state
+                    .lock()
+                    .map_err(|_| "Mom speech operation state is unavailable".to_string())?
+                    .active
+                    .get(operation)
+                    .is_none_or(|active| active.request_id != request_id);
+                if settled {
+                    return Ok::<(), String>(());
+                }
+                changed
+                    .changed()
+                    .await
+                    .map_err(|_| "speech_stop_wait_state_closed".to_string())?;
+            }
+        })
+        .await
+        .map_err(|_| "speech_stop_wait_terminal_timeout".to_string())??;
+        Ok(SpeechStopWaitOutput {
+            stop: stopped,
+            terminal_acknowledged: true,
+        })
+    }
+
     pub fn begin_quiesce(&self) {
         if let Ok(mut backpressure) = self.generation_backpressure.lock() {
             backpressure.clear();
@@ -1730,12 +1777,16 @@ impl MomSpeech {
                 .active
                 .get(operation)
                 .is_none_or(|active| active.request_id != *request_id || active.cancelled);
-        if state
+        let removed = state
             .active
             .get(operation)
             .is_some_and(|active| active.request_id == *request_id)
-        {
-            state.active.remove(operation);
+            && state.active.remove(operation).is_some();
+        drop(state);
+        if removed {
+            self.operation_revision.send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
         }
         cancelled
     }
@@ -1760,12 +1811,16 @@ impl MomSpeech {
                 .active
                 .get(operation)
                 .is_none_or(|active| active.request_id != *request_id || active.cancelled);
-        if state
+        let removed = state
             .active
             .get(operation)
             .is_some_and(|active| active.request_id == *request_id)
-        {
-            state.active.remove(operation);
+            && state.active.remove(operation).is_some();
+        drop(state);
+        if removed {
+            self.operation_revision.send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
         }
         if cancelled {
             return Err(speech_cancelled_blocker());
@@ -3071,6 +3126,150 @@ mod tests {
         assert!(duration_ms.is_some_and(|duration| duration > 500));
         speech.shutdown().await.expect("speech host joined");
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "diagnoses an existing exact voice attachment with the installed Parakeet model"]
+    async fn real_local_saved_voice_transcription_diagnostic() {
+        let conversation = std::env::var("MOM_DIAG_CONVERSATION").expect("conversation id");
+        let attachment = std::env::var("MOM_DIAG_ATTACHMENT").expect("attachment id");
+        let catalog = mom_llama_runtime::attachment_preview(&attachment)
+            .expect("attachment preview")
+            .result
+            .expect("owned attachment preview");
+        let anchor = AttachmentPreviewAnchor {
+            attachment_id: catalog.attachment_id,
+            root_sha256: catalog.root_sha256,
+            artifact_id: catalog.primary.expect("canonical audio").artifact_id,
+            policy_fingerprint: catalog.policy_fingerprint,
+        };
+        let input = mom_llama_runtime::attachment_transcription_input(&conversation, &anchor)
+            .expect("audio input")
+            .expect("owned audio input");
+        let pcm = input.bytes.get(44..).expect("PCM WAV payload");
+        let samples = pcm
+            .chunks_exact(2)
+            .map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+            .collect::<Vec<_>>();
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f64>()
+            / samples.len().max(1) as f64)
+            .sqrt();
+        let peak = samples
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "saved voice input: bytes={}, samples={}, rms={rms:.5}, peak={peak:.5}",
+            input.bytes.len(),
+            samples.len()
+        );
+        let data_dir = mom_llama_runtime::config::resolve_data_dir();
+        // Keep this diagnostic isolated from Qwen's independent voice warmup.
+        let host = Arc::new(SpeechHost::default());
+        let parakeet = speech_native_backend_parakeet::ParakeetSpeechBackend::discover(
+            speech_native_backend_parakeet::ParakeetBackendConfig {
+                model_dir: None,
+                managed_model_root: Some(data_dir.join("speech-models")),
+            },
+        )
+        .await;
+        host.register_backend(Arc::new(parakeet))
+            .expect("register installed Parakeet");
+        let speech = MomSpeech {
+            executor: Arc::new(HostSpeechExecutor::new(host).expect("speech inventory")),
+            _qwen: None,
+            _qwen_startup_warm: None,
+            state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
+        };
+        let result = speech
+            .transcribe_attachment(&conversation, &anchor, "diagnose-existing-voice")
+            .await
+            .expect("transcription command");
+        eprintln!(
+            "saved voice diagnostic: status={}, blocker={:?}, transcript_bytes={}",
+            result.status,
+            result.blocker.as_ref().map(|blocker| &blocker.code),
+            result
+                .result
+                .as_ref()
+                .map_or(0, |output| output.transcript.len())
+        );
+        if result
+            .result
+            .as_ref()
+            .is_some_and(|output| output.transcript.trim().is_empty())
+        {
+            // Diagnostic only: test whether Parakeet rejected a quiet or
+            // abruptly terminated clip. The original stored WAV is untouched.
+            let gain = if peak > 0.0 {
+                (0.65 / peak).min(32.0)
+            } else {
+                1.0
+            };
+            let mut conditioned = vec![0_i16; 3_200];
+            conditioned.extend(samples.iter().map(|sample| {
+                (sample * gain * 32767.0).clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+            }));
+            conditioned.extend(std::iter::repeat_n(0_i16, 8_000));
+            let pcm_bytes = conditioned
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>();
+            let data_size = u32::try_from(pcm_bytes.len()).expect("diagnostic size");
+            let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&16_000_u32.to_le_bytes());
+            wav.extend_from_slice(&32_000_u32.to_le_bytes());
+            wav.extend_from_slice(&2_u16.to_le_bytes());
+            wav.extend_from_slice(&16_u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_size.to_le_bytes());
+            wav.extend_from_slice(&pcm_bytes);
+            let request_id = SpeechRequestId("diagnose-conditioned-voice".to_owned());
+            let conditioned_result = speech
+                .executor
+                .transcribe(TranscriptionRequest {
+                    context: request_context(
+                        request_id,
+                        SpeechRouteSelector::ExactBackend {
+                            backend_id: PARAKEET_BACKEND_ID.to_owned(),
+                            model_id: Some(PARAKEET_MODEL_ID.to_owned()),
+                            voice_id: None,
+                        },
+                        120_000,
+                    ),
+                    input: TranscriptionInput::Complete {
+                        audio: AudioInput::Encoded {
+                            format: EncodedAudioFormat::Wav,
+                            data: wav,
+                        },
+                    },
+                    language: Some("en".to_owned()),
+                    task: TranscriptionTask::Transcribe,
+                    timestamps: TimestampGranularity::None,
+                    diarization: DiarizationPolicy::Disabled,
+                    partial_results: false,
+                    punctuation: true,
+                    hotwords: Vec::new(),
+                })
+                .await;
+            eprintln!(
+                "conditioned voice diagnostic: gain={gain:.2}, result={:?}",
+                conditioned_result
+                    .as_ref()
+                    .map(|response| response.text.len())
+            );
+        }
+        speech.shutdown().await.expect("speech host joined");
+    }
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,
@@ -3427,6 +3626,65 @@ mod tests {
         assert_eq!(shutdown.retained_playback_count, 0);
     }
 
+    #[tokio::test]
+    async fn stop_and_wait_requires_the_exact_active_operation_to_finish() {
+        let speech = Arc::new(MomSpeech::empty_for_tests());
+        let request_id = SpeechRequestId("waited-transcription".to_string());
+        speech
+            .begin_operation(
+                "waited-operation",
+                request_id.clone(),
+                OperationKind::Transcription,
+            )
+            .expect("active transcription");
+
+        let waiter_speech = Arc::clone(&speech);
+        let waiter = tokio::spawn(async move {
+            waiter_speech
+                .stop_and_wait("waited-operation", false)
+                .await
+                .expect("terminal acknowledgment")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "cancel request alone is not terminal"
+        );
+
+        speech.finish_operation("waited-operation", &request_id);
+        let output = waiter.await.expect("waiter task");
+        assert!(output.stop.cancellation_requested);
+        assert!(output.terminal_acknowledged);
+    }
+
+    #[test]
+    fn cold_initialization_wait_is_bounded_and_only_applies_to_attachment_transcription() {
+        assert_eq!(
+            speech_stop_wait_timeout(
+                &SpeechRequestId("mom-transcribe-history-op".to_string()),
+                true,
+            ),
+            std::time::Duration::from_secs(30),
+        );
+        for request_id in [
+            "mom-live-transcribe-op",
+            "mom-read-aloud-op",
+            "mom-precommit-op",
+        ] {
+            assert_eq!(
+                speech_stop_wait_timeout(&SpeechRequestId(request_id.to_string()), true),
+                std::time::Duration::from_secs(2),
+            );
+        }
+        assert_eq!(
+            speech_stop_wait_timeout(
+                &SpeechRequestId("mom-transcribe-history-op".to_string()),
+                false,
+            ),
+            std::time::Duration::from_secs(2),
+        );
+    }
+
     #[test]
     fn descriptor_hash_binds_request_to_exact_inventory() {
         let original = qwen_descriptor();
@@ -3734,6 +3992,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             };
@@ -3760,6 +4019,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             });
@@ -3960,6 +4220,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             });

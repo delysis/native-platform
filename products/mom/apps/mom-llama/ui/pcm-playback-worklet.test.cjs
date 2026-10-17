@@ -61,7 +61,71 @@ test("the audio-thread ring converts and drains exact PCM order", () => {
     minBufferedFrames: null,
     firstReceiveContextFrame: 0,
     firstRenderContextFrame: 0,
+    pcmSignalFrames: 4,
+    pcmSignalRms: Math.sqrt((1 + 0.25 + (32767 / 32768) ** 2) / 4),
+    pcmSignalPeak: 1,
+    pcmSignalMinQuantumRms: Math.sqrt((1 + 0.25 + (32767 / 32768) ** 2) / 4),
+    pcmSignalMaxQuantumRms: Math.sqrt((1 + 0.25 + (32767 / 32768) ** 2) / 4),
+    pcmLowEnergyThresholdRms: Math.pow(10, -50 / 20),
+    pcmLowEnergyFrames: 0,
+    pcmLowEnergyQuanta: 0,
+    pcmMaxLowEnergyFrames: 0,
   });
+});
+
+test("PCM signal aggregates cross packet boundaries and count only the partial PCM tail", () => {
+  const { processor, messages } = harness({ channels: 1, capacityFrames: 32 });
+  const send = (samples, packetIndex) => {
+    const buffer = pcm16(...samples);
+    processor.receive({
+      type: "pcm", buffer, byteOffset: 0, byteLength: buffer.byteLength,
+      channels: 1, packetIndex,
+    });
+  };
+  // Four loud frames, then ten quiet frames split across packets and 4-frame
+  // render quanta. The last quantum has two PCM frames and two drain zeros.
+  send([16384, 16384, 16384], 0);
+  send([16384, 0], 1);
+  send(Array(5).fill(0), 2);
+  send(Array(4).fill(0), 3);
+  processor.receive({ type: "finish" });
+  for (let index = 0; index < 4; index += 1) {
+    processor.process([], [[new Float32Array(4)]]);
+  }
+  for (let index = 0; index < 600; index += 1) {
+    processor.process([], [[new Float32Array(4)]]);
+  }
+  const drained = messages.find((message) => message.type === "drained");
+  assert.ok(drained);
+  assert.equal(drained.pcmSignalFrames, 14);
+  assert.equal(drained.pcmSignalPeak, 0.5);
+  assert.ok(Math.abs(drained.pcmSignalRms - Math.sqrt(1 / 14)) < 1e-6);
+  assert.equal(drained.pcmLowEnergyFrames, 10);
+  assert.equal(drained.pcmMaxLowEnergyFrames, 10);
+  assert.equal(drained.pcmLowEnergyQuanta, 3);
+});
+
+test("PCM signal aggregates exclude the worklet's starvation-filled output quantum", () => {
+  const { processor, messages } = harness({
+    channels: 1, capacityFrames: 128, recoveryFrames: 4,
+  });
+  const short = pcm16(0, 0);
+  processor.receive({ type: "pcm", buffer: short, byteOffset: 0, byteLength: short.byteLength, channels: 1 });
+  processor.process([], [[new Float32Array(4)]]);
+  assert.equal(messages.find((message) => message.type === "underrun_started")?.bufferedFrames, 2);
+
+  const rest = pcm16(...Array(126).fill(16384));
+  processor.receive({ type: "pcm", buffer: rest, byteOffset: 0, byteLength: rest.byteLength, channels: 1 });
+  processor.process([], [[new Float32Array(128)]]);
+  processor.receive({ type: "finish" });
+  for (let index = 0; index < 19; index += 1) {
+    processor.process([], [[new Float32Array(128)]]);
+  }
+  const drained = messages.find((message) => message.type === "drained");
+  assert.equal(drained.underruns, 1);
+  assert.equal(drained.pcmSignalFrames, 128);
+  assert.equal(drained.pcmLowEnergyFrames, 0);
+  assert.equal(drained.pcmMaxLowEnergyFrames, 0);
 });
 
 test("the audio-thread ring reports bounded overflow without overwriting unread PCM", () => {

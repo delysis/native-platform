@@ -176,6 +176,25 @@ test("preserves absent metrics instead of reporting false zeroes", () => {
   assert.equal(row.tts_helper_first_pcm_ms, null);
   assert.equal(row.tts_aggregate_rtf, null);
   assert.equal(row.next_prefill_overlapped_tts, null);
+  assert.equal(row.transcript_ready_before_next_prefill, null);
+  assert.equal(row.capture_stop_to_transcript_committed_ms, null);
+});
+
+test("shows whether complete transcript replacement preceded the next prefill", () => {
+  const row = (committedAt) => latencyRow({ checkpoint: 1, path: "/turn.json", trace: {
+    id: "turn", mode: "call", stages: [
+      { stage: "capture_stopped", elapsed_ms: 100 },
+      { stage: "voice_transcript_live_verified", elapsed_ms: 145 },
+      { stage: "next_turn_prefill_started", elapsed_ms: 200 },
+      { stage: "voice_transcript_finished", elapsed_ms: committedAt },
+    ], summary: {},
+  } });
+  assert.equal(row(180).capture_stop_to_transcript_verified_ms, 45);
+  assert.equal(row(180).capture_stop_to_transcript_committed_ms, 80);
+  assert.equal(row(180).transcript_ready_before_next_prefill, true);
+  assert.equal(row(180).transcript_to_next_prefill_ms, 20);
+  assert.equal(row(240).transcript_ready_before_next_prefill, false);
+  assert.equal(row(240).transcript_to_next_prefill_ms, -40);
 });
 
 test("diagnoses a fallen-back voice turn that finishes without PCM", () => {
@@ -191,6 +210,48 @@ test("diagnoses a fallen-back voice turn that finishes without PCM", () => {
   assert.deepEqual(latencyDiagnosis(row).findings, [
     "audio_prefill_failed", "response_without_pcm",
   ]);
+});
+
+test("identifies a call that abandoned a pending prefill instead of silently waiting", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "capture_started" },
+      { stage: "voice_activity_first_detected" },
+      { stage: "audio_prefill_wait_expired", silence_ms: 900, retry: false },
+      { stage: "fallback_capture_encoded" },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_failure_stage, "audio_prefill_wait_expired");
+  assert.equal(row.prefill_wait_expired_ms, 900);
+  assert.equal(row.prefill_wait_expired_on_retry, false);
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_wait_expired"));
+});
+
+test("locates a stalled audio push drain before the recorded-audio fallback", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "prefill_flush_started", elapsed_ms: 180 },
+      { stage: "audio_prefill_drain_failed", elapsed_ms: 900,
+        message: "voice_audio_prefill_drain_timeout" },
+      { stage: "fallback_capture_encoded", elapsed_ms: 910 },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_drain_to_failure_ms, 720);
+  assert.equal(row.prefill_failure_stage, "audio_prefill_drain_failed");
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_drain_stalled"));
+});
+
+test("reports a bounded browser prefill queue overflow without claiming audio loss", () => {
+  const row = latencyRow({ checkpoint: 1, path: "/call.json", trace: {
+    id: "call", mode: "call", stages: [
+      { stage: "audio_prefill_producer_overflow", queued_samples: 480_000,
+        incoming_samples: 640, limit_samples: 480_000 },
+      { stage: "fallback_capture_encoded" },
+    ], summary: {},
+  } });
+  assert.equal(row.prefill_producer_overflow_samples, 480_000);
+  assert.equal(row.prefill_producer_limit_samples, 480_000);
+  assert.ok(latencyDiagnosis(row).findings.includes("audio_prefill_producer_overflow"));
 });
 
 test("a pickup completion inside the next capture is not a missing call reply", () => {
@@ -379,20 +440,31 @@ test("identifies cold greeting prefill without calling it model loading", () => 
 test("aggregates the latency scoreboard without treating missing metrics as zero", () => {
   assert.equal(percentile([100, 200, 300, 400], 0.5), 250);
   const aggregate = latencyAggregate([
-    { mode: "call", terminal_stage: "playback_started", subsecond: true,
+    { mode: "call", terminal_stage: "playback_started", playback_completion: "natural",
+      playback_interrupted: false, subsecond: true,
       call_request_to_playback_ms: 1_240, runtime_warm_audio_projector_ms: 40,
       silence_to_first_token_native_ms: 180, silence_to_playback_ms: 620,
       playback_underruns: 0, findings: [] },
-    { mode: "call", terminal_stage: "failed", subsecond: null,
+    { mode: "call", terminal_stage: "failed", playback_completion: "stopped",
+      playback_interrupted: true, subsecond: null,
       call_request_to_playback_ms: null, runtime_warm_audio_projector_ms: 55,
       silence_to_first_token_native_ms: 320, silence_to_playback_ms: null,
       playback_underruns: 2, findings: ["playback_underrun"] },
-    { mode: "voice_note", terminal_stage: "playback_started", subsecond: false,
+    { mode: "voice_note", terminal_stage: "playback_started", playback_completion: "unknown",
+      playback_interrupted: null, subsecond: false,
       silence_to_first_token_native_ms: null, silence_to_playback_ms: 1_240,
       playback_underruns: null, findings: ["conversation_target_missed"] },
   ]);
   assert.equal(aggregate.traces, 3);
-  assert.deepEqual(aggregate.modes.call, { traces: 2, playback_started: 1, subsecond: 1 });
+  assert.deepEqual(aggregate.modes.call, {
+    traces: 2,
+    playback_started: 1,
+    playback_natural_completion: 1,
+    playback_stopped: 1,
+    playback_completion_unknown: 0,
+    playback_interrupted: 1,
+    subsecond: 1,
+  });
   assert.equal(aggregate.metrics.silence_to_first_token_native_ms.samples, 2);
   assert.equal(aggregate.metrics.call_request_to_playback_ms.samples, 1);
   assert.equal(aggregate.metrics.runtime_warm_audio_projector_ms.samples, 2);
@@ -403,4 +475,54 @@ test("aggregates the latency scoreboard without treating missing metrics as zero
     playback_underrun: 1,
     conversation_target_missed: 1,
   });
+});
+
+// A recorded zero in a compacted trace does not certify uninterrupted sound.
+test("compacted diagnostics remain visibly incomplete in latency reports", () => {
+  const row = latencyRow({ checkpoint: 20, path: "/compacted.json", trace: {
+    id: "compacted", mode: "call", stages: [{ stage: "playback_renderer", elapsed_ms: 1200 }],
+    compaction: { byte_limit_records_omitted: 4 },
+    summary: { playback_underrun_occurrences: 0, silence_to_playback_ms: 800 },
+  } });
+  assert.equal(row.trace_incomplete, true);
+  const diagnosis = latencyDiagnosis(row);
+  assert.ok(diagnosis.findings.includes("trace_incomplete"));
+  assert.equal(latencyAggregate([{ ...row, ...diagnosis }]).findings.trace_incomplete, 1);
+  const flagged = latencyRow({ checkpoint: 1, trace: {
+    id: "flagged", stages: [], summary: { incomplete: true },
+  } });
+  assert.equal(flagged.trace_incomplete, true);
+});
+
+test("renderer stop is non-natural completion and only explicit barge evidence assigns its cause", () => {
+  const stopped = latencyRow({ checkpoint: 3, trace: {
+    id: "reply-stopped", mode: "call", stages: [
+      { stage: "playback_started", elapsed_ms: 100 },
+      { stage: "playback_renderer", elapsed_ms: 900, reason: "stopped", underruns: 0 },
+      { stage: "barge_in_detected", elapsed_ms: 850,
+        reply_trace_id: "reply-stopped", reply_request_id: "request-7", capture_trace_id: "next-turn" },
+      { stage: "barge_in_playback_stopped", elapsed_ms: 905,
+        reply_trace_id: "reply-stopped", reply_request_id: "request-7", capture_trace_id: "next-turn" },
+    ],
+    summary: { playback_underrun_occurrences: 0 },
+  } });
+  assert.equal(stopped.playback_renderer_reason, "stopped");
+  assert.equal(stopped.playback_completion, "stopped");
+  assert.equal(stopped.playback_interrupted, true);
+  assert.equal(stopped.playback_stop_cause, "barge_in");
+  assert.deepEqual(latencyDiagnosis(stopped).findings, ["playback_stopped", "playback_interrupted"]);
+
+  const unexplainedStop = latencyRow({ checkpoint: 1, trace: {
+    id: "reply-unknown-stop", stages: [
+      { stage: "playback_renderer", elapsed_ms: 80, reason: "stopped", underruns: 0 },
+    ], summary: { playback_underrun_occurrences: 0 },
+  } });
+  assert.equal(unexplainedStop.playback_interrupted, null);
+  assert.equal(unexplainedStop.playback_stop_cause, "unknown");
+
+  const ended = latencyRow({ checkpoint: 1, trace: {
+    id: "reply-ended", stages: [{ stage: "playback_renderer", elapsed_ms: 250, reason: "ended" }],
+  } });
+  assert.equal(ended.playback_completion, "natural");
+  assert.equal(ended.playback_interrupted, false);
 });

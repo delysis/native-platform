@@ -4,14 +4,46 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   analyzeVoiceSamples,
+  createPlaybackEchoMatcher,
   createStreamingMonoResampler,
   initialPlaybackEchoGuard,
   initialVoiceActivity,
   nextVoiceActivity,
+  quantizeInferencePcm16,
+  truncateInferencePcm16,
+  encodeInferencePcm16Wav,
   speechThreshold,
   splitPrefillPcm,
   updatePlaybackEchoGuard,
 } = require("./voice-capture-policy.js");
+
+test("model-input archive reproduces accepted PCM16 across speculative checkpoint replay", () => {
+  const source = Float32Array.from([-.75, -.125, 0, .25, .625, .999]);
+  const firstAccepted = quantizeInferencePcm16(source.subarray(0, 4));
+  const ledger = {
+    modelInputPcm16Parts: [firstAccepted.pcm16],
+    modelInputSampleCount: firstAccepted.pcm16.length,
+  };
+
+  // The first speculative decode is cancelled at sample 2. Reuse only its
+  // committed prefix, then rebuild the accepted suffix from the source PCM.
+  truncateInferencePcm16(ledger, 2);
+  const replayedTail = quantizeInferencePcm16(source.subarray(2));
+  ledger.modelInputPcm16Parts.push(replayedTail.pcm16);
+  ledger.modelInputSampleCount += replayedTail.pcm16.length;
+
+  const expected = quantizeInferencePcm16(source).pcm16;
+  const wav = encodeInferencePcm16Wav(
+    ledger.modelInputPcm16Parts,
+    ledger.modelInputSampleCount,
+  );
+  assert.ok(wav instanceof Uint8Array);
+  assert.equal(new DataView(wav.buffer, wav.byteOffset).getUint32(40, true), expected.length * 2);
+  const wavView = new DataView(wav.buffer, wav.byteOffset);
+  const archived = Int16Array.from(expected, (_, index) => wavView.getInt16(44 + index * 2, true));
+  assert.deepEqual(archived, expected);
+  assert.equal(encodeInferencePcm16Wav(ledger.modelInputPcm16Parts, expected.length - 1), null);
+});
 
 test("resumed call prefill keeps a long captured utterance in bounded ordered blocks", () => {
   const samples = Float32Array.from({ length: 16_000 * 5 + 17 }, (_, index) => index);
@@ -143,4 +175,132 @@ test("speech during convergence does not poison the residual estimate", () => {
     guard = updatePlaybackEchoGuard(guard, .04, 5.33).guard;
   }
   assert.equal(guard.residualRms, .003);
+});
+
+const deterministicAudio = (length, seed) => {
+  let state = seed >>> 0;
+  return Float32Array.from({ length }, () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return ((state / 0x1_0000_0000) * 2 - 1) * .12;
+  });
+};
+
+const expandAt48k = (audio2k) => {
+  const output = new Float32Array(audio2k.length * 24);
+  for (let sample = 0; sample < audio2k.length; sample += 1) {
+    output.fill(audio2k[sample], sample * 24, (sample + 1) * 24);
+  }
+  return output;
+};
+
+test("playback matcher recognizes correlated echo after stable 40 ms evidence", () => {
+  const reference2k = deterministicAudio(2_000, 71);
+  const start = 700;
+  const microphone = expandAt48k(reference2k.slice(start, start + 80));
+  const matcher = createPlaybackEchoMatcher();
+  assert.equal(matcher.process(microphone, 48_000, expandAt48k(reference2k), 48_000), null);
+  const match = matcher.process(microphone, 48_000, expandAt48k(reference2k), 48_000);
+  assert.ok(match);
+  assert.ok(match.correlation > .99);
+  assert.ok(match.residualRms < .001);
+});
+
+test("echo-only startup does not open VAD before the playback match stabilizes", () => {
+  const reference2k = deterministicAudio(2_000, 211);
+  const reference = expandAt48k(reference2k);
+  const matcher = createPlaybackEchoMatcher();
+  let guard = initialPlaybackEchoGuard();
+  let activity = initialVoiceActivity();
+  let matchAtMs = null;
+  let detectorReleaseAtMs = null;
+  let voiceOnsetAtMs = null;
+  const callbackSamples = 256;
+  const silence = new Float32Array(callbackSamples);
+
+  for (let callback = 0; callback < 24; callback += 1) {
+    const start = callback * callbackSamples;
+    const microphone = reference.subarray(start, start + callbackSamples);
+    const match = matcher.process(microphone, 48_000, reference, 48_000);
+    const elapsedMs = (start + callbackSamples) * 1_000 / 48_000;
+    if (match && matchAtMs === null) matchAtMs = elapsedMs;
+    const rawRms = Math.sqrt(microphone.reduce((sum, value) => sum + value * value, 0)
+      / microphone.length);
+    const echo = updatePlaybackEchoGuard(
+      guard,
+      match ? match.residualRms : rawRms,
+      callbackSamples * 1_000 / 48_000,
+      { matchedEcho: Boolean(match) },
+    );
+    guard = echo.guard;
+    if (!echo.suppressed && detectorReleaseAtMs === null) detectorReleaseAtMs = elapsedMs;
+    const analysis = analyzeVoiceSamples(
+      activity,
+      echo.suppressed ? silence : microphone,
+      48_000,
+    );
+    activity = analysis.activity;
+    if (analysis.voiceOnsetSample !== null && voiceOnsetAtMs === null) {
+      voiceOnsetAtMs = start * 1_000 / 48_000
+        + analysis.voiceOnsetSample * 1_000 / 48_000;
+    }
+  }
+
+  assert.equal(detectorReleaseAtMs, 48, "unmatched playback energy reaches the detector at 48 ms");
+  assert.equal(matchAtMs, 64, "256-sample callbacks quantize the stable match to 64 ms");
+  assert.equal(voiceOnsetAtMs, null, "the brief unmatched window is shorter than VAD open time");
+});
+
+test("independent caller speech is not silenced when playback correlation is absent", () => {
+  const reference = expandAt48k(deterministicAudio(2_000, 19));
+  const speech = expandAt48k(deterministicAudio(80, 997));
+  const matcher = createPlaybackEchoMatcher();
+  assert.equal(matcher.process(speech, 48_000, reference, 48_000), null);
+  assert.equal(matcher.process(speech, 48_000, reference, 48_000), null);
+
+  let guard = initialPlaybackEchoGuard();
+  for (let frame = 0; frame < 10; frame += 1) {
+    const result = updatePlaybackEchoGuard(guard, .025, 5.33, { matchedEcho: false });
+    guard = result.guard;
+    if (frame < 9) assert.equal(result.suppressed, true);
+    else assert.equal(result.suppressed, false);
+  }
+});
+
+test("double talk leaves an independent residual and opens the caller gate", () => {
+  const reference2k = deterministicAudio(2_000, 313);
+  const start = 700;
+  const referenceWindow = reference2k.slice(start, start + 80);
+  const speech = deterministicAudio(80, 773);
+  const mixed = Float32Array.from(referenceWindow, (value, index) => value + speech[index] * .7);
+  const reference = expandAt48k(reference2k);
+  const microphone = expandAt48k(mixed);
+  const matcher = createPlaybackEchoMatcher();
+  matcher.process(microphone, 48_000, reference, 48_000);
+  const match = matcher.process(microphone, 48_000, reference, 48_000);
+  assert.ok(match, "speaker echo should still be found during double talk");
+  assert.ok(match.residualRms > .02, "independent caller energy remains in the residual");
+
+  let guard = initialPlaybackEchoGuard();
+  let result;
+  for (let frame = 0; frame < 10; frame += 1) {
+    result = updatePlaybackEchoGuard(guard, match.residualRms, 5.33, { matchedEcho: true });
+    guard = result.guard;
+  }
+  assert.equal(result.suppressed, false);
+});
+
+test("voice progress deadline tolerates progress and bounds total generation time", () => {
+  const { voiceProgressDeadlineExpired } = require("./voice-capture-policy.js");
+  assert.equal(voiceProgressDeadlineExpired({
+    now: 11_000, started: 0, lastProgress: 10_500, idleMs: 2_000,
+  }), false, "slow but progressing token/audio delivery remains alive");
+  assert.equal(voiceProgressDeadlineExpired({
+    now: 12_001, started: 0, lastProgress: 10_000, idleMs: 2_000,
+  }), true, "a stalled producer expires on inactivity");
+  assert.equal(voiceProgressDeadlineExpired({
+    now: 120_001, started: 0, lastProgress: 119_999, idleMs: 5_000,
+  }), true, "regular progress cannot exceed the hard elapsed-time cap");
+  assert.equal(voiceProgressDeadlineExpired({
+    now: 500, started: 0, lastProgress: 500, idleMs: 1_000, maxElapsedMs: 0,
+  }), true);
 });

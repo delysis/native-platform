@@ -283,6 +283,7 @@ pub fn conversation_model_select_and_load(
             ),
         ));
     }
+    crate::kv_cache::checkpoint_session_before_profile_change(scope, conversation_id);
     let expected_profile_version = conversation.execution_profile.version;
     let mut settings = match settings_for_model_selection(model_path) {
         Ok(settings) => settings,

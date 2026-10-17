@@ -617,18 +617,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     let samplesPerFrame = 1920
                     let overlapSamples = 512
 
-                    let referenceFrames: [[Int32]] = {
-                        guard let referenceAudioCodes,
-                              referenceAudioCodes.count == numCodeGroups,
-                              let frameCount = referenceAudioCodes.map({ $0.count }).min(),
-                              frameCount > 0 else { return [] }
-                        return (0..<frameCount).map { frame in
-                            referenceAudioCodes.map { $0[frame] }
-                        }
-                    }()
                     var generatedCodes: [[Int32]] = []
                     var emittedFrames = 0
-                    var pendingTail: [Float] = []
+                    var pcmOverlap = StreamingPCMOverlap(overlapSamples: overlapSamples)
                     var firstCodeGenerationMicros: UInt64?
                     var firstDecodeMicros: UInt64?
                     var emittedFirstPcmMetrics = false
@@ -643,11 +634,10 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     func decodeWindow(end: Int, newFrames: Int, windowSize: Int) -> [Float] {
                         guard end > 0, newFrames > 0 else { return [] }
                         let start = max(0, end - windowSize)
-                        var decodeInput = Array(generatedCodes[start..<end])
-                        let referenceSpace = max(0, windowSize - decodeInput.count)
-                        if referenceSpace > 0, !referenceFrames.isEmpty {
-                            decodeInput = Array(referenceFrames.suffix(referenceSpace)) + decodeInput
-                        }
+                        // Speaker/reference conditioning belongs to the talker.
+                        // Prepending unrelated reference codes here leaks their
+                        // waveform into the causal decoder's new-audio onset.
+                        let decodeInput = Array(generatedCodes[start..<end])
                         let allSamples = Device.withDefaultDevice(capturedDevice) { () -> [Float] in
                             defer { DeviceSelector.synchronizeIfNeeded(device: capturedDevice) }
                             let flatCodes: [Int32] = decodeInput.flatMap { $0 }
@@ -657,44 +647,12 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             eval(flatAudio)
                             return flatAudio.asArray(Float.self)
                         }
-                        let wanted = min(allSamples.count, newFrames * samplesPerFrame)
+                        // Re-decode the withheld tail too: the crossfade must blend
+                        // two versions of the same samples, never adjacent audio.
+                        let wanted = min(allSamples.count, pcmOverlap.requiredSampleCount(
+                            newSampleCount: newFrames * samplesPerFrame
+                        ))
                         return wanted > 0 ? cleanSamples(Array(allSamples.suffix(wanted))) : []
-                    }
-
-                    func blendWithPendingTail(_ samples: [Float], final: Bool) -> [Float] {
-                        guard !samples.isEmpty else { return [] }
-                        var joined = samples
-                        let overlap = min(overlapSamples, pendingTail.count, joined.count)
-                        if overlap > 0 {
-                            for index in 0..<overlap {
-                                let position = Double(index) / Double(max(overlap - 1, 1))
-                                let fadeIn = Float(0.5 * (1 - cos(Double.pi * position)))
-                                joined[index] = pendingTail[pendingTail.count - overlap + index]
-                                    * (1 - fadeIn) + joined[index] * fadeIn
-                            }
-                        } else if pendingTail.isEmpty {
-                            let fadeLength = min(overlapSamples, joined.count)
-                            for index in 0..<fadeLength {
-                                let position = Double(index) / Double(max(fadeLength - 1, 1))
-                                joined[index] *= Float(0.5 * (1 - cos(Double.pi * position)))
-                            }
-                        }
-                        if final {
-                            let fadeLength = min(overlapSamples, joined.count)
-                            for index in 0..<fadeLength {
-                                let position = Double(index) / Double(max(fadeLength - 1, 1))
-                                joined[joined.count - fadeLength + index]
-                                    *= Float(0.5 * (1 + cos(Double.pi * position)))
-                            }
-                            pendingTail = []
-                            return joined
-                        }
-                        guard joined.count > overlapSamples * 2 else {
-                            pendingTail = joined
-                            return []
-                        }
-                        pendingTail = Array(joined.suffix(overlapSamples))
-                        return Array(joined.dropLast(overlapSamples))
                     }
 
                     var requestCancelled = false
@@ -746,7 +704,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                                 firstDecodeMicros =
                                     (DispatchTime.now().uptimeNanoseconds - decodeStarted) / 1_000
                             }
-                            let samples = blendWithPendingTail(decoded, final: false)
+                            let samples = pcmOverlap.append(decoded, final: false)
                             let tokenRange = emittedFrames..<end
                             emittedFrames = end
                             if !samples.isEmpty {
@@ -787,16 +745,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             firstDecodeMicros =
                                 (DispatchTime.now().uptimeNanoseconds - decodeStarted) / 1_000
                         }
-                        finalSamples = blendWithPendingTail(decoded, final: true)
+                        finalSamples = pcmOverlap.append(decoded, final: true)
                     } else {
-                        finalSamples = pendingTail
-                        pendingTail = []
-                        let fadeLength = min(overlapSamples, finalSamples.count)
-                        for index in 0..<fadeLength {
-                            let position = Double(index) / Double(max(fadeLength - 1, 1))
-                            finalSamples[finalSamples.count - fadeLength + index]
-                                *= Float(0.5 * (1 + cos(Double.pi * position)))
-                        }
+                        finalSamples = pcmOverlap.finish()
                     }
                     if !finalSamples.isEmpty {
                         continuation.yield(AudioChunk(

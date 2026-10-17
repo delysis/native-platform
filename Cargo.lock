@@ -4889,7 +4889,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=b508f1c7652c751513c361c7e4fdeb090fbed577#b508f1c7652c751513c361c7e4fdeb090fbed577"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=ce39455a799de9e96e3cbd509dd117b3a6a55e9f#ce39455a799de9e96e3cbd509dd117b3a6a55e9f"
 dependencies = [
  "bindgen",
  "cc",
@@ -4906,6 +4906,7 @@ version = "0.1.0"
 dependencies = [
  "llama-native-types",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
@@ -4916,6 +4917,7 @@ dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "fs4",
+ "getrandom 0.3.4",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "llama-native-types",

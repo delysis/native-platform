@@ -6,6 +6,7 @@ mod model_acquisition;
 // Capture/host stage only; activation awaits the runtime and KV owners.
 #[allow(dead_code)]
 mod live_transcription;
+mod live_transcription_owner;
 mod native_voice_capture;
 mod operation_supervisor;
 mod speech;
@@ -362,10 +363,9 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         } => retry_cached_failure,
     };
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Blessenger could not locate its setup data: {error}"))?;
+    // Setup readiness belongs to the runtime profile. Tauri's application
+    // directory is shared by profiles launched with distinct data overrides.
+    let app_data_dir = mom_llama_runtime::config::resolve_data_dir();
     let first_run = !model_acquisition::installation_receipt_is_current(&app_data_dir);
     let _ = app.emit(
         "mom_llama_setup_state",
@@ -601,10 +601,14 @@ fn bind_acquired_model_pair(
     let changed = previous_projector != settings.mmproj_path
         || previous_projection != settings.upstream_settings.get("mmprojPath").cloned()
         || previous_mtp != settings.upstream_settings.get("mtpAssistantPath").cloned();
+    let previous_verified = settings.verified_model_artifacts.clone();
     if changed {
         settings.verified_model_artifacts = None;
     }
-    changed
+    if let Some(verified) = &acquired.verified_model_artifacts {
+        settings.verified_model_artifacts = Some(verified.clone());
+    }
+    changed || previous_verified != settings.verified_model_artifacts
 }
 
 fn first_run_warm_ready(
@@ -643,6 +647,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_information_managed_removal_commit,
         commands::mom_llama_engine_check,
         commands::mom_llama_runtime_warm,
+        commands::mom_llama_voice_persona_prepare,
         commands::mom_llama_engine_configure,
         commands::mom_llama_model_list,
         commands::mom_llama_model_select,
@@ -654,6 +659,10 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_voice_audio_begin,
         commands::mom_llama_voice_capture_prepare,
         commands::mom_llama_voice_capture_start,
+        commands::mom_llama_live_transcription_begin,
+        commands::mom_llama_live_transcription_push,
+        commands::mom_llama_live_transcription_finish,
+        commands::mom_llama_live_transcription_cancel,
         commands::mom_llama_voice_capture_pause,
         commands::mom_llama_voice_capture_retarget,
         commands::mom_llama_voice_capture_stop,
@@ -724,7 +733,9 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_attachment_preview_content,
         commands::mom_llama_attachment_preview_bytes,
         commands::mom_llama_speech_transcribe_attachment,
+        commands::mom_llama_speech_parakeet_resident,
         commands::mom_llama_speech_stop,
+        commands::mom_llama_speech_stop_and_wait,
         commands::mom_llama_settings_get,
         commands::mom_llama_settings_reset,
         commands::mom_llama_settings_update,
@@ -734,6 +745,8 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_skill_apply,
         commands::mom_llama_kv_cache_status,
         commands::mom_llama_kv_cache_save,
+        commands::mom_llama_kv_cache_checkpoint_voice_session,
+        commands::mom_llama_kv_cache_set_voice_call_activity,
         commands::mom_llama_kv_cache_restore,
         commands::mom_llama_kv_cache_clear,
         commands::mom_llama_mcp_status,
@@ -779,6 +792,7 @@ impl EmbeddedMom {
             .manage(self.clone())
             .manage(self.startup.clone())
             .manage(native_voice_capture::NativeVoiceCapture::new())
+            .manage(live_transcription_owner::LiveTranscriptionOwner::default())
             .invoke_handler(command_handler())
     }
 
@@ -925,6 +939,7 @@ pub fn run() {
         .menu(build_desktop_menu)
         .manage(startup)
         .manage(native_voice_capture::NativeVoiceCapture::new())
+        .manage(live_transcription_owner::LiveTranscriptionOwner::default())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             app.manage(PreparedSpeech::new(&app_data_dir));
@@ -967,6 +982,12 @@ pub fn run() {
                 // Dock Quit and AppleEvent Quit may reach this final boundary
                 // without an interceptable ExitRequested. Do not let AppKit
                 // or static teardown proceed while Metal owns live resources.
+                // Hide the window before that bounded native join. AppKit is
+                // otherwise stuck displaying a beachball over a dead call
+                // modal while the speech workers acknowledge cancellation.
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
                 let decision = decide_final_exit(app_handle, &event_startup);
                 if decision == FinalExitDecision::AbortWithoutRustTeardown {
                     eprintln!(
@@ -1557,7 +1578,8 @@ mod tests {
     fn acquired_default_rebinds_stale_companions_without_changing_custom_model() {
         use std::path::PathBuf;
 
-        let acquired = model_acquisition::AcquiredModels {
+        let mut acquired = model_acquisition::AcquiredModels {
+            verified_model_artifacts: None,
             gemma: PathBuf::from("/cache/gemma.gguf"),
             projector: PathBuf::from("/cache/projector.gguf"),
             mtp_assistant: PathBuf::from("/cache/mtp.gguf"),
@@ -1582,6 +1604,26 @@ mod tests {
         );
         assert!(!bind_acquired_model_pair(&mut settings, &acquired));
 
+        use mom_llama_runtime::config::{VerifiedArtifactDigest, VerifiedModelArtifacts};
+        acquired.verified_model_artifacts = Some(VerifiedModelArtifacts {
+            model: VerifiedArtifactDigest {
+                path: acquired.gemma.clone(),
+                sha256: "a".repeat(64),
+                file_identity: "model-version".into(),
+            },
+            projector: Some(VerifiedArtifactDigest {
+                path: acquired.projector.clone(),
+                sha256: "b".repeat(64),
+                file_identity: "projector-version".into(),
+            }),
+        });
+        assert!(bind_acquired_model_pair(&mut settings, &acquired));
+        assert_eq!(
+            settings.verified_model_artifacts,
+            acquired.verified_model_artifacts
+        );
+        assert!(!bind_acquired_model_pair(&mut settings, &acquired));
+
         settings.model_path = Some(PathBuf::from("/chosen/custom.gguf"));
         settings.mmproj_path = Some(PathBuf::from("/chosen/projector.gguf"));
         let custom = settings.clone();
@@ -1600,6 +1642,8 @@ mod tests {
             audio_projector_warm_us: 1,
             persona_prefixes_ready: 0,
             persona_prefixes_reused: 0,
+            persona_prefix_warm_us: 0,
+            persona_prefix_warm_status: "no_selected_persona".into(),
             settings_us: 1,
             model_acquire_us: 1,
             model_load: None,

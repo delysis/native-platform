@@ -4,6 +4,12 @@ const test = require("node:test");
 const {
   AdaptiveVoiceLeadController,
   SemanticLeadController,
+  shouldRunCallTranscriptSlot,
+  shouldDisableCallTranscriptSlotsAfterStop,
+  canContinueVoiceHistoryRecovery,
+  shouldWaitForVoiceHistoryRecovery,
+  createCallTranscriptIntent,
+  enqueueCallTranscriptIntent,
 } = require("./voice-pipeline-scheduler.js");
 
 test("voice lead dispatches immediately for startup and only near its adaptive floor later", () => {
@@ -22,6 +28,86 @@ test("next call prefill waits for adaptive runway after generation completes", (
   lead.noteSegment({ synthesisMs: 1_450, audioMs: 1_000, firstAudioMs: 260 });
   assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: 240 }), false);
   assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: lead.targetRunwayMs() }), true);
+});
+
+test("call transcript work runs only in a resident-model, playback-safe unattached slot", () => {
+  const ready = {
+    generationComplete: true,
+    playbackSafe: true,
+    qwenIdle: true,
+    captureUnattached: true,
+    callerVoiced: false,
+    parakeetResident: true,
+    transcriptSlotActive: false,
+    disabled: false,
+  };
+  assert.equal(shouldRunCallTranscriptSlot(ready), true);
+  for (const changed of [
+    { qwenIdle: false },
+    { captureUnattached: false },
+    { callerVoiced: true },
+    { parakeetResident: false },
+    { transcriptSlotActive: true },
+    { disabled: true },
+    { playbackSafe: false },
+    { generationComplete: false },
+  ]) {
+    assert.equal(shouldRunCallTranscriptSlot({ ...ready, ...changed }), false);
+  }
+});
+
+test("cold Parakeet skips only the current slot; slow acknowledged stop disables later slots", () => {
+  const ready = {
+    generationComplete: true,
+    playbackSafe: true,
+    qwenIdle: true,
+    captureUnattached: true,
+    callerVoiced: false,
+    parakeetResident: false,
+    transcriptSlotActive: false,
+    disabled: false,
+  };
+  assert.equal(shouldRunCallTranscriptSlot(ready), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(undefined), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(500), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(500.01), true);
+});
+
+test("foreground work gates recovery without awaiting metadata, but waits an active operation or commit", () => {
+  assert.equal(canContinueVoiceHistoryRecovery(), true);
+  assert.equal(canContinueVoiceHistoryRecovery({ suspended: true }), false);
+  assert.equal(canContinueVoiceHistoryRecovery({ foregroundDispatch: true }), false);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "metadata" }), false);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ operation: "exact-operation", stage: "transcription" }), true);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "recording_commit" }), true);
+});
+
+test("queued call transcript intents retain only durable identities and have a hard bound", () => {
+  const sourceCapture = { capturedPcm: [new Float32Array(24_000 * 60)], transcription: { reader: {} } };
+  const trace = { events: [] };
+  const intent = createCallTranscriptIntent({
+    conversation: "conversation-a",
+    output: { user_message_id: "message-a", voice_attachment_id: "attachment-a", audio: sourceCapture },
+    fallbackAttachment: "fallback-a",
+    sourceTrace: trace,
+    sourceCapture,
+  });
+  assert.deepEqual(intent, {
+    conversation: "conversation-a",
+    output: { voice_attachment_id: "attachment-a", user_message_id: "message-a" },
+    fallbackAttachment: "fallback-a",
+    sourceTrace: trace,
+  });
+  assert.equal("sourceCapture" in intent, false);
+  const queue = [];
+  for (let index = 0; index < 64; index += 1) {
+    assert.equal(enqueueCallTranscriptIntent(queue, { ...intent, output: {
+      voice_attachment_id: `attachment-${index}`,
+      user_message_id: `message-${index}`,
+    } }), true);
+  }
+  assert.equal(enqueueCallTranscriptIntent(queue, intent), false);
+  assert.equal(queue.length, 64);
 });
 
 test("slow synthesis and packet jitter raise the runway target", () => {
@@ -131,32 +217,103 @@ test("semantic terminal always releases exact-request backpressure", () => {
   assert.equal(lead.shouldPause({ queuedWords: 18, readyChunk: true, terminal: true }), false);
 });
 
-test("fast TTS uses short quanta so one segment cannot grossly overfill PCM", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  lead.noteSegment({ synthesisMs: 600, audioMs: 2_000, firstAudioMs: 120, words: 5 });
-  const words = lead.chunkWordLimit({ bufferedMs: lead.targetRunwayMs() });
-  assert.ok(words >= 4 && words <= 6, `expected a short fast-producer quantum, got ${words}`);
+test("complete buffering activates after sustained slow segments or one severe first segment", () => {
+  const sustained = new AdaptiveVoiceLeadController();
+  assert.equal(sustained.shouldBufferCompleteReply(), false);
+  sustained.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  assert.equal(sustained.shouldBufferCompleteReply(), false);
+  sustained.noteSegment({ synthesisMs: 1_060, audioMs: 1_000 });
+  assert.equal(sustained.shouldBufferCompleteReply(), true);
+
+  const severe = new AdaptiveVoiceLeadController();
+  severe.noteSegment({ synthesisMs: 1_450, audioMs: 1_000 });
+  assert.equal(severe.shouldBufferCompleteReply(), true);
 });
 
-test("near-real-time TTS uses a larger quantum to amortize switching", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  for (let index = 0; index < 4; index += 1) {
-    lead.noteSegment({ synthesisMs: 2_100, audioMs: 2_000, firstAudioMs: 220, words: 5 });
+test("complete buffering recovers only after healthy segments and survives reply calibration", () => {
+  const slowReply = new AdaptiveVoiceLeadController();
+  slowReply.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  slowReply.noteSegment({ synthesisMs: 1_100, audioMs: 1_000 });
+  assert.equal(slowReply.shouldBufferCompleteReply(), true);
+
+  const firstBufferedReply = new AdaptiveVoiceLeadController(slowReply.calibration());
+  assert.equal(firstBufferedReply.shouldBufferCompleteReply(), true);
+  firstBufferedReply.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
+  const stillBuffered = new AdaptiveVoiceLeadController(firstBufferedReply.calibration());
+  assert.equal(stillBuffered.shouldBufferCompleteReply(), true);
+  assert.equal(stillBuffered.snapshot().healthy_segment_count, 1);
+
+  stillBuffered.noteSegment({ synthesisMs: 800, audioMs: 1_000 });
+  assert.equal(stillBuffered.shouldBufferCompleteReply(), false);
+  const recoveredReply = new AdaptiveVoiceLeadController(stillBuffered.calibration());
+  assert.equal(recoveredReply.shouldBufferCompleteReply(), false);
+});
+
+test("a cold-call probe releases only for a complete, clearly healthy segment", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
+  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
+
+  const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true, initialProbePending: true });
+  assert.equal(cold.shouldBufferCompleteReply(), true);
+  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000, firstAudioMs: 150 });
+  assert.equal(cold.shouldBufferCompleteReply(), false, "one complete healthy segment releases the cold gate");
+
+  const healthyHandoff = new AdaptiveVoiceLeadController(cold.calibration());
+  assert.equal(healthyHandoff.shouldBufferCompleteReply(), false);
+});
+
+test("cold-call buffering remains for short, slow, unknown, jittered, or previously-underrun probes", () => {
+  const makeCold = (extra = {}) => new AdaptiveVoiceLeadController({
+    initialBufferComplete: true,
+    initialProbePending: true,
+    ...extra,
+  });
+  const cases = [
+    ["short", {}, { synthesisMs: 500, audioMs: 900, firstAudioMs: 140 }],
+    ["slow", {}, { synthesisMs: 1_050, audioMs: 1_000, firstAudioMs: 150 }],
+    ["unknown", {}, { synthesisMs: 500, audioMs: 0, firstAudioMs: 150 }],
+    ["previous-underrun", { initialUnderrunPenaltyMs: 120 }, { synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150 }],
+  ];
+  for (const [name, calibration, segment] of cases) {
+    const cold = makeCold(calibration);
+    cold.noteSegment(segment);
+    assert.equal(cold.shouldBufferCompleteReply(), true, `${name} probe must retain complete-reply buffering`);
+    if (name !== "unknown") {
+      assert.equal(cold.snapshot().startup_probe_pending, false, `${name} measurement settles the one-time probe`);
+    }
   }
-  const slowWords = lead.chunkWordLimit({ bufferedMs: 0 });
-  assert.ok(slowWords >= 8 && slowWords <= 16, `expected a bounded slow-producer quantum, got ${slowWords}`);
-  assert.equal(lead.chunkWordLimit({ first: true, bufferedMs: 0 }), 4);
+
+  const jittered = makeCold();
+  jittered.notePacket({ audioMs: 139, gapMs: 400, startupDeficitMs: 251 });
+  jittered.noteSegment({ synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150 });
+  assert.equal(jittered.shouldBufferCompleteReply(), true, "measured startup jitter keeps the full-reply gate");
+
+  const noFirstAudioMeasurement = makeCold();
+  noFirstAudioMeasurement.noteSegment({ synthesisMs: 500, audioMs: 1_000 });
+  assert.equal(noFirstAudioMeasurement.shouldBufferCompleteReply(), true);
+  assert.equal(noFirstAudioMeasurement.snapshot().startup_probe_pending, false);
 });
 
-test("speech-rate observations tune segment size without escaping hard bounds", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  lead.noteSegment({ synthesisMs: 400, audioMs: 1_000, firstAudioMs: 90, words: 5 });
-  assert.ok(lead.snapshot().observed_speech_ms_per_word < 400);
-  assert.ok(lead.chunkWordLimit({ bufferedMs: 10_000 }) >= 4);
-  assert.ok(lead.chunkWordLimit({ bufferedMs: 0 }) <= 16);
+test("progress timeout grows with measured slow-machine cadence and stays bounded", () => {
+  const healthy = new AdaptiveVoiceLeadController();
+  assert.equal(healthy.progressTimeoutMs(), 20_000);
+
+  const slower = new AdaptiveVoiceLeadController({
+    initialFirstAudioMs: 3_000,
+    initialMaximumPacketGapMs: 4_500,
+  });
+  assert.equal(slower.progressTimeoutMs(), 36_000);
+
+  const verySlow = new AdaptiveVoiceLeadController({
+    initialFirstAudioMs: 15_000,
+    initialMaximumPacketGapMs: 20_000,
+  });
+  assert.equal(verySlow.progressTimeoutMs(), 60_000);
 });
 
-test("speech chunks preserve call latency and voice-note prosody", () => {
+test("call speech waits for complete sentences and voice notes retain phrase rules", () => {
   const fs = require("node:fs");
   const vm = require("node:vm");
   const source = fs.readFileSync(require.resolve("./coop-hx.js"), "utf8");
@@ -166,60 +323,96 @@ test("speech chunks preserve call latency and voice-note prosody", () => {
   const context = {};
   vm.createContext(context);
   vm.runInContext(`${source.slice(start, end)}\nthis.takeLiveSpeechChunk = takeLiveSpeechChunk;`, context);
-  assert.equal(context.takeLiveSpeechChunk("One two three four five six", false, true, 6), null);
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six ", false, true, 6))),
-    { chunk: "One two three four five six", rest: "" },
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six s", false, true, 6))),
-    { chunk: "One two three four five six", rest: "s" },
-  );
-  assert.equal(
-    context.takeLiveSpeechChunk("One two three four five six seven eight nine ten", false, true, 10, "voice_note"),
-    null,
-  );
-  assert.equal(
-    context.takeLiveSpeechChunk(
-      "One two three four five six seven eight nine ten eleven ",
-      false,
-      true,
-      10,
-      "voice_note",
-    ),
-    null,
-  );
-  assert.equal(
-    context.takeLiveSpeechChunk(
-      "That sounds hard, and I am listening",
-      false,
-      true,
-      10,
-      "voice_note",
-    ),
-    null,
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(
-      "That sounds hard, and I am listening carefully to you now.",
-      false,
-      true,
-      10,
-      "voice_note",
-    ))),
-    { chunk: "That sounds hard, and I am listening carefully to you now.", rest: "" },
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(
-      "I hear you. That sounds difficult, and I am listening carefully to what happened.",
-      true,
-      true,
-      10,
-      "voice_note",
-    ))),
-    {
-      chunk: "I hear you. That sounds difficult, and I am listening carefully to what happened.",
-      rest: "",
-    },
-  );
+  const chunk = (text, flush = false, first = false, mode = "call") =>
+    context.takeLiveSpeechChunk(text, flush, first, mode);
+
+  assert.equal(chunk("One two three four five six"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("One two three four five six. "))), {
+    chunk: "One two three four five six.", rest: "", boundary: "sentence",
+  });
+  assert.equal(chunk("A partial sentence keeps arriving without punctuation"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("Dr. Smith met the U.S. team at 3.14 p.m. today. Next sentence. "))), {
+    chunk: "Dr. Smith met the U.S. team at 3.14 p.m. today.",
+    rest: "Next sentence. ", boundary: "sentence",
+  });
+  const sentenceStream = "First one ends. Second one ends. ";
+  const firstSentence = chunk(sentenceStream);
+  const secondSentence = chunk(firstSentence.rest);
+  assert.equal(`${firstSentence.chunk} ${secondSentence.chunk}`, sentenceStream.trim());
+
+  const streamedInput = "Dr. Smith met the U.S. team at 3.14 p.m. today. The next sentence is complete. final unpunctuated tail";
+  const streamedSentences = [];
+  let pending = "";
+  for (const character of streamedInput) {
+    pending += character;
+    const ready = chunk(pending);
+    if (ready) {
+      streamedSentences.push(ready.chunk);
+      pending = ready.rest;
+    }
+  }
+  assert.deepEqual(streamedSentences, [
+    "Dr. Smith met the U.S. team at 3.14 p.m. today.",
+    "The next sentence is complete.",
+  ]);
+  assert.equal(pending, "final unpunctuated tail");
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(pending, true))), {
+    chunk: "final unpunctuated tail", rest: "", boundary: "end",
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("A final unterminated sentence", true))), {
+    chunk: "A final unterminated sentence", rest: "", boundary: "end",
+  });
+
+  const clauseWords = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  clauseWords[18] += ",";
+  const clause = chunk(`${clauseWords.join(" ")} `);
+  assert.deepEqual(JSON.parse(JSON.stringify(clause)), {
+    chunk: clauseWords.slice(0, 19).join(" "),
+    rest: `${clauseWords.slice(19).join(" ")} `, boundary: "limit_clause",
+  });
+  const words = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  const sixtyFourWithoutSeparator = words.slice(0, 64).join(" ");
+  assert.equal(chunk(sixtyFourWithoutSeparator), null, "the 64th partial word is not dispatched");
+  const sixtyFourComplete = chunk(`${sixtyFourWithoutSeparator} `);
+  assert.equal(sixtyFourComplete.boundary, "limit_words");
+  assert.equal(sixtyFourComplete.chunk.split(/\s+/).length, 64);
+  const capped = chunk(`${words.join(" ")} `);
+  assert.equal(capped.boundary, "limit_words");
+  assert.equal(capped.chunk.split(/\s+/).length, 64);
+  assert.equal(`${capped.chunk} ${capped.rest}`.trim().split(/\s+/).length, 70);
+
+  const semanticLead = new SemanticLeadController();
+  const longSentence = Array.from({ length: 24 }, (_, index) => `word${index + 1}`).join(" ");
+  assert.equal(chunk(longSentence), null);
+  assert.equal(semanticLead.shouldPause({ queuedWords: 24, readyChunk: false }), false);
+  const completedLongSentence = chunk(`${longSentence}. `);
+  assert.equal(completedLongSentence.boundary, "sentence");
+  assert.equal(semanticLead.shouldPause({ queuedWords: 24, readyChunk: true }), true);
+
+  assert.equal(chunk("One two three four five six seven eight nine ten", false, true, "voice_note"), null);
+  const voiceNotePartial = Array.from({ length: 27 }, (_, index) => `word${index + 1}`).join(" ") + " partial";
+  assert.equal(chunk(voiceNotePartial, false, false, "voice_note"), null);
+  const voiceNoteComplete = `${voiceNotePartial} `;
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(voiceNoteComplete, false, false, "voice_note"))), {
+    chunk: voiceNotePartial, rest: "", boundary: "limit_words",
+  });
+  const voiceNoteNextWord = chunk(`${voiceNotePartial} next`, false, false, "voice_note");
+  assert.deepEqual(JSON.parse(JSON.stringify(voiceNoteNextWord)), {
+    chunk: voiceNotePartial, rest: "next", boundary: "limit_words",
+  });
+  assert.equal(`${voiceNoteNextWord.chunk} ${voiceNoteNextWord.rest}`, `${voiceNotePartial} next`);
+  assert.equal(chunk("That sounds hard, and I am listening", false, true, "voice_note"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(
+    "That sounds hard, and I am listening carefully to you now and I can stay with you, then we can talk.", false, false, "voice_note",
+  ))), {
+    chunk: "That sounds hard, and I am listening carefully to you now and I can stay with you,",
+    rest: "then we can talk.", boundary: "phrase",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(
+    "I hear you. That sounds difficult, and I am listening carefully to what happened.", true, true, "voice_note",
+  ))), {
+    chunk: "I hear you. That sounds difficult, and I am listening carefully to what happened.",
+    rest: "", boundary: "phrase",
+  });
 });

@@ -1051,34 +1051,79 @@ pub fn settings_reset() -> Result<CommandResult<Settings>> {
 }
 
 pub fn resolve_data_dir() -> PathBuf {
-    if let Some(path) = data_dir_override() {
-        return path;
-    }
-    if let Ok(path) = std::env::var("LLAMA_NATIVE_KIT_DATA_DIR")
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    if let Ok(home) = std::env::var("HOME")
+    let fallback = if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("llama-native-kit")
-            .join(if insecure_development_store_enabled() {
-                "mom-llama-development-mom1-v1"
-            } else {
-                "mom-llama"
-            });
+        PathBuf::from(home).join(".local").join("share")
+    } else {
+        std::env::temp_dir()
     }
-    std::env::temp_dir()
-        .join("llama-native-kit")
-        .join(if insecure_development_store_enabled() {
-            "mom-llama-development-mom1-v1"
-        } else {
-            "mom-llama"
-        })
+    .join("llama-native-kit")
+    .join(if insecure_development_store_enabled() {
+        "mom-llama-development-mom1-v1"
+    } else {
+        "mom-llama"
+    });
+
+    resolve_data_dir_with_overrides(
+        data_dir_override(),
+        std::env::var("LLAMA_NATIVE_KIT_DATA_DIR").ok(),
+        fallback,
+        COMPILED_DATA_NAMESPACE,
+    )
+}
+
+const COMPILED_DATA_NAMESPACE: Option<&str> = option_env!("MOM_LLAMA_DATA_NAMESPACE");
+
+// A candidate-specific compiled namespace makes a packaged candidate safe to
+// auto-launch even when its launcher cannot preserve shell environment. This
+// compile-time assertion keeps the value to one portable path component.
+const _: () = {
+    if let Some(namespace) = COMPILED_DATA_NAMESPACE {
+        assert!(
+            is_safe_data_namespace(namespace),
+            "invalid Mom data namespace"
+        );
+    }
+};
+
+const fn is_safe_data_namespace(namespace: &str) -> bool {
+    let bytes = namespace.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let allowed = (byte >= b'a' && byte <= b'z')
+            || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'0' && byte <= b'9')
+            || byte == b'-'
+            || byte == b'_';
+        if !allowed {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn resolve_data_dir_with_overrides(
+    test_override: Option<PathBuf>,
+    explicit_data_dir: Option<String>,
+    fallback: PathBuf,
+    namespace: Option<&str>,
+) -> PathBuf {
+    if let Some(path) = test_override {
+        return path;
+    }
+    if let Some(path) = explicit_data_dir.filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    match namespace {
+        Some(namespace) => fallback.join(namespace),
+        None => fallback,
+    }
 }
 
 pub(crate) fn insecure_development_store_enabled() -> bool {
@@ -1187,6 +1232,57 @@ mod tests {
         set_data_dir_override_for_tests(None);
         let parallel_data_dir = parallel_data_dir.expect("parallel data-dir lookup");
         assert_ne!(parallel_data_dir, override_path);
+    }
+
+    #[test]
+    fn data_dir_namespace_is_safe_and_only_applies_to_fallback() {
+        for namespace in ["voice-qualification", "candidate_01", "M2"] {
+            assert!(is_safe_data_namespace(namespace));
+        }
+        for namespace in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "voice/candidate",
+            "voice\\candidate",
+            "/tmp",
+        ] {
+            assert!(!is_safe_data_namespace(namespace), "accepted {namespace:?}");
+        }
+
+        let fallback = PathBuf::from("/isolated/default");
+        assert_eq!(
+            resolve_data_dir_with_overrides(
+                None,
+                None,
+                fallback.clone(),
+                Some("voice-qualification")
+            ),
+            fallback.join("voice-qualification")
+        );
+        assert_eq!(
+            resolve_data_dir_with_overrides(None, None, fallback.clone(), None),
+            fallback
+        );
+        assert_eq!(
+            resolve_data_dir_with_overrides(
+                None,
+                Some("/explicit/store".into()),
+                PathBuf::from("/isolated/default"),
+                Some("voice-qualification")
+            ),
+            PathBuf::from("/explicit/store")
+        );
+        assert_eq!(
+            resolve_data_dir_with_overrides(
+                Some(PathBuf::from("/test/store")),
+                Some("/explicit/store".into()),
+                PathBuf::from("/isolated/default"),
+                Some("voice-qualification")
+            ),
+            PathBuf::from("/test/store")
+        );
     }
 
     #[test]

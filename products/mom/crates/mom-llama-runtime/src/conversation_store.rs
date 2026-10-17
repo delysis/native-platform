@@ -67,6 +67,13 @@ pub struct ConversationExecutionProfile {
     pub version: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationInferenceWindow {
+    pub covered_through_message_id: String,
+    pub covered_source_sha256: String,
+    pub profile_sha256: String,
+}
+
 impl Default for ConversationExecutionProfile {
     fn default() -> Self {
         Self {
@@ -170,6 +177,8 @@ pub struct Conversation {
     pub current_skill_ids: Vec<String>,
     #[serde(default)]
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_window: Option<ConversationInferenceWindow>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -794,6 +803,7 @@ fn new_conversation(
         recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: Vec::new(),
+        inference_window: None,
     })
 }
 
@@ -1687,6 +1697,7 @@ pub fn conversation_fork(
                 recipient_ids: source.recipient_ids,
                 current_skill_ids: source.current_skill_ids,
                 messages,
+                inference_window: None,
             };
             db.selected_conversation_id = Some(fork_id);
             db.conversations.insert(0, fork.clone());
@@ -2280,6 +2291,7 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
                 recipient_ids: Vec::new(),
                 current_skill_ids: Vec::new(),
                 messages: Vec::new(),
+                inference_window: None,
             };
             db.conversations.insert(0, conversation.clone());
             Ok((db.clone(), conversation))
@@ -2447,6 +2459,7 @@ mod tests {
                 message("user", None, MessageRole::User, "Actual subject\nDetails"),
                 message("reply", Some("user"), MessageRole::Assistant, "Response"),
             ],
+            inference_window: None,
         };
         for message in &mut conversation.messages {
             message.conversation_id = conversation.id.clone();
@@ -2578,6 +2591,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         };
         conversation.execution_profile.model_path = Some(PathBuf::from("   "));
         conversation.execution_profile.mmproj_path = Some(PathBuf::new());
@@ -2607,6 +2621,7 @@ mod tests {
                 message("u", None, MessageRole::User, "café\r\n"),
                 message("a", Some("u"), MessageRole::Assistant, "selected"),
             ],
+            inference_window: None,
         }
     }
 
@@ -2808,6 +2823,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         }
     }
 

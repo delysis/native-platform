@@ -4229,6 +4229,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         }
     }
 
@@ -4897,6 +4898,7 @@ mod tests {
                         attribution: None,
                         attachment_ids: Vec::new(),
                     }],
+                    inference_window: None,
                 }],
                 selected_conversation_id: Some("host".to_string()),
             },
