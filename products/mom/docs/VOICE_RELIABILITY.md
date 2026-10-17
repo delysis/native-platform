@@ -1,23 +1,25 @@
 # Voice reliability qualification
 
-## Evidence snapshot — 16 October 2026
+## Evidence snapshot — 17 October 2026
 
 This is a dated implementation and evidence snapshot, not a live qualification
 declaration. Each local gate, candidate build, and device run applies only to
 the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
-The 244/244 frontend result and Rust counts below predate the current
-uncommitted live-audio derivative, pre-call checkpoint, and shutdown-flush
-integration changes. The latest candidate attempt is not valid for this tree.
-Do not treat those historical focused checks as validation of the current
-checkout; the current consolidated gate and a new package receipt must bind the
-final clean source/tree identity before promotion.
-
+Historical focused counts below are tied to their retained receipts. The
+latest fully passing consolidated gate before these changes is `5c47b94a`.
+The `599ecbde` gate failed on three Clippy diagnostics and rejected checkout
+cleanliness after scratch files appeared during the run. Both the failure and
+the fix are retained; scratch work now stays outside the source checkout.
+The shutdown capability and native capture ledger below require a subsequent
+clean exact-commit gate. Candidate attempt 01 does not validate this tree.
+Do not promote a package unless its manifest binds the final clean source and
+tree to a complete passing local gate.
 The M4 Max runtime evidence below covers bounded voice-history rollover with
 synthetic input. Under a manual 21,845 MiB memory budget, the initial
 8,192-token setting resolved to 18,944 native context cells in that run. It is
-not an M2 measurement or packaged-call acceptance. The two latest consolidated
+not an M2 measurement or packaged-call acceptance. Earlier consolidated
 gate attempts documented below failed for separate workspace issues. Consult
 the newest exact local-ci receipt before making a gate claim. Candidate identity
 and packaging evidence belong to the generated candidate manifest, not this
@@ -143,7 +145,10 @@ resident tokens and retained the existing restore/replay checks; a packaged
 call still needs request-scoped filesystem evidence for the no-disk-I/O
 boundary. Hangup now requests a conversation-scoped checkpoint without waiting
 on the UI path, and graceful shutdown flushes eligible committed checkpoints
-after work drain but before native teardown. A per-call opaque activity ID is
+after work drain but before native teardown. Shutdown captures a restricted
+resident-checkpoint capability before cancelling its operation scope. That
+capability cannot load a model or submit generation; ordinary native access
+stays revoked while the final committed state is saved. A per-call opaque activity ID is
 registered before microphone/model setup and remains active until call-owned
 stop acknowledgements settle; a matching-ID clear precedes the hangup
 checkpoint. Active calls suppress idle persistence, and graceful shutdown
@@ -162,12 +167,15 @@ PCM sent to live inference.
 
 ## Live audio and retained inference input
 
-For a browser-captured voice turn, the complete physical microphone recording
-remains the original attachment and is not rewritten. Samples accepted by live
-Gemma prefill are quantized to canonical PCM16 before native submission; a
-successful commit may retain those exact accepted samples as a
-`VoiceInferenceAudio` derived artifact with its source range and canonicalizer
-version. This preserves live-to-history media identity while keeping the full
+For browser and native microphone turns, the complete physical microphone recording
+remains the original attachment and is not rewritten. Browser samples are quantized before submission and native input is quantized
+at engine admission, using the same canonical PCM16 rule. A successful commit
+may retain those exact acknowledged samples as a
+`VoiceInferenceAudio` derived artifact with its source ranges and canonicalizer
+version. The native ledger translates model checkpoint sample offsets through
+acknowledged physical ranges before replay, rather than treating a model offset
+as a physical recording index. Failed or ambiguous derivative construction
+leaves the physical WAV available and records a diagnostic. This preserves live-to-history media identity while keeping the full
 physical capture available for playback and recovery. The live request and
 selected derived history append their `native-media` placeholder at the same
 current-user message boundary; the placeholder is projected into inference,
@@ -182,7 +190,10 @@ or persistence fails, the original physical attachment still commits. The
 runtime emits structured `model_input_derivative_unavailable` reason data,
 leaves the derived artifact unlinked, and history falls back to the original
 audio path. Such a fallback must not be reported as a live-prefix/cache hit.
-Rust integration and packaged confirmation for this new path remain pending.
+Real native tests demonstrate retained mixed text/audio state, authenticated
+restart without token replay, exact partial-audio prefix reuse, and cold-output
+parity. Browser/native IPC and physical packaged behavior require the separate
+app checks and candidate run; native tests alone do not establish those gates.
 
 ## Evidence history and limitations
 
@@ -315,3 +326,34 @@ payloads where Loom's contract remains 32. The full receipts remain at
 the default ledger aggregate limit at 32 and opts in only Mom's committed
 history emitter to the bounded audio-history allowance. These receipts remain
 failures even if a later exact-tree gate passes.
+
+## Streaming and shutdown follow-up
+
+The producer's unread backlog remains bounded at 30 seconds. The accepted PCM
+archive has a separate capacity derived from the admitted native context, so a
+worker keeping up with speech does not reject an utterance merely because its
+total duration crosses 30 seconds. The model still enforces its actual context
+budget. A 45-second processed-stream test distinguishes archive retention from
+backpressure.
+
+The final shutdown regression test creates a real committed conversation while
+an active call guard excludes idle persistence, captures export access, cancels
+the scope, flushes, tears down the worker, and requests authenticated restore
+from the encrypted checkpoint. Its run receipt, not the test's existence,
+establishes success. The actual M2 and sustained physical-call qualification
+remain separate from all M4 component measurements.
+
+A quick call restart can overlap the previous hangup's encrypted checkpoint
+write. Preparation first probes the worker for the pending committed request's
+identity. If it still owns that exact request, RAM wins without a cache database
+read; an older persisted checkpoint must not replace it. This probe reads only
+ownership/count metadata and preserves speculative resume state. The shutdown
+regression also creates an older disk checkpoint and a newer divergent resident
+turn to verify this ordering before final save/restart.
+
+Checkpoint publication is also conditional on the serialized source conversation
+still matching inside the SQLite write transaction. A delayed writer cannot
+replace a newer conversation's saved state. Conditional native imports compare
+the worker revision at the import command itself, closing the gap between RAM
+inspection and disk loading. Generation attempts advance that revision even
+when cancelled; read-only inspection leaves resume checkpoints intact.

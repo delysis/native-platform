@@ -159,7 +159,7 @@ pub(crate) struct VoiceInferenceRecording {
     pub wav: Vec<u8>,
     pub source_sample_count: u64,
     pub accepted_sample_count: u64,
-    pub source_start_sample: u64,
+    pub source_ranges: Vec<mom_llama_runtime::InferenceAudioSampleRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,10 +254,11 @@ impl VoiceSpeculationControl {
         if let Some(inference) = &recording.inference {
             let valid_source_range = inference.source_sample_count > 0
                 && inference.accepted_sample_count > 0
-                && inference
-                    .source_start_sample
-                    .checked_add(inference.accepted_sample_count)
-                    .is_some_and(|end| end <= inference.source_sample_count)
+                && valid_voice_inference_source_ranges(
+                    &inference.source_ranges,
+                    inference.source_sample_count,
+                    inference.accepted_sample_count,
+                )
                 && wav_sample_count(&recording.physical_wav) == Some(inference.source_sample_count)
                 && wav_sample_count(&inference.wav) == Some(inference.accepted_sample_count);
             if !valid_source_range || !complete_voice_wav(&inference.wav) {
@@ -301,34 +302,80 @@ fn wav_sample_count(recording: &[u8]) -> Option<u64> {
     Some(u64::from(u32::from_le_bytes(recording[40..44].try_into().ok()?)) / 2)
 }
 
+fn valid_voice_inference_source_ranges(
+    ranges: &[mom_llama_runtime::InferenceAudioSampleRange],
+    source_sample_count: u64,
+    accepted_sample_count: u64,
+) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let mut previous_end = None;
+    let mut total = 0_u64;
+    for range in ranges {
+        if range.start >= range.end_exclusive
+            || range.end_exclusive > source_sample_count
+            || previous_end.is_some_and(|end| range.start < end)
+        {
+            return false;
+        }
+        let Some(length) = range.end_exclusive.checked_sub(range.start) else {
+            return false;
+        };
+        let Some(next_total) = total.checked_add(length) else {
+            return false;
+        };
+        total = next_total;
+        previous_end = Some(range.end_exclusive);
+    }
+    total == accepted_sample_count
+}
+
 pub(crate) fn validate_voice_inference_recording(
     physical_wav: &[u8],
     wav: Option<Vec<u8>>,
     source_sample_count: Option<u64>,
     accepted_sample_count: Option<u64>,
     source_start_sample: Option<u64>,
+    source_ranges: Option<Vec<mom_llama_runtime::InferenceAudioSampleRange>>,
 ) -> (Option<VoiceInferenceRecording>, Option<String>) {
-    match (
-        wav,
-        source_sample_count,
-        accepted_sample_count,
-        source_start_sample,
-    ) {
-        (None, None, None, None) => (None, None),
-        (
-            Some(wav),
-            Some(source_sample_count),
-            Some(accepted_sample_count),
-            Some(source_start_sample),
-        ) => {
+    match (wav, source_sample_count, accepted_sample_count) {
+        (None, None, None) if source_start_sample.is_none() && source_ranges.is_none() => {
+            (None, None)
+        }
+        (Some(wav), Some(source_sample_count), Some(accepted_sample_count)) => {
+            let normalized_ranges = match (source_start_sample, source_ranges) {
+                (Some(start), None) => {
+                    start
+                        .checked_add(accepted_sample_count)
+                        .map(|end_exclusive| {
+                            vec![mom_llama_runtime::InferenceAudioSampleRange {
+                                start,
+                                end_exclusive,
+                            }]
+                        })
+                }
+                (None, Some(ranges)) => Some(ranges),
+                _ => None,
+            };
+            let Some(source_ranges) = normalized_ranges else {
+                return (
+                    None,
+                    Some(
+                        "model-input recording provenance was incomplete or ambiguous".to_string(),
+                    ),
+                );
+            };
             let valid = complete_voice_wav(physical_wav)
                 && complete_voice_wav(&wav)
                 && wav_sample_count(physical_wav) == Some(source_sample_count)
                 && wav_sample_count(&wav) == Some(accepted_sample_count)
                 && accepted_sample_count > 0
-                && source_start_sample
-                    .checked_add(accepted_sample_count)
-                    .is_some_and(|end| end <= source_sample_count);
+                && valid_voice_inference_source_ranges(
+                    &source_ranges,
+                    source_sample_count,
+                    accepted_sample_count,
+                );
             if !valid {
                 return (
                     None,
@@ -340,7 +387,7 @@ pub(crate) fn validate_voice_inference_recording(
                     wav,
                     source_sample_count,
                     accepted_sample_count,
-                    source_start_sample,
+                    source_ranges,
                 }),
                 None,
             )
@@ -1249,6 +1296,11 @@ impl AppRuntimeHandle {
                 // Closing app admission publishes cancellation to every long
                 // operation before application work drains. That drain
                 // precedes the sole terminal native join.
+                // Capture only export authority before cancellation revokes
+                // normal model access. This capability cannot start generation.
+                let checkpoint_drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(
+                    &self.0.operation_scope,
+                );
                 self.request_product_cancellation();
                 let voice_sessions = self
                     .0
@@ -1297,10 +1349,7 @@ impl AppRuntimeHandle {
                 eprintln!("Blessenger shutdown: app work drained {} ms", started.elapsed().as_millis());
                 let supervisor = self.0.operation_supervisor.shutdown();
                 eprintln!("Blessenger shutdown: operations joined {} ms", started.elapsed().as_millis());
-                let checkpoint_scope = self.0.operation_scope.clone();
-                let checkpoint_flush = tokio::task::spawn_blocking(move || {
-                    mom_llama_runtime::flush_committed_session_checkpoints(&checkpoint_scope)
-                })
+                let checkpoint_flush = tokio::task::spawn_blocking(move || checkpoint_drain.flush())
                 .await;
                 let checkpoint_flush_error = match checkpoint_flush {
                     Ok(Ok(count)) => {
@@ -1572,6 +1621,7 @@ mod tests {
                 Some(1),
                 Some(1),
                 Some(0),
+                None,
             )
             .0
             .is_some()
@@ -1582,6 +1632,7 @@ mod tests {
             Some(1),
             Some(1),
             Some(1),
+            None,
         );
         assert!(invalid.is_none());
         assert!(diagnostic.is_some());
@@ -1620,7 +1671,10 @@ mod tests {
                 wav,
                 source_sample_count: 1,
                 accepted_sample_count: 1,
-                source_start_sample: 0,
+                source_ranges: vec![mom_llama_runtime::InferenceAudioSampleRange {
+                    start: 0,
+                    end_exclusive: 1,
+                }],
             }),
             inference_unavailable_reason: None,
         };
@@ -1630,9 +1684,93 @@ mod tests {
             "a late confirm after cancellation must not publish the payload"
         );
         assert_eq!(
-            control.wait_for_confirmation().unwrap_err(),
+            control
+                .wait_for_confirmation()
+                .expect_err("aborted speculation must not confirm"),
             "voice_speculation_aborted"
         );
+    }
+
+    #[test]
+    fn voice_inference_recording_accepts_ordered_disjoint_ranges_only_when_counts_match() {
+        let wav_with_samples = |count: u32| {
+            let data_bytes = count * 2;
+            let mut wav = vec![0; 44 + data_bytes as usize];
+            wav[..4].copy_from_slice(b"RIFF");
+            wav[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+            wav[8..16].copy_from_slice(b"WAVEfmt ");
+            wav[16..20].copy_from_slice(&16_u32.to_le_bytes());
+            wav[20..22].copy_from_slice(&1_u16.to_le_bytes());
+            wav[22..24].copy_from_slice(&1_u16.to_le_bytes());
+            wav[24..28].copy_from_slice(&16_000_u32.to_le_bytes());
+            wav[28..32].copy_from_slice(&32_000_u32.to_le_bytes());
+            wav[32..34].copy_from_slice(&2_u16.to_le_bytes());
+            wav[34..36].copy_from_slice(&16_u16.to_le_bytes());
+            wav[36..40].copy_from_slice(b"data");
+            wav[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+            wav
+        };
+        let physical = wav_with_samples(6);
+        let inference = wav_with_samples(3);
+        let disjoint_ranges = vec![
+            mom_llama_runtime::InferenceAudioSampleRange {
+                start: 0,
+                end_exclusive: 1,
+            },
+            mom_llama_runtime::InferenceAudioSampleRange {
+                start: 4,
+                end_exclusive: 6,
+            },
+        ];
+        let (validated, diagnostic) = validate_voice_inference_recording(
+            &physical,
+            Some(inference.clone()),
+            Some(6),
+            Some(3),
+            None,
+            Some(disjoint_ranges.clone()),
+        );
+        assert!(diagnostic.is_none());
+        assert_eq!(
+            validated
+                .expect("valid ordered disjoint ranges")
+                .source_ranges,
+            disjoint_ranges
+        );
+
+        let (overlap, diagnostic) = validate_voice_inference_recording(
+            &physical,
+            Some(inference.clone()),
+            Some(6),
+            Some(3),
+            None,
+            Some(vec![
+                mom_llama_runtime::InferenceAudioSampleRange {
+                    start: 0,
+                    end_exclusive: 2,
+                },
+                mom_llama_runtime::InferenceAudioSampleRange {
+                    start: 1,
+                    end_exclusive: 2,
+                },
+            ]),
+        );
+        assert!(overlap.is_none());
+        assert!(diagnostic.is_some());
+
+        let (wrong_count, diagnostic) = validate_voice_inference_recording(
+            &physical,
+            Some(inference),
+            Some(6),
+            Some(3),
+            None,
+            Some(vec![mom_llama_runtime::InferenceAudioSampleRange {
+                start: 0,
+                end_exclusive: 2,
+            }]),
+        );
+        assert!(wrong_count.is_none());
+        assert!(diagnostic.is_some());
     }
 
     #[test]

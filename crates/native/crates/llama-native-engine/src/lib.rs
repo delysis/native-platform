@@ -2272,6 +2272,14 @@ impl NativeModelInner {
     }
 }
 
+/// Worker-owned observation used to avoid importing an older checkpoint over
+/// generation that completed while disk state was being loaded.
+#[derive(Debug, Clone, Copy)]
+pub struct ResidentConversationInspection {
+    pub revision: u64,
+    pub committed_prefix_tokens: Option<usize>,
+}
+
 #[derive(Debug)]
 enum WorkerCommand {
     EvaluateResidual {
@@ -2346,6 +2354,10 @@ enum WorkerCommand {
         cells: Vec<MultimodalPrefixCell>,
         response: Sender<NativeResult<bool>>,
     },
+    InspectCommittedConversation {
+        request_id: Option<String>,
+        response: Sender<NativeResult<ResidentConversationInspection>>,
+    },
     Snapshot {
         expected_request_id: Option<String>,
         conversation: bool,
@@ -2356,7 +2368,8 @@ enum WorkerCommand {
     Restore {
         state: SequenceStateBlob,
         destination_sequence_id: i32,
-        response: Sender<NativeResult<SequenceRestoreKind>>,
+        expected_revision: Option<u64>,
+        response: Sender<NativeResult<Option<SequenceRestoreKind>>>,
     },
     PrefillPrefix {
         request: SharedPrefixBatchRequest,
@@ -3036,6 +3049,28 @@ impl NativeModelHandle {
         })?
     }
 
+    /// Read-only ownership probe. No KV export, disk access, or model evaluation.
+    pub fn inspect_resident_conversation(
+        &self,
+        request_id: Option<&str>,
+    ) -> NativeResult<ResidentConversationInspection> {
+        self.inner.ensure_accepting()?;
+        let (response, receiver) = bounded(1);
+        self.inner.send_command(
+            WorkerCommand::InspectCommittedConversation {
+                request_id: request_id.map(str::to_owned),
+                response,
+            },
+            "checking committed resident conversation",
+        )?;
+        receiver.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native committed conversation probe stopped: {error}"),
+            )
+        })?
+    }
+
     pub fn snapshot_conversation_for_request_if_fits(
         &self,
         request_id: &str,
@@ -3076,12 +3111,39 @@ impl NativeModelHandle {
         state: SequenceStateBlob,
         destination_sequence_id: i32,
     ) -> NativeResult<SequenceRestoreKind> {
+        self.restore_sequence_internal(state, destination_sequence_id, None)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "unconditional restore was skipped",
+                )
+            })
+    }
+
+    /// Imports only if no generation or restore has changed the worker since
+    /// inspection. The comparison and import execute in one worker command.
+    pub fn restore_sequence_if_revision(
+        &self,
+        state: SequenceStateBlob,
+        destination_sequence_id: i32,
+        expected_revision: u64,
+    ) -> NativeResult<Option<SequenceRestoreKind>> {
+        self.restore_sequence_internal(state, destination_sequence_id, Some(expected_revision))
+    }
+
+    fn restore_sequence_internal(
+        &self,
+        state: SequenceStateBlob,
+        destination_sequence_id: i32,
+        expected_revision: Option<u64>,
+    ) -> NativeResult<Option<SequenceRestoreKind>> {
         self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
             WorkerCommand::Restore {
                 state,
                 destination_sequence_id,
+                expected_revision,
                 response: response_tx,
             },
             "submitting a sequence restore",
@@ -3817,6 +3879,7 @@ fn run_worker(
     let mut resident_text_prefix = ResidentTextPrefixCache::new(resident_prefix_binding.clone());
     let mut resident_audio_checkpoint: Option<ResidentAudioCheckpoint> = None;
     let mut resident_audio_text_prefix: Option<ResidentAudioTextPrefix> = None;
+    let mut conversation_revision = 0_u64;
     let mut controlled_token_contract = None;
     let mut embedding_call_sequence = 0_u64;
     let mut controlled_call_sequence = 0_u64;
@@ -3845,11 +3908,26 @@ fn run_worker(
         let _speculative_permit = speculative_permit;
         if !matches!(
             &command,
+            WorkerCommand::InspectControlledIdentity { .. }
+                | WorkerCommand::InspectConversation { .. }
+                | WorkerCommand::InspectCommittedConversation { .. }
+                | WorkerCommand::Snapshot { .. }
+                | WorkerCommand::Restore { .. }
+                | WorkerCommand::Tokenize { .. }
+                | WorkerCommand::PrepareInput { .. }
+                | WorkerCommand::MeasurePrompt { .. }
+        ) {
+            conversation_revision = conversation_revision.wrapping_add(1);
+        }
+
+        if !matches!(
+            &command,
             WorkerCommand::GenerateIncrementalAudio { .. }
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Restore { .. }
                 | WorkerCommand::InspectConversation { .. }
+                | WorkerCommand::InspectCommittedConversation { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
@@ -3871,6 +3949,7 @@ fn run_worker(
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Restore { .. }
                 | WorkerCommand::InspectConversation { .. }
+                | WorkerCommand::InspectCommittedConversation { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
@@ -4625,6 +4704,29 @@ fn run_worker(
                         .all(|(cell, token)| matches!(cell, MultimodalPrefixCell::Text(value) if value == token))));
                 let _ = response.send(Ok(covers));
             }
+            WorkerCommand::InspectCommittedConversation {
+                request_id,
+                response,
+            } => {
+                let expected = request_id.as_deref();
+                let audio = resident_audio_text_prefix
+                    .as_ref()
+                    .filter(|prefix| {
+                        expected.is_some()
+                            && prefix.source_request_id.as_deref() == expected
+                            && prefix.source_cell_count > 0
+                            && prefix.source_cell_count <= prefix.cells.len()
+                    })
+                    .map(|prefix| prefix.source_cell_count);
+                let text = (expected.is_some()
+                    && resident_text_prefix.source_request_id.as_deref() == expected
+                    && !resident_text_prefix.token_ids.is_empty())
+                .then_some(resident_text_prefix.token_ids.len());
+                let _ = response.send(Ok(ResidentConversationInspection {
+                    revision: conversation_revision,
+                    committed_prefix_tokens: audio.or(text),
+                }));
+            }
             WorkerCommand::Snapshot {
                 expected_request_id,
                 conversation,
@@ -4734,8 +4836,13 @@ fn run_worker(
             WorkerCommand::Restore {
                 state,
                 destination_sequence_id,
+                expected_revision,
                 response,
             } => {
+                if expected_revision.is_some_and(|expected| expected != conversation_revision) {
+                    let _ = response.send(Ok(None));
+                    continue;
+                }
                 // Pure rejection preserves all prior sequence state. Once native
                 // mutation starts, failure cannot leave tracking or reuse
                 // authority describing a partially restored context.
@@ -4753,6 +4860,7 @@ fn run_worker(
                             "mixed audio state requires an authenticated native export",
                         ));
                     }
+                    conversation_revision = conversation_revision.wrapping_add(1);
                     invalidate_resident_audio_checkpoint(
                         &mut context,
                         &mut resident_audio_checkpoint,
@@ -4775,27 +4883,26 @@ fn run_worker(
                             destination_sequence_id,
                         )
                     };
+                    if result.is_ok()
+                        && !state.cells.is_empty()
+                        && destination_sequence_id == 0
+                        && worker_identity.kv_unified
+                        && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+                        && let Err(error) = retain_multimodal_prefix(
+                            &mut context,
+                            0,
+                            state.cells.clone(),
+                            &mut resident_audio_text_prefix,
+                        )
+                    {
+                        context.clear_kv_cache();
+                        resident_audio_text_prefix = None;
+                        resident_audio_checkpoint = None;
+                        sequence_token_counts.clear();
+                        sequence_token_ids.clear();
+                        return Err(error);
+                    }
                     if result.is_ok() {
-                        if !state.cells.is_empty()
-                            && destination_sequence_id == 0
-                            && worker_identity.kv_unified
-                            && fingerprint.max_sequences
-                                > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
-                        {
-                            if let Err(error) = retain_multimodal_prefix(
-                                &mut context,
-                                0,
-                                state.cells.clone(),
-                                &mut resident_audio_text_prefix,
-                            ) {
-                                context.clear_kv_cache();
-                                resident_audio_text_prefix = None;
-                                resident_audio_checkpoint = None;
-                                sequence_token_counts.clear();
-                                sequence_token_ids.clear();
-                                return Err(error);
-                            }
-                        }
                         sequence_token_counts.insert(destination_sequence_id, state.token_count);
                         sequence_token_ids.insert(
                             destination_sequence_id,
@@ -4850,7 +4957,7 @@ fn run_worker(
                     }
                     result
                 });
-                let _ = response.send(result);
+                let _ = response.send(result.map(Some));
             }
             WorkerCommand::PrefillPrefix { request, response } => {
                 // The prefill owns the context after admission. Transfer the
@@ -5111,6 +5218,9 @@ fn reject_queued_command(command: WorkerCommand) {
             let _ = response.send(Err(cancelled()));
         }
         WorkerCommand::InspectConversation { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::InspectCommittedConversation { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
         WorkerCommand::Snapshot { response, .. } => {
@@ -8262,16 +8372,28 @@ fn incremental_audio_request_sha256(request: &GenerationRequest) -> NativeResult
     Ok(format!("{:x}", Sha256::digest(encoded?)))
 }
 
-fn fork_resident_audio_checkpoint(
-    context: &mut LlamaContext<'_>,
-    source_sequence_id: i32,
-    resume_key: &str,
-    request_sha256: &str,
+struct AudioCheckpointContents<'a> {
+    resume_key: &'a str,
+    request_sha256: &'a str,
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
-    cells: &[MultimodalPrefixCell],
+    cells: &'a [MultimodalPrefixCell],
+}
+
+fn fork_resident_audio_checkpoint(
+    context: &mut LlamaContext<'_>,
+    source_sequence_id: i32,
+    contents: AudioCheckpointContents<'_>,
 ) -> NativeResult<ResidentAudioCheckpoint> {
+    let AudioCheckpointContents {
+        resume_key,
+        request_sha256,
+        next_position,
+        prompt_tokens,
+        projected_samples,
+        cells,
+    } = contents;
     let destination_sequence_id = alternate_checkpoint_sequence(source_sequence_id)?;
     let copy_end = u32::try_from(next_position).map_err(|_| {
         NativeError::new(
@@ -8322,12 +8444,14 @@ fn capture_resident_audio_checkpoint(
         return fork_resident_audio_checkpoint(
             context,
             source_sequence_id,
-            resume_key,
-            request_sha256,
-            next_position,
-            prompt_tokens,
-            projected_samples,
-            cells,
+            AudioCheckpointContents {
+                resume_key,
+                request_sha256,
+                next_position,
+                prompt_tokens,
+                projected_samples,
+                cells,
+            },
         );
     }
     Ok(ResidentAudioCheckpoint {
@@ -16194,6 +16318,8 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(&wav)),
             bytes: wav,
         }];
+        let inspected = handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert_eq!(inspected.committed_prefix_tokens, Some(state.token_count));
         let probe = handle.generate_incremental_audio(request.clone())?;
         probe.wait_for_resume()?;
         probe.cancel();
@@ -16206,6 +16332,16 @@ mod tests {
         assert!(idle.token_count >= audio_end && idle.token_count <= state.token_count);
         assert!(state.cells.starts_with(&idle.cells));
         assert!(handle.resident_conversation_covers_cells(idle.cells.clone())?);
+        assert!(
+            handle
+                .restore_sequence_if_revision(state.clone(), 0, inspected.revision)?
+                .is_none(),
+            "a delayed disk import must not overwrite newer worker activity"
+        );
+        assert!(
+            handle.resident_conversation_covers_cells(idle.cells.clone())?,
+            "conditional restore rejection must preserve the retained prefix"
+        );
         drop(idle);
         let next = handle.generate_incremental_audio(request.clone())?;
         next.wait_for_resume()?;

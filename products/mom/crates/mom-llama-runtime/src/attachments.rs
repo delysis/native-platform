@@ -6133,7 +6133,12 @@ mod tests {
             "the model-input child must not replace original attachment identity"
         );
         let manifest = store
-            .get::<AttachmentManifest>(persisted.manifest_namespace.as_deref().unwrap())
+            .get::<AttachmentManifest>(
+                persisted
+                    .manifest_namespace
+                    .as_deref()
+                    .expect("persisted manifest namespace"),
+            )
             .expect("load source manifest")
             .expect("source manifest");
         let selected = selected_inference_audio_artifact(persisted, &manifest)
@@ -6168,7 +6173,13 @@ mod tests {
             .expect("selected model input")
             .source_sha256 = "0".repeat(64);
         store
-            .put(persisted.manifest_namespace.as_deref().unwrap(), &corrupted)
+            .put(
+                persisted
+                    .manifest_namespace
+                    .as_deref()
+                    .expect("persisted manifest namespace"),
+                &corrupted,
+            )
             .expect("corrupt selection for fail-closed assertion");
         let blocked = prepare_live_audio_history("chat", std::slice::from_ref(&message))
             .expect("resolve malformed selected model input")

@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 68,
+  "expected_test_count": 69,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1461,6 +1461,17 @@
       "target": "test:runtime",
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "prerequisite": "requires a real local GGUF; builds a >1 GB voice persona prefix, verifies encrypted multi-part storage, then reloads and checks cached-versus-cold continuation after worker restart",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["macos"]
+    },
+    {
+      "test_id": "real_committed_session_checkpoint_survives_scope_shutdown",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF; verifies committed session checkpoint save after operation-scope cancellation and authenticated native restore after worker restart",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",

@@ -72,10 +72,11 @@ pub use engine::{
     runtime_warm_until_cancelled,
 };
 pub use kv_cache::{
-    VoicePersonaPrefixPreparation, flush_committed_session_checkpoints,
+    CommittedSessionCheckpointDrain, VoicePersonaPrefixPreparation,
     kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
     kv_cache_prepare_voice_persona_resident, kv_cache_restore, kv_cache_save,
     kv_cache_save_voice_persona, kv_cache_set_voice_call_activity, kv_cache_status,
+    prepare_committed_session_checkpoint_drain,
 };
 pub use llama_native_engine::{
     GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,

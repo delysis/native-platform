@@ -312,11 +312,13 @@ pub(crate) fn export_sequence_bounded(
     export_sequence_cells_internal(
         context,
         fingerprint,
-        sequence_id,
-        sequence_id,
-        token_count,
-        token_ids,
-        Vec::new(),
+        SequenceExportMetadata {
+            source_sequence_id: sequence_id,
+            export_sequence_id: sequence_id,
+            token_count,
+            token_ids,
+            cells: Vec::new(),
+        },
         max_bytes,
     )
 }
@@ -347,25 +349,38 @@ pub(crate) fn export_sequence_cells_bounded(
     export_sequence_cells_internal(
         context,
         fingerprint,
-        source_sequence_id,
-        export_sequence_id,
-        token_count,
-        token_ids,
-        cells,
+        SequenceExportMetadata {
+            source_sequence_id,
+            export_sequence_id,
+            token_count,
+            token_ids,
+            cells,
+        },
         max_bytes,
     )
 }
 
-fn export_sequence_cells_internal(
-    context: &LlamaContext<'_>,
-    fingerprint: &ModelFingerprint,
+struct SequenceExportMetadata {
     source_sequence_id: i32,
     export_sequence_id: i32,
     token_count: usize,
     token_ids: Vec<i32>,
     cells: Vec<SequenceStateCell>,
+}
+
+fn export_sequence_cells_internal(
+    context: &LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    metadata: SequenceExportMetadata,
     max_bytes: usize,
 ) -> Result<Option<SequenceStateBlob>, NativeError> {
+    let SequenceExportMetadata {
+        source_sequence_id,
+        export_sequence_id,
+        token_count,
+        token_ids,
+        cells,
+    } = metadata;
     if source_sequence_id < 0
         || source_sequence_id as u32 >= fingerprint.max_sequences
         || export_sequence_id < 0

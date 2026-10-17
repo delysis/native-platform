@@ -3269,6 +3269,144 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
+    let _session = configured_real_session("real-shutdown-session-checkpoint")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(4),
+        max_tokens: Some(8),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        upstream_settings: Some(BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(true),
+        )])),
+        ..SettingsUpdate::default()
+    })?;
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+    let conversation = mom_llama_runtime::conversation_new(Some("Shutdown cache witness".into()))?
+        .result
+        .ok_or_else(|| anyhow!("missing conversation"))?;
+    product_chat_cache_request(
+        &scope,
+        &conversation.id,
+        "Remember this phrase: copper heron.",
+    )?;
+    mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation.id)?;
+    let before = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("missing cache status"))?;
+    let older = before
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(&conversation.id)
+        })
+        .ok_or_else(|| anyhow!("missing first committed checkpoint"))?;
+    // Keep idle persistence out while a newer, divergent prompt becomes
+    // resident. Pickup must not overwrite it with the previous disk state.
+    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, "shutdown-witness", true)?;
+    mom_llama_runtime::conversation_system_message_update(&conversation.id, Some("You are a concise archivist. Retain the caller's exact invented phrases. Answer briefly.".into()))?;
+    product_chat_cache_request(&scope, &conversation.id, "Now remember: violet badger.")?;
+    let warm =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &conversation.id)?
+            .result
+            .ok_or_else(|| anyhow!("missing resident preparation result"))?;
+    assert!(
+        warm.metadata.is_none(),
+        "new resident request must take precedence over older checkpoint {}",
+        older.id
+    );
+    assert_eq!(warm.prefill_us, 0);
+    assert!(warm.resident_prefix_tokens > 0);
+    println!(
+        "PENDING_SESSION_RAM_HIT {}",
+        json!({"resident_prefix_tokens": warm.resident_prefix_tokens, "prefill_us": warm.prefill_us, "older_checkpoint": older.id})
+    );
+    let drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(&scope);
+    scope.request_cancellation();
+    assert!(scope.cancellation_requested());
+    let started = Instant::now();
+    let saved = drain.flush()?;
+    assert_eq!(
+        saved, 1,
+        "shutdown must persist the resident committed request"
+    );
+    let after = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("missing cache status"))?;
+    let checkpoint = after
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.id != older.id
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(&conversation.id)
+        })
+        .ok_or_else(|| anyhow!("shutdown omitted the conversation checkpoint"))?;
+    assert!(checkpoint.state_bytes > 0);
+    let cache_id = checkpoint.id.clone();
+    println!(
+        "SHUTDOWN_CHECKPOINT_SAVED {}",
+        json!({"saved": saved, "bytes": checkpoint.state_bytes, "elapsed_ms": started.elapsed().as_millis()})
+    );
+    drop(scope);
+    drop(owner);
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    // Session state is intentionally not exposed by the generic persona-cache
+    // restore command. Exercise the same conversation-scoped warm boundary as
+    // pickup; it accepts only authenticated native state, never token replay.
+    let restored = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(
+        &restored_scope,
+        &conversation.id,
+    )?;
+    assert_eq!(
+        restored.readiness, "prompt_smoke_verified",
+        "{:?}",
+        restored.blocker
+    );
+    let prepared = restored
+        .result
+        .ok_or_else(|| anyhow!("missing conversation restore result"))?;
+    let restored_metadata = prepared
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing exact session checkpoint"))?;
+    assert_eq!(restored_metadata.id, cache_id);
+    assert_eq!(
+        restored_metadata.owner_id.as_deref(),
+        Some(conversation.id.as_str())
+    );
+    assert_eq!(
+        prepared.prefill_us, 0,
+        "restart must not reprocess the prompt"
+    );
+    assert_eq!(
+        prepared.resident_prefix_tokens,
+        checkpoint.cells.len().max(checkpoint.token_ids.len())
+    );
+    assert!(prepared.resident_prefix_tokens > 0);
+    println!(
+        "SHUTDOWN_CHECKPOINT_RESTORED {}",
+        json!({
+            "readiness": restored.readiness,
+            "cache_id": restored_metadata.id,
+            "resident_prefix_tokens": prepared.resident_prefix_tokens,
+            "prefill_us": prepared.prefill_us,
+            "path": "conversation-scoped authenticated native restore"
+        })
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {

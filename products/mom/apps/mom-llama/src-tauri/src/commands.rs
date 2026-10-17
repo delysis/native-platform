@@ -121,10 +121,6 @@ fn import_voice_message_with_inference(
     let (imported, derivative_failure) =
         preserve_original_import_on_derivative_failure(imported, |original| {
             if let (Some(attachment), Some(inference)) = (&original.result, inference) {
-                let source_end = inference
-                    .source_start_sample
-                    .checked_add(inference.accepted_sample_count)
-                    .ok_or_else(|| anyhow::anyhow!("model-input source range overflowed"))?;
                 mom_llama_runtime::store_inference_audio_derivative(
                     &attachment.attachment.id,
                     &attachment.attachment.sha256,
@@ -132,10 +128,7 @@ fn import_voice_message_with_inference(
                     mom_llama_runtime::InferenceAudioProvenance {
                         source_sample_count: inference.source_sample_count,
                         accepted_sample_count: inference.accepted_sample_count,
-                        source_ranges: Some(vec![mom_llama_runtime::InferenceAudioSampleRange {
-                            start: inference.source_start_sample,
-                            end_exclusive: source_end,
-                        }]),
+                        source_ranges: Some(inference.source_ranges),
                     },
                 )?;
             }
@@ -1867,7 +1860,7 @@ pub async fn mom_llama_voice_capture_stop(
     capture_state: State<'_, NativeVoiceCapture>,
     window: Window,
     capture: String,
-) -> Result<Response, String> {
+) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_capture_stop"))?;
     let controller = capture_state.inner().clone();
     lease
@@ -1879,10 +1872,20 @@ pub async fn mom_llama_voice_capture_stop(
                     "capture": capture,
                     "heard_voice": output.heard_voice,
                     "wav_bytes": output.wav.len(),
+                    "inference_wav_bytes": output.inference_wav.as_ref().map_or(0, Vec::len),
+                    "inference_accepted_samples": output.inference_accepted_sample_count,
                     "metrics": output.metrics,
                 }),
             );
-            Ok(Response::new(output.wav))
+            Ok(serde_json::json!({
+                "wav": output.wav,
+                "heard_voice": output.heard_voice,
+                "metrics": output.metrics,
+                "inference_wav": output.inference_wav,
+                "inference_source_sample_count": output.inference_source_sample_count,
+                "inference_accepted_sample_count": output.inference_accepted_sample_count,
+                "inference_source_ranges": output.inference_source_ranges,
+            }))
         })
         .await
 }
@@ -1931,6 +1934,10 @@ pub async fn mom_llama_voice_audio_push(
         .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes named source-capture metadata as IPC parameters"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_finish(
     runtime: State<'_, AppRuntimeHandle>,
@@ -1941,6 +1948,7 @@ pub async fn mom_llama_voice_audio_finish(
     source_sample_count: Option<u64>,
     accepted_sample_count: Option<u64>,
     source_start_sample: Option<u64>,
+    source_ranges: Option<Vec<mom_llama_runtime::InferenceAudioSampleRange>>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_audio_finish"))?;
     if !complete_voice_wav(&recording) {
@@ -1952,6 +1960,7 @@ pub async fn mom_llama_voice_audio_finish(
         source_sample_count,
         accepted_sample_count,
         source_start_sample,
+        source_ranges,
     );
     let owner = runtime.inner().clone();
     let voice = owner.take_voice_audio_session(&session)?;
@@ -2389,6 +2398,10 @@ pub async fn mom_llama_voice_audio_speculate(
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes named source-capture metadata as IPC parameters"
+)]
 #[tauri::command]
 pub async fn mom_llama_voice_audio_speculation_confirm(
     runtime: State<'_, AppRuntimeHandle>,
@@ -2399,6 +2412,7 @@ pub async fn mom_llama_voice_audio_speculation_confirm(
     source_sample_count: Option<u64>,
     accepted_sample_count: Option<u64>,
     source_start_sample: Option<u64>,
+    source_ranges: Option<Vec<mom_llama_runtime::InferenceAudioSampleRange>>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_confirm"))?;
     let (inference, inference_unavailable_reason) = validate_voice_inference_recording(
@@ -2407,6 +2421,7 @@ pub async fn mom_llama_voice_audio_speculation_confirm(
         source_sample_count,
         accepted_sample_count,
         source_start_sample,
+        source_ranges,
     );
     if let Some(reason) = inference_unavailable_reason.as_deref() {
         emit_model_input_derivative_unavailable(&window, reason);

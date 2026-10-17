@@ -1,6 +1,7 @@
 use crate::config::{KvCachePolicy, Settings, resolve_settings, upstream_setting_string};
 use crate::native_runtime::{
-    clear_native_prefix_cache, resident_model, resident_model_for_profile_if_loaded,
+    ResidentCheckpointAccess, clear_native_prefix_cache, resident_model,
+    resident_model_for_profile_if_loaded,
 };
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
@@ -19,6 +20,7 @@ use llama_native_types::{
     SequenceStateBlob, SequenceStateCell, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -574,12 +576,44 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ));
         }
     };
+    // A previous hangup may still be encrypting its snapshot. If the worker
+    // owns this conversation's newer committed request, do not replace it with
+    // an older disk checkpoint (or touch the disk cache at all).
+    let pending_request = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
+        .get(&session_owner_id)
+        .cloned();
+    let resident = handle
+        .inspect_resident_conversation(pending_request.as_deref())
+        .map_err(|error| anyhow!(error))?;
+    if let Some(count) = resident.committed_prefix_tokens {
+        return Ok(CommandResult::passed(
+            operation,
+            "prompt_smoke_verified",
+            VoicePersonaPrefixPreparation {
+                metadata: None,
+                resident_prefix_tokens: count,
+                prefill_us: 0,
+                verification_us: 0,
+                persistence_us: 0,
+                promotion_us: 0,
+                persisted: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        ));
+    }
     let fingerprint = cache_fingerprint(&handle)?;
     if let Some(metadata) = restore_latest_session_checkpoint_if_needed(
         &settings,
         &handle,
         &fingerprint,
         &session_owner_id,
+        resident.revision,
     )? {
         return Ok(CommandResult::passed(
             operation,
@@ -1067,6 +1101,7 @@ fn restore_latest_session_checkpoint_if_needed(
     handle: &NativeModelHandle,
     fingerprint: &CacheFingerprint,
     conversation_id: &str,
+    expected_revision: u64,
 ) -> Result<Option<PrefixCacheMetadata>> {
     let store = RuntimeStore::open(&settings.data_dir)?;
     let db = store
@@ -1111,9 +1146,12 @@ fn restore_latest_session_checkpoint_if_needed(
     let Some(value) = touch_persistent_value_for_promotion(&store, &current, now_ms())? else {
         return Ok(None);
     };
-    let kind = handle
-        .restore_sequence(value.sequence.clone(), 0)
-        .map_err(|error| anyhow!(error))?;
+    let Some(kind) = handle
+        .restore_sequence_if_revision(value.sequence.clone(), 0, expected_revision)
+        .map_err(|error| anyhow!(error))?
+    else {
+        return Ok(None);
+    };
     if kind != llama_native_types::SequenceRestoreKind::NativeState {
         anyhow::bail!("session checkpoint did not restore authenticated native KV state");
     }
@@ -1171,7 +1209,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(&handle)?;
+    let fingerprint = cache_fingerprint(handle)?;
     let tokenized = handle
         .tokenize_messages_with_template(messages.to_vec(), template.clone())
         .map_err(|error| anyhow!(error))?;
@@ -1274,7 +1312,7 @@ pub(crate) fn compatible_memory_prefix_for_owner_with_settings(
     if messages.is_empty() || !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(&handle)?;
+    let fingerprint = cache_fingerprint(handle)?;
     let tokenized = handle
         .tokenize_messages_with_template(messages.to_vec(), template)
         .map_err(|error| anyhow!(error))?;
@@ -1461,47 +1499,86 @@ fn pending_session_checkpoint_candidates(
         .collect()
 }
 
-/// Persist every latest committed request the resident worker still owns.
-/// Call from graceful shutdown after operation cancellation/drain and before
-/// native model teardown. Ineligible or over-budget entries remain registered
-/// only for this process and are safely skipped.
-pub fn flush_committed_session_checkpoints(scope: &crate::OperationScope) -> Result<usize> {
-    // Graceful shutdown reaches this only after application work and model
-    // supervisors drain. Clearing the lifecycle markers here lets the final
-    // exact-committed snapshots proceed before native teardown.
-    scope
-        .clear_voice_call_activity()
-        .map_err(|error| anyhow!("Unable to clear voice call activity at shutdown: {error:#}"))?;
-    let requests = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
-        .iter()
-        .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
-        .collect::<Vec<_>>();
-    let mut persisted = 0;
-    let mut first_error = None;
-    for (conversation_id, request_id) in requests {
-        match checkpoint_committed_session_request(scope, &conversation_id, Some(&request_id)) {
-            Ok(Some(_)) => persisted += 1,
-            Ok(None) => {}
-            Err(error) => {
-                first_error.get_or_insert(error);
+/// Restricted checkpoint access captured before scope cancellation. It never
+/// reopens generation admission and is consumed after application work drains.
+pub struct CommittedSessionCheckpointDrain {
+    scope: crate::OperationScope,
+    access: Option<ResidentCheckpointAccess>,
+}
+
+pub fn prepare_committed_session_checkpoint_drain(
+    scope: &crate::OperationScope,
+) -> CommittedSessionCheckpointDrain {
+    CommittedSessionCheckpointDrain {
+        scope: scope.clone(),
+        access: ResidentCheckpointAccess::capture(scope),
+    }
+}
+
+impl CommittedSessionCheckpointDrain {
+    /// Call after cancellation and application work drain, before native teardown.
+    pub fn flush(self) -> Result<usize> {
+        anyhow::ensure!(
+            self.scope.cancellation_requested(),
+            "checkpoint drain requires a cancelled scope"
+        );
+        let scope = &self.scope;
+        scope.clear_voice_call_activity().map_err(|error| {
+            anyhow!("Unable to clear voice call activity at shutdown: {error:#}")
+        })?;
+        if self.access.is_none() {
+            return Ok(0);
+        }
+        let requests = COMMITTED_SESSION_REQUESTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
+            .iter()
+            .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
+            .collect::<Vec<_>>();
+        let mut persisted = 0;
+        let mut first_error = None;
+        for (conversation_id, request_id) in requests {
+            match checkpoint_committed_session_request_with_drain(
+                scope,
+                &conversation_id,
+                Some(&request_id),
+                self.access.as_ref(),
+            ) {
+                Ok(Some(_)) => persisted += 1,
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
+        if let Some(error) = first_error {
+            return Err(anyhow!(
+                "one or more committed session checkpoints failed after {persisted} saves: {error:#}"
+            ));
+        }
+        Ok(persisted)
     }
-    if let Some(error) = first_error {
-        return Err(anyhow!(
-            "one or more committed session checkpoints failed after {persisted} saves: {error:#}"
-        ));
-    }
-    Ok(persisted)
 }
 
 fn checkpoint_committed_session_request(
     scope: &crate::OperationScope,
     conversation_id: &str,
     expected_request_id: Option<&str>,
+) -> Result<Option<String>> {
+    checkpoint_committed_session_request_with_drain(
+        scope,
+        conversation_id,
+        expected_request_id,
+        None,
+    )
+}
+
+fn checkpoint_committed_session_request_with_drain(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    expected_request_id: Option<&str>,
+    drain: Option<&ResidentCheckpointAccess>,
 ) -> Result<Option<String>> {
     if scope.has_active_voice_call() {
         return Ok(None);
@@ -1511,7 +1588,7 @@ fn checkpoint_committed_session_request(
         return Ok(None);
     }
     if scope
-        .current_chat_request_id(conversation_id, true)
+        .current_chat_request_id(conversation_id, drain.is_none())
         .is_some()
     {
         return Ok(None);
@@ -1536,6 +1613,11 @@ fn checkpoint_committed_session_request(
     else {
         return Ok(None);
     };
+    // Fence this snapshot against a newer committed source conversation. The
+    // matching check is repeated inside the SQLite mutation that writes the
+    // checkpoint, so an older snapshot cannot win a race after a newer chat
+    // commit.
+    let conversation_authority = SessionConversationAuthority::from_conversation(conversation)?;
     crate::chat::apply_conversation_model_pair(
         &mut settings,
         conversation.execution_profile.model_path.clone(),
@@ -1545,30 +1627,45 @@ fn checkpoint_committed_session_request(
     let Some(model_path) = settings.model_path.clone() else {
         return Ok(None);
     };
-    let Some(handle) = resident_model_for_profile_if_loaded(
-        scope,
-        &settings,
-        &model_path,
-        settings.mmproj_path.as_deref(),
-    )
-    .map_err(|blocked| anyhow!(blocked.blocker.message))?
-    else {
-        return Ok(None);
-    };
-    let Some(state) = scope
-        .with_idle_voice_checkpoint(|| {
-            handle
-                .snapshot_conversation_for_request_if_fits(&request_id, MAX_PERSISTENT_ENTRY_BYTES)
-                .map_err(|error| anyhow!(error))
-        })?
-        .flatten()
-    else {
+    let snapshot = scope.with_idle_voice_checkpoint(|| {
+        if let Some(drain) = drain {
+            return drain.snapshot(
+                &settings,
+                &model_path,
+                settings.mmproj_path.as_deref(),
+                &request_id,
+                MAX_PERSISTENT_ENTRY_BYTES,
+            );
+        }
+        let Some(handle) = resident_model_for_profile_if_loaded(
+            scope,
+            &settings,
+            &model_path,
+            settings.mmproj_path.as_deref(),
+        )
+        .map_err(|blocked| anyhow!(blocked.blocker.message))?
+        else {
+            return Ok(None);
+        };
+        let Some(state) = handle
+            .snapshot_conversation_for_request_if_fits(&request_id, MAX_PERSISTENT_ENTRY_BYTES)
+            .map_err(|error| anyhow!(error))?
+        else {
+            return Ok(None);
+        };
+        let fingerprint = handle
+            .status()
+            .fingerprint
+            .ok_or_else(|| anyhow!("resident model has no native fingerprint"))?;
+        Ok(Some((state, fingerprint)))
+    })?;
+    let Some((state, fingerprint)) = snapshot.flatten() else {
         return Ok(None);
     };
     if (state.token_ids.is_empty() && state.cells.is_empty()) || state.bytes.is_empty() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(&handle)?;
+    let fingerprint = cache_fingerprint_from_native(fingerprint)?;
     let mut metadata = PrefixCacheMetadata::new(
         Uuid::new_v4().to_string(),
         CacheTier::SessionPersistent,
@@ -1587,7 +1684,7 @@ fn checkpoint_committed_session_request(
     if !value.is_valid() {
         return Ok(None);
     }
-    let promoted = persist_value(&settings, &value)?;
+    let promoted = persist_session_checkpoint_value(&settings, &value, &conversation_authority)?;
     if !promoted {
         return Ok(None);
     }
@@ -1754,6 +1851,12 @@ fn cache_fingerprint(handle: &NativeModelHandle) -> Result<CacheFingerprint> {
         .status()
         .fingerprint
         .ok_or_else(|| anyhow!("resident model has no native fingerprint"))?;
+    cache_fingerprint_from_native(fingerprint)
+}
+
+fn cache_fingerprint_from_native(
+    fingerprint: llama_native_types::ModelFingerprint,
+) -> Result<CacheFingerprint> {
     if fingerprint.rope_config_sha256.is_empty() || fingerprint.kv_layout_sha256.is_empty() {
         return Err(anyhow!(
             "resident model lacks the context fingerprints required for safe cache reuse"
@@ -1916,6 +2019,52 @@ fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<bool> 
     persist_value_with_promotion_hook(&store, value, || {})
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionConversationAuthority {
+    conversation_id: String,
+    serialized_sha256: [u8; 32],
+}
+
+impl SessionConversationAuthority {
+    fn from_conversation(conversation: &crate::conversation_store::Conversation) -> Result<Self> {
+        let serialized = serde_json::to_vec(conversation)?;
+        Ok(Self {
+            conversation_id: conversation.id.clone(),
+            serialized_sha256: Sha256::digest(serialized).into(),
+        })
+    }
+
+    fn still_authoritative_in_documents(
+        &self,
+        documents: &DocumentMutations<'_, '_, '_>,
+    ) -> Result<bool> {
+        let Some(db) = documents.get::<crate::conversation_store::ConversationDb>(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(conversation) = db
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == self.conversation_id)
+        else {
+            return Ok(false);
+        };
+        let serialized = serde_json::to_vec(conversation)?;
+        Ok(Sha256::digest(serialized).as_slice() == self.serialized_sha256.as_slice())
+    }
+}
+
+fn persist_session_checkpoint_value(
+    settings: &Settings,
+    value: &PrefixCacheValue,
+    authority: &SessionConversationAuthority,
+) -> Result<bool> {
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    persist_value_with_authority_and_promotion_hook(&store, value, Some(authority), || {})
+}
+
 fn persistent_entry_fits(bytes: usize) -> bool {
     bytes > 0 && bytes <= MAX_PERSISTENT_ENTRY_BYTES
 }
@@ -1925,15 +2074,25 @@ fn persist_value_with_promotion_hook(
     value: &PrefixCacheValue,
     before_promotion: impl FnOnce(),
 ) -> Result<bool> {
+    persist_value_with_authority_and_promotion_hook(store, value, None, before_promotion)
+}
+
+fn persist_value_with_authority_and_promotion_hook(
+    store: &RuntimeStore,
+    value: &PrefixCacheValue,
+    authority: Option<&SessionConversationAuthority>,
+    before_promotion: impl FnOnce(),
+) -> Result<bool> {
     let Some(lease) = MomCachePromotionLease::acquire(store, value.metadata.owner_id.as_deref())?
     else {
         return Ok(false);
     };
-    if !persist_value_to_store(
+    if !persist_value_to_store_with_authority(
         store,
         value,
         DEFAULT_PERSISTENT_CACHE_ENTRIES,
         DEFAULT_PERSISTENT_CACHE_BYTES,
+        authority,
     )? {
         return Ok(false);
     }
@@ -1945,11 +2104,22 @@ fn persist_value_with_promotion_hook(
     Ok(false)
 }
 
+#[cfg(test)]
 fn persist_value_to_store(
     store: &RuntimeStore,
     value: &PrefixCacheValue,
     max_entries: usize,
     max_bytes: usize,
+) -> Result<bool> {
+    persist_value_to_store_with_authority(store, value, max_entries, max_bytes, None)
+}
+
+fn persist_value_to_store_with_authority(
+    store: &RuntimeStore,
+    value: &PrefixCacheValue,
+    max_entries: usize,
+    max_bytes: usize,
+    authority: Option<&SessionConversationAuthority>,
 ) -> Result<bool> {
     let mut persisted = value.clone();
     persisted.bind_reconstruction();
@@ -1973,6 +2143,11 @@ fn persist_value_to_store(
         KV_CACHE_NAMESPACE,
         KvCacheDb::default,
         |db: &mut KvCacheDb, documents| {
+            if let Some(authority) = authority
+                && !authority.still_authoritative_in_documents(documents)?
+            {
+                return Ok(false);
+            }
             if let Some(owner_id) = value.metadata.owner_id.as_deref()
                 && crate::personas::persona_cache_owner_is_removed_from_documents(
                     documents, owner_id,
@@ -2464,7 +2639,6 @@ mod tests {
     use super::*;
     use crate::conversation_store::{Conversation, ConversationDb};
     use llama_native_cache::ValidatedPrefixCacheValue;
-    use sha2::{Digest, Sha256};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -3019,7 +3193,9 @@ mod tests {
 
         assert!(persistent_entry_fits(MAX_PERSISTENT_ENTRY_BYTES));
         assert!(!persistent_entry_fits(MAX_PERSISTENT_ENTRY_BYTES + 1));
-        assert!(DEFAULT_PERSISTENT_CACHE_BYTES >= 8 * MAX_PERSISTENT_ENTRY_BYTES);
+        const {
+            assert!(DEFAULT_PERSISTENT_CACHE_BYTES >= 8 * MAX_PERSISTENT_ENTRY_BYTES);
+        }
         assert!(
             persistent_eviction_ids(
                 &entries,
@@ -3303,6 +3479,119 @@ mod tests {
         assert_eq!(
             store.get_bytes(&blob_namespace("replacement"))?,
             Some(vec![7; 4])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_checkpoint_write_is_fenced_by_atomic_conversation_authority() -> Result<()> {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-cache-session-authority-{}",
+            crate::now_ms()
+        ));
+        let store = RuntimeStore::open_with_key(&data_dir, [41_u8; 32])?;
+        let conversation_id = Uuid::new_v4().to_string();
+        let make_conversation = |title: &str| Conversation {
+            id: conversation_id.clone(),
+            title: title.to_owned(),
+            created_at: "2026-10-17T00:00:00Z".to_owned(),
+            updated_at: title.to_owned(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: crate::conversation_store::ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
+            inference_window: None,
+        };
+        let initial = make_conversation("initial");
+        let mut db = ConversationDb::default();
+        db.conversations.push(initial.clone());
+        store.put(crate::conversation_store::CONVERSATIONS_NAMESPACE, &db)?;
+        let initial_authority = SessionConversationAuthority::from_conversation(&initial)?;
+
+        let make_value = |id: &str, marker: u8| {
+            let mut value = test_cache_value(id, "session-authority-model");
+            value.metadata.tier = CacheTier::SessionPersistent;
+            value.metadata.owner_id = Some(conversation_id.clone());
+            value.metadata.state_bytes = 1;
+            value.sequence.bytes = vec![marker].into();
+            value
+        };
+
+        // A matching source authority may persist normally.
+        let first = make_value("session-a", 1);
+        assert!(persist_value_to_store_with_authority(
+            &store,
+            &first,
+            8,
+            1024,
+            Some(&initial_authority),
+        )?);
+
+        // Simulate a later source commit, then persist its newer checkpoint.
+        // An older writer arriving afterward must neither replace metadata nor
+        // delete the newer blob.
+        let newer = make_conversation("newer committed source");
+        let mut updated_db = db.clone();
+        updated_db.conversations[0] = newer.clone();
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &updated_db,
+        )?;
+        let newer_authority = SessionConversationAuthority::from_conversation(&newer)?;
+        let second = make_value("session-b", 2);
+        assert!(persist_value_to_store_with_authority(
+            &store,
+            &second,
+            8,
+            1024,
+            Some(&newer_authority),
+        )?);
+        assert!(!persist_value_to_store_with_authority(
+            &store,
+            &first,
+            8,
+            1024,
+            Some(&initial_authority),
+        )?);
+        let persisted = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .unwrap_or_default();
+        assert_eq!(
+            persisted.entries.first().map(|entry| entry.id.as_str()),
+            Some("session-b")
+        );
+        assert_eq!(
+            store.get_bytes(&blob_namespace("session-b"))?,
+            Some(vec![2])
+        );
+        assert_eq!(store.get_bytes(&blob_namespace("session-a"))?, None);
+
+        // A deleted source conversation also rejects a delayed checkpoint.
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &ConversationDb::default(),
+        )?;
+        assert!(!persist_value_to_store_with_authority(
+            &store,
+            &second,
+            8,
+            1024,
+            Some(&newer_authority),
+        )?);
+        assert_eq!(
+            store
+                .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                .unwrap_or_default()
+                .entries
+                .first()
+                .map(|entry| entry.id.as_str()),
+            Some("session-b")
         );
         Ok(())
     }

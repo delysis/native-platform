@@ -6665,14 +6665,17 @@
       }
       await recording.targetChain.catch(() => null);
       const stopped = await invoke("mom_llama_voice_capture_stop", { capture: recording.capture });
-      const wavBytes = stopped instanceof ArrayBuffer
-        ? new Uint8Array(stopped)
-        : (ArrayBuffer.isView(stopped) ? new Uint8Array(stopped.buffer, stopped.byteOffset, stopped.byteLength)
-          : Uint8Array.from(stopped || []));
+      const wavBytes = ipcBinaryBytes(stopped?.wav, 16 * 1024 * 1024, "Native voice recording");
+      const modelInputWavBytes = stopped?.inference_wav == null
+        ? null : ipcBinaryBytes(stopped.inference_wav, 16 * 1024 * 1024, "Native model-input recording");
       return {
-        heardVoice: wavBytes.byteLength > 44,
-        metrics: recording.nativeMetrics || {},
+        heardVoice: stopped?.heard_voice === true,
+        metrics: stopped?.metrics || recording.nativeMetrics || {},
         wavBytes,
+        modelInputWavBytes,
+        sourceSampleCount: stopped?.inference_source_sample_count,
+        modelInputSampleCount: stopped?.inference_accepted_sample_count,
+        modelInputSourceRanges: stopped?.inference_source_ranges,
         trace: recording.trace,
       };
     }
@@ -7399,11 +7402,36 @@
   const sealedVoiceInferenceRecording = (capture) => {
     const bytes = capture?.modelInputWavBytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength <= 44) return null;
+    const sourceSampleCount = Number(capture.sourceSampleCount);
+    const acceptedSampleCount = Number(capture.modelInputSampleCount);
+    if (!Number.isSafeInteger(sourceSampleCount) || sourceSampleCount <= 0
+        || !Number.isSafeInteger(acceptedSampleCount) || acceptedSampleCount <= 0) return null;
+    const sourceRanges = Array.isArray(capture.modelInputSourceRanges)
+      ? capture.modelInputSourceRanges.map((range) => ({
+        start: Number(range?.start),
+        end_exclusive: Number(range?.end_exclusive),
+      }))
+      : null;
+    const sourceStartSample = Number(capture.modelInputStartSample);
+    if (sourceRanges) {
+      let previousEnd = 0;
+      let rangeSamples = 0;
+      if (sourceRanges.length === 0) return null;
+      for (const range of sourceRanges) {
+        if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end_exclusive)
+            || range.start < previousEnd || range.start >= range.end_exclusive
+            || range.end_exclusive > sourceSampleCount) return null;
+        rangeSamples += range.end_exclusive - range.start;
+        previousEnd = range.end_exclusive;
+      }
+      if (rangeSamples !== acceptedSampleCount) return null;
+    } else if (!Number.isSafeInteger(sourceStartSample) || sourceStartSample < 0
+        || sourceStartSample + acceptedSampleCount > sourceSampleCount) return null;
     return {
       recording: Array.from(bytes),
-      sourceSampleCount: capture.sourceSampleCount,
-      acceptedSampleCount: capture.modelInputSampleCount,
-      sourceStartSample: capture.modelInputStartSample,
+      sourceSampleCount,
+      acceptedSampleCount,
+      ...(sourceRanges ? { sourceRanges } : { sourceStartSample }),
     };
   };
 
@@ -7416,7 +7444,9 @@
         ...(modelInput ? { modelInputRecording: modelInput.recording,
           sourceSampleCount: modelInput.sourceSampleCount,
           acceptedSampleCount: modelInput.acceptedSampleCount,
-          sourceStartSample: modelInput.sourceStartSample } : {}),
+          ...(modelInput.sourceRanges
+            ? { sourceRanges: modelInput.sourceRanges }
+            : { sourceStartSample: modelInput.sourceStartSample }) } : {}),
       });
     })
     .catch(async (error) => {
@@ -9568,7 +9598,9 @@
                   modelInputRecording: liveVoice.modelInput.recording,
                   sourceSampleCount: liveVoice.modelInput.sourceSampleCount,
                   acceptedSampleCount: liveVoice.modelInput.acceptedSampleCount,
-                  sourceStartSample: liveVoice.modelInput.sourceStartSample,
+                  ...(liveVoice.modelInput.sourceRanges
+                    ? { sourceRanges: liveVoice.modelInput.sourceRanges }
+                    : { sourceStartSample: liveVoice.modelInput.sourceStartSample }),
                 } : {}),
               });
               result = finished?.result ? {
