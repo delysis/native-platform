@@ -267,6 +267,11 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.ok(voiceCapture.includes("pendingVoiceAudioSession"));
   assert.ok(voiceCapture.includes('invoke("mom_llama_voice_message_import"'), "attachment import remains only as the explicit failed-prefill fallback");
   assert.match(
+    bridge,
+    /tts\.trackGeneration\(invoke\("mom_llama_chat_send"/,
+    "the call greeting must register its exact native generation promise",
+  );
+  assert.match(
     voiceCapture,
     /if \(live\?\.session && !expectedRecording\.prefillFailed\)[\s\S]*pendingVoiceAudioSession = \{[\s\S]*bytes: Array\.from\(wav\)/,
     "the normal path must hand persistence bytes to the exact incremental session",
@@ -277,7 +282,16 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     submitStart,
     bridge.indexOf('  document.addEventListener("input"', submitStart),
   );
-  assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
+  assert.match(
+    submitHandler,
+    /const operation = invoke\("mom_llama_chat_dispatch"[\s\S]*?result = await \(voiceTtsOwner\s*\? voiceTtsOwner\.trackGeneration\(operation\) : operation\)/,
+    "fallback voice dispatch must register the native operation with the active TTS owner",
+  );
+  assert.match(
+    submitHandler,
+    /const finished = await \(voiceTtsOwner\s*\? voiceTtsOwner\.trackGeneration\(operation\) : operation\)/,
+    "incremental audio completion must register its exact native generation promise",
+  );
   assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
   assert.match(submitHandler, /finishVoiceReplyAndIndexTurn\([\s\S]*callReplyConversation === conversation[\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
   const voiceTranscript = bridge.slice(
@@ -290,10 +304,11 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.ok(!voiceTranscript.includes("waitForVoiceTranscript"), "new microphone turns cannot wait for transcription");
   assert.ok(!voiceTranscript.includes("await previous"), "one failed transcript cannot strand later backfills");
   const speculate = bridge.slice(
-    bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
-    bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
+    bridge.indexOf('const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate"'),
+    bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate"')),
   );
   assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*indexVoiceTurn\(live\.conversation, response\.result, null,[\s\S]*speculation\.captureReady, recording\.trace\)[\s\S]*tts\.finish/);
+  assert.match(speculate, /tts\.trackGeneration\(invoke\("mom_llama_voice_audio_speculate"/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(

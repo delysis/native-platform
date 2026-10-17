@@ -1094,13 +1094,17 @@ test("live voice synthesis has an idle-progress deadline after first PCM", () =>
   assert.match(live, /invoke\("mom_llama_speech_stop", \{ operation \}\)/);
 });
 
-const liveTtsTailHarness = () => {
+const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   const invocations = [];
   const delivered = [];
   const timers = new Map();
   let operationNumber = 0;
   let now = 0;
   let timerNumber = 0;
+  let playbackCallbacks = null;
+  let activeLeaf = "previous-leaf";
+  const prefills = [];
+  const capture = { retainedSamples: [1, 2, 3] };
   class AdaptiveVoiceLeadController {
     shouldDispatch() { return true; }
     shouldBufferCompleteReply() { return false; }
@@ -1146,13 +1150,16 @@ const liveTtsTailHarness = () => {
     markVoiceLatencyIn(trace, stage, detail) { trace.stages.push({ stage, ...detail }); },
     decodePcmFrame: (frame) => frame,
     pcmChannel: (onmessage) => ({ onmessage }),
-    createPcmPlaybackBuffer: () => controller,
+    createPcmPlaybackBuffer: (callbacks) => {
+      playbackCallbacks = callbacks;
+      return controller;
+    },
     speechOperationToken: () => `tts-op-${++operationNumber}`,
     rememberVoiceStreamRequest() {},
     voiceStreamRequestIds: new Set(),
     voiceReplyPlayback: new WeakMap(),
-    voiceCallActive: false,
-    voiceCallEpoch: 0,
+    voiceCallActive: callActive,
+    voiceCallEpoch: callEpoch,
     activeCallPlayback: null,
     liveVoiceTts: null,
     voiceReplyPlayRequested: false,
@@ -1162,6 +1169,11 @@ const liveTtsTailHarness = () => {
     activeCallTranscriptTask: null,
     voiceCallTranscriptSlotsDisabled: false,
     voiceRecording: null,
+    beginVoiceCapture: async () => { context.voiceRecording = capture; },
+    startVoicePrefill: async (conversation) => {
+      prefills.push({ conversation, activeLeaf });
+      return { session: `prefill-${prefills.length}`, leaf: activeLeaf };
+    },
     errorMessage: (error) => String(error),
     reportError() {},
     invoke(command, args) {
@@ -1201,7 +1213,17 @@ const liveTtsTailHarness = () => {
     timers.delete(entry[0]);
     entry[1]();
   };
-  return { context, invocations, delivered, synthesis, pcm, fireLatestTimer };
+  const startPlayback = async (playback) => {
+    controller.playing = true;
+    playbackCallbacks?.onPlaybackStarted?.({});
+    await new Promise((resolve) => setImmediate(resolve));
+    return playback;
+  };
+  return {
+    context, invocations, delivered, synthesis, pcm, fireLatestTimer,
+    startPlayback, prefills, capture,
+    setActiveLeaf(value) { activeLeaf = value; },
+  };
 };
 
 test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
@@ -1260,6 +1282,93 @@ test("stopping live TTS releases promptly while it waits for channel EOF", async
   assert.equal(stopSettled, true, "stop must not await the missing PCM EOF");
   assert.equal(h.synthesis().length, 1, "stop must not dispatch queued text before old channel EOF");
   assert.equal(await completed, false, "stop settles without waiting for channel EOF");
+});
+
+test("interrupted call keeps capture live but waits for native commit before next prefill", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  const native = speechDeferred();
+  const committedGeneration = native.promise.then((result) => {
+    h.setActiveLeaf(result.committedLeaf);
+    return result;
+  });
+  assert.equal(playback.trackGeneration(committedGeneration), committedGeneration,
+    "tracking must return the exact native operation to its existing caller");
+  await h.startPlayback(playback);
+  assert.equal(h.context.voiceRecording, h.capture,
+    "playback hands off to a capture that retains the caller's samples");
+
+  const stopping = playback.interruptForSpeech();
+  const stoppedBeforeCommit = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeCommit) native.resolve({ committedLeaf: "assistant-committed" });
+  assert.equal(stoppedBeforeCommit, true,
+    "stopping audible speech must not wait for Gemma's history commit");
+  assert.equal(h.context.voiceRecording, h.capture,
+    "interrupting playback must preserve the active microphone capture");
+  assert.deepEqual(h.prefills, [],
+    "next-turn prompt preparation must wait while the previous native request is pending");
+
+  native.resolve({ committedLeaf: "assistant-committed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.prefills, [{ conversation: "fixture-conversation", activeLeaf: "assistant-committed" }],
+    "the next prefill must observe the leaf after the native operation settles");
+});
+
+test("a rejected native generation still releases next-turn prefill safely", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 3 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 3,
+  });
+  const native = speechDeferred();
+  const tracked = playback.trackGeneration(native.promise);
+  tracked.catch(() => {});
+  await h.startPlayback(playback);
+  const stopping = playback.stop();
+  const stoppedBeforeSettlement = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeSettlement) native.reject(new Error("native request failed"));
+  assert.equal(stoppedBeforeSettlement, true,
+    "playback stop must remain prompt while native generation is pending");
+  assert.deepEqual(h.prefills, []);
+
+  native.reject(new Error("native request failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.prefills.length, 1,
+    "a failed native request has settled and must not strand the next capture");
+  assert.equal(h.prefills[0].activeLeaf, "previous-leaf");
+});
+
+test("hangup while waiting for native settlement suppresses next-turn prefill", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 11 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 11,
+  });
+  const native = speechDeferred();
+  playback.trackGeneration(native.promise);
+  await h.startPlayback(playback);
+  const stopping = playback.stop();
+  const stoppedBeforeSettlement = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeSettlement) native.resolve({});
+  assert.equal(stoppedBeforeSettlement, true,
+    "playback teardown must not wait for the native request");
+  assert.deepEqual(h.prefills, []);
+
+  h.context.voiceCallActive = false;
+  h.context.voiceCallEpoch += 1;
+  native.resolve({ committedLeaf: "late-commit" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.prefills, [],
+    "the delayed settlement must recheck call ownership before opening a prefill");
 });
 
 test("live TTS also waits for native success when channel EOF arrives first", async () => {

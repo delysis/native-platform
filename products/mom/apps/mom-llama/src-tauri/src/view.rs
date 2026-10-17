@@ -4562,7 +4562,7 @@ mod tests {
             .find(r#"if (textarea) textarea.value = "";"#)
             .expect("composer must clear optimistically when a send is accepted");
         let dispatch = js
-            .find(r#"result = await invoke("mom_llama_chat_dispatch"#)
+            .find(r#"invoke("mom_llama_chat_dispatch"#)
             .expect("composer must dispatch through the canonical Rust command");
         assert!(
             composer_clear < dispatch,
