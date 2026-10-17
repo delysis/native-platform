@@ -3445,6 +3445,7 @@ fn load_verified_object_with_digest(
     verify_content_with_digest(&object.sha256, object.byte_len, bytes)
 }
 
+#[cfg(test)]
 fn verify_content(expected_sha256: &str, expected_bytes: u64, bytes: Vec<u8>) -> Result<Vec<u8>> {
     verify_content_with_digest(expected_sha256, expected_bytes, bytes).map(|(bytes, _)| bytes)
 }

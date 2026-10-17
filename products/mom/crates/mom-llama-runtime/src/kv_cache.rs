@@ -2675,14 +2675,6 @@ fn blob_chunk_namespace(id: &str, index: usize) -> String {
     }
 }
 
-fn write_cache_bytes(
-    documents: &mut DocumentMutations<'_, '_, '_>,
-    id: &str,
-    bytes: &[u8],
-) -> Result<()> {
-    write_cache_bytes_with_admission(documents, id, bytes, &|| true)
-}
-
 fn write_cache_bytes_with_admission(
     documents: &mut DocumentMutations<'_, '_, '_>,
     id: &str,
@@ -2716,6 +2708,7 @@ fn delete_cache_bytes(
     }
 }
 
+#[cfg(test)]
 fn read_cache_bytes(
     store: &RuntimeStore,
     metadata: &PrefixCacheMetadata,
@@ -2765,13 +2758,10 @@ mod tests {
         schema: String,
         fixture_key_hex: String,
         native_prefix_namespace: String,
-        session_metadata_namespace: String,
-        session_blob_namespace: String,
         authoritative_namespace: String,
         authoritative_conversation: Conversation,
         tampered_ciphertext_hex: String,
         native_prefix_disposition: String,
-        session_blob_disposition: String,
     }
 
     fn test_cache_value(id: &str, model: &str) -> PrefixCacheValue {
@@ -3410,19 +3400,23 @@ mod tests {
             "mom_llama.w1.disposable_cache_corruption_fixture.v1"
         );
         assert_eq!(fixture.fixture_key_hex, "17".repeat(32));
-        assert_eq!(fixture.session_metadata_namespace, KV_CACHE_NAMESPACE);
         assert_eq!(
             fixture.native_prefix_disposition,
             "quarantine_then_cold_miss"
-        );
-        assert_eq!(
-            fixture.session_blob_disposition,
-            "unsupported_legacy_snapshot_preserved"
         );
         assert_eq!(fixture.tampered_ciphertext_hex, "00");
         let data_dir =
             std::env::temp_dir().join(format!("mom-llama-cache-corruption-{}", crate::now_ms()));
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
+        let session_value = authenticated_session_value("preserved-v3-session");
+        assert!(persist_value_to_store(
+            &store,
+            &session_value,
+            4,
+            1024 * 1024
+        )?);
+        let session_metadata = session_value.metadata.clone();
+        let session_state = Arc::clone(&session_value.sequence.bytes);
         let authoritative = ConversationDb {
             selected_conversation_id: Some(fixture.authoritative_conversation.id.clone()),
             conversations: vec![fixture.authoritative_conversation.clone()],
@@ -3451,6 +3445,16 @@ mod tests {
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative.clone())
         );
+        let session_before_reopen =
+            load_persistent_value_or_invalidate_from_store(&store, &session_metadata)?
+                .expect("unrelated native-prefix corruption preserves v3 session cache");
+        assert_eq!(session_before_reopen.metadata, session_metadata);
+        assert_eq!(session_before_reopen.sequence.bytes, session_state);
+        assert!(
+            session_before_reopen
+                .sequence
+                .has_authenticated_storage_proof()
+        );
         drop(connection);
         drop(store);
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
@@ -3467,7 +3471,16 @@ mod tests {
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative.clone())
         );
-
+        let session_after_reopen =
+            load_persistent_value_or_invalidate_from_store(&store, &session_metadata)?
+                .expect("v3 session cache survives reopen with native-prefix corruption");
+        assert_eq!(session_after_reopen.metadata, session_metadata);
+        assert_eq!(session_after_reopen.sequence.bytes, session_state);
+        assert!(
+            session_after_reopen
+                .sequence
+                .has_authenticated_storage_proof()
+        );
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative)

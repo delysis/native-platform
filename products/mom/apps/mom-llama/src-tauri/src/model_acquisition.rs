@@ -1039,7 +1039,10 @@ mod tests {
         server.join().expect("fixture server completed");
         assert_eq!(fs::read(&paths.blob).expect("blob"), BYTES);
         assert_eq!(observed.last(), Some(&FIXTURE.bytes));
-        assert_eq!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
+        assert_eq!(
+            identity,
+            file_identity(&fs::metadata(&paths.blob).expect("blob metadata"))
+        );
     }
 
     #[test]
@@ -1061,23 +1064,59 @@ mod tests {
 
     #[test]
     fn verified_existing_artifact_carries_file_identity_but_presence_probe_does_not() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = cache_paths(root.path(), FIXTURE).unwrap();
-        real_dir(paths.blob.parent().unwrap(), FIXTURE.id).unwrap();
-        real_dir(paths.snapshot.parent().unwrap(), FIXTURE.id).unwrap();
-        fs::write(&paths.blob, BYTES).unwrap();
-        publish(&paths, FIXTURE).unwrap();
-        let acquired = acquire_one(root.path(), FIXTURE, &client().unwrap(), true, |_| {}).unwrap();
-        let identity = acquired.verified_identity.unwrap();
-        assert_eq!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
-        let probe = acquire_one(root.path(), FIXTURE, &client().unwrap(), false, |_| {}).unwrap();
+        let root = tempfile::tempdir().expect("temporary cache");
+        let paths = cache_paths(root.path(), FIXTURE).expect("cache paths");
+        real_dir(paths.blob.parent().expect("blob parent"), FIXTURE.id)
+            .expect("create blob directory");
+        real_dir(
+            paths.snapshot.parent().expect("snapshot parent"),
+            FIXTURE.id,
+        )
+        .expect("create snapshot directory");
+        fs::write(&paths.blob, BYTES).expect("write verified fixture bytes");
+        publish(&paths, FIXTURE).expect("publish fixture");
+        let acquired = acquire_one(
+            root.path(),
+            FIXTURE,
+            &client().expect("HTTP client"),
+            true,
+            |_| {},
+        )
+        .expect("verified acquisition");
+        let identity = acquired
+            .verified_identity
+            .expect("verified acquisition carries file identity");
+        assert_eq!(
+            identity,
+            file_identity(&fs::metadata(&paths.blob).expect("blob metadata"))
+        );
+        let probe = acquire_one(
+            root.path(),
+            FIXTURE,
+            &client().expect("HTTP client"),
+            false,
+            |_| {},
+        )
+        .expect("presence-only probe");
         assert!(
             probe.verified_identity.is_none(),
             "metadata-only discovery cannot mint verification"
         );
-        fs::write(&paths.blob, b"wrong fixture!").unwrap();
-        assert_ne!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
-        assert!(acquire_one(root.path(), FIXTURE, &client().unwrap(), true, |_| {}).is_err());
+        fs::write(&paths.blob, b"wrong fixture!").expect("replace fixture with wrong bytes");
+        assert_ne!(
+            identity,
+            file_identity(&fs::metadata(&paths.blob).expect("replaced blob metadata"))
+        );
+        assert!(
+            acquire_one(
+                root.path(),
+                FIXTURE,
+                &client().expect("HTTP client"),
+                true,
+                |_| {}
+            )
+            .is_err()
+        );
     }
 
     #[test]

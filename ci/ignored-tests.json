@@ -348,7 +348,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "8406d6c324a4a6380fb4293160f2997e1d7aa182e8fb11a542d8a5c6f498fda4"
+      "sha256": "21cc7b19606788b87ff78d7626e9a29f3ca85f1df65fe1af1af783a80066af74"
     },
     {
       "package": "speech-native-platform",

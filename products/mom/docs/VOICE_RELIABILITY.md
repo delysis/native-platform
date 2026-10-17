@@ -69,6 +69,15 @@ published destination), down from five; these are source-derived counts, not
 measured startup speedups. Platforms without strong identities retain full
 verification at the load boundaries.
 
+Native artifact identity remains a build-time operation. The binding at
+`ce39455a799de9e96e3cbd509dd117b3a6a55e9f` also fixes two sources of irrelevant
+cache invalidation: the separately compiled multimodal sources now receive
+the source-path remapping, and `cc`-built archives use stable member names.
+Two actual native builds with distinct Cargo output directories produced
+16 byte-identical archives, including wrapper and multimodal libraries, on
+the same Mac/compiler/features. No artifact digest was normalized or weakened.
+This does not establish cross-compiler or cross-machine reproducibility.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and
