@@ -567,6 +567,10 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   const stages = [];
   const indexed = [];
   const finishedSpeech = [];
+  const ordering = [];
+  let resolveSpeech;
+  let signalFinishStarted;
+  const finishStarted = new Promise((resolve) => { signalFinishStarted = resolve; });
   const persistedDrafts = [];
   const capture = { trace: { mode: "voice_note" } };
   const attachment = { id: "audio-attachment" };
@@ -575,7 +579,12 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   const owner = {
     conversation: "conversation-a",
     trace: capture.trace,
-    finish: async (text) => { finishedSpeech.push(text); return true; },
+    finish: (text) => {
+      finishedSpeech.push(text);
+      ordering.push("finish");
+      signalFinishStarted();
+      return new Promise((resolve) => { resolveSpeech = resolve; });
+    },
     stop: async () => true,
   };
   const context = {
@@ -603,7 +612,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
     report() {}, reportError(error) { throw error; },
     releaseMentionInvocationBusy() {},
     markVoiceLatencyIn: (_trace, stage, detail) => stages.push([stage, detail]),
-    indexVoiceTurn: (...args) => indexed.push(args),
+    indexVoiceTurn: (...args) => { ordering.push("index"); indexed.push(args); },
     owner, attachment, capture,
     invoke: async (command) => {
       if (command === "mom_llama_chat_dispatch") return result;
@@ -611,10 +620,14 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
       throw new Error(`unexpected invocation: ${command}`);
     },
   };
+  const helperStart = source.indexOf("  const finishVoiceReplyAndIndexTurn = async");
+  const helperEnd = source.indexOf("\n  const startPendingCallTranscriptSlot", helperStart);
+  const helper = source.slice(helperStart, helperEnd);
   vm.createContext(context);
   const start = source.indexOf('  document.addEventListener("submit"');
   const end = start + source.slice(start).indexOf('\n  });') + 7;
   vm.runInContext(`
+    ${helper}
     const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
     let activeDispatchConversation = null;
     let voiceReplyConversation = null;
@@ -630,13 +643,19 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   `, context);
   // The production listener is the unit under test; capture it from the mock document.
   assert.equal(typeof submit, "function");
-  await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {}, querySelector: () => null } });
+  const submitted = submit({ preventDefault() {}, target: { id: "chat-form", dataset: {}, querySelector: () => null } });
+  await finishStarted;
+  assert.deepEqual(indexed, [], "voice-note ASR waits while reply TTS is still active");
+  assert.deepEqual(ordering, ["finish"]);
+  resolveSpeech(true);
+  await submitted;
   assert.equal(persistedDrafts.length, 1);
   assert.equal(persistedDrafts[0][0], attachment);
   assert.equal(indexed.length, 1, "the completed direct result must reach post-commit indexing");
   assert.equal(indexed[0][2], attachment);
   assert.equal(indexed[0][3], capture, "the fallback source capture remains in scope after dispatch");
   assert.deepEqual(finishedSpeech, [output.assistant_text], "the retained owner must receive the direct output");
+  assert.deepEqual(ordering, ["finish", "index"], "successful reply playback releases backfill after TTS");
   assert.ok(stages.some(([stage]) => stage === "tts_text_admitted"));
 });
 
@@ -905,7 +924,7 @@ test("voice completion remains owned until durable PCM succeeds or fails", () =>
   const speculateStart = source.indexOf("  const startVoiceSpeculation = async");
   const speculateEnd = source.indexOf("\n  const sendVoiceCapture = async", speculateStart);
   const speculate = source.slice(speculateStart, speculateEnd);
-  assert.match(speculate, /const synthesized = await tts\.finish\(response\.result\.assistant_text \|\| tts\.text\)/);
+  assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*tts\.finish\(response\.result\.assistant_text \|\| tts\.text\)\)/);
   assert.match(speculate, /if \(!synthesized\)[\s\S]*voice_reply_incomplete/);
 
   const greetingStart = source.indexOf("  const startStreamedCallGreeting = async");
@@ -913,6 +932,66 @@ test("voice completion remains owned until durable PCM succeeds or fails", () =>
   const greeting = source.slice(greetingStart, greetingEnd);
   assert.match(greeting, /const synthesized = await tts\.finish\(greeting\)/);
   assert.match(greeting, /if \(!synthesized\)[\s\S]*voice could not be produced/);
+});
+
+test("voice transcript backfill queues during calls but waits for successful note playback", async () => {
+  const helperStart = source.indexOf("  const finishVoiceReplyAndIndexTurn = async");
+  const helperEnd = source.indexOf("\n  const startPendingCallTranscriptSlot", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "production reply/index ordering helper must remain testable");
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.finishReply = finishVoiceReplyAndIndexTurn;`,
+    context,
+  );
+
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    return { promise, resolve };
+  };
+
+  const callEvents = [];
+  const callFinish = deferred();
+  const callTask = context.finishReply(true,
+    () => callEvents.push("index"),
+    () => { callEvents.push("finish"); return callFinish.promise; });
+  assert.deepEqual(callEvents, ["index", "finish"], "call transcript is enqueued before playback completion");
+  callFinish.resolve(false);
+  assert.equal(await callTask, false);
+  assert.deepEqual(callEvents, ["index", "finish"], "a failed call reply still leaves its caller transcript queued");
+
+  const noteEvents = [];
+  const noteFinish = deferred();
+  const noteTask = context.finishReply(false,
+    () => noteEvents.push("index"),
+    () => { noteEvents.push("finish"); return noteFinish.promise; });
+  assert.deepEqual(noteEvents, ["finish"], "voice-note indexing must not compete with active synthesis");
+  noteFinish.resolve(true);
+  assert.equal(await noteTask, true);
+  assert.deepEqual(noteEvents, ["finish", "index"], "successful playback releases voice-note backfill");
+
+  const failedNoteEvents = [];
+  const failedNote = await context.finishReply(false,
+    () => failedNoteEvents.push("index"),
+    async () => { failedNoteEvents.push("finish"); return false; });
+  assert.equal(failedNote, false);
+  assert.deepEqual(failedNoteEvents, ["finish"], "failed or cancelled playback preserves the original recording without starting ASR");
+
+  const cancelledNoteEvents = [];
+  await assert.rejects(context.finishReply(false,
+    () => cancelledNoteEvents.push("index"),
+    async () => { cancelledNoteEvents.push("finish"); throw new Error("cancelled"); }), /cancelled/);
+  assert.deepEqual(cancelledNoteEvents, ["finish"], "a cancelled note reply does not start ASR or replace its source recording");
+
+  const speculativeStart = source.indexOf("  const startVoiceSpeculation = async");
+  const speculativeEnd = source.indexOf("\n  const sendVoiceCapture = async", speculativeStart);
+  const speculative = source.slice(speculativeStart, speculativeEnd);
+  assert.match(speculative, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*tts\.finish/);
+  const submitStart = source.indexOf('  document.addEventListener("submit"');
+  const submitEnd = source.indexOf("\n  });", submitStart);
+  const submit = source.slice(submitStart, submitEnd);
+  assert.match(submit, /finishVoiceReplyAndIndexTurn\([\s\S]*callReplyConversation === conversation[\s\S]*voiceTtsOwner\.finish/);
 });
 
 test("fallback voice replies admit authoritative direct output without a brittle kind tag", () => {

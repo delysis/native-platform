@@ -7,15 +7,14 @@ declaration. Each local gate, candidate build, and device run applies only to
 the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
-The latest completed clean-source gate is `a75f042c` (64 command records,
-including 291 frontend tests and 279 WebKit tests). Candidate 07 used that
-source. It restored the saved conversation and answered a warm call promptly,
-but human testing still reported one-to-three-second speech pauses. It is not
-qualified as a reliable voice release. The current transport and diagnostic
-repairs require a new exact-source gate and packaged run. All earlier failed
-receipts remain preserved; successful component checks do not supersede failed
-packaged acceptance. Do not promote a package unless its manifest binds its
-clean source and tree to the complete passing gate.
+The latest completed clean-source gate is `b60a82e4` (64 command records).
+Candidate 09 was built from that exact tree, with immediate ringing during
+setup. It has not been launched or accepted. Its native cache identity matches
+candidate 08. Candidate 08 (`52c26174`) included the PCM-tail transport repair,
+but human testing still reported interrupted speech. Successful component checks
+do not supersede that packaged failure. All failed receipts remain preserved.
+Do not promote a package unless its manifest binds its clean source and tree to
+the complete passing gate and the required packaged evidence.
 The M4 Max runtime evidence below covers bounded voice-history rollover with
 synthetic input. Under a manual 21,845 MiB memory budget, the initial
 8,192-token setting resolved to 18,944 native context cells in that run. It is
@@ -43,6 +42,48 @@ target-device behavior remain unqualified.
 The actual 32 GB M2 device, physical speaker/microphone loopback, sustained
 packaged call, and 30-minute soak remain unqualified. Synthetic tone/PCM and
 unbundled native runs do not substitute for those checks.
+
+## Candidate 08 follow-up: cache identity and attribution
+
+Saved conversation checkpoints were present. Candidate 07 and 08 had different
+native build IDs while all other fingerprint fields matched, so restoration
+correctly rejected the older checkpoint. The CMake-produced macOS archives
+included member timestamps in the bytes used for build identity. A controlled
+reproduction changed only an object's timestamp: ordinary archives differed;
+`ZERO_AR_DATE=1` archives matched. The binding now supplies that environment to
+CMake. Actual native artifact hashing remains mandatory. The old candidate 07
+archives were not retained, so this proves a reproducibility defect without
+claiming timestamps were its only changed build input.
+
+Live voice lookup is RAM-only, but authenticated cache candidates previously
+rescanned their entire multi-gigabyte payload at each lookup/import. The signing
+authority now remembers successful authentication of the exact immutable Arc
+allocation, with a bounded weak-reference index. Metadata is authenticated again
+on each use; changed bytes, metadata, authority or allocation require full
+verification. Weak references do not retain the payload. Cold disk entries still
+receive full verification before native import.
+
+Candidate 08's delayed voice-note row eventually became a complete replayable
+player. Its admission took 27.674 seconds, including an 18.879-second cache
+lookup; this aggregate can include worker queueing and authentication, and does
+not prove disk access. Its recording included room audio as well as a fixture,
+so it cannot qualify fixture-only streaming overlap. Voice-note backfill now
+waits for speech synthesis to finish before starting Parakeet. Calls continue
+to queue work for the existing preemptible idle slot.
+
+Two playback stops aligned exactly with barge-in events on subsequent capture
+traces. The user could not establish whether they spoke at those moments.
+Do not classify these as echo failures or successful natural playback. New
+barge records link capture trace, interrupted reply trace and request identity;
+reports distinguish natural completion, stopped playback and missing completion.
+Zero underruns never overrides a stopped or missing terminal.
+
+Qualification must verify the running executable AND the intended saved
+conversation ID before each test. An accidentally selected new-persona call
+must remain a separate receipt, not resumption evidence. Snapshot the complete
+trace sequence, since barge-in belongs to the next capture. Preserve unknown
+human-versus-echo attribution. Gate/build source is frozen; exactly one owner
+launches candidates, and no model checks compete with a user's live test.
 
 ## Candidate 07 follow-up: delayed speech and incomplete traces
 

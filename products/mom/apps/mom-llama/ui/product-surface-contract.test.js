@@ -279,7 +279,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   );
   assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
   assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
-  assert.match(submitHandler, /if \(result\?\.status !== "blocked" && result\?\.result\?\.kind === "direct"\) \{[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
+  assert.match(submitHandler, /finishVoiceReplyAndIndexTurn\([\s\S]*callReplyConversation === conversation[\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
   const voiceTranscript = bridge.slice(
     bridge.indexOf("  const indexVoiceTurn ="),
     bridge.indexOf("  const stopVoiceCapture =", bridge.indexOf("  const indexVoiceTurn =")),
@@ -293,7 +293,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
     bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
   );
-  assert.match(speculate, /indexVoiceTurn\(live\.conversation, response\.result, null, speculation\.captureReady,\s*recording\.trace\);\s*const synthesized = await tts\.finish/);
+  assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*indexVoiceTurn\(live\.conversation, response\.result, null,[\s\S]*speculation\.captureReady, recording\.trace\)[\s\S]*tts\.finish/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
@@ -817,7 +817,7 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(!styles.includes("color: var(--accent);"));
   assert.ok(live.includes("finalText.startsWith(streamedText)"));
   assert.ok(bridge.includes("const voiceTtsOwner = voiceDispatch"));
-  assert.ok(bridge.includes("await voiceTtsOwner.finish(output.assistant_text)"));
+  assert.ok(bridge.includes("() => voiceTtsOwner.finish(output.assistant_text)"));
   assert.ok(bridge.includes("pendingVoiceTtsOwner"));
   assert.ok(bridge.includes('markVoiceLatencyIn(trace, "audio_prefill_session_ready", { begin: live?.begin_metrics || null })'));
   assert.ok(live.includes('markTtsLatency("tts_segment_finished"'));
@@ -1023,7 +1023,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
     { stage: "barge_in_detected", elapsed_ms: 1_930 },
     { stage: "barge_in_playback_stopped", elapsed_ms: 1_948 },
     { stage: "playback_underrun", elapsed_ms: 900, occurrences: 2, total_gap_ms: 21.5, max_gap_ms: 14 },
-    { stage: "playback_renderer", elapsed_ms: 950, worklet: true, packets: 8, frames: 24_000,
+    { stage: "playback_renderer", elapsed_ms: 950, reason: "stopped", worklet: true, packets: 8, frames: 24_000,
       schedule_cpu_us: 1_250, schedule_max_us: 310, underruns: 2, worklet_recoveries: 1,
       worklet_rebuffered_frames: 2_400, worklet_max_buffered_frames: 8_000,
       worklet_max_queued_frames: 9_000 },
@@ -1083,6 +1083,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.next_prefill_buffered_runway_ms, 582);
   assert.equal(summary.next_prefill_overlapped_active_tts, false);
   assert.equal(summary.barge_in_playback_stop_ms, 18);
+  assert.equal(summary.playback_renderer_reason, "stopped");
   assert.equal(summary.playback_renderer_worklet, true);
   assert.equal(summary.playback_renderer_packets, 8);
   assert.equal(summary.playback_renderer_frames, 24_000);
@@ -1486,6 +1487,55 @@ test("call barge-in can stop only an actually audible reply", () => {
   assert.ok(bridge.includes("get audible() { return controller.playing; }"));
   assert.ok(interruption.includes("reply.interruptForSpeech()"));
   assert.ok(bridge.includes("if (!synthesized && tts.interruptedForSpeech) return true;"));
+});
+
+test("barge-in records the interrupted reply owner on both reply and capture traces", async () => {
+  const start = bridge.indexOf("  const interruptCallPlaybackForSpeech =");
+  const end = bridge.indexOf("\n  const beginBrowserVoiceCapture =", start);
+  assert.ok(start >= 0 && end > start);
+  let settleStop;
+  let stopCalls = 0;
+  const events = [];
+  const reply = {
+    audible: true,
+    trace: { id: "reply-trace" },
+    requestId: "reply-request",
+    interruptForSpeech() {
+      stopCalls += 1;
+      return new Promise((resolve) => { settleStop = resolve; });
+    },
+  };
+  let now = 10;
+  const context = {
+    activeCallPlayback: reply,
+    performance: { now: () => now++ },
+    errorMessage: (error) => error.message,
+    markVoiceLatencyIn: (trace, stage, detail) => events.push({ traceId: trace?.id, stage, detail }),
+  };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(start, end)}\nthis.interrupt = interruptCallPlaybackForSpeech;`, context);
+  const captureTrace = { id: "capture-trace" };
+  context.interrupt({ call: true, trace: captureTrace }, { producer: "browser_capture", onset_sample: 320 });
+
+  assert.equal(stopCalls, 1);
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.equal(event.stage, "barge_in_detected");
+    assert.equal(event.detail.reply_trace_id, "reply-trace");
+    assert.equal(event.detail.reply_request_id, "reply-request");
+  }
+  assert.deepEqual(events.map((event) => event.traceId).sort(), ["capture-trace", "reply-trace"]);
+  assert.equal(events.find((event) => event.traceId === "capture-trace").detail.onset_sample, 320);
+  assert.equal(events.find((event) => event.traceId === "reply-trace").detail.capture_trace_id, "capture-trace");
+
+  settleStop();
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopped = events.filter((event) => event.stage === "barge_in_playback_stopped");
+  assert.equal(stopped.length, 2);
+  assert.ok(stopped.every((event) => event.detail.reply_trace_id === "reply-trace"
+    && event.detail.reply_request_id === "reply-request"));
+  assert.ok(stopped.every((event) => event.detail.duration_ms >= 0));
+  assert.equal(stopped.find((event) => event.traceId === "reply-trace").detail.capture_trace_id, "capture-trace");
 });
 
 test("call generation cannot stall forever or disappear without a visible terminal error", () => {

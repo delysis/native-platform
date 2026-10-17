@@ -4817,6 +4817,9 @@
       playback_renderer_worklet: typeof playbackRenderer?.worklet === "boolean"
         ? playbackRenderer.worklet
         : null,
+      playback_renderer_reason: typeof playbackRenderer?.reason === "string"
+        ? playbackRenderer.reason
+        : null,
       playback_renderer_packets: Number.isFinite(Number(playbackRenderer?.packets))
         ? Number(playbackRenderer.packets)
         : null,
@@ -6821,6 +6824,13 @@
     return task;
   };
 
+  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish) => {
+    if (callTurn) index();
+    const synthesized = await finish();
+    if (synthesized && !callTurn) index();
+    return synthesized;
+  };
+
   const startPendingCallTranscriptSlot = () => {
     if (!voiceCallActive || activeCallTranscriptTask || !pendingCallTranscriptJobs.length) return null;
     const job = pendingCallTranscriptJobs.shift();
@@ -7169,13 +7179,49 @@
     // the later Gemma result with nowhere to send audio.
     if (!reply?.audible) return;
     const startedAt = performance.now();
-    markVoiceLatencyIn(recording.trace, "barge_in_detected", detail);
+    const replyTrace = reply.trace;
+    const replyTraceId = replyTrace?.id || null;
+    const replyRequestId = reply.requestId || null;
+    const captureTraceId = recording.trace?.id || null;
+    const replyOwnership = {
+      reply_trace_id: replyTraceId,
+      reply_request_id: replyRequestId,
+    };
+    const captureOwnership = {
+      ...replyOwnership,
+      capture_trace_id: captureTraceId,
+    };
+    markVoiceLatencyIn(recording.trace, "barge_in_detected", {
+      ...detail,
+      ...replyOwnership,
+    });
+    if (replyTrace && replyTrace !== recording.trace) {
+      markVoiceLatencyIn(replyTrace, "barge_in_detected", captureOwnership);
+    }
     void reply.interruptForSpeech().then(() => {
-      markVoiceLatencyIn(recording.trace, "barge_in_playback_stopped", {
+      const stopped = {
+        ...replyOwnership,
         duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
-      });
+      };
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stopped", stopped);
+      if (replyTrace && replyTrace !== recording.trace) {
+        markVoiceLatencyIn(replyTrace, "barge_in_playback_stopped", {
+          ...stopped,
+          capture_trace_id: captureTraceId,
+        });
+      }
     }).catch((error) => {
-      markVoiceLatencyIn(recording.trace, "barge_in_playback_stop_failed", { message: errorMessage(error) });
+      const failure = {
+        ...replyOwnership,
+        message: errorMessage(error),
+      };
+      markVoiceLatencyIn(recording.trace, "barge_in_playback_stop_failed", failure);
+      if (replyTrace && replyTrace !== recording.trace) {
+        markVoiceLatencyIn(replyTrace, "barge_in_playback_stop_failed", {
+          ...failure,
+          capture_trace_id: captureTraceId,
+        });
+      }
     });
   };
 
@@ -8097,9 +8143,10 @@
         cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
-      indexVoiceTurn(live.conversation, response.result, null, speculation.captureReady,
-        recording.trace);
-      const synthesized = await tts.finish(response.result.assistant_text || tts.text);
+      const synthesized = await finishVoiceReplyAndIndexTurn(recording.call,
+        () => indexVoiceTurn(live.conversation, response.result, null,
+          speculation.captureReady, recording.trace),
+        () => tts.finish(response.result.assistant_text || tts.text));
       if (!synthesized) {
         throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
       }
@@ -10081,12 +10128,6 @@
             // the attachment fallback can commit valid assistant text while
             // that presentation-only tag is unavailable at this boundary.
             const output = result?.result?.output || null;
-            if (result?.status !== "blocked" && result?.result?.kind === "direct") {
-              // Backfill this exact turn after commit. The next Gemma prompt
-              // may proceed with its recorded audio if Parakeet is still busy.
-              indexVoiceTurn(conversation, output, voiceTranscriptAttachment,
-                (liveVoice || fallbackVoice)?.sourceCapture || null, voiceDispatchTrace);
-            }
             if (result?.status !== "blocked" && output?.assistant_text) {
               markVoiceLatencyIn(voiceDispatchTrace, "tts_text_admitted", {
                 characters: output.assistant_text.length,
@@ -10098,7 +10139,18 @@
               // A successful model result transfers this turn to the speech
               // drain. Keep that exact owner alive until every text segment
               // has either produced PCM or failed explicitly.
-              const synthesized = await voiceTtsOwner.finish(output.assistant_text);
+              const synthesized = await finishVoiceReplyAndIndexTurn(
+                callReplyConversation === conversation,
+                () => {
+                  if (result?.result?.kind === "direct") {
+                    // Keep call transcripts queued before the next capture;
+                    // voice-note backfill waits until durable speech succeeds.
+                    indexVoiceTurn(conversation, output, voiceTranscriptAttachment,
+                      (liveVoice || fallbackVoice)?.sourceCapture || null, voiceDispatchTrace);
+                  }
+                },
+                () => voiceTtsOwner.finish(output.assistant_text),
+              );
               if (!synthesized) {
                 throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
               }

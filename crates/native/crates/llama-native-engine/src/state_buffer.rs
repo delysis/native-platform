@@ -8,7 +8,7 @@ use llama_native_types::{
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 const MAGIC: &[u8; 16] = b"native-seq-v1\0\0\0";
 const HEADER_BYTES: usize = llama_native_types::SEQUENCE_STATE_HEADER_BYTES;
@@ -20,7 +20,17 @@ const SIGNATURE_BYTES: usize = 32;
 /// An application-selected, private on-disk signing key. Only successful native
 /// exports are signed. The signature binds all bytes, token IDs and the complete
 /// model/build/context fingerprint; arbitrary serialized state is still refused.
-pub(crate) struct PersistentAuthority([u8; 32]);
+pub(crate) struct PersistentAuthority {
+    key: [u8; 32],
+    verified: Mutex<VecDeque<VerifiedAllocation>>,
+}
+
+const MAX_VERIFIED_ALLOCATIONS: usize = 64;
+
+struct VerifiedAllocation {
+    bytes: Weak<Vec<u8>>,
+    metadata_mac: [u8; 32],
+}
 impl std::fmt::Debug for PersistentAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PersistentAuthority([redacted])")
@@ -62,14 +72,17 @@ impl PersistentAuthority {
                 .and_then(|_| file.read_exact(&mut key))
                 .map_err(|e| incompatible(&e.to_string()))?;
         }
-        Ok(Arc::new(Self(key)))
+        Ok(Arc::new(Self {
+            key,
+            verified: Mutex::new(VecDeque::new()),
+        }))
     }
 
     fn mac(&self, state: &SequenceStateBlob, bytes: &[u8]) -> hmac::Hmac<Sha256> {
         use hmac::Mac;
         // HMAC accepts every key length; this key has exactly 256 random bits.
         let mut mac =
-            hmac::Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC accepts a 32 byte key");
+            hmac::Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts a 32 byte key");
         mac.update(b"native-state-auth-v1");
         mac.update(&state.sequence_id.to_le_bytes());
         mac.update(&(state.token_count as u64).to_le_bytes());
@@ -114,10 +127,51 @@ impl PersistentAuthority {
         {
             return false;
         }
+        // The bytes are immutable while shared. A Weak keeps the allocation's
+        // identity alive without retaining its multi-gigabyte payload; safe
+        // Arc mutation must detach it. Metadata lives in separately mutable
+        // vectors, so authenticate that small envelope on every lookup.
+        let metadata_mac = self.mac(state, &[]).finalize().into_bytes().into();
+        if self.verified_allocation(state, &metadata_mac) {
+            return true;
+        }
         let split = state.bytes.len() - SIGNATURE_BYTES;
-        self.mac(state, &state.bytes[..split])
+        let valid = self
+            .mac(state, &state.bytes[..split])
             .verify_slice(&state.bytes[split..])
-            .is_ok()
+            .is_ok();
+        if valid {
+            self.remember_verified(state, metadata_mac);
+        }
+        valid
+    }
+
+    fn verified_allocation(&self, state: &SequenceStateBlob, metadata_mac: &[u8; 32]) -> bool {
+        let Ok(mut verified) = self.verified.lock() else {
+            return false;
+        };
+        verified.retain(|entry| entry.bytes.strong_count() > 0);
+        verified.iter().any(|entry| {
+            &entry.metadata_mac == metadata_mac
+                && entry
+                    .bytes
+                    .upgrade()
+                    .is_some_and(|bytes| Arc::ptr_eq(&bytes, &state.bytes))
+        })
+    }
+
+    fn remember_verified(&self, state: &SequenceStateBlob, metadata_mac: [u8; 32]) {
+        let Ok(mut verified) = self.verified.lock() else {
+            return;
+        };
+        verified.retain(|entry| entry.bytes.strong_count() > 0);
+        if verified.len() >= MAX_VERIFIED_ALLOCATIONS {
+            verified.pop_front();
+        }
+        verified.push_back(VerifiedAllocation {
+            bytes: Arc::downgrade(&state.bytes),
+            metadata_mac,
+        });
     }
 }
 
@@ -446,6 +500,8 @@ fn export_sequence_cells_internal(
             Arc::make_mut(&mut state.bytes)[..MAGIC.len()].copy_from_slice(SIGNED_MAGIC);
             let signature = authority.mac(&state, &state.bytes).finalize().into_bytes();
             Arc::make_mut(&mut state.bytes).extend_from_slice(&signature);
+            let metadata_mac = authority.mac(&state, &[]).finalize().into_bytes().into();
+            authority.remember_verified(&state, metadata_mac);
         }
     });
     remember_export(receipt(&state));
@@ -521,17 +577,21 @@ mod tests {
 
     impl TestTempDir {
         fn new() -> Self {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "llama-native-state-buffer-{}-{nonce}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path).expect("create temporary state directory");
-            Self(path)
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "llama-native-state-buffer-{}-{id}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create temporary state directory: {error}"),
+                }
+            }
         }
     }
 
@@ -716,6 +776,70 @@ mod tests {
         let mut malformed = original;
         malformed.cells[0] = SequenceStateCell::Text(99);
         assert!(validate_cell_metadata(&malformed).is_err());
+    }
+
+    #[test]
+    fn verified_allocations_bind_bytes_metadata_and_authority() {
+        use hmac::Mac;
+        let directory = TestTempDir::new();
+        let authority = PersistentAuthority::open(&directory.0).expect("authority");
+        let original = authenticated_mixed_fixture(&authority, &fingerprint());
+        let metadata_mac = authority.mac(&original, &[]).finalize().into_bytes().into();
+        assert!(!authority.verified_allocation(&original, &metadata_mac));
+        assert!(authority.verifies(&original));
+        assert!(authority.verified_allocation(&original.clone(), &metadata_mac));
+
+        let mut changed = original.clone();
+        changed.cells[1] = SequenceStateCell::Media {
+            digest: [0x55; 32],
+            chunk: 2,
+            offset: 640,
+        };
+        assert!(!authority.verifies(&changed));
+        changed = original.clone();
+        changed.token_count += 1;
+        assert!(!authority.verifies(&changed));
+        changed = original.clone();
+        Arc::make_mut(&mut changed.bytes)[HEADER_BYTES] ^= 1;
+        assert!(!authority.verified_allocation(&changed, &metadata_mac));
+        assert!(!authority.verifies(&changed));
+
+        let mut copied = original.clone();
+        copied.bytes = Arc::new(original.bytes.as_ref().clone());
+        assert!(!authority.verified_allocation(&copied, &metadata_mac));
+        assert!(authority.verifies(&copied));
+        let other_directory = TestTempDir::new();
+        let other = PersistentAuthority::open(&other_directory.0).expect("other authority");
+        assert!(!other.verifies(&original));
+    }
+
+    #[test]
+    fn verified_allocations_are_bounded_and_do_not_retain_payloads() {
+        let directory = TestTempDir::new();
+        let authority = PersistentAuthority::open(&directory.0).expect("authority");
+        let mut retained = Vec::new();
+        for _ in 0..MAX_VERIFIED_ALLOCATIONS + 1 {
+            let state = authenticated_fixture(&authority, &fingerprint());
+            assert!(authority.verifies(&state));
+            retained.push(state);
+        }
+        assert_eq!(
+            authority.verified.lock().unwrap().len(),
+            MAX_VERIFIED_ALLOCATIONS
+        );
+        let weak = Arc::downgrade(&retained[1].bytes);
+        retained.clear();
+        assert!(weak.upgrade().is_none());
+        let state = authenticated_fixture(&authority, &fingerprint());
+        assert!(authority.verifies(&state));
+        assert_eq!(authority.verified.lock().unwrap().len(), 1);
+
+        // Even with a sole strong owner, the cached Weak prevents mutation
+        // in place. make_mut must detach before exposing mutable bytes.
+        let mut state = state;
+        assert!(Arc::get_mut(&mut state.bytes).is_none());
+        Arc::make_mut(&mut state.bytes)[HEADER_BYTES] ^= 1;
+        assert!(!authority.verifies(&state));
     }
 
     #[test]

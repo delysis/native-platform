@@ -81,6 +81,23 @@ export function latencyRow(snapshot) {
     "playback_started", "generation_finished", "failed", "durable_voice_audio_failed",
     "native_capture_failed", "generation_timeout",
   ].includes(entry.stage))?.stage ?? stages.at(-1)?.stage ?? null;
+  const renderer = lastStage("playback_renderer");
+  const playbackRendererReason = typeof summary.playback_renderer_reason === "string"
+    ? summary.playback_renderer_reason
+    : typeof renderer?.reason === "string" ? renderer.reason : null;
+  const bargeDetected = stages.find((entry) => entry.stage === "barge_in_detected"
+    && entry.reply_trace_id === trace.id);
+  const explicitBargeIn = Boolean(bargeDetected && stages.some((entry) => (
+    entry.stage === "barge_in_playback_stopped"
+      && entry.reply_trace_id === trace.id
+      && entry.reply_request_id === bargeDetected.reply_request_id
+  )));
+  const playbackCompletion = playbackRendererReason === "ended"
+    ? "natural"
+    : playbackRendererReason === "stopped" ? "stopped" : "unknown";
+  const playbackInterrupted = playbackCompletion === "stopped"
+    ? (explicitBargeIn ? true : null)
+    : playbackCompletion === "natural" ? false : null;
   const pick = (name) => number(summary[name]);
   const silenceStage = lastStage("silence_onset");
   const persistedSilenceDecisionMs = pick("silence_decision_delay_ms");
@@ -155,6 +172,11 @@ export function latencyRow(snapshot) {
     checkpoint: snapshot.checkpoint,
     stage_count: stages.length,
     terminal_stage: terminal,
+    playback_renderer_reason: playbackRendererReason,
+    playback_completion: playbackCompletion,
+    playback_interrupted: playbackInterrupted,
+    playback_stop_cause: playbackInterrupted === true ? "barge_in"
+      : playbackCompletion === "stopped" ? "unknown" : null,
     prefill_failure_stage: prefillFailure?.stage ?? null,
     prefill_failure_message: prefillFailure?.message ?? null,
     prefill_wait_expired_ms: number(prefillWaitExpired?.silence_ms),
@@ -405,6 +427,8 @@ export function latencyDiagnosis(row) {
     findings.push("continuous_prefill_backlog");
   }
   if ((row.playback_underruns ?? 0) > 0) findings.push("playback_underrun");
+  if (row.playback_completion === "stopped") findings.push("playback_stopped");
+  if (row.playback_interrupted === true) findings.push("playback_interrupted");
   if (row.tts_aggregate_rtf !== null && row.tts_aggregate_rtf >= 1) {
     findings.push("tts_slower_than_realtime");
   }
@@ -511,9 +535,22 @@ export function latencyAggregate(rows) {
   const findings = {};
   for (const row of rows) {
     const mode = row.mode ?? "unknown";
-    const entry = modes[mode] ??= { traces: 0, playback_started: 0, subsecond: 0 };
+    const entry = modes[mode] ??= {
+      traces: 0,
+      playback_started: 0,
+      playback_natural_completion: 0,
+      playback_stopped: 0,
+      playback_completion_unknown: 0,
+      playback_interrupted: 0,
+      subsecond: 0,
+    };
     entry.traces += 1;
     entry.playback_started += Number(row.terminal_stage === "playback_started");
+    const completion = row.playback_completion ?? "unknown";
+    entry.playback_natural_completion += Number(completion === "natural");
+    entry.playback_stopped += Number(completion === "stopped");
+    entry.playback_completion_unknown += Number(completion === "unknown");
+    entry.playback_interrupted += Number(row.playback_interrupted === true);
     entry.subsecond += Number(row.subsecond === true);
     for (const finding of row.findings ?? []) findings[finding] = (findings[finding] ?? 0) + 1;
   }

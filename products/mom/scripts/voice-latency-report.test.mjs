@@ -440,20 +440,31 @@ test("identifies cold greeting prefill without calling it model loading", () => 
 test("aggregates the latency scoreboard without treating missing metrics as zero", () => {
   assert.equal(percentile([100, 200, 300, 400], 0.5), 250);
   const aggregate = latencyAggregate([
-    { mode: "call", terminal_stage: "playback_started", subsecond: true,
+    { mode: "call", terminal_stage: "playback_started", playback_completion: "natural",
+      playback_interrupted: false, subsecond: true,
       call_request_to_playback_ms: 1_240, runtime_warm_audio_projector_ms: 40,
       silence_to_first_token_native_ms: 180, silence_to_playback_ms: 620,
       playback_underruns: 0, findings: [] },
-    { mode: "call", terminal_stage: "failed", subsecond: null,
+    { mode: "call", terminal_stage: "failed", playback_completion: "stopped",
+      playback_interrupted: true, subsecond: null,
       call_request_to_playback_ms: null, runtime_warm_audio_projector_ms: 55,
       silence_to_first_token_native_ms: 320, silence_to_playback_ms: null,
       playback_underruns: 2, findings: ["playback_underrun"] },
-    { mode: "voice_note", terminal_stage: "playback_started", subsecond: false,
+    { mode: "voice_note", terminal_stage: "playback_started", playback_completion: "unknown",
+      playback_interrupted: null, subsecond: false,
       silence_to_first_token_native_ms: null, silence_to_playback_ms: 1_240,
       playback_underruns: null, findings: ["conversation_target_missed"] },
   ]);
   assert.equal(aggregate.traces, 3);
-  assert.deepEqual(aggregate.modes.call, { traces: 2, playback_started: 1, subsecond: 1 });
+  assert.deepEqual(aggregate.modes.call, {
+    traces: 2,
+    playback_started: 1,
+    playback_natural_completion: 1,
+    playback_stopped: 1,
+    playback_completion_unknown: 0,
+    playback_interrupted: 1,
+    subsecond: 1,
+  });
   assert.equal(aggregate.metrics.silence_to_first_token_native_ms.samples, 2);
   assert.equal(aggregate.metrics.call_request_to_playback_ms.samples, 1);
   assert.equal(aggregate.metrics.runtime_warm_audio_projector_ms.samples, 2);
@@ -481,4 +492,37 @@ test("compacted diagnostics remain visibly incomplete in latency reports", () =>
     id: "flagged", stages: [], summary: { incomplete: true },
   } });
   assert.equal(flagged.trace_incomplete, true);
+});
+
+test("renderer stop is non-natural completion and only explicit barge evidence assigns its cause", () => {
+  const stopped = latencyRow({ checkpoint: 3, trace: {
+    id: "reply-stopped", mode: "call", stages: [
+      { stage: "playback_started", elapsed_ms: 100 },
+      { stage: "playback_renderer", elapsed_ms: 900, reason: "stopped", underruns: 0 },
+      { stage: "barge_in_detected", elapsed_ms: 850,
+        reply_trace_id: "reply-stopped", reply_request_id: "request-7", capture_trace_id: "next-turn" },
+      { stage: "barge_in_playback_stopped", elapsed_ms: 905,
+        reply_trace_id: "reply-stopped", reply_request_id: "request-7", capture_trace_id: "next-turn" },
+    ],
+    summary: { playback_underrun_occurrences: 0 },
+  } });
+  assert.equal(stopped.playback_renderer_reason, "stopped");
+  assert.equal(stopped.playback_completion, "stopped");
+  assert.equal(stopped.playback_interrupted, true);
+  assert.equal(stopped.playback_stop_cause, "barge_in");
+  assert.deepEqual(latencyDiagnosis(stopped).findings, ["playback_stopped", "playback_interrupted"]);
+
+  const unexplainedStop = latencyRow({ checkpoint: 1, trace: {
+    id: "reply-unknown-stop", stages: [
+      { stage: "playback_renderer", elapsed_ms: 80, reason: "stopped", underruns: 0 },
+    ], summary: { playback_underrun_occurrences: 0 },
+  } });
+  assert.equal(unexplainedStop.playback_interrupted, null);
+  assert.equal(unexplainedStop.playback_stop_cause, "unknown");
+
+  const ended = latencyRow({ checkpoint: 1, trace: {
+    id: "reply-ended", stages: [{ stage: "playback_renderer", elapsed_ms: 250, reason: "ended" }],
+  } });
+  assert.equal(ended.playback_completion, "natural");
+  assert.equal(ended.playback_interrupted, false);
 });
