@@ -495,15 +495,41 @@ test("call startup waits for idle speech cancellation to reach its terminal befo
   const callStart = bridge.indexOf("  const openVoiceCallSurface = async");
   const callEnd = bridge.indexOf("\n  const closeVoiceCallSurface = async", callStart);
   const call = bridge.slice(callStart, callEnd);
-  const preempt = call.indexOf('await stopSpeechOperationAndWait(voiceHistoryRecoveryOperation, "call_start")');
+  const preempt = call.indexOf('suspendVoiceHistoryRecoveryForForeground("call_start")');
   const warm = call.indexOf('runtimeWarmPromise.then');
   const microphone = call.indexOf('prepareCallMicrophoneStream()');
+  const visiblePreparing = call.indexOf('modal.dataset.callState = "preparing"');
+  const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
+  const cancellationGuard = call.indexOf('if (voiceCallEpoch !== epoch || !voiceCallActive) return;', preempt);
 
-  assert.ok(preempt >= 0, "call pickup must request exact speech terminal acknowledgment");
-  assert.ok(call.includes("await voiceHistoryRecovery?.catch(() => {})"));
+  assert.ok(preempt >= 0, "call pickup must suspend and settle idle voice recovery");
+  assert.ok(bridge.includes('await stopSpeechOperationAndWait(operation, reason, {'));
+  assert.ok(bridge.includes('allowColdTranscriptionSettlement: coldInitialization'));
   assert.ok(preempt < warm && preempt < microphone,
     "Gemma warmup and microphone setup must wait until the idle Parakeet operation settles");
-  assert.ok(bridge.includes('invoke("mom_llama_speech_stop_and_wait", { operation })'));
+  assert.ok(visiblePreparing >= 0 && visibleModal >= 0 && visiblePreparing < visibleModal && visibleModal < preempt,
+    "the cancellable call surface must show its preparing state before a cold ASR wait");
+  assert.ok(cancellationGuard > preempt && cancellationGuard < warm,
+    "closing the visible preparation surface must prevent later call warmup");
+  assert.ok(call.includes('modal.setAttribute("aria-label", "Preparing call")'));
+  assert.ok(call.includes('modal.querySelector(\'[data-action="voice-call-close"]\')?.focus()'));
+  assert.ok(styles.includes('.voice-call-backdrop[data-call-state="preparing"] .voice-call-pulse'));
+  assert.match(
+    bridge,
+    /invoke\("mom_llama_speech_stop_and_wait", \{\s*operation,\s*allowColdTranscriptionSettlement,/,
+  );
+});
+
+test("foreground chat sends suspend idle audio recovery before draft or model admission", () => {
+  const submitStart = bridge.indexOf('document.addEventListener("submit", async (event) => {');
+  const sendStart = bridge.indexOf('if (form.id === "chat-form")', submitStart);
+  const sendEnd = bridge.indexOf('if (form.id === "conversation-rename-form")', sendStart);
+  const send = bridge.slice(sendStart, sendEnd);
+  const suspend = send.indexOf('await suspendVoiceHistoryRecoveryForForeground("chat_send")');
+  const firstAwait = send.indexOf('await updateRecipients');
+  const dispatch = send.indexOf('invoke("mom_llama_chat_dispatch"');
+  assert.ok(suspend >= 0 && suspend < firstAwait && suspend < dispatch);
+  assert.ok(send.includes("releaseHistoryRecovery?.();"));
 });
 
 test("call capture remains live during playback through the shared echo-cancelled route", () => {
@@ -588,8 +614,8 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(open.includes("await prepareCallMicrophoneStream()"));
   assert.ok(
     open.indexOf("await prepareCallMicrophoneStream()")
-      < open.indexOf('setModalVisibility("voice-call-modal", true)'),
-    "microphone permission and device readiness must precede the call modal",
+      < open.indexOf("await startCallRinging(epoch)"),
+    "microphone permission and device readiness must precede ringing",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
   assert.ok(open.includes("const warm = await warmReady;"));

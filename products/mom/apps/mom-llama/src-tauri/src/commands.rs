@@ -2602,11 +2602,12 @@ pub fn mom_llama_speech_stop(
 pub async fn mom_llama_speech_stop_and_wait(
     runtime: State<'_, AppRuntimeHandle>,
     operation: String,
+    allow_cold_transcription_settlement: bool,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_speech_stop_and_wait"))?;
     let result = runtime
         .speech()
-        .stop_and_wait(&operation)
+        .stop_and_wait(&operation, allow_cold_transcription_settlement)
         .await
         .map_err(anyhow::Error::msg)
         .map_err(to_error)?;

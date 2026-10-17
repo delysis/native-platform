@@ -5,6 +5,9 @@ const {
   AdaptiveVoiceLeadController,
   SemanticLeadController,
   shouldRunCallTranscriptSlot,
+  shouldDisableCallTranscriptSlotsAfterStop,
+  canContinueVoiceHistoryRecovery,
+  shouldWaitForVoiceHistoryRecovery,
   replayDeferredPcm,
   createCallTranscriptIntent,
   enqueueCallTranscriptIntent,
@@ -52,6 +55,32 @@ test("call transcript work runs only in a resident-model, playback-safe unattach
   ]) {
     assert.equal(shouldRunCallTranscriptSlot({ ...ready, ...changed }), false);
   }
+});
+
+test("cold Parakeet skips only the current slot; slow acknowledged stop disables later slots", () => {
+  const ready = {
+    generationComplete: true,
+    playbackSafe: true,
+    qwenIdle: true,
+    captureUnattached: true,
+    callerVoiced: false,
+    parakeetResident: false,
+    transcriptSlotActive: false,
+    disabled: false,
+  };
+  assert.equal(shouldRunCallTranscriptSlot(ready), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(undefined), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(500), false);
+  assert.equal(shouldDisableCallTranscriptSlotsAfterStop(500.01), true);
+});
+
+test("foreground work gates recovery without awaiting metadata, but waits an active operation or commit", () => {
+  assert.equal(canContinueVoiceHistoryRecovery(), true);
+  assert.equal(canContinueVoiceHistoryRecovery({ suspended: true }), false);
+  assert.equal(canContinueVoiceHistoryRecovery({ foregroundDispatch: true }), false);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "metadata" }), false);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ operation: "exact-operation", stage: "transcription" }), true);
+  assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "recording_commit" }), true);
 });
 
 test("deferred PCM replay includes audio captured during settlement exactly once before handoff", async () => {

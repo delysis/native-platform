@@ -36,6 +36,9 @@ use tokio::sync::watch;
 use speech_native_types::PlatformTarget;
 const MOM_SPEECH_CLIENT_ID: &str = "mom-llama";
 const MAX_ACTIVE_SPEECH_OPERATIONS: usize = 4;
+const SPEECH_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const COLD_TRANSCRIPTION_STOP_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 const MAX_PENDING_CANCELS: usize = 32;
 const MAX_PLAYBACKS: usize = 2;
 const MAX_COMPLETE_WAV_BYTES: usize = 64 * 1024 * 1024;
@@ -426,6 +429,17 @@ pub struct SpeechStopOutput {
 pub struct SpeechStopWaitOutput {
     pub stop: SpeechStopOutput,
     pub terminal_acknowledged: bool,
+}
+
+fn speech_stop_wait_timeout(
+    request_id: &SpeechRequestId,
+    allow_cold_transcription_settlement: bool,
+) -> std::time::Duration {
+    if allow_cold_transcription_settlement && request_id.0.starts_with("mom-transcribe-") {
+        COLD_TRANSCRIPTION_STOP_WAIT_TIMEOUT
+    } else {
+        SPEECH_STOP_WAIT_TIMEOUT
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1598,7 +1612,11 @@ impl MomSpeech {
     /// has left the active registry. The host removes the operation only
     /// after the backend ticket reaches its terminal, so foreground compute
     /// must not start based on the cancellation request alone.
-    pub async fn stop_and_wait(&self, operation: &str) -> Result<SpeechStopWaitOutput, String> {
+    pub async fn stop_and_wait(
+        &self,
+        operation: &str,
+        allow_cold_transcription_settlement: bool,
+    ) -> Result<SpeechStopWaitOutput, String> {
         validate_operation_token(operation).map_err(|error| error.to_string())?;
         let stopped = self
             .stop(Some(operation), None)
@@ -1622,7 +1640,8 @@ impl MomSpeech {
         };
 
         let mut changed = self.operation_revision.subscribe();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let timeout = speech_stop_wait_timeout(&request_id, allow_cold_transcription_settlement);
+        tokio::time::timeout(timeout, async {
             loop {
                 let settled = self
                     .state
@@ -3622,7 +3641,7 @@ mod tests {
         let waiter_speech = Arc::clone(&speech);
         let waiter = tokio::spawn(async move {
             waiter_speech
-                .stop_and_wait("waited-operation")
+                .stop_and_wait("waited-operation", false)
                 .await
                 .expect("terminal acknowledgment")
         });
@@ -3636,6 +3655,34 @@ mod tests {
         let output = waiter.await.expect("waiter task");
         assert!(output.stop.cancellation_requested);
         assert!(output.terminal_acknowledged);
+    }
+
+    #[test]
+    fn cold_initialization_wait_is_bounded_and_only_applies_to_attachment_transcription() {
+        assert_eq!(
+            speech_stop_wait_timeout(
+                &SpeechRequestId("mom-transcribe-history-op".to_string()),
+                true,
+            ),
+            std::time::Duration::from_secs(30),
+        );
+        for request_id in [
+            "mom-live-transcribe-op",
+            "mom-read-aloud-op",
+            "mom-precommit-op",
+        ] {
+            assert_eq!(
+                speech_stop_wait_timeout(&SpeechRequestId(request_id.to_string()), true),
+                std::time::Duration::from_secs(2),
+            );
+        }
+        assert_eq!(
+            speech_stop_wait_timeout(
+                &SpeechRequestId("mom-transcribe-history-op".to_string()),
+                false,
+            ),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]

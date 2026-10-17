@@ -17,6 +17,22 @@
   } = {}) => generationComplete && playbackSafe && qwenIdle && captureUnattached
     && !callerVoiced && parakeetResident && !transcriptSlotActive && !disabled;
 
+  // A cold/missing Parakeet model skips this one opportunity. Only a slow
+  // acknowledged preemption is evidence that future in-call slots are unsafe.
+  const shouldDisableCallTranscriptSlotsAfterStop = (elapsedMs) =>
+    Number.isFinite(elapsedMs) && elapsedMs > 500;
+
+  const canContinueVoiceHistoryRecovery = ({
+    suspended = false,
+    foregroundDispatch = false,
+    callActive = false,
+    callPreparing = false,
+    recording = false,
+  } = {}) => !suspended && !foregroundDispatch && !callActive && !callPreparing && !recording;
+
+  const shouldWaitForVoiceHistoryRecovery = ({ operation = null, stage = "idle" } = {}) =>
+    Boolean(operation) || stage === "recording_commit";
+
   const replayDeferredPcm = async ({ readChunks, enqueue, settle, handoff }) => {
     let cursor = 0;
     while (true) {
@@ -338,6 +354,9 @@
     AdaptiveVoiceLeadController,
     SemanticLeadController,
     shouldRunCallTranscriptSlot,
+    shouldDisableCallTranscriptSlotsAfterStop,
+    canContinueVoiceHistoryRecovery,
+    shouldWaitForVoiceHistoryRecovery,
     replayDeferredPcm,
     createCallTranscriptIntent,
     enqueueCallTranscriptIntent,

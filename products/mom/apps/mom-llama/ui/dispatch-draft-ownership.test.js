@@ -5,6 +5,42 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(`${__dirname}/coop-hx.js`, "utf8");
 
+test("unacknowledged speech preemption permanently disables call transcript admission", async () => {
+  const start = source.indexOf("  const stopSpeechOperationAndWait = async (");
+  const end = source.indexOf("\n  const startStreamedCallGreeting", start);
+  assert.ok(start >= 0 && end > start, "the production preemption helper must remain testable");
+  const definition = source.slice(start, end);
+
+  const makeContext = (response, invokeError = null) => {
+    const context = {
+      voiceCallTranscriptSlotsDisabled: false,
+      performance: { now: (() => { let now = 0; return () => ++now; })() },
+      markVoiceLatency() {},
+      invoke: async () => {
+        if (invokeError) throw invokeError;
+        return response;
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext(`${definition}\nthis.stop = stopSpeechOperationAndWait;`, context);
+    return context;
+  };
+
+  const acknowledged = makeContext({ result: { terminal_acknowledged: true } });
+  await acknowledged.stop("operation", "test");
+  assert.equal(acknowledged.voiceCallTranscriptSlotsDisabled, false);
+
+  for (const [response, invokeError] of [
+    [{ status: "blocked" }, null],
+    [{ result: { terminal_acknowledged: false } }, null],
+    [null, new Error("transport failed")],
+  ]) {
+    const unacknowledged = makeContext(response, invokeError);
+    await assert.rejects(unacknowledged.stop("operation", "test"));
+    assert.equal(unacknowledged.voiceCallTranscriptSlotsDisabled, true);
+  }
+});
+
 test("call persona preparation is awaited, epoch-bound, and required before greeting dispatch", async () => {
   const helperStart = source.indexOf("  const prepareVoicePersonaForCall = async");
   const helperEnd = source.indexOf("\n  const startStreamedCallGreeting", helperStart);
@@ -155,6 +191,7 @@ for (const switchAt of ["persistence", "dispatch"]) {
         autocompleteAccepting: false, cancelComposerAutocomplete() {},
         formValue: () => textarea.value, draftAttachmentIds: () => [],
         acquireChatBusy: () => "lease", releaseChatBusy() {},
+        suspendVoiceHistoryRecoveryForForeground: async () => () => {},
         selectedConversation: () => selected, selectedConversationKind: () => "chat",
         formField: () => textarea, closeMentions() {}, appendLiveMessage() {}, sizeComposer() {},
         report() {}, reportError() {}, releaseMentionInvocationBusy() {},
@@ -221,6 +258,7 @@ for (const outcome of ["blocked", "throw"]) {
       autocompleteAccepting: false, cancelComposerAutocomplete() {},
       formValue: () => textarea.value, draftAttachmentIds: () => [],
       acquireChatBusy: () => "dispatch", releaseChatBusy: (lease) => released.push(lease),
+      suspendVoiceHistoryRecoveryForForeground: async () => () => {},
       selectedConversation: () => "A", selectedConversationKind: () => "chat",
       formField: () => textarea, closeMentions() {}, appendLiveMessage() {}, sizeComposer() {},
       report() {}, reportError(error) { assert.equal(error.message, "rejected"); },

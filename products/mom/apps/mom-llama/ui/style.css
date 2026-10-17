@@ -1946,6 +1946,11 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
 .voice-call-pulse span { width: 3px; height: 8px; border-radius: 2px; background: currentColor; }
 .voice-call-pulse span:nth-child(2), .voice-call-pulse span:nth-child(4) { height: 16px; }
 .voice-call-pulse span:nth-child(3) { height: 24px; }
+.voice-call-backdrop[data-call-state="preparing"] .voice-call-pulse {
+  opacity: .75;
+  animation: voice-call-preparing 1.2s ease-in-out infinite;
+}
+@keyframes voice-call-preparing { 50% { opacity: .28; } }
 .voice-call-controls { display: flex; justify-content: center; gap: 18px; padding: 14px 0 6px; }
 .voice-call-control {
   width: 58px;

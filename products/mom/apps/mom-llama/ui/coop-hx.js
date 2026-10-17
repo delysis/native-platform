@@ -2220,13 +2220,26 @@
     return true;
   };
 
-  const stopSpeechOperationAndWait = async (operation, reason) => {
+  const stopSpeechOperationAndWait = async (
+    operation,
+    reason,
+    { allowColdTranscriptionSettlement = false } = {},
+  ) => {
     if (!operation) return;
     const started = performance.now();
     markVoiceLatency("speech_preemption_started", { reason });
-    const response = await invoke("mom_llama_speech_stop_and_wait", { operation });
-    if (response?.status === "blocked" || response?.result?.terminal_acknowledged !== true) {
-      throw new Error(response?.blocker?.message || "Speech transcription did not confirm that it stopped.");
+    try {
+      const response = await invoke("mom_llama_speech_stop_and_wait", {
+        operation,
+        allowColdTranscriptionSettlement,
+      });
+      if (response?.status === "blocked" || response?.result?.terminal_acknowledged !== true) {
+        throw new Error(response?.blocker?.message || "Speech transcription did not confirm that it stopped.");
+      }
+    } catch (error) {
+      // An unacknowledged stop is not evidence of safe future preemption.
+      voiceCallTranscriptSlotsDisabled = true;
+      throw error;
     }
     markVoiceLatency("speech_preemption_acknowledged", {
       reason,
@@ -2389,15 +2402,33 @@
       return;
     }
     voiceCallPreparing = true;
-    let epoch = null;
+    const epoch = {};
+    voiceCallEpoch = epoch;
+    voiceCallActive = true;
+    voiceCallConversation = null;
+    let releaseHistoryRecovery = null;
     startVoiceLatency("call_greeting", "call_requested");
+    const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
+    const sourceAvatar = recipient.querySelector(".contact-avatar");
+    const targetAvatar = modal.querySelector("#voice-call-avatar");
+    if (sourceAvatar && targetAvatar) {
+      targetAvatar.className = sourceAvatar.className.replace(/\bcontact-avatar\b/g, "").trim();
+      targetAvatar.classList.add("contact-avatar", "voice-call-avatar");
+      targetAvatar.setAttribute("style", sourceAvatar.getAttribute("style") || "");
+      targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
+    }
+    modal.dataset.voicePersona = recipientId;
+    modal.dataset.callState = "preparing";
+    modal.setAttribute("aria-label", "Preparing call");
+    setText("voice-call-name", name);
+    setModalVisibility("voice-call-modal", true);
+    modal.querySelector('[data-action="voice-call-close"]')?.focus();
     try {
       // Do not admit Gemma warming or microphone setup while an idle Parakeet
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
-      const speechStopMs = await stopSpeechOperationAndWait(voiceHistoryRecoveryOperation, "call_start");
-      if (speechStopMs > 500) voiceCallTranscriptSlotsDisabled = true;
-      await voiceHistoryRecovery?.catch(() => {});
+      releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Start independent resident/worklet readiness while the required
       // microphone authorization and first CoreAudio callback are pending.
       // Recording either only after that await falsely charged microphone
@@ -2414,27 +2445,17 @@
       // this exact stream for the whole call so WebKit can continuously apply
       // acoustic echo cancellation while contact audio is playing.
       const microphone = await prepareCallMicrophoneStream();
-      markVoiceLatency("call_microphone_ready", microphone);
-      const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
-      const sourceAvatar = recipient.querySelector(".contact-avatar");
-      const targetAvatar = modal.querySelector("#voice-call-avatar");
-      if (sourceAvatar && targetAvatar) {
-        targetAvatar.className = sourceAvatar.className.replace(/\bcontact-avatar\b/g, "").trim();
-        targetAvatar.classList.add("contact-avatar", "voice-call-avatar");
-        targetAvatar.setAttribute("style", sourceAvatar.getAttribute("style") || "");
-        targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
+      if (voiceCallEpoch !== epoch || !voiceCallActive) {
+        releaseCallMicrophoneStream();
+        return;
       }
-      modal.dataset.voicePersona = recipientId;
-      setText("voice-call-name", name);
-      setModalVisibility("voice-call-modal", true);
-      modal.querySelector('[data-action="voice-call-close"]')?.focus();
-      epoch = {};
-      voiceCallEpoch = epoch;
-      voiceCallActive = true;
+      markVoiceLatency("call_microphone_ready", microphone);
       // Permission/device readiness has already completed. Ring now, while
       // conversation materialization and resident-model admission continue
       // behind the ring.
       await startCallRinging(epoch);
+      modal.dataset.callState = "ringing";
+      modal.setAttribute("aria-label", `Calling ${name}`);
       markVoiceLatency("call_ringing_started");
       const warm = await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
@@ -2485,6 +2506,7 @@
       throw error;
     } finally {
       voiceCallPreparing = false;
+      releaseHistoryRecovery?.();
     }
   };
 
@@ -5333,7 +5355,6 @@
         if (callTranscriptResidentCheck) return;
         callTranscriptResidentCheck = invoke("mom_llama_speech_parakeet_resident").then(async (status) => {
           if (status?.status === "blocked" || status?.result !== true) {
-            voiceCallTranscriptSlotsDisabled = true;
             markTtsLatency("call_transcript_slot_skipped", { reason: "parakeet_not_resident" });
             const live = await startNextCallPrefill("transcript_model_not_resident");
             if (recording?.prefillDeferred && live?.session) await recording.resumeDeferredPrefill(live);
@@ -5389,7 +5410,6 @@
           });
         }
         }).catch((error) => {
-          voiceCallTranscriptSlotsDisabled = true;
           markTtsLatency("call_transcript_slot_skipped", {
             reason: "parakeet_residency_check_failed",
             message: errorMessage(error),
@@ -6315,7 +6335,9 @@
       job.cancelledByCaller = true;
       if (operation) {
         const elapsed = await stopSpeechOperationAndWait(operation, "caller_speech_onset");
-        if (elapsed > 500) voiceCallTranscriptSlotsDisabled = true;
+        if (globalThis.MomVoicePipelineScheduler.shouldDisableCallTranscriptSlotsAfterStop(elapsed)) {
+          voiceCallTranscriptSlotsDisabled = true;
+        }
       }
       await activeCallTranscriptTask?.catch(() => {});
       if (!job.committed) pendingCallTranscriptJobs.unshift(job);
@@ -6357,13 +6379,26 @@
   // from the active chain without ever dropping or truncating its history.
   let voiceHistoryRecovery = null;
   let voiceHistoryRecoveryOperation = null;
+  let voiceHistoryRecoveryStage = "idle";
+  let voiceHistoryRecoveryColdInitialization = false;
+  let voiceHistoryRecoverySuspensions = 0;
+  const canContinueVoiceHistoryRecovery = () => globalThis.MomVoicePipelineScheduler.canContinueVoiceHistoryRecovery({
+    suspended: voiceHistoryRecoverySuspensions > 0,
+    foregroundDispatch: activeDispatchConversation !== null,
+    callActive: voiceCallActive,
+    callPreparing: voiceCallPreparing,
+    recording: Boolean(voiceRecording),
+  });
   const recoverPendingVoiceHistory = () => {
+    if (!canContinueVoiceHistoryRecovery()) return Promise.resolve();
     // Selection or call teardown can arrive while an earlier conversation is
     // still being examined. Revisit the current selection after that pass;
     // otherwise its recordings can remain forever on the slow media path.
     if (voiceHistoryRecovery) return voiceHistoryRecovery.then(() => recoverPendingVoiceHistory());
     voiceHistoryRecovery = (async () => {
+      voiceHistoryRecoveryStage = "listing";
       const listed = await invoke("mom_llama_conversation_list");
+      if (!canContinueVoiceHistoryRecovery()) return;
       if (listed?.status === "blocked" || !Array.isArray(listed?.result)) return;
       const selected = selectedConversation();
       for (const conversation of listed.result.filter((item) => item.id === selected)) {
@@ -6378,6 +6413,7 @@
           id = message.parent_id;
         }
         for (const message of active.reverse()) {
+          if (!canContinueVoiceHistoryRecovery()) return;
           if (message.role !== "user"
               || ![voiceModePrompt(true), voiceModePrompt(false)].includes(message.content)
               || message.attachment_ids?.length !== 1) continue;
@@ -6386,12 +6422,14 @@
           if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
           const attachment = message.attachment_ids[0];
           try {
+            voiceHistoryRecoveryStage = "metadata";
             markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_started", {
               conversation: conversation.id, message: message.id, attachment,
             });
             const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
               attachment,
             }));
+            if (!canContinueVoiceHistoryRecovery()) return;
             if (catalog.primary?.kind !== "audio") {
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id, reason: "not_audio",
@@ -6399,8 +6437,12 @@
               continue;
             }
             if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
+            const residency = await invoke("mom_llama_speech_parakeet_resident");
+            if (!canContinueVoiceHistoryRecovery()) return;
+            voiceHistoryRecoveryColdInitialization = residency?.result !== true;
             const operation = speechOperationToken();
             voiceHistoryRecoveryOperation = operation;
+            voiceHistoryRecoveryStage = "transcription";
             let transcribed;
             try {
               transcribed = await invoke("mom_llama_speech_transcribe_attachment", {
@@ -6411,6 +6453,7 @@
             } finally {
               if (voiceHistoryRecoveryOperation === operation) voiceHistoryRecoveryOperation = null;
             }
+            if (!canContinueVoiceHistoryRecovery()) return;
             if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) {
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id,
@@ -6418,13 +6461,15 @@
               });
               continue;
             }
-            if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
+            if (!canContinueVoiceHistoryRecovery()) return;
+            voiceHistoryRecoveryStage = "recording_commit";
             const recorded = await invoke("mom_llama_message_record_voice_transcript", {
               conversation: conversation.id,
               message: message.id,
               attachment,
               transcript: transcribed.result.transcript.trim(),
             });
+            if (!canContinueVoiceHistoryRecovery()) return;
             if (recorded?.status === "blocked" || !recorded?.result) {
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id,
@@ -6444,8 +6489,47 @@
           }
         }
       }
-    })().finally(() => { voiceHistoryRecovery = null; });
+    })().finally(() => {
+      voiceHistoryRecovery = null;
+      voiceHistoryRecoveryOperation = null;
+      voiceHistoryRecoveryStage = "idle";
+      voiceHistoryRecoveryColdInitialization = false;
+    });
     return voiceHistoryRecovery;
+  };
+
+  const suspendVoiceHistoryRecoveryForForeground = async (reason) => {
+    voiceHistoryRecoverySuspensions += 1;
+    try {
+      const operation = voiceHistoryRecoveryOperation;
+      const coldInitialization = voiceHistoryRecoveryColdInitialization;
+      if (operation) {
+        const elapsed = await stopSpeechOperationAndWait(operation, reason, {
+          allowColdTranscriptionSettlement: coldInitialization,
+        });
+        if (globalThis.MomVoicePipelineScheduler.shouldDisableCallTranscriptSlotsAfterStop(elapsed)) {
+          voiceCallTranscriptSlotsDisabled = true;
+        }
+      }
+      if (globalThis.MomVoicePipelineScheduler.shouldWaitForVoiceHistoryRecovery({
+        operation,
+        stage: voiceHistoryRecoveryStage,
+      })) {
+        await voiceHistoryRecovery?.catch(() => {});
+      }
+    } catch (error) {
+      voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
+      throw error;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
+      if (voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
+        void recoverPendingVoiceHistory().catch(() => {});
+      }
+    };
   };
 
   const startVoicePrefill = async (conversation, call, trace) => {
@@ -6796,7 +6880,6 @@
           if (onVoiceOnset) {
             queueMicrotask(() => {
               void Promise.resolve(onVoiceOnset(recording)).catch((error) => {
-                if (recording.call) voiceCallTranscriptSlotsDisabled = true;
                 recording.computePreemptionBlocked = true;
                 recording.prefillPending = true;
                 recording.prefillFailed = true;
@@ -9243,7 +9326,9 @@
         const sourceConversation = selectedConversation();
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
+        let releaseHistoryRecovery = null;
         try {
+          releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("chat_send");
           if (exactRecipient) {
             await updateRecipients((ids) => ids.includes(exactRecipient.dataset.recipient)
               ? ids
@@ -9453,6 +9538,7 @@
           if (callReplyConversation === conversation) callReplyConversation = null;
           if (pendingVoiceTtsOwner?.conversation === conversation) pendingVoiceTtsOwner = null;
           releaseChatBusy(dispatchLease);
+          releaseHistoryRecovery?.();
         }
       }
       if (form.id === "conversation-rename-form") {

@@ -3,13 +3,13 @@
 ## Current status — 16 October 2026
 
 The current source has runtime evidence for bounded voice-history rollover on
-an M4 Max with synthetic input. The evidence uses an 8,192-token context and a
-manual 21,845 MiB memory budget, which resolves to 19,456 tokens. It is not an
+an M4 Max with synthetic input. Under a manual 21,845 MiB memory budget, the
+initial 8,192-token setting resolves to 18,944 native context cells in this run. It is not an
 M2 measurement or packaged-call acceptance. The current tree has not passed the
 settled-tree `local-ci` gate and no candidate bundle has been built.
 
-Opportunistic ASR slotting is implemented. The current frontend suite passes
-240/240. A low-priority resident-only Parakeet slot runs during
+Opportunistic ASR slotting is implemented. The earlier full frontend receipt passes
+240/240; the final consolidated gate covers subsequent scheduling fixes. A low-priority resident-only Parakeet slot runs during
 the targetless interval with playback fully buffered. A finalized transcript
 replaces that older audio only in future model input; the original recording
 remains attached for playback and provenance. This can reduce history pressure
@@ -67,6 +67,19 @@ boundary but does not qualify packaged opportunistic slot/capture sequencing.
 The preceding compiler-artifact mismatch is recorded in
 `outputs/qualification/parakeet-samantha-active-cancel-20-initial-toolchain-failure.log`.
 A fixture-digest typo also failed before inference; neither is a model-quality result.
+That digest assertion appeared in the session tool output but was not saved to
+a separate raw log before the corrected run; do not treat the initial
+toolchain-mismatch log as that failure receipt.
+
+Cold absence skips a transcription opportunity; it does not permanently disable
+future slots after the model becomes resident. A slow acknowledged stop or a
+failed terminal acknowledgment disables later in-call slots for that process.
+Idle history recovery is suspended before foreground chat or call admission,
+including across asynchronous metadata lookup and transcript commit. Resident
+ASR keeps a two-second settlement bound. An already-running cold attachment
+transcriber may take up to thirty seconds to settle initialization; this is
+preparation time, not a rapid-cancellation claim. The call surface opens
+immediately with its preparing state and working hangup control.
 
 ## Cache and transcription boundaries
 
@@ -92,7 +105,7 @@ previous source snapshot.
 
 The focused current-tree checks passed: all-target check for engine, runtime,
 CLI, and app; all-target Clippy with warnings denied; runtime integration tests
-(39 passed, 17 ignored); app tests (169 passed); and frontend tests (240/240).
+(39 passed, 17 ignored); app tests (166 passed, 3 ignored); and frontend tests (240/240).
 The engine focused suite passed 225 tests (15 ignored), and runtime unit tests
 passed 310. These focused checks are not the settled-tree `local-ci` gate. The
 M4 20-cycle audio run, 5,270-token edited-prompt four-path parity run,
@@ -129,6 +142,24 @@ slot. Preserve user data and every failed receipt. Run affected frontend tests,
 then focused Rust tests, and finally one settled-tree `cargo run --locked -p
 xtask -- local-ci <new-evidence-directory>` gate. Do not treat an ignored
 real-model diagnostic or a component test as packaged acceptance.
+
+Run one-off real-model checks through the exclusive-log wrapper. Choose a new
+log path outside the checkout; the wrapper opens it with create-new semantics,
+so a second run cannot overwrite the first. Child stdout and stderr share that
+file, followed by a small exit-status record; environment values are not
+recorded. For the active Parakeet cancellation fixture, pin a WAV with the
+expected byte length and SHA-256 before running:
+
+```sh
+SPEECH_NATIVE_TEST_WAV_ACTIVE_CANCEL=/absolute/path/to/pinned-active-cancel.wav \
+SPEECH_NATIVE_PARAKEET_MODEL_DIR=/absolute/path/to/pinned-parakeet-model \
+node products/mom/scripts/run-voice-check.mjs \
+  /absolute/path/to/new-active-cancel.log -- \
+  rustup run 1.95.0 cargo test --locked \
+    -p speech-native-backend-parakeet --test real_parakeet \
+    real_gateway_transcription_and_request_scoped_cancellation \
+    -- --ignored --exact --nocapture
+```
 
 The candidate builder requires the passing summary for the exact clean source
 tree, verifies source identity before and after packaging, and writes a
@@ -171,3 +202,9 @@ the microphone prefix lane, including when no serialized RAM snapshot exists.
 Background maintenance retains at most 64 transcript intents containing saved
 message/attachment identities; it does not retain raw capture PCM. Unqueued
 maintenance is rediscovered from saved recordings during idle recovery.
+
+The clean d4cb3a33 consolidated attempt failed because root workspace tests
+required the generated Loom Signal helper before the runner built it. The
+runner now provisions that isolated workspace and macOS smoke support first,
+and installs WebKit before browser tests. Failed attempt evidence remains at
+`/Users/george/.codex/evidence/local-ci-d4cb3a33-attempt-01`.
