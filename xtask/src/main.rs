@@ -326,6 +326,7 @@ fn visit_extension(directory: &Path, extension: &str, found: &mut BTreeSet<PathB
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             let ignored = entry.file_name() == ".git"
+                || entry.file_name() == ".build"
                 || entry.file_name() == "target"
                 || entry.file_name() == "node_modules";
             if !ignored {
@@ -344,6 +345,7 @@ fn visit(directory: &Path, name: &str, found: &mut BTreeSet<PathBuf>) -> Result<
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             let ignored = entry.file_name() == ".git"
+                || entry.file_name() == ".build"
                 || entry.file_name() == "target"
                 || entry.file_name() == "node_modules";
             if !ignored {
@@ -408,6 +410,37 @@ mod tests {
     #[test]
     fn repository_shell_satisfies_policy() {
         check_policy(&workspace_root()).expect("workspace shell policy");
+    }
+
+    #[test]
+    fn generated_build_checkouts_are_not_scanned_as_repository_sources() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let generated = root.path().join("package/.build/checkouts/dependency");
+        fs::create_dir_all(generated.join(".github/workflows")).expect("generated workflow dir");
+        fs::write(
+            generated.join("Cargo.toml"),
+            "[package]\nname='dependency'\n",
+        )
+        .expect("generated Cargo manifest");
+        fs::write(
+            generated.join(".github/workflows/pull_request.yml"),
+            "name: generated\n",
+        )
+        .expect("generated workflow");
+        let tracked = root.path().join("package/src");
+        fs::create_dir_all(&tracked).expect("source directory");
+        fs::write(tracked.join("Cargo.toml"), "[package]\nname='tracked'\n")
+            .expect("tracked Cargo manifest");
+
+        assert_eq!(
+            find_named(root.path(), "Cargo.toml").expect("scan manifests"),
+            BTreeSet::from([tracked.join("Cargo.toml")])
+        );
+        assert!(
+            find_extension(root.path(), "yml")
+                .expect("scan workflows")
+                .is_empty()
+        );
     }
 
     #[test]
