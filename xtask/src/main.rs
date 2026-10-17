@@ -271,7 +271,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
             if let Some(repository) = table.get("git").and_then(toml::Value::as_str) {
                 let (name, revision) = match repository.trim_end_matches(".git") {
                     "https://github.com/delysis/llama-cpp-rs" => {
-                        ("llama-cpp-rs", "2cee3adbbad556a980daa9bda1887d4881e68b91")
+                        ("llama-cpp-rs", "f97267c4964dcdf9e3a33f13bd99b4613ffca24f")
                     }
                     "https://github.com/whisperfish/presage"
                         if manifest.ends_with("products/loom/signal/Cargo.toml") =>
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn external_ffi_git_dependency_requires_the_exact_revision() {
-        let revision = "2cee3adbbad556a980daa9bda1887d4881e68b91";
+        let revision = "f97267c4964dcdf9e3a33f13bd99b4613ffca24f";
         for suffix in ["", ".git"] {
             let source = format!(
                 "dependency = {{ git = \"https://github.com/delysis/llama-cpp-rs{suffix}\", rev = \"{revision}\" }}"
