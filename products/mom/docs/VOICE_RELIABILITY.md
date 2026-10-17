@@ -55,6 +55,15 @@ CMake. Actual native artifact hashing remains mandatory. The old candidate 07
 archives were not retained, so this proves a reproducibility defect without
 claiming timestamps were its only changed build input.
 
+For a binding revision update, settle every active identity before the full
+gate: both dependency manifests and lockfile, the engine build recipe and
+runtime identity constant/test, the xtask exact-revision seal, and the reviewed
+build-script digest in `ci/ignored-tests.json`. Search for the previous revision
+and digest across the tree; historical prose is evidence, active policy is not.
+Run the focused identity, policy and ignored-test inventory checks together.
+The first two gates for this update caught omitted seals; their failed receipts
+remain part of the development record.
+
 Live voice lookup is RAM-only, but authenticated cache candidates previously
 rescanned their entire multi-gigabyte payload at each lookup/import. The signing
 authority now remembers successful authentication of the exact immutable Arc
