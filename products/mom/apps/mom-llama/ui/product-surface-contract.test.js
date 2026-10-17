@@ -498,7 +498,7 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(live.includes("speech_stream_runaway"));
 });
 
-test("call startup waits for idle speech cancellation to reach its terminal before model warmup", () => {
+test("call starts ringing immediately while preparation remains cancellation guarded", () => {
   const callStart = bridge.indexOf("  const openVoiceCallSurface = async");
   const callEnd = bridge.indexOf("\n  const closeVoiceCallSurface = async", callStart);
   const call = bridge.slice(callStart, callEnd);
@@ -507,8 +507,10 @@ test("call startup waits for idle speech cancellation to reach its terminal befo
   const activityReady = call.indexOf("await activityGuard.ready");
   const warm = call.indexOf('runtimeWarmPromise.then');
   const microphone = call.indexOf('prepareCallMicrophoneStream()');
-  const visiblePreparing = call.indexOf('modal.dataset.callState = "preparing"');
+  const visibleRinging = call.indexOf('modal.dataset.callState = "ringing"');
   const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
+  const ringStart = call.indexOf("const ringingReady = startCallRinging(epoch)");
+  const ringAwait = call.indexOf("const ringResult = await ringingReady");
   const cancellationGuard = call.indexOf('if (voiceCallEpoch !== epoch || !voiceCallActive) return;', preempt);
 
   assert.ok(preempt >= 0, "call pickup must suspend and settle idle voice recovery");
@@ -518,13 +520,17 @@ test("call startup waits for idle speech cancellation to reach its terminal befo
   assert.ok(bridge.includes('allowColdTranscriptionSettlement: coldInitialization'));
   assert.ok(preempt < warm && preempt < microphone,
     "Gemma warmup and microphone setup must wait until the idle Parakeet operation settles");
-  assert.ok(visiblePreparing >= 0 && visibleModal >= 0 && visiblePreparing < visibleModal && visibleModal < preempt,
-    "the cancellable call surface must show its preparing state before a cold ASR wait");
+  assert.ok(visibleRinging >= 0 && visibleModal >= 0 && visibleRinging < visibleModal
+      && visibleModal < ringStart && ringStart < activityReady && activityReady < preempt,
+    "the modal and ring must start on the click path before setup waits on cold ASR");
+  assert.ok(ringAwait > activityReady && call.includes("if (ringResult.error) throw ringResult.error"),
+    "ring initialization failure must still stop admission before Gemma setup");
   assert.ok(cancellationGuard > preempt && cancellationGuard < warm,
     "closing the visible preparation surface must prevent later call warmup");
-  assert.ok(call.includes('modal.setAttribute("aria-label", "Preparing call")'));
+  assert.ok(call.includes("modal.setAttribute(\"aria-label\", `Calling ${name}`)"));
   assert.ok(call.includes('modal.querySelector(\'[data-action="voice-call-close"]\')?.focus()'));
-  assert.ok(styles.includes('.voice-call-backdrop[data-call-state="preparing"] .voice-call-pulse'));
+  assert.ok(!styles.includes('.voice-call-backdrop[data-call-state="preparing"]'),
+    "the call surface no longer exposes a separate preparing presentation");
   assert.match(
     bridge,
     /invoke\("mom_llama_speech_stop_and_wait", \{\s*operation,\s*allowColdTranscriptionSettlement,/,
@@ -621,12 +627,14 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
     "an intentional hang-up must consume the native cancellation acknowledgement",
   );
   assert.ok(open.includes("startCallRinging(epoch)"));
+  assert.ok(!open.includes("await startCallRinging(epoch)"));
   assert.ok(open.includes("startStreamedCallGreeting(epoch, conversation)"));
   assert.ok(open.includes("await prepareCallMicrophoneStream()"));
   assert.ok(
-    open.indexOf("await prepareCallMicrophoneStream()")
-      < open.indexOf("await startCallRinging(epoch)"),
-    "microphone permission and device readiness must precede ringing",
+    open.indexOf("const ringingReady = startCallRinging(epoch)")
+      < open.indexOf("await activityGuard.ready")
+      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream()"),
+    "ringing starts on the user gesture while microphone and model setup remain guarded",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
   assert.ok(open.includes("await warmReady;"));

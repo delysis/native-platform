@@ -214,26 +214,27 @@ test("failed startup warm still admits a call only after the exact conversation 
     status: "blocked",
     message: "startup used a different profile",
   }), prepareResponse = null) => {
+    // The caller has already opened the surface and started its ring before
+    // this test enters the later model-admission portion of the handler.
     const stages = [];
     const calls = [];
-    const ringing = [];
     const greetings = [];
     const epoch = {};
     const context = {
       name: "Jan",
-      modal: { dataset: {}, setAttribute() {} },
+      modal: { dataset: { callState: "ringing" }, setAttribute() {} },
       voiceCallEpoch: epoch,
       voiceCallActive: true,
       voiceCallConversation: null,
       voiceLatencyTrace: { mode: "call_greeting" },
       warmReady,
+      ringingReady: Promise.resolve({ started: true }),
       performance: { now: () => 1 },
       errorMessage: (error) => error.message,
       markVoiceLatency: (stage) => stages.push(stage),
       setText() {},
       selectedConversation: () => "chat-frozen-profile",
       selectedConversationKind: () => "chat",
-      startCallRinging: async (...args) => ringing.push(args),
       startStreamedCallGreeting: async (...args) => greetings.push(args),
       invoke: async (command, args) => {
         calls.push([command, args]);
@@ -249,7 +250,7 @@ test("failed startup warm still admits a call only after the exact conversation 
       `${source.slice(helperStart, helperEnd)}\nconst epoch = voiceCallEpoch;\nasync function runAdmission() {\n${admission}\n}\nthis.runAdmission = runAdmission;`,
       context,
     );
-    return { context, calls, ringing, greetings, stages, epoch };
+    return { context, calls, greetings, stages, epoch };
   };
 
   const ready = makeContext(true);
@@ -258,19 +259,16 @@ test("failed startup warm still admits a call only after the exact conversation 
   assert.equal(ready.calls[0][0], "mom_llama_voice_persona_prepare");
   assert.equal(ready.calls[0][1].personaId, "chat-frozen-profile");
   assert.equal(ready.context.modal.dataset.callState, "ringing");
-  assert.deepEqual(ready.ringing, [[ready.epoch]]);
   assert.deepEqual(ready.greetings, [[ready.epoch, "chat-frozen-profile"]]);
   assert.deepEqual(ready.stages, [
     "call_conversation_ready",
     "call_persona_prepare_started",
     "call_persona_prepare_completed",
-    "call_ringing_started",
   ]);
 
   const cold = makeContext(false);
   await assert.rejects(cold.context.runAdmission(), /could not be prepared for voice/);
   assert.equal(cold.calls.length, 1);
-  assert.deepEqual(cold.ringing, []);
   assert.deepEqual(cold.greetings, [], "a ready startup result cannot bypass the exact conversation encoder check");
 
   let settleWarm;
@@ -281,13 +279,11 @@ test("failed startup warm still admits a call only after the exact conversation 
   settleWarm({ status: "blocked", message: "startup was superseded" });
   await pendingAdmission;
   assert.equal(stale.calls.length, 0, "a superseded call must not prepare a model");
-  assert.deepEqual(stale.ringing, []);
   assert.deepEqual(stale.greetings, [], "a superseded call must not greet");
 
   const rejectedWarm = makeContext(true, Promise.reject(new Error("startup warm failed")));
   await assert.rejects(rejectedWarm.context.runAdmission(), /startup warm failed/);
   assert.equal(rejectedWarm.calls.length, 0);
-  assert.deepEqual(rejectedWarm.ringing, [], "a failed startup warm cannot start a ringing call");
   assert.deepEqual(rejectedWarm.greetings, []);
 
   let settlePreparation;
@@ -308,8 +304,73 @@ test("failed startup warm still admits a call only after the exact conversation 
     result: { audio_projector_warmed: true, resident_prefix_tokens: 76 },
   });
   await lateAdmission;
-  assert.deepEqual(latePreparation.ringing, [], "hangup during exact preparation must not ring later");
   assert.deepEqual(latePreparation.greetings, [], "hangup during exact preparation must not greet later");
+});
+
+test("the real call-open prefix shows Calling and starts the ring before awaiting setup", async () => {
+  const openStart = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const readyBoundary = source.indexOf("      await activityGuard.ready;", openStart);
+  assert.ok(openStart >= 0 && readyBoundary > openStart);
+  const prefix = source.slice(openStart, readyBoundary);
+  let resolveRing;
+  const stages = [];
+  const calls = [];
+  const recipient = {
+    dataset: { recipientId: "contact-live" },
+    querySelector: (selector) => selector.startsWith(":scope") ? { textContent: "Jan" } : null,
+  };
+  const modal = {
+    dataset: {},
+    attributes: {},
+    querySelector: (selector) => selector.includes("voice-call-close") ? { focus() { calls.push("focused"); } } : null,
+    setAttribute(name, value) { this.attributes[name] = value; },
+  };
+  const context = {
+    document: {
+      getElementById: (id) => id === "voice-call-modal" ? modal : null,
+      querySelector: (selector) => selector === ".recipients-header .recipient-chip" ? recipient : null,
+    },
+    voiceCallActive: false,
+    voiceCallPreparing: false,
+    voiceCallEpoch: null,
+    voiceCallConversation: null,
+    voiceCallActivityGuard: null,
+    createVoiceCallActivityGuard: () => {
+      calls.push("guard-created");
+      return { ready: new Promise(() => {}), clear: async () => {} };
+    },
+    speechOperationToken: () => "session-live",
+    reportError: (error) => { throw error; },
+    startVoiceLatency() {},
+    markVoiceLatency: (stage) => stages.push(stage),
+    setText: (id, value) => { if (id === "voice-call-title") modal.title = value; },
+    setModalVisibility: (_id, visible) => { modal.visible = visible; },
+    startCallRinging: (epoch) => {
+      calls.push(["ring-start", epoch]);
+      return new Promise((resolve) => { resolveRing = resolve; });
+    },
+    performance: { now: () => 1 },
+    window: {},
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${prefix}\n      return { epoch, ringingReady };\n    } catch (error) { throw error; }\n  };\nthis.openCall = openVoiceCallSurface;`,
+    context,
+  );
+  const opened = await context.openCall();
+  assert.equal(modal.visible, true);
+  assert.equal(modal.dataset.callState, "ringing");
+  assert.equal(modal.attributes["aria-label"], "Calling Jan");
+  assert.equal(modal.title, "Calling");
+  assert.ok(calls.includes("guard-created"));
+  assert.equal(calls.filter((entry) => Array.isArray(entry) && entry[0] === "ring-start").length, 1);
+  assert.equal(typeof resolveRing, "function", "ring initialization began before the activity guard settled");
+
+  resolveRing(true);
+  const ringResult = await opened.ringingReady;
+  assert.equal(ringResult.started, true);
+  assert.deepEqual(stages, ["call_ringing_started"], "a successful ring publishes its milestone before setup settles");
+  assert.equal(opened.epoch, calls.find((entry) => Array.isArray(entry) && entry[0] === "ring-start")[1]);
 });
 
 test("a late ring-context resume after hangup closes without installing a timer", async () => {

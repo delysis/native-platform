@@ -2554,15 +2554,30 @@
       targetAvatar.replaceChildren(...Array.from(sourceAvatar.childNodes).map((node) => node.cloneNode(true)));
     }
     modal.dataset.voicePersona = recipientId;
-    modal.dataset.callState = "preparing";
-    modal.setAttribute("aria-label", "Preparing call");
-    setText("voice-call-title", "Preparing");
+    modal.dataset.callState = "ringing";
+    modal.setAttribute("aria-label", `Calling ${name}`);
+    setText("voice-call-title", "Calling");
     setText("voice-call-name", name);
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
+    // Establish the visible call and begin ringing from the user's gesture.
+    // Model, microphone, and history-recovery setup continues in parallel;
+    // the exact audio context result is checked before we admit the greeting.
+    const ringingReady = startCallRinging(epoch).then(
+      (started) => {
+        if (started && voiceCallEpoch === epoch && voiceCallActive) {
+          markVoiceLatency("call_ringing_started");
+        }
+        return { started };
+      },
+      (error) => ({ error }),
+    );
     try {
       await activityGuard.ready;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      const ringResult = await ringingReady;
+      if (ringResult.error) throw ringResult.error;
+      if (!ringResult.started || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Do not admit Gemma warming or microphone setup while an idle Parakeet
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
@@ -2625,12 +2640,6 @@
       // Use the actual frozen call profile. It may differ from its source contact.
       const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
       if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
-      await startCallRinging(epoch);
-      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
-      modal.dataset.callState = "ringing";
-      modal.setAttribute("aria-label", `Calling ${name}`);
-      setText("voice-call-title", "Calling");
-      markVoiceLatency("call_ringing_started");
       // The first model reply uses the same token -> TTS -> PCM buffer as every
       // later call turn. Its first PCM frame stops ringing; playback startup
       // opens continuous listening, while model attachment waits until Qwen

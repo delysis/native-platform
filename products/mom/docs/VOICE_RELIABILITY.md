@@ -191,9 +191,11 @@ A launched process with a verified executable is not evidence of voice readiness
 A separate diagnostic Metal run evaluated 11,143 tokens in 27.815 seconds,
 reused that resident prefix in 26 milliseconds, and spent 23.001 seconds on
 explicit export of 3,831,765,240 bytes. These are debug diagnostic timings,
-not release or M2 performance. Call presentation now stays in Preparing until
-its exact conversation is ready, then starts ringing. The latency clock still
-starts at the original call request, so this does not conceal initialization.
+not release or M2 performance. The call surface now shows Calling and starts
+ringing immediately from the user's gesture while recovery, microphone, and
+exact-conversation setup continue. Greeting/model admission remains gated on
+that setup and the call epoch; the latency clock still starts at the original
+call request, so initialization time remains visible.
 
 Checkpoint persistence yields to foreground work during receipt hashing,
 each bounded encrypted part, and subsequent SQLite mutation stages. A typed
