@@ -127,5 +127,18 @@ to a bundled question, so it does not establish separate ratings or reasons
 for each person. Keep the current installed references for this set; none of
 those three longer candidates is promoted. The ignored local review record and
 the per-voice render receipts are under
-`artifacts/voice-samples/candidates/round4/auditions/`. A shorter-reference
-comparison is pending review and does not supersede this decision.
+`artifacts/voice-samples/candidates/round4/auditions/`.
+
+The reviewer then heard a second A/B of 14–16-second excerpts from those same
+candidate sources. Their bundled answer was exactly **“Current still sounds
+better”**. Keep the current references for all three; do not promote the
+shortened candidates either. The local receipt is
+`artifacts/voice-samples/candidates/round4/auditions/review-short-2026-10-17.json`.
+This rejects the tested samples, not every possible source recording or future
+voice model. A duration change alone has not yielded a preferred voice.
+The existing quality review already marks Bessel and Gabor as `keep`; stop
+spending audition time on replacements for them. Jim's current recording is
+still marked `replace` for compression, but both rejected excerpts came from
+the same teaching-video source. His next candidate should come from a
+different, verified continuous-speaker recording, not another cut of that
+source.
