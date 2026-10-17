@@ -108,7 +108,7 @@ run as reproducible or packaging its `config_sha256`; the command above is an
 exact pilot execution, not yet a reproducible promotion recipe.
 
 Do not select the last checkpoint automatically. Compare every epoch to the
-unadapted Base ICL route with frozen short, long, emotional, numerical, and
+unadapted resident Base route with frozen short, long, emotional, numerical, and
 out-of-domain prompts. Record validation/test loss, ASR intelligibility,
 speaker similarity as a supporting metric, blind identity/naturalness ratings,
 EOS failures, interviewer leakage, time to first PCM, real-time factor, and
@@ -129,7 +129,8 @@ module sets, selects one resident persona at a time, and clears generation
 caches on every switch. The remaining integration step is to load a configured
 adapter package root when the resident helper starts and carry `persona_id`
 over the serial Rust-to-Swift request protocol. Until admitted data has produced
-a validated package, the shipped request path continues to use Base ICL.
+a validated package, the shipped resident request path continues to use Base
+speaker-embedding conditioning with reference-code decoder context.
 
 Primary guidance: [Thinking Machines Lab, “LoRA Without Regret”](https://thinkingmachines.ai/blog/lora/).
 The Qwen-specific trainer is the pinned community companion above and remains
