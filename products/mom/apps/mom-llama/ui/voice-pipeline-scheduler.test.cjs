@@ -8,7 +8,6 @@ const {
   shouldDisableCallTranscriptSlotsAfterStop,
   canContinueVoiceHistoryRecovery,
   shouldWaitForVoiceHistoryRecovery,
-  replayDeferredPcm,
   createCallTranscriptIntent,
   enqueueCallTranscriptIntent,
 } = require("./voice-pipeline-scheduler.js");
@@ -81,26 +80,6 @@ test("foreground work gates recovery without awaiting metadata, but waits an act
   assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "metadata" }), false);
   assert.equal(shouldWaitForVoiceHistoryRecovery({ operation: "exact-operation", stage: "transcription" }), true);
   assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "recording_commit" }), true);
-});
-
-test("deferred PCM replay includes audio captured during settlement exactly once before handoff", async () => {
-  const captured = ["preroll", "onset"];
-  const enqueued = [];
-  let settlements = 0;
-  let handedOff = false;
-  const count = await replayDeferredPcm({
-    readChunks: (cursor) => captured.slice(cursor),
-    enqueue: (chunk) => enqueued.push(chunk),
-    settle: async () => {
-      settlements += 1;
-      if (settlements === 1) captured.push("during-push");
-    },
-    handoff: () => { handedOff = true; },
-  });
-  assert.deepEqual(enqueued, ["preroll", "onset", "during-push"]);
-  assert.equal(count, 3);
-  assert.equal(settlements, 2);
-  assert.equal(handedOff, true);
 });
 
 test("queued call transcript intents retain only durable identities and have a hard bound", () => {

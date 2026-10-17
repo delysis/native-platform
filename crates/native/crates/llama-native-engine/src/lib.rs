@@ -2371,9 +2371,13 @@ enum WorkerCommand {
         expected_revision: Option<u64>,
         response: Sender<NativeResult<Option<SequenceRestoreKind>>>,
     },
+    WarmAudioProjector {
+        response: Sender<NativeResult<bool>>,
+    },
     PrefillPrefix {
         request: SharedPrefixBatchRequest,
-        response: Sender<NativeResult<SequenceStateBlob>>,
+        expected_revision: Option<u64>,
+        response: Sender<NativeResult<Option<SequenceStateBlob>>>,
     },
     Tokenize {
         messages: Vec<ChatMessage>,
@@ -3156,10 +3160,53 @@ impl NativeModelHandle {
         })?
     }
 
+    /// Compile audio encoding without evaluating any language-model tokens or
+    /// changing resident conversation state. Serialized with normal projection.
+    pub fn warm_audio_projector(&self) -> NativeResult<bool> {
+        self.inner.ensure_accepting()?;
+        let (response_tx, response_rx) = bounded(1);
+        self.inner.send_command(
+            WorkerCommand::WarmAudioProjector {
+                response: response_tx,
+            },
+            "submitting audio projector warmup",
+        )?;
+        response_rx.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native model worker dropped the projector warmup response: {error}"),
+            )
+        })?
+    }
+
     pub fn prefill_shared_prefix(
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<SequenceStateBlob> {
+        self.prefill_shared_prefix_internal(request, None)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "unconditional prefill was skipped",
+                )
+            })
+    }
+
+    /// Prepares only if the inspected worker revision is still current. A
+    /// superseded background warm returns None without evicting any live state.
+    pub fn prefill_shared_prefix_if_revision(
+        &self,
+        request: SharedPrefixBatchRequest,
+        expected_revision: u64,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
+        self.prefill_shared_prefix_internal(request, Some(expected_revision))
+    }
+
+    fn prefill_shared_prefix_internal(
+        &self,
+        request: SharedPrefixBatchRequest,
+        expected_revision: Option<u64>,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
         self.require_unified_kv()?;
         self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
@@ -3170,6 +3217,7 @@ impl NativeModelHandle {
         self.inner.send_command(
             WorkerCommand::PrefillPrefix {
                 request,
+                expected_revision,
                 response: response_tx,
             },
             "submitting prefix prefill",
@@ -3880,6 +3928,7 @@ fn run_worker(
     let mut resident_audio_checkpoint: Option<ResidentAudioCheckpoint> = None;
     let mut resident_audio_text_prefix: Option<ResidentAudioTextPrefix> = None;
     let mut conversation_revision = 0_u64;
+    let mut audio_projector_warmed = false;
     let mut controlled_token_contract = None;
     let mut embedding_call_sequence = 0_u64;
     let mut controlled_call_sequence = 0_u64;
@@ -3913,9 +3962,11 @@ fn run_worker(
                 | WorkerCommand::InspectCommittedConversation { .. }
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Restore { .. }
+                | WorkerCommand::PrefillPrefix { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
+                | WorkerCommand::WarmAudioProjector { .. }
         ) {
             conversation_revision = conversation_revision.wrapping_add(1);
         }
@@ -3926,11 +3977,13 @@ fn run_worker(
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Restore { .. }
+                | WorkerCommand::PrefillPrefix { .. }
                 | WorkerCommand::InspectConversation { .. }
                 | WorkerCommand::InspectCommittedConversation { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
+                | WorkerCommand::WarmAudioProjector { .. }
         ) {
             invalidate_resident_audio_checkpoint(&mut context, &mut resident_audio_checkpoint);
         }
@@ -3953,6 +4006,7 @@ fn run_worker(
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
+                | WorkerCommand::WarmAudioProjector { .. }
         ) {
             invalidate_resident_audio_text_prefix(&mut context, &mut resident_audio_text_prefix);
         }
@@ -4959,7 +5013,28 @@ fn run_worker(
                 });
                 let _ = response.send(result.map(Some));
             }
-            WorkerCommand::PrefillPrefix { request, response } => {
+            WorkerCommand::WarmAudioProjector { response } => {
+                let result = if audio_projector_warmed {
+                    Ok(true)
+                } else {
+                    warm_projector_without_language_context(multimodal.as_ref())
+                };
+                if result.as_ref().is_ok_and(|warmed| *warmed) {
+                    audio_projector_warmed = true;
+                }
+                let _ = response.send(result);
+            }
+            WorkerCommand::PrefillPrefix {
+                request,
+                expected_revision,
+                response,
+            } => {
+                if expected_revision.is_some_and(|revision| revision != conversation_revision) {
+                    let _ = response.send(Ok(None));
+                    continue;
+                }
+                conversation_revision = conversation_revision.wrapping_add(1);
+                invalidate_resident_audio_checkpoint(&mut context, &mut resident_audio_checkpoint);
                 // The prefill owns the context after admission. Transfer the
                 // old authorities so an error cannot leave stale reuse claims.
                 let text = std::mem::take(&mut resident_text_prefix.token_ids);
@@ -5002,7 +5077,7 @@ fn run_worker(
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
                 }
-                let _ = response.send(result);
+                let _ = response.send(result.map(Some));
             }
             WorkerCommand::Tokenize {
                 messages,
@@ -5229,6 +5304,9 @@ fn reject_queued_command(command: WorkerCommand) {
         WorkerCommand::Restore { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
+        WorkerCommand::WarmAudioProjector { response } => {
+            let _ = response.send(Err(cancelled()));
+        }
         WorkerCommand::PrefillPrefix { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
@@ -5242,6 +5320,48 @@ fn reject_queued_command(command: WorkerCommand) {
             let _ = response.send(Err(cancelled()));
         }
     }
+}
+
+// Deliberately takes no LlamaContext: background warmup must never evict,
+// replay, or append conversation KV, including an interrupted audio checkpoint.
+fn warm_projector_without_language_context(projector: Option<&MtmdContext>) -> NativeResult<bool> {
+    let Some(projector) = projector
+        .filter(|projector| media_kinds_for_context(projector).contains(&MediaKind::Audio))
+    else {
+        return Ok(false);
+    };
+    let samples = (0..INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES)
+        .map(|index| {
+            let phase = index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0;
+            phase.sin() * 0.01
+        })
+        .collect::<Vec<_>>();
+    let bitmap = MtmdBitmap::from_audio_data(&samples).map_err(|error| {
+        native_decode_error("failed to construct projector warmup audio", error)
+    })?;
+    let chunks = projector
+        .tokenize(
+            MtmdInputText {
+                text: mtmd_default_marker().to_string(),
+                add_special: false,
+                parse_special: true,
+            },
+            &[&bitmap],
+        )
+        .map_err(|error| native_decode_error("failed to tokenize projector warmup audio", error))?;
+    let mut encoded = false;
+    for index in 0..chunks.len() {
+        let chunk = chunks
+            .get(index)
+            .ok_or_else(|| native_decode_error("missing projector warmup chunk", index))?;
+        if chunk.chunk_type() == MtmdInputChunkType::Audio {
+            projector
+                .encode_chunk(&chunk)
+                .map_err(|error| native_decode_error("failed to warm audio projector", error))?;
+            encoded = true;
+        }
+    }
+    Ok(encoded)
 }
 
 fn ensure_controlled_token_contract<'a>(
@@ -16262,6 +16382,23 @@ mod tests {
                 2 * 1024 * 1024 * 1024,
             )?
             .ok_or("snapshot exceeds test budget")?;
+        let before_projector_warm =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert!(handle.warm_audio_projector()?);
+        let after_projector_warm =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert_eq!(
+            after_projector_warm.revision,
+            before_projector_warm.revision
+        );
+        assert_eq!(
+            after_projector_warm.committed_prefix_tokens,
+            before_projector_warm.committed_prefix_tokens
+        );
+        assert!(
+            handle.resident_conversation_covers_cells(state.cells.clone())?,
+            "projector warmup must preserve the committed audio checkpoint"
+        );
         let audio_end = state
             .cells
             .iter()
@@ -16303,7 +16440,7 @@ mod tests {
         request.request_id = "audio-retention-next".into();
         request.input = GenerationInput::Chat {
             messages: vec![
-                prior,
+                prior.clone(),
                 ChatMessage {
                     role: ChatRole::User,
                     content: "Listen.\n\n[[native-media:recorded]]".into(),
@@ -16337,6 +16474,19 @@ mod tests {
                 2 * 1024 * 1024 * 1024,
             )?
             .ok_or("next capture lost committed checkpoint authority")?;
+        let before_cancelled_warm =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert!(handle.warm_audio_projector()?);
+        let after_cancelled_warm =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert_eq!(
+            after_cancelled_warm.revision,
+            before_cancelled_warm.revision
+        );
+        assert_eq!(
+            after_cancelled_warm.committed_prefix_tokens,
+            before_cancelled_warm.committed_prefix_tokens
+        );
         assert!(idle.token_count >= audio_end && idle.token_count <= state.token_count);
         assert!(state.cells.starts_with(&idle.cells));
         assert!(handle.resident_conversation_covers_cells(idle.cells.clone())?);
@@ -16349,6 +16499,42 @@ mod tests {
         assert!(
             handle.resident_conversation_covers_cells(idle.cells.clone())?,
             "conditional restore rejection must preserve the retained prefix"
+        );
+        let before_stale_prefill =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        let stale_prefill = handle.prefill_shared_prefix_if_revision(
+            SharedPrefixBatchRequest {
+                request_id: "stale-audio-retention-prefill".into(),
+                model_id: request.model_id.clone(),
+                common_messages: vec![prior.clone()],
+                branches: vec![BranchRequest {
+                    branch_id: "stale-prefill".into(),
+                    label: "Stale prefill".into(),
+                    instruction: String::new(),
+                    sampling: request.sampling.clone(),
+                    messages: Vec::new(),
+                    cached_prefix: None,
+                }],
+                chat_template: ChatTemplateChoice::PreferNonThinking,
+                cached_prefix: None,
+            },
+            inspected.revision,
+        )?;
+        assert!(
+            stale_prefill.is_none(),
+            "a stale conditional prefill must not run after newer worker activity"
+        );
+        let after_stale_prefill =
+            handle.inspect_resident_conversation(Some("audio-retention-first"))?;
+        assert_eq!(after_stale_prefill.revision, before_stale_prefill.revision);
+        assert_eq!(
+            after_stale_prefill.committed_prefix_tokens,
+            before_stale_prefill.committed_prefix_tokens,
+            "stale prefill must preserve the latest committed conversation"
+        );
+        assert!(
+            handle.resident_conversation_covers_cells(idle.cells.clone())?,
+            "stale prefill must preserve the retained audio checkpoint"
         );
         drop(idle);
         let next = handle.generate_incremental_audio(request.clone())?;
@@ -16508,21 +16694,27 @@ mod tests {
         };
         // Cache-only preparation must seed the microphone route even when
         // the serialized snapshot is not retained by the runtime's RAM LRU.
-        let prepared = handle.prefill_shared_prefix(SharedPrefixBatchRequest {
-            request_id: "native-prepare-to-audio".into(),
-            model_id: model_id.clone(),
-            common_messages: vec![prior_user.clone()],
-            branches: vec![BranchRequest {
-                branch_id: "prepare".into(),
-                label: "Prepare".into(),
-                instruction: String::new(),
-                sampling: sampling.clone(),
-                messages: Vec::new(),
-                cached_prefix: None,
-            }],
-            chat_template: ChatTemplateChoice::PreferNonThinking,
-            cached_prefix: None,
-        })?;
+        let prepare_revision = handle.inspect_resident_conversation(None)?.revision;
+        let prepared = handle
+            .prefill_shared_prefix_if_revision(
+                SharedPrefixBatchRequest {
+                    request_id: "native-prepare-to-audio".into(),
+                    model_id: model_id.clone(),
+                    common_messages: vec![prior_user.clone()],
+                    branches: vec![BranchRequest {
+                        branch_id: "prepare".into(),
+                        label: "Prepare".into(),
+                        instruction: String::new(),
+                        sampling: sampling.clone(),
+                        messages: Vec::new(),
+                        cached_prefix: None,
+                    }],
+                    chat_template: ChatTemplateChoice::PreferNonThinking,
+                    cached_prefix: None,
+                },
+                prepare_revision,
+            )?
+            .ok_or("uncontended conditional prefix prefill was skipped")?;
         let prepared_audio = handle.generate_incremental_audio(GenerationRequest {
             request_id: "native-prepared-first-audio".into(),
             model_id: model_id.clone(),

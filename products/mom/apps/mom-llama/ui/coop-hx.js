@@ -2243,7 +2243,7 @@
       throw error;
     }
     if (!isCurrent()) return false;
-    if (response?.status === "blocked" || !response?.result) {
+    if (response?.status === "blocked" || !response?.result?.audio_projector_warmed) {
       const error = new Error(response?.blocker?.message || "The selected contact could not be prepared for voice.");
       markVoiceLatency("call_persona_prepare_failed", {
         persona_id: recipientId,
@@ -2515,11 +2515,11 @@
       modal.dataset.callState = "ringing";
       modal.setAttribute("aria-label", `Calling ${name}`);
       markVoiceLatency("call_ringing_started");
-      const warm = await warmReady;
+      await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
-      if (warm.status !== "ready" || !warm.model_loaded || !warm.audio_projector_warmed) {
-        throw new Error(warm.message || "The voice model did not become ready for the call.");
-      }
+      // Startup is opportunistic and can be superseded by foreground model
+      // selection. The exact conversation preparation below owns call readiness
+      // and warms its own audio encoder; a stale startup failure is not final.
       let conversation = selectedConversation();
       if (conversation === "default") {
         const started = await invoke("mom_llama_conversation_draft_call_start");
@@ -4902,6 +4902,7 @@
       "native_capture_started",
       "capture_stopped",
       "capture_processing",
+      "voice_inference_archive",
       "native_capture_failed",
       "generation_dispatched",
       "speculation_dispatch_started",
@@ -6140,41 +6141,38 @@
 
   // Live inference and its retained derivative share the same integer PCM16
   // samples; the policy module owns the canonical quantizer/encoder.
-  const { quantizeInferencePcm16, truncateInferencePcm16, encodeInferencePcm16Wav }
+  const { quantizeInferencePcm16, truncateInferencePcm16, encodeInferencePcm16Wav,
+    appendInferenceSourceRange, sliceInferenceSourceRanges, inferenceSourceOffset }
     = globalThis.MomVoiceCapturePolicy;
 
   const voiceModePrompt = (call) => call
     ? "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
     : "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
 
-  const enqueueVoicePrefill = (recording, samples, flush = false, deferredReplay = false) => {
-    if (recording.prefillDeferred && !deferredReplay) return;
+  const enqueueVoicePrefill = (recording, samples, flush = false,
+    sourceStart = recording.capturedSamples - (samples?.length || 0)) => {
     if (recording.prefillFailed || (!samples?.length && !flush)) return;
     if (samples?.length) {
+      if (!Number.isSafeInteger(sourceStart) || sourceStart < recording.prefillLastSourceEnd
+          || sourceStart + samples.length > recording.capturedSamples) {
+        throw new Error("Voice prefill does not match the captured source.");
+      }
+      if (recording.prefillInputStartSample === null) recording.prefillInputStartSample = sourceStart;
+      appendInferenceSourceRange(recording.prefillSourceRanges, sourceStart, samples.length);
+      recording.prefillLastSourceEnd = sourceStart + samples.length;
       recording.prefillParts.push(samples);
       recording.prefillSamples += samples.length;
     }
-    // Keep publication aligned with the projector's 40 ms audio frame; an
-    // onset-of-silence flush still sends any short tail immediately.
-    if (!flush && recording.prefillSamples < 640) return;
-    if (!recording.prefillSamples) return;
-    const block = mergeFloat32(recording.prefillParts);
-    recording.prefillParts = [];
-    recording.prefillSamples = 0;
-    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block)
-      .map((chunk) => quantizeInferencePcm16(chunk));
-    const queuedSamples = blocks.reduce((count, chunk) => count + chunk.pcm16.length, 0);
     // The native consumer has a 30-second ring. Bound the browser IPC queue
-    // to the same capacity; the complete physical recording remains available
-    // for the explicit fallback if this producer cannot keep up.
+    // and deferred caller input together; keep the physical archive separate.
     const queueLimitSamples = 16_000 * 30;
-    if (recording.prefillQueuedSamples + queuedSamples > queueLimitSamples) {
+    if (recording.prefillQueuedSamples + recording.prefillSamples > queueLimitSamples) {
       recording.prefillFailed = true;
       recording.modelInputReliable = false;
       recording.prefillEpoch += 1;
       markVoiceLatencyIn(recording.trace, "audio_prefill_producer_overflow", {
         queued_samples: recording.prefillQueuedSamples,
-        incoming_samples: queuedSamples,
+        incoming_samples: recording.prefillSamples,
         limit_samples: queueLimitSamples,
       });
       void recording.prefillSession.then((live) => live?.session
@@ -6182,6 +6180,24 @@
         : null).catch(() => {});
       return;
     }
+    // Queue only VAD-admitted caller input during compute handoff. Replaying
+    // all captured PCM here used to insert playback and idle room audio, then
+    // lose the exact derivative when its guessed contiguous origin disagreed.
+    if (recording.prefillDeferred || (!flush && recording.prefillSamples < 640)
+        || !recording.prefillSamples) return;
+    const block = mergeFloat32(recording.prefillParts);
+    const sourceRanges = recording.prefillSourceRanges;
+    recording.prefillParts = [];
+    recording.prefillSourceRanges = [];
+    recording.prefillSamples = 0;
+    let blockOffset = 0;
+    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block).map((chunk) => {
+      const quantized = quantizeInferencePcm16(chunk);
+      const ranges = sliceInferenceSourceRanges(sourceRanges, blockOffset, chunk.length);
+      blockOffset += chunk.length;
+      return { ...quantized, ranges };
+    });
+    const queuedSamples = block.length;
     recording.prefillQueuedSamples += queuedSamples;
     recording.prefillQueueHighWaterSamples = Math.max(
       recording.prefillQueueHighWaterSamples, recording.prefillQueuedSamples);
@@ -6200,6 +6216,10 @@
         if (recording.prefillEpoch !== epoch) return;
         recording.modelInputPcm16Parts.push(chunk.pcm16);
         recording.modelInputSampleCount += chunk.pcm16.length;
+        for (const range of chunk.ranges) {
+          appendInferenceSourceRange(recording.modelInputSourceRanges,
+            range.start, range.end_exclusive - range.start);
+        }
         recording.prefillPushes += 1;
         recording.prefillAcceptedSamples += chunk.pcm16.length;
         const pushMs = performance.now() - pushStarted;
@@ -6726,17 +6746,22 @@
     }
     await recording.pushChain;
     const modelInputWavBytes = recording.modelInputReliable && !recording.prefillFailed
-      && Number.isSafeInteger(recording.prefillInputStartSample)
-      && recording.prefillInputStartSample + recording.modelInputSampleCount <= recording.capturedSamples
+      && recording.modelInputSourceRanges.length > 0
       ? encodeInferencePcm16Wav(recording.modelInputPcm16Parts, recording.modelInputSampleCount)
       : null;
+    markVoiceLatencyIn(recording.trace, "voice_inference_archive", {
+      source_samples: recording.capturedSamples,
+      accepted_samples: recording.modelInputSampleCount,
+      source_ranges: recording.modelInputSourceRanges.length,
+      exact_derivative: Boolean(modelInputWavBytes),
+    });
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
       transcription: recording.transcription,
       trace: recording.trace,
       modelInputWavBytes,
-      modelInputStartSample: recording.prefillInputStartSample,
+      modelInputSourceRanges: recording.modelInputSourceRanges,
       modelInputSampleCount: recording.modelInputSampleCount,
       sourceSampleCount: recording.capturedSamples,
       // The saved turn is the physical microphone stream. Editing it here
@@ -6804,6 +6829,7 @@
       transcription,
       capturedSamples: 0, prefillInputStartSample: null,
       modelInputPcm16Parts: [], modelInputSampleCount: 0, modelInputReliable: true,
+      modelInputSourceRanges: [], prefillSourceRanges: [], prefillLastSourceEnd: 0,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
       resampler: globalThis.MomVoiceCapturePolicy.createStreamingMonoResampler(context.sampleRate),
@@ -6875,33 +6901,19 @@
         recording.prefillPending = true;
         recording.prefillFailed = false;
         recording.prefillSession = Promise.resolve(live);
-        let replayedParts = 0;
-        replayedParts = await globalThis.MomVoicePipelineScheduler.replayDeferredPcm({
-          readChunks: (cursor) => recording.capturedPcm.slice(cursor),
-          enqueue: (part) => enqueueVoicePrefill(recording, part, false, true),
-          settle: async () => {
-            await recording.pushChain;
-            if (recording.prefillFailed) throw new Error("voice_deferred_pcm_replay_failed");
-          },
-          // The cursor check and this synchronous handoff run in one JS turn.
-          // Any later audio callback therefore queues directly after the
-          // already replayed PCM, with no gap or duplicate.
-          handoff: () => {
-            recording.prefillDeferred = false;
-            recording.prefillPending = false;
-            recording.prefillRetryPending = false;
-          },
-        }).catch((error) => {
-          recording.prefillFailed = true;
-          markVoiceLatencyIn(recording.trace, "audio_prefill_deferred_pcm_replay_failed", {
-            message: errorMessage(error),
-          });
-          throw error;
-        });
+        // The deferred queue contains only source ranges admitted by the
+        // detector. Attach it synchronously before awaiting IPC so later
+        // callbacks append in order, without replaying the physical archive.
+        recording.prefillDeferred = false;
+        recording.prefillPending = false;
+        recording.prefillRetryPending = false;
+        const replayedSamples = recording.prefillSamples;
+        enqueueVoicePrefill(recording, new Float32Array(), true);
+        await recording.pushChain;
         if (recording.prefillFailed) return false;
         markVoiceLatencyIn(recording.trace, "audio_prefill_deferred_pcm_replayed", {
-          samples: recording.capturedSamples,
-          chunks: replayedParts,
+          samples: replayedSamples,
+          captured_samples: recording.capturedSamples,
         });
         return true;
       })();
@@ -6997,10 +7009,6 @@
       // replay only the PCM beyond the native audio checkpoint.
       if (!recording.speculation && analysis.hadVoiced) {
         if (!previousActivity.heardVoice) {
-          if (recording.prefillInputStartSample === null) {
-            recording.prefillInputStartSample = Math.max(0,
-              recording.capturedSamples - recording.preRollSamples - pcm.length);
-          }
           interruptCallPlaybackForSpeech(recording, {
             producer: "browser_capture",
             onset_sample: analysis.voiceOnsetSample,
@@ -7022,7 +7030,11 @@
               });
             });
           }
-          recording.preRoll.forEach((part) => enqueueVoicePrefill(recording, part));
+          let preRollStart = recording.capturedSamples - pcm.length - recording.preRollSamples;
+          recording.preRoll.forEach((part) => {
+            enqueueVoicePrefill(recording, part, false, preRollStart);
+            preRollStart += part.length;
+          });
           recording.preRoll = [];
           recording.preRollSamples = 0;
           markVoiceLatencyIn(recording.trace, "voice_activity_first_detected", {
@@ -7222,19 +7234,19 @@
     }
     recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
     const captured = mergeFloat32(recording.capturedPcm);
-    const origin = recording.prefillInputStartSample ?? 0;
     const resumeOffset = Number(replacement.resume_sample_offset || 0);
-    if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0
-        || origin + resumeOffset > captured.length) {
-      throw new Error("The voice checkpoint is outside the captured audio.");
+    const sourceOffset = recording.modelInputSourceRanges.length
+      ? inferenceSourceOffset(recording.modelInputSourceRanges, resumeOffset)
+      : (resumeOffset === 0 ? recording.prefillInputStartSample : null);
+    if (!Number.isSafeInteger(sourceOffset) || sourceOffset < 0 || sourceOffset > captured.length
+        || resumeOffset > recording.modelInputSampleCount) {
+      throw new Error("The voice checkpoint is outside the acknowledged audio.");
     }
-    if ((recording.modelInputSampleCount || 0) < resumeOffset) {
-      recording.modelInputReliable = false;
-    } else {
-      truncateInferencePcm16(recording, resumeOffset);
-    }
-    const priorAudio = captured.subarray(origin + resumeOffset);
+    truncateInferencePcm16(recording, resumeOffset);
+    const priorAudio = captured.subarray(sourceOffset);
     recording.prefillParts = [];
+    recording.prefillSourceRanges = [];
+    recording.prefillLastSourceEnd = sourceOffset;
     recording.prefillSamples = 0;
     recording.prefillQueuedSamples = 0;
     recording.prefillQueueHighWaterSamples = 0;
@@ -7252,7 +7264,7 @@
       conversation: replacement.conversation_id || voiceCallConversation || recording.sourceConversation,
       begin_metrics: replacement.begin_metrics || null,
     });
-    enqueueVoicePrefill(recording, priorAudio, true);
+    enqueueVoicePrefill(recording, priorAudio, true, sourceOffset);
     markVoiceLatencyIn(recording.trace, "speculation_handoff_replay_enqueued", {
       checkpoint_samples: resumeOffset,
       replay_samples: priorAudio.length,

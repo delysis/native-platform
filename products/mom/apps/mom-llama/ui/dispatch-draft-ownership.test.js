@@ -104,6 +104,7 @@ test("call persona preparation is awaited, epoch-bound, and required before gree
       return {
         status: "prompt_smoke_verified",
         result: {
+          audio_projector_warmed: true,
           metadata: { id: "prepared-prefix" },
           prefill_us: 17,
           verification_us: 29,
@@ -144,6 +145,29 @@ test("call persona preparation is awaited, epoch-bound, and required before gree
   await assert.rejects(blockedContext.prepareVoicePersonaForCall("contact-a", epoch), /persona unavailable/);
   assert.deepEqual(blockedStages, ["call_persona_prepare_started", "call_persona_prepare_failed"]);
 
+  const coldEncoderStages = [];
+  const coldEncoderContext = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    performance: { now: () => 1 },
+    errorMessage: (error) => error.message,
+    markVoiceLatency: (stage) => coldEncoderStages.push(stage),
+    invoke: async () => ({
+      status: "resident_prefix_prepared",
+      result: { audio_projector_warmed: false, resident_prefix_tokens: 76 },
+    }),
+  };
+  vm.createContext(coldEncoderContext);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.prepareVoicePersonaForCall = prepareVoicePersonaForCall;`,
+    coldEncoderContext,
+  );
+  await assert.rejects(
+    coldEncoderContext.prepareVoicePersonaForCall("chat-a", epoch),
+    /could not be prepared for voice/,
+  );
+  assert.deepEqual(coldEncoderStages, ["call_persona_prepare_started", "call_persona_prepare_failed"]);
+
   let resolvePreparation;
   const staleStages = [];
   const staleEpoch = {};
@@ -171,7 +195,83 @@ test("call persona preparation is awaited, epoch-bound, and required before gree
   const openEnd = source.indexOf("\n  const closeVoiceCallSurface = async", openStart);
   const open = source.slice(openStart, openEnd);
   assert.ok(open.indexOf("const recipientId = recipient.dataset.recipientId") < open.indexOf("await prepareVoicePersonaForCall"));
+  assert.ok(open.indexOf("await warmReady") < open.indexOf("await prepareVoicePersonaForCall"));
+  assert.ok(!/if\s*\(warm\.status/.test(open), "a failed opportunistic startup warm must not reject a call before exact conversation preparation");
   assert.ok(open.indexOf("await prepareVoicePersonaForCall") < open.indexOf("await startStreamedCallGreeting"));
+});
+
+test("failed startup warm still admits a call only after the exact conversation encoder is ready", async () => {
+  const openStart = source.indexOf("  const openVoiceCallSurface = async");
+  const warmStart = source.indexOf("      await warmReady;", openStart);
+  const catchStart = source.indexOf("\n    } catch (error)", warmStart);
+  const helperStart = source.indexOf("  const prepareVoicePersonaForCall = async");
+  const helperEnd = source.indexOf("\n  const startStreamedCallGreeting", helperStart);
+  assert.ok(openStart >= 0 && warmStart > openStart && catchStart > warmStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const admission = source.slice(warmStart, catchStart);
+
+  const makeContext = (encoderWarmed, warmReady = Promise.resolve({
+    status: "blocked",
+    message: "startup used a different profile",
+  })) => {
+    const stages = [];
+    const calls = [];
+    const greetings = [];
+    const epoch = {};
+    const context = {
+      voiceCallEpoch: epoch,
+      voiceCallActive: true,
+      voiceCallConversation: null,
+      voiceLatencyTrace: { mode: "call_greeting" },
+      warmReady,
+      performance: { now: () => 1 },
+      errorMessage: (error) => error.message,
+      markVoiceLatency: (stage) => stages.push(stage),
+      selectedConversation: () => "chat-frozen-profile",
+      selectedConversationKind: () => "chat",
+      startStreamedCallGreeting: async (...args) => greetings.push(args),
+      invoke: async (command, args) => {
+        calls.push([command, args]);
+        return {
+          status: "resident_prefix_prepared",
+          result: { audio_projector_warmed: encoderWarmed, resident_prefix_tokens: 76 },
+        };
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext(
+      `${source.slice(helperStart, helperEnd)}\nconst epoch = voiceCallEpoch;\nasync function runAdmission() {\n${admission}\n}\nthis.runAdmission = runAdmission;`,
+      context,
+    );
+    return { context, calls, greetings, stages, epoch };
+  };
+
+  const ready = makeContext(true);
+  await ready.context.runAdmission();
+  assert.equal(ready.calls.length, 1);
+  assert.equal(ready.calls[0][0], "mom_llama_voice_persona_prepare");
+  assert.equal(ready.calls[0][1].personaId, "chat-frozen-profile");
+  assert.deepEqual(ready.greetings, [[ready.epoch, "chat-frozen-profile"]]);
+  assert.deepEqual(ready.stages, [
+    "call_conversation_ready",
+    "call_persona_prepare_started",
+    "call_persona_prepare_completed",
+  ]);
+
+  const cold = makeContext(false);
+  await assert.rejects(cold.context.runAdmission(), /could not be prepared for voice/);
+  assert.equal(cold.calls.length, 1);
+  assert.deepEqual(cold.greetings, [], "a ready startup result cannot bypass the exact conversation encoder check");
+
+  let settleWarm;
+  const stale = makeContext(true, new Promise((resolve) => { settleWarm = resolve; }));
+  const pendingAdmission = stale.context.runAdmission();
+  await Promise.resolve();
+  stale.context.voiceCallEpoch = {};
+  settleWarm({ status: "blocked", message: "startup was superseded" });
+  await pendingAdmission;
+  assert.equal(stale.calls.length, 0, "a superseded call must not prepare a model");
+  assert.deepEqual(stale.greetings, [], "a superseded call must not greet");
 });
 
 test("call persona preparation stops when its epoch changes while native preparation is pending", async () => {

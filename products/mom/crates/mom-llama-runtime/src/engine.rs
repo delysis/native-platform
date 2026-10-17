@@ -5,15 +5,14 @@ use crate::config::{
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, ConversationDb, ConversationKind, DraftRecipients,
 };
-use crate::native_runtime::{resident_model, resident_slots, resident_status};
+use crate::native_runtime::{
+    resident_model, resident_model_for_profile, resident_slots, resident_status,
+};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
-use llama_native_types::{
-    ChatMessage, ChatRole, ChatTemplateChoice, GenerationInput, GenerationRequest, MediaKind,
-    NativeModelLoadMetrics, SamplingConfig,
-};
+use llama_native_types::{MediaKind, NativeModelLoadMetrics};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,13 +77,25 @@ pub fn runtime_warm_until_cancelled(
         ));
     }
     let settings_started = std::time::Instant::now();
-    let settings = resolve_settings()?;
+    let mut settings = resolve_settings()?;
+    let selected_context = selected_voice_context_to_warm(&mut settings);
     let settings_us = settings_started
         .elapsed()
         .as_micros()
         .min(u128::from(u64::MAX)) as u64;
     let acquire_started = std::time::Instant::now();
-    let handle = match resident_model(scope, &settings) {
+    // Background startup may fill an available slot, but must never replace
+    // an already resident foreground model via explicit slot-zero loading.
+    let acquired = match settings.model_path.as_deref() {
+        Some(model_path) => resident_model_for_profile(
+            scope,
+            &settings,
+            model_path,
+            settings.mmproj_path.as_deref(),
+        ),
+        None => resident_model(scope, &settings),
+    };
+    let handle = match acquired {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -155,9 +166,9 @@ pub fn runtime_warm_until_cancelled(
     let (persona_prefixes_ready, persona_prefixes_reused, persona_prefix_warm_status) =
         if audio_projector_warmed && !cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
         {
-            match selected_voice_persona_to_warm() {
+            match selected_context {
                 Ok(Some(persona_id)) => {
-                    match crate::kv_cache::kv_cache_prepare_voice_persona_resident(
+                    match crate::kv_cache::prepare_startup_voice_context_resident(
                         scope,
                         &persona_id,
                     ) {
@@ -199,7 +210,7 @@ pub fn runtime_warm_until_cancelled(
     ))
 }
 
-fn selected_voice_persona_to_warm() -> Result<Option<String>> {
+fn selected_voice_context_to_warm(settings: &mut Settings) -> Result<Option<String>> {
     let store = RuntimeStore::current()?;
     let db: ConversationDb = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
     let draft = if db.selected_conversation_id.as_deref() == Some("default") {
@@ -207,10 +218,22 @@ fn selected_voice_persona_to_warm() -> Result<Option<String>> {
     } else {
         DraftRecipients::default()
     };
-    Ok(selected_voice_persona_id(&db, &draft))
+    let context_id = selected_voice_context_id(&db, &draft);
+    if let Some(context) = context_id
+        .as_ref()
+        .and_then(|id| db.conversations.iter().find(|context| &context.id == id))
+    {
+        crate::chat::apply_conversation_model_pair(
+            settings,
+            context.execution_profile.model_path.clone(),
+            context.selected_model_path.clone(),
+            context.execution_profile.mmproj_path.clone(),
+        );
+    }
+    Ok(context_id)
 }
 
-fn selected_voice_persona_id(db: &ConversationDb, draft: &DraftRecipients) -> Option<String> {
+fn selected_voice_context_id(db: &ConversationDb, draft: &DraftRecipients) -> Option<String> {
     let selected = db.selected_conversation_id.as_deref()?;
     if selected == "default" {
         return (draft.recipient_ids.len() == 1).then(|| draft.recipient_ids[0].clone());
@@ -218,7 +241,10 @@ fn selected_voice_persona_id(db: &ConversationDb, draft: &DraftRecipients) -> Op
     let conversation = db.conversations.iter().find(|item| item.id == selected)?;
     match conversation.kind {
         ConversationKind::PersonaTemplate => Some(conversation.id.clone()),
-        ConversationKind::Chat => conversation.source_conversation_id.clone(),
+        ConversationKind::Chat => conversation
+            .source_conversation_id
+            .as_ref()
+            .map(|_| conversation.id.clone()),
     }
 }
 
@@ -260,60 +286,16 @@ fn runtime_warm_result(
     )
 }
 
-/// Compile the audio projector and its first recurrent-model evaluation before
-/// the application advertises voice readiness. Loading GGUF weights alone does
-/// not compile Metal pipelines; without this probe the caller's first 40 ms
-/// frame can stall for hundreds of milliseconds after they stop speaking.
+/// Compile audio encoding before voice readiness without changing live KV.
 fn warm_audio_projector(
     handle: &llama_native_engine::NativeModelHandle,
     cancellation: Option<&AtomicBool>,
 ) -> Result<bool> {
-    let sampling = SamplingConfig {
-        max_tokens: 1,
-        temperature: 0.0,
-        ..SamplingConfig::default()
-    };
-    let generation = handle.generate_incremental_audio(GenerationRequest {
-        request_id: format!("runtime-audio-warm-{}", uuid::Uuid::new_v4()),
-        model_id: handle.status().model_id,
-        input: GenerationInput::Chat {
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "Warm the live audio path.".to_string(),
-            }],
-            template: ChatTemplateChoice::PreferNonThinking,
-        },
-        sampling,
-        media: Vec::new(),
-        cached_prefix: None,
-    })?;
-    generation.wait_for_resume()?;
-    let frame = (0..640)
-        .map(|index| {
-            let phase = index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0;
-            phase.sin() * 0.01
-        })
-        .collect::<Vec<_>>();
-    generation.push_pcm(&frame)?;
-    generation.seal_input()?;
-    let monitor = generation.monitor();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while monitor.stats().projected_blocks == 0 {
-        if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
-            generation.cancel();
-            let _ = generation.finish().and_then(|ticket| ticket.wait());
-            return Ok(false);
-        }
-        if std::time::Instant::now() >= deadline {
-            generation.cancel();
-            let _ = generation.finish().and_then(|ticket| ticket.wait());
-            anyhow::bail!("the live audio projector did not warm before its bounded deadline");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    if cancellation.is_some_and(|control| control.load(Ordering::Acquire)) {
+        return Ok(false);
     }
-    generation.cancel();
-    let _ = generation.finish().and_then(|ticket| ticket.wait());
-    Ok(true)
+    let warmed = handle.warm_audio_projector()?;
+    Ok(warmed && !cancellation.is_some_and(|control| control.load(Ordering::Acquire)))
 }
 
 pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
@@ -511,7 +493,7 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_warm_until_cancelled, selected_voice_persona_id, validate_model_path};
+    use super::{runtime_warm_until_cancelled, selected_voice_context_id, validate_model_path};
     use crate::conversation_store::{ConversationDb, DraftRecipients};
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
@@ -532,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_warms_only_the_selected_contact() {
+    fn launch_warms_only_the_selected_voice_context() {
         let mut db = ConversationDb::default();
         let draft = DraftRecipients {
             recipient_ids: vec!["persona-janina".into()],
@@ -540,27 +522,27 @@ mod tests {
         };
         db.selected_conversation_id = Some("default".into());
         assert_eq!(
-            selected_voice_persona_id(&db, &draft).as_deref(),
+            selected_voice_context_id(&db, &draft).as_deref(),
             Some("persona-janina")
         );
         db.selected_conversation_id = Some("chat-janina".into());
         db.conversations.push(
             serde_json::from_value(serde_json::json!({
                 "id": "chat-janina", "title": "Janina", "created_at": "1", "updated_at": "1",
-                "kind": "chat", "selected_model_path": null,
+                "kind": "chat", "selected_model_path": "/models/frozen-chat.gguf",
                 "source_conversation_id": "persona-janina"
             }))
             .expect("chat fixture"),
         );
         assert_eq!(
-            selected_voice_persona_id(&db, &DraftRecipients::default()).as_deref(),
-            Some("persona-janina")
+            selected_voice_context_id(&db, &DraftRecipients::default()).as_deref(),
+            Some("chat-janina")
         );
         db.selected_conversation_id = Some("other-chat".into());
-        assert_eq!(selected_voice_persona_id(&db, &draft), None);
+        assert_eq!(selected_voice_context_id(&db, &draft), None);
         db.selected_conversation_id = Some("default".into());
         assert_eq!(
-            selected_voice_persona_id(&db, &DraftRecipients::default()),
+            selected_voice_context_id(&db, &DraftRecipients::default()),
             None
         );
     }

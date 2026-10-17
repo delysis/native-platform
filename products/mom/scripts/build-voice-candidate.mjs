@@ -4,15 +4,25 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, delimiter, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..'));
+// CONTRIBUTING.md and supported CI/release workflows pin Node 22. Reject other
+// majors before creating the output directory or writing any candidate receipt.
+const pinnedNodeMajor = 22;
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (nodeMajor !== pinnedNodeMajor) {
+  throw new Error(`Node ${pinnedNodeMajor}.x is required; found ${process.version}`);
+}
 const [receiptPath, outputPath] = process.argv.slice(2);
 if (!receiptPath || !outputPath || process.argv.length !== 4) {
   throw new Error('Usage: node products/mom/scripts/build-voice-candidate.mjs <local-ci/summary.json> <new-output-directory>');
 }
 if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('Apple Silicon macOS required');
+const sysctl = '/usr/sbin/sysctl';
+const swVers = '/usr/bin/sw_vers';
+if (!existsSync(sysctl) || !existsSync(swVers)) throw new Error('Required macOS identity tools are absent');
 // Resolve the existing parent before any write: an outside-looking symlink
 // must not redirect a candidate or its evidence into this checkout.
 const requestedOutput = resolve(outputPath);
@@ -22,7 +32,7 @@ if (output === root || output.startsWith(`${root}/`)) throw new Error('Candidate
 for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) {
   if (process.env[key]) throw new Error(`Unset ${key}`);
 }
-const read = (command, args, cwd = root) => execFileSync(command, args, { cwd, encoding: 'utf8' }).trim();
+const read = (command, args, cwd = root, env = process.env) => execFileSync(command, args, { cwd, env, encoding: 'utf8' }).trim();
 const git = (...args) => read('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args]);
 function source() {
   if (git('status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')) throw new Error('Source must be clean');
@@ -41,15 +51,33 @@ if (receipt.status !== 'component-pass' || !receipt.source_unchanged || !receipt
 }
 const cargo = read('rustup', ['which', '--toolchain', '1.95.0', 'cargo']);
 const rustc = read('rustup', ['which', '--toolchain', '1.95.0', 'rustc']);
+const nodeDirectory = dirname(realpathSync(process.execPath));
+const npx = join(nodeDirectory, 'npx');
+if (!existsSync(npx)) throw new Error(`Pinned Node installation has no npx: ${npx}`);
 const env = { ...process.env, RUSTUP_TOOLCHAIN: '1.95.0', CARGO: cargo, RUSTC: rustc,
-  PATH: `${dirname(cargo)}:${process.env.PATH}`, MOM_LLAMA_DATA_NAMESPACE: dataNamespace };
+  PATH: [nodeDirectory, dirname(cargo), process.env.PATH || ''].filter(Boolean).join(delimiter),
+  MOM_LLAMA_DATA_NAMESPACE: dataNamespace };
+// Resolve and validate all tool identities before the first output write. The
+// pinned Node directory leads PATH so npx/pnpm child scripts cannot drift to a
+// different `node` even if the caller's PATH does.
+const pnpmVersion = read(npx, ['--offline', '--yes=false', 'pnpm@11.16.0', '--version'], root, env);
+if (pnpmVersion !== '11.16.0') throw new Error(`Pinned pnpm 11.16.0 required; found ${pnpmVersion}`);
+const tools = {
+  node: { version: process.version, path: realpathSync(process.execPath) },
+  cargo: { version: read(cargo, ['--version'], root, env), path: realpathSync(cargo) },
+  rustc: { version: read(rustc, ['--version'], root, env), path: realpathSync(rustc) },
+  pnpm: { package: 'pnpm@11.16.0', version: pnpmVersion, node_version: process.version, npx_path: realpathSync(npx) }
+};
+const hardware = read(sysctl, ['-n', 'hw.model'], root, env);
+const os = read(swVers, ['-buildVersion'], root, env);
 mkdirSync(output, { recursive: true });
 const manifest = { bundle_identifier: bundleIdentifier, status: 'incomplete', source: before, started: new Date().toISOString(),
   data_namespace: dataNamespace,
   data_directory_policy: 'compiled namespace is appended only to the default fallback; LLAMA_NATIVE_KIT_DATA_DIR takes precedence',
   build_profile: 'release',
+  tools,
   component_receipt: resolve(receiptPath), component_receipt_sha256: createHash('sha256').update(receiptBytes).digest('hex'),
-  hardware: read('sysctl', ['-n', 'hw.model']), os: read('sw_vers', ['-buildVersion']),
+  hardware, os,
   acceptance: { packaged_voice: 'pending', physical_echo_double_talk: 'pending', m2: 'pending', thirty_minute_soak: 'pending' } };
 const publish = () => writeFileSync(join(output, 'candidate.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 publish();
@@ -60,7 +88,7 @@ try {
     // Tauri builds release by default. Keep the final latency candidate on the
     // optimized path; debug crypto makes multi-gigabyte state persistence
     // timings unrepresentative.
-    build = spawnSync('npx', ['--offline', '--yes=false', 'pnpm@11.16.0', '--filter', '@delysis/mom-llama', 'exec', 'tauri', 'build', '--bundles', 'app', '--config', JSON.stringify({ identifier: bundleIdentifier })],
+    build = spawnSync(npx, ['--offline', '--yes=false', 'pnpm@11.16.0', '--filter', '@delysis/mom-llama', 'exec', 'tauri', 'build', '--bundles', 'app', '--config', JSON.stringify({ identifier: bundleIdentifier })],
       { cwd: root, env, stdio: ['ignore', log, log] });
   } finally { closeSync(log); }
   if (build.error || build.status !== 0) throw new Error(`Candidate build failed: ${build.error?.message || build.status}; preserve build.log`);

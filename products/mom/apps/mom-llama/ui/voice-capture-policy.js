@@ -41,6 +41,45 @@
     return { pcm16, decoded };
   };
 
+  const appendInferenceSourceRange = (ranges, start, count) => {
+    if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count <= 0
+        || !Number.isSafeInteger(start + count)) throw new Error("Invalid inference source range");
+    const previous = ranges[ranges.length - 1];
+    if (previous && start < previous.end_exclusive) throw new Error("Inference source ranges overlap");
+    if (previous?.end_exclusive === start) previous.end_exclusive += count;
+    else ranges.push({ start, end_exclusive: start + count });
+  };
+
+  const sliceInferenceSourceRanges = (ranges, offset, count) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(count) || count < 0) {
+      throw new Error("Invalid inference source slice");
+    }
+    const result = [];
+    for (const range of ranges) {
+      const length = range.end_exclusive - range.start;
+      if (offset >= length) { offset -= length; continue; }
+      const take = Math.min(count, length - offset);
+      if (take) appendInferenceSourceRange(result, range.start + offset, take);
+      count -= take;
+      offset = 0;
+      if (!count) break;
+    }
+    if (count) throw new Error("Inference source slice exceeds acknowledged input");
+    return result;
+  };
+
+  const inferenceSourceOffset = (ranges, offset) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !ranges.length) {
+      throw new Error("Invalid inference checkpoint offset");
+    }
+    for (const range of ranges) {
+      const length = range.end_exclusive - range.start;
+      if (offset <= length) return range.start + offset;
+      offset -= length;
+    }
+    throw new Error("Inference checkpoint exceeds acknowledged input");
+  };
+
   const truncateInferencePcm16 = (recording, sampleCount) => {
     const target = clamp(Math.floor(Number(sampleCount) || 0), 0,
       recording.modelInputSampleCount || 0);
@@ -58,6 +97,10 @@
     }
     recording.modelInputPcm16Parts = retained;
     recording.modelInputSampleCount = target - remaining;
+    if (recording.modelInputSourceRanges) {
+      recording.modelInputSourceRanges = sliceInferenceSourceRanges(
+        recording.modelInputSourceRanges, 0, recording.modelInputSampleCount);
+    }
   };
 
   const encodeInferencePcm16Wav = (parts, sampleCount) => {
@@ -539,6 +582,9 @@
     initialVoiceActivity,
     nextVoiceActivity,
     quantizeInferencePcm16,
+    appendInferenceSourceRange,
+    sliceInferenceSourceRanges,
+    inferenceSourceOffset,
     truncateInferencePcm16,
     encodeInferencePcm16Wav,
     speechThreshold,

@@ -627,7 +627,8 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
     "microphone permission and device readiness must precede ringing",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
-  assert.ok(open.includes("const warm = await warmReady;"));
+  assert.ok(open.includes("await warmReady;"));
+  assert.ok(!/if\s*\(warm\.status/.test(open), "opportunistic startup status must not decide call admission");
   assert.ok(
     open.indexOf("const warmReady = runtimeWarmPromise.then((warm) => {")
       < open.indexOf("await prepareCallMicrophoneStream()"),
@@ -638,7 +639,8 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
       < open.indexOf("await prepareCallMicrophoneStream()"),
     "the PCM renderer must warm under the required microphone readiness wait",
   );
-  assert.ok(open.includes("!warm.audio_projector_warmed"));
+  assert.ok(open.includes("await prepareVoicePersonaForCall(conversation, epoch)"));
+  assert.ok(bridge.includes("!response?.result?.audio_projector_warmed"), "exact call preparation must require the selected encoder before greeting");
   assert.ok(open.includes('markVoiceLatency("call_runtime_ready", warm)'));
   assert.ok(!bridge.includes("playPreparedCallSpeech"));
   assert.ok(!bridge.includes("activeCallSpeech"));
@@ -1529,4 +1531,22 @@ test("the native presentation contains no Skills, cache, engine, or resident-slo
   ]) {
     assert.ok(!styles.includes(marker), `orphaned presentation style remains: ${marker}`);
   }
+});
+
+test("the frontend test command includes every UI test file", () => {
+  const uiRoot = path.join(productRoot, "apps/mom-llama/ui");
+  const packageJson = JSON.parse(read("apps/mom-llama/package.json"));
+  const testCommand = packageJson.scripts["test:frontend"];
+  const configuredUiTests = new Set(
+    testCommand
+      .split(/\s+/)
+      .filter((argument) => argument.startsWith("ui/") && /\.test\.(?:js|cjs)$/.test(argument)),
+  );
+  const discoveredUiTests = fs
+    .readdirSync(uiRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.test\.(?:js|cjs)$/.test(entry.name))
+    .map((entry) => `ui/${entry.name}`);
+  const omittedUiTests = discoveredUiTests.filter((testFile) => !configuredUiTests.has(testFile));
+
+  assert.deepEqual(omittedUiTests, [], "test:frontend must run every UI *.test.js and *.test.cjs file");
 });

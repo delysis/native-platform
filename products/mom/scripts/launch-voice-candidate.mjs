@@ -6,7 +6,12 @@ import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'no
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { resolveCandidateDataDirectory, runtimeReadyLogConfirmsPath } from './voice-candidate-launch-policy.mjs';
+import {
+  parseStartOptions,
+  readPrivateStoreKeyFile,
+  resolveCandidateDataDirectory,
+  runtimeReadyLogConfirmsPath,
+} from './voice-candidate-launch-policy.mjs';
 
 const [operation, ...args] = process.argv.slice(2);
 const fail = message => { throw new Error(message); };
@@ -45,9 +50,16 @@ function runtimeReady(logPath, expectedDataDir) {
 }
 
 async function start(candidatePath, receiptPath) {
-  const [dataDirectoryFlag, explicitDataDirectory] = args.slice(2);
-  if (!candidatePath || !receiptPath || (args.length !== 2 && !(args.length === 4 && dataDirectoryFlag === '--data-dir'))) {
-    fail('Usage: launch-voice-candidate.mjs start <candidate.json> <new-launch-receipt.json> [--data-dir <isolated-directory>]');
+  if (!candidatePath || !receiptPath) {
+    fail('Usage: launch-voice-candidate.mjs start <candidate.json> <new-launch-receipt.json> [--data-dir <isolated-directory>] [--store-key-file <private-key-file>]');
+  }
+  let options;
+  try { options = parseStartOptions(args.slice(2)); }
+  catch (error) { fail(`${error.message}. Usage: launch-voice-candidate.mjs start <candidate.json> <new-launch-receipt.json> [--data-dir <isolated-directory>] [--store-key-file <private-key-file>]`); }
+  let storeKey;
+  if (options.storeKeyFile) {
+    try { storeKey = readPrivateStoreKeyFile(resolve(options.storeKeyFile)); }
+    catch (error) { fail(error.message); }
   }
   const receipt = resolve(receiptPath);
   const logPath = `${receipt.replace(/\.json$/i, '')}.stdout.log`;
@@ -55,8 +67,8 @@ async function start(candidatePath, receiptPath) {
   const { candidate, executable, executableSha256 } = candidateExecutable(resolve(candidatePath));
   // Honor an explicitly prepared isolated store first. An absent override uses
   // the compiled namespace, never the ordinary installed-app default store.
-  const explicitPath = dataDirectoryFlag === '--data-dir'
-    ? explicitDataDirectory
+  const explicitPath = options.dataDirectory
+    ? options.dataDirectory
     : process.env.LLAMA_NATIVE_KIT_DATA_DIR || null;
   const dataDirectory = resolveCandidateDataDirectory({
     home: homedir(), namespace: candidate.data_namespace, explicitPath,
@@ -79,9 +91,11 @@ async function start(candidatePath, receiptPath) {
   try { logFd = openSync(logPath, 'wx', 0o600); }
   catch { evidence.status = 'failed'; evidence.error = 'Cannot exclusively create launch log'; writeJson(receipt, evidence); fail(evidence.error); }
 
+  const childEnvironment = { ...process.env, LLAMA_NATIVE_KIT_DATA_DIR: expectedDataDir };
+  if (storeKey !== undefined) childEnvironment.LLAMA_NATIVE_KIT_STORE_KEY_HEX = storeKey;
   const child = spawn(executable, [], {
     cwd: dirname(executable), detached: true,
-    env: { ...process.env, LLAMA_NATIVE_KIT_DATA_DIR: expectedDataDir },
+    env: childEnvironment,
     stdio: ['ignore', logFd, logFd],
   });
   closeSync(logFd);

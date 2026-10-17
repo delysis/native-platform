@@ -47,6 +47,7 @@ pub struct VoicePersonaPrefixPreparation {
     /// serialized snapshot. Such a hit must not invent a stored cache entry.
     pub metadata: Option<KvCacheMetadata>,
     pub resident_prefix_tokens: usize,
+    pub audio_projector_warmed: bool,
     pub prefill_us: u64,
     pub verification_us: u64,
     pub persistence_us: u64,
@@ -491,6 +492,7 @@ pub fn kv_cache_save_voice_persona(
         operation,
         "prompt_smoke_verified",
         VoicePersonaPrefixPreparation {
+            audio_projector_warmed: false,
             resident_prefix_tokens: value.sequence.token_count,
             metadata: Some(value.metadata.clone()),
             prefill_us,
@@ -513,7 +515,35 @@ pub fn kv_cache_prepare_voice_persona_resident(
     scope: &crate::OperationScope,
     persona_id: &str,
 ) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
+    prepare_voice_context_resident(scope, persona_id, false)
+}
+
+/// Startup is opportunistic: once any foreground work has used this worker,
+/// only an explicit call preparation may choose a different conversation.
+pub(crate) fn prepare_startup_voice_context_resident(
+    scope: &crate::OperationScope,
+    context_id: &str,
+) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
+    prepare_voice_context_resident(scope, context_id, true)
+}
+
+fn prepare_voice_context_resident(
+    scope: &crate::OperationScope,
+    persona_id: &str,
+    startup_only: bool,
+) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
     let operation = "mom_llama.kv_cache_prepare_voice_persona_resident";
+    let superseded = || {
+        CommandResult::blocked(
+            operation,
+            "preparation_superseded",
+            Blocker::new(
+                "voice_prewarm_superseded",
+                "Newer model activity superseded this preparation.",
+                Vec::new(),
+            ),
+        )
+    };
     let mut settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
@@ -566,8 +596,25 @@ pub fn kv_cache_prepare_voice_persona_resident(
         persona.selected_model_path.clone(),
         persona.execution_profile.mmproj_path.clone(),
     );
-    let handle = match resident_model(scope, &settings) {
-        Ok(handle) => handle,
+    let acquisition = if startup_only {
+        // Background preparation must not switch models either. The startup
+        // owner already acquired its model; a different selected profile is
+        // left to explicit foreground preparation.
+        let Some(model_path) = settings.model_path.as_deref() else {
+            return Ok(superseded());
+        };
+        resident_model_for_profile_if_loaded(
+            scope,
+            &settings,
+            model_path,
+            settings.mmproj_path.as_deref(),
+        )
+    } else {
+        resident_model(scope, &settings).map(Some)
+    };
+    let handle = match acquisition {
+        Ok(Some(handle)) => handle,
+        Ok(None) => return Ok(superseded()),
         Err(blocked) => {
             return Ok(CommandResult::blocked(
                 operation,
@@ -576,6 +623,12 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ));
         }
     };
+    // Call readiness belongs to this exact frozen profile, not a possibly
+    // failed or different model from asynchronous startup. Worker-local warm
+    // memoization makes repeated call preparation cheap and leaves KV intact.
+    let audio_projector_warmed = handle
+        .warm_audio_projector()
+        .map_err(|error| anyhow!(error))?;
     // A previous hangup may still be encrypting its snapshot. If the worker
     // owns this conversation's newer committed request, do not replace it with
     // an older disk checkpoint (or touch the disk cache at all).
@@ -588,11 +641,19 @@ pub fn kv_cache_prepare_voice_persona_resident(
     let resident = handle
         .inspect_resident_conversation(pending_request.as_deref())
         .map_err(|error| anyhow!(error))?;
+    // Comparing only against the revision observed here is insufficient for
+    // startup: foreground work may have completed before this inspection. A
+    // fresh worker begins at zero; conditional imports/prefills below retain
+    // that same zero fence across disk reads and tokenization.
+    if startup_only && resident.revision != 0 {
+        return Ok(superseded());
+    }
     if let Some(count) = resident.committed_prefix_tokens {
         return Ok(CommandResult::passed(
             operation,
-            "prompt_smoke_verified",
+            "resident_prefix_prepared",
             VoicePersonaPrefixPreparation {
+                audio_projector_warmed,
                 metadata: None,
                 resident_prefix_tokens: count,
                 prefill_us: 0,
@@ -617,8 +678,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
     )? {
         return Ok(CommandResult::passed(
             operation,
-            "prompt_smoke_verified",
+            "resident_prefix_prepared",
             VoicePersonaPrefixPreparation {
+                audio_projector_warmed,
                 resident_prefix_tokens: metadata.cells.len().max(metadata.token_ids.len()),
                 metadata: Some(metadata),
                 prefill_us: 0,
@@ -668,8 +730,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
     {
         return Ok(CommandResult::passed(
             operation,
-            "prompt_smoke_verified",
+            "resident_prefix_prepared",
             VoicePersonaPrefixPreparation {
+                audio_projector_warmed,
                 metadata: None,
                 resident_prefix_tokens: common,
                 prefill_us: 0,
@@ -703,8 +766,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
     {
         return Ok(CommandResult::passed(
             operation,
-            "prompt_smoke_verified",
+            "resident_prefix_prepared",
             VoicePersonaPrefixPreparation {
+                audio_projector_warmed,
                 resident_prefix_tokens: value.sequence.token_count,
                 metadata: Some(value.metadata.clone()),
                 prefill_us: 0,
@@ -739,8 +803,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ) {
                 return Ok(CommandResult::passed(
                     operation,
-                    "prompt_smoke_verified",
+                    "resident_prefix_prepared",
                     VoicePersonaPrefixPreparation {
+                        audio_projector_warmed,
                         resident_prefix_tokens: metadata.token_ids.len(),
                         metadata: Some(metadata.clone()),
                         prefill_us: 0,
@@ -770,15 +835,18 @@ pub fn kv_cache_prepare_voice_persona_resident(
             tokenized.resident_media_prefix_tokens,
             &tokenized.token_ids,
             &value.sequence.token_ids,
-        ) {
-            handle
-                .restore_sequence(value.sequence.clone(), 0)
-                .map_err(|error| anyhow!(error))?;
+        ) && handle
+            .restore_sequence_if_revision(value.sequence.clone(), 0, resident.revision)
+            .map_err(|error| anyhow!(error))?
+            .is_none()
+        {
+            return Ok(superseded());
         }
         return Ok(CommandResult::passed(
             operation,
-            "prompt_smoke_verified",
+            "resident_prefix_prepared",
             VoicePersonaPrefixPreparation {
+                audio_projector_warmed,
                 resident_prefix_tokens: value.sequence.token_count,
                 metadata: Some(value.metadata),
                 prefill_us: 0,
@@ -794,28 +862,24 @@ pub fn kv_cache_prepare_voice_persona_resident(
         ));
     }
     let started = std::time::Instant::now();
-    let value = create_prefix_value(
+    let Some(value) = create_prefix_value_with_revision(
         &handle,
         CacheTier::PersonaPack,
         Some(persona.id.clone()),
         format!("Resident voice persona: {}", persona.title),
         &messages,
         template.clone(),
-    )?;
+        Some(resident.revision),
+    )?
+    else {
+        return Ok(superseded());
+    };
     let prefill_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-    let started = std::time::Instant::now();
-    if !verify_restore_equivalence(&handle, &messages, &value.sequence, template)? {
-        return Ok(CommandResult::blocked(
-            operation,
-            "blocked_native_runtime",
-            Blocker::new(
-                "kv_cache_restore_mismatch",
-                "The voice prefix failed deterministic restoration.",
-                Vec::new(),
-            ),
-        ));
-    }
-    let verification_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    // Automatic preparation exports authenticated native state. Probe
+    // generations belong to explicit cache qualification, not this background
+    // path: they can replace a newer foreground conversation between commands.
+    // Publication below touches only cache storage, never the live worker.
+    let verification_us = 0;
     let started = std::time::Instant::now();
     let store = RuntimeStore::open(&settings.data_dir)?;
     let Some(lease) = MomCachePromotionLease::acquire(&store, Some(&persona.id))? else {
@@ -850,8 +914,9 @@ pub fn kv_cache_prepare_voice_persona_resident(
         .min(u128::from(u64::MAX)) as u64;
     Ok(CommandResult::passed(
         operation,
-        "prompt_smoke_verified",
+        "resident_prefix_prepared",
         VoicePersonaPrefixPreparation {
+            audio_projector_warmed,
             resident_prefix_tokens: value.sequence.token_count,
             metadata: Some(value.metadata.clone()),
             prefill_us,
@@ -1716,6 +1781,27 @@ fn create_prefix_value(
     stable_messages: &[ChatMessage],
     template: ChatTemplateChoice,
 ) -> Result<PrefixCacheValue> {
+    create_prefix_value_with_revision(
+        handle,
+        tier,
+        owner_id,
+        label,
+        stable_messages,
+        template,
+        None,
+    )?
+    .ok_or_else(|| anyhow!("unconditional prefix preparation was skipped"))
+}
+
+fn create_prefix_value_with_revision(
+    handle: &NativeModelHandle,
+    tier: CacheTier,
+    owner_id: Option<String>,
+    label: String,
+    stable_messages: &[ChatMessage],
+    template: ChatTemplateChoice,
+    expected_revision: Option<u64>,
+) -> Result<Option<PrefixCacheValue>> {
     let settings = resolve_settings()?;
     let tokenized = handle
         .tokenize_messages_with_template(stable_messages.to_vec(), template.clone())
@@ -1752,16 +1838,22 @@ fn create_prefix_value(
             }
         })
         .collect();
-    let state = handle
-        .prefill_shared_prefix(SharedPrefixBatchRequest {
-            request_id: format!("kv-cache-prefill-{}", Uuid::new_v4()),
-            model_id: handle.status().model_id,
-            common_messages: stable_messages.to_vec(),
-            chat_template: template,
-            branches,
-            cached_prefix,
-        })
-        .map_err(|error| anyhow!(error))?;
+    let request = SharedPrefixBatchRequest {
+        request_id: format!("kv-cache-prefill-{}", Uuid::new_v4()),
+        model_id: handle.status().model_id,
+        common_messages: stable_messages.to_vec(),
+        chat_template: template,
+        branches,
+        cached_prefix,
+    };
+    let state = match expected_revision {
+        Some(revision) => handle.prefill_shared_prefix_if_revision(request, revision),
+        None => handle.prefill_shared_prefix(request).map(Some),
+    }
+    .map_err(|error| anyhow!(error))?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
     let mut metadata = PrefixCacheMetadata::new(
         Uuid::new_v4().to_string(),
         tier,
@@ -1783,7 +1875,7 @@ fn create_prefix_value(
             "native prefix state failed its token and byte integrity checks"
         ));
     }
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn verify_restore_equivalence(

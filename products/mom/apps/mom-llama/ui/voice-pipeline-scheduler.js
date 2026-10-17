@@ -33,20 +33,6 @@
   const shouldWaitForVoiceHistoryRecovery = ({ operation = null, stage = "idle" } = {}) =>
     Boolean(operation) || stage === "recording_commit";
 
-  const replayDeferredPcm = async ({ readChunks, enqueue, settle, handoff }) => {
-    let cursor = 0;
-    while (true) {
-      const chunks = readChunks(cursor);
-      if (!chunks.length) {
-        handoff();
-        return cursor;
-      }
-      cursor += chunks.length;
-      chunks.forEach(enqueue);
-      await settle();
-    }
-  };
-
   const createCallTranscriptIntent = ({ conversation, output, fallbackAttachment, sourceTrace }) => {
     const attachment = output?.voice_attachment_id || fallbackAttachment || null;
     const messageId = output?.user_message_id || null;
@@ -375,7 +361,6 @@
     shouldDisableCallTranscriptSlotsAfterStop,
     canContinueVoiceHistoryRecovery,
     shouldWaitForVoiceHistoryRecovery,
-    replayDeferredPcm,
     createCallTranscriptIntent,
     enqueueCallTranscriptIntent,
   };

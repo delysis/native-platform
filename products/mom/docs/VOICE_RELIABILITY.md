@@ -77,6 +77,60 @@ must verify the live PID, executable and effective data path before attaching UI
 automation. Those earlier launches are failed attempts, not 32 GB budget evidence.
 Never infer process identity from an app window or a successful build.
 
+Candidate 04 (`27fdfd0d`) completed its greeting with 11,208 of 11,260 prompt
+tokens resident, first PCM at 1.019 seconds and rendered playback at 2.419
+seconds. The greeting had no renderer underrun or barge-in. Subsequent room
+audio triggered listening turns; their latest trace was initially mistaken for
+the greeting trace. That interpretation was retracted after checking trace IDs
+and absolute timestamps. Qualification must read the complete call sequence,
+not infer pickup behavior from `voice-latency-latest.json`.
+
+That run exposed a browser handoff defect: deferred input replay included the
+whole physical recording, including playback and idle time. A later speech
+onset supplied a different contiguous origin, so some turns could not retain
+their exact inference derivative. The next prompt then processed old physical
+audio again. Deferred input now contains only detector-admitted source ranges;
+the handoff attaches that queue synchronously before awaiting IPC. Accepted
+source ranges are recorded only after acknowledgement, and cancellation maps
+model offsets through that ledger before replaying the physical tail. The
+`voice_inference_archive` trace records whether the exact derivative survived.
+This repair needs a new exact-source gate and packaged continuation test.
+
+Candidate attempts 02 and 03 exposed shell toolchain drift: a missing `sysctl`
+path and Node 26 instead of the pinned Node 22. The builder now validates tools
+before creating output, uses absolute macOS utility paths, fixes child Node
+resolution, and records Node/Rust/pnpm identities in its manifest. Failed
+attempts remain separate evidence.
+
+Background startup preparation also needs revision fencing for PersonaPack
+restores and cold prefix creation, not only conversation checkpoint imports.
+Ordinary chat can run while startup warming is reading a disk entry. Both
+worker commands now compare the inspected revision before changing live state;
+superseded preparation reports no ready prefix. Automatic warming no longer
+runs separate probe generations in the live worker. Authenticated native export
+and integrity checks remain required, while deterministic restore/parity probes
+remain in explicit cache qualification. Automatic readiness is therefore
+`resident_prefix_prepared`, not a claim that a smoke generation ran.
+
+The audio-projector warm command now encodes one frame without taking a
+language-model context. It cannot change the conversation revision, committed
+prefix, or resumable audio checkpoint. The previous synthetic generation could
+replace foreground KV before the persona revision check even began. Startup
+selection must also retain the selected chat's identity, so its saved session
+is considered before its shared persona prefix; choosing the source contact
+would defer conversation restoration until pickup.
+Startup may acquire an empty model slot or reuse an exact resident model, but
+cannot replace an occupied slot. Its prefix preparation requires that worker's
+initial revision (zero), and never loads another profile. This also covers
+foreground work that completed before startup's first cache inspection;
+comparing only against the revision observed at inspection would be too late.
+Startup resolves the selected frozen model before acquisition. Call readiness
+is nevertheless established again by explicit preparation of the actual
+conversation: its result includes audio-encoder readiness. A superseded or
+blocked background warm cannot permanently poison call admission. Encoder
+warmup is memoized within its worker, so this readiness check does not re-encode
+a frame on every call.
+
 ## Inference-window behavior
 
 Voice preparation measures the complete text and audio prompt against the

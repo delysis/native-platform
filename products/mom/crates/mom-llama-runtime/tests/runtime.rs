@@ -3268,7 +3268,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MM_PROJ_PATH for real Gemma audio"]
 fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     let _session = configured_real_session("real-shutdown-session-checkpoint")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -3278,6 +3278,9 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         batch_tokens: Some(128),
         max_parallel_sequences: Some(4),
         max_tokens: Some(8),
+        mmproj_path: Some(Some(PathBuf::from(std::env::var(
+            "MOM_LLAMA_MM_PROJ_PATH",
+        )?))),
         resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         upstream_settings: Some(BTreeMap::from([(
@@ -3288,9 +3291,16 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     })?;
     let owner = initialize_product_runtime()?;
     let scope = owner.operation_scope();
-    let conversation = mom_llama_runtime::conversation_new(Some("Shutdown cache witness".into()))?
+    let persona = mom_llama_runtime::persona_list()?
         .result
-        .ok_or_else(|| anyhow!("missing conversation"))?;
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no built-in persona"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id))?;
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona call did not materialize"))?;
     product_chat_cache_request(
         &scope,
         &conversation.id,
@@ -3312,7 +3322,8 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     // resident. Pickup must not overwrite it with the previous disk state.
     mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, "shutdown-witness", true)?;
     mom_llama_runtime::conversation_system_message_update(&conversation.id, Some("You are a concise archivist. Retain the caller's exact invented phrases. Answer briefly.".into()))?;
-    product_chat_cache_request(&scope, &conversation.id, "Now remember: violet badger.")?;
+    let latest =
+        product_chat_cache_request(&scope, &conversation.id, "Now remember: violet badger.")?;
     let warm =
         mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &conversation.id)?
             .result
@@ -3324,6 +3335,59 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     );
     assert_eq!(warm.prefill_us, 0);
     assert!(warm.resident_prefix_tokens > 0);
+
+    // Launch warming is permitted only on a pristine worker. The selected
+    // materialized Chat owns a newer committed request, so this attempt must
+    // leave its exact resident revision and committed-prefix count untouched.
+    let settings = mom_llama_runtime::config::resolve_settings()?;
+    let handle = mom_llama_runtime::native_runtime::resident_model(&scope, &settings)?;
+    let before_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
+    let before_startup_state = handle
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .ok_or_else(|| anyhow!("latest committed request was not snapshot eligible"))?;
+    let startup_warm = mom_llama_runtime::runtime_warm(&scope)?
+        .result
+        .ok_or_else(|| anyhow!("startup warm returned no result"))?;
+    assert!(startup_warm.audio_projector_warmed);
+    assert_eq!(startup_warm.persona_prefix_warm_status, "blocked");
+    assert_eq!(startup_warm.persona_prefixes_ready, 0);
+    let after_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
+    assert_eq!(after_startup_warm.revision, before_startup_warm.revision);
+    assert_eq!(
+        after_startup_warm.committed_prefix_tokens,
+        before_startup_warm.committed_prefix_tokens
+    );
+    assert_eq!(
+        after_startup_warm.committed_prefix_tokens,
+        Some(before_startup_state.token_count)
+    );
+    // Verify the supported warm API still takes the resident path after
+    // opportunistic startup work.
+    let warm_after_startup =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &conversation.id)?
+            .result
+            .ok_or_else(|| anyhow!("latest resident prefix was not prepared"))?;
+    assert_eq!(warm_after_startup.prefill_us, 0);
+    assert_eq!(
+        warm_after_startup.resident_prefix_tokens,
+        warm.resident_prefix_tokens
+    );
+    let after_startup_state = handle
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .ok_or_else(|| anyhow!("startup warm lost the latest committed request"))?;
+    assert_eq!(
+        after_startup_state.cells, before_startup_state.cells,
+        "startup warm must not replace the latest committed KV cells"
+    );
+    assert!(handle.resident_conversation_covers_cells(after_startup_state.cells)?);
+    println!(
+        "STARTUP_WARM_PRESERVED_ACTIVE_SESSION {}",
+        json!({
+            "revision": after_startup_warm.revision,
+            "committed_prefix_tokens": after_startup_warm.committed_prefix_tokens,
+            "warm_status": startup_warm.persona_prefix_warm_status,
+        })
+    );
     println!(
         "PENDING_SESSION_RAM_HIT {}",
         json!({"resident_prefix_tokens": warm.resident_prefix_tokens, "prefill_us": warm.prefill_us, "older_checkpoint": older.id})
@@ -3367,7 +3431,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         &conversation.id,
     )?;
     assert_eq!(
-        restored.readiness, "prompt_smoke_verified",
+        restored.readiness, "resident_prefix_prepared",
         "{:?}",
         restored.blocker
     );
