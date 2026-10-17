@@ -128,14 +128,19 @@
     let previous = null;
     let result = null;
     let lastLag = null;
+    let diagnostic = { status: "unobserved" };
     return {
+      snapshot() { return { ...diagnostic }; },
       process(input, inputRate, reference, referenceRate) {
         if (!reference?.length || !input?.length) return null;
         // Capture at 48 kHz and playback at 24 kHz both divide this analysis
         // rate exactly. Unsupported rates retain WebKit's unmodified signal.
         const stride = inputRate / rate;
         const referenceStride = referenceRate / rate;
-        if (!Number.isInteger(stride) || !Number.isInteger(referenceStride)) return null;
+        if (!Number.isInteger(stride) || !Number.isInteger(referenceStride)) {
+          diagnostic = { status: "unsupported_rate", input_rate_hz: inputRate, reference_rate_hz: referenceRate };
+          return null;
+        }
         for (const value of input) {
           pending += value;
           written += 1;
@@ -174,6 +179,14 @@
           if (correlation > best) { best = correlation; lag = count - start - microphone.length; }
         }
         const stable = lastLag !== null && Math.abs(lag - lastLag) <= rate * .025;
+        diagnostic = {
+          status: best >= .64 ? (stable ? "matched" : "unstable_lag") : "weak_correlation",
+          correlation: Math.sqrt(best),
+          lag_ms: lag * 1000 / rate,
+          stable,
+          microphone_rms: Math.sqrt(power / microphone.length),
+          reference_window_ms: reference.length * 1000 / referenceRate,
+        };
         lastLag = best >= .64 ? lag : null;
         result = best >= .64 && stable ? {
           correlation: Math.sqrt(best),

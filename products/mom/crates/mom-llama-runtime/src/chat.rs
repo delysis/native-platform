@@ -1350,16 +1350,10 @@ where
             ),
         ));
     }
-    // A pickup is a short acknowledgement, not a reply to the recorded
-    // history. Keep the recordings attached to their saved turns; the live
-    // microphone turn will receive them until exact transcripts replace them.
-    // Admitting them here defeats the prepared persona prefix and makes the
-    // caller wait for every historical audio projector pass before pickup.
-    let media = if call_greeting {
-        Vec::new()
-    } else {
-        attachment_context.media.clone()
-    };
+    // Pending recordings are conversation memory even during pickup. The
+    // measured projection and generation must consume the same media; exact
+    // transcripts replace archived audio only after their durable commit.
+    let media = attachment_context.media.clone();
     if !media.is_empty()
         && !settings
             .mmproj_path

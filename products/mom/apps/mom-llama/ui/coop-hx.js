@@ -2373,6 +2373,9 @@
       permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       source_rate_hz: settings.sampleRate || null,
       echo_cancellation: settings.echoCancellation ?? null,
+      noise_suppression: settings.noiseSuppression ?? null,
+      auto_gain_control: settings.autoGainControl ?? null,
+      graph_rate_hz: context.sampleRate,
       graph_state: context.state,
     };
   };
@@ -4838,6 +4841,7 @@
       "voice_transcript_inference_started",
       "voice_transcript_inference_finished",
       "voice_transcript_finished",
+      "voice_transcript_skipped",
       "voice_transcript_failed",
       "first_content_delta",
       "first_content_delta_received",
@@ -4940,7 +4944,7 @@
       return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
     }
     if (words.length >= maximum || flush) {
-      if (first && !flush && words.length === maximum && !/\s$/.test(text)) return null;
+      if (!flush && words.length === maximum && !/\s$/.test(text)) return null;
       // Closing the text stream makes a short tail dispatchable; it does not
       // suspend the segment bound. Sending an entire completed reply as one
       // Qwen request can synthesize seconds ahead of playback and removes the
@@ -6215,7 +6219,7 @@
       // Speculative generation can finish before the first audible packet.
       // Its recording becomes authoritative only after confirmation commits.
       const physicalCapture = await Promise.resolve(sourceCapture);
-      if (sourceCapture && !physicalCapture) return;
+      if (sourceCapture && !physicalCapture) return false;
       const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
         attachment,
       }));
@@ -6281,7 +6285,13 @@
       }
       const transcript = transcribed?.result?.transcript?.trim();
       if (!transcript) {
-        throw new Error("voice_transcript_empty: The recorded voice could not be transcribed for conversation memory.");
+        // Archival enrichment is optional. Silence or an ASR miss leaves the
+        // original recording authoritative for the next prompt and idle retry.
+        markVoiceLatencyIn(trace, "voice_transcript_skipped", {
+          reason: "empty_transcript",
+          recording_retained: true,
+        });
+        return false;
       }
       const recordStarted = performance.now();
       markVoiceLatencyIn(trace, "voice_transcript_record_started");
@@ -6295,8 +6305,10 @@
         throw new Error(`${recorded?.blocker?.code || "voice_transcript_record_failed"}: ${recorded?.blocker?.message || "The voice transcript could not be saved."}`);
       }
       if (callJob) callJob.committed = true;
+      return true;
     })();
-    void task.then(() => {
+    void task.then((committed) => {
+      if (committed !== true) return;
       markVoiceLatencyIn(trace, "voice_transcript_finished", {
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
       });
@@ -6599,6 +6611,8 @@
       echo_guard_suppressed_callbacks: recording.echoGuardSuppressedCallbacks || 0,
       echo_guard_peak_rms: recording.echoGuardPeakRms || 0,
       echo_guard_threshold: recording.echoGuardThreshold || 0,
+      echo_reference_callbacks: recording.echoReferenceCallbacks || 0,
+      echo_matched_callbacks: recording.echoMatchedCallbacks || 0,
       prefill_ipc_queued_samples: recording.prefillQueuedSamples || 0,
       prefill_ipc_queue_high_water_samples: recording.prefillQueueHighWaterSamples || 0,
       prefill_suppressed_silence_samples: recording.prefillSuppressedSilenceSamples || 0,
@@ -6706,7 +6720,9 @@
       prefillRetryPending,
       prefillEpoch: 0,
       firstPrefillChunkAccepted: false, speculation: null, speculationStarting: false,
-      speculationReleaseMs: 180,
+      // Give a caller a natural pause before spending compute on a reply.
+      // Keep VAD onset/resume fast so speech still cancels speculation promptly.
+      speculationReleaseMs: 350,
       prefillPushes: 0, prefillAcceptedSamples: 0, prefillHighWaterSamples: 0,
       prefillQueuedSamples: 0, prefillQueueHighWaterSamples: 0,
       prefillSuppressedSilenceSamples: 0,
@@ -6718,6 +6734,7 @@
       echoGuardCallbacks: 0,
       echoGuardSuppressedCallbacks: 0, echoGuardPeakRms: 0,
       echoGuardThreshold: 0,
+      echoReferenceCallbacks: 0, echoMatchedCallbacks: 0, echoEvidence: null,
       detectorSilence: new Float32Array(processor.bufferSize),
     };
     // Transcription is an idle archival operation. The live microphone has
@@ -6802,15 +6819,16 @@
       const callbackStarted = performance.now();
       const chunk = event.inputBuffer.getChannelData(0);
       const previousActivity = recording.voiceActivity;
-      const playbackAudible = recording.call && liveVoiceTts?.mode === "call"
-        && liveVoiceTts.audible;
+      const audibleReply = recording.call ? activeCallPlayback : null;
+      const playbackAudible = Boolean(audibleReply?.audible);
       let detectorChunk = chunk;
       if (playbackAudible) {
         let power = 0;
         for (let index = 0; index < chunk.length; index += 1) power += chunk[index] * chunk[index];
         const rawRms = Math.sqrt(power / Math.max(1, chunk.length));
         const durationMs = chunk.length * 1000 / context.sampleRate;
-        const reference = liveVoiceTts?.controller?.echoReference();
+        const reference = audibleReply?.controller?.echoReference();
+        if (reference) recording.echoReferenceCallbacks += 1;
         const matchedEcho = reference ? recording.echoMatcher.process(chunk, context.sampleRate,
           reference.samples, reference.sampleRate) : null;
         const echo = globalThis.MomVoiceCapturePolicy.updatePlaybackEchoGuard(
@@ -6819,6 +6837,21 @@
           durationMs,
           { matchedEcho: Boolean(matchedEcho) },
         );
+        if (matchedEcho) recording.echoMatchedCallbacks += 1;
+        recording.echoEvidence = {
+          reference_available: Boolean(reference),
+          matched: Boolean(matchedEcho),
+          correlation: matchedEcho?.correlation ?? null,
+          residual_rms: matchedEcho?.residualRms ?? null,
+          raw_rms: rawRms,
+          guard_threshold: echo.threshold,
+          suppressed: echo.suppressed,
+          source_rate_hz: context.sampleRate,
+          reference_rate_hz: reference?.sampleRate ?? null,
+          matcher: recording.echoMatcher.snapshot(),
+          callback_lag_ms: Number.isFinite(event.playbackTime)
+            ? (context.currentTime - event.playbackTime) * 1000 : null,
+        };
         recording.echoGuard = echo.guard;
         recording.echoGuardCallbacks += 1;
         recording.echoGuardPeakRms = Math.max(recording.echoGuardPeakRms, rawRms);
@@ -6873,6 +6906,7 @@
           interruptCallPlaybackForSpeech(recording, {
             producer: "browser_capture",
             onset_sample: analysis.voiceOnsetSample,
+            echo: recording.echoEvidence,
           });
           // A real caller takes priority over finishing the contact's voice.
           // Release the prefetched-session gate at onset so PCM enters Gemma

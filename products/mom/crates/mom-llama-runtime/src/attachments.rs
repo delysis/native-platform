@@ -1084,9 +1084,9 @@ pub(crate) fn prepare_live_audio_history(
     .map(|result| result.map(|scoped| scoped.context))
 }
 
-/// A pickup greeting needs the saved conversation text but does not answer
-/// old recordings. Leave those recordings intact for the next microphone
-/// turn while avoiding their read, admission budget, and projector work here.
+/// A pickup greeting uses the same authoritative saved-history representation
+/// as a live turn: pending recordings remain audio until an exact transcript
+/// replaces them. The source messages and retained attachments are untouched.
 pub(crate) fn prepare_call_greeting_history(
     conversation_id: &str,
     active_messages: &[Message],
@@ -1094,7 +1094,7 @@ pub(crate) fn prepare_call_greeting_history(
     prepare_scoped_chat_attachments(
         conversation_id,
         active_messages,
-        CurrentAttachmentSelection::HistoryTextOnly,
+        CurrentAttachmentSelection::HistoryOnly,
     )
     .map(|result| result.map(|scoped| scoped.context))
 }
@@ -5367,11 +5367,23 @@ mod tests {
                 "all retained audio placeholders must remain in chronological order"
             );
         }
+        let source_before_greeting = messages.clone();
         let greeting = prepare_call_greeting_history("chat", &messages)
             .expect("pickup preparation")
-            .expect("a greeting does not require old recordings");
-        assert!(greeting.media.is_empty());
+            .expect("pending call history remains authoritative audio");
+        assert_eq!(greeting.media.len(), messages.len());
+        for (media, message) in greeting.media.iter().zip(&messages) {
+            assert!(
+                media
+                    .id
+                    .starts_with(&format!("{}:", message.attachment_ids[0]))
+            );
+        }
         assert!(greeting.staged_ids.is_empty());
+        assert_eq!(
+            messages, source_before_greeting,
+            "greeting preparation is read-only"
+        );
 
         let current = attachment_import_pasted_text(&scope, "chat", "current note".to_string())
             .expect("stage current note")
@@ -5401,6 +5413,16 @@ mod tests {
             .expect("final transcripts must free the current recording's media budget");
         assert_eq!(voice_reply.media.len(), 1);
         assert_eq!(voice_reply.staged_ids, vec![current.id, current_audio.id]);
+        let transcript_greeting = prepare_call_greeting_history("chat", &transcribed_messages)
+            .expect("transcript pickup preparation")
+            .expect("final transcripts replace archived media in model history");
+        assert!(transcript_greeting.media.is_empty());
+        assert!(
+            transcribed_messages.iter().all(|message| {
+                message.content.contains("Final transcript ") && message.attachment_ids.len() == 1
+            }),
+            "the exact transcript is used while original audio IDs remain on each source turn"
+        );
 
         // Long voice conversations retain their recordings for playback, but
         // finalized transcripts alone represent those turns to the model.

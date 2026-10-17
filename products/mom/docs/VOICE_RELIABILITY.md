@@ -35,6 +35,34 @@ The actual 32 GB M2 device, physical speaker/microphone loopback, sustained
 packaged call, and 30-minute soak remain unqualified. Synthetic tone/PCM and
 unbundled native runs do not substitute for those checks.
 
+## Packaged regression findings
+
+The clean-tree gate for `91246311` passed, but its first candidate did not pass
+packaged acceptance. Human testing reported eighth-ring pickup, speaker-triggered
+cutoffs and weak recall. One greeting trace took 9.366 seconds to playback and
+was stopped by the barge-in path after 619 ms with 4.52 seconds still buffered.
+Zero renderer underruns in that trace did not establish audible continuity.
+The microphone reported echo cancellation enabled at 48 kHz; the output worklet
+used 24 kHz. Reference availability, correlation and residual energy must be
+recorded at the interruption boundary to distinguish echo from real double talk.
+
+Pickup previously excluded untranscribed historical audio, even though later
+voice turns included it. Pickup now measures and consumes the same authoritative
+history: pending audio stays present until an exact transcript is committed.
+Empty archival transcription is an observed skip, retaining the recording for
+later recovery; source, backend and durable-commit failures remain errors.
+The initial speculative reply pause is now 350 ms, while interruption onset
+remains independent and responsive. All streamed speech segments preserve an
+incomplete final word until another token or end-of-stream establishes it.
+
+Qualification also exposed a process failure: attaching a UI tool to an exited
+candidate could silently relaunch it without the isolated data and memory-budget
+environment. A distinct app identifier did not isolate the runtime store. The
+candidate builder now embeds a safe default data namespace, and qualification
+must verify the live PID, executable and effective data path before attaching UI
+automation. Those earlier launches are failed attempts, not 32 GB budget evidence.
+Never infer process identity from an app window or a successful build.
+
 ## Inference-window behavior
 
 Voice preparation measures the complete text and audio prompt against the

@@ -348,6 +348,28 @@ test("speech chunks preserve call latency and voice-note prosody", () => {
     JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six s", false, true, 6))),
     { chunk: "One two three four five six", rest: "s" },
   );
+  // Every call segment must wait for a partial final word at its dynamic cap.
+  // Once a separator arrives, dispatch the complete capped chunk; once a new
+  // word starts, dispatch the complete prefix and retain that partial tail.
+  assert.equal(
+    context.takeLiveSpeechChunk("One two three four five six seven eigh", false, false, 8),
+    null,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six seven eight ", false, false, 8))),
+    { chunk: "One two three four five six seven eight", rest: "" },
+  );
+  const callSplit = context.takeLiveSpeechChunk(
+    "One two three four five six seven eight nin",
+    false,
+    false,
+    8,
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(callSplit)), {
+    chunk: "One two three four five six seven eight",
+    rest: "nin",
+  });
+  assert.equal(`${callSplit.chunk} ${callSplit.rest}`, "One two three four five six seven eight nin");
   assert.equal(
     context.takeLiveSpeechChunk("One two three four five six seven eight nine ten", false, true, 10, "voice_note"),
     null,
@@ -362,6 +384,22 @@ test("speech chunks preserve call latency and voice-note prosody", () => {
     ),
     null,
   );
+  const voiceNotePartial = Array.from({ length: 27 }, (_, index) => `word${index + 1}`).join(" ") + " partial";
+  assert.equal(context.takeLiveSpeechChunk(voiceNotePartial, false, false, 28, "voice_note"), null);
+  const voiceNoteComplete = `${voiceNotePartial} `;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(voiceNoteComplete, false, false, 28, "voice_note"))),
+    { chunk: voiceNotePartial, rest: "" },
+  );
+  const voiceNoteNextWord = context.takeLiveSpeechChunk(
+    `${voiceNotePartial} next`,
+    false,
+    false,
+    28,
+    "voice_note",
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(voiceNoteNextWord)), { chunk: voiceNotePartial, rest: "next" });
+  assert.equal(`${voiceNoteNextWord.chunk} ${voiceNoteNextWord.rest}`, `${voiceNotePartial} next`);
   assert.equal(
     context.takeLiveSpeechChunk(
       "That sounds hard, and I am listening",

@@ -31,6 +31,7 @@ function source() {
 }
 const before = source();
 const bundleIdentifier = 'com.delysis.blessenger.voice-qualification';
+const dataNamespace = 'voice-qualification';
 const receiptBytes = readFileSync(resolve(receiptPath));
 const receipt = JSON.parse(receiptBytes);
 if (receipt.status !== 'component-pass' || !receipt.source_unchanged || !receipt.component_gate_complete
@@ -41,9 +42,11 @@ if (receipt.status !== 'component-pass' || !receipt.source_unchanged || !receipt
 const cargo = read('rustup', ['which', '--toolchain', '1.95.0', 'cargo']);
 const rustc = read('rustup', ['which', '--toolchain', '1.95.0', 'rustc']);
 const env = { ...process.env, RUSTUP_TOOLCHAIN: '1.95.0', CARGO: cargo, RUSTC: rustc,
-  PATH: `${dirname(cargo)}:${process.env.PATH}` };
+  PATH: `${dirname(cargo)}:${process.env.PATH}`, MOM_LLAMA_DATA_NAMESPACE: dataNamespace };
 mkdirSync(output, { recursive: true });
 const manifest = { bundle_identifier: bundleIdentifier, status: 'incomplete', source: before, started: new Date().toISOString(),
+  data_namespace: dataNamespace,
+  data_directory_policy: 'compiled namespace is appended only to the default fallback; LLAMA_NATIVE_KIT_DATA_DIR takes precedence',
   build_profile: 'release',
   component_receipt: resolve(receiptPath), component_receipt_sha256: createHash('sha256').update(receiptBytes).digest('hex'),
   hardware: read('sysctl', ['-n', 'hw.model']), os: read('sw_vers', ['-buildVersion']),
