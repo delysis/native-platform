@@ -862,6 +862,8 @@
     let workletCapacityFrames = 0;
     let workletQueuedFrames = 0;
     let rendererPacketIndex = 0;
+    const rendererPacketOwners = new Map();
+    const RENDERER_PACKET_OWNER_LIMIT = 512;
     let metricsReported = false;
     const rendererMetrics = {
       packets: 0,
@@ -923,7 +925,7 @@
       }, remainingMs + 12);
     };
 
-    const schedule = (frame) => {
+    const schedule = (frame, operationId = null) => {
       if (stopped) return false;
       const scheduleStarted = rendererNow();
       const frames = validateFrame(frame);
@@ -932,6 +934,11 @@
       if (workletNode) {
         if (workletQueuedFrames + frames > workletCapacityFrames) return false;
         const packetIndex = rendererPacketIndex++;
+        if (rendererPacketOwners.size >= RENDERER_PACKET_OWNER_LIMIT) {
+          rendererPacketOwners.delete(rendererPacketOwners.keys().next().value);
+          rendererMetrics.operation_owner_evictions = (rendererMetrics.operation_owner_evictions || 0) + 1;
+        }
+        rendererPacketOwners.set(packetIndex, operationId);
         const enqueuedContextTimeMs = context.currentTime * 1_000;
         const buffer = frame.data.buffer;
         if (!(buffer instanceof ArrayBuffer)) {
@@ -966,6 +973,8 @@
           frames,
           queued_frames: workletQueuedFrames,
           audio_context_ms: Math.round(enqueuedContextTimeMs * 100) / 100,
+          operation_id: operationId,
+          operation_owner_missing: !operationId,
         });
         return true;
       }
@@ -1010,9 +1019,10 @@
     const schedulePending = () => {
       if (stopped) return;
       while (chunkHead < chunks.length) {
-        const frame = chunks[chunkHead];
+        const queued = chunks[chunkHead];
+        const { frame, operationId } = queued;
         const seconds = frame.data.byteLength / (2 * frame.channels * frame.sampleRate);
-        if (!schedule(frame)) break;
+        if (!schedule(frame, operationId)) break;
         chunkHead += 1;
         pendingSeconds -= seconds;
       }
@@ -1104,9 +1114,13 @@
           if (stopped) return;
           const audioContextMs = Number(data?.audioContextFrame || 0) * 1_000 / format.sampleRate;
           if (data?.type === "packet_admitted") {
+            const packetIndex = Number(data.packetIndex || 0);
+            const operationOwnerKnown = rendererPacketOwners.has(packetIndex);
+            const operationId = operationOwnerKnown ? rendererPacketOwners.get(packetIndex) : null;
+            rendererPacketOwners.delete(packetIndex);
             onRendererEvent?.({
               type: "packet_admitted",
-              packet_index: Number(data.packetIndex || 0),
+              packet_index: packetIndex,
               sequence: Number(data.sequence || 0),
               sample_offset: Number(data.sampleOffset || 0),
               frames: Number(data.frames || 0),
@@ -1116,6 +1130,8 @@
                 0,
                 audioContextMs - Number(data.enqueuedContextTimeMs || 0),
               ) * 100) / 100,
+              operation_id: operationId,
+              operation_owner_missing: !operationOwnerKnown || !operationId,
             });
           } else if (data?.type === "render_started") {
             rendererMetrics.worklet_first_render_context_frame = Number(data.audioContextFrame || 0);
@@ -1303,7 +1319,10 @@
         // AudioWorklet transfer detaches the scheduled packet's ArrayBuffer.
         // History is the durable replay source, so each replay gets its own
         // transferable copy and the retained frames remain intact forever.
-        chunks.push(...history.map((frame) => ({ ...frame, data: frame.data.slice() })));
+        chunks.push(...history.map((frame) => ({
+          frame: { ...frame, data: frame.data.slice() },
+          operationId: null,
+        })));
         pendingSeconds = history.reduce((seconds, frame) => (
           seconds + (frame.data.byteLength / (2 * frame.channels * frame.sampleRate))
         ), 0);
@@ -1356,7 +1375,7 @@
           history.push({ ...frame, data: frame.data.slice() });
           rendererMetrics.retained_bytes += frame.data.byteLength;
         }
-        chunks.push(frame);
+        chunks.push({ frame, operationId: typeof sequenceKey === "string" ? sequenceKey : null });
         pendingSeconds += frame.data.byteLength / (2 * frame.channels * frame.sampleRate);
         if (!receivedAudio) {
           receivedAudio = true;
@@ -1411,6 +1430,7 @@
       }
       workletOwner = null;
       context = null;
+      rendererPacketOwners.clear();
       reportRendererMetrics("stopped");
     };
 
@@ -4857,9 +4877,11 @@
       // Multiple marks for one trace intentionally coalesce to the newest
       // checkpoint; the stage array still contains every individual timing.
       const snapshot = JSON.parse(JSON.stringify(trace));
-      const serialized = JSON.stringify({ ...snapshot, summary: voiceLatencySummary(snapshot) });
-      if (serialized.length > 64 * 1024) return;
-      voiceLatencyHistory.push(snapshot);
+      // Derive metrics before byte compaction so a bounded receipt keeps the
+      // complete summary even when repetitive detail must be omitted.
+      const summary = voiceLatencySummary(snapshot);
+      const serialized = compactVoiceLatencySnapshot(snapshot, summary);
+      voiceLatencyHistory.push(JSON.parse(serialized));
       if (voiceLatencyHistory.length > 20) voiceLatencyHistory.splice(0, voiceLatencyHistory.length - 20);
       persistVoiceLatency(serialized);
     });
@@ -4880,6 +4902,298 @@
   // first-voice milestone is coalesced.
   const COALESCED_VOICE_LATENCY_STAGES = new Set(["voice_activity_first_detected"]);
   const VOICE_LATENCY_STAGE_LIMIT = 512;
+  const VOICE_LATENCY_TRACE_BYTE_LIMIT = 64 * 1024;
+  const VOICE_LATENCY_OWNER_BUCKET_LIMIT = 128;
+  const VOICE_LATENCY_HIGH_VOLUME_STAGES = new Set([
+    "native_chat_stream_event",
+    "chat_stream_event_received",
+    "chat_stream_route_decision",
+    "playback_packet_enqueued",
+    "playback_packet_admitted",
+  ]);
+  const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
+    "call_requested", "call_ringing_started", "call_conversation_ready",
+    "audio_prefill_begin_requested", "audio_prefill_session_ready",
+    "audio_prefill_begin_failed", "audio_prefill_push_failed",
+    "audio_prefill_wait_expired", "audio_prefill_drain_failed",
+    "audio_prefill_producer_overflow", "native_capture_started", "capture_stopped",
+    "capture_processing", "voice_inference_archive", "native_capture_failed",
+    "generation_dispatched", "speculation_dispatch_started", "native_silence_armed",
+    "native_silence_released", "native_generation_worker_started", "generation_finished",
+    "voice_transcript_started", "voice_transcript_inference_started",
+    "voice_transcript_inference_finished", "voice_transcript_finished",
+    "voice_transcript_skipped", "voice_transcript_failed", "first_content_delta",
+    "first_content_delta_received", "tts_first_chunk_ready", "tts_native_dispatched",
+    "tts_first_pcm", "tts_segment_finished", "tts_all_segments_finished",
+    "tts_segment_dispatched", "tts_segment_first_pcm", "tts_segment_pcm_complete",
+    "tts_segment_receipt_received",
+    "next_turn_prefill_started", "next_turn_prefill_ready", "next_turn_prefill_failed",
+    "barge_in_detected", "barge_in_playback_stopped", "barge_in_playback_stop_failed",
+    "playable", "playback_started", "playback_render_started",
+    "playback_underrun_started", "playback_underrun_recovered", "durable_voice_audio_ready",
+    "durable_voice_audio_failed", "playback_underrun", "playback_renderer",
+    "speculation_handoff_ready", "speculation_handoff_failed", "failed",
+  ]);
+  const VOICE_LATENCY_LIFECYCLE_EVENTS = new Set([
+    "started", "prefill_started", "decode_started", "completed", "cancelled", "failed",
+  ]);
+
+  const voiceLatencyUtf8Bytes = (value) => new TextEncoder().encode(value).byteLength;
+
+  const noteVoiceLatencyCompaction = (trace, field, amount = 1) => {
+    trace.compaction ||= {};
+    trace.compaction[field] = (Number(trace.compaction[field]) || 0) + Math.max(0, Number(amount) || 0);
+  };
+
+  const isVoiceLatencyCriticalRecord = (record) => {
+    if (VOICE_LATENCY_CHECKPOINT_STAGES.has(record.stage)) return true;
+    if (record.stage === "native_chat_stream_event"
+      || record.stage === "chat_stream_event_received" || record.stage === "chat_stream_route_decision") {
+      return VOICE_LATENCY_LIFECYCLE_EVENTS.has(record.event);
+    }
+    return false;
+  };
+
+  const appendVoiceLatencyStage = (trace, record) => {
+    if (trace.stages.length >= VOICE_LATENCY_STAGE_LIMIT) {
+      let removeAt = trace.stages.findIndex((entry) => entry.voice_latency_aggregate === true);
+      if (removeAt < 0 && isVoiceLatencyCriticalRecord(record)) {
+        removeAt = trace.stages.findIndex((entry) => !isVoiceLatencyCriticalRecord(entry));
+      }
+      if (removeAt < 0 && isVoiceLatencyCriticalRecord(record)) removeAt = 0;
+      if (removeAt < 0) {
+        noteVoiceLatencyCompaction(trace, "stage_limit_events_omitted");
+        return null;
+      }
+      const [removed] = trace.stages.splice(removeAt, 1);
+      noteVoiceLatencyCompaction(trace, "stage_limit_records_omitted");
+      noteVoiceLatencyCompaction(trace, "stage_limit_events_omitted", removed?.occurrences || 1);
+    }
+    trace.stages.push(record);
+    return record;
+  };
+
+  const aggregateVoiceLatencyStage = (trace, stage, detail, elapsedMs, observedAtUnixUs) => {
+    const isStream = stage === "native_chat_stream_event"
+      || stage === "chat_stream_event_received" || stage === "chat_stream_route_decision";
+    if (isStream && !["delta", "reasoning_delta"].includes(detail.event)) return { handled: false };
+    if (!VOICE_LATENCY_HIGH_VOLUME_STAGES.has(stage)) return { handled: false };
+    const ownerType = isStream ? "request" : "operation";
+    const rawOwner = isStream ? detail.request_id : detail.operation_id;
+    if (!rawOwner) noteVoiceLatencyCompaction(trace,
+      isStream ? "unowned_stream_events" : "unowned_packet_events");
+    const ownerId = typeof rawOwner === "string" && rawOwner.length <= 128
+      ? rawOwner : (rawOwner ? String(rawOwner).slice(0, 128) : "unattributed");
+    let recorded = trace.stages.find((entry) => entry.voice_latency_aggregate === true
+      && entry.stage === stage && entry.owner_type === ownerType && entry.owner_id === ownerId);
+    if (!recorded) {
+      const ownerCount = new Set(trace.stages
+        .filter((entry) => entry.voice_latency_aggregate === true && entry.stage === stage)
+        .map((entry) => `${entry.owner_type}:${entry.owner_id}`)).size;
+      if (ownerCount >= VOICE_LATENCY_OWNER_BUCKET_LIMIT) {
+        noteVoiceLatencyCompaction(trace, "owner_bucket_events_omitted");
+        return { handled: true, recorded: null };
+      }
+      recorded = appendVoiceLatencyStage(trace, {
+        stage,
+        owner_type: ownerType,
+        owner_id: ownerId,
+        request_id: isStream ? ownerId : null,
+        operation_id: isStream ? null : ownerId,
+        conversation_id: detail.conversation_id || null,
+        event: detail.event || null,
+        first_elapsed_ms: elapsedMs,
+        first_observed_at_unix_us: observedAtUnixUs,
+        elapsed_ms: elapsedMs,
+        observed_at_unix_us: observedAtUnixUs,
+        occurrences: 0,
+        voice_latency_aggregate: true,
+      });
+      if (!recorded) return { handled: true, recorded: null };
+    }
+    recorded.elapsed_ms = elapsedMs;
+    recorded.observed_at_unix_us = observedAtUnixUs;
+    recorded.last_event = detail.event || recorded.last_event || null;
+    recorded.occurrences += 1;
+    if (stage === "chat_stream_route_decision") {
+      recorded.same_live_conversation_true = (recorded.same_live_conversation_true || 0)
+        + (detail.same_live_conversation ? 1 : 0);
+      recorded.owns_live_voice_true = (recorded.owns_live_voice_true || 0)
+        + (detail.owns_live_voice ? 1 : 0);
+      recorded.last_live_request_id = detail.live_request_id || null;
+    } else if (stage === "native_chat_stream_event") {
+      recorded.total_delta_bytes = (recorded.total_delta_bytes || 0) + Math.max(0, Number(detail.delta_bytes) || 0);
+      recorded.last_kind = detail.kind || recorded.last_kind || null;
+      const nativeTime = Number(detail.native_emitted_at_unix_us);
+      if (Number.isFinite(nativeTime)) {
+        recorded.first_native_emitted_at_unix_us ??= nativeTime;
+        recorded.last_native_emitted_at_unix_us = nativeTime;
+      }
+    } else if (stage === "playback_packet_enqueued" || stage === "playback_packet_admitted") {
+      const frames = Math.max(0, Number(detail.frames) || 0);
+      recorded.total_frames = (recorded.total_frames || 0) + frames;
+      recorded.packet_count = (recorded.packet_count || 0) + 1;
+      recorded.first_packet_index ??= Number(detail.packet_index) || 0;
+      recorded.first_sequence ??= Number(detail.sequence) || 0;
+      recorded.first_sample_offset ??= Number(detail.sample_offset) || 0;
+      recorded.last_packet_index = Number(detail.packet_index) || 0;
+      recorded.last_sequence = Number(detail.sequence) || 0;
+      recorded.last_sample_offset = Number(detail.sample_offset) || 0;
+      const audioContextMs = Number(detail.audio_context_ms);
+      if (Number.isFinite(audioContextMs)) {
+        recorded.first_audio_context_ms ??= audioContextMs;
+        recorded.last_audio_context_ms = audioContextMs;
+      }
+      const queued = Number(detail.queued_frames);
+      const buffered = Number(detail.buffered_frames);
+      const delay = Number(detail.enqueue_to_admission_ms);
+      if (Number.isFinite(queued)) recorded.max_queued_frames = Math.max(recorded.max_queued_frames || 0, queued);
+      if (Number.isFinite(buffered)) recorded.max_buffered_frames = Math.max(recorded.max_buffered_frames || 0, buffered);
+      if (Number.isFinite(delay)) recorded.max_enqueue_to_admission_ms = Math.max(recorded.max_enqueue_to_admission_ms || 0, delay);
+      if (detail.operation_owner_missing) recorded.operation_owner_missing_packets = (recorded.operation_owner_missing_packets || 0) + 1;
+    }
+    return { handled: true, recorded };
+  };
+
+  const compactVoiceLatencySnapshot = (snapshot, summary) => {
+    const serialize = () => JSON.stringify({ ...snapshot, summary });
+    const envelopeBytes = () => voiceLatencyUtf8Bytes(JSON.stringify({ ...snapshot, stages: [], summary }));
+    const stageBytes = () => snapshot.stages.map((entry) => voiceLatencyUtf8Bytes(JSON.stringify(entry)));
+    const estimatedBytes = () => {
+      const sizes = stageBytes();
+      return envelopeBytes() + sizes.reduce((total, bytes) => total + bytes, 0) + Math.max(0, sizes.length - 1);
+    };
+
+    // High-volume detail has already been aggregated by owner. Under receipt
+    // pressure discard aggregate buckets first, then noncritical diagnostics,
+    // without serializing the full trace once per discarded stage.
+    let sizes = stageBytes();
+    const dropSelected = (predicate) => {
+      const kept = [];
+      let removedRecords = 0;
+      let removedEvents = 0;
+      snapshot.stages.forEach((entry, index) => {
+        if (predicate(entry)) {
+          removedRecords += 1;
+          removedEvents += Number(entry?.occurrences) || 1;
+        } else {
+          kept.push(entry);
+        }
+      });
+      if (removedRecords) {
+        snapshot.stages = kept;
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_records_omitted", removedRecords);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_events_omitted", removedEvents);
+      }
+    };
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      dropSelected((entry) => entry.voice_latency_aggregate === true);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      sizes = stageBytes();
+      let bytesToRemove = estimatedBytes() - VOICE_LATENCY_TRACE_BYTE_LIMIT;
+      let removeBytes = 0;
+      let removeCount = 0;
+      for (let index = 0; index < snapshot.stages.length && removeBytes < bytesToRemove; index += 1) {
+        if (!isVoiceLatencyCriticalRecord(snapshot.stages[index])) {
+          removeBytes += (sizes[index] || 0) + 1;
+          removeCount += 1;
+        }
+      }
+      let remaining = removeCount;
+      dropSelected((entry) => !isVoiceLatencyCriticalRecord(entry) && remaining-- > 0);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      // Preserve lifecycle identity/timing while discarding only verbose
+      // metric fields. These receipts explicitly mark that detail was omitted.
+      const keep = new Set([
+        "stage", "elapsed_ms", "observed_at_unix_us", "native_emitted_at_unix_us",
+        "first_elapsed_ms", "first_observed_at_unix_us", "request_id", "operation_id",
+        "conversation_id", "event", "owner_type", "owner_id", "occurrences",
+      ]);
+      let fieldsRemoved = 0;
+      for (const entry of snapshot.stages) {
+        for (const key of Object.keys(entry)) {
+          if (!keep.has(key)) {
+            delete entry[key];
+            fieldsRemoved += 1;
+          }
+        }
+      }
+      if (fieldsRemoved) noteVoiceLatencyCompaction(snapshot, "byte_limit_detail_fields_omitted", fieldsRemoved);
+    }
+    if (estimatedBytes() > VOICE_LATENCY_TRACE_BYTE_LIMIT && snapshot.stages.length > 1) {
+      // As a last pressure step retain the latest lifecycle milestone.
+      sizes = stageBytes();
+      let bytesToRemove = estimatedBytes() - VOICE_LATENCY_TRACE_BYTE_LIMIT;
+      let removeCount = 0;
+      for (let index = 0; index < snapshot.stages.length - 1 && bytesToRemove > 0; index += 1) {
+        bytesToRemove -= (sizes[index] || 0) + 1;
+        removeCount += 1;
+      }
+      if (removeCount) {
+        const removed = snapshot.stages.splice(0, removeCount);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_records_omitted", removed.length);
+        noteVoiceLatencyCompaction(snapshot, "byte_limit_events_omitted",
+          removed.reduce((total, entry) => total + (Number(entry?.occurrences) || 1), 0));
+      }
+    }
+
+    if (Object.values(snapshot.compaction || {}).some((count) => Number(count) > 0)) {
+      summary.incomplete = true;
+    }
+    let serialized = serialize();
+    if (voiceLatencyUtf8Bytes(serialized) > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+      // The fixed summary is normally small. If a malformed/custom summary
+      // itself exceeds the receipt budget, retain core scalar outcomes and
+      // make the summary loss explicit rather than looping or dropping it.
+      const compactSummary = {};
+      for (const key of [
+        "silence_to_first_content_ms", "silence_to_first_token_ms", "silence_to_tts_pcm_ms",
+        "generation_first_token_ms", "generation_finish_ms", "capture_to_first_sample_ms",
+        "barge_in_playback_stop_ms", "playback_underrun_total_gap_ms",
+        "playback_underrun_max_gap_ms", "tts_segments", "tts_total_ms",
+      ]) {
+        const value = summary?.[key];
+        if (value === null || typeof value === "number" || typeof value === "boolean") compactSummary[key] = value;
+      }
+      compactSummary.incomplete = true;
+      snapshot.compaction ||= {};
+      snapshot.compaction.summary_fields_omitted = Object.keys(summary || {}).length - Object.keys(compactSummary).length + 1;
+      const lastStage = snapshot.stages.at(-1);
+      const minimal = {
+        id: snapshot.id,
+        mode: snapshot.mode,
+        began_at: snapshot.began_at,
+        checkpoint: snapshot.checkpoint,
+        compaction: snapshot.compaction,
+        stages: lastStage ? [{
+          stage: lastStage.stage,
+          elapsed_ms: lastStage.elapsed_ms,
+          observed_at_unix_us: lastStage.observed_at_unix_us,
+          request_id: lastStage.request_id,
+          operation_id: lastStage.operation_id,
+          occurrences: lastStage.occurrences,
+        }] : [],
+        summary: compactSummary,
+      };
+      serialized = JSON.stringify(minimal);
+      if (voiceLatencyUtf8Bytes(serialized) > VOICE_LATENCY_TRACE_BYTE_LIMIT) {
+        // This final form contains only bounded generated identifiers and
+        // scalar fields; it is a defensive guarantee against a future schema
+        // accidentally making the summary or trace envelope unbounded.
+        serialized = JSON.stringify({
+          id: String(snapshot.id || "").slice(0, 64),
+          mode: String(snapshot.mode || "").slice(0, 64),
+          checkpoint: Number(snapshot.checkpoint) || 0,
+          compaction: { receipt_fallback: true, records_omitted: snapshot.compaction?.byte_limit_records_omitted || 0 },
+          stages: [],
+          summary: { incomplete: true },
+        });
+      }
+    }
+    return serialized;
+  };
 
   const markVoiceLatencyIn = (trace, stage, detail = {}) => {
     if (!trace) return;
@@ -4891,18 +5205,21 @@
       : Date.now() * 1000;
     let recorded = null;
     let firstOccurrence = true;
-    if (stage === "playback_consumed") {
+    const aggregation = aggregateVoiceLatencyStage(trace, stage, detail, elapsedMs, observedAtUnixUs);
+    recorded = aggregation.recorded || null;
+    if (aggregation.handled) {
+      firstOccurrence = false;
+    } else if (stage === "playback_consumed") {
       let consumed = trace.stages.find((entry) => entry.stage === stage);
       const frames = Math.max(0, Number(detail.frames) || 0);
       const buffered = Math.max(0, Number(detail.buffered_frames) || 0);
-      if (!consumed && trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
-        consumed = {
+      if (!consumed) {
+        consumed = appendVoiceLatencyStage(trace, {
           stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs,
           first_elapsed_ms: elapsedMs, first_observed_at_unix_us: observedAtUnixUs,
           occurrences: 0, total_frames: 0,
           min_buffered_frames: buffered, max_buffered_frames: buffered,
-        };
-        trace.stages.push(consumed);
+        });
       }
       if (consumed) {
         consumed.elapsed_ms = elapsedMs;
@@ -4919,9 +5236,11 @@
     } else if (stage === "playback_underrun") {
       let underrun = trace.stages.find((entry) => entry.stage === stage);
       if (!underrun) {
-        underrun = { stage, elapsed_ms: elapsedMs, occurrences: 0, total_gap_ms: 0, max_gap_ms: 0 };
-        trace.stages.push(underrun);
+        underrun = appendVoiceLatencyStage(trace, {
+          stage, elapsed_ms: elapsedMs, occurrences: 0, total_gap_ms: 0, max_gap_ms: 0,
+        });
       }
+      if (!underrun) return;
       const gapMs = Math.max(0, Number(detail.gap_ms) || 0);
       underrun.elapsed_ms = elapsedMs;
       underrun.occurrences += 1;
@@ -4941,70 +5260,20 @@
           first_observed_at_unix_us: firstObservedAtUnixUs,
           occurrences: (recorded.occurrences || 1) + 1,
         });
-      } else if (trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
+      } else {
         recorded = { stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs,
           first_elapsed_ms: elapsedMs, first_observed_at_unix_us: observedAtUnixUs,
           occurrences: 1, ...detail };
-        trace.stages.push(recorded);
+        recorded = appendVoiceLatencyStage(trace, recorded);
       }
-    } else if (trace.stages.length < VOICE_LATENCY_STAGE_LIMIT) {
+    } else {
       recorded = { stage, elapsed_ms: elapsedMs, observed_at_unix_us: observedAtUnixUs, ...detail };
-      trace.stages.push(recorded);
+      recorded = appendVoiceLatencyStage(trace, recorded);
     }
-    const checkpoint = [
-      "call_requested",
-      "call_ringing_started",
-      "call_conversation_ready",
-      "audio_prefill_begin_requested",
-      "audio_prefill_session_ready",
-      "audio_prefill_begin_failed",
-      "audio_prefill_push_failed",
-      "audio_prefill_wait_expired",
-      "audio_prefill_drain_failed",
-      "audio_prefill_producer_overflow",
-      "native_capture_started",
-      "capture_stopped",
-      "capture_processing",
-      "voice_inference_archive",
-      "native_capture_failed",
-      "generation_dispatched",
-      "speculation_dispatch_started",
-      "native_silence_armed",
-      "native_silence_released",
-      "native_generation_worker_started",
-      "generation_finished",
-      "voice_transcript_started",
-      "voice_transcript_inference_started",
-      "voice_transcript_inference_finished",
-      "voice_transcript_finished",
-      "voice_transcript_skipped",
-      "voice_transcript_failed",
-      "first_content_delta",
-      "first_content_delta_received",
-      "tts_first_chunk_ready",
-      "tts_native_dispatched",
-      "tts_first_pcm",
-      "tts_segment_finished",
-      "tts_all_segments_finished",
-      "next_turn_prefill_started",
-      "next_turn_prefill_ready",
-      "next_turn_prefill_failed",
-      "barge_in_detected",
-      "barge_in_playback_stopped",
-      "barge_in_playback_stop_failed",
-      "playable",
-      "playback_started",
-      "playback_render_started",
-      "playback_underrun_started",
-      "playback_underrun_recovered",
-      "durable_voice_audio_ready",
-      "durable_voice_audio_failed",
-      "playback_underrun",
-      "playback_renderer",
-      "speculation_handoff_ready",
-      "speculation_handoff_failed",
-      "failed",
-    ].includes(stage);
+    const lifecycleStreamEvent = (stage === "native_chat_stream_event"
+      || stage === "chat_stream_event_received" || stage === "chat_stream_route_decision")
+      && VOICE_LATENCY_LIFECYCLE_EVENTS.has(detail.event);
+    const checkpoint = VOICE_LATENCY_CHECKPOINT_STAGES.has(stage) || lifecycleStreamEvent;
     if (checkpoint && (firstOccurrence || !COALESCED_VOICE_LATENCY_STAGES.has(stage))) {
       trace.checkpoint = (trace.checkpoint || 0) + 1;
       queueVoiceLatencyCheckpoint(trace);
@@ -5114,6 +5383,7 @@
     let firstRequest = true;
     let activeOperation = null;
     let activeSynthesis = null;
+    let cancelPcmDelivery = null;
     let nextCallPrefill = null;
     let callTranscriptResidentCheck = null;
     let nextCallPrefillRetryPending = false;
@@ -5569,6 +5839,7 @@
     const fail = (error) => {
       if (stopped) return;
       stopped = true;
+      cancelPcmDelivery?.();
       if (activeCallPlayback === playback) activeCallPlayback = null;
       updateSemanticBackpressure({ terminal: true });
       window.clearTimeout(audioProgressWatchdog);
@@ -5718,6 +5989,19 @@
       const operation = speechOperationToken();
       activeOperation = operation;
       const segment = ++segmentIndex;
+      // Tauri delivers large binary channel packets through asynchronous
+      // fetches. The command result can overtake that channel's last packets.
+      // Keep this segment's owner until both native success and validated PCM
+      // EOF arrive; otherwise the next segment discards the old audio tail.
+      let pcmEndSeen = false;
+      let settlePcmDelivery;
+      const pcmDelivered = new Promise((resolve) => { settlePcmDelivery = resolve; });
+      const cancelThisPcmDelivery = () => settlePcmDelivery(false);
+      cancelPcmDelivery = cancelThisPcmDelivery;
+      const segmentDispatchedAt = performance.now();
+      markTtsLatency("tts_segment_dispatched", {
+        segment, operation_id: operation, request_id: requestId,
+      });
       const wordCount = next.chunk.match(/\S+/g)?.length || 1;
       const maxSegmentFrames = Math.ceil(Math.min(20, Math.max(2.5, wordCount / 2 + 1)) * 24000);
       let segmentFrames = 0;
@@ -5741,6 +6025,9 @@
       const stream = pcmChannel((frame) => {
         if (stopped || activeOperation !== operation) return;
         try {
+          if (pcmEndSeen) {
+            throw new Error("speech_stream_after_end: PCM arrived after its segment ended.");
+          }
           const decoded = decodePcmFrame(frame);
           const packetFrames = decoded.data.byteLength / (2 * decoded.channels);
           segmentFrames += packetFrames;
@@ -5749,6 +6036,12 @@
           }
           if (packetFrames > 0) {
             const packetAt = performance.now();
+            if (segmentFirstPacketAt === null) {
+              markTtsLatency("tts_segment_first_pcm", {
+                segment, operation_id: operation, request_id: requestId,
+                dispatch_to_pcm_ms: Math.round(packetAt - segmentDispatchedAt),
+              });
+            }
             const packetAudioMs = packetFrames * 1000 / decoded.sampleRate;
             segmentPcmPackets += 1;
             segmentPcmAudioMs += packetAudioMs;
@@ -5796,6 +6089,14 @@
               ? aggregateLead : Math.min(ttsMinimumProducerLeadMs, aggregateLead);
           }
           controller.pushSegment(frame, operation);
+          if (decoded.end) {
+            pcmEndSeen = true;
+            markTtsLatency("tts_segment_pcm_complete", {
+              segment, operation_id: operation, request_id: requestId,
+              frames: segmentFrames, packets: segmentPcmPackets,
+            });
+            settlePcmDelivery(true);
+          }
           // Transport heartbeats and terminal empty packets are not synthesis
           // progress. Only actual PCM earns more time; otherwise an unhealthy
           // producer can keep a pending bubble alive forever without audio.
@@ -5813,11 +6114,20 @@
         pcmStream: stream,
       });
       activeSynthesis = synthesis;
-      synthesis.then((response) => {
+      synthesis.then(async (response) => {
         if (stopped || activeOperation !== operation) return;
         if (response?.status === "blocked" || !response?.result) {
           throw new Error(response?.blocker?.message || "Voice synthesis stopped.");
         }
+        const receiptAt = performance.now();
+        markTtsLatency("tts_segment_receipt_received", {
+          segment, operation_id: operation, request_id: requestId,
+          pcm_complete: pcmEndSeen,
+        });
+        // The existing audio-progress watchdog also bounds a missing channel
+        // EOF. Stop/failure settles this delivery wait immediately, while
+        // activeSynthesis separately tracks the actual native producer.
+        if (!await pcmDelivered || stopped || activeOperation !== operation) return;
         const binding = response.result.binding || {};
         const synthesisMs = Number(binding.tts_total_ms);
         const outputAudioMs = Number(binding.duration_ms);
@@ -5835,6 +6145,9 @@
         if (mode === "call") void controller.reconsiderStartup();
         markTtsLatency("tts_segment_finished", {
           segment,
+          operation_id: operation,
+          request_id: requestId,
+          transport_drain_ms: Math.round(performance.now() - receiptAt),
           characters: next.chunk.length,
           words: wordCount,
           chunk_word_limit: chunkWordLimit,
@@ -5898,6 +6211,7 @@
         watchdogActive = false;
         if (activeOperation === operation) activeOperation = null;
         if (activeSynthesis === synthesis) activeSynthesis = null;
+        if (cancelPcmDelivery === cancelThisPcmDelivery) cancelPcmDelivery = null;
         running = false;
         pump();
       });
@@ -6010,6 +6324,7 @@
       async cancel() {
         if (stopped) return;
         stopped = true;
+        cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);
@@ -6039,6 +6354,7 @@
       async stop() {
         if (stopped) return;
         stopped = true;
+        cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
         window.clearTimeout(audioProgressWatchdog);

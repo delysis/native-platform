@@ -1035,6 +1035,237 @@ test("live voice synthesis has an idle-progress deadline after first PCM", () =>
   assert.match(live, /invoke\("mom_llama_speech_stop", \{ operation \}\)/);
 });
 
+const liveTtsTailHarness = () => {
+  const invocations = [];
+  const delivered = [];
+  const timers = new Map();
+  let operationNumber = 0;
+  let now = 0;
+  let timerNumber = 0;
+  class AdaptiveVoiceLeadController {
+    chunkWordLimit() { return 8; }
+    shouldDispatch() { return true; }
+    shouldBufferCompleteReply() { return false; }
+    shouldPrepareNextCall() { return false; }
+    startupRunwayMs() { return 0; }
+    startupDelayMs() { return 0; }
+    targetRunwayMs() { return 0; }
+    progressTimeoutMs() { return 60_000; }
+    notePacket() {}
+    noteSegment() {}
+    noteWait() {}
+    noteUnderrun() {}
+    calibration() { return {}; }
+    snapshot() { return {}; }
+  }
+  const controller = {
+    playing: false,
+    bufferedMs: () => 0,
+    reconsiderStartup: async () => false,
+    pushSegment(frame, operation) { delivered.push({ frame, operation }); },
+    finish() {},
+    stop: async () => {},
+  };
+  const setTimer = (callback) => {
+    const id = ++timerNumber;
+    timers.set(id, callback);
+    return id;
+  };
+  const clearTimer = (id) => timers.delete(id);
+  const context = {
+    window: { setTimeout: setTimer, clearTimeout: clearTimer },
+    performance: { now: () => ++now },
+    document: { createElement: () => ({ className: "" }), querySelector: () => null },
+    MomVoicePipelineScheduler: {
+      AdaptiveVoiceLeadController,
+      SemanticLeadController: class {
+        shouldPause() { return false; }
+        snapshot() { return {}; }
+      },
+    },
+    voiceLeadCalibration: null,
+    voiceLatencyTrace: { stages: [] },
+    markVoiceLatencyIn(trace, stage, detail) { trace.stages.push({ stage, ...detail }); },
+    decodePcmFrame: (frame) => frame,
+    pcmChannel: (onmessage) => ({ onmessage }),
+    createPcmPlaybackBuffer: () => controller,
+    speechOperationToken: () => `tts-op-${++operationNumber}`,
+    rememberVoiceStreamRequest() {},
+    voiceStreamRequestIds: new Set(),
+    voiceReplyPlayback: new WeakMap(),
+    voiceCallActive: false,
+    voiceCallEpoch: 0,
+    activeCallPlayback: null,
+    liveVoiceTts: null,
+    voiceReplyPlayRequested: false,
+    retryCallPrefillAfterTranscript: null,
+    pendingCallTranscriptJobs: [],
+    activeCallTranscriptJob: null,
+    activeCallTranscriptTask: null,
+    voiceCallTranscriptSlotsDisabled: false,
+    voiceRecording: null,
+    errorMessage: (error) => String(error),
+    reportError() {},
+    invoke(command, args) {
+      if (command === "mom_llama_speech_stop") {
+        invocations.push({ command, args, reply: null });
+        return Promise.resolve({ status: "passed" });
+      }
+      const reply = speechDeferred();
+      invocations.push({ command, args, reply });
+      return reply.promise;
+    },
+    queueMicrotask,
+  };
+  context.globalThis = context;
+  const chunkStart = ui.indexOf("  const takeLiveSpeechChunk =");
+  const chunkEnd = ui.indexOf("\n  const beginLiveVoiceTts =", chunkStart);
+  assert.ok(chunkStart >= 0 && chunkEnd > chunkStart);
+  speechVm.runInNewContext(
+    ui.slice(chunkStart, chunkEnd)
+      + block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =")
+      + "\nglobalThis.beginLiveVoiceTts = beginLiveVoiceTts;",
+    context,
+  );
+  const synthesis = () => invocations.filter(
+    (entry) => entry.command === "mom_llama_speech_precommit_synthesize",
+  );
+  const pcm = (label, end = false) => ({
+    data: new Uint8Array(end ? 0 : [label.charCodeAt(0), 0]),
+    sampleRate: 24_000,
+    channels: 1,
+    label,
+    end,
+  });
+  const fireLatestTimer = () => {
+    const entry = [...timers.entries()].at(-1);
+    assert.ok(entry, "a bounded PCM progress timer is armed");
+    timers.delete(entry[0]);
+    entry[1]();
+  };
+  return { context, invocations, delivered, synthesis, pcm, fireLatestTimer };
+};
+
+test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta ");
+  const first = h.synthesis()[0];
+  assert.ok(first, "first synthesis segment is dispatched");
+  first.args.pcmStream.onmessage(h.pcm("head"));
+
+  playback.push("eta theta iota kappa lambda mu nu xi ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const prematureNextSegment = h.synthesis().length > 1;
+
+  // Tauri response and channel callbacks are separate transports: the final
+  // PCM and EOF may arrive after the response promise has already resolved.
+  first.args.pcmStream.onmessage(h.pcm("tail"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = h.synthesis()[1];
+  if (second) {
+    second.args.pcmStream.onmessage(h.pcm("next"));
+    second.args.pcmStream.onmessage(h.pcm("next-eof", true));
+    second.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  }
+  await completed;
+
+  assert.equal(prematureNextSegment, false, "next request must wait until prior-channel EOF");
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "tail", "eof", "next", "next-eof"]);
+});
+
+test("stopping live TTS releases promptly while it waits for channel EOF", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  playback.push("eta theta iota kappa lambda mu nu xi ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const stopping = playback.stop();
+  // If the pre-fix pump already started the queued segment, let its native
+  // response settle only after stop has claimed it. This verifies stop does
+  // not wait for the channel's missing EOF or dispatch more queued text.
+  const premature = h.synthesis()[1];
+  premature?.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  const stopSettled = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  assert.equal(stopSettled, true, "stop must not await the missing PCM EOF");
+  assert.equal(h.synthesis().length, 1, "stop must not dispatch queued text before old channel EOF");
+  assert.equal(await completed, false, "stop settles without waiting for channel EOF");
+});
+
+test("live TTS also waits for native success when channel EOF arrives first", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  playback.push("eta theta iota kappa lambda mu nu xi ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1, "terminal PCM alone cannot release the next synthesis request");
+
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = h.synthesis()[1];
+  assert.ok(second, "the next segment starts after both response and EOF");
+  second.args.pcmStream.onmessage(h.pcm("next"));
+  second.args.pcmStream.onmessage(h.pcm("next-eof", true));
+  second.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await completed;
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "eof", "next", "next-eof"]);
+});
+
+test("missing PCM EOF is bounded by the progress watchdog", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
+  playback.push("alpha beta gamma delta epsilon zeta ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1, "the operation remains owned while EOF is outstanding");
+
+  h.fireLatestTimer();
+  assert.equal(await completed, false, "missing EOF fails the reply instead of hanging forever");
+  assert.equal(h.synthesis().length, 1);
+  assert.ok(h.invocations.some((entry) => entry.command === "mom_llama_speech_stop"));
+});
+
+test("PCM callbacks after terminal EOF fail the active segment instead of extending it", async () => {
+  const h = liveTtsTailHarness();
+  const failures = [];
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture", mode: "call", onFailure: (error) => failures.push(String(error)),
+  });
+  playback.push("alpha beta gamma delta epsilon zeta ");
+  const first = h.synthesis()[0];
+  assert.ok(first);
+  first.args.pcmStream.onmessage(h.pcm("head"));
+  first.args.pcmStream.onmessage(h.pcm("eof", true));
+  first.args.pcmStream.onmessage(h.pcm("late"));
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "eof"]);
+  assert.equal(failures.length, 1);
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta ");
+  first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
+  assert.equal(await completed, false);
+  assert.equal(h.synthesis().length, 1);
+});
+
 test("natural playback end clears pressed state and restores the Read Aloud button", async () => {
   const h = speechLifetimeHarness();
   try {

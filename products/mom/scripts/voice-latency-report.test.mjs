@@ -465,3 +465,20 @@ test("aggregates the latency scoreboard without treating missing metrics as zero
     conversation_target_missed: 1,
   });
 });
+
+// A recorded zero in a compacted trace does not certify uninterrupted sound.
+test("compacted diagnostics remain visibly incomplete in latency reports", () => {
+  const row = latencyRow({ checkpoint: 20, path: "/compacted.json", trace: {
+    id: "compacted", mode: "call", stages: [{ stage: "playback_renderer", elapsed_ms: 1200 }],
+    compaction: { byte_limit_records_omitted: 4 },
+    summary: { playback_underrun_occurrences: 0, silence_to_playback_ms: 800 },
+  } });
+  assert.equal(row.trace_incomplete, true);
+  const diagnosis = latencyDiagnosis(row);
+  assert.ok(diagnosis.findings.includes("trace_incomplete"));
+  assert.equal(latencyAggregate([{ ...row, ...diagnosis }]).findings.trace_incomplete, 1);
+  const flagged = latencyRow({ checkpoint: 1, trace: {
+    id: "flagged", stages: [], summary: { incomplete: true },
+  } });
+  assert.equal(flagged.trace_incomplete, true);
+});

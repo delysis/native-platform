@@ -139,6 +139,8 @@ export function latencyRow(snapshot) {
   const nextPrefillStarted = number(lastStage("next_turn_prefill_started")?.elapsed_ms);
   return {
     ...scalarSummary,
+    trace_incomplete: summary.incomplete === true
+      || Object.values(trace.compaction ?? {}).some((count) => Number(count) > 0),
     ...(foreignGreetingOnly ? {
       generation_prompt_tokens: null,
       generation_completion_tokens: null,
@@ -358,6 +360,7 @@ export function latencyDiagnosis(row) {
     ? Math.round((row.silence_to_playback_ms - accountedMs) * 100) / 100
     : null;
   const findings = [];
+  if (row.trace_incomplete) findings.push("trace_incomplete");
   if (row.voice_session_model_resident_hit === false) findings.push("model_not_resident");
   if (row.runtime_warm_audio_projector_ready === false) {
     findings.push("audio_projector_not_warmed");

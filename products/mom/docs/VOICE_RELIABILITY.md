@@ -7,15 +7,15 @@ declaration. Each local gate, candidate build, and device run applies only to
 the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
-Historical focused counts below are tied to their retained receipts. The
-latest fully passing consolidated gate before the current repair is `ddaf8fe7`
-(64 command records, including 279 WebKit tests). Its candidate 05 failed cold
-pickup and voice-note acceptance despite a later responsive warm call. The
-current repairs require another clean exact-commit gate and packaged run.
-The earlier `599ecbde` gate failed on Clippy and checkout cleanliness; those
-failed receipts remain preserved. Scratch work stays outside source.
-Do not promote a package unless its manifest binds the final clean source and
-tree to a complete passing local gate.
+The latest completed clean-source gate is `a75f042c` (64 command records,
+including 291 frontend tests and 279 WebKit tests). Candidate 07 used that
+source. It restored the saved conversation and answered a warm call promptly,
+but human testing still reported one-to-three-second speech pauses. It is not
+qualified as a reliable voice release. The current transport and diagnostic
+repairs require a new exact-source gate and packaged run. All earlier failed
+receipts remain preserved; successful component checks do not supersede failed
+packaged acceptance. Do not promote a package unless its manifest binds its
+clean source and tree to the complete passing gate.
 The M4 Max runtime evidence below covers bounded voice-history rollover with
 synthetic input. Under a manual 21,845 MiB memory budget, the initial
 8,192-token setting resolved to 18,944 native context cells in that run. It is
@@ -43,6 +43,42 @@ target-device behavior remain unqualified.
 The actual 32 GB M2 device, physical speaker/microphone loopback, sustained
 packaged call, and 30-minute soak remain unqualified. Synthetic tone/PCM and
 unbundled native runs do not substitute for those checks.
+
+## Candidate 07 follow-up: delayed speech and incomplete traces
+
+Candidate 07 restored the saved conversation during startup: 18.328 seconds
+of total startup, including 17.234 seconds of prefix restoration. Its warm call
+preparation reused 13,973 resident positions with zero prefill; first playback
+was 2.038 seconds after the call request. This confirms that restart restoration
+and subsequent RAM readiness worked in this run, not that all device or context
+cases are qualified.
+
+The user reported one-to-three-second pauses and possible old/new speech mixing.
+Some microphone onsets were the user speaking; these are not evidence of echo.
+One reply's worklet first-render marker arrived about one second after its
+AudioContext resume completed. The context clock advanced only 37 milliseconds
+in that wall-clock interval; other replies started rendering within 3–5 ms.
+This is a renderer timing anomaly, not acoustic proof or an explanation of all
+mid-speech pauses.
+
+The saved reply traces ended around 60–61 KiB before terminal playback metrics.
+The recorder silently skipped snapshots above 64 KiB and stopped adding stages
+at 512. These limits could hide later underruns, cancellation or completion.
+Missing events in these incomplete receipts cannot establish that none occurred.
+The repair aggregates repeated delta/PCM traffic and records explicit bounded
+compaction while retaining later lifecycle evidence. Caps remain unchanged.
+
+A separate actual-controller regression reproduced a transport ordering defect:
+the native synthesis result could resolve before its final PCM channel packets.
+Tauri 2.11.5 uses asynchronous fetch delivery for raw channel payloads of at least
+1,024 bytes; command completion is a separate transport. The old pump retired
+its operation and started the next segment, discarding the delayed audio tail.
+The repair waits for both native success and validated PCM EOF before releasing
+that segment. Stop/failure releases the delivery wait immediately, while native
+producer completion remains a separate cancellation obligation. The watchdog
+bounds missing EOF. Per-segment dispatch, first PCM, EOF and result receipts now
+distinguish transport delay from synthesis delay. This reproduction establishes
+a software defect, not that it caused every reported pause in candidate 07.
 
 ## Packaged regression findings
 
