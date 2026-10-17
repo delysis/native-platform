@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import Qwen3TTS
 
 private struct Result: Encodable {
@@ -15,6 +16,7 @@ private struct Request: Decodable {
     let ref_text: String
     var warm_only: Bool? = nil
     var chunk_size: Int? = nil
+    var audition_seed: UInt64? = nil
 }
 
 private struct ControlRequest: Decodable {
@@ -347,6 +349,9 @@ private enum Qwen3TTSHelperMain {
                 }
                 var firstPCM = true
                 let chunkSize = min(8, max(2, request.chunk_size ?? 2))
+                // Explicitly seeded audition requests make reference A/B
+                // comparisons repeatable. App requests omit this field.
+                if let seed = request.audition_seed { MLX.seed(seed) }
                 for textChunk in speechChunks {
                     // Reset generation at natural boundaries before acoustic
                     // drift can propagate. The cached speaker embedding keeps
