@@ -633,3 +633,21 @@ first fixture also began late and was truncated by silence handling. Retain
 both failed attempts. Start fixture playback immediately with capture and stop
 without intermediate tool/readback trips; do not call source-duration clocks
 proof that the whole waveform reached the microphone.
+
+## Native metadata independence
+
+Candidate 11 (2f418b3f) passed components but failed cross-build cache-identity
+qualification and was not launched. GGML's generated source overlay lives under
+the consuming application's target directory; its Git discovery embedded the
+application commit in libggml-base.a. Thus unrelated UI commits changed native
+artifact bytes and invalidated compatible cached state despite ZERO_AR_DATE.
+
+Binding revision 0eda11257a189bd26484d9b751eb6710fec0d7c0 pins GGML metadata to
+the actual upstream 5f55650a78f92aff4d48d671423e888fac0469ff. The overlay honors
+that explicit value, and the build script applies it after generic environment
+forwarding so an environment override cannot substitute another revision. Full
+artifact hashing and context-fingerprint validation remain intact. A real CMake
+regression under two distinct parent Git commits kept the pinned metadata equal;
+the unpinned control followed each parent commit. The earlier failed candidate
+and comparison receipt remain preserved. Always compare native identity between
+app-only builds; a component pass alone does not establish cache compatibility.

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-const LLAMA_CPP_BINDING_REV: &str = "f97267c4964dcdf9e3a33f13bd99b4613ffca24f";
+const LLAMA_CPP_BINDING_REV: &str = "0eda11257a189bd26484d9b751eb6710fec0d7c0";
 const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 
 // Fixed names only. Values are fed to a hash-only accumulator and are never

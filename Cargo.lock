@@ -4889,7 +4889,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=f97267c4964dcdf9e3a33f13bd99b4613ffca24f#f97267c4964dcdf9e3a33f13bd99b4613ffca24f"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=0eda11257a189bd26484d9b751eb6710fec0d7c0#0eda11257a189bd26484d9b751eb6710fec0d7c0"
 dependencies = [
  "bindgen",
  "cc",
