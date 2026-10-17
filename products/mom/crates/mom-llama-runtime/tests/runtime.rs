@@ -2874,7 +2874,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no built-in persona"))?;
-    mom_llama_runtime::conversation_draft_open(Some(persona.id))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
     let started = std::time::Instant::now();
     let warmed = mom_llama_runtime::runtime_warm(&scope)?;
     let warmed = warmed
@@ -2892,8 +2892,18 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let warmed_again = mom_llama_runtime::runtime_warm(&scope)?
         .result
         .ok_or_else(|| anyhow!("second runtime warm failed"))?;
-    assert_eq!(warmed_again.persona_prefix_warm_status, "reused");
-    assert_eq!(warmed_again.persona_prefixes_reused, 1);
+    assert_eq!(
+        warmed_again.persona_prefix_warm_status, "blocked",
+        "startup warming must not supersede a worker after its first admitted prefix"
+    );
+    assert_eq!(warmed_again.persona_prefixes_ready, 0);
+    assert_eq!(warmed_again.persona_prefixes_reused, 0);
+    let resident = mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona.id)?
+        .result
+        .ok_or_else(|| anyhow!("explicit resident persona preparation failed"))?;
+    assert!(resident.resident_prefix_tokens > 0);
+    assert!(resident.metadata.is_none());
+    assert!(!resident.persisted);
     let conversation = mom_llama_runtime::conversation_draft_call_start()?
         .result
         .ok_or_else(|| anyhow!("persona call draft did not materialize"))?;

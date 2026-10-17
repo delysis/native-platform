@@ -1994,7 +1994,10 @@ fn sidebar(
                                         }
                                         div class="conversation-copy" {
                                             span { (display_title) }
-                                            @if let Some(message) = conversation.messages.iter().rev().find(|message| !is_call_turn(conversation, message)) {
+                                            @if let Some(message) = conversation.messages.iter().rev().find(|message| {
+                                                !is_call_turn(conversation, message)
+                                                    && !is_voice_note_turn(conversation, message)
+                                            }) {
                                                 small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
                                             }
                                         }
@@ -2410,6 +2413,17 @@ fn is_call_turn(conversation: &Conversation, message: &Message) -> bool {
                 parent.id == parent_id
                     && parent.role == MessageRole::User
                     && parent.content.starts_with("[Phone call]")
+            })
+        })
+}
+
+fn is_voice_note_turn(conversation: &Conversation, message: &Message) -> bool {
+    message.content.starts_with("[Voice note]")
+        || message.parent_id.as_deref().is_some_and(|parent_id| {
+            conversation.messages.iter().any(|parent| {
+                parent.id == parent_id
+                    && parent.role == MessageRole::User
+                    && parent.content.starts_with("[Voice note]")
             })
         })
 }
@@ -4986,6 +5000,47 @@ mod tests {
         assert!(!html.contains("voice-reply-row"));
         assert!(!html.contains("voice-message-player"));
         assert!(html.contains(r#"data-action="message-read-aloud""#));
+    }
+
+    #[test]
+    fn sidebar_does_not_preview_voice_note_prompt_or_reply() {
+        let earlier = test_message("earlier", MessageRole::User, "Earlier ordinary message");
+        let voice_prompt = test_message(
+            "voice-user",
+            MessageRole::User,
+            "[Voice note] Reply naturally and briefly.",
+        );
+        let mut voice_reply = test_message(
+            "voice-assistant",
+            MessageRole::Assistant,
+            "Hey Jan, I'm doing well, thanks for asking.",
+        );
+        voice_reply.parent_id = Some("voice-user".to_string());
+        let conversation = test_conversation(
+            "chat",
+            "Chat with Jan",
+            ConversationKind::Chat,
+            vec![earlier, voice_prompt, voice_reply],
+        );
+        let conversations = CommandResult::passed(
+            "mom_llama.conversation_list",
+            "contracted",
+            vec![conversation],
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let personas = StoreProjection {
+            value: Vec::new(),
+            blocker: None,
+        };
+
+        let html = sidebar(&conversations, &personas, Some("chat")).into_string();
+
+        assert!(html.contains("Earlier ordinary message"));
+        assert!(!html.contains("Hey Jan"));
+        assert!(!html.contains("Reply naturally and briefly"));
     }
 
     #[test]

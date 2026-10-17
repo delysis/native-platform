@@ -8,12 +8,12 @@ the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
 Historical focused counts below are tied to their retained receipts. The
-latest fully passing consolidated gate before these changes is `5c47b94a`.
-The `599ecbde` gate failed on three Clippy diagnostics and rejected checkout
-cleanliness after scratch files appeared during the run. Both the failure and
-the fix are retained; scratch work now stays outside the source checkout.
-The shutdown capability and native capture ledger below require a subsequent
-clean exact-commit gate. Candidate attempt 01 does not validate this tree.
+latest fully passing consolidated gate before the current repair is `ddaf8fe7`
+(64 command records, including 279 WebKit tests). Its candidate 05 failed cold
+pickup and voice-note acceptance despite a later responsive warm call. The
+current repairs require another clean exact-commit gate and packaged run.
+The earlier `599ecbde` gate failed on Clippy and checkout cleanliness; those
+failed receipts remain preserved. Scratch work stays outside source.
 Do not promote a package unless its manifest binds the final clean source and
 tree to a complete passing local gate.
 The M4 Max runtime evidence below covers bounded voice-history rollover with
@@ -130,6 +130,75 @@ conversation: its result includes audio-encoder readiness. A superseded or
 blocked background warm cannot permanently poison call admission. Encoder
 warmup is memoized within its worker, so this readiness check does not re-encode
 a frame on every call.
+
+## Candidate 05 startup and playback regressions
+
+Candidate 05 (`ddaf8fe7`) passed its exact component gate but failed cold
+pickup. The user called eight seconds after launch. Runtime preparation took
+72.801 seconds, including 69.317 seconds in persona preparation, with no
+compatible prefix reused. Engine source changes between candidates 04 and 05
+changed the conservative native build fingerprint, so earlier native KV was
+ineligible. This is not permission to weaken compatibility validation. The
+automatic cold path also exported and persisted a large PersonaPack before
+reporting readiness. The packaged trace did not separately measure decode,
+export, encryption and disk time within those 69.317 seconds.
+
+Automatic preparation now evaluates the prefix into worker-owned RAM without
+exporting a snapshot. Explicit cache creation still persists PersonaPacks;
+committed conversation checkpoints remain scheduled after idle, hangup and
+shutdown. A saved compatible session is still restored before persona-only
+preparation. The revision fence applies to both resident-only and exported
+prefill. Qualification must measure a cold long persona and a same-build
+restart separately, before offering another candidate for manual testing.
+A launched process with a verified executable is not evidence of voice readiness.
+
+A separate diagnostic Metal run evaluated 11,143 tokens in 27.815 seconds,
+reused that resident prefix in 26 milliseconds, and spent 23.001 seconds on
+explicit export of 3,831,765,240 bytes. These are debug diagnostic timings,
+not release or M2 performance. Call presentation now stays in Preparing until
+its exact conversation is ready, then starts ringing. The latency clock still
+starts at the original call request, so this does not conceal initialization.
+
+Checkpoint persistence yields to foreground work during receipt hashing,
+each bounded encrypted part, and subsequent SQLite mutation stages. A typed
+preemption rolls back the entire transaction, preserving the prior durable
+checkpoint and retaining the pending request for retry. Poisoned call activity
+fails closed. Native snapshot export already in progress still serializes call
+activation; immediate hangup/redial must measure this separately in the release
+package. Bounded write preemption does not make that native export cancellable.
+
+The later human call was responsive for much of the run. Completed turns had
+exact inference derivatives, and many reused roughly 13,000 native positions.
+Three renderer stops followed barge-in detection with no underruns. These facts
+do not prove the interruptions were genuine caller speech or establish audible
+continuity. Preserve the whole timestamped call sequence, including failed
+pickup, rather than selecting only the successful warm call.
+
+Two actual presentation/cancellation defects were found after this run. The
+fallback voice-note handler referenced try-block locals after leaving their
+scope, throwing before TTS admission after a successful generation. Those
+bindings now survive through the owning dispatch. The sidebar excludes voice
+note prompts and their replies from ordinary text previews. Also, PCM startup
+could finish after Stop while awaiting worklet preparation or AudioContext
+resume. Startup and paused-context resume now observe cancellation before
+scheduling or announcing playback, and late cleanup cannot suspend a newer
+owner of the shared context. Tests execute the production handlers with those
+asynchronous boundaries deliberately held open.
+
+Unbound greeting/fallback speech owners previously accepted any new `started`
+event for the same conversation. Dispatch now supplies a bounded correlation
+nonce, echoed by the native event bridge, and the speech owner binds only the
+matching dispatch. Native request IDs still own generation/cancellation; the
+nonce grants no native authority. Late events for stopped/retired owners are
+rejected. Cancellation during historical prefill can legitimately leave no
+live-audio checkpoint: a replacement that completed the same immutable prompt
+and requests sample zero now retains the streaming path instead of being
+cancelled again and converted into an ordinary attachment dispatch. Nonzero
+replay offsets still require a reused checkpoint.
+
+These repairs require their own exact component and packaged qualification;
+candidate 05 remains a failed acceptance attempt. Physical speaker/double-talk,
+long-call continuity and the actual 32 GB M2 remain separate gates.
 
 ## Inference-window behavior
 

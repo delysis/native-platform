@@ -419,7 +419,7 @@ const speechDeferred = () => {
   const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 };
-const speechLifetimeHarness = ({ worklet = false } = {}) => {
+const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null, playbackResumeGate = null } = {}) => {
   const pending = [];
   const calls = [];
   const hashes = [];
@@ -520,12 +520,13 @@ const speechLifetimeHarness = ({ worklet = false } = {}) => {
       this.options = options; this.sampleRate = options?.sampleRate || 24_000;
       this.currentTime = 0; this.destination = {}; this.sources = [];
       this.closed = false; this.state = "running";
-      if (worklet) this.audioWorklet = { async addModule() {} };
+      if (worklet) this.audioWorklet = { addModule: () => workletPreparationGate?.promise || Promise.resolve() };
       audioContexts.push(this);
     }
     async resume() {
       if (playbackResumeError) throw playbackResumeError;
       if (playbackResumePending) return new Promise(() => {});
+      if (playbackResumeGate) await playbackResumeGate.promise;
       this.state = "running";
     }
     async suspend() { this.state = "suspended"; }
@@ -719,6 +720,82 @@ test("a stopped player cannot be woken by clearing its cold startup gate", async
   probePending = false;
   await controller.reconsiderStartup();
   assert.equal(h.audioContexts.length, 0, "stopped buffers cannot restart after late calibration");
+});
+
+test("stop during delayed worklet preparation settles queued playback without creating a renderer", async () => {
+  const preparation = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, workletPreparationGate: preparation });
+  const started = [];
+  const ended = [];
+  const firstChunks = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+    onEnded: () => ended.push(true),
+    onFirstChunk: (event) => firstChunks.push(event),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  const playback = controller.play();
+  controller.finish();
+  assert.equal(firstChunks.length, 1, "accepted PCM still settles first-chunk notification");
+  assert.equal(h.workletNodes.length, 0);
+
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles the queued start request");
+  preparation.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 0, "late preparation cannot create a capture-triggering renderer");
+  assert.deepEqual(started, []);
+  assert.deepEqual(ended, [], "stopped queued completion is not reported as natural playback end");
+});
+
+test("stop during delayed context resume prevents playback-start callbacks and re-suspends late resume", async () => {
+  const resume = speechDeferred();
+  const h = speechLifetimeHarness({ worklet: true, playbackResumeGate: resume });
+  const started = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  const playback = controller.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 1);
+
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles even while browser resume is pending");
+  resume.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [], "stale resume cannot announce playback or open capture");
+  assert.equal(h.audioContexts[0].state, "suspended", "a late resume is returned to the stopped state");
+});
+
+test("stop during a paused-context resume cannot schedule queued PCM or announce playback", async () => {
+  const resumeGate = { promise: Promise.resolve() };
+  const h = speechLifetimeHarness({ playbackResumeGate: resumeGate });
+  const started = [];
+  const controller = h.createPcmPlaybackBuffer({
+    retainHistory: false,
+    onPlaybackStarted: () => started.push(true),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  assert.equal(await controller.play(), true);
+  assert.deepEqual(started, [true]);
+  assert.equal(await controller.pause(), true);
+  const delayedResume = speechDeferred();
+  resumeGate.promise = delayedResume.promise;
+
+  const playback = controller.play();
+  await Promise.resolve();
+  await controller.stop();
+  assert.equal(await playback, false, "stop settles the paused-context resume request");
+  delayedResume.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, [true], "a stale resume cannot announce a second audible start");
+  assert.equal(h.audioContexts[0].closed, true, "late resume cannot leave the stopped context running");
+  assert.equal(h.audioContexts[0].sources.length, 1, "stale resume does not reschedule queued PCM");
 });
 
 test("call playback waits a bounded wall-clock guard without hoarding another PCM packet", async () => {

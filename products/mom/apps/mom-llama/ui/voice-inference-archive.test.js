@@ -281,6 +281,35 @@ test("browser handoff truncates to acknowledged q16 prefix and resumes through a
   });
 });
 
+test("a zero-offset replacement replays the recording when historical prefill had no checkpoint", async () => {
+  const { harness, calls, policy } = makePrefillHarness();
+  const captured = Float32Array.from({ length: 32 }, (_, index) => (index + 1) / 64);
+  const recording = makeRecording(captured, { deferred: false });
+  recording.prefillInputStartSample = 0;
+  recording.modelInputSourceRanges = [];
+  recording.modelInputSampleCount = 0;
+  recording.modelInputPcm16Parts = [];
+  harness.setCurrent(recording);
+
+  harness.resumeBrowserVoicePrefill(recording, {
+    session: "replacement-without-checkpoint",
+    request_id: "request-fresh",
+    resume_reused: false,
+    resume_sample_offset: 0,
+    conversation_id: "call-1",
+  });
+  await recording.pushChain;
+
+  const pushes = calls.filter((call) => call.name === "mom_llama_voice_audio_push");
+  assert.equal(pushes.length, 1, "the complete captured tail is replayed once into the replacement session");
+  const expected = policy.quantizeInferencePcm16(captured);
+  assert.deepEqual(pushes[0].args.samples, Array.from(expected.decoded));
+  assert.equal(recording.modelInputSampleCount, captured.length);
+  assert.deepEqual(JSON.parse(JSON.stringify(recording.modelInputSourceRanges)), [
+    { start: 0, end_exclusive: captured.length },
+  ]);
+});
+
 test("rejected native push invalidates the exact derivative", async () => {
   const { harness, calls, policy } = makePrefillHarness({ rejectPush: true });
   const captured = new Float32Array(640).fill(0.125);

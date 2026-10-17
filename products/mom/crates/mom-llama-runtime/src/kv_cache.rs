@@ -862,68 +862,31 @@ fn prepare_voice_context_resident(
         ));
     }
     let started = std::time::Instant::now();
-    let Some(value) = create_prefix_value_with_revision(
-        &handle,
-        CacheTier::PersonaPack,
-        Some(persona.id.clone()),
-        format!("Resident voice persona: {}", persona.title),
-        &messages,
-        template.clone(),
-        Some(resident.revision),
-    )?
+    let request =
+        shared_prefix_preparation_request(&handle, &messages, Some(&persona.id), template)?;
+    let Some(token_count) = handle
+        .prefill_resident_prefix_if_revision(request, resident.revision)
+        .map_err(|error| anyhow!(error))?
     else {
         return Ok(superseded());
     };
+    // Readiness means evaluated KV is resident, not that a multi-gigabyte
+    // snapshot has been copied, encrypted, and written. The committed-session
+    // scheduler persists the complete conversation after the call/idle window.
+    // Explicit cache creation continues to export and persist PersonaPacks.
     let prefill_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-    // Automatic preparation exports authenticated native state. Probe
-    // generations belong to explicit cache qualification, not this background
-    // path: they can replace a newer foreground conversation between commands.
-    // Publication below touches only cache storage, never the live worker.
-    let verification_us = 0;
-    let started = std::time::Instant::now();
-    let store = RuntimeStore::open(&settings.data_dir)?;
-    let Some(lease) = MomCachePromotionLease::acquire(&store, Some(&persona.id))? else {
-        return Ok(CommandResult::blocked(
-            operation,
-            "stub_blocked",
-            Blocker::new(
-                "kv_cache_owner_removed",
-                "The persona was removed during preparation.",
-                Vec::new(),
-            ),
-        ));
-    };
-    if !lease.promote(value.clone())? && !lease.current_for(value.metadata.owner_id.as_deref())? {
-        return Ok(CommandResult::blocked(
-            operation,
-            "stub_blocked",
-            Blocker::new(
-                "kv_cache_owner_changed",
-                "The persona changed during preparation.",
-                Vec::new(),
-            ),
-        ));
-    }
-    let promotion_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-    drop(lease);
-    let persistence_started = std::time::Instant::now();
-    let persisted = persist_value(&settings, &value)?;
-    let persistence_us = persistence_started
-        .elapsed()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64;
     Ok(CommandResult::passed(
         operation,
         "resident_prefix_prepared",
         VoicePersonaPrefixPreparation {
             audio_projector_warmed,
-            resident_prefix_tokens: value.sequence.token_count,
-            metadata: Some(value.metadata.clone()),
+            resident_prefix_tokens: token_count,
+            metadata: None,
             prefill_us,
-            verification_us,
-            persistence_us,
-            promotion_us,
-            persisted,
+            verification_us: 0,
+            persistence_us: 0,
+            promotion_us: 0,
+            persisted: false,
         },
         Vec::new(),
         Vec::new(),
@@ -1749,7 +1712,8 @@ fn checkpoint_committed_session_request_with_drain(
     if !value.is_valid() {
         return Ok(None);
     }
-    let promoted = persist_session_checkpoint_value(&settings, &value, &conversation_authority)?;
+    let promoted =
+        persist_session_checkpoint_value(scope, &settings, &value, &conversation_authority)?;
     if !promoted {
         return Ok(None);
     }
@@ -1773,35 +1737,12 @@ pub fn invalidate_cache(cache_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_prefix_value(
+fn shared_prefix_preparation_request(
     handle: &NativeModelHandle,
-    tier: CacheTier,
-    owner_id: Option<String>,
-    label: String,
     stable_messages: &[ChatMessage],
+    owner_id: Option<&str>,
     template: ChatTemplateChoice,
-) -> Result<PrefixCacheValue> {
-    create_prefix_value_with_revision(
-        handle,
-        tier,
-        owner_id,
-        label,
-        stable_messages,
-        template,
-        None,
-    )?
-    .ok_or_else(|| anyhow!("unconditional prefix preparation was skipped"))
-}
-
-fn create_prefix_value_with_revision(
-    handle: &NativeModelHandle,
-    tier: CacheTier,
-    owner_id: Option<String>,
-    label: String,
-    stable_messages: &[ChatMessage],
-    template: ChatTemplateChoice,
-    expected_revision: Option<u64>,
-) -> Result<Option<PrefixCacheValue>> {
+) -> Result<SharedPrefixBatchRequest> {
     let settings = resolve_settings()?;
     let tokenized = handle
         .tokenize_messages_with_template(stable_messages.to_vec(), template.clone())
@@ -1809,7 +1750,7 @@ fn create_prefix_value_with_revision(
     let cached_prefix = compatible_cached_prefix_for_owner_with_settings(
         handle,
         stable_messages,
-        owner_id.as_deref(),
+        owner_id,
         &settings,
         template.clone(),
         tokenized
@@ -1838,22 +1779,29 @@ fn create_prefix_value_with_revision(
             }
         })
         .collect();
-    let request = SharedPrefixBatchRequest {
+    Ok(SharedPrefixBatchRequest {
         request_id: format!("kv-cache-prefill-{}", Uuid::new_v4()),
         model_id: handle.status().model_id,
         common_messages: stable_messages.to_vec(),
         chat_template: template,
         branches,
         cached_prefix,
-    };
-    let state = match expected_revision {
-        Some(revision) => handle.prefill_shared_prefix_if_revision(request, revision),
-        None => handle.prefill_shared_prefix(request).map(Some),
-    }
-    .map_err(|error| anyhow!(error))?;
-    let Some(state) = state else {
-        return Ok(None);
-    };
+    })
+}
+
+fn create_prefix_value(
+    handle: &NativeModelHandle,
+    tier: CacheTier,
+    owner_id: Option<String>,
+    label: String,
+    stable_messages: &[ChatMessage],
+    template: ChatTemplateChoice,
+) -> Result<PrefixCacheValue> {
+    let request =
+        shared_prefix_preparation_request(handle, stable_messages, owner_id.as_deref(), template)?;
+    let state = handle
+        .prefill_shared_prefix(request)
+        .map_err(|error| anyhow!(error))?;
     let mut metadata = PrefixCacheMetadata::new(
         Uuid::new_v4().to_string(),
         tier,
@@ -1875,7 +1823,7 @@ fn create_prefix_value_with_revision(
             "native prefix state failed its token and byte integrity checks"
         ));
     }
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn verify_restore_equivalence(
@@ -2149,12 +2097,19 @@ impl SessionConversationAuthority {
 }
 
 fn persist_session_checkpoint_value(
+    scope: &crate::OperationScope,
     settings: &Settings,
     value: &PrefixCacheValue,
     authority: &SessionConversationAuthority,
 ) -> Result<bool> {
     let store = RuntimeStore::open(&settings.data_dir)?;
-    persist_value_with_authority_and_promotion_hook(&store, value, Some(authority), || {})
+    persist_value_with_authority_and_promotion_hook(
+        &store,
+        value,
+        Some(authority),
+        &|| !scope.has_active_voice_call() && scope.active_operation_count() == 0,
+        || {},
+    )
 }
 
 fn persistent_entry_fits(bytes: usize) -> bool {
@@ -2166,25 +2121,30 @@ fn persist_value_with_promotion_hook(
     value: &PrefixCacheValue,
     before_promotion: impl FnOnce(),
 ) -> Result<bool> {
-    persist_value_with_authority_and_promotion_hook(store, value, None, before_promotion)
+    persist_value_with_authority_and_promotion_hook(store, value, None, &|| true, before_promotion)
 }
 
 fn persist_value_with_authority_and_promotion_hook(
     store: &RuntimeStore,
     value: &PrefixCacheValue,
     authority: Option<&SessionConversationAuthority>,
+    admitted: &dyn Fn() -> bool,
     before_promotion: impl FnOnce(),
 ) -> Result<bool> {
+    if !admitted() {
+        return Ok(false);
+    }
     let Some(lease) = MomCachePromotionLease::acquire(store, value.metadata.owner_id.as_deref())?
     else {
         return Ok(false);
     };
-    if !persist_value_to_store_with_authority(
+    if !persist_value_to_store_with_admission(
         store,
         value,
         DEFAULT_PERSISTENT_CACHE_ENTRIES,
         DEFAULT_PERSISTENT_CACHE_BYTES,
         authority,
+        admitted,
     )? {
         return Ok(false);
     }
@@ -2206,6 +2166,7 @@ fn persist_value_to_store(
     persist_value_to_store_with_authority(store, value, max_entries, max_bytes, None)
 }
 
+#[cfg(test)]
 fn persist_value_to_store_with_authority(
     store: &RuntimeStore,
     value: &PrefixCacheValue,
@@ -2213,8 +2174,47 @@ fn persist_value_to_store_with_authority(
     max_bytes: usize,
     authority: Option<&SessionConversationAuthority>,
 ) -> Result<bool> {
+    persist_value_to_store_with_admission(store, value, max_entries, max_bytes, authority, &|| true)
+}
+
+#[derive(Debug)]
+struct CachePersistencePreempted;
+
+impl std::fmt::Display for CachePersistencePreempted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cache persistence yielded to a voice call")
+    }
+}
+impl std::error::Error for CachePersistencePreempted {}
+
+fn require_cache_persistence_admission(admitted: &dyn Fn() -> bool) -> Result<()> {
+    if admitted() {
+        Ok(())
+    } else {
+        Err(CachePersistencePreempted.into())
+    }
+}
+
+fn persist_value_to_store_with_admission(
+    store: &RuntimeStore,
+    value: &PrefixCacheValue,
+    max_entries: usize,
+    max_bytes: usize,
+    authority: Option<&SessionConversationAuthority>,
+    admitted: &dyn Fn() -> bool,
+) -> Result<bool> {
+    if !admitted() {
+        return Ok(false);
+    }
     let mut persisted = value.clone();
-    persisted.bind_reconstruction();
+    let Some(reconstruction) = persisted.sequence.reconstruction_while(admitted) else {
+        return Ok(false);
+    };
+    persisted
+        .metadata
+        .cells
+        .clone_from(&persisted.sequence.cells);
+    persisted.metadata.reconstruction = Some(reconstruction);
     let value = &persisted;
     if !value.is_valid() {
         return Err(anyhow!(
@@ -2231,10 +2231,12 @@ fn persist_value_to_store_with_authority(
             "native prefix state exceeds the persistent cache byte budget"
         ));
     }
-    store.mutate_documents(
+    let result = store.mutate_documents_with_admission(
         KV_CACHE_NAMESPACE,
         KvCacheDb::default,
+        || require_cache_persistence_admission(admitted),
         |db: &mut KvCacheDb, documents| {
+            require_cache_persistence_admission(admitted)?;
             if let Some(authority) = authority
                 && !authority.still_authoritative_in_documents(documents)?
             {
@@ -2261,7 +2263,15 @@ fn persist_value_to_store_with_authority(
             for entry in replaced_ids {
                 delete_cache_bytes(documents, &entry);
             }
-            write_cache_bytes(documents, &value.metadata.id, &value.sequence.bytes)?;
+            // Yield at every bounded encrypted part. An error rolls back this
+            // entire transaction, including replacement/eviction; the existing
+            // durable checkpoint stays intact and the pending request can retry.
+            write_cache_bytes_with_admission(
+                documents,
+                &value.metadata.id,
+                &value.sequence.bytes,
+                admitted,
+            )?;
             db.entries.retain(|entry| {
                 entry.id != value.metadata.id
                     && !(entry.tier == value.metadata.tier
@@ -2281,7 +2291,11 @@ fn persist_value_to_store_with_authority(
             db.entries.retain(|entry| !evicted.contains(&entry.id));
             Ok(true)
         },
-    )
+    );
+    match result {
+        Err(error) if error.is::<CachePersistencePreempted>() => Ok(false),
+        other => other,
+    }
 }
 
 pub(crate) fn persona_cache_ids_from_snapshot(
@@ -2671,15 +2685,25 @@ fn write_cache_bytes(
     id: &str,
     bytes: &[u8],
 ) -> Result<()> {
+    write_cache_bytes_with_admission(documents, id, bytes, &|| true)
+}
+
+fn write_cache_bytes_with_admission(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    id: &str,
+    bytes: &[u8],
+    admitted: &dyn Fn() -> bool,
+) -> Result<()> {
     if !persistent_entry_fits(bytes.len()) {
         return Err(anyhow!(
             "native prefix state exceeds the per-entry persistent cache limit"
         ));
     }
     for (index, chunk) in bytes.chunks(CACHE_BLOB_CHUNK_BYTES).enumerate() {
+        require_cache_persistence_admission(admitted)?;
         documents.put_bytes_streamed(&blob_chunk_namespace(id, index), chunk)?;
     }
-    Ok(())
+    require_cache_persistence_admission(admitted)
 }
 
 fn delete_cache_bytes(
@@ -2866,6 +2890,81 @@ mod tests {
                 .iter()
                 .any(|(conversation_id, _)| conversation_id == "incoming")
         );
+    }
+
+    #[test]
+    fn call_preempts_chunked_checkpoint_without_replacing_durable_state() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("mom-cache-preempt-{}", Uuid::new_v4()));
+        let store = RuntimeStore::open_with_key(&root, [69; 32])?;
+        let previous = test_cache_value("previous", "model");
+        assert!(persist_value_to_store(
+            &store,
+            &previous,
+            4,
+            CACHE_BLOB_CHUNK_BYTES * 2
+        )?);
+        let mut next = test_cache_value("next", "model");
+        next.sequence.bytes = vec![7; CACHE_BLOB_CHUNK_BYTES + 23].into();
+        next.metadata.state_bytes = next.sequence.bytes.len();
+        let checks = std::cell::Cell::new(0);
+        let interrupted: Result<()> = store.mutate_documents(
+            KV_CACHE_NAMESPACE,
+            KvCacheDb::default,
+            |db: &mut KvCacheDb, documents| {
+                delete_cache_bytes(documents, &previous.metadata);
+                db.entries.clear();
+                write_cache_bytes_with_admission(
+                    documents,
+                    &next.metadata.id,
+                    &next.sequence.bytes,
+                    &|| {
+                        let count = checks.get() + 1;
+                        checks.set(count);
+                        // Part zero is staged; the call arrives before part one.
+                        count == 1
+                    },
+                )?;
+                db.entries.push(next.metadata.clone());
+                Ok(())
+            },
+        );
+        assert!(
+            interrupted
+                .expect_err("the foreground call should preempt the second chunk")
+                .is::<CachePersistencePreempted>()
+        );
+        assert_eq!(checks.get(), 2);
+        assert!(!persist_value_to_store_with_admission(
+            &store,
+            &next,
+            4,
+            CACHE_BLOB_CHUNK_BYTES * 2,
+            None,
+            &|| false,
+        )?);
+        assert_eq!(
+            read_cache_bytes(&store, &previous.metadata)?.as_deref(),
+            Some(previous.sequence.bytes.as_slice())
+        );
+        assert!(store.get_bytes(&blob_chunk_namespace("next", 0))?.is_none());
+        assert!(store.get_bytes(&blob_chunk_namespace("next", 1))?.is_none());
+        let db = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("the previous durable cache database remains present");
+        assert_eq!(db.entries.len(), 1);
+        assert_eq!(db.entries[0].id, "previous");
+        // The same snapshot remains retryable after the call; no state reset.
+        assert!(persist_value_to_store(
+            &store,
+            &next,
+            4,
+            CACHE_BLOB_CHUNK_BYTES * 2
+        )?);
+        assert_eq!(
+            read_cache_bytes(&store, &next.metadata)?.as_deref(),
+            Some(next.sequence.bytes.as_slice())
+        );
+        Ok(())
     }
 
     #[test]

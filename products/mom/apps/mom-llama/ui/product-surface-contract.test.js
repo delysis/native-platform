@@ -445,7 +445,8 @@ test("voice PCM playback uses a prewarmed audio-thread ring while retaining repl
   assert.ok(playback.includes("workletCapacityFrames = format.sampleRate * 8"));
   assert.ok(playback.includes('data?.type === "consumed"'));
   assert.ok(playback.includes("}, [buffer])"));
-  assert.ok(playback.includes("const engine = await preparePcmWorklet(format.sampleRate)"));
+  assert.ok(playback.includes("const preparedEngine = await Promise.race(["));
+  assert.ok(playback.includes("startCancellation.then(() => cancelledStart)"));
   assert.ok(playback.includes("history.push({ ...frame, data: frame.data.slice() })"));
   assert.ok(playback.includes("onBufferLevel?.(bufferedPlaybackSeconds() * 1000)"));
   assert.ok(!playback.includes("retainHistory ? null : await preparePcmWorklet"));
@@ -781,7 +782,7 @@ test("streamed voice playback is owned by the exact native request", () => {
 
   assert.ok(live.includes("acceptsRequest(candidate"));
   assert.ok(live.includes("return requestId === candidate"));
-  assert.ok(events.includes("liveVoiceTts.acceptsRequest(payload.request_id, payload.event)"));
+  assert.ok(events.includes("liveVoiceTts.acceptsRequest(payload.request_id, payload.event, payload.client_request)"));
   assert.ok(events.includes("(sameLiveConversation || voiceStreamRequestIds.has(payload.request_id)) && !ownsLiveVoice"));
   assert.ok(events.includes("const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null"));
   assert.ok(live.includes("voice_reply_timeout: Voice synthesis stopped making progress."));
@@ -1549,4 +1550,29 @@ test("the frontend test command includes every UI test file", () => {
   const omittedUiTests = discoveredUiTests.filter((testFile) => !configuredUiTests.has(testFile));
 
   assert.deepEqual(omittedUiTests, [], "test:frontend must run every UI *.test.js and *.test.cjs file");
+});
+
+
+test("late same-conversation events cannot bind a replacement voice owner", () => {
+  const vm = require("node:vm");
+  const start = bridge.indexOf("      acceptsRequest(candidate");
+  const end = bridge.indexOf("      get button()", start);
+  const method = bridge.slice(start, end).trim().replace(/,$/, "");
+  const retired = new Set(["known-old"]);
+  const context = {
+    stopped: false, requestId: null, clientRequest: "dispatch-new",
+    voiceStreamRequestIds: retired,
+    rememberVoiceStreamRequest: (id) => retired.add(id),
+    reconcileSemanticBackpressure: () => Promise.resolve(),
+  };
+  const owner = vm.runInNewContext(`({${method}})`, context);
+  assert.equal(owner.acceptsRequest("unseen-old", "started", "dispatch-old"), false);
+  assert.equal(owner.acceptsRequest("unseen-old", "started"), false);
+  assert.equal(owner.acceptsRequest("known-old", "started", "dispatch-new"), false);
+  assert.equal(context.requestId, null);
+  assert.equal(owner.acceptsRequest("new-request", "started", "dispatch-new"), true);
+  assert.equal(owner.acceptsRequest("unseen-old", "delta", "dispatch-old"), false);
+  assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), true);
+  context.stopped = true;
+  assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), false);
 });

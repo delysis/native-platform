@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 69,
+  "expected_test_count": 70,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -481,6 +481,21 @@
         "linux",
         "macos",
         "windows"
+      ]
+    },
+    {
+      "test_id": "tests::real_long_resident_prefix_separates_prefill_from_snapshot_export",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, Apple Metal, and a local Gemma 4 GGUF; measures resident prefill/reuse separately from explicit state export for an approximately 11k-token prefix at 18,944 context",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this timing test alone cannot promote M2 latency, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": [
+        "macos"
       ]
     },
     {

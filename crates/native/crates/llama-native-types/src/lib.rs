@@ -2938,6 +2938,16 @@ const fn sequence_replay_allowed() -> bool {
 impl SequenceStateBlob {
     #[must_use]
     pub fn export_receipt(&self) -> [u8; 32] {
+        self.export_receipt_while(|| true)
+            .expect("unconditional receipt hashing is admitted")
+    }
+
+    /// Hash bounded pieces so background persistence can yield to foreground
+    /// work without accepting a partial receipt or changing its byte contract.
+    pub fn export_receipt_while(&self, admitted: impl Fn() -> bool) -> Option<[u8; 32]> {
+        if !admitted() {
+            return None;
+        }
         use sha2::{Digest as _, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"native-sequence-export-receipt-v1");
@@ -2954,18 +2964,31 @@ impl SequenceStateBlob {
             hash.update((self.cells.len() as u64).to_le_bytes());
             hash_cells(&mut hash, &self.cells);
         }
-        hash.update(self.bytes.as_slice());
-        hash.finalize().into()
+        for chunk in self.bytes.chunks(1024 * 1024) {
+            if !admitted() {
+                return None;
+            }
+            hash.update(chunk);
+        }
+        admitted().then(|| hash.finalize().into())
     }
 
     #[must_use]
     pub fn reconstruction(&self) -> SequenceReconstruction {
-        SequenceReconstruction {
+        self.reconstruction_while(|| true)
+            .expect("unconditional reconstruction is admitted")
+    }
+
+    pub fn reconstruction_while(
+        &self,
+        admitted: impl Fn() -> bool,
+    ) -> Option<SequenceReconstruction> {
+        Some(SequenceReconstruction {
             sequence_id: self.sequence_id,
             header: self.bytes[..self.bytes.len().min(SEQUENCE_STATE_HEADER_BYTES)].to_vec(),
-            export_receipt: self.export_receipt(),
+            export_receipt: self.export_receipt_while(admitted)?,
             token_replay_allowed: self.cells.is_empty(),
-        }
+        })
     }
 }
 
@@ -3305,6 +3328,70 @@ pub enum NativeErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sequence_blob(byte_len: usize) -> SequenceStateBlob {
+        SequenceStateBlob {
+            sequence_id: 7,
+            token_count: 2,
+            bytes: std::sync::Arc::new(vec![0x5a; byte_len]),
+            token_ids: vec![11, 12],
+            cells: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_export_receipt_and_reconstruction_keep_the_original_contract() {
+        let blob = test_sequence_blob(2 * 1024 * 1024 + 17);
+        use sha2::Digest as _;
+        let mut legacy_hash = sha2::Sha256::new();
+        legacy_hash.update(b"native-sequence-export-receipt-v1");
+        legacy_hash.update(blob.sequence_id.to_le_bytes());
+        legacy_hash.update((blob.token_count as u64).to_le_bytes());
+        legacy_hash.update((blob.token_ids.len() as u64).to_le_bytes());
+        for token in &blob.token_ids {
+            legacy_hash.update(token.to_le_bytes());
+        }
+        legacy_hash.update(blob.bytes.as_slice());
+        let legacy_receipt: [u8; 32] = legacy_hash.finalize().into();
+
+        assert_eq!(blob.export_receipt(), legacy_receipt);
+        assert_eq!(blob.export_receipt_while(|| true), Some(legacy_receipt));
+        let expected_reconstruction = blob.reconstruction();
+        let actual_reconstruction = blob
+            .reconstruction_while(|| true)
+            .expect("uninterrupted checkpoint hashing should complete");
+        assert_eq!(actual_reconstruction, expected_reconstruction);
+        assert_eq!(actual_reconstruction.export_receipt, legacy_receipt);
+    }
+
+    #[test]
+    fn bounded_export_receipt_cancels_between_large_byte_chunks() {
+        let blob = test_sequence_blob(4 * 1024 * 1024 + 17);
+        let checks = std::cell::Cell::new(0);
+        let receipt = blob.export_receipt_while(|| {
+            let check = checks.get();
+            checks.set(check + 1);
+            check < 3
+        });
+
+        assert_eq!(receipt, None);
+        assert_eq!(
+            checks.get(),
+            4,
+            "admission is checked before the third 1 MiB chunk"
+        );
+
+        let checks = std::cell::Cell::new(0);
+        let reconstruction = blob.reconstruction_while(|| {
+            let check = checks.get();
+            checks.set(check + 1);
+            check < 3
+        });
+        assert_eq!(
+            reconstruction, None,
+            "canceled hashing exposes no partial receipt"
+        );
+    }
 
     #[test]
     fn sampling_validation_rejects_invalid_numeric_domains() {

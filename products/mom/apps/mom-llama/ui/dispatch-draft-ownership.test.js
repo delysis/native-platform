@@ -213,12 +213,15 @@ test("failed startup warm still admits a call only after the exact conversation 
   const makeContext = (encoderWarmed, warmReady = Promise.resolve({
     status: "blocked",
     message: "startup used a different profile",
-  })) => {
+  }), prepareResponse = null) => {
     const stages = [];
     const calls = [];
+    const ringing = [];
     const greetings = [];
     const epoch = {};
     const context = {
+      name: "Jan",
+      modal: { dataset: {}, setAttribute() {} },
       voiceCallEpoch: epoch,
       voiceCallActive: true,
       voiceCallConversation: null,
@@ -227,11 +230,14 @@ test("failed startup warm still admits a call only after the exact conversation 
       performance: { now: () => 1 },
       errorMessage: (error) => error.message,
       markVoiceLatency: (stage) => stages.push(stage),
+      setText() {},
       selectedConversation: () => "chat-frozen-profile",
       selectedConversationKind: () => "chat",
+      startCallRinging: async (...args) => ringing.push(args),
       startStreamedCallGreeting: async (...args) => greetings.push(args),
       invoke: async (command, args) => {
         calls.push([command, args]);
+        if (prepareResponse) return prepareResponse;
         return {
           status: "resident_prefix_prepared",
           result: { audio_projector_warmed: encoderWarmed, resident_prefix_tokens: 76 },
@@ -243,7 +249,7 @@ test("failed startup warm still admits a call only after the exact conversation 
       `${source.slice(helperStart, helperEnd)}\nconst epoch = voiceCallEpoch;\nasync function runAdmission() {\n${admission}\n}\nthis.runAdmission = runAdmission;`,
       context,
     );
-    return { context, calls, greetings, stages, epoch };
+    return { context, calls, ringing, greetings, stages, epoch };
   };
 
   const ready = makeContext(true);
@@ -251,16 +257,20 @@ test("failed startup warm still admits a call only after the exact conversation 
   assert.equal(ready.calls.length, 1);
   assert.equal(ready.calls[0][0], "mom_llama_voice_persona_prepare");
   assert.equal(ready.calls[0][1].personaId, "chat-frozen-profile");
+  assert.equal(ready.context.modal.dataset.callState, "ringing");
+  assert.deepEqual(ready.ringing, [[ready.epoch]]);
   assert.deepEqual(ready.greetings, [[ready.epoch, "chat-frozen-profile"]]);
   assert.deepEqual(ready.stages, [
     "call_conversation_ready",
     "call_persona_prepare_started",
     "call_persona_prepare_completed",
+    "call_ringing_started",
   ]);
 
   const cold = makeContext(false);
   await assert.rejects(cold.context.runAdmission(), /could not be prepared for voice/);
   assert.equal(cold.calls.length, 1);
+  assert.deepEqual(cold.ringing, []);
   assert.deepEqual(cold.greetings, [], "a ready startup result cannot bypass the exact conversation encoder check");
 
   let settleWarm;
@@ -271,7 +281,74 @@ test("failed startup warm still admits a call only after the exact conversation 
   settleWarm({ status: "blocked", message: "startup was superseded" });
   await pendingAdmission;
   assert.equal(stale.calls.length, 0, "a superseded call must not prepare a model");
+  assert.deepEqual(stale.ringing, []);
   assert.deepEqual(stale.greetings, [], "a superseded call must not greet");
+
+  const rejectedWarm = makeContext(true, Promise.reject(new Error("startup warm failed")));
+  await assert.rejects(rejectedWarm.context.runAdmission(), /startup warm failed/);
+  assert.equal(rejectedWarm.calls.length, 0);
+  assert.deepEqual(rejectedWarm.ringing, [], "a failed startup warm cannot start a ringing call");
+  assert.deepEqual(rejectedWarm.greetings, []);
+
+  let settlePreparation;
+  const latePreparation = makeContext(
+    true,
+    Promise.resolve({ status: "ready" }),
+    new Promise((resolve) => { settlePreparation = resolve; }),
+  );
+  const lateAdmission = latePreparation.context.runAdmission();
+  for (let attempts = 0; attempts < 8 && latePreparation.calls.length === 0; attempts += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(latePreparation.calls.length, 1, "the exact-profile preparation is in flight");
+  latePreparation.context.voiceCallEpoch = {};
+  latePreparation.context.voiceCallActive = false;
+  settlePreparation({
+    status: "resident_prefix_prepared",
+    result: { audio_projector_warmed: true, resident_prefix_tokens: 76 },
+  });
+  await lateAdmission;
+  assert.deepEqual(latePreparation.ringing, [], "hangup during exact preparation must not ring later");
+  assert.deepEqual(latePreparation.greetings, [], "hangup during exact preparation must not greet later");
+});
+
+test("a late ring-context resume after hangup closes without installing a timer", async () => {
+  const start = source.indexOf("  const stopCallBed = async () => {");
+  const end = source.indexOf("\n  const prepareVoicePersonaForCall", start);
+  assert.ok(start >= 0 && end > start, "the production ring helpers must remain directly testable");
+  let resolveResume;
+  let constructedContext;
+  let intervals = 0;
+  let closes = 0;
+  const epoch = {};
+  const context = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    voiceCallAudio: null,
+    window: { clearInterval() {}, setInterval() { intervals += 1; return intervals; } },
+    AudioContext: function AudioContextMock() {
+      constructedContext = {
+        resume: () => new Promise((resolve) => { resolveResume = resolve; }),
+        close: async () => { closes += 1; },
+      };
+      return constructedContext;
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(start, end)}\nthis.startRing = startCallRinging;`,
+    context,
+  );
+  const starting = context.startRing(epoch);
+  for (let attempts = 0; attempts < 4 && !resolveResume; attempts += 1) await Promise.resolve();
+  assert.equal(typeof resolveResume, "function", "the audio context resume is pending");
+  context.voiceCallActive = false;
+  context.voiceCallEpoch = null;
+  resolveResume();
+  assert.equal(await starting, false);
+  assert.equal(closes, 1, "the stale resumed context is closed");
+  assert.equal(intervals, 0, "hangup cannot install a late ring timer");
+  assert.equal(context.voiceCallAudio, null);
 });
 
 test("call persona preparation stops when its epoch changes while native preparation is pending", async () => {
@@ -423,6 +500,84 @@ for (const outcome of ["blocked", "throw"]) {
     assert.equal(textarea.value, "Hello");
   });
 }
+
+test("a direct voice fallback keeps its capture through indexing and admits reply speech", async () => {
+  let submit;
+  const stages = [];
+  const indexed = [];
+  const finishedSpeech = [];
+  const persistedDrafts = [];
+  const capture = { trace: { mode: "voice_note" } };
+  const attachment = { id: "audio-attachment" };
+  const output = { assistant_text: "A spoken reply.", assistant_message_id: "assistant-message" };
+  const result = { status: "passed", result: { kind: "direct", conversation_id: "conversation-a", output } };
+  const owner = {
+    conversation: "conversation-a",
+    trace: capture.trace,
+    finish: async (text) => { finishedSpeech.push(text); return true; },
+    stop: async () => true,
+  };
+  const context = {
+    document: {
+      addEventListener: (_, handler) => { submit = handler; },
+      getElementById: () => null,
+      querySelectorAll: () => [],
+    },
+    recipientMutation: Promise.resolve(),
+    activeDispatchStreamLeases: new Set(),
+    autocompleteAccepting: false,
+    cancelComposerAutocomplete() {},
+    formValue: () => "",
+    draftAttachmentIds: () => [],
+    acquireChatBusy: () => "voice-dispatch",
+    releaseChatBusy() {},
+    suspendVoiceHistoryRecoveryForForeground: async () => () => {},
+    selectedConversation: () => "conversation-a",
+    selectedConversationKind: () => "chat",
+    formField: () => null,
+    closeMentions() {}, sizeComposer() {}, appendLiveMessage() {},
+    persistDraftNow: async (_message, ids) => persistedDrafts.push(ids),
+    refreshChat: async () => {}, refreshConversationProjection: async () => {},
+    refreshSidebar: async () => {}, refreshConversationSettingsProjection: async () => {},
+    report() {}, reportError(error) { throw error; },
+    releaseMentionInvocationBusy() {},
+    markVoiceLatencyIn: (_trace, stage, detail) => stages.push([stage, detail]),
+    indexVoiceTurn: (...args) => indexed.push(args),
+    owner, attachment, capture,
+    invoke: async (command) => {
+      if (command === "mom_llama_chat_dispatch") return result;
+      if (command === "mom_llama_draft_update") return { status: "passed" };
+      throw new Error(`unexpected invocation: ${command}`);
+    },
+  };
+  vm.createContext(context);
+  const start = source.indexOf('  document.addEventListener("submit"');
+  const end = start + source.slice(start).indexOf('\n  });') + 7;
+  vm.runInContext(`
+    const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
+    let activeDispatchConversation = null;
+    let voiceReplyConversation = null;
+    let callReplyConversation = null;
+    let voiceReplyMessageId = null;
+    let pendingVoiceDispatchPrompt = "[Voice note]";
+    let pendingVoiceTtsOwner = owner;
+    let pendingVoiceAudioSession = null;
+    let pendingVoiceFallbackAttachment = { conversation: "conversation-a", attachment, sourceCapture: capture };
+    let liveVoiceTts = owner;
+    let voiceLatencyTrace = capture.trace;
+    ${source.slice(start, end)}
+  `, context);
+  // The production listener is the unit under test; capture it from the mock document.
+  assert.equal(typeof submit, "function");
+  await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {}, querySelector: () => null } });
+  assert.equal(persistedDrafts.length, 1);
+  assert.equal(persistedDrafts[0][0], attachment);
+  assert.equal(indexed.length, 1, "the completed direct result must reach post-commit indexing");
+  assert.equal(indexed[0][2], attachment);
+  assert.equal(indexed[0][3], capture, "the fallback source capture remains in scope after dispatch");
+  assert.deepEqual(finishedSpeech, [output.assistant_text], "the retained owner must receive the direct output");
+  assert.ok(stages.some(([stage]) => stage === "tts_text_admitted"));
+});
 
 test("voice replies do not create an incoming card or expose streamed text", () => {
   const events = [];

@@ -2281,6 +2281,12 @@ pub struct ResidentConversationInspection {
 }
 
 #[derive(Debug)]
+struct PreparedResidentPrefix {
+    token_count: usize,
+    snapshot: Option<SequenceStateBlob>,
+}
+
+#[derive(Debug)]
 enum WorkerCommand {
     EvaluateResidual {
         request: llama_native_types::ResidualEvaluationRequest,
@@ -2377,7 +2383,8 @@ enum WorkerCommand {
     PrefillPrefix {
         request: SharedPrefixBatchRequest,
         expected_revision: Option<u64>,
-        response: Sender<NativeResult<Option<SequenceStateBlob>>>,
+        export_snapshot: bool,
+        response: Sender<NativeResult<Option<PreparedResidentPrefix>>>,
     },
     Tokenize {
         messages: Vec<ChatMessage>,
@@ -3183,7 +3190,8 @@ impl NativeModelHandle {
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<SequenceStateBlob> {
-        self.prefill_shared_prefix_internal(request, None)?
+        self.prefill_shared_prefix_internal(request, None, true)?
+            .and_then(|prepared| prepared.snapshot)
             .ok_or_else(|| {
                 NativeError::new(
                     NativeErrorCode::Internal,
@@ -3199,14 +3207,30 @@ impl NativeModelHandle {
         request: SharedPrefixBatchRequest,
         expected_revision: u64,
     ) -> NativeResult<Option<SequenceStateBlob>> {
-        self.prefill_shared_prefix_internal(request, Some(expected_revision))
+        Ok(self
+            .prefill_shared_prefix_internal(request, Some(expected_revision), true)?
+            .and_then(|prepared| prepared.snapshot))
+    }
+
+    /// Evaluate the reusable prefix in worker-owned RAM without exporting KV.
+    /// A foreground call must never wait for serialization of a cold prefix.
+    /// Committed conversations are checkpointed separately during idle/shutdown.
+    pub fn prefill_resident_prefix_if_revision(
+        &self,
+        request: SharedPrefixBatchRequest,
+        expected_revision: u64,
+    ) -> NativeResult<Option<usize>> {
+        Ok(self
+            .prefill_shared_prefix_internal(request, Some(expected_revision), false)?
+            .map(|prepared| prepared.token_count))
     }
 
     fn prefill_shared_prefix_internal(
         &self,
         request: SharedPrefixBatchRequest,
         expected_revision: Option<u64>,
-    ) -> NativeResult<Option<SequenceStateBlob>> {
+        export_snapshot: bool,
+    ) -> NativeResult<Option<PreparedResidentPrefix>> {
         self.require_unified_kv()?;
         self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
@@ -3218,6 +3242,7 @@ impl NativeModelHandle {
             WorkerCommand::PrefillPrefix {
                 request,
                 expected_revision,
+                export_snapshot,
                 response: response_tx,
             },
             "submitting prefix prefill",
@@ -5027,6 +5052,7 @@ fn run_worker(
             WorkerCommand::PrefillPrefix {
                 request,
                 expected_revision,
+                export_snapshot,
                 response,
             } => {
                 if expected_revision.is_some_and(|revision| revision != conversation_revision) {
@@ -5047,7 +5073,25 @@ fn run_worker(
                     &mut sequence_token_counts,
                     &mut sequence_token_ids,
                     (&text, media.as_ref()),
-                );
+                )
+                .and_then(|token_ids| {
+                    let token_count = token_ids.len();
+                    let snapshot = if export_snapshot {
+                        Some(state_buffer::export_sequence(
+                            &context,
+                            &fingerprint,
+                            0,
+                            token_count,
+                            token_ids,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok(PreparedResidentPrefix {
+                        token_count,
+                        snapshot,
+                    })
+                });
                 if result.is_ok() {
                     resident_text_prefix.commit(
                         &resident_prefix_binding,
@@ -7788,7 +7832,7 @@ fn prefill_shared_prefix(
     sequence_token_counts: &mut HashMap<i32, usize>,
     sequence_token_ids: &mut HashMap<i32, Vec<i32>>,
     resident: (&[i32], Option<&ResidentAudioTextPrefix>),
-) -> NativeResult<SequenceStateBlob> {
+) -> NativeResult<Vec<i32>> {
     sequence_token_counts.clear();
     sequence_token_ids.clear();
     let prompt = render_messages_prompt_with_template(
@@ -7902,7 +7946,7 @@ fn prefill_shared_prefix(
     let token_ids = tokens.iter().map(|token| token.0).collect::<Vec<_>>();
     sequence_token_counts.insert(0, tokens.len());
     sequence_token_ids.insert(0, token_ids.clone());
-    state_buffer::export_sequence(context, fingerprint, 0, tokens.len(), token_ids)
+    Ok(token_ids)
 }
 
 // Cache keys describe evaluated positions, including verified media content.
@@ -15767,17 +15811,48 @@ mod tests {
             chat_template: ChatTemplateChoice::ModelDefault,
             cached_prefix: None,
         };
-        let prefix = handle.prefill_shared_prefix(preparation.clone())?;
-        let repeated = handle.prefill_shared_prefix(preparation)?;
-        assert_eq!(repeated.token_ids, prefix.token_ids);
+        let initial_revision = handle.inspect_resident_conversation(None)?.revision;
+        let resident_tokens = handle
+            .prefill_resident_prefix_if_revision(preparation.clone(), initial_revision)?
+            .expect("first resident prefix preparation is current");
+        assert!(resident_tokens > 0);
+        let after_first = handle.inspect_resident_conversation(None)?;
+        assert!(after_first.revision > initial_revision);
+        let reused_tokens = handle
+            .prefill_resident_prefix_if_revision(preparation.clone(), after_first.revision)?
+            .expect("resident prefix reuse is current");
+        assert_eq!(reused_tokens, resident_tokens);
         assert_eq!(
             PREFIX_PREFILL_REUSED_TOKENS.load(Ordering::SeqCst),
-            prefix.token_count,
+            resident_tokens,
             "preparing an already resident prefix must not evaluate it again"
         );
+        let after_reuse = handle.inspect_resident_conversation(None)?;
+        let prefix = handle
+            .prefill_shared_prefix_if_revision(preparation.clone(), after_reuse.revision)?
+            .expect("explicit snapshot export is current");
+        assert_eq!(prefix.token_count, resident_tokens);
+        let before_stale = handle.inspect_resident_conversation(None)?;
+        let before_stale_sequence = handle.snapshot_sequence(0)?;
+        assert!(
+            handle
+                .prefill_resident_prefix_if_revision(preparation, initial_revision)?
+                .is_none()
+        );
+        let after_stale = handle.inspect_resident_conversation(None)?;
+        assert_eq!(after_stale.revision, before_stale.revision);
+        assert_eq!(
+            after_stale.committed_prefix_tokens,
+            before_stale.committed_prefix_tokens
+        );
+        assert_eq!(
+            handle.snapshot_sequence(0)?.token_ids,
+            before_stale_sequence.token_ids,
+            "stale prefill must not replace the currently resident sequence"
+        );
         eprintln!(
-            "resident preparation reused {} tokens without a supplied snapshot",
-            prefix.token_count
+            "resident preparation reused {resident_tokens} tokens without a supplied snapshot; explicit export followed at revision {}",
+            before_stale.revision,
         );
         assert_eq!(
             handle.restore_sequence(prefix.clone(), 0)?,
@@ -15960,6 +16035,105 @@ mod tests {
             NativeErrorCode::CacheIncompatible
         );
         owner.shutdown_joined()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local Gemma 4 GGUF; measures an approximately 11k-token resident voice prefix"]
+    fn real_long_resident_prefix_separates_prefill_from_snapshot_export()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
+        let mut config = NativeModelConfig::local(std::env::var("MOM_LLAMA_MODEL_PATH")?.into());
+        let state_directory = RealTestDirectory::new();
+        config.state_cache_directory = Some(state_directory.0.clone());
+        config.device = NativeDevice::Metal;
+        // This matches the app's resolved long-persona context under its
+        // 21,845 MiB budget. NativeModelConfig does not enforce that budget.
+        config.context_tokens = 18_944;
+        config.batch_tokens = 512;
+        config.max_sequences = 4;
+        let owner = NativeModelOwner::load(config.clone())?;
+        let handle = owner.handle();
+        let stable_persona_sentence = "This profile is a careful conversational partner. It distinguishes observed facts from interpretations, preserves uncertainty, and answers in plain language. When evidence is incomplete, it says what is unknown instead of filling gaps. It asks one concise clarifying question when that will materially improve the answer.";
+        let persona = std::iter::repeat_n(stable_persona_sentence, 210)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let common_messages = vec![ChatMessage {
+            role: ChatRole::System,
+            content: persona,
+        }];
+        let tokenized = handle.tokenize_messages_with_template(
+            common_messages.clone(),
+            ChatTemplateChoice::PreferNonThinking,
+        )?;
+        let prompt_tokens = tokenized.token_ids.len();
+        assert!(
+            (10_000..=12_000).contains(&prompt_tokens),
+            "fixture should approximate the app-scale persona prefix, got {prompt_tokens} tokens"
+        );
+        let request = SharedPrefixBatchRequest {
+            request_id: "long-resident-persona-prefix".into(),
+            model_id: config.model_id.clone(),
+            common_messages,
+            branches: (0..4)
+                .map(|index| BranchRequest {
+                    branch_id: format!("branch-{index}"),
+                    label: "Voice persona".into(),
+                    instruction: "Continue briefly.".into(),
+                    sampling: SamplingConfig {
+                        max_tokens: 1,
+                        ..SamplingConfig::default()
+                    },
+                    messages: Vec::new(),
+                    cached_prefix: None,
+                })
+                .collect(),
+            chat_template: ChatTemplateChoice::PreferNonThinking,
+            cached_prefix: None,
+        };
+
+        let initial_revision = handle.inspect_resident_conversation(None)?.revision;
+        assert_eq!(initial_revision, 0, "fresh worker starts at revision zero");
+        let resident_started = std::time::Instant::now();
+        let resident_tokens = handle
+            .prefill_resident_prefix_if_revision(request.clone(), initial_revision)?
+            .expect("fresh resident preparation must be current");
+        let resident_prefill_ms = resident_started.elapsed().as_millis();
+        assert!(
+            (10_000..=12_000).contains(&resident_tokens),
+            "the evaluated prefix should remain at app scale, got {resident_tokens} tokens"
+        );
+
+        let after_prefill = handle.inspect_resident_conversation(None)?;
+        let reuse_started = std::time::Instant::now();
+        let reused_tokens = handle
+            .prefill_resident_prefix_if_revision(request.clone(), after_prefill.revision)?
+            .expect("resident reuse must use the inspected revision");
+        let resident_reuse_ms = reuse_started.elapsed().as_millis();
+        assert_eq!(reused_tokens, resident_tokens);
+        assert_eq!(
+            PREFIX_PREFILL_REUSED_TOKENS.load(Ordering::SeqCst),
+            resident_tokens,
+            "the repeated long prefix must reuse all evaluated positions"
+        );
+
+        let before_export = handle.inspect_resident_conversation(None)?;
+        let export_started = std::time::Instant::now();
+        let snapshot = handle
+            .prefill_shared_prefix_if_revision(request, before_export.revision)?
+            .expect("explicit state export must use the latest revision");
+        let snapshot_export_ms = export_started.elapsed().as_millis();
+        assert_eq!(snapshot.token_count, resident_tokens);
+        eprintln!(
+            "LONG_RESIDENT_PREFIX {{\"context_tokens\":{},\"max_sequences\":{},\"prompt_tokens\":{},\"resident_prefill_ms\":{},\"resident_reuse_ms\":{},\"snapshot_export_ms\":{},\"snapshot_bytes\":{}}}",
+            config.context_tokens,
+            config.max_sequences,
+            prompt_tokens,
+            resident_prefill_ms,
+            resident_reuse_ms,
+            snapshot_export_ms,
+            snapshot.bytes.len(),
+        );
         Ok(())
     }
 

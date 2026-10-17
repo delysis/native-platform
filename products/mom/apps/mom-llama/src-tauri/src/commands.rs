@@ -648,13 +648,44 @@ pub async fn mom_llama_model_select(
     .await
 }
 
+// A renderer nonce only correlates events to the dispatch that created them;
+// native request IDs retain cancellation and generation authority.
+fn validate_chat_client_request(request: Option<&str>) -> Result<(), String> {
+    if request.is_some_and(|request| {
+        request.is_empty()
+            || request.len() > 64
+            || !request
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
+    }
+    Ok(())
+}
+
+fn correlate_chat_event(
+    event: &impl serde::Serialize,
+    client_request: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut payload = to_value(event)?;
+    if let Some(request) = client_request {
+        payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("chat stream event must be an object"))?
+            .insert("client_request".into(), Value::String(request.to_owned()));
+    }
+    Ok(payload)
+}
+
 #[tauri::command]
 pub async fn mom_llama_chat_send(
     runtime: State<'_, AppRuntimeHandle>,
     window: Window,
     conversation: String,
     message: String,
+    client_request: Option<String>,
 ) -> Result<Value, String> {
+    validate_chat_client_request(client_request.as_deref())?;
     let lease = runtime.admit(command_spec("mom_llama_chat_send"))?;
     let operations = runtime.operation_scope();
     let events = window.clone();
@@ -668,7 +699,10 @@ pub async fn mom_llama_chat_send(
             ChatSendOptions::default(),
             move |event| {
                 events
-                    .emit("mom_llama_chat_stream", &event)
+                    .emit(
+                        "mom_llama_chat_stream",
+                        correlate_chat_event(&event, client_request.as_deref())?,
+                    )
                     .map_err(anyhow::Error::new)?;
                 Ok(())
             },
@@ -764,15 +798,7 @@ pub async fn mom_llama_chat_dispatch(
     message: String,
     client_request: Option<String>,
 ) -> Result<Value, String> {
-    if client_request.as_ref().is_some_and(|request| {
-        request.is_empty()
-            || request.len() > 64
-            || !request
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
-    }
+    validate_chat_client_request(client_request.as_deref())?;
     let stream_conversation = conversation.clone();
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
     let runtime = runtime.inner().clone();
@@ -786,7 +812,7 @@ pub async fn mom_llama_chat_dispatch(
         },
         Some(move |event| {
             events
-                .emit("mom_llama_chat_dispatch_stream", &event)
+                .emit("mom_llama_chat_dispatch_stream", correlate_chat_event(&event, client_request.as_deref())?)
                 .map_err(anyhow::Error::new)?;
             if let Some(request) = &client_request {
                 events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
@@ -2504,9 +2530,14 @@ pub async fn mom_llama_voice_audio_speculation_abort_and_retarget(
                     .map_err(to_error)?;
             let resume_wait_started = Instant::now();
             let resume = session.wait_for_resume().map_err(to_error)?;
-            if !resume.reused {
+            // Cancellation can arrive while historical input is still being
+            // prefetched, before a live-audio checkpoint exists. The worker
+            // then rebuilds the same prepared prompt and requests live input
+            // from sample zero. Keep streaming into that valid session instead
+            // of discarding it and falling back to a separate text request.
+            if !resume.reused && resume.sample_offset != 0 {
                 session.cancel();
-                return Err("voice_audio_checkpoint_unavailable: The live audio prefix could not be resumed".to_string());
+                return Err("voice_audio_resume_invalid: A fresh audio session cannot skip captured samples".to_string());
             }
             let resume_wait_us = resume_wait_started
                 .elapsed()
@@ -3326,6 +3357,30 @@ mod tests {
     };
     use speech_native_types::{AudioChunk, PcmFormat, PcmSampleFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn chat_correlation_preserves_native_authority_and_matches_dispatch_envelopes() {
+        let event = serde_json::json!({
+            "kind": "chat", "event": {
+                "request_id": "native-request", "conversation_id": "conversation",
+                "event": "started"
+            }
+        });
+        assert_eq!(
+            super::correlate_chat_event(&event, None)
+                .expect("an event without a client request remains valid"),
+            event
+        );
+        let correlated = super::correlate_chat_event(&event, Some("voice-turn-7"))
+            .expect("the correlated event should remain valid");
+        assert_eq!(correlated["client_request"], "voice-turn-7");
+        assert_eq!(correlated["event"], event["event"]);
+        for bad in ["", "with space", "line\nbreak", "../path"] {
+            assert!(super::validate_chat_client_request(Some(bad)).is_err());
+        }
+        assert!(super::validate_chat_client_request(Some(&"x".repeat(65))).is_err());
+        assert!(super::validate_chat_client_request(Some("voice-turn-7")).is_ok());
+    }
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
         let declaration = format!("pub async fn {name}");

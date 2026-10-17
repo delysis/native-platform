@@ -852,6 +852,8 @@
     let starting = null;
     let ended = false;
     let stopped = false;
+    let startCancellationResolve = null;
+    const startCancellation = new Promise((resolve) => { startCancellationResolve = resolve; });
     let endGeneration = 0;
     let scheduledAudio = false;
     let workletNode = null;
@@ -1058,6 +1060,7 @@
 
     const startPlayback = async () => {
       if (stopped || playing) return false;
+      const isStartCurrent = () => !stopped;
       if (startupDelayTimer !== null) {
         window.clearTimeout(startupDelayTimer);
         startupDelayTimer = null;
@@ -1071,9 +1074,14 @@
       // on the renderer thread. `pushDecoded` copies history before `schedule`
       // transfers the packet, so voice notes and calls can share the same
       // preallocated audio-thread ring without sacrificing durable playback.
-      const engine = await preparePcmWorklet(format.sampleRate);
-      if (engine && !pcmWorkletEngine.owner) {
-        context = engine.context;
+      const cancelledStart = {};
+      const preparedEngine = await Promise.race([
+        preparePcmWorklet(format.sampleRate),
+        startCancellation.then(() => cancelledStart),
+      ]);
+      if (preparedEngine === cancelledStart || !isStartCurrent()) return false;
+      if (preparedEngine && !pcmWorkletEngine.owner) {
+        context = preparedEngine.context;
         workletOwner = {};
         pcmWorkletEngine.owner = workletOwner;
         workletCapacityFrames = format.sampleRate * 8;
@@ -1175,12 +1183,29 @@
       } else {
         context = new AudioContext({ latencyHint: "interactive", sampleRate: format.sampleRate });
       }
+      const startContext = context;
+      const startOwner = workletOwner;
       playing = true;
       nextStart = context.currentTime + 0.035;
       schedulePending();
       const resumeStarted = rendererNow();
       try {
-        await resumeContext(context);
+        const resume = resumeContext(startContext);
+        const resumeResult = await Promise.race([
+          resume.then(() => "resumed"),
+          startCancellation.then(() => "cancelled"),
+        ]);
+        if (resumeResult === "cancelled" || !isStartCurrent()) {
+          // stop() has already torn down this renderer. A resume that settles
+          // afterward can wake its AudioContext again, so put it back to sleep
+          // only while the shared worklet context is still ours (or unowned).
+          void resume.then(async () => {
+            if (startOwner && pcmWorkletEngine.owner && pcmWorkletEngine.owner !== startOwner) return;
+            if (startOwner) await startContext.suspend().catch(() => {});
+            else await startContext.close().catch(() => {});
+          }).catch(() => {});
+          return false;
+        }
       } catch (error) {
         playing = false;
         sources.forEach((source) => { try { source.stop(); } catch (_) {} });
@@ -1238,8 +1263,24 @@
       if (context?.state === "suspended") {
         playing = true;
         playWhenReady = true;
+        const resumedContext = context;
+        const resumedOwner = workletOwner;
         try {
-          await resumeContext(context);
+          const resume = resumeContext(resumedContext);
+          const resumeResult = await Promise.race([
+            resume.then(() => true),
+            startCancellation.then(() => false),
+          ]);
+          if (!resumeResult || stopped || !playing || context !== resumedContext) {
+            playing = false;
+            void resume.then(async () => {
+              if (resumedOwner && pcmWorkletEngine.owner
+                  && pcmWorkletEngine.owner !== resumedOwner) return;
+              if (resumedOwner) await resumedContext.suspend().catch(() => {});
+              else await resumedContext.close().catch(() => {});
+            }).catch(() => {});
+            return false;
+          }
           schedulePending();
           onPlaybackStarted?.({
             renderer: workletNode ? "audio_worklet_ring" : "audio_buffer_source",
@@ -1344,6 +1385,8 @@
 
     const stop = async () => {
       stopped = true;
+      startCancellationResolve?.();
+      startCancellationResolve = null;
       playing = false;
       if (startupDelayTimer !== null) {
         window.clearTimeout(startupDelayTimer);
@@ -1408,6 +1451,7 @@
         return { samples: echoReferenceSamples, sampleRate: context.sampleRate };
       },
       get playing() { return playing; },
+      get starting() { return starting !== null; },
       get ready() { return playable; },
       bufferedMs: () => Math.round(bufferedPlaybackSeconds() * 100_000) / 100,
       metrics: () => ({ ...rendererMetrics }),
@@ -2198,8 +2242,18 @@
 
   const startCallRinging = async (epoch) => {
     await stopCallBed();
+    if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
     const context = new AudioContext();
-    await context.resume();
+    try {
+      await context.resume();
+    } catch (error) {
+      await context.close().catch(() => {});
+      throw error;
+    }
+    if (voiceCallEpoch !== epoch || !voiceCallActive) {
+      await context.close().catch(() => {});
+      return false;
+    }
     const gain = context.createGain();
     gain.gain.value = 0.035;
     gain.connect(context.destination);
@@ -2221,6 +2275,7 @@
     };
     ring();
     voiceCallAudio = { context, ringTimer: window.setInterval(ring, 1250), nodes: [] };
+    return true;
   };
 
   const prepareVoicePersonaForCall = async (recipientId, epoch) => {
@@ -2303,7 +2358,7 @@
     const tts = beginLiveVoiceTts({
       conversation,
       mode: "call",
-      allowRequestBinding: true,
+      clientRequest: speechOperationToken(),
       callEpoch: epoch,
       onPlaybackStarted: () => {
         if (voiceCallEpoch === epoch && voiceCallActive) {
@@ -2312,6 +2367,7 @@
           // A persistent synthetic line bed is audible to the native
           // microphone and was cancelling the greeting as a false barge-in.
           void stopCallBed().catch(reportError);
+          setText("voice-call-title", "Call");
         }
       },
       // The call action owns teardown and error presentation. Closing here
@@ -2329,6 +2385,7 @@
       const response = await withProgressDeadline(
         invoke("mom_llama_chat_send", {
           conversation,
+          clientRequest: tts.clientRequest,
           message: "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
         }),
         30_000,
@@ -2476,6 +2533,7 @@
     modal.dataset.voicePersona = recipientId;
     modal.dataset.callState = "preparing";
     modal.setAttribute("aria-label", "Preparing call");
+    setText("voice-call-title", "Preparing");
     setText("voice-call-name", name);
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
@@ -2508,13 +2566,9 @@
         return;
       }
       markVoiceLatency("call_microphone_ready", microphone);
-      // Permission/device readiness has already completed. Ring now, while
-      // conversation materialization and resident-model admission continue
-      // behind the ring.
-      await startCallRinging(epoch);
-      modal.dataset.callState = "ringing";
-      modal.setAttribute("aria-label", `Calling ${name}`);
-      markVoiceLatency("call_ringing_started");
+      // A cold local engine is still preparation, not a ringing contact.
+      // Keep measuring the entire request-to-playback interval; do not hide
+      // initialization time by redefining the latency clock at readiness.
       await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Startup is opportunistic and can be superseded by foreground model
@@ -2548,6 +2602,12 @@
       // Use the actual frozen call profile. It may differ from its source contact.
       const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
       if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
+      await startCallRinging(epoch);
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      modal.dataset.callState = "ringing";
+      modal.setAttribute("aria-label", `Calling ${name}`);
+      setText("voice-call-title", "Calling");
+      markVoiceLatency("call_ringing_started");
       // The first model reply uses the same token -> TTS -> PCM buffer as every
       // later call turn. Its first PCM frame stops ringing; playback startup
       // opens continuous listening, while model attachment waits until Qwen
@@ -5033,7 +5093,7 @@
     conversation,
     mode,
     requestId = null,
-    allowRequestBinding = false,
+    clientRequest = null,
     button: initialButton = null,
     callEpoch = null,
     deferPlayback = false,
@@ -5846,10 +5906,12 @@
       firstDeltaSeen: false,
       lastProgressAt: performance.now(),
       get requestId() { return requestId; },
-      acceptsRequest(candidate, eventName = "") {
-        if (!candidate) return false;
+      clientRequest,
+      acceptsRequest(candidate, eventName = "", candidateClientRequest = null) {
+        if (stopped || !candidate) return false;
         if (requestId) return requestId === candidate;
-        if (!allowRequestBinding || eventName !== "started") return false;
+        if (!clientRequest || candidateClientRequest !== clientRequest
+            || eventName !== "started" || voiceStreamRequestIds.has(candidate)) return false;
         requestId = candidate;
         rememberVoiceStreamRequest(candidate);
         void reconcileSemanticBackpressure();
@@ -7229,12 +7291,14 @@
 
   const resumeBrowserVoicePrefill = (recording, replacement) => {
     if (voiceRecording !== recording || (recording.call && !voiceCallActive)) return;
-    if (recording.native || !replacement?.session || replacement.resume_reused !== true) {
+    const resumeOffset = Number(replacement?.resume_sample_offset);
+    if (recording.native || !replacement?.session
+        || !Number.isSafeInteger(resumeOffset) || resumeOffset < 0
+        || (replacement.resume_reused !== true && resumeOffset !== 0)) {
       throw new Error("The live audio checkpoint could not be resumed.");
     }
     recording.prefillEpoch = (recording.prefillEpoch || 0) + 1;
     const captured = mergeFloat32(recording.capturedPcm);
-    const resumeOffset = Number(replacement.resume_sample_offset || 0);
     const sourceOffset = recording.modelInputSourceRanges.length
       ? inferenceSourceOffset(recording.modelInputSourceRanges, resumeOffset)
       : (resumeOffset === 0 ? recording.prefillInputStartSample : null);
@@ -7861,7 +7925,7 @@
       conversation,
       mode: call ? "call" : "voice_note",
       requestId: live?.request_id || null,
-      allowRequestBinding: !live?.request_id,
+      clientRequest: live?.request_id ? null : speechOperationToken(),
       button: pendingButton,
       callEpoch: call ? voiceCallEpoch : null,
     });
@@ -7929,7 +7993,7 @@
     // even when that stale cleanup has already run.
     const sameLiveConversation = liveVoiceTts?.conversation === payload.conversation_id;
     const ownsLiveVoice = sameLiveConversation
-      && liveVoiceTts.acceptsRequest(payload.request_id, payload.event);
+      && liveVoiceTts.acceptsRequest(payload.request_id, payload.event, payload.client_request);
     const eventTrace = ownsLiveVoice ? liveVoiceTts.trace : null;
     if (eventTrace) {
       markVoiceLatencyIn(eventTrace, "chat_stream_event_received", {
@@ -8043,7 +8107,10 @@
       ? envelope.event
       : (envelope.request_id && envelope.conversation_id ? envelope : null);
     if (chatEvent) {
-      onChatEvent({ payload: chatEvent });
+      const clientRequest = envelope.client_request ?? chatEvent.client_request;
+      onChatEvent({ payload: clientRequest === undefined
+        ? chatEvent
+        : { ...chatEvent, client_request: clientRequest } });
       return;
     }
     const payload = envelope.event || envelope;
@@ -8637,7 +8704,9 @@
     "message-read-aloud": async (button) => {
       const personaVoice = button.dataset.personaVoice === "true";
       if (activeSpeechPlayback?.button === button) {
-        if (activeSpeechPlayback.controller?.ready && !activeSpeechPlayback.controller.playing) {
+        if (activeSpeechPlayback.controller?.ready
+            && !activeSpeechPlayback.controller.playing
+            && !activeSpeechPlayback.controller.starting) {
           commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
           button.title = "Stop reading";
           button.setAttribute("aria-pressed", "true");
@@ -9585,14 +9654,16 @@
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
           let voiceTranscriptAttachment = null;
+          let liveVoice = null;
+          let fallbackVoice = null;
           let voiceDispatchTrace = voiceDispatch
             ? (voiceTtsOwner?.trace || voiceLatencyTrace) : null;
           try {
-            const liveVoice = voiceDispatch
+            liveVoice = voiceDispatch
               && pendingVoiceAudioSession?.conversation === conversation
               ? pendingVoiceAudioSession
               : null;
-            const fallbackVoice = voiceDispatch
+            fallbackVoice = voiceDispatch
               && pendingVoiceFallbackAttachment?.conversation === conversation
               ? pendingVoiceFallbackAttachment
               : null;
@@ -9627,7 +9698,10 @@
               if (fallbackVoice) {
                 await persistDraftNow(message, [fallbackVoice.attachment], conversation);
               }
-              result = await invoke("mom_llama_chat_dispatch", { conversation, message });
+              result = await invoke("mom_llama_chat_dispatch", {
+                conversation, message,
+                ...(voiceTtsOwner?.clientRequest ? { clientRequest: voiceTtsOwner.clientRequest } : {}),
+              });
             }
             if (voiceDispatch) {
               const output = result?.result?.output;

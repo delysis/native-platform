@@ -405,7 +405,7 @@ impl OperationScope {
         self.0
             .voice_call_sessions
             .lock()
-            .is_ok_and(|sessions| !sessions.is_empty())
+            .map_or(true, |sessions| !sessions.is_empty())
     }
 
     pub(crate) fn clear_voice_call_activity(&self) -> anyhow::Result<()> {
