@@ -1475,7 +1475,7 @@
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
-      "platforms": ["macos"]
+      "platforms": ["linux", "macos", "windows"]
     },
     {
       "test_id": "tests::real_completed_audio_survives_next_turn_and_authenticated_restart",
