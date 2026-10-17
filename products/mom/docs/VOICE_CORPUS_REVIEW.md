@@ -136,9 +136,29 @@ shortened candidates either. The local receipt is
 `artifacts/voice-samples/candidates/round4/auditions/review-short-2026-10-17.json`.
 This rejects the tested samples, not every possible source recording or future
 voice model. A duration change alone has not yielded a preferred voice.
+
 The existing quality review already marks Bessel and Gabor as `keep`; stop
 spending audition time on replacements for them. Jim's current recording is
 still marked `replace` for compression, but both rejected excerpts came from
 the same teaching-video source. His next candidate should come from a
 different, verified continuous-speaker recording, not another cut of that
 source.
+
+The separate Judith Herman podcast-reference audition also lost to the
+current voice: the reviewer's exact answer was **“Current sounds better”**.
+That answer did not verify whether the source excerpt was Judith, so identity
+remains pending. Keep her current reference installed. After these repeated
+losses, pause further source-swap auditions until the live reference
+conditioning and comparison method have been checked; more unqualified clips
+are not a voice-quality improvement.
+
+The first audition pages used one stochastic render per reference. Those
+preferences govern the installed voices, but they do not isolate source quality
+from sampling variation. The resident audition harness now supplies the same
+explicit seed to each reference and records it in its receipt. A real-model
+repeatability check rendered the identical Judith reference twice with seed
+42: the disk-cache and memory-cache runs produced the same PCM SHA-256,
+`4c726454ea510350f30f7e431081544d4f5ea46ceef1b99bdc7edd849c8a1259`.
+Use seeded, level-matched comparisons for subsequent reference qualification;
+do not retroactively claim that the earlier unseeded votes measured an
+intrinsic reference advantage.

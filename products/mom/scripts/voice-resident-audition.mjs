@@ -2,7 +2,7 @@
 
 // Render an A/B from the same resident streaming route used by the app.
 // Usage: node voice-resident-audition.mjs PLAN.json OUTPUT_DIR
-// PLAN: { model, helper, persona_id, text, references: [{ label, audio }] }
+// PLAN: { model, helper, persona_id, text, seed?: 42, references: [{ label, audio }] }
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -20,6 +20,10 @@ const plan = JSON.parse(await readFile(planName, 'utf8'));
 if (!plan.model || !plan.helper || !plan.persona_id || !plan.text ||
     !Array.isArray(plan.references) || plan.references.length < 1) {
   throw new Error('Plan needs model, helper, persona_id, text, and references');
+}
+const auditionSeed = plan.seed ?? 42;
+if (!Number.isSafeInteger(auditionSeed) || auditionSeed < 0) {
+  throw new Error('Plan seed must be a nonnegative safe integer');
 }
 const outputDir = resolve(outputName);
 await mkdir(outputDir, { recursive: true });
@@ -88,6 +92,7 @@ const receipt = {
   helper: resolve(plan.helper),
   persona_id: plan.persona_id,
   text: plan.text,
+  audition_seed: auditionSeed,
   results: [],
 };
 let active = null;
@@ -115,6 +120,7 @@ function sendNext() {
     ref_sha256: reference.sha256,
     ref_text: reference.transcript ?? '',
     chunk_size: 2,
+    audition_seed: auditionSeed,
   }) + '\n');
 }
 
