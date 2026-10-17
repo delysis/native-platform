@@ -603,3 +603,33 @@ replace a newer conversation's saved state. Conditional native imports compare
 the worker revision at the import command itself, closing the gap between RAM
 inspection and disk loading. Generation attempts advance that revision even
 when cancelled; read-only inspection leaves resume checkpoints intact.
+
+## Candidate 10 findings and corrective scope (17 October 2026)
+
+Candidate 10's exact 1a283ba7 component gate passed all 64 records. Packaged
+ringing began at 15 ms; the first greeting was subsequently cancelled by a
+recorded microphone onset before the fixture played. This is not a clean
+speaker playback pass, and source tests cannot determine whether a person or
+echo caused that onset. A quiet-room/double-talk interval remains required.
+
+Rollover formerly applied its two-thirds low-water mark to the whole context
+allowance. A long mandatory persona could exceed that mark, forcing the fitter
+to discard every older turn even though recent exchanges still fit the hard
+limit. Headroom now applies only to the budget remaining after the mandatory
+persona/system/current-input projection. A versioned profile invalidates old
+window boundaries once; source history and native prefix authority remain
+unchanged. Warm windows that still fit require no baseline remeasurement.
+
+A silent native note can already own a prearmed speculation. Sending it rejects
+the incomplete recording, but previously stranded optimistic user/reply rows.
+Confirmation failure now settles only nodes and routing owned by that exact
+speculation, preserves replayable native/browser audio when available, and
+leaves newer replies untouched. The complete-recording guard remains intact.
+
+Speaker-played fixtures are not reliable microphone injection: candidate 10's
+second fixture produced zero detected onsets and zero accepted samples. That
+run demonstrates failure-state cleanup needs, not recognition quality. The
+first fixture also began late and was truncated by silence handling. Retain
+both failed attempts. Start fixture playback immediately with capture and stop
+without intermediate tool/readback trips; do not call source-duration clocks
+proof that the whole waveform reached the microphone.

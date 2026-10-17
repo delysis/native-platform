@@ -934,6 +934,211 @@ test("voice completion remains owned until durable PCM succeeds or fails", () =>
   assert.match(greeting, /if \(!synthesized\)[\s\S]*voice could not be produced/);
 });
 
+test("silent voice-note confirmation removes only its optimistic rows", async () => {
+  const sourceStart = source.indexOf("  const confirmVoiceNoteSpeculation = async");
+  const sourceEnd = source.indexOf("\n  const startVoiceSpeculation = async", sourceStart);
+  assert.ok(sourceStart >= 0 && sourceEnd > sourceStart,
+    "the production voice-note confirmation handler must remain testable");
+
+  const makeRow = () => {
+    const classes = new Set(["voice-reply-pending"]);
+    return {
+      hidden: false,
+      removed: false,
+      classList: { remove: (name) => classes.delete(name) },
+      card: { replaceChildren(value) { this.contents = [value]; } },
+      querySelector(selector) { return selector === ".message-card" ? this.card : null; },
+      remove() { this.removed = true; },
+    };
+  };
+  const outgoing = makeRow();
+  outgoing.dataset = { objectUrl: "blob:outgoing" };
+  const pendingReply = makeRow();
+  pendingReply.dataset = {};
+  const owner = { stop: async () => {}, bindButton() {}, bindPendingRow() {} };
+  const recording = { speculation: null, sending: false, trace: {} };
+  const speculation = { id: "spec-silent", conversation: "conversation-a", tts: owner,
+    confirmed: false, aborting: false, resolveCapture(promise) { promise.catch(() => {}); } };
+  recording.speculation = speculation;
+  const stages = [];
+  const revoked = [];
+  const context = {
+    voiceRecording: recording,
+    voiceCallActive: false,
+    voiceReplyConversation: null,
+    liveVoiceTts: null,
+    document: { querySelector: () => ({}) },
+    URL: { revokeObjectURL: (url) => revoked.push(url) },
+    appendOptimisticVoiceMessage: () => outgoing,
+    appendLiveVoiceReply: () => pendingReply,
+    setVoiceRecordingVisible() {},
+    markVoiceLatencyIn: (_trace, stage, detail) => stages.push([stage, detail]),
+    stopVoiceCapture: async () => ({ heardVoice: false, wavBytes: new Uint8Array(44) }),
+    confirmRecordedSpeculation: async () => { throw new Error("The voice turn has no complete recording."); },
+    hydrateOptimisticVoiceMessage() { assert.fail("silent capture must not become playable audio"); },
+    unavailableVoiceMessage: () => ({ unavailable: true }),
+    errorMessage: (error) => error.message,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(sourceStart, sourceEnd)}\nthis.confirm = confirmVoiceNoteSpeculation;`, context);
+  context.liveVoiceTts = owner;
+  context.voiceReplyConversation = "conversation-a";
+
+  await assert.rejects(context.confirm(recording, speculation), /no complete recording/);
+  assert.equal(outgoing.removed, true);
+  assert.equal(pendingReply.removed, true);
+  assert.deepEqual(revoked, ["blob:outgoing"]);
+  assert.equal(context.liveVoiceTts, null);
+  assert.equal(context.voiceReplyConversation, null);
+  assert.ok(stages.some(([stage, detail]) => stage === "voice_note_confirmation_failed"
+    && detail.heard_voice === false));
+});
+
+test("failed voice-note confirmation preserves valid audio without clearing a newer reply", async () => {
+  const sourceStart = source.indexOf("  const confirmVoiceNoteSpeculation = async");
+  const sourceEnd = source.indexOf("\n  const startVoiceSpeculation = async", sourceStart);
+  const classes = new Set(["voice-reply-pending"]);
+  const pendingReply = {
+    hidden: false,
+    removed: false,
+    dataset: {},
+    classList: { remove: (name) => classes.delete(name) },
+    card: { replaceChildren(value) { this.contents = [value]; } },
+    querySelector(selector) { return selector === ".message-card" ? this.card : null; },
+    remove() { this.removed = true; },
+  };
+  const outgoing = { dataset: {}, removed: false };
+  const recordingBytes = new Uint8Array(128);
+  const newerReplyContent = { text: "new reply" };
+  const oldOwner = { stop: async () => {}, bindButton() {}, bindPendingRow() {} };
+  const newOwner = { newer: true };
+  const recording = { speculation: null, sending: false, trace: {} };
+  const speculation = { id: "spec-old", conversation: "conversation-a", tts: oldOwner,
+    confirmed: false, aborting: false, resolveCapture(promise) { promise.catch(() => {}); } };
+  recording.speculation = speculation;
+  let context;
+  context = {
+    voiceRecording: recording,
+    voiceCallActive: false,
+    voiceReplyConversation: "conversation-a",
+    liveVoiceTts: newOwner,
+    document: { querySelector: () => ({}) },
+    URL: { revokeObjectURL() {} },
+    appendOptimisticVoiceMessage: () => outgoing,
+    appendLiveVoiceReply: () => pendingReply,
+    setVoiceRecordingVisible() {},
+    markVoiceLatencyIn() {},
+    stopVoiceCapture: async () => ({ heardVoice: true, samples: () => new Float32Array([0.25]) }),
+    confirmRecordedSpeculation: async () => {
+      await Promise.resolve();
+      context.liveVoiceTts = newOwner;
+      pendingReply.dataset.voiceSpeculationId = "spec-new";
+      pendingReply.card.replaceChildren(newerReplyContent);
+      throw new Error("native confirmation failed");
+    },
+    encodePcmWav: () => recordingBytes,
+    hydrateOptimisticVoiceMessage: (row, bytes) => { row.hydratedWith = bytes; },
+    unavailableVoiceMessage: () => unavailable,
+    errorMessage: (error) => error.message,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(sourceStart, sourceEnd)}\nthis.confirm = confirmVoiceNoteSpeculation;`, context);
+
+  await assert.rejects(context.confirm(recording, speculation), /native confirmation failed/);
+  assert.equal(outgoing.hydratedWith, recordingBytes, "the original captured message stays playable");
+  assert.equal(pendingReply.removed, false);
+  assert.deepEqual(pendingReply.card.contents, [newerReplyContent], "late failure does not mutate a reused reply row");
+  assert.equal(pendingReply.hidden, false);
+  assert.equal(classes.has("voice-reply-pending"), true);
+  assert.equal(context.liveVoiceTts, newOwner, "late failure cannot clear a newer reply owner");
+  assert.equal(context.voiceReplyConversation, "conversation-a");
+});
+
+test("browser voice-note capture samples are encoded and hydrated after confirmation", async () => {
+  const sourceStart = source.indexOf("  const confirmVoiceNoteSpeculation = async");
+  const sourceEnd = source.indexOf("\n  const startVoiceSpeculation = async", sourceStart);
+  const outgoing = { dataset: {}, hydratedWith: null };
+  const pendingReply = { dataset: {}, classList: { add() {}, remove() {} }, hidden: false };
+  const owner = { bindButton() {}, bindPendingRow() {} };
+  const recording = { speculation: null, sending: false, trace: {} };
+  const speculation = { id: "browser-spec", conversation: "conversation-b", tts: owner,
+    confirmed: false, aborting: false, resolveCapture(promise) { promise.catch(() => {}); } };
+  recording.speculation = speculation;
+  const samples = new Float32Array([0.25, -0.25]);
+  const encoded = new Uint8Array(128);
+  const encodedSamples = [];
+  const context = {
+    voiceRecording: recording,
+    voiceCallActive: false,
+    voiceReplyConversation: null,
+    liveVoiceTts: null,
+    document: { querySelector: () => ({}) },
+    URL: { revokeObjectURL() {} },
+    appendOptimisticVoiceMessage: () => outgoing,
+    appendLiveVoiceReply: () => pendingReply,
+    setVoiceRecordingVisible() {},
+    markVoiceLatencyIn() {},
+    stopVoiceCapture: async () => ({ heardVoice: true, samples: () => samples }),
+    confirmRecordedSpeculation: async () => ({}),
+    encodePcmWav: (input) => { encodedSamples.push(input); return encoded; },
+    hydrateOptimisticVoiceMessage: (row, bytes) => { row.hydratedWith = bytes; },
+    unavailableVoiceMessage: () => ({ unavailable: true }),
+    errorMessage: (error) => error.message,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(sourceStart, sourceEnd)}\nthis.confirm = confirmVoiceNoteSpeculation;`, context);
+
+  assert.equal(await context.confirm(recording, speculation), true);
+  assert.equal(encodedSamples.length, 1);
+  assert.deepEqual(Array.from(encodedSamples[0]), [0.25, -0.25]);
+  assert.equal(outgoing.hydratedWith, encoded);
+});
+
+test("WAV encoding failure settles owned rows without replacing the confirmation error", async () => {
+  const sourceStart = source.indexOf("  const confirmVoiceNoteSpeculation = async");
+  const sourceEnd = source.indexOf("\n  const startVoiceSpeculation = async", sourceStart);
+  const outgoing = { dataset: { objectUrl: "blob:unsealed" }, removed: false,
+    remove() { this.removed = true; } };
+  const pendingReply = { dataset: {}, removed: false, hidden: false,
+    remove() { this.removed = true; } };
+  const owner = { bindButton() {}, bindPendingRow() {} };
+  const recording = { speculation: null, sending: false, trace: {} };
+  const speculation = { id: "bad-wav-spec", conversation: "conversation-c", tts: owner,
+    confirmed: false, aborting: false, resolveCapture(promise) { promise.catch(() => {}); } };
+  recording.speculation = speculation;
+  const revoked = [];
+  const stages = [];
+  const context = {
+    voiceRecording: recording,
+    voiceCallActive: false,
+    voiceReplyConversation: null,
+    liveVoiceTts: null,
+    document: { querySelector: () => ({}) },
+    URL: { revokeObjectURL: (url) => revoked.push(url) },
+    appendOptimisticVoiceMessage: () => outgoing,
+    appendLiveVoiceReply: () => pendingReply,
+    setVoiceRecordingVisible() {},
+    markVoiceLatencyIn: (_trace, stage, detail) => stages.push([stage, detail]),
+    stopVoiceCapture: async () => ({ heardVoice: true, samples: () => new Float32Array([0.5]) }),
+    confirmRecordedSpeculation: async () => { throw new Error("native confirmation failed"); },
+    encodePcmWav: () => { throw new Error("WAV encoder failed"); },
+    unavailableVoiceMessage: () => ({ unavailable: true }),
+    errorMessage: (error) => error.message,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(sourceStart, sourceEnd)}\nthis.confirm = confirmVoiceNoteSpeculation;`, context);
+  context.liveVoiceTts = owner;
+  context.voiceReplyConversation = "conversation-c";
+
+  await assert.rejects(context.confirm(recording, speculation), /native confirmation failed/);
+  assert.equal(outgoing.removed, true);
+  assert.equal(pendingReply.removed, true);
+  assert.deepEqual(revoked, ["blob:unsealed"]);
+  assert.equal(context.liveVoiceTts, null);
+  assert.ok(stages.some(([stage, detail]) => stage === "voice_note_confirmation_failed"
+    && detail.message === "native confirmation failed"));
+});
+
 test("voice transcript backfill queues during calls but waits for successful note playback", async () => {
   const helperStart = source.indexOf("  const finishVoiceReplyAndIndexTurn = async");
   const helperEnd = source.indexOf("\n  const startPendingCallTranscriptSlot", helperStart);

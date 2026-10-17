@@ -3942,7 +3942,7 @@
   const appendLiveVoiceReply = (id) => {
     const card = appendLiveMessage("assistant", "", id);
     const row = card?.closest(".message-row");
-    if (!card || !row) return;
+    if (!card || !row) return null;
     row.classList.add("voice-reply-row", "voice-reply-pending");
     // A bare portrait reads as a broken message. Publish the speaker only
     // when PCM exists; until then the compact typing bubble is the complete
@@ -3950,6 +3950,7 @@
     row.querySelector?.(".message-speaker-avatar")?.remove();
     card.replaceChildren(pendingVoiceReply());
     row.hidden = false;
+    return row;
   };
 
   const keepLiveTailVisible = (element) => {
@@ -7992,7 +7993,9 @@
     // speaking. Publish only after the send boundary, while capture drain and
     // WAV encoding continue concurrently with the native commit latch.
     const outgoing = appendOptimisticVoiceMessage();
-    appendLiveVoiceReply("live-voice-reply-pending");
+    const pendingReply = appendLiveVoiceReply("live-voice-reply-pending");
+    if (outgoing?.dataset) outgoing.dataset.voiceSpeculationId = speculation.id;
+    if (pendingReply?.dataset) pendingReply.dataset.voiceSpeculationId = speculation.id;
     const pendingButton = document.querySelector(
       "#live-voice-reply-pending [data-action='voice-reply-pending-play']",
     );
@@ -8005,13 +8008,82 @@
       reason: "voice_note_speculation_confirmed" });
     const confirmed = confirmRecordedSpeculation(speculation, stoppedCapture);
     speculation.resolveCapture?.(Promise.all([stoppedCapture, confirmed]).then(([capture]) => capture));
-    const [capture] = await Promise.all([stoppedCapture, confirmed]);
-    if (capture?.wavBytes?.byteLength > 44) {
-      hydrateOptimisticVoiceMessage(outgoing, capture.wavBytes);
-    } else {
-      outgoing?.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+    let capture = null;
+    let captureWavBytes = null;
+    let captureWavAttempted = false;
+    const materializeCaptureWav = () => {
+      if (captureWavAttempted) return captureWavBytes;
+      captureWavAttempted = true;
+      captureWavBytes = capture?.wavBytes
+        || (typeof capture?.samples === "function" ? encodePcmWav(capture.samples()) : null);
+      return captureWavBytes;
+    };
+    try {
+      [capture] = await Promise.all([stoppedCapture, confirmed]);
+      captureWavBytes = materializeCaptureWav();
+      if (captureWavBytes?.byteLength > 44) {
+        if (outgoing?.dataset?.voiceSpeculationId === speculation.id) {
+          hydrateOptimisticVoiceMessage(outgoing, captureWavBytes);
+        }
+      } else {
+        if (outgoing?.dataset?.voiceSpeculationId === speculation.id) {
+          outgoing.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+        }
+      }
+      return true;
+    } catch (error) {
+      // Confirmation can fail after the optimistic rows are visible (most
+      // commonly because the stopped capture contains no speech). Settle only
+      // these exact nodes and this speculation's controller: a later reply in
+      // the same conversation may already own the global routing state.
+      capture ??= await stoppedCapture.catch(() => null);
+      let captureWavError = null;
+      try {
+        materializeCaptureWav();
+      } catch (wavError) {
+        captureWavError = wavError;
+      }
+      const hasRecording = capture?.heardVoice === true
+        && captureWavBytes?.byteLength > 44;
+      const ownsOutgoing = outgoing?.dataset?.voiceSpeculationId === speculation.id;
+      const ownsPendingReply = pendingReply?.dataset?.voiceSpeculationId === speculation.id;
+      if (hasRecording) {
+        if (ownsOutgoing) {
+          try {
+            hydrateOptimisticVoiceMessage(outgoing, captureWavBytes);
+          } catch (hydrateError) {
+            markVoiceLatencyIn(recording.trace, "voice_note_recording_hydration_failed", {
+              message: errorMessage(hydrateError),
+            });
+            outgoing.querySelector(".message-card")?.replaceChildren(unavailableVoiceMessage());
+          }
+        }
+        if (ownsPendingReply) {
+          const card = pendingReply.querySelector(".message-card");
+          if (card) card.replaceChildren(unavailableVoiceMessage());
+          pendingReply.hidden = false;
+          pendingReply.classList.remove("voice-reply-pending");
+        }
+      } else {
+        if (ownsOutgoing) {
+          if (outgoing.dataset.objectUrl) URL.revokeObjectURL(outgoing.dataset.objectUrl);
+          outgoing.remove();
+        }
+        if (ownsPendingReply) pendingReply.remove();
+      }
+      if (liveVoiceTts === speculation.tts) {
+        liveVoiceTts = null;
+        if (voiceReplyConversation === speculation.conversation) {
+          voiceReplyConversation = null;
+        }
+      }
+      markVoiceLatencyIn(recording.trace, "voice_note_confirmation_failed", {
+        heard_voice: hasRecording,
+        message: errorMessage(error),
+        ...(captureWavError ? { recording_encode_error: errorMessage(captureWavError) } : {}),
+      });
+      throw error;
     }
-    return true;
   };
 
   const startVoiceSpeculation = async (recording, { prearm = false } = {}) => {

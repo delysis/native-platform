@@ -55,6 +55,9 @@ pub(crate) fn fit_voice_context(
     };
     let limit = context.saturating_sub(microphone_reserve + prompt.completion_tokens + 32);
     let profile = digest(&(
+        // Older windows reserved headroom from the entire prompt, which could
+        // put the target below the mandatory persona and discard all history.
+        "voice-window-mandatory-budget-v2",
         &conversation.execution_profile,
         prompt.system,
         prompt.skill,
@@ -205,8 +208,14 @@ fn fit_window<T>(
     limit: usize,
     mut prepare: impl FnMut(&[Message]) -> Result<Option<(usize, T)>>,
 ) -> Result<(usize, T)> {
-    let mut rolling = false;
+    let mut rollover_target = None;
+    let mut minimal_projection = None;
     loop {
+        if start == active.len()
+            && let Some(prepared) = minimal_projection.take()
+        {
+            return Ok((start, prepared));
+        }
         let selected = active
             .iter()
             .enumerate()
@@ -214,8 +223,8 @@ fn fit_window<T>(
             .map(|(_, message)| message.clone())
             .collect::<Vec<_>>();
         if let Some((tokens, prepared)) = prepare(&selected)? {
-            let target = if rolling { limit * 2 / 3 } else { limit };
-            if tokens <= target || (start == active.len() && tokens <= limit) {
+            let target = rollover_target.unwrap_or(limit);
+            if tokens <= target {
                 return Ok((start, prepared));
             }
         }
@@ -224,7 +233,30 @@ fn fit_window<T>(
                 "The persona and current utterance exceed the available voice context"
             ));
         }
-        rolling = true;
+        if rollover_target.is_none() {
+            // The persona, system messages and current input cannot be rolled
+            // away. Reserve headroom only from the discretionary history
+            // budget, otherwise a long persona can make the low-water target
+            // impossible even while several recent exchanges still fit.
+            let mandatory = active
+                .iter()
+                .filter(|message| message.role == MessageRole::System)
+                .cloned()
+                .collect::<Vec<_>>();
+            let Some((mandatory_tokens, prepared)) = prepare(&mandatory)? else {
+                return Err(anyhow!(
+                    "The persona and current utterance exceed the available voice context"
+                ));
+            };
+            if mandatory_tokens > limit {
+                return Err(anyhow!(
+                    "The persona and current utterance exceed the available voice context"
+                ));
+            }
+            let available_history = limit - mandatory_tokens;
+            rollover_target = Some(limit - available_history.div_ceil(3));
+            minimal_projection = Some(prepared);
+        }
         start += (active.len() - start).div_ceil(4);
         // Keep complete user/assistant exchanges.
         while start < active.len() && active[start].role == MessageRole::Assistant {
@@ -326,6 +358,68 @@ mod tests {
             "a later projection still leaves source history intact"
         );
         Ok(())
+    }
+
+    #[test]
+    fn long_persona_rollover_retains_recent_exchanges_and_next_turn_reuses_window() -> Result<()> {
+        let mut active = vec![message("persona", MessageRole::System, "persona")];
+        for index in 0..5 {
+            active.push(message(&format!("user-{index}"), MessageRole::User, "turn"));
+            active.push(message(
+                &format!("reply-{index}"),
+                MessageRole::Assistant,
+                "reply",
+            ));
+        }
+        let measure = |messages: &[Message]| {
+            11_000
+                + messages
+                    .iter()
+                    .filter(|m| m.role != MessageRole::System)
+                    .count()
+                    * 500
+        };
+        let (start, selected) = fit_window(&active, 0, 14_000, |messages| {
+            Ok(Some((measure(messages), messages.to_vec())))
+        })?;
+        assert_eq!(measure(&selected), 13_000);
+        assert_eq!(selected.len(), 5, "keep persona and two recent exchanges");
+        assert_eq!(selected[1].id, "user-3");
+        assert_eq!(selected[4].id, "reply-4");
+
+        active.push(message("user-next", MessageRole::User, "next"));
+        let mut preparations = 0;
+        let (next_start, next) = fit_window(&active, start, 14_000, |messages| {
+            preparations += 1;
+            Ok(Some((measure(messages), messages.to_vec())))
+        })?;
+        assert_eq!(
+            next_start, start,
+            "do not shift the cached prefix on each turn"
+        );
+        assert_eq!(
+            preparations, 1,
+            "fitting warm history needs no baseline remeasurement"
+        );
+        assert_eq!(measure(&next), 13_500);
+        Ok(())
+    }
+
+    #[test]
+    fn impossible_mandatory_prompt_fails_without_repeated_history_preparation() {
+        let active = vec![
+            message("persona", MessageRole::System, "persona"),
+            message("user", MessageRole::User, "turn"),
+            message("reply", MessageRole::Assistant, "reply"),
+        ];
+        let mut preparations = 0;
+        let error = fit_window(&active, 0, 10, |messages| {
+            preparations += 1;
+            Ok(Some((11 + messages.len(), ())))
+        })
+        .expect_err("mandatory input exceeding the hard limit must fail");
+        assert!(error.to_string().contains("available voice context"));
+        assert_eq!(preparations, 2);
     }
 
     #[test]
