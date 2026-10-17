@@ -175,6 +175,7 @@ fn attributed_history_fixture(id: &str) -> Conversation {
                 None,
             ),
         ],
+        inference_window: None,
     }
 }
 
@@ -1893,6 +1894,7 @@ fn system_and_tool_messages_reject_edits_without_mutating_the_conversation() -> 
         recipient_ids: Vec::new(),
         current_skill_ids: Vec::new(),
         messages: vec![system.clone(), tool.clone()],
+        inference_window: None,
     };
     mom_llama_runtime::conversation_import_json(&serde_json::to_string(&fixture)?)?;
     let before = mom_llama_runtime::conversation_select(&fixture.id)?
@@ -2841,17 +2843,29 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         .ok_or_else(|| anyhow!("MOM_LLAMA_TEST_VOICE_WAV must point to a 16 kHz WAV"))?;
     let samples = pcm16_mono_16khz_wav_samples(&wav_path)?;
     anyhow::ensure!(samples.len() >= 8_000, "voice WAV needs 500 ms of PCM");
-    mom_llama_runtime::settings_update(SettingsUpdate {
+    let configured_settings = mom_llama_runtime::settings_update(SettingsUpdate {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         native_device: Some(llama_native_types::NativeDevice::Metal),
         max_tokens: Some(8),
         mmproj_path: Some(Some(projector)),
-        context_tokens: Some(51_200),
+        context_tokens: Some(8192),
         batch_tokens: Some(256),
         max_parallel_sequences: Some(4),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
-    })?;
+    })?
+    .result
+    .ok_or_else(|| anyhow!("voice context settings were not accepted"))?;
+    assert!(
+        (8192..=19_456).contains(&configured_settings.context_tokens),
+        "the manual memory cap should resolve a bounded context, got {}",
+        configured_settings.context_tokens
+    );
+    assert_eq!(
+        configured_settings.resident_memory_budget_bytes,
+        21_845 * 1024 * 1024
+    );
     let native_owner = initialize_product_runtime()?;
     let scope = native_owner.operation_scope();
     let persona = mom_llama_runtime::persona_list()?
@@ -3002,6 +3016,254 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
         following.begin_metrics()
     );
     following.cancel();
+
+    let mut overflow = conversation.clone();
+    overflow.id = uuid::Uuid::new_v4().to_string();
+    overflow.title = "Voice context rollover proof".to_string();
+    let handle = overflow
+        .execution_profile
+        .mention_handle
+        .chars()
+        .take(32)
+        .collect::<String>();
+    overflow.execution_profile.mention_handle = format!("{handle}-rollover");
+    overflow.messages.clear();
+    overflow.branch_root_message_id = None;
+    overflow.active_leaf_message_id = None;
+    let mut parent_id = None;
+    for index in 0..24 {
+        let user_id = format!("rollover-user-{index}");
+        let assistant_id = format!("rollover-assistant-{index}");
+        overflow.messages.push(Message {
+            id: user_id.clone(),
+            conversation_id: overflow.id.clone(),
+            role: MessageRole::User,
+            content: format!(
+                "Historical user turn {index}: {}",
+                "Earlier detail remains in the original source record. ".repeat(64)
+            ),
+            created_at: index.to_string(),
+            parent_id: parent_id.take(),
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        });
+        overflow.messages.push(Message {
+            id: assistant_id.clone(),
+            conversation_id: overflow.id.clone(),
+            role: MessageRole::Assistant,
+            content: format!(
+                "Historical assistant turn {index}: {}",
+                "The full answer remains available in source history. ".repeat(64)
+            ),
+            created_at: index.to_string(),
+            parent_id: Some(user_id),
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        });
+        parent_id = Some(assistant_id);
+    }
+    overflow.active_leaf_message_id = parent_id;
+    let imported = mom_llama_runtime::conversation_import_json(&serde_json::to_string(&overflow)?)?
+        .result
+        .ok_or_else(|| anyhow!("large voice history import failed"))?;
+    let original_messages = imported.messages.clone();
+    let persona_system_message = imported.execution_profile.system_message.clone();
+    anyhow::ensure!(
+        !original_messages.is_empty(),
+        "rollover fixture must retain source messages"
+    );
+    anyhow::ensure!(
+        persona_system_message.is_some(),
+        "rollover fixture must retain the selected Persona's system prompt"
+    );
+    assert_eq!(
+        persona_system_message, conversation.execution_profile.system_message,
+        "importing the rollover fixture must preserve the Persona prompt"
+    );
+    assert_eq!(
+        imported.source_conversation_id, conversation.source_conversation_id,
+        "the rollover fixture must remain owned by the same Persona"
+    );
+
+    let rollover_voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &imported.id,
+        "[Phone call] Reply naturally and briefly to the latest message.",
+    )?;
+    let rollover_begin = rollover_voice.begin_metrics().clone();
+    let reserved_prompt_limit = rollover_begin.resident_context_tokens as usize
+        - (rollover_begin.resident_context_tokens as usize / 4).min(4096)
+        - 96
+        - 32;
+    eprintln!(
+        "VOICE_CONTEXT_ROLLOVER {}",
+        serde_json::to_string(&json!({
+            "profile": "32GB-manual-21845MiB",
+            "fixture": "24 synthetic source exchanges and synthetic 16kHz tone",
+            "source_messages": original_messages.len(),
+            "resident_context_tokens": rollover_begin.resident_context_tokens,
+            "measured_static_prompt_tokens": rollover_begin.measured_prompt_tokens,
+            "reserved_prompt_limit": reserved_prompt_limit,
+            "omitted_history_messages": rollover_begin.omitted_history_messages,
+            "cached_prefix_found": rollover_begin.cached_prefix_found,
+            "cached_prefix_tokens": rollover_begin.cached_prefix_tokens,
+        }))?
+    );
+    assert!(
+        rollover_begin.omitted_history_messages > 0,
+        "oversized retained history should be excluded from inference"
+    );
+    assert!(
+        rollover_begin.measured_prompt_tokens <= reserved_prompt_limit,
+        "measured prompt {} exceeded the voice context limit {reserved_prompt_limit} (context {})",
+        rollover_begin.measured_prompt_tokens,
+        rollover_begin.resident_context_tokens
+    );
+    assert!(
+        rollover_begin.cached_prefix_found,
+        "the rollover conversation should reuse the prepared Persona prefix"
+    );
+    rollover_voice.wait_for_resume()?;
+    let capture_started = Instant::now();
+    for (index, chunk) in samples[..8_000].chunks(160).enumerate() {
+        let deadline = capture_started + Duration::from_millis(index as u64 * 10);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        rollover_voice.push_pcm(chunk)?;
+    }
+    if let Some(wait) =
+        (capture_started + Duration::from_millis(500)).checked_duration_since(Instant::now())
+    {
+        std::thread::sleep(wait);
+    }
+    rollover_voice.seal_input()?;
+    let rollover_finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
+        rollover_voice,
+        ChatSendOptions {
+            timeout_s: 60.0,
+            fake_fixture: false,
+        },
+        None::<fn(mom_llama_runtime::ChatStreamEvent) -> Result<()>>,
+        || {
+            let imported_audio = mom_llama_runtime::attachment_import_voice_message(
+                &scope,
+                &imported.id,
+                std::fs::read(&wav_path)?,
+            )?;
+            Ok(Some(
+                imported_audio
+                    .result
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "rollover voice attachment import failed: {:?}",
+                            imported_audio.blocker
+                        )
+                    })?
+                    .attachment
+                    .id,
+            ))
+        },
+    )?;
+    let rollover_output = rollover_finished.result.ok_or_else(|| {
+        anyhow!(
+            "rollover voice turn failed: {:#?}",
+            rollover_finished.blocker
+        )
+    })?;
+    let rollover_audio = rollover_output
+        .voice_audio_metrics
+        .as_ref()
+        .ok_or_else(|| anyhow!("rollover turn omitted voice metrics"))?;
+    assert!(
+        rollover_audio.accepted_samples >= 8_000,
+        "the real voice path must accept the full synthetic PCM window"
+    );
+    let committed = mom_llama_runtime::conversation_select(&imported.id)?
+        .result
+        .ok_or_else(|| anyhow!("committed rollover conversation disappeared"))?;
+    anyhow::ensure!(
+        committed.messages.len() >= original_messages.len(),
+        "committing voice must retain every original source message"
+    );
+    for (saved, original) in committed.messages[..original_messages.len()]
+        .iter()
+        .zip(&original_messages)
+    {
+        assert_eq!(saved.id, original.id, "source message identity changed");
+        assert_eq!(saved.conversation_id, original.conversation_id);
+        assert_eq!(saved.role, original.role);
+        assert_eq!(
+            saved.content, original.content,
+            "source message text changed"
+        );
+        assert_eq!(saved.created_at, original.created_at);
+        assert_eq!(saved.parent_id, original.parent_id);
+        assert_eq!(saved.model, original.model);
+        assert_eq!(saved.receipt_id, original.receipt_id);
+        assert_eq!(saved.prompt_tokens, original.prompt_tokens);
+        assert_eq!(saved.completion_tokens, original.completion_tokens);
+        assert_eq!(saved.reasoning_content, original.reasoning_content);
+        assert_eq!(saved.reasoning_incomplete, original.reasoning_incomplete);
+        assert_eq!(saved.attribution, original.attribution);
+        assert_eq!(saved.attachment_ids, original.attachment_ids);
+    }
+    let saved_window = committed
+        .inference_window
+        .clone()
+        .ok_or_else(|| anyhow!("rollover boundary was not durably saved"))?;
+    assert!(
+        original_messages
+            .iter()
+            .any(|message| message.id == saved_window.covered_through_message_id),
+        "the saved boundary must point into the unchanged original source history"
+    );
+    assert_eq!(
+        rollover_audio.begin.omitted_history_messages,
+        rollover_begin.omitted_history_messages
+    );
+
+    let next_rollover_voice = mom_llama_runtime::voice_audio_begin_in_scope(
+        &scope,
+        &imported.id,
+        "[Phone call] Reply naturally and briefly to the latest message.",
+    )?;
+    assert_eq!(
+        next_rollover_voice.begin_metrics().omitted_history_messages,
+        rollover_begin.omitted_history_messages,
+        "the following small turn should keep the saved context boundary"
+    );
+    assert!(
+        next_rollover_voice.begin_metrics().cached_prefix_found
+            && next_rollover_voice.begin_metrics().cached_prefix_tokens > 0,
+        "the following turn should reuse a resident Persona prefix: {:?}",
+        next_rollover_voice.begin_metrics()
+    );
+    eprintln!(
+        "VOICE_CONTEXT_NEXT_TURN {}",
+        serde_json::to_string(&json!({
+            "omitted_history_messages": next_rollover_voice.begin_metrics().omitted_history_messages,
+            "cached_prefix_found": next_rollover_voice.begin_metrics().cached_prefix_found,
+            "cached_prefix_tokens": next_rollover_voice.begin_metrics().cached_prefix_tokens,
+        }))?
+    );
+    next_rollover_voice.cancel();
     Ok(())
 }
 
@@ -4282,7 +4544,10 @@ fn real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_rest
     let prepared = mom_llama_runtime::kv_cache_save_voice_persona(&scope, &persona.id)?
         .result
         .ok_or_else(|| anyhow!("long voice persona cache preparation failed"))?;
-    let metadata = &prepared.metadata;
+    let metadata = prepared
+        .metadata
+        .as_ref()
+        .expect("persisted preparation metadata");
     assert!(
         metadata.token_ids.len() > 4_000,
         "persona cache prefix was not long enough to exercise SWA retention: {}",

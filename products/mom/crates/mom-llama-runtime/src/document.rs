@@ -165,6 +165,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages,
+            inference_window: None,
         }
     }
 

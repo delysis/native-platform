@@ -21,6 +21,7 @@ pub mod server;
 pub mod skill_store;
 mod store;
 pub mod tool_loop;
+mod voice_context;
 
 pub use attachments::{
     AttachmentImportOutput, AttachmentKind, AttachmentLibraryInput, AttachmentPreviewAnchor,

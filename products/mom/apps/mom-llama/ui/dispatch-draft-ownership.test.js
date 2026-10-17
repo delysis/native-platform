@@ -5,6 +5,123 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(`${__dirname}/coop-hx.js`, "utf8");
 
+test("call persona preparation is awaited, epoch-bound, and required before greeting dispatch", async () => {
+  const helperStart = source.indexOf("  const prepareVoicePersonaForCall = async");
+  const helperEnd = source.indexOf("\n  const startStreamedCallGreeting", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "the production preparation helper must remain testable");
+
+  const epoch = {};
+  const calls = [];
+  const stages = [];
+  let now = 0;
+  const context = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    performance: { now: () => ++now },
+    errorMessage: (error) => error.message,
+    markVoiceLatency: (stage, detail) => stages.push([stage, detail]),
+    invoke: async (command, args) => {
+      calls.push([command, args]);
+      return {
+        status: "prompt_smoke_verified",
+        result: {
+          metadata: { id: "prepared-prefix" },
+          prefill_us: 17,
+          verification_us: 29,
+          persisted: false,
+        },
+      };
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.prepareVoicePersonaForCall = prepareVoicePersonaForCall;`,
+    context,
+  );
+  assert.equal(await context.prepareVoicePersonaForCall("contact-a", epoch), true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "mom_llama_voice_persona_prepare");
+  assert.equal(calls[0][1].personaId, "contact-a");
+  assert.deepEqual(stages.map(([stage]) => stage), [
+    "call_persona_prepare_started",
+    "call_persona_prepare_completed",
+  ]);
+  assert.equal(stages[1][1].prefix_cache_id, "prepared-prefix");
+
+  const blockedStages = [];
+  const blockedContext = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    performance: { now: () => 1 },
+    errorMessage: (error) => error.message,
+    markVoiceLatency: (stage) => blockedStages.push(stage),
+    invoke: async () => ({ status: "blocked", blocker: { message: "persona unavailable" } }),
+  };
+  vm.createContext(blockedContext);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.prepareVoicePersonaForCall = prepareVoicePersonaForCall;`,
+    blockedContext,
+  );
+  await assert.rejects(blockedContext.prepareVoicePersonaForCall("contact-a", epoch), /persona unavailable/);
+  assert.deepEqual(blockedStages, ["call_persona_prepare_started", "call_persona_prepare_failed"]);
+
+  let resolvePreparation;
+  const staleStages = [];
+  const staleEpoch = {};
+  const staleContext = {
+    voiceCallEpoch: staleEpoch,
+    voiceCallActive: true,
+    performance: { now: () => 1 },
+    errorMessage: (error) => error.message,
+    markVoiceLatency: (stage) => staleStages.push(stage),
+    invoke: () => new Promise((resolve) => { resolvePreparation = resolve; }),
+  };
+  vm.createContext(staleContext);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.prepareVoicePersonaForCall = prepareVoicePersonaForCall;`,
+    staleContext,
+  );
+  const pending = staleContext.prepareVoicePersonaForCall("contact-a", staleEpoch);
+  await Promise.resolve();
+  staleContext.voiceCallEpoch = {};
+  resolvePreparation({ status: "prompt_smoke_verified", result: { metadata: { id: "stale-prefix" } } });
+  assert.equal(await pending, false);
+  assert.deepEqual(staleStages, ["call_persona_prepare_started"]);
+
+  const openStart = source.indexOf("  const openVoiceCallSurface = async");
+  const openEnd = source.indexOf("\n  const closeVoiceCallSurface = async", openStart);
+  const open = source.slice(openStart, openEnd);
+  assert.ok(open.indexOf("const recipientId = recipient.dataset.recipientId") < open.indexOf("await prepareVoicePersonaForCall"));
+  assert.ok(open.indexOf("await prepareVoicePersonaForCall") < open.indexOf("await startStreamedCallGreeting"));
+});
+
+test("call persona preparation stops when its epoch changes while native preparation is pending", async () => {
+  const helperStart = source.indexOf("  const prepareVoicePersonaForCall = async");
+  const helperEnd = source.indexOf("\n  const startStreamedCallGreeting", helperStart);
+  let resolvePreparation;
+  const stages = [];
+  const epoch = {};
+  const context = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    performance: { now: () => 1 },
+    errorMessage: (error) => error.message,
+    markVoiceLatency: (stage) => stages.push(stage),
+    invoke: () => new Promise((resolve) => { resolvePreparation = resolve; }),
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(helperStart, helperEnd)}\nthis.prepareVoicePersonaForCall = prepareVoicePersonaForCall;`,
+    context,
+  );
+  const pending = context.prepareVoicePersonaForCall("contact-a", epoch);
+  await Promise.resolve();
+  context.voiceCallEpoch = {};
+  resolvePreparation({ status: "prompt_smoke_verified", result: { metadata: { id: "stale" } } });
+  assert.equal(await pending, false);
+  assert.deepEqual(stages, ["call_persona_prepare_started"]);
+});
+
 test("Stop appears only for a registered live chat request", () => {
   const definition = source.match(/const chatRequestIsCancellable = \(busyLeases, streamLeases\) => \([\s\S]*?\n  \);/);
   assert.ok(definition, "production cancellable-request policy must remain directly testable");

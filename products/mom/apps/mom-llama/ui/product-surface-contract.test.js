@@ -27,6 +27,7 @@ const backendOnlyCommandIds = [
   "mom_llama.engine_check",
   "mom_llama.engine_configure",
   "mom_llama.kv_cache_clear",
+  "mom_llama.kv_cache_prepare_voice_persona_resident",
   "mom_llama.kv_cache_restore",
   "mom_llama.kv_cache_save",
   "mom_llama.kv_cache_status",
@@ -490,6 +491,21 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(live.includes("speech_stream_runaway"));
 });
 
+test("call startup waits for idle speech cancellation to reach its terminal before model warmup", () => {
+  const callStart = bridge.indexOf("  const openVoiceCallSurface = async");
+  const callEnd = bridge.indexOf("\n  const closeVoiceCallSurface = async", callStart);
+  const call = bridge.slice(callStart, callEnd);
+  const preempt = call.indexOf('await stopSpeechOperationAndWait(voiceHistoryRecoveryOperation, "call_start")');
+  const warm = call.indexOf('runtimeWarmPromise.then');
+  const microphone = call.indexOf('prepareCallMicrophoneStream()');
+
+  assert.ok(preempt >= 0, "call pickup must request exact speech terminal acknowledgment");
+  assert.ok(call.includes("await voiceHistoryRecovery?.catch(() => {})"));
+  assert.ok(preempt < warm && preempt < microphone,
+    "Gemma warmup and microphone setup must wait until the idle Parakeet operation settles");
+  assert.ok(bridge.includes('invoke("mom_llama_speech_stop_and_wait", { operation })'));
+});
+
 test("call capture remains live during playback through the shared echo-cancelled route", () => {
   const liveStart = bridge.indexOf("  const beginLiveVoiceTts =");
   const liveEnd = bridge.indexOf("\n  const chatRequestIsCancellable", liveStart);
@@ -507,7 +523,8 @@ test("call capture remains live during playback through the shared echo-cancelle
   const playbackEndedAt = live.indexOf("onEnded: () => {");
   const playbackEnded = live.slice(playbackEndedAt, live.indexOf("    });", playbackEndedAt));
   assert.ok(playbackEnded.includes("startCallCapture();"));
-  assert.ok(live.includes("prefillSession: nextCallPrefill || nextCallPrefillGate"));
+  assert.ok(live.includes("prefillSession: deferPrefill ? null : (nextCallPrefill || nextCallPrefillGate)"));
+  assert.ok(live.includes("deferPrefill,"));
   assert.ok(live.includes("startNextCallPrefill();\n          controller.finish();"));
   assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
   assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
@@ -773,8 +790,9 @@ test("streamed voice playback is owned by the exact native request", () => {
   assert.ok(live.includes('startNextCallPrefill("generation_complete_buffered_playback")'));
   assert.ok(live.includes('leadController.shouldPrepareNextCall({'));
   assert.ok(live.includes('startBufferedNextCallPrefill();'));
-  assert.ok(bridge.includes('onVoiceOnset: () => startNextCallPrefill("caller_voice_onset")'));
-  assert.ok(bridge.includes('if (onVoiceOnset) queueMicrotask(onVoiceOnset)'));
+  assert.ok(bridge.includes("onVoiceOnset: (recording) => preemptCallTranscriptForSpeech(recording, startNextCallPrefill)"));
+  assert.ok(bridge.includes("onVoiceOnset(recording)"));
+  assert.ok(bridge.includes("await stopSpeechOperationAndWait(operation, \"caller_speech_onset\")"));
   assert.ok(live.includes('markTtsLatency("tts_all_segments_finished"'));
   assert.ok(live.includes('markTtsLatency("next_turn_prefill_ready"'));
   assert.ok(live.includes("production_rtf: aggregateRtf"));

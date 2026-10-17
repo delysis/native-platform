@@ -3038,6 +3038,7 @@ fn merge_generated_conversation(
     );
     if active_branch_is_unchanged {
         existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
+        existing.inference_window = conversation.inference_window.clone();
     }
     if crate::conversation_store::is_placeholder_title(&existing.title, &existing.id) {
         existing.title = if crate::conversation_store::is_placeholder_title(
@@ -4271,7 +4272,7 @@ mod tests {
         let base = message("base", Vec::new());
         let mut concurrent_branch = message("concurrent-branch", Vec::new());
         concurrent_branch.parent_id = Some(base.id.clone());
-        let mut existing = Conversation {
+        let existing = Conversation {
             id: "chat".to_string(),
             title: "Renamed while generating".to_string(),
             created_at: "1".to_string(),
@@ -4289,6 +4290,11 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: vec!["concurrent-skill".to_string()],
             messages: vec![base.clone(), concurrent_branch.clone()],
+            inference_window: Some(crate::conversation_store::ConversationInferenceWindow {
+                covered_through_message_id: "concurrent-branch".to_string(),
+                covered_source_sha256: "c".repeat(64),
+                profile_sha256: "d".repeat(64),
+            }),
         };
         let mut generated_user = message("generated-user", Vec::new());
         generated_user.parent_id = Some(base.id.clone());
@@ -4301,6 +4307,12 @@ mod tests {
         stale_generation.execution_profile.system_message = Some("Stale instructions".to_string());
         stale_generation.selected_model_path = Some(PathBuf::from("/stale/model.gguf"));
         stale_generation.current_skill_ids = vec!["stale-skill".to_string()];
+        stale_generation.inference_window =
+            Some(crate::conversation_store::ConversationInferenceWindow {
+                covered_through_message_id: "base".to_string(),
+                covered_source_sha256: "a".repeat(64),
+                profile_sha256: "b".repeat(64),
+            });
         stale_generation.messages = vec![base, generated_user, generated_assistant.clone()];
         stale_generation.active_leaf_message_id = Some(generated_assistant.id.clone());
         let mut db = ConversationDb {
@@ -4315,7 +4327,7 @@ mod tests {
             &["generated-user".to_string(), generated_assistant.id.clone()],
         )
         .expect("merge exact generated messages");
-        existing = db.conversations.remove(0);
+        let existing = db.conversations[0].clone();
         assert_eq!(existing.title, "Renamed while generating");
         assert_eq!(
             existing.execution_profile.system_message.as_deref(),
@@ -4326,6 +4338,14 @@ mod tests {
             Some(PathBuf::from("/concurrent/model.gguf"))
         );
         assert_eq!(existing.current_skill_ids, vec!["concurrent-skill"]);
+        let retained_window = existing.inference_window.clone();
+        assert_eq!(
+            retained_window
+                .as_ref()
+                .map(|window| window.covered_through_message_id.as_str()),
+            Some("concurrent-branch"),
+            "a stale generation must not install its window on a concurrently selected branch"
+        );
         assert_eq!(
             existing.active_leaf_message_id.as_deref(),
             Some("concurrent-branch")
@@ -4337,6 +4357,19 @@ mod tests {
                 .any(|message| message.id == generated_assistant.id)
         );
         assert_eq!(db.selected_conversation_id.as_deref(), Some("another-chat"));
+
+        stale_generation.inference_window = None;
+        merge_generated_conversation(
+            &mut db,
+            &stale_generation,
+            Some("base"),
+            &["generated-user".to_string(), generated_assistant.id.clone()],
+        )
+        .expect("merge without a stale inference window");
+        assert_eq!(
+            db.conversations[0].inference_window, retained_window,
+            "a missing incoming window must not clear the concurrent branch window"
+        );
     }
 
     #[test]
@@ -4368,6 +4401,7 @@ mod tests {
                 generated_user.clone(),
                 generated_assistant.clone(),
             ],
+            inference_window: None,
         };
         let mut db = ConversationDb {
             conversations: vec![Conversation {
@@ -4431,6 +4465,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: vec![recorded.clone()],
+            inference_window: None,
         };
         let mut assistant = message("reply", Vec::new());
         assistant.role = crate::conversation_store::MessageRole::Assistant;
@@ -4564,6 +4599,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["First", "Second"]
         );
+    }
+
+    #[test]
+    fn generated_exchange_persists_inference_window_with_full_source_history() {
+        let _session = TestDataDir::new("generated-inference-window-commit");
+        let mut initial = new_conversation("Window host");
+        let mut source = message("window-source", Vec::new());
+        source.conversation_id = initial.id.clone();
+        source.content = "The original source message remains complete.".to_string();
+        initial.messages.push(source.clone());
+        initial.active_leaf_message_id = Some(source.id.clone());
+        commit_generated_exchange(
+            load_db().expect("fallback db"),
+            initial.clone(),
+            None,
+            std::slice::from_ref(&source.id),
+            &[],
+            &source.id,
+            None,
+        )
+        .expect("commit source history");
+
+        let mut generated = crate::conversation_store::conversation_select(&initial.id)
+            .expect("read source host")
+            .result
+            .expect("source conversation")
+            .clone();
+        let mut user = message("window-user", Vec::new());
+        user.conversation_id = initial.id.clone();
+        user.parent_id = Some(source.id.clone());
+        let mut answer = message("window-answer", Vec::new());
+        answer.conversation_id = initial.id.clone();
+        answer.role = crate::conversation_store::MessageRole::Assistant;
+        answer.parent_id = Some(user.id.clone());
+        generated.messages.extend([user.clone(), answer.clone()]);
+        generated.active_leaf_message_id = Some(answer.id.clone());
+        let window = crate::conversation_store::ConversationInferenceWindow {
+            covered_through_message_id: source.id.clone(),
+            covered_source_sha256: "a".repeat(64),
+            profile_sha256: "b".repeat(64),
+        };
+        generated.inference_window = Some(window.clone());
+
+        commit_generated_exchange(
+            load_db().expect("fallback db"),
+            generated.clone(),
+            Some(&source.id),
+            &[user.id.clone(), answer.id.clone()],
+            &[],
+            &user.id,
+            None,
+        )
+        .expect("commit generated exchange and inference window atomically");
+
+        let committed = crate::conversation_store::conversation_select(&initial.id)
+            .expect("read committed host")
+            .result
+            .expect("committed conversation");
+        assert_eq!(committed.messages.len(), generated.messages.len());
+        assert_eq!(committed.messages[0].id, source.id);
+        assert_eq!(committed.messages[0].content, source.content);
+        assert_eq!(committed.messages[0].attachment_ids, source.attachment_ids);
+        assert_eq!(committed.messages[1].id, user.id);
+        assert_eq!(committed.messages[1].content, user.content);
+        assert_eq!(committed.messages[2].id, answer.id);
+        assert_eq!(committed.messages[2].content, answer.content);
+        assert_eq!(committed.inference_window, Some(window));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use tokio::sync::watch;
 
 #[cfg(test)]
 use speech_native_types::PlatformTarget;
@@ -422,6 +423,12 @@ pub struct SpeechStopOutput {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpeechStopWaitOutput {
+    pub stop: SpeechStopOutput,
+    pub terminal_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SpeechShutdown {
     pub host_joined: bool,
     pub active_operation_count: usize,
@@ -741,6 +748,7 @@ pub struct MomSpeech {
     _qwen: Option<Arc<QwenSpeechBackend>>,
     _qwen_startup_warm: Option<IclWarmStatus>,
     state: Mutex<SpeechState>,
+    operation_revision: watch::Sender<u64>,
     precommit_voices: RwLock<BTreeMap<String, String>>,
     generation_backpressure:
         Mutex<BTreeMap<String, mom_llama_runtime::GenerationBackpressureLease>>,
@@ -803,6 +811,7 @@ impl MomSpeech {
             _qwen: prepared_qwen,
             _qwen_startup_warm: qwen_startup_warm,
             state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
             precommit_voices: RwLock::new(BTreeMap::new()),
             generation_backpressure: Mutex::new(BTreeMap::new()),
         }))
@@ -817,6 +826,7 @@ impl MomSpeech {
             _qwen: None,
             _qwen_startup_warm: None,
             state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
             precommit_voices: RwLock::new(BTreeMap::new()),
             generation_backpressure: Mutex::new(BTreeMap::new()),
         })
@@ -1369,6 +1379,17 @@ impl MomSpeech {
         result
     }
 
+    /// Reports whether the exact Parakeet model is already resident. Live
+    /// voice-call slots may only use a resident transcriber; loading it while
+    /// the caller is waiting would add an unbounded cold-start interval.
+    pub fn parakeet_is_resident(&self) -> Result<bool, String> {
+        let descriptors = self
+            .executor
+            .current_descriptors()
+            .map_err(|error| error.to_string())?;
+        Ok(select_resident_parakeet(&descriptors).is_ok())
+    }
+
     pub async fn transcribe_attachment(
         &self,
         conversation_id: &str,
@@ -1573,6 +1594,60 @@ impl MomSpeech {
         ))
     }
 
+    /// Cancels one transcription and waits until its exact speech operation
+    /// has left the active registry. The host removes the operation only
+    /// after the backend ticket reaches its terminal, so foreground compute
+    /// must not start based on the cancellation request alone.
+    pub async fn stop_and_wait(&self, operation: &str) -> Result<SpeechStopWaitOutput, String> {
+        validate_operation_token(operation).map_err(|error| error.to_string())?;
+        let stopped = self
+            .stop(Some(operation), None)
+            .map_err(|error| error.to_string())?
+            .result
+            .ok_or_else(|| "speech_stop_wait_receipt_missing".to_string())?;
+        let request_id = self
+            .state
+            .lock()
+            .map_err(|_| "Mom speech operation state is unavailable".to_string())?
+            .active
+            .get(operation)
+            .map(|active| active.request_id.clone());
+        let Some(request_id) = request_id else {
+            // If stop raced ahead of begin_operation, stop() retained an
+            // early-cancel fact; the future backend admission will be refused.
+            return Ok(SpeechStopWaitOutput {
+                stop: stopped,
+                terminal_acknowledged: true,
+            });
+        };
+
+        let mut changed = self.operation_revision.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let settled = self
+                    .state
+                    .lock()
+                    .map_err(|_| "Mom speech operation state is unavailable".to_string())?
+                    .active
+                    .get(operation)
+                    .is_none_or(|active| active.request_id != request_id);
+                if settled {
+                    return Ok::<(), String>(());
+                }
+                changed
+                    .changed()
+                    .await
+                    .map_err(|_| "speech_stop_wait_state_closed".to_string())?;
+            }
+        })
+        .await
+        .map_err(|_| "speech_stop_wait_terminal_timeout".to_string())??;
+        Ok(SpeechStopWaitOutput {
+            stop: stopped,
+            terminal_acknowledged: true,
+        })
+    }
+
     pub fn begin_quiesce(&self) {
         if let Ok(mut backpressure) = self.generation_backpressure.lock() {
             backpressure.clear();
@@ -1683,12 +1758,16 @@ impl MomSpeech {
                 .active
                 .get(operation)
                 .is_none_or(|active| active.request_id != *request_id || active.cancelled);
-        if state
+        let removed = state
             .active
             .get(operation)
             .is_some_and(|active| active.request_id == *request_id)
-        {
-            state.active.remove(operation);
+            && state.active.remove(operation).is_some();
+        drop(state);
+        if removed {
+            self.operation_revision.send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
         }
         cancelled
     }
@@ -1713,12 +1792,16 @@ impl MomSpeech {
                 .active
                 .get(operation)
                 .is_none_or(|active| active.request_id != *request_id || active.cancelled);
-        if state
+        let removed = state
             .active
             .get(operation)
             .is_some_and(|active| active.request_id == *request_id)
-        {
-            state.active.remove(operation);
+            && state.active.remove(operation).is_some();
+        drop(state);
+        if removed {
+            self.operation_revision.send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
         }
         if cancelled {
             return Err(speech_cancelled_blocker());
@@ -3078,6 +3161,7 @@ mod tests {
             _qwen: None,
             _qwen_startup_warm: None,
             state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
             precommit_voices: RwLock::new(BTreeMap::new()),
             generation_backpressure: Mutex::new(BTreeMap::new()),
         };
@@ -3523,6 +3607,37 @@ mod tests {
         assert_eq!(shutdown.retained_playback_count, 0);
     }
 
+    #[tokio::test]
+    async fn stop_and_wait_requires_the_exact_active_operation_to_finish() {
+        let speech = Arc::new(MomSpeech::empty_for_tests());
+        let request_id = SpeechRequestId("waited-transcription".to_string());
+        speech
+            .begin_operation(
+                "waited-operation",
+                request_id.clone(),
+                OperationKind::Transcription,
+            )
+            .expect("active transcription");
+
+        let waiter_speech = Arc::clone(&speech);
+        let waiter = tokio::spawn(async move {
+            waiter_speech
+                .stop_and_wait("waited-operation")
+                .await
+                .expect("terminal acknowledgment")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "cancel request alone is not terminal"
+        );
+
+        speech.finish_operation("waited-operation", &request_id);
+        let output = waiter.await.expect("waiter task");
+        assert!(output.stop.cancellation_requested);
+        assert!(output.terminal_acknowledged);
+    }
+
     #[test]
     fn descriptor_hash_binds_request_to_exact_inventory() {
         let original = qwen_descriptor();
@@ -3830,6 +3945,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             };
@@ -3856,6 +3972,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             });
@@ -4056,6 +4173,7 @@ mod tests {
                 _qwen: None,
                 _qwen_startup_warm: None,
                 state: Mutex::new(SpeechState::default()),
+                operation_revision: watch::channel(0).0,
                 precommit_voices: RwLock::new(BTreeMap::new()),
                 generation_backpressure: Mutex::new(BTreeMap::new()),
             });

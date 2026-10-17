@@ -138,16 +138,42 @@ fn assert_exact_model_bundle(model_dir: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Parakeet weights in the Hugging Face cache and SPEECH_NATIVE_TEST_WAV"]
+#[ignore = "requires Parakeet weights and an exact historical WAV or opt-in active-cancel WAV"]
 async fn real_gateway_transcription_and_request_scoped_cancellation() {
-    let wav_path = real_wav_path().expect("SPEECH_NATIVE_TEST_WAV must point at real English WAV");
+    // The historical fixture remains the default and keeps its exact
+    // identity. The current Samantha recording is admitted only through a
+    // separate explicit environment variable and its own fixed digest.
+    let active_cancel_fixture = std::env::var_os("SPEECH_NATIVE_TEST_WAV_ACTIVE_CANCEL");
+    let wav_path = active_cancel_fixture
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(real_wav_path)
+        .expect("set an exact Parakeet test WAV path");
     let wav = std::fs::read(wav_path).expect("read real WAV fixture");
-    assert_eq!(wav.len(), 305_580, "exact Parakeet input length");
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&wav)),
-        "326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34",
-        "exact Parakeet input digest"
+    let digest = format!("{:x}", Sha256::digest(&wav));
+    eprintln!(
+        "Parakeet fixture identity: mode={}, bytes={}, sha256={}",
+        if active_cancel_fixture.is_some() {
+            "active-cancel"
+        } else {
+            "historical"
+        },
+        wav.len(),
+        digest,
     );
+    if active_cancel_fixture.is_some() {
+        assert_eq!(wav.len(), 289_452, "exact active-cancel fixture length");
+        assert_eq!(
+            digest, "8489ce680feee78ba0758e9e149e42f1dd54c01c2c955a9088b0e671340759b7",
+            "exact active-cancel fixture digest"
+        );
+    } else {
+        assert_eq!(wav.len(), 305_580, "exact historical Parakeet input length");
+        assert_eq!(
+            digest, "326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34",
+            "exact historical Parakeet input digest"
+        );
+    }
     let model_dir = std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
         .map(PathBuf::from)
         .expect("SPEECH_NATIVE_PARAKEET_MODEL_DIR must name the exact model directory");
@@ -264,6 +290,57 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
             if response.usage.model_load_ms == Some(0)
     ));
     eprintln!("real streaming Parakeet transcript: {stream_transcript}");
+
+    // Wait for a real partial result before cancelling. This proves the model
+    // has completed at least one inference chunk and avoids measuring only
+    // queued-request cancellation or model loading. The final event is the
+    // acknowledgment foreground Gemma/Qwen admission must wait for.
+    let mut cancellation_latencies_ms = Vec::with_capacity(20);
+    for repetition in 0..20 {
+        let request_id = format!("parakeet-real-active-cancel-{repetition:02}");
+        let mut ticket = gateway
+            .transcribe(request(&request_id, wav.clone()))
+            .await
+            .expect("start active-inference cancellation request");
+        let mut saw_partial = false;
+        while let Some(event) = ticket.events.recv().await {
+            match event {
+                TranscriptionEvent::Partial { .. } => {
+                    saw_partial = true;
+                    break;
+                }
+                event if event.is_terminal() => {
+                    panic!("request reached a terminal before active inference: {event:?}");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_partial,
+            "model must acknowledge a completed inference chunk"
+        );
+        let cancelled_at = std::time::Instant::now();
+        assert_eq!(
+            gateway.cancel(&SpeechRequestId(request_id.clone())),
+            1,
+            "active request cancellation must reach Parakeet"
+        );
+        let (events, result) = drain(ticket).await;
+        cancellation_latencies_ms.push(cancelled_at.elapsed().as_secs_f64() * 1_000.0);
+        assert_eq!(result, Err("speech_request_cancelled".to_string()));
+        assert!(matches!(
+            events.last(),
+            Some(TranscriptionEvent::Cancelled { .. })
+        ));
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+    }
+    cancellation_latencies_ms.sort_by(f64::total_cmp);
+    eprintln!(
+        "active Parakeet cancellation terminal latency (20 repeats): median_ms={:.2}, max_ms={:.2}, samples_ms={:?}",
+        cancellation_latencies_ms[cancellation_latencies_ms.len() / 2],
+        cancellation_latencies_ms[cancellation_latencies_ms.len() - 1],
+        cancellation_latencies_ms,
+    );
 
     let mut cancelled_ticket = gateway
         .transcribe(stream_request("parakeet-real-cancelled", format))

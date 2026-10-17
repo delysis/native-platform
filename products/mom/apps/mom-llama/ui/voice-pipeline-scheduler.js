@@ -5,6 +5,50 @@
 }(typeof globalThis === "object" ? globalThis : this, () => {
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 
+  const shouldRunCallTranscriptSlot = ({
+    generationComplete = false,
+    playbackSafe = false,
+    qwenIdle = false,
+    captureUnattached = false,
+    callerVoiced = false,
+    parakeetResident = false,
+    transcriptSlotActive = false,
+    disabled = false,
+  } = {}) => generationComplete && playbackSafe && qwenIdle && captureUnattached
+    && !callerVoiced && parakeetResident && !transcriptSlotActive && !disabled;
+
+  const replayDeferredPcm = async ({ readChunks, enqueue, settle, handoff }) => {
+    let cursor = 0;
+    while (true) {
+      const chunks = readChunks(cursor);
+      if (!chunks.length) {
+        handoff();
+        return cursor;
+      }
+      cursor += chunks.length;
+      chunks.forEach(enqueue);
+      await settle();
+    }
+  };
+
+  const createCallTranscriptIntent = ({ conversation, output, fallbackAttachment, sourceTrace }) => {
+    const attachment = output?.voice_attachment_id || fallbackAttachment || null;
+    const messageId = output?.user_message_id || null;
+    if (!conversation || !attachment || !messageId) return null;
+    return {
+      conversation,
+      output: { voice_attachment_id: attachment, user_message_id: messageId },
+      fallbackAttachment: fallbackAttachment || null,
+      sourceTrace: sourceTrace || null,
+    };
+  };
+
+  const enqueueCallTranscriptIntent = (queue, intent, limit = 64) => {
+    if (!intent || queue.length >= limit) return false;
+    queue.push(intent);
+    return true;
+  };
+
   class AdaptiveVoiceLeadController {
     constructor({
       startupMs = 120,
@@ -290,5 +334,12 @@
     }
   }
 
-  return { AdaptiveVoiceLeadController, SemanticLeadController };
+  return {
+    AdaptiveVoiceLeadController,
+    SemanticLeadController,
+    shouldRunCallTranscriptSlot,
+    replayDeferredPcm,
+    createCallTranscriptIntent,
+    enqueueCallTranscriptIntent,
+  };
 }));

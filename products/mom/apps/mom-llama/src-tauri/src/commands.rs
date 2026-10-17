@@ -519,6 +519,19 @@ pub async fn mom_llama_runtime_warm(runtime: State<'_, AppRuntimeHandle>) -> Res
 }
 
 #[tauri::command]
+pub async fn mom_llama_voice_persona_prepare(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona_id: String,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    let lease = runtime.admit(command_spec("mom_llama_voice_persona_prepare"))?;
+    blocking_command(lease, move || {
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&scope, &persona_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub fn mom_llama_engine_configure(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
@@ -2555,6 +2568,23 @@ pub async fn mom_llama_speech_transcribe_attachment(
 }
 
 #[tauri::command]
+pub fn mom_llama_speech_parakeet_resident(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_parakeet_resident"))?;
+    let resident = runtime.speech().parakeet_is_resident().map_err(to_error)?;
+    command_value(Ok(mom_llama_runtime::CommandResult::passed(
+        "mom_llama.speech_parakeet_resident",
+        "host_integrated",
+        resident,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    )))
+}
+
+#[tauri::command]
 pub fn mom_llama_speech_stop(
     runtime: State<'_, AppRuntimeHandle>,
     operation: Option<String>,
@@ -2566,6 +2596,29 @@ pub fn mom_llama_speech_stop(
             .speech()
             .stop(operation.as_deref(), playback.as_deref()),
     )
+}
+
+#[tauri::command]
+pub async fn mom_llama_speech_stop_and_wait(
+    runtime: State<'_, AppRuntimeHandle>,
+    operation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_stop_and_wait"))?;
+    let result = runtime
+        .speech()
+        .stop_and_wait(&operation)
+        .await
+        .map_err(anyhow::Error::msg)
+        .map_err(to_error)?;
+    command_value(Ok(mom_llama_runtime::CommandResult::passed(
+        "mom_llama.speech_stop_and_wait",
+        "host_integrated",
+        result,
+        Vec::new(),
+        vec![format!("speech-operation:{operation}")],
+        false,
+        false,
+    )))
 }
 
 fn attachment_preview_response(anchor: &AttachmentPreviewAnchor) -> Result<Response, String> {

@@ -826,6 +826,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: vec!["skill".to_string()],
             messages: Vec::new(),
+            inference_window: None,
         };
         let mut settings = Settings::defaults_for_data_dir(PathBuf::from("fixture"));
         let mut skills = SkillDb {

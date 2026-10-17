@@ -4,6 +4,10 @@ const test = require("node:test");
 const {
   AdaptiveVoiceLeadController,
   SemanticLeadController,
+  shouldRunCallTranscriptSlot,
+  replayDeferredPcm,
+  createCallTranscriptIntent,
+  enqueueCallTranscriptIntent,
 } = require("./voice-pipeline-scheduler.js");
 
 test("voice lead dispatches immediately for startup and only near its adaptive floor later", () => {
@@ -22,6 +26,80 @@ test("next call prefill waits for adaptive runway after generation completes", (
   lead.noteSegment({ synthesisMs: 1_450, audioMs: 1_000, firstAudioMs: 260 });
   assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: 240 }), false);
   assert.equal(lead.shouldPrepareNextCall({ generationComplete: true, playing: true, bufferedMs: lead.targetRunwayMs() }), true);
+});
+
+test("call transcript work runs only in a resident-model, playback-safe unattached slot", () => {
+  const ready = {
+    generationComplete: true,
+    playbackSafe: true,
+    qwenIdle: true,
+    captureUnattached: true,
+    callerVoiced: false,
+    parakeetResident: true,
+    transcriptSlotActive: false,
+    disabled: false,
+  };
+  assert.equal(shouldRunCallTranscriptSlot(ready), true);
+  for (const changed of [
+    { qwenIdle: false },
+    { captureUnattached: false },
+    { callerVoiced: true },
+    { parakeetResident: false },
+    { transcriptSlotActive: true },
+    { disabled: true },
+    { playbackSafe: false },
+    { generationComplete: false },
+  ]) {
+    assert.equal(shouldRunCallTranscriptSlot({ ...ready, ...changed }), false);
+  }
+});
+
+test("deferred PCM replay includes audio captured during settlement exactly once before handoff", async () => {
+  const captured = ["preroll", "onset"];
+  const enqueued = [];
+  let settlements = 0;
+  let handedOff = false;
+  const count = await replayDeferredPcm({
+    readChunks: (cursor) => captured.slice(cursor),
+    enqueue: (chunk) => enqueued.push(chunk),
+    settle: async () => {
+      settlements += 1;
+      if (settlements === 1) captured.push("during-push");
+    },
+    handoff: () => { handedOff = true; },
+  });
+  assert.deepEqual(enqueued, ["preroll", "onset", "during-push"]);
+  assert.equal(count, 3);
+  assert.equal(settlements, 2);
+  assert.equal(handedOff, true);
+});
+
+test("queued call transcript intents retain only durable identities and have a hard bound", () => {
+  const sourceCapture = { capturedPcm: [new Float32Array(24_000 * 60)], transcription: { reader: {} } };
+  const trace = { events: [] };
+  const intent = createCallTranscriptIntent({
+    conversation: "conversation-a",
+    output: { user_message_id: "message-a", voice_attachment_id: "attachment-a", audio: sourceCapture },
+    fallbackAttachment: "fallback-a",
+    sourceTrace: trace,
+    sourceCapture,
+  });
+  assert.deepEqual(intent, {
+    conversation: "conversation-a",
+    output: { voice_attachment_id: "attachment-a", user_message_id: "message-a" },
+    fallbackAttachment: "fallback-a",
+    sourceTrace: trace,
+  });
+  assert.equal("sourceCapture" in intent, false);
+  const queue = [];
+  for (let index = 0; index < 64; index += 1) {
+    assert.equal(enqueueCallTranscriptIntent(queue, { ...intent, output: {
+      voice_attachment_id: `attachment-${index}`,
+      user_message_id: `message-${index}`,
+    } }), true);
+  }
+  assert.equal(enqueueCallTranscriptIntent(queue, intent), false);
+  assert.equal(queue.length, 64);
 });
 
 test("slow synthesis and packet jitter raise the runway target", () => {

@@ -1,211 +1,173 @@
 # Voice reliability qualification
 
-## Current diagnosis
+## Current status — 16 October 2026
 
-The last available app log is `/tmp/mom-live-parakeet-app.log` (Oct 16,
-17:54). It reports Gemma and Parakeet warm-up, Parakeet taking 5.236 s, and
-prepared speech becoming ready after 7.263 s. Metal identifies an M4 Max and a
-Gemma 4 12B Q4_0 model. The log names the data identity
-`mom-llama-development-mom1-v1`, but does not bind the executable or installed
-bundle to a source commit or digest. There is no Mom process running at the
-time of inspection. Treat this as diagnostic context, not acceptance evidence.
+The current source has runtime evidence for bounded voice-history rollover on
+an M4 Max with synthetic input. The evidence uses an 8,192-token context and a
+manual 21,845 MiB memory budget, which resolves to 19,456 tokens. It is not an
+M2 measurement or packaged-call acceptance. The current tree has not passed the
+settled-tree `local-ci` gate and no candidate bundle has been built.
 
-The browser capture requests native `echoCancellation`, `noiseSuppression`, and
-`autoGainControl`. Current source compares mic frames with the actual rendered
-playback reference. It suppresses low-level input only after a stable echo
-match; unmatched caller audio passes after its 48 ms onset debounce, and
-double-talk leaves an independent residual that can open the gate. This removes
-the previous blanket 250 ms suppression. Deterministic matcher and double-talk
-tests pass; physical speaker/microphone loopback remains unqualified.
+Opportunistic ASR slotting is implemented. The current frontend suite passes
+240/240. A low-priority resident-only Parakeet slot runs during
+the targetless interval with playback fully buffered. A finalized transcript
+replaces that older audio only in future model input; the original recording
+remains attached for playback and provenance. This can reduce history pressure
+before rolling the inference boundary. Microphone PCM stays detached from Gemma
+until its transcript is complete. Caller onset cancels the exact ASR operation
+and waits for its terminal acknowledgement before Gemma preparation. A slot
+exceeding 500 ms disables later in-call slots, and cold Parakeet loading is
+skipped. A real Parakeet active-cancel test passed 20/20, with 32.55 ms median
+and 33.22 ms maximum terminal latency. This verifies the transcription
+cancellation boundary; packaged opportunistic slot/capture sequencing and
+target-device behavior remain unqualified.
 
-The old app log reports Parakeet taking 5.236 s and speech readiness at 7.263 s.
-Current source removes the unused startup Parakeet transcription probe while
-retaining backend discovery and on-demand transcription. A packaged launch
-trace has not yet verified this source change.
+The actual 32 GB M2 device, physical speaker/microphone loopback, sustained
+packaged call, and 30-minute soak remain unqualified. Synthetic tone/PCM and
+unbundled native runs do not substitute for those checks.
 
-Live transcription queues at most 40,960 samples (2.56 s at 16 kHz), includes
-in-flight audio in that bound, and fails the parallel transcription explicitly
-on overflow or a stalled native acknowledgement. The saved recording remains
-the fallback source. Existing Node tests cover this boundary, deadline,
-cancellation, PCM order, ring overflow, rebuffering, scheduler runway, and
-telemetry. They do not establish microphone-device behavior or slow-machine
-resilience.
+## Inference-window behavior
 
-## Regression comparison
+Voice preparation measures the complete text and audio prompt against the
+native context. Live input reserves one quarter of context, capped at 4,096
+tokens, plus completion and framing headroom. When history does not fit, the
+planner preserves system messages, advances the boundary by complete
+user/assistant exchanges, and stops at a lower-water target. The headroom keeps
+the same boundary on a small next turn.
 
-Use `97e6e459` (`Make Mom voice conversations native and responsive`) as the
-pre-live-Parakeet-fanout candidate baseline; live Parakeet fan-out begins later
-at `660afc42` and `3b3be988`. Confirm the exact two worktree commits and retain
-the baseline source and measurements before comparing. The baseline is a
-comparison point, not a release qualification. Run both versions with the same
-Mac, OS, model/projector, voice reference, audio corpus, cache state, and
-thermal starting condition. Report warm and cold first response, first token,
-first PCM, playback start, underruns, queue high-water, and quit duration.
-Do not compare results across cache states or devices as if they were paired.
+The boundary is persisted as metadata on the conversation. It identifies the
+last omitted message and hashes the omitted source authority and frozen
+inference profile. Original messages and attachments remain intact; this is
+rolling inference history, not a generated summary. The boundary is committed
+atomically with the generated exchange. A source edit, branch change, or
+profile change makes the saved boundary ineligible for reuse.
 
-## Acceptance run
+The passing M4 Max runtime receipt is
+`outputs/qualification/real-voice-context-rollover-m2-budget-synthetic-tone-retry.log`.
+It warms the prepared persona prefix, imports long original history, fits a
+synthetic live microphone turn under the measured reserve, completes the turn,
+checks that all source messages remain unchanged, and verifies that the window
+and native persona prefix are reused on the next turn. The run took 71.44 s.
+Despite the receipt's historical filename, it is an M4 Max run, not M2 evidence.
 
-One integrator owns the checkout, app state, and Cargo target at a time. Keep
-model loads serialized. Preserve source logs and failed traces. Begin with the
-affected Node suites; then run the standard Mom native tests and app build with
-the same configured target. Do not run ignored real-model diagnostics until
-the owner has stopped other model work and recorded the intended model and
-artifact.
+The read-only real-audio preflight receipt is
+`outputs/qualification/context-window-preflight-real-audio.log`. At a 4,096-token
+context it measured 3,178 static multimodal prompt tokens after cancel #1 and
+preserved the cancellation/resume evidence: 20 decode-cancel cycles, 19/19
+resume-prefix hits, and cancel-to-terminal p50/p95/max of 1.967/2.527/2.707 ms.
+The capacity-switch request measured 3,310 tokens before and after its edit,
+with only 12 shared prefix tokens; it completed after trimming to that common
+prefix. This used synthetic PCM on an M4 Max.
 
-For real-device qualification, record the exact app bundle and executable
-paths, executable SHA-256, `Info.plist` bundle identity/version, source commit,
-OS/build, Mac model/RAM, model/projector and Parakeet identities/digests,
-voice reference digest, and whether each process was cold or resident. Capture
-the final trace and process/resource sample with that identity.
+`outputs/qualification/parakeet-samantha-active-cancel-20.log` passed 20/20
+active Parakeet cancellations after a partial result. Batch and streaming
+transcripts both included the sentence ending; terminal latency was 32.55 ms
+median and 33.22 ms maximum. This verifies the transcription cancellation
+boundary but does not qualify packaged opportunistic slot/capture sequencing.
+The preceding compiler-artifact mismatch is recorded in
+`outputs/qualification/parakeet-samantha-active-cancel-20-initial-toolchain-failure.log`.
+A fixture-digest typo also failed before inference; neither is a model-quality result.
 
-Exercise at least one sustained multi-minute conversation, then 20 rapid
-cancel/resume cycles with varied speech timing, plus a longer 30-minute soak.
-For every accepted input, verify source ordering, no silent drop or retarget,
-bounded queues, one terminal result per operation, no late speech/transcript
-publication, and successful immediate restart. Include playback plus physical
-microphone loopback to assess echo and double-talk, and repeat the sustained
-run on a lower-memory M2-class Mac under normal thermal load. Report startup,
-first-token/PCM/playback percentiles, underrun and cancellation distributions,
-peak process memory, queue high-water, CPU, thermal state, and any failed
-receipts. Deterministic tests and a synthetic loopback are component evidence;
-they do not replace these packaged-device runs.
+## Cache and transcription boundaries
 
-## Current local evidence
+Before pickup, warm-up prepares the call's actual frozen profile. It aliases a
+source persona's cache owner only when the relevant system, model, projector,
+selected-model, and skill fields match. During an active call, prefix lookup is
+RAM-only; live generation may use resident KV state or bounded in-memory replay
+and does not read or write the disk cache. Pre-call preparation can recognize
+worker-owned resident prefixes without inventing serialized cache metadata. The
+real Gemma 4 12B prefix receipt below verifies repeat preparation reused 11
+resident tokens and retained the existing restore/replay checks; a packaged
+call still needs request-scoped filesystem evidence for the no-disk-I/O
+boundary. No automatic full-conversation KV checkpoint at hangup is claimed.
 
-The comparison source is `97e6e459`; the qualification worktree is based on
-`a8d85989` on branch `fix/voice-reliability`. No paired baseline run or ABBA
-comparison has been performed. The source and build receipts are retained under
-`outputs/qualification`; the final commit and packaged-app identity must be
-recorded in the external candidate manifest after the settled-tree gate. The old
-`/tmp/mom-live-parakeet-app.log` is diagnostic evidence only: it names the
-development data identity but not the app executable, bundle digest, or source
-commit. It cannot identify the current installed/running artifact. No release
-app has been launched for this qualification.
+Live transcription remains bounded to 40,960 samples (2.56 s at 16 kHz),
+including in-flight audio. Overflow and stalled native acknowledgements fail
+explicitly. Deferred PCM replay is tested for exactly-once delivery, including
+chunks received during an asynchronous drain. The saved recording remains
+authoritative. Older statements that live ASR fan-out was removed describe a
+previous source snapshot.
 
-On an M4 Max, an ignored real Gemma 4 12B Q4_0 + matching mmproj test passed
-with 24 generated chronological audio-history items, 20 cancel/resume cycles,
-and deterministic synthetic live PCM. The final test seals audio, waits for a
-nonempty decode token, cancels the exact generation ticket, and waits for its
-terminal cancellation event in all 20 cycles. It reported 19/19 resumed-prefix
-hits; decode-cancel-to-terminal latency was p50 1.899 ms, p95 1.962 ms, and max
-2.032 ms in this uncontented component run. Final generated token IDs and text
-matched the cold baseline exactly. The earlier 17.678 ms measurement was the
-separate prefill-cancellation path, retained at
-`outputs/qualification/real-audio-20-cancel-final-core-executed.log`. The
-signed-state worker-restart test also passed on the real GGUF with CPU
-execution. Neither is packaged-call acceptance.
+## Evidence history and limitations
 
-The high-scale M4 Metal test initially found authenticated imported KV diverging
-from resident KV, compact token replay, and cold generation. Inspection isolated
-SWA export pruning: the 8,192-cell context allocated the full SWA cache, but the
-export included only 1,024 cells. The pinned llama.cpp binding now exports all
-SWA cells. The same four-path test then passed exact token and text parity at a
-5,270-token prompt with 5,262 shared tokens. `state_read_meta` reported all
-5,270 cells on import; restored=5,262, compact replay=5,262, and resident=5,262.
-Timings were 175 ms resident, 6,487 ms imported, 10,877 ms compact replay,
-11,486 ms cold, and 18,082 ms to warm. The import path is correct but still
-slower than a resident hit; performance needs separate qualification. The exact
-serialized snapshot byte length was not logged. Preserve the earlier failure
-receipts at `outputs/qualification/real-edited-prompt-imported-lcp-long-persona.log`
-and `outputs/qualification/real-edited-prompt-four-path-diagnostic.log`, and
-the passing receipt at
-`outputs/qualification/real-edited-prompt-four-path-swa-full.log`.
+The focused current-tree checks passed: all-target check for engine, runtime,
+CLI, and app; all-target Clippy with warnings denied; runtime integration tests
+(39 passed, 17 ignored); app tests (169 passed); and frontend tests (240/240).
+The engine focused suite passed 225 tests (15 ignored), and runtime unit tests
+passed 310. These focused checks are not the settled-tree `local-ci` gate. The
+M4 20-cycle audio run, 5,270-token edited-prompt four-path parity run,
+5,556-token encrypted restart test, and earlier frontend/Rust counts are
+historical snapshots. The earlier 3,310-token
+capacity-switch case found a failure before the native lane-trim repair; the
+post-repair case above passes with only 12 shared tokens. Keep all failure
+receipts unchanged.
 
-The complete Mom frontend suite passes 234 Node tests. It covers progress
-deadlines, complete buffering for sustained slow synthesis, reference-correlated
-echo, independent caller speech, double-talk residual, playback lifecycle, and
-first-call buffering. These are deterministic component tests; they do not
-qualify physical echo or the M2-class machine. Rust 1.95.0 focused native gates
-pass: cache 21, engine 225 with 15 ignored, types 72, and runtime all-targets
-344 with 17 ignored. The app build and full local-ci gate are pending. The
-intended lower-memory target is the mother's M2 MacBook Pro with 32 GB RAM; it
-is unavailable for this local run.
+`outputs/qualification/real-saved-prefix-restores-final.log` passed the real
+Gemma 4 12B native prefix test on an M4 Max. Repeating preparation reused 11
+resident tokens without a supplied snapshot; the test also checked native
+restore, durable replay, and rejection after a context change. It is native
+prefix correctness evidence, not a packaged voice call or M2 result. The first
+attempt lacked its model environment and is retained separately as
+`outputs/qualification/real-saved-prefix-restores-final-missing-env.log`.
 
-The new ignored encrypted-chunk integration test exercised a real 5,556-token
-voice persona on an M4 Max using the Gemma 4 12B Q4_0 model with SHA-256
-`93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b`. The
-resolved context was 19,456 tokens under the 21,845 MiB manual resident budget.
-Native state was 1,911,754,200 bytes and persisted in 114 encrypted chunks;
-setup and persistence took 165,813 ms in this debug test run. CPU sampling from
-the earlier failed attempt attributed 668 of 671 samples to unoptimized
-ChaCha20 decryption, so this is correctness evidence, not an application latency
-measurement. After restarting the native worker, the authenticated state
-imported all 5,556 cells. This exposed a live-promotion bug: restore incorrectly
-required the huge state to fit the separate RAM LRU. The lease now accepts a
-disk-backed authenticated state when its owner and memory generation still
-validate. The rerun passed after worker restart, reported
-`prompt_smoke_verified`, and took 255,980 ms for reload/verification in the
-debug test. Its full test took 421.05 s. The current receipt reports native
-state import for all 5,556 cells; the test also asserts the receipt names
-authenticated native state and does not report token replay. The
-original single-branch attempt failed configuration because persona preparation
-requires two probe branches; both failed receipts remain. These debug ChaCha20
-times are correctness diagnostics, not optimized application latency. Receipts:
-`outputs/qualification/real-runtime-encrypted-5k-cache-latest.log` (branch
-configuration failure),
-`outputs/qualification/real-runtime-encrypted-5k-cache-retry-maxseq2.log`
-(pre-fix restore promotion failure), and
-`outputs/qualification/real-runtime-encrypted-5k-cache-promotion-fixed.log`
-(successful restart restore), and
-`outputs/qualification/real-kv-cache-maxseq1-metal-guard-fixed.log`
-(one-sequence real save/restore). The preceding one-sequence attempt exposed a
-spurious two-probe minimum in shared-prefix prefill; its failure receipt is
-`outputs/qualification/real-kv-cache-maxseq1-metal.log`.
+The old `/tmp/mom-live-parakeet-app.log` names a development data identity but
+does not bind the executable, bundle digest, or source commit. It is diagnostic
+context only. No release app has been launched for this qualification. No
+paired baseline/ABBA comparison has been performed; `97e6e459` remains a
+comparison candidate, not an established release baseline.
 
-Run the standard focused non-model native gate from the repository root with
-the pinned binaries required by `CONTRIBUTING.md`:
+The encrypted-cache restart receipt is correctness evidence, not an application
+latency result. It used a debug build, and an earlier CPU sample attributed
+most restore time to unoptimized ChaCha20 decryption. The cache restore and
+SWA-export repairs have separate passing M4 receipts; import remains slower
+than resident reuse and needs performance qualification.
 
-```sh
-export RUSTUP_TOOLCHAIN=1.95.0
-export CARGO="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" cargo)"
-export RUSTC="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)"
-export RUSTDOC="$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustdoc)"
-export PATH="$(dirname "$CARGO"):$PATH"
-cargo test --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets
-```
+## Development and device gates
 
-After the complete local-ci gate passes on the exact clean source tree, create
-one reviewable candidate with the checked builder. It requires the JSON summary
-for that exact commit/tree, verifies the source before and after building, and
-writes a per-file SHA-256 manifest beside the bundle. It does not install or
-launch the app:
+Use one integrator for the checkout, app state, and serialized Cargo/model
+slot. Preserve user data and every failed receipt. Run affected frontend tests,
+then focused Rust tests, and finally one settled-tree `cargo run --locked -p
+xtask -- local-ci <new-evidence-directory>` gate. Do not treat an ignored
+real-model diagnostic or a component test as packaged acceptance.
 
-```sh
-node products/mom/scripts/build-voice-candidate.mjs \
-  "$HOME/.codex/evidence/local-ci-<commit>-attempt-01/summary.json" \
-  "/Users/george/Documents/Codex/2026-10-16/gemma-first-token-152-154-ms/outputs/qualification/candidate-attempt-01"
-```
+The candidate builder requires the passing summary for the exact clean source
+tree, verifies source identity before and after packaging, and writes a
+per-file SHA-256 manifest. It does not install or launch the app. The exact
+candidate must then be identified before any device run.
 
-It creates `Blessenger Voice Candidate.app`, `candidate.json`, and `build.log`
-inside the new output directory. Verify the exact candidate and manifest before
-launching it for device qualification.
+Packaged qualification must record the app and executable paths and hashes,
+bundle identity/version, commit and dirty state, OS/build, Mac model/RAM,
+model/projector/Parakeet identities and digests, voice-reference digest, and
+cold/resident state. Retain traces and resource samples. Exercise a sustained
+multi-minute call, 20 varied cancel/resume cycles, a 30-minute soak, physical
+playback/microphone loopback with double-talk, and the 32 GB M2 under normal
+thermal load. Measure startup, first-token/PCM/playback percentiles, underruns,
+cancellation, peak memory, queue high-water, CPU, and thermal state.
 
-The current real-model audio command is opt-in and uses generated test PCM:
+## Audit corrections
 
-```sh
-MOM_LLAMA_MULTIMODAL_MODEL_PATH="$HOME/.cache/huggingface/hub/models--google--gemma-4-12B-it-qat-q4_0-gguf/snapshots/29d097773436b69ff9feafd636ab4cf873786537/gemma-4-12b-it-qat-q4_0.gguf" \
-MOM_LLAMA_MM_PROJ_PATH="$HOME/.cache/huggingface/hub/models--google--gemma-4-12B-it-qat-q4_0-gguf/snapshots/29d097773436b69ff9feafd636ab4cf873786537/mmproj-gemma-4-12b-it-qat-q4_0.gguf" \
-cargo test --locked -p llama-native-engine tests::real_incremental_audio_accepts_earlier_recording -- --ignored --exact --nocapture
-```
+One Clippy attempt pinned Cargo and RUSTC to Rust 1.95.0 but left PATH pointing
+at Homebrew `cargo-clippy` and `clippy-driver`; it failed on incompatible
+compiler metadata before producing project diagnostics. The corrected pinned
+retry reached project linting and passed after a test-source fix. See
+`outputs/qualification/clippy-homebrew-toolchain-mismatch.txt` and the pinned
+retry receipt.
 
-Record an artifact identity manifest immediately after packaging. At minimum
-capture `git rev-parse HEAD`, dirty-tree status, the absolute `.app` path,
-`/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist`,
-`/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist`,
-`shasum -a 256` of the actual `Contents/MacOS/*` executable, `sw_vers`,
-`system_profiler SPHardwareDataType`, model/projector/Parakeet file identities
-and SHA-256 values, voice-reference digest, and each run's cold/resident state.
-Retain this manifest beside the trace, capture log, and process/resource sample;
-keep logs and failed receipts unchanged. The Tauri source identity currently
-declares Blessenger `0.1.0`, bundle identifier
-`com.delysis.llama-native-kit.mom-llama`; this is source configuration, not
-proof that a particular installed app has that identity.
+The first consolidated attempt used Node 26 instead of pinned Node 22. A
+later policy scan traversed ignored SwiftPM `.build` output as project source;
+the scanner now excludes that generated subtree, with a regression test.
+Ignored-test inventory counts and the audited build-script digest were also
+corrected. Failed gate receipts remain failures.
 
-The full-device acceptance matrix remains open: exact packaged app, one
-integrator and serialized model slot, sustained conversation, 20 rapid
-cancel/resume cycles, 30-minute soak, microphone/speaker physical loopback with
-double-talk, and repeat on a lower-memory M2-class Mac under ordinary thermal
-load. Preserve startup/first-token/first-PCM/playback percentiles, underruns,
-cancellation latency, peak memory, queue high-water, CPU/thermal readings, and
-failed operation receipts. Synthetic audio and unbundled native tests are not
-packaged-product acceptance.
+The historical generated Parakeet WAV could not be reproduced byte-for-byte.
+The current run uses a fresh explicitly pinned fixture identity; it does not
+claim reproduction of the historical audio artifact.
+
+The direct cache-preparation-to-microphone handoff also passed on M4 Metal:
+`outputs/qualification/real-text-greeting-incremental-audio-prefix-final.log`
+reports 211/211 prepared tokens reused without a supplied snapshot, followed
+by the greeting-to-audio check. The worker now retains preparation's text KV in
+the microphone prefix lane, including when no serialized RAM snapshot exists.
+Background maintenance retains at most 64 transcript intents containing saved
+message/attachment identities; it does not retain raw capture PCM. Unqueued
+maintenance is rediscovered from saved recordings during idle recovery.

@@ -112,6 +112,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_information_managed_removal_commit", true, false),
     long("mom_llama_engine_check", true, true),
     long("mom_llama_runtime_warm", true, true),
+    long("mom_llama_voice_persona_prepare", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
     long("mom_llama_model_select", true, true),
@@ -201,11 +202,13 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
     long("mom_llama_speech_transcribe_attachment", true, true),
+    read("mom_llama_speech_parakeet_resident", false, true),
     long("mom_llama_live_transcription_begin", false, true),
     mutation("mom_llama_live_transcription_push", false, true),
     mutation("mom_llama_live_transcription_finish", false, true),
     mutation("mom_llama_live_transcription_cancel", false, true),
     mutation("mom_llama_speech_stop", true, true),
+    mutation("mom_llama_speech_stop_and_wait", true, true),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
     mutation("mom_llama_settings_update", true, true),
@@ -350,6 +353,7 @@ mod tests {
             "mom_llama_render_settings_fragment",
             "mom_llama_engine_check",
             "mom_llama_runtime_warm",
+            "mom_llama_voice_persona_prepare",
             "mom_llama_engine_configure",
             "mom_llama_model_select",
             "mom_llama_chat_send",
@@ -396,11 +400,13 @@ mod tests {
             "mom_llama_speech_precommit_synthesize",
             "mom_llama_voice_generation_backpressure",
             "mom_llama_speech_transcribe_attachment",
+            "mom_llama_speech_parakeet_resident",
             "mom_llama_live_transcription_begin",
             "mom_llama_live_transcription_push",
             "mom_llama_live_transcription_finish",
             "mom_llama_live_transcription_cancel",
             "mom_llama_speech_stop",
+            "mom_llama_speech_stop_and_wait",
         ]);
         let command_source = include_str!("commands.rs");
 
@@ -425,6 +431,10 @@ mod tests {
                 .enumerate()
             {
                 let expected_store_mutation = body.contains("command_value(")
+                    // This command only serializes the result of a read-only
+                    // native residency query; command_value itself is not a
+                    // store mutation.
+                    && spec.name != "mom_llama_speech_parakeet_resident"
                     || body.contains("blocking_command(")
                     || body.contains("picker_blocked(")
                     || body.contains("composer_autocomplete_accept(")
@@ -450,6 +460,16 @@ mod tests {
         assert_eq!(warm.class, super::CommandClass::LongOperation);
         assert!(warm.mutates_store);
         assert!(warm.uses_native);
+    }
+
+    #[test]
+    fn selected_voice_persona_prepare_is_supervised_native_initialization() {
+        let prepare = super::command_spec("mom_llama_voice_persona_prepare");
+        assert_eq!(prepare.admission, super::AdmissionClass::Foreground);
+        assert_eq!(prepare.class, super::CommandClass::LongOperation);
+        assert!(prepare.starts_operation);
+        assert!(prepare.mutates_store);
+        assert!(prepare.uses_native);
     }
 
     #[test]

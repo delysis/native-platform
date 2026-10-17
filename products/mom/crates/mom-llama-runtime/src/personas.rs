@@ -348,6 +348,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
                 recipient_ids: Vec::new(),
                 current_skill_ids: source.current_skill_ids,
                 messages,
+                inference_window: None,
             };
             db.conversations.insert(0, persona.clone());
             reject_removed_conversation_writes_from_documents(db, documents)?;
@@ -1390,6 +1391,7 @@ pub(crate) fn instantiate_from_documents(
         recipient_ids: Vec::new(),
         current_skill_ids: persona.current_skill_ids,
         messages,
+        inference_window: None,
     };
     db.selected_conversation_id = Some(id.to_string());
     db.conversations.insert(0, conversation.clone());
@@ -1779,6 +1781,7 @@ fn reconcile_builtin_personas(
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         };
         let applied_persona_sha256 = builtin_persona_content_sha256(&persona)?;
         replace_builtin_provenance(
@@ -2110,6 +2113,7 @@ mod tests {
                 attribution: None,
                 attachment_ids: Vec::new(),
             }],
+            inference_window: None,
         }
     }
 
@@ -2187,6 +2191,7 @@ mod tests {
             recipient_ids: Vec::new(),
             current_skill_ids: Vec::new(),
             messages: Vec::new(),
+            inference_window: None,
         }
     }
 

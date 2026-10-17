@@ -38,7 +38,10 @@ pub type KvCacheMetadata = PrefixCacheMetadata;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoicePersonaPrefixPreparation {
-    pub metadata: KvCacheMetadata,
+    /// Absent when readiness comes directly from worker-owned KV without a
+    /// serialized snapshot. Such a hit must not invent a stored cache entry.
+    pub metadata: Option<KvCacheMetadata>,
+    pub resident_prefix_tokens: usize,
     pub prefill_us: u64,
     pub verification_us: u64,
     pub persistence_us: u64,
@@ -380,7 +383,8 @@ pub fn kv_cache_save_voice_persona(
         operation,
         "prompt_smoke_verified",
         VoicePersonaPrefixPreparation {
-            metadata: value.metadata.clone(),
+            resident_prefix_tokens: value.sequence.token_count,
+            metadata: Some(value.metadata.clone()),
             prefill_us,
             verification_us,
             persistence_us,
@@ -402,7 +406,7 @@ pub fn kv_cache_prepare_voice_persona_resident(
     persona_id: &str,
 ) -> Result<CommandResult<VoicePersonaPrefixPreparation>> {
     let operation = "mom_llama.kv_cache_prepare_voice_persona_resident";
-    let settings = resolve_settings()?;
+    let mut settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
             operation,
@@ -414,11 +418,14 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ),
         ));
     }
-    let Some(persona) = crate::personas::persona_list()?
-        .result
-        .unwrap_or_default()
-        .into_iter()
+    // A materialized call can have a frozen profile different from its source
+    // persona. Prepare that actual profile, never overwrite it with the source.
+    let conversations = crate::conversation_store::load_db_with_settings(&settings)?;
+    let Some(mut persona) = conversations
+        .conversations
+        .iter()
         .find(|persona| persona.id == persona_id)
+        .cloned()
     else {
         return Ok(CommandResult::blocked(
             operation,
@@ -430,6 +437,26 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ),
         ));
     };
+    if let Some(source) = persona.source_conversation_id.as_ref().and_then(|id| {
+        conversations
+            .conversations
+            .iter()
+            .find(|item| &item.id == id)
+    }) && source.execution_profile.system_message == persona.execution_profile.system_message
+        && source.execution_profile.model_path == persona.execution_profile.model_path
+        && source.execution_profile.mmproj_path == persona.execution_profile.mmproj_path
+        && source.selected_model_path == persona.selected_model_path
+        && source.current_skill_ids == persona.current_skill_ids
+    {
+        // Identical inherited profiles share their prepared persona entry.
+        persona.id = source.id.clone();
+    }
+    crate::chat::apply_conversation_model_pair(
+        &mut settings,
+        persona.execution_profile.model_path.clone(),
+        persona.selected_model_path.clone(),
+        persona.execution_profile.mmproj_path.clone(),
+    );
     let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
@@ -449,6 +476,49 @@ pub fn kv_cache_prepare_voice_persona_resident(
     let tokenized = handle
         .tokenize_messages_with_template(messages.clone(), template.clone())
         .map_err(|error| anyhow!(error))?;
+    // Probe only tokenization: a live conversation can own the whole profile
+    // even when no serialized copy exists in the RAM LRU or on disk.
+    let mut probes = Vec::new();
+    for text in ["alpha", "beta"] {
+        let mut probe = messages.clone();
+        probe.push(ChatMessage {
+            role: ChatRole::User,
+            content: text.to_string(),
+        });
+        probes.push(
+            handle
+                .tokenize_messages_with_template(probe, template.clone())
+                .map_err(|error| anyhow!(error))?,
+        );
+    }
+    let common =
+        llama_native_cache::common_prefix_tokens(&probes[0].token_ids, &probes[1].token_ids);
+    if common > 0
+        && probes.iter().all(|probe| {
+            probe
+                .resident_text_prefix_tokens
+                .max(probe.resident_media_prefix_tokens)
+                >= common
+        })
+    {
+        return Ok(CommandResult::passed(
+            operation,
+            "prompt_smoke_verified",
+            VoicePersonaPrefixPreparation {
+                metadata: None,
+                resident_prefix_tokens: common,
+                prefill_us: 0,
+                verification_us: 0,
+                persistence_us: 0,
+                promotion_us: 0,
+                persisted: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        ));
+    }
     let mut live_value = {
         let mut memory = memory_cache()
             .lock()
@@ -458,6 +528,32 @@ pub fn kv_cache_prepare_voice_persona_resident(
             .best_match_for_owner(&fingerprint, &tokenized.token_ids, &persona.id)
             .and_then(|matched| memory.cache.get(&matched.id, now_ms()))
     };
+    if let Some(value) = live_value.as_ref()
+        && resident_prefix_covers_snapshot(
+            tokenized.resident_text_prefix_tokens,
+            tokenized.resident_media_prefix_tokens,
+            &tokenized.token_ids,
+            &value.sequence.token_ids,
+        )
+    {
+        return Ok(CommandResult::passed(
+            operation,
+            "prompt_smoke_verified",
+            VoicePersonaPrefixPreparation {
+                resident_prefix_tokens: value.sequence.token_count,
+                metadata: Some(value.metadata.clone()),
+                prefill_us: 0,
+                verification_us: 0,
+                persistence_us: 0,
+                promotion_us: 0,
+                persisted: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        ));
+    }
     if live_value.is_none() {
         let store = RuntimeStore::open(&settings.data_dir)?;
         let db = store
@@ -470,17 +566,18 @@ pub fn kv_cache_prepare_voice_persona_resident(
             &persona.id,
         ) && let Some(metadata) = db.entries.iter().find(|entry| entry.id == candidate.id)
         {
-            if tokenized
-                .resident_text_prefix_tokens
-                .max(tokenized.resident_media_prefix_tokens)
-                >= metadata.token_ids.len()
-                && tokenized.token_ids.starts_with(&metadata.token_ids)
-            {
+            if resident_prefix_covers_snapshot(
+                tokenized.resident_text_prefix_tokens,
+                tokenized.resident_media_prefix_tokens,
+                &tokenized.token_ids,
+                &metadata.token_ids,
+            ) {
                 return Ok(CommandResult::passed(
                     operation,
                     "prompt_smoke_verified",
                     VoicePersonaPrefixPreparation {
-                        metadata: metadata.clone(),
+                        resident_prefix_tokens: metadata.token_ids.len(),
+                        metadata: Some(metadata.clone()),
                         prefill_us: 0,
                         verification_us: 0,
                         persistence_us: 0,
@@ -503,7 +600,12 @@ pub fn kv_cache_prepare_voice_persona_resident(
         handle.has_reusable_sequence(&value.sequence)
             && tokenized.token_ids.starts_with(&value.sequence.token_ids)
     }) {
-        if tokenized.resident_text_prefix_tokens < value.sequence.token_count {
+        if !resident_prefix_covers_snapshot(
+            tokenized.resident_text_prefix_tokens,
+            tokenized.resident_media_prefix_tokens,
+            &tokenized.token_ids,
+            &value.sequence.token_ids,
+        ) {
             handle
                 .restore_sequence(value.sequence.clone(), 0)
                 .map_err(|error| anyhow!(error))?;
@@ -512,7 +614,8 @@ pub fn kv_cache_prepare_voice_persona_resident(
             operation,
             "prompt_smoke_verified",
             VoicePersonaPrefixPreparation {
-                metadata: value.metadata,
+                resident_prefix_tokens: value.sequence.token_count,
+                metadata: Some(value.metadata),
                 prefill_us: 0,
                 verification_us: 0,
                 persistence_us: 0,
@@ -584,7 +687,8 @@ pub fn kv_cache_prepare_voice_persona_resident(
         operation,
         "prompt_smoke_verified",
         VoicePersonaPrefixPreparation {
-            metadata: value.metadata.clone(),
+            resident_prefix_tokens: value.sequence.token_count,
+            metadata: Some(value.metadata.clone()),
             prefill_us,
             verification_us,
             persistence_us,
@@ -946,6 +1050,83 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     Ok(Some((value.metadata.id, value.sequence)))
 }
 
+/// Look up a compatible prefix only in the in-process cache. Live voice paths
+/// must not open SQLite or wait for the persona cache lease; persistent cache
+/// discovery and restoration belongs to the pre-call warm path.
+pub(crate) fn compatible_memory_prefix_for_owner_with_settings(
+    handle: &NativeModelHandle,
+    messages: &[ChatMessage],
+    owner_id: &str,
+    settings: &Settings,
+    template: ChatTemplateChoice,
+    resident_prefix_tokens: usize,
+) -> Result<Option<(String, SequenceStateBlob)>> {
+    if messages.is_empty() || !settings.kv_cache_policy.allows_prefix_reuse() {
+        return Ok(None);
+    }
+    let fingerprint = cache_fingerprint(handle)?;
+    let tokenized = handle
+        .tokenize_messages_with_template(messages.to_vec(), template)
+        .map_err(|error| anyhow!(error))?;
+    let Some(value) = memory_cached_prefix(
+        memory_cache(),
+        owner_id,
+        &fingerprint,
+        &tokenized.token_ids,
+        resident_prefix_tokens,
+        now_ms(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((value.metadata.id, value.sequence)))
+}
+
+fn memory_cached_prefix(
+    cache: &Mutex<MemoryCacheState>,
+    owner_id: &str,
+    fingerprint: &CacheFingerprint,
+    prompt_token_ids: &[i32],
+    resident_prefix_tokens: usize,
+    now: u128,
+) -> Option<PrefixCacheValue> {
+    let (selected, generation) = {
+        let state = cache.lock().ok()?;
+        let selected = state
+            .cache
+            .best_match_for_owner(fingerprint, prompt_token_ids, owner_id)?;
+        (selected, state.generation(Some(owner_id)))
+    };
+    // The resident engine prefix is the longest candidate when it already
+    // covers the same token boundary. Returning no blob preserves that state.
+    if resident_prefix_tokens
+        >= selected
+            .matched_tokens
+            .min(prompt_token_ids.len().saturating_sub(1))
+    {
+        return None;
+    }
+    selected_memory_value(
+        cache,
+        &selected,
+        generation,
+        Some(owner_id),
+        fingerprint,
+        prompt_token_ids,
+        now,
+    )
+}
+
+fn resident_prefix_covers_snapshot(
+    resident_text_prefix_tokens: usize,
+    resident_media_prefix_tokens: usize,
+    prompt_token_ids: &[i32],
+    snapshot_token_ids: &[i32],
+) -> bool {
+    !snapshot_token_ids.is_empty()
+        && resident_text_prefix_tokens.max(resident_media_prefix_tokens) >= snapshot_token_ids.len()
+        && prompt_token_ids.starts_with(snapshot_token_ids)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PersonaPrefixUse {
     pub cache_id: String,
@@ -1039,13 +1220,18 @@ fn create_prefix_value(
     template: ChatTemplateChoice,
 ) -> Result<PrefixCacheValue> {
     let settings = resolve_settings()?;
+    let tokenized = handle
+        .tokenize_messages_with_template(stable_messages.to_vec(), template.clone())
+        .map_err(|error| anyhow!(error))?;
     let cached_prefix = compatible_cached_prefix_for_owner_with_settings(
         handle,
         stable_messages,
         owner_id.as_deref(),
         &settings,
         template.clone(),
-        0,
+        tokenized
+            .resident_text_prefix_tokens
+            .max(tokenized.resident_media_prefix_tokens),
     )?
     .map(|(_, state)| state);
     let branches = ["alpha", "beta"]
@@ -1743,7 +1929,7 @@ fn promote_to_memory_if_current(
         .promote_if_current(value, expected))
 }
 
-fn invalidate_memory(cache_id: &str) {
+pub(crate) fn invalidate_memory(cache_id: &str) {
     if let Ok(mut state) = memory_cache().lock() {
         state.global_generation = state.global_generation.saturating_add(1);
         state.cache.invalidate(cache_id);
@@ -2073,6 +2259,81 @@ mod tests {
         assert_eq!(state.invalidate_owner("removed-persona"), 0);
         assert!(!state.promote_if_current(value, captured));
         assert_eq!(state.cache.len(), 0);
+    }
+
+    #[test]
+    fn memory_only_lookup_uses_longest_ram_match_and_never_falls_back() {
+        const OWNER: &str = "voice-memory-only-owner";
+        let cache = Mutex::new(MemoryCacheState::new());
+        let fingerprint = test_cache_value("unused", "fingerprint")
+            .metadata
+            .fingerprint;
+        let make_value = |id: &str, token_ids: Vec<i32>| {
+            let metadata = PrefixCacheMetadata::new(
+                id,
+                CacheTier::MemoryLru,
+                fingerprint.clone(),
+                token_ids.clone(),
+                1,
+                1,
+            )
+            .with_owner(OWNER.to_string());
+            PrefixCacheValue {
+                metadata,
+                sequence: SequenceStateBlob {
+                    sequence_id: 0,
+                    token_count: token_ids.len(),
+                    bytes: vec![1].into(),
+                    token_ids,
+                },
+            }
+        };
+        let short = make_value("short", vec![1, 2]);
+        let long = make_value("long", vec![1, 2, 3]);
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(Some(OWNER));
+            assert!(state.promote_if_current(short, generation));
+            assert!(state.promote_if_current(long, generation));
+        }
+
+        let prompt = [1, 2, 3, 4];
+        let selected = memory_cached_prefix(&cache, OWNER, &fingerprint, &prompt, 0, 10)
+            .expect("the longest compatible RAM prefix should be selected");
+        assert_eq!(selected.metadata.id, "long");
+        assert!(
+            memory_cached_prefix(&cache, OWNER, &fingerprint, &prompt, 3, 11).is_none(),
+            "a longer engine-resident prefix must remain selected"
+        );
+        assert!(
+            memory_cached_prefix(&cache, "other-owner", &fingerprint, &prompt, 0, 12).is_none(),
+            "a prefix owned by another persona must not be reused"
+        );
+
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            state.invalidate_owner(OWNER);
+        }
+        assert!(
+            memory_cached_prefix(&cache, OWNER, &fingerprint, &prompt, 0, 13).is_none(),
+            "owner invalidation must remove RAM matches before any disk lookup"
+        );
+        let empty = Mutex::new(MemoryCacheState::new());
+        assert!(
+            memory_cached_prefix(&empty, OWNER, &fingerprint, &prompt, 0, 14).is_none(),
+            "a memory-only miss returns no candidate; it has no persistent fallback"
+        );
+    }
+
+    #[test]
+    fn resident_text_or_media_prefix_avoids_snapshot_restore_only_for_exact_tokens() {
+        let prompt = [1, 2, 3, 4];
+        let snapshot = [1, 2, 3];
+        assert!(resident_prefix_covers_snapshot(3, 0, &prompt, &snapshot));
+        assert!(resident_prefix_covers_snapshot(0, 3, &prompt, &snapshot));
+        assert!(!resident_prefix_covers_snapshot(2, 2, &prompt, &snapshot));
+        assert!(!resident_prefix_covers_snapshot(3, 0, &prompt, &[1, 2, 9]));
+        assert!(!resident_prefix_covers_snapshot(4, 0, &prompt, &[]));
     }
 
     #[test]

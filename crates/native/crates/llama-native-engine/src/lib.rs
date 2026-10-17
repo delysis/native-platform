@@ -2342,6 +2342,11 @@ enum WorkerCommand {
         input: GenerationInput,
         response: Sender<NativeResult<Vec<PreparedPrompt>>>,
     },
+    MeasurePrompt {
+        input: GenerationInput,
+        media: Vec<MediaInput>,
+        response: Sender<NativeResult<usize>>,
+    },
 }
 
 #[derive(Debug)]
@@ -3058,6 +3063,33 @@ impl NativeModelHandle {
             )
         })?
     }
+
+    /// Count the exact rendered prompt, including projected media positions,
+    /// without evaluating tokens or changing any resident KV/checkpoint state.
+    /// Future microphone samples and completion tokens need a separate budget.
+    pub fn measure_prompt_tokens(
+        &self,
+        input: GenerationInput,
+        media: Vec<MediaInput>,
+    ) -> NativeResult<usize> {
+        self.inner.ensure_accepting()?;
+        validate_multimodal_input(&input, media.len())?;
+        let (response_tx, response_rx) = bounded(1);
+        self.inner.send_command(
+            WorkerCommand::MeasurePrompt {
+                input,
+                media,
+                response: response_tx,
+            },
+            "submitting prompt measurement",
+        )?;
+        response_rx.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native model worker stopped during prompt measurement: {error}"),
+            )
+        })?
+    }
 }
 
 impl ModelArtifactGuard {
@@ -3717,6 +3749,7 @@ fn run_worker(
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
+                | WorkerCommand::MeasurePrompt { .. }
         ) {
             invalidate_resident_audio_checkpoint(&mut context, &mut resident_audio_checkpoint);
         }
@@ -3730,10 +3763,12 @@ fn run_worker(
             WorkerCommand::GenerateIncrementalAudio { .. }
                 | WorkerCommand::GenerateMultimodal { .. }
                 | WorkerCommand::GenerateBatch { .. }
+                | WorkerCommand::PrefillPrefix { .. }
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
+                | WorkerCommand::MeasurePrompt { .. }
         ) {
             invalidate_resident_audio_text_prefix(&mut context, &mut resident_audio_text_prefix);
         }
@@ -4538,15 +4573,47 @@ fn run_worker(
                 let _ = response.send(result);
             }
             WorkerCommand::PrefillPrefix { request, response } => {
-                resident_text_prefix.invalidate();
-                let result = prefill_shared_prefix(
+                // The prefill owns the context after admission. Transfer the
+                // old authorities so an error cannot leave stale reuse claims.
+                let text = std::mem::take(&mut resident_text_prefix.token_ids);
+                let media = resident_audio_text_prefix.take();
+                let mut result = prefill_shared_prefix(
                     &model,
                     &fingerprint,
                     &mut context,
                     &request,
                     &mut sequence_token_counts,
                     &mut sequence_token_ids,
+                    (&text, media.as_ref()),
                 );
+                if result.is_ok() {
+                    resident_text_prefix.commit(
+                        &resident_prefix_binding,
+                        sequence_token_counts.get(&0).copied(),
+                        sequence_token_ids.get(&0),
+                    );
+                    if worker_identity.kv_unified
+                        && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+                        && multimodal.as_ref().is_some_and(|projector| {
+                            media_kinds_for_context(projector).contains(&MediaKind::Audio)
+                        })
+                        && let Err(error) = retain_incremental_audio_text_prefix(
+                            &mut context,
+                            0,
+                            &resident_text_prefix.token_ids,
+                            &mut resident_audio_text_prefix,
+                        )
+                    {
+                        result = Err(error);
+                    }
+                }
+                if result.is_err() {
+                    context.clear_kv_cache();
+                    sequence_token_counts.clear();
+                    sequence_token_ids.clear();
+                    resident_text_prefix.invalidate();
+                    resident_audio_text_prefix = None;
+                }
                 let _ = response.send(result);
             }
             WorkerCommand::Tokenize {
@@ -4573,6 +4640,18 @@ fn run_worker(
             }
             WorkerCommand::PrepareInput { input, response } => {
                 let _ = response.send(prepare_input(&model, input));
+            }
+            WorkerCommand::MeasurePrompt {
+                input,
+                media,
+                response,
+            } => {
+                let _ = response.send(measure_prompt_tokens(
+                    &model,
+                    multimodal.as_ref(),
+                    input,
+                    &media,
+                ));
             }
         }
     }
@@ -4763,6 +4842,9 @@ fn reject_queued_command(command: WorkerCommand) {
             let _ = response.send(Err(cancelled()));
         }
         WorkerCommand::PrepareInput { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::MeasurePrompt { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
     }
@@ -7179,6 +7261,9 @@ fn validate_saved_sequence(
     state_buffer::validate_binding(state, fingerprint)
 }
 
+#[cfg(test)]
+static PREFIX_PREFILL_REUSED_TOKENS: AtomicUsize = AtomicUsize::new(0);
+
 fn prefill_shared_prefix(
     model: &LlamaModel,
     fingerprint: &ModelFingerprint,
@@ -7186,6 +7271,7 @@ fn prefill_shared_prefix(
     request: &SharedPrefixBatchRequest,
     sequence_token_counts: &mut HashMap<i32, usize>,
     sequence_token_ids: &mut HashMap<i32, Vec<i32>>,
+    resident: (&[i32], Option<&ResidentAudioTextPrefix>),
 ) -> NativeResult<SequenceStateBlob> {
     sequence_token_counts.clear();
     sequence_token_ids.clear();
@@ -7209,17 +7295,86 @@ fn prefill_shared_prefix(
             "the common messages produced no reusable rendered prompt prefix",
         ));
     }
-    let matched = request
+    if tokens.len() > context.n_ctx() as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            "the common cache prefix exceeds the native context",
+        ));
+    }
+    let shared = |cached: &[i32]| {
+        cached
+            .iter()
+            .zip(&tokens)
+            .take_while(|(a, b)| **a == b.0)
+            .count()
+    };
+    let text_match = shared(resident.0);
+    let media_match = resident.1.map_or(0, |prefix| shared(&prefix.token_ids));
+    let (source, resident_match) = if media_match > text_match {
+        (
+            resident.1.map_or(0, |prefix| prefix.sequence_id),
+            media_match,
+        )
+    } else {
+        (0, text_match)
+    };
+    let supplied_match = request
         .cached_prefix
         .as_ref()
         .map_or(0, |state| reusable_saved_tokens(state, &tokens));
-    if let Some(state) = request.cached_prefix.as_ref().filter(|_| matched > 0) {
-        validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+    let mut matched = 0;
+    if resident_prefix_wins(resident_match, supplied_match) {
+        clear_audio_working_sequences(context, fingerprint.max_sequences, Some(source))?;
+        let trimmed = context
+            .clear_kv_cache_seq(Some(source as u32), Some(resident_match as u32), None)
+            .map_err(|error| {
+                native_decode_error("failed to trim cache preparation prefix", error)
+            })?;
+        if trimmed {
+            if source != 0 {
+                context
+                    .copy_kv_cache_seq(source, 0, Some(0), Some(resident_match as u32))
+                    .map_err(|error| {
+                        native_decode_error("failed to reuse cache preparation prefix", error)
+                    })?;
+                context
+                    .clear_kv_cache_seq(Some(source as u32), None, None)
+                    .map_err(|error| {
+                        native_decode_error("failed to release cache preparation lane", error)
+                    })?;
+            }
+            matched = resident_match;
+        } else {
+            context.clear_kv_cache();
+        }
+    } else {
+        if let Some(state) = request
+            .cached_prefix
+            .as_ref()
+            .filter(|_| supplied_match > 0)
+        {
+            validate_saved_sequence(state, 0, model.n_vocab(), fingerprint)?;
+        }
+        context.clear_kv_cache();
+        if let Some(state) = request
+            .cached_prefix
+            .as_ref()
+            .filter(|_| supplied_match > 0)
+        {
+            restore_saved_prefix(
+                model,
+                context,
+                fingerprint,
+                state,
+                0,
+                supplied_match,
+                || false,
+            )?;
+            matched = supplied_match;
+        }
     }
-    context.clear_kv_cache();
-    if let Some(state) = request.cached_prefix.as_ref().filter(|_| matched > 0) {
-        restore_saved_prefix(model, context, fingerprint, state, 0, matched, || false)?;
-    }
+    #[cfg(test)]
+    PREFIX_PREFILL_REUSED_TOKENS.store(matched, Ordering::SeqCst);
     decode_tokens_chunked_cancellable(
         context,
         &tokens[matched..],
@@ -7329,7 +7484,7 @@ fn prefill_multimodal_cached(
             }
         })
         .collect::<Vec<_>>();
-    let resident_tokens = if cache_supported {
+    let mut resident_tokens = if cache_supported {
         resident.as_ref().map_or(0, |prefix| {
             common_multimodal_prefix(&prefix.cells, &cells, final_logits)
         })
@@ -7359,13 +7514,11 @@ fn prefill_multimodal_cached(
         ));
     }
     let (mut position, kind, reused) = if let Some(state) = supplied {
-        // Restoring a sequence does not require clearing unrelated retained
-        // lanes. Those remain a valid fallback until this prefix is complete.
-        clear_audio_working_sequences(
-            context,
-            fingerprint.max_sequences,
-            resident.as_ref().map(|p| p.sequence_id),
-        )?;
+        // Import allocates the full saved sequence before cropping it. Keeping
+        // an obsolete resident lane alongside it can exhaust the unified KV
+        // pool even though either prompt fits alone.
+        resident.take();
+        clear_audio_working_sequences(context, fingerprint.max_sequences, None)?;
         let kind = restore_saved_prefix(
             model,
             context,
@@ -7382,6 +7535,30 @@ fn prefill_multimodal_cached(
             fingerprint.max_sequences,
             resident.as_ref().map(|p| p.sequence_id),
         )?;
+        if let Some(prefix) = resident.as_mut() {
+            // Only the shared prefix remains useful. Release the divergent
+            // tail before allocating any new prompt cells, and keep metadata
+            // accurate if the following prefill is cancelled.
+            let trimmed = context
+                .clear_kv_cache_seq(
+                    Some(prefix.sequence_id as u32),
+                    Some(resident_tokens as u32),
+                    None,
+                )
+                .map_err(|e| native_decode_error("failed to trim media prefix", e))?;
+            if trimmed && resident_tokens > 0 {
+                prefix.cells.truncate(resident_tokens);
+                prefix.token_ids.truncate(resident_tokens);
+            } else {
+                // Architectures without partial removal cannot promise a
+                // rewindable prefix. Drop that lane and evaluate from zero.
+                context
+                    .clear_kv_cache_seq(Some(prefix.sequence_id as u32), None, None)
+                    .map_err(|e| native_decode_error("failed to release media prefix", e))?;
+                resident.take();
+                resident_tokens = 0;
+            }
+        }
         if resident_tokens > 0 {
             context
                 .copy_kv_cache_seq(
@@ -8980,6 +9157,44 @@ fn media_bitmap(
 struct RenderedMultimodalPrompt {
     text: String,
     add_special: bool,
+}
+
+fn measure_prompt_tokens(
+    model: &LlamaModel,
+    multimodal: Option<&MtmdContext>,
+    input: GenerationInput,
+    media: &[MediaInput],
+) -> NativeResult<usize> {
+    if media.is_empty() {
+        return Ok(prepare_input(model, input)?
+            .iter()
+            .map(|prompt| prompt.token_ids.len())
+            .sum());
+    }
+    let multimodal = multimodal.ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "measuring a media prompt requires a loaded projector",
+        )
+    })?;
+    let rendered = render_multimodal_case_prompt(model, media, &input)?;
+    let supported = media_kinds_for_context(multimodal);
+    let bitmaps = media
+        .iter()
+        .map(|item| media_bitmap(multimodal, &supported, item))
+        .collect::<NativeResult<Vec<_>>>()?;
+    let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
+    let chunks = multimodal
+        .tokenize(
+            MtmdInputText {
+                text: rendered.text,
+                add_special: rendered.add_special,
+                parse_special: true,
+            },
+            &bitmap_refs,
+        )
+        .map_err(|error| native_decode_error("failed to measure media prompt", error))?;
+    Ok(chunks.total_tokens())
 }
 
 fn render_multimodal_prompt(
@@ -14649,7 +14864,7 @@ mod tests {
         config.max_sequences = 2;
         let owner = NativeModelOwner::load(config.clone())?;
         let handle = owner.handle();
-        let prefix = handle.prefill_shared_prefix(SharedPrefixBatchRequest {
+        let preparation = SharedPrefixBatchRequest {
             request_id: "saved-prefix-source".into(),
             model_id: config.model_id.clone(),
             common_messages: vec![ChatMessage {
@@ -14671,7 +14886,19 @@ mod tests {
                 .collect(),
             chat_template: ChatTemplateChoice::ModelDefault,
             cached_prefix: None,
-        })?;
+        };
+        let prefix = handle.prefill_shared_prefix(preparation.clone())?;
+        let repeated = handle.prefill_shared_prefix(preparation)?;
+        assert_eq!(repeated.token_ids, prefix.token_ids);
+        assert_eq!(
+            PREFIX_PREFILL_REUSED_TOKENS.load(Ordering::SeqCst),
+            prefix.token_count,
+            "preparing an already resident prefix must not evaluate it again"
+        );
+        eprintln!(
+            "resident preparation reused {} tokens without a supplied snapshot",
+            prefix.token_count
+        );
         assert_eq!(
             handle.restore_sequence(prefix.clone(), 0)?,
             SequenceRestoreKind::NativeState
@@ -15205,6 +15432,56 @@ mod tests {
             max_tokens: 12,
             ..SamplingConfig::default()
         };
+        // Cache-only preparation must seed the microphone route even when
+        // the serialized snapshot is not retained by the runtime's RAM LRU.
+        let prepared = handle.prefill_shared_prefix(SharedPrefixBatchRequest {
+            request_id: "native-prepare-to-audio".into(),
+            model_id: model_id.clone(),
+            common_messages: vec![prior_user.clone()],
+            branches: vec![BranchRequest {
+                branch_id: "prepare".into(),
+                label: "Prepare".into(),
+                instruction: String::new(),
+                sampling: sampling.clone(),
+                messages: Vec::new(),
+                cached_prefix: None,
+            }],
+            chat_template: ChatTemplateChoice::PreferNonThinking,
+            cached_prefix: None,
+        })?;
+        let prepared_audio = handle.generate_incremental_audio(GenerationRequest {
+            request_id: "native-prepared-first-audio".into(),
+            model_id: model_id.clone(),
+            input: GenerationInput::Chat {
+                messages: vec![
+                    prior_user.clone(),
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: "Listen to the caller.".into(),
+                    },
+                ],
+                template: ChatTemplateChoice::PreferNonThinking,
+            },
+            sampling: sampling.clone(),
+            media: Vec::new(),
+            cached_prefix: None,
+        })?;
+        prepared_audio.wait_for_resume()?;
+        let monitor = prepared_audio.monitor();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while monitor.stats().prefix_finish_ms.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let prepared_stats = monitor.stats();
+        prepared_audio.cancel();
+        assert!(
+            prepared_stats.restored_prefix_tokens > 100,
+            "worker-only preparation must reach the microphone: {prepared_stats:?}"
+        );
+        eprintln!(
+            "prepared-to-audio reused {}/{} tokens without a supplied snapshot",
+            prepared_stats.restored_prefix_tokens, prepared.token_count
+        );
         let greeting = require_ready(
             handle
                 .generate(GenerationRequest {
@@ -15276,7 +15553,8 @@ mod tests {
         let wav = one_second_tone_wav();
         let prior_user = ChatMessage {
             role: ChatRole::User,
-            content: "Answer briefly after listening to the caller.".to_string(),
+            content: "The caller needs calm, practical advice about organizing a small garden. "
+                .repeat(140),
         };
         let greeting = require_ready(
             handle
@@ -15363,6 +15641,16 @@ mod tests {
                 .wait_timeout(Duration::from_mins(2))?,
         )?;
         assert_eq!(baseline.len(), 1);
+        assert!(
+            baseline[0].metrics.prompt_tokens > 4096 / 2,
+            "initial audio prompt must exceed half the context: {:?}",
+            baseline[0].metrics
+        );
+        assert!(
+            baseline[0].metrics.prompt_tokens + request.sampling.max_tokens as usize <= 4096,
+            "initial audio prompt and completion must fit context: {:?}",
+            baseline[0].metrics
+        );
 
         let mut cancel_to_terminal_ms = Vec::with_capacity(20);
         let mut resumed_prefix_count = 0usize;
@@ -15463,6 +15751,20 @@ mod tests {
                 "cancel-to-terminal should stay below one second without contention: {cancel_elapsed:?}"
             );
             cancel_to_terminal_ms.push(cancel_elapsed.as_secs_f64() * 1_000.0);
+
+            if attempt == 0 {
+                // The context planner may measure this exact historical
+                // multimodal prompt between a cancelled speculative decode
+                // and its resume. Measurement must not mutate the resident
+                // audio checkpoint or consume its projected PCM offset.
+                let static_prompt_tokens =
+                    handle.measure_prompt_tokens(request.input.clone(), request.media.clone())?;
+                assert!(static_prompt_tokens > 4096 / 2);
+                assert!(static_prompt_tokens + request.sampling.max_tokens as usize <= 4096);
+                println!(
+                    "real audio preflight: static_multimodal_prompt_tokens={static_prompt_tokens} context_tokens=4096 measurement_after_cancel=true"
+                );
+            }
         }
         cancel_to_terminal_ms.sort_by(f64::total_cmp);
         let p50 = cancel_to_terminal_ms[(cancel_to_terminal_ms.len() - 1) * 50 / 100];
@@ -15477,7 +15779,7 @@ mod tests {
             19
         );
 
-        let mut final_request = request;
+        let mut final_request = request.clone();
         final_request.request_id = "native-audio-with-history-resumed-final".to_string();
         let audio = handle.generate_incremental_audio_resumable(
             final_request,
@@ -15495,6 +15797,45 @@ mod tests {
             baseline[0].generated_token_ids
         );
         assert_eq!(output[0].text, baseline[0].text);
+
+        let mut switched_request = request;
+        switched_request.request_id = "native-audio-with-history-long-prompt-switch".to_string();
+        if let GenerationInput::Chat { messages, .. } = &mut switched_request.input {
+            messages[0].content =
+                "The caller needs calm, practical advice about planning a quiet weekend. "
+                    .repeat(140);
+        } else {
+            unreachable!("the sustained audio history request uses chat input");
+        }
+        let switched_audio = handle.generate_incremental_audio(switched_request)?;
+        let switched_resume = switched_audio.wait_for_resume()?;
+        assert_eq!(switched_resume.sample_offset, 0);
+        for chunk in samples.chunks(160) {
+            switched_audio.push_pcm(chunk)?;
+        }
+        let switched = require_ready(
+            switched_audio
+                .finish()?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(switched.len(), 1);
+        assert!(!switched[0].text.trim().is_empty());
+        assert!(
+            switched[0].metrics.prompt_tokens > 4096 / 2,
+            "switched audio prompt must exceed half the context: {:?}",
+            switched[0].metrics
+        );
+        assert!(
+            switched[0].metrics.prompt_tokens + 96 <= 4096,
+            "switched audio prompt and completion must fit context: {:?}",
+            switched[0].metrics
+        );
+        println!(
+            "real audio capacity switch: initial_prompt_tokens={} switched_prompt_tokens={} context_tokens=4096 switched_shared_prefix_tokens={}",
+            baseline[0].metrics.prompt_tokens,
+            switched[0].metrics.prompt_tokens,
+            switched[0].metrics.shared_prefix_tokens
+        );
         Ok(())
     }
 

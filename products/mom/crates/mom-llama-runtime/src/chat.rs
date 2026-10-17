@@ -1,7 +1,6 @@
 use crate::attachments::{
     ChatAttachmentContext, commit_generated_exchange, prepare_call_greeting_history,
-    prepare_chat_attachments, prepare_live_audio_commit, prepare_live_audio_history,
-    prepare_voice_reply_attachments,
+    prepare_chat_attachments, prepare_live_audio_commit, prepare_voice_reply_attachments,
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
@@ -9,7 +8,9 @@ use crate::conversation_store::{
     load_db_with_settings, strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
-    compatible_cached_prefix_for_owner_with_settings, invalidate_cache, persist_session_checkpoint,
+    compatible_cached_prefix_for_owner_with_settings,
+    compatible_memory_prefix_for_owner_with_settings, invalidate_cache, invalidate_memory,
+    persist_session_checkpoint,
 };
 use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
@@ -409,6 +410,8 @@ pub struct VoiceAudioMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VoiceAudioBeginMetrics {
+    pub measured_prompt_tokens: usize,
+    pub omitted_history_messages: usize,
     pub total_us: u64,
     /// Context cells allocated by the exact resident used for this turn.
     /// This is reported from the live fingerprint rather than a persisted
@@ -657,7 +660,7 @@ pub fn voice_audio_begin_in_scope(
         .find(|conversation| conversation.id == conversation_id)
         .cloned();
     let existing_conversation_fast_path = existing.is_some();
-    let (db, conversation) = match existing {
+    let (db, mut conversation) = match existing {
         Some(conversation) => (loaded, conversation),
         None => get_or_create_conversation(conversation_id)?,
     };
@@ -676,20 +679,6 @@ pub fn voice_audio_begin_in_scope(
     let attachment_free_fast_path = active_messages
         .iter()
         .all(|message| message.attachment_ids.is_empty());
-    let stage_started = Instant::now();
-    let history = if attachment_free_fast_path {
-        ChatAttachmentContext {
-            staged_ids: Vec::new(),
-            draft_snapshot: None,
-            text_by_message_id: std::collections::HashMap::new(),
-            current_text: String::new(),
-            media: Vec::new(),
-        }
-    } else {
-        prepare_live_audio_history(conversation_id, &active_messages)?
-            .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?
-    };
-    let attachments_us = elapsed_us(stage_started);
     let skill_free_fast_path = conversation.current_skill_ids.is_empty();
     let stage_started = Instant::now();
     let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
@@ -701,15 +690,6 @@ pub fn voice_audio_begin_in_scope(
         .clone()
         .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
     let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
-    let messages = build_native_messages(
-        &system_message,
-        &skill_prompt.prompt,
-        &active_messages,
-        message,
-        upstream_setting_bool(&settings, "excludeReasoningFromContext"),
-        &history.text_by_message_id,
-        "",
-    );
     let prompt_us = elapsed_us(stage_started);
     let model_path = settings.model_path.clone().unwrap_or_default();
     let stage_started = Instant::now();
@@ -729,6 +709,26 @@ pub fn voice_audio_begin_in_scope(
             fingerprint.context_tokens
         });
     let stage_started = Instant::now();
+    let projection = crate::voice_context::fit_voice_context(
+        &handle,
+        &mut conversation,
+        &active_messages,
+        crate::voice_context::VoicePrompt {
+            settings: &settings,
+            system: &system_message,
+            skill: &skill_prompt.prompt,
+            current: message,
+            template: ChatTemplateChoice::PreferNonThinking,
+            completion_tokens: 96,
+            mode: crate::voice_context::VoiceHistoryMode::Live,
+        },
+    )?;
+    let attachments_us = elapsed_us(stage_started);
+    let measured_prompt_tokens = projection.prompt_tokens;
+    let omitted_history_messages = projection.omitted_history_messages;
+    let messages = projection.messages;
+    let history = projection.attachments;
+    let stage_started = Instant::now();
     // Historical audio is evaluated after the leading text prefix. Its
     // presence must not prevent reuse of the exact persona/conversation KV
     // shared by both the cached request and this live microphone turn.
@@ -739,20 +739,18 @@ pub fn voice_audio_begin_in_scope(
         skill_prompt.cache_owner_id.is_some(),
         skill_prompt.cache_owner_id.as_deref(),
     );
-    let cached_prefix = longest_cached_prefix_for_owners(
+    let (cached_prefix, resident_or_cached_prefix_tokens) = longest_cached_prefix_for_owners(
         &handle,
         &messages,
         &owner_ids,
         &settings,
         true,
-        true,
+        PrefixLookupMode::LiveVoice,
         ChatTemplateChoice::PreferNonThinking,
     )?;
     let cache_lookup_us = elapsed_us(stage_started);
-    let cached_prefix_tokens = cached_prefix
-        .as_ref()
-        .map_or(0, |(_, sequence)| sequence.token_count);
-    let cached_prefix_found = cached_prefix.is_some();
+    let cached_prefix_tokens = resident_or_cached_prefix_tokens;
+    let cached_prefix_found = cached_prefix_tokens > 0;
     let cache_id = cached_prefix.as_ref().map(|(id, _)| id.clone());
     let cached_prefix = cached_prefix.map(|(_, sequence)| sequence);
     let stage_started = Instant::now();
@@ -783,6 +781,8 @@ pub fn voice_audio_begin_in_scope(
     };
     let preparation_source_us = elapsed_us(total_started);
     let preparation_metrics = VoiceAudioBeginMetrics {
+        measured_prompt_tokens,
+        omitted_history_messages,
         total_us: 0,
         resident_context_tokens,
         settings_cache_hit,
@@ -1246,16 +1246,73 @@ where
     let voice_reply = regenerate_user_id.is_none()
         && (input.message.starts_with("[Voice note]") || input.message.starts_with("[Phone call]"));
     let call_greeting = input.message.starts_with("[Phone call] [Greeting]");
-    let prepared_attachments = if call_greeting {
-        prepare_call_greeting_history(&input.conversation_id, &active_messages)?
-    } else if voice_reply {
-        prepare_voice_reply_attachments(&input.conversation_id, &active_messages)?
+    let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
+    let system_message = conversation
+        .execution_profile
+        .system_message
+        .clone()
+        .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
+    let model_path = settings.model_path.clone().unwrap_or_default();
+    let request_id = Uuid::new_v4().to_string();
+    let operation = scope.register_chat(&request_id, &conversation.id)?;
+    let voice_handle = if voice_reply && !options.fake_fixture {
+        match resident_model_for_profile(
+            scope,
+            &settings,
+            &model_path,
+            settings.mmproj_path.as_deref(),
+        ) {
+            Ok(handle) => Some(handle),
+            Err(blocked) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.chat_send",
+                    &blocked.readiness,
+                    blocked.blocker,
+                ));
+            }
+        }
     } else {
-        prepare_chat_attachments(
-            &input.conversation_id,
+        None
+    };
+    let voice_projection = if let Some(handle) = &voice_handle {
+        Some(crate::voice_context::fit_voice_context(
+            handle,
+            &mut conversation,
             &active_messages,
-            regenerate_user_id.as_deref(),
-        )?
+            crate::voice_context::VoicePrompt {
+                settings: &settings,
+                system: &system_message,
+                skill: &skill_prompt.prompt,
+                current: &input.message,
+                template: ChatTemplateChoice::PreferNonThinking,
+                completion_tokens: 96,
+                mode: if call_greeting {
+                    crate::voice_context::VoiceHistoryMode::Greeting
+                } else {
+                    crate::voice_context::VoiceHistoryMode::Recorded
+                },
+            },
+        )?)
+    } else {
+        None
+    };
+    let (prepared_attachments, voice_messages) = if let Some(projection) = voice_projection {
+        (Ok(projection.attachments), Some(projection.messages))
+    } else {
+        (
+            if call_greeting {
+                prepare_call_greeting_history(&input.conversation_id, &active_messages)?
+            } else if voice_reply {
+                prepare_voice_reply_attachments(&input.conversation_id, &active_messages)?
+            } else {
+                prepare_chat_attachments(
+                    &input.conversation_id,
+                    &active_messages,
+                    regenerate_user_id.as_deref(),
+                )?
+            },
+            None,
+        )
     };
     let attachment_context = match prepared_attachments {
         Ok(context) => context,
@@ -1322,12 +1379,6 @@ where
             ),
         ));
     }
-    let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
-    let system_message = conversation
-        .execution_profile
-        .system_message
-        .clone()
-        .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
     let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
     let exclude_reasoning_from_context =
         upstream_setting_bool(&settings, "excludeReasoningFromContext");
@@ -1350,17 +1401,17 @@ where
     } else {
         active_messages.as_slice()
     };
-    let messages = build_native_messages(
-        &system_message,
-        &skill_prompt.prompt,
-        context_messages,
-        &input.message,
-        exclude_reasoning_from_context,
-        &attachment_context.text_by_message_id,
-        &attachment_context.current_text,
-    );
-    let request_id = Uuid::new_v4().to_string();
-    let operation = scope.register_chat(&request_id, &conversation.id)?;
+    let messages = voice_messages.unwrap_or_else(|| {
+        build_native_messages(
+            &system_message,
+            &skill_prompt.prompt,
+            context_messages,
+            &input.message,
+            exclude_reasoning_from_context,
+            &attachment_context.text_by_message_id,
+            &attachment_context.current_text,
+        )
+    });
     let mut stream = ChatStreamLifecycle::new(
         &request_id,
         &conversation.id,
@@ -1387,7 +1438,6 @@ where
         return stream.finish_cancelled();
     }
     let started = Instant::now();
-    let model_path = settings.model_path.clone().unwrap_or_default();
     let phone_call = input.message.starts_with("[Phone call]");
     let voice_note = input.message.starts_with("[Voice note]");
     let (
@@ -1418,20 +1468,23 @@ where
         if stream.cancellation_requested() {
             return stream.finish_cancelled();
         }
-        let handle = match resident_model_for_profile(
-            scope,
-            &settings,
-            &model_path,
-            settings.mmproj_path.as_deref(),
-        ) {
-            Ok(handle) => handle,
-            Err(blocked) => {
-                return Ok(CommandResult::blocked(
-                    "mom_llama.chat_send",
-                    &blocked.readiness,
-                    blocked.blocker,
-                ));
-            }
+        let handle = match voice_handle {
+            Some(handle) => handle,
+            None => match resident_model_for_profile(
+                scope,
+                &settings,
+                &model_path,
+                settings.mmproj_path.as_deref(),
+            ) {
+                Ok(handle) => handle,
+                Err(blocked) => {
+                    return Ok(CommandResult::blocked(
+                        "mom_llama.chat_send",
+                        &blocked.readiness,
+                        blocked.blocker,
+                    ));
+                }
+            },
         };
         let status = handle.status();
         if stream.cancellation_requested() {
@@ -1462,10 +1515,15 @@ where
                 &messages,
                 &owner_ids,
                 &settings,
-                false,
                 !media.is_empty(),
+                if phone_call {
+                    PrefixLookupMode::LiveVoice
+                } else {
+                    PrefixLookupMode::Persistent
+                },
                 request_template.clone(),
             )?
+            .0
         };
         let mut sampling =
             settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
@@ -1511,7 +1569,11 @@ where
                     && attempted_cache_id.is_some() =>
             {
                 if let Some(cache_id) = attempted_cache_id.as_deref() {
-                    invalidate_cache(cache_id)?;
+                    if phone_call {
+                        invalidate_memory(cache_id);
+                    } else {
+                        invalidate_cache(cache_id)?;
+                    }
                 }
                 let Some(retry) =
                     stream.with_native_admission(|| handle.generate(build_request(None)))?
@@ -1548,7 +1610,10 @@ where
         if output.state == GenerationState::Cancelled {
             return stream.finish_cancelled();
         }
-        if media.is_empty() && settings.kv_cache_policy.persists_conversation_checkpoints() {
+        if !phone_call
+            && media.is_empty()
+            && settings.kv_cache_policy.persists_conversation_checkpoints()
+        {
             let _ = persist_session_checkpoint(&conversation.id, &handle)?;
         }
         let parsed = parse_reasoning_output(&output.text, parse_reasoning);
@@ -1693,7 +1758,7 @@ where
     ))
 }
 
-fn apply_conversation_model_pair(
+pub(crate) fn apply_conversation_model_pair(
     settings: &mut crate::Settings,
     profile_model: Option<PathBuf>,
     legacy_selected_model: Option<PathBuf>,
@@ -2176,36 +2241,54 @@ fn configure_voice_sampling(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixLookupMode {
+    Persistent,
+    LiveVoice,
+}
+
 fn longest_cached_prefix_for_owners(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
     owner_ids: &[&str],
     settings: &crate::config::Settings,
-    require_live_receipt: bool,
     multimodal: bool,
+    mode: PrefixLookupMode,
     template: ChatTemplateChoice,
-) -> Result<Option<(String, SequenceStateBlob)>> {
+) -> Result<(Option<(String, SequenceStateBlob)>, usize)> {
     let prompt = handle
         .tokenize_messages_with_template(messages.to_vec(), template.clone())
         .map_err(|error| anyhow::anyhow!(error))?;
+    let resident_prefix_tokens = if multimodal {
+        prompt.resident_media_prefix_tokens
+    } else {
+        prompt.resident_text_prefix_tokens
+    };
     let mut longest: Option<(String, SequenceStateBlob)> = None;
-    let mut longest_match = 0;
+    let mut longest_match = resident_prefix_tokens;
     for owner_id in owner_ids {
-        let candidate = compatible_cached_prefix_for_owner_with_settings(
-            handle,
-            messages,
-            Some(owner_id),
-            settings,
-            template.clone(),
-            if multimodal {
-                prompt.resident_media_prefix_tokens
-            } else {
-                prompt.resident_text_prefix_tokens
-            },
-        )?;
-        if let Some(candidate) = candidate
-            .filter(|(_, sequence)| !require_live_receipt || handle.has_reusable_sequence(sequence))
-        {
+        let candidate = if mode == PrefixLookupMode::LiveVoice {
+            compatible_memory_prefix_for_owner_with_settings(
+                handle,
+                messages,
+                owner_id,
+                settings,
+                template.clone(),
+                resident_prefix_tokens,
+            )?
+        } else {
+            compatible_cached_prefix_for_owner_with_settings(
+                handle,
+                messages,
+                Some(owner_id),
+                settings,
+                template.clone(),
+                resident_prefix_tokens,
+            )?
+        };
+        if let Some(candidate) = candidate.filter(|(_, sequence)| {
+            mode == PrefixLookupMode::Persistent || handle.has_reusable_sequence(sequence)
+        }) {
             let matched =
                 llama_native_cache::common_prefix_tokens(&candidate.1.token_ids, &prompt.token_ids);
             if matched > longest_match {
@@ -2214,7 +2297,7 @@ fn longest_cached_prefix_for_owners(
             }
         }
     }
-    Ok(longest)
+    Ok((longest, longest_match))
 }
 
 #[cfg(test)]
