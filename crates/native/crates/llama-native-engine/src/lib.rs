@@ -11620,7 +11620,9 @@ mod tests {
             INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES
         );
         assert_eq!(
-            ring.push(&[0.0]).unwrap_err().code,
+            ring.push(&[0.0])
+                .expect_err("capacity bound must reject the next sample")
+                .code,
             NativeErrorCode::PromptTooLarge
         );
         let wav = ring
@@ -11639,7 +11641,10 @@ mod tests {
             .push(&vec![0.0; INCREMENTAL_AUDIO_RING_SAMPLES])
             .expect("30 second backlog");
         assert_eq!(
-            blocked.push(&[0.0]).unwrap_err().code,
+            blocked
+                .push(&[0.0])
+                .expect_err("full backlog must reject the next sample")
+                .code,
             NativeErrorCode::QueueFull
         );
         assert_eq!(
@@ -16277,7 +16282,10 @@ mod tests {
             digest[0] ^= 1;
         }
         assert_eq!(
-            handle.restore_sequence(altered, 0).unwrap_err().code,
+            handle
+                .restore_sequence(altered, 0)
+                .expect_err("tampered checkpoint must not restore")
+                .code,
             NativeErrorCode::CacheIncompatible
         );
         assert!(
