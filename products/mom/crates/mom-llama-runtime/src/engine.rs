@@ -12,6 +12,7 @@ use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
+pub use llama_native_engine::model_artifact_file_identity;
 use llama_native_types::{MediaKind, NativeModelLoadMetrics};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

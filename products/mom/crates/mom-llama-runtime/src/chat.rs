@@ -2361,6 +2361,7 @@ mod tests {
                     bytes: vec![1].into(),
                     token_ids: vec![1; tokens],
                     cells: Vec::new(),
+                    storage_proof: None,
                 },
             )
         };

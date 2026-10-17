@@ -307,12 +307,13 @@ test("failed startup warm still admits a call only after the exact conversation 
   assert.deepEqual(latePreparation.greetings, [], "hangup during exact preparation must not greet later");
 });
 
-test("the real call-open prefix shows Calling and starts the ring before awaiting setup", async () => {
+test("the real call-open prefix shows Calling before the first ring tone paint boundary", async () => {
   const openStart = source.indexOf("  const openVoiceCallSurface = async () => {");
   const readyBoundary = source.indexOf("      await activityGuard.ready;", openStart);
   assert.ok(openStart >= 0 && readyBoundary > openStart);
   const prefix = source.slice(openStart, readyBoundary);
   let resolveRing;
+  const animationFrames = [];
   const stages = [];
   const calls = [];
   const recipient = {
@@ -346,30 +347,53 @@ test("the real call-open prefix shows Calling and starts the ring before awaitin
     setText: (id, value) => { if (id === "voice-call-title") modal.title = value; },
     setModalVisibility: (_id, visible) => { modal.visible = visible; },
     startCallRinging: (epoch) => {
-      calls.push(["ring-start", epoch]);
-      return new Promise((resolve) => { resolveRing = resolve; });
+      // Model the production helper: resume is requested synchronously, while
+      // oscillator scheduling waits until the second animation frame.
+      calls.push(["resume-requested", epoch]);
+      return (async () => {
+        await new Promise((resolve) => animationFrames.push(resolve));
+        await new Promise((resolve) => animationFrames.push(resolve));
+        calls.push("paint-opportunity");
+        calls.push(["ring-start", epoch]);
+        return new Promise((resolve) => { resolveRing = resolve; });
+      })();
     },
+    requestAnimationFrame: (callback) => { animationFrames.push(callback); return animationFrames.length; },
     performance: { now: () => 1 },
     window: {},
   };
+  context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(
     `${prefix}\n      return { epoch, ringingReady };\n    } catch (error) { throw error; }\n  };\nthis.openCall = openVoiceCallSurface;`,
     context,
   );
-  const opened = await context.openCall();
+  const opening = context.openCall();
+  await Promise.resolve();
+  const opened = await opening;
   assert.equal(modal.visible, true);
   assert.equal(modal.dataset.callState, "ringing");
   assert.equal(modal.attributes["aria-label"], "Calling Jan");
   assert.equal(modal.title, "Calling");
   assert.ok(calls.includes("guard-created"));
-  assert.equal(calls.filter((entry) => Array.isArray(entry) && entry[0] === "ring-start").length, 1);
-  assert.equal(typeof resolveRing, "function", "ring initialization began before the activity guard settled");
+  assert.equal(calls.filter((entry) => Array.isArray(entry) && entry[0] === "resume-requested").length, 1);
+  assert.equal(calls.filter((entry) => Array.isArray(entry) && entry[0] === "ring-start").length, 0,
+    "resume may start on the gesture, but no ring tone is scheduled before paint");
+  assert.equal(animationFrames.length, 1);
+  animationFrames.shift()();
+  await Promise.resolve();
+  assert.equal(animationFrames.length, 1);
+  calls.push("browser-paint");
+  animationFrames.shift()();
+  await Promise.resolve();
+  assert.equal(calls.indexOf("browser-paint") < calls.findIndex((entry) => Array.isArray(entry) && entry[0] === "ring-start"), true);
+  assert.equal(typeof resolveRing, "function", "ring starts only after the paint opportunity");
 
   resolveRing(true);
   const ringResult = await opened.ringingReady;
   assert.equal(ringResult.started, true);
-  assert.deepEqual(stages, ["call_ringing_started"], "a successful ring publishes its milestone before setup settles");
+  assert.deepEqual(stages, ["call_activity_guard_wait_started", "call_ringing_started"],
+    "the ring and setup-wait boundary are recorded before later preparation");
   assert.equal(opened.epoch, calls.find((entry) => Array.isArray(entry) && entry[0] === "ring-start")[1]);
 });
 
@@ -378,6 +402,7 @@ test("a late ring-context resume after hangup closes without installing a timer"
   const end = source.indexOf("\n  const prepareVoicePersonaForCall", start);
   assert.ok(start >= 0 && end > start, "the production ring helpers must remain directly testable");
   let resolveResume;
+  const animationFrames = [];
   let constructedContext;
   let intervals = 0;
   let closes = 0;
@@ -387,6 +412,7 @@ test("a late ring-context resume after hangup closes without installing a timer"
     voiceCallActive: true,
     voiceCallAudio: null,
     window: { clearInterval() {}, setInterval() { intervals += 1; return intervals; } },
+    requestAnimationFrame: (callback) => { animationFrames.push(callback); return animationFrames.length; },
     AudioContext: function AudioContextMock() {
       constructedContext = {
         resume: () => new Promise((resolve) => { resolveResume = resolve; }),
@@ -403,6 +429,11 @@ test("a late ring-context resume after hangup closes without installing a timer"
   const starting = context.startRing(epoch);
   for (let attempts = 0; attempts < 4 && !resolveResume; attempts += 1) await Promise.resolve();
   assert.equal(typeof resolveResume, "function", "the audio context resume is pending");
+  assert.equal(intervals, 0, "ring tones wait for the visible call paint");
+  assert.equal(animationFrames.length, 1);
+  animationFrames.shift()();
+  assert.equal(animationFrames.length, 1, "a second animation frame provides the paint opportunity");
+  animationFrames.shift()();
   context.voiceCallActive = false;
   context.voiceCallEpoch = null;
   resolveResume();

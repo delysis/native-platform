@@ -7,7 +7,7 @@ use crate::chat::{build_native_messages, upstream_setting_bool};
 use crate::config::Settings;
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationInferenceWindow, Message,
-    MessageRole,
+    MessageAttribution, MessageRole,
 };
 use crate::store::RuntimeStore;
 use anyhow::{Result, anyhow};
@@ -167,7 +167,7 @@ fn persist_window_if_unchanged(
     expected_active: &[Message],
     window: Option<&ConversationInferenceWindow>,
 ) -> Result<bool> {
-    let expected_source = source_digest(expected_active)?;
+    let expected_source = source_projection(expected_active);
     store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         ConversationDb::default,
@@ -184,6 +184,7 @@ fn persist_window_if_unchanged(
             else {
                 return Ok(false);
             };
+            let current_active = crate::document::checked_active_messages(current)?;
             if current.active_leaf_message_id != expected.active_leaf_message_id
                 || current.branch_root_message_id != expected.branch_root_message_id
                 || current.execution_profile != expected.execution_profile
@@ -192,8 +193,7 @@ fn persist_window_if_unchanged(
                 || current.source_conversation_id != expected.source_conversation_id
                 || (current.inference_window != expected.inference_window
                     && current.inference_window.as_ref() != window)
-                || source_digest(&crate::document::checked_active_messages(current)?)?
-                    != expected_source
+                || source_projection(&current_active) != expected_source
             {
                 return Ok(false);
             }
@@ -222,7 +222,23 @@ fn digest(value: &(impl Serialize + ?Sized)) -> Result<String> {
 /// generated exchange is committed, so they must not invalidate a saved
 /// inference boundary.
 fn source_digest(messages: &[Message]) -> Result<String> {
-    let source = messages
+    digest(&source_projection(messages))
+}
+
+type InferenceSourceProjection<'a> = (
+    &'a String,
+    &'a String,
+    MessageRole,
+    &'a String,
+    &'a Option<String>,
+    &'a Vec<String>,
+    &'a Option<String>,
+    bool,
+    &'a Option<MessageAttribution>,
+);
+
+fn source_projection(messages: &[Message]) -> Vec<InferenceSourceProjection<'_>> {
+    messages
         .iter()
         .map(|message| {
             (
@@ -237,8 +253,7 @@ fn source_digest(messages: &[Message]) -> Result<String> {
                 &message.attribution,
             )
         })
-        .collect::<Vec<_>>();
-    digest(&source)
+        .collect()
 }
 
 fn valid_window_start(

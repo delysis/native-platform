@@ -20,7 +20,6 @@ use llama_native_types::{
     SequenceStateBlob, SequenceStateCell, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -820,7 +819,7 @@ fn prepare_voice_context_resident(
                     false,
                 ));
             }
-            live_value = load_persistent_value_or_invalidate(&settings, metadata, &handle)?;
+            live_value = load_persistent_value_or_invalidate(&settings, metadata)?;
         }
     }
     if let Some(value) = live_value.filter(|value| {
@@ -955,7 +954,7 @@ pub fn kv_cache_restore(
         ));
     }
     let stable_messages = stable_prompt_messages(&settings, metadata.owner_id.as_deref())?;
-    let value = load_persistent_value_or_invalidate(&settings, &metadata, &handle)?;
+    let value = load_persistent_value_or_invalidate(&settings, &metadata)?;
     let compatible = value
         .as_ref()
         .is_some_and(|value| value.is_valid() && value.metadata.fingerprint == expected);
@@ -997,8 +996,7 @@ pub fn kv_cache_restore(
             ),
         ));
     };
-    let Some(current_value) =
-        load_current_persistent_value(&store, &verified_value.metadata.id, &handle)?
+    let Some(current_value) = load_current_persistent_value(&store, &verified_value.metadata.id)?
     else {
         return Ok(CommandResult::blocked(
             "mom_llama.kv_cache_restore",
@@ -1161,7 +1159,7 @@ fn restore_latest_session_checkpoint_if_needed(
     let Some(lease) = MomCachePromotionLease::acquire(&store, Some(conversation_id))? else {
         return Ok(None);
     };
-    let Some(current) = load_current_persistent_value(&store, &metadata.id, handle)? else {
+    let Some(current) = load_current_persistent_value(&store, &metadata.id)? else {
         return Ok(None);
     };
     // Load the large encrypted payload once. `load_current_persistent_value`
@@ -1304,11 +1302,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
         return Ok(None);
     };
     let metadata = db.entries[index].clone();
-    let Some(value) =
-        load_persistent_value_or_invalidate_from_store(&store, &metadata, |receipt| {
-            handle.has_live_sequence_receipt(receipt)
-        })?
-    else {
+    let Some(value) = load_persistent_value_or_invalidate_from_store(&store, &metadata)? else {
         return Ok(None);
     };
     if !value.is_valid() {
@@ -1655,7 +1649,7 @@ fn checkpoint_committed_session_request_with_drain(
     let Some(model_path) = settings.model_path.clone() else {
         return Ok(None);
     };
-    let snapshot = scope.with_idle_voice_checkpoint(|| {
+    let snapshot = scope.with_idle_voice_checkpoint(|foreground_waiters| {
         if let Some(drain) = drain {
             return drain.snapshot(
                 &settings,
@@ -1676,7 +1670,11 @@ fn checkpoint_committed_session_request_with_drain(
             return Ok(None);
         };
         let Some(state) = handle
-            .snapshot_conversation_for_request_if_fits(&request_id, MAX_PERSISTENT_ENTRY_BYTES)
+            .snapshot_conversation_for_request_if_idle(
+                &request_id,
+                MAX_PERSISTENT_ENTRY_BYTES,
+                foreground_waiters,
+            )
             .map_err(|error| anyhow!(error))?
         else {
             return Ok(None);
@@ -2059,18 +2057,17 @@ fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<bool> 
     persist_value_with_promotion_hook(&store, value, || {})
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SessionConversationAuthority {
     conversation_id: String,
-    serialized_sha256: [u8; 32],
+    conversation: crate::conversation_store::Conversation,
 }
 
 impl SessionConversationAuthority {
     fn from_conversation(conversation: &crate::conversation_store::Conversation) -> Result<Self> {
-        let serialized = serde_json::to_vec(conversation)?;
         Ok(Self {
             conversation_id: conversation.id.clone(),
-            serialized_sha256: Sha256::digest(serialized).into(),
+            conversation: conversation.clone(),
         })
     }
 
@@ -2091,8 +2088,7 @@ impl SessionConversationAuthority {
         else {
             return Ok(false);
         };
-        let serialized = serde_json::to_vec(conversation)?;
-        Ok(Sha256::digest(serialized).as_slice() == self.serialized_sha256.as_slice())
+        Ok(conversation == &self.conversation)
     }
 }
 
@@ -2361,95 +2357,79 @@ fn cache_ids_for_owner(db: &KvCacheDb, owner_id: &str) -> Vec<String> {
 fn load_persistent_value_or_invalidate(
     settings: &Settings,
     metadata: &PrefixCacheMetadata,
-    handle: &NativeModelHandle,
 ) -> Result<Option<PrefixCacheValue>> {
     let store = RuntimeStore::open(&settings.data_dir)?;
-    load_persistent_value_or_invalidate_from_store(&store, metadata, |receipt| {
-        handle.has_live_sequence_receipt(receipt)
-    })
+    load_persistent_value_or_invalidate_from_store(&store, metadata)
 }
 
 fn load_persistent_value_or_invalidate_from_store(
     store: &RuntimeStore,
     metadata: &PrefixCacheMetadata,
-    has_live_receipt: impl FnOnce(&[u8; 32]) -> bool,
 ) -> Result<Option<PrefixCacheValue>> {
     let Some(reconstruction) = metadata.reconstruction.as_ref() else {
-        invalidate_persistent_entry_in_store(store, &metadata.id)?;
         return Ok(None);
     };
-    if reconstruction.token_replay_allowed != metadata.cells.is_empty() {
-        invalidate_persistent_entry_in_store(store, &metadata.id)?;
+    // This process accepts only the current authenticated storage format.
+    // Earlier or unknown snapshots stay untouched and fall back to prompt replay.
+    if reconstruction.header.len() != llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+        || !reconstruction
+            .header
+            .starts_with(llama_native_types::SEQUENCE_STATE_MAGIC)
+        || metadata.state_bytes < llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+    {
         return Ok(None);
     }
-    // Authenticated exports survive worker/process restart. Their full
-    // bytes must reach the engine's signature and fingerprint check; replacing
-    // them with token replay here destroyed the durable KV cache on launch.
-    let authenticated_export = reconstruction.header.starts_with(b"native-seq-v2\0\0\0");
-    if !authenticated_export && !has_live_receipt(&reconstruction.export_receipt) {
-        let Some(value) = metadata.replay_value() else {
-            invalidate_persistent_entry_in_store(store, &metadata.id)?;
-            return Ok(None);
-        };
-        if !persistent_entry_fits(value.metadata.state_bytes) {
-            invalidate_persistent_entry_in_store(store, &metadata.id)?;
-            return Ok(None);
-        }
-        return store.mutate_documents(KV_CACHE_NAMESPACE, KvCacheDb::default, |db, documents| {
-            if let Some(owner_id) = metadata.owner_id.as_deref()
-                && crate::personas::persona_cache_owner_is_removed_from_documents(
-                    documents, owner_id,
-                )?
-            {
-                return Ok(None);
-            }
-            let Some(current) = db.entries.iter_mut().find(|entry| entry.id == metadata.id) else {
-                return Ok(None);
-            };
-            if current != metadata {
-                return Ok(None);
-            }
-            // Expired native bytes are overwritten directly, never materialized.
-            if value.metadata.state_bytes != metadata.state_bytes {
-                delete_cache_bytes(documents, metadata);
-                write_cache_bytes(documents, &metadata.id, &value.sequence.bytes)?;
-                *current = value.metadata.clone();
-            }
-            Ok(Some(value.clone()))
-        });
+    if reconstruction.token_replay_allowed != metadata.cells.is_empty() {
+        invalidate_persistent_entry_if_matches_in_store(store, metadata)?;
+        return Ok(None);
     }
-    let loaded = read_cache_bytes(store, metadata);
-    let value = match loaded {
-        Ok(Some(bytes)) => PrefixCacheValue {
-            metadata: metadata.clone(),
-            sequence: SequenceStateBlob {
-                sequence_id: reconstruction.sequence_id,
-                token_count: if metadata.cells.is_empty() {
-                    metadata.token_ids.len()
-                } else {
-                    metadata.cells.len()
-                },
-                bytes: bytes.into(),
-                token_ids: metadata.token_ids.clone(),
-                cells: metadata.cells.clone(),
-            },
-        },
-        Ok(None) | Err(_) => {
-            invalidate_persistent_entry_in_store(store, &metadata.id)?;
+    // Both current metadata and all payload chunks are verified from one AEAD
+    // read snapshot; only then is the process-local storage proof minted.
+    let snapshot_payload = store.read_documents(|snapshot| {
+        let db = snapshot
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .unwrap_or_default();
+        if !db.entries.iter().any(|entry| entry == metadata) {
             return Ok(None);
         }
+        Ok(Some(read_cache_bytes_from_snapshot(snapshot, metadata)?))
+    });
+    let bytes = match snapshot_payload {
+        Ok(Some(Some(bytes))) => bytes,
+        Ok(None) => return Ok(None),
+        Ok(Some(None)) | Err(_) => {
+            invalidate_persistent_entry_if_matches_in_store(store, metadata)?;
+            return Ok(None);
+        }
+    };
+    let mut value = PrefixCacheValue {
+        metadata: metadata.clone(),
+        sequence: SequenceStateBlob {
+            storage_proof: None,
+            sequence_id: reconstruction.sequence_id,
+            token_count: if metadata.cells.is_empty() {
+                metadata.token_ids.len()
+            } else {
+                metadata.cells.len()
+            },
+            bytes: bytes.into(),
+            token_ids: metadata.token_ids.clone(),
+            cells: metadata.cells.clone(),
+        },
     };
     if !value.is_valid() {
-        invalidate_persistent_entry_in_store(store, &metadata.id)?;
+        invalidate_persistent_entry_if_matches_in_store(store, metadata)?;
         return Ok(None);
     }
+    // Both metadata and every payload chunk came from authenticated documents.
+    // This non-serialized proof binds their exact immutable allocation.
+    value.sequence.mark_authenticated_storage();
     Ok(Some(value))
 }
 
 fn load_current_persistent_value(
     store: &RuntimeStore,
     cache_id: &str,
-    handle: &NativeModelHandle,
 ) -> Result<Option<PrefixCacheValue>> {
     let db = store
         .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
@@ -2457,9 +2437,7 @@ fn load_current_persistent_value(
     let Some(metadata) = db.entries.iter().find(|entry| entry.id == cache_id) else {
         return Ok(None);
     };
-    load_persistent_value_or_invalidate_from_store(store, metadata, |receipt| {
-        handle.has_live_sequence_receipt(receipt)
-    })
+    load_persistent_value_or_invalidate_from_store(store, metadata)
 }
 
 fn touch_persistent_value_for_promotion(
@@ -2505,7 +2483,6 @@ fn same_cache_authority(left: &PrefixCacheMetadata, right: &PrefixCacheMetadata)
         && left.label == right.label
         && left.fingerprint == right.fingerprint
         && left.token_ids == right.token_ids
-        && left.token_sha256 == right.token_sha256
         && left.cells == right.cells
         && left.state_bytes == right.state_bytes
         && left.created_at_ms == right.created_at_ms
@@ -2523,6 +2500,24 @@ fn invalidate_persistent_entry_in_store(store: &RuntimeStore, cache_id: &str) ->
         KvCacheDb::default,
         |db: &mut KvCacheDb, documents| {
             if let Some(entry) = db.entries.iter_mut().find(|entry| entry.id == cache_id) {
+                entry.state = CacheEntryState::Invalidated;
+                delete_cache_bytes(documents, entry);
+            }
+            Ok(())
+        },
+    )
+}
+
+fn invalidate_persistent_entry_if_matches_in_store(
+    store: &RuntimeStore,
+    expected: &PrefixCacheMetadata,
+) -> Result<()> {
+    store.mutate_documents(
+        KV_CACHE_NAMESPACE,
+        KvCacheDb::default,
+        |db: &mut KvCacheDb, documents| {
+            if let Some(index) = db.entries.iter().position(|entry| entry == expected) {
+                let entry = &mut db.entries[index];
                 entry.state = CacheEntryState::Invalidated;
                 delete_cache_bytes(documents, entry);
             }
@@ -2728,22 +2723,29 @@ fn read_cache_bytes(
     if !persistent_entry_fits(metadata.state_bytes) {
         return Ok(None);
     }
-    store.read_documents(|snapshot| {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(metadata.state_bytes)?;
-        for index in 0..metadata.state_bytes.div_ceil(CACHE_BLOB_CHUNK_BYTES) {
-            let Some(chunk) = snapshot.get_bytes(&blob_chunk_namespace(&metadata.id, index))?
-            else {
-                return Ok(None);
-            };
-            let expected = (metadata.state_bytes - bytes.len()).min(CACHE_BLOB_CHUNK_BYTES);
-            if chunk.len() != expected {
-                return Ok(None);
-            }
-            bytes.extend_from_slice(&chunk);
+    store.read_documents(|snapshot| read_cache_bytes_from_snapshot(snapshot, metadata))
+}
+
+fn read_cache_bytes_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    metadata: &PrefixCacheMetadata,
+) -> Result<Option<Vec<u8>>> {
+    if !persistent_entry_fits(metadata.state_bytes) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(metadata.state_bytes)?;
+    for index in 0..metadata.state_bytes.div_ceil(CACHE_BLOB_CHUNK_BYTES) {
+        let Some(chunk) = snapshot.get_bytes(&blob_chunk_namespace(&metadata.id, index))? else {
+            return Ok(None);
+        };
+        let expected = (metadata.state_bytes - bytes.len()).min(CACHE_BLOB_CHUNK_BYTES);
+        if chunk.len() != expected {
+            return Ok(None);
         }
-        Ok(Some(bytes))
-    })
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
 }
 
 fn encrypted_blob_uri(id: &str) -> String {
@@ -2770,19 +2772,6 @@ mod tests {
         tampered_ciphertext_hex: String,
         native_prefix_disposition: String,
         session_blob_disposition: String,
-    }
-
-    #[derive(Serialize)]
-    struct W1SessionCacheLogicalState<'a> {
-        metadata: &'a KvCacheDb,
-        blob_sha256: String,
-        blob_length: usize,
-    }
-
-    #[derive(Serialize)]
-    struct W1SessionCacheAfterLogicalState<'a> {
-        metadata: &'a KvCacheDb,
-        blob: Option<&'a [u8]>,
     }
 
     fn test_cache_value(id: &str, model: &str) -> PrefixCacheValue {
@@ -2813,6 +2802,7 @@ mod tests {
                 1,
             ),
             sequence: SequenceStateBlob {
+                storage_proof: None,
                 sequence_id: 0,
                 token_count: 1,
                 bytes: (vec![1]).into(),
@@ -2820,6 +2810,17 @@ mod tests {
                 cells: Vec::new(),
             },
         }
+    }
+
+    fn authenticated_session_value(id: &str) -> PrefixCacheValue {
+        let mut value = test_cache_value(id, "fingerprint");
+        value.metadata.tier = CacheTier::SessionPersistent;
+        let mut bytes = b"native-seq-v3\0\0\0".to_vec();
+        bytes.extend_from_slice(&[7; 64]);
+        value.sequence.bytes = bytes.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        value
     }
 
     #[test]
@@ -3146,6 +3147,7 @@ mod tests {
             PrefixCacheValue {
                 metadata,
                 sequence: SequenceStateBlob {
+                    storage_proof: None,
                     sequence_id: 0,
                     token_count: token_ids.len(),
                     bytes: vec![1].into(),
@@ -3399,7 +3401,8 @@ mod tests {
     }
 
     #[test]
-    fn persistent_cache_corruption_invalidates_and_falls_back_after_reopen() -> Result<()> {
+    fn native_prefix_corruption_preserves_session_metadata_and_authoritative_conversation()
+    -> Result<()> {
         let fixture: W1CacheCorruptionFixture =
             serde_json::from_str(include_str!("../fixtures/compat/cache-corruption-v1.json"))?;
         assert_eq!(
@@ -3414,27 +3417,12 @@ mod tests {
         );
         assert_eq!(
             fixture.session_blob_disposition,
-            "invalidate_delete_then_cold_miss"
+            "unsupported_legacy_snapshot_preserved"
         );
         assert_eq!(fixture.tampered_ciphertext_hex, "00");
         let data_dir =
             std::env::temp_dir().join(format!("mom-llama-cache-corruption-{}", crate::now_ms()));
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
-        let mut value = test_cache_value("w1-tampered", "fingerprint");
-        value.metadata.tier = CacheTier::SessionPersistent;
-        store.mutate_documents(
-            KV_CACHE_NAMESPACE,
-            KvCacheDb::default,
-            |db: &mut KvCacheDb, documents| {
-                db.entries.push(value.metadata.clone());
-                documents.put_bytes(&blob_namespace(&value.metadata.id), &value.sequence.bytes)?;
-                Ok(())
-            },
-        )?;
-        assert_eq!(
-            blob_namespace(&value.metadata.id),
-            fixture.session_blob_namespace
-        );
         let authoritative = ConversationDb {
             selected_conversation_id: Some(fixture.authoritative_conversation.id.clone()),
             conversations: vec![fixture.authoritative_conversation.clone()],
@@ -3448,45 +3436,17 @@ mod tests {
             native_before,
             include_bytes!("../fixtures/compat/cache-native-prefix-state-v1.json")
         );
-        let metadata_before = store
-            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
-            .ok_or_else(|| anyhow!("cache metadata missing before corruption"))?;
-        let mut session_before = serde_json::to_vec_pretty(&W1SessionCacheLogicalState {
-            metadata: &metadata_before,
-            blob_sha256: format!("{:x}", Sha256::digest(value.sequence.bytes.as_slice())),
-            blob_length: value.sequence.bytes.len(),
-        })?;
-        session_before.push(b'\n');
-        assert_eq!(
-            session_before,
-            include_bytes!("../fixtures/compat/cache-session-state-v1.json"),
-            "{}",
-            String::from_utf8_lossy(&session_before)
-        );
         let connection = rusqlite::Connection::open(store.path())?;
-        connection.execute(
-            "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
-            [blob_namespace(&value.metadata.id)],
-        )?;
         connection.execute(
             "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
             [&fixture.native_prefix_namespace],
         )?;
 
-        assert!(
-            load_persistent_value_or_invalidate_from_store(&store, &value.metadata, |_| true)?
-                .is_none()
-        );
         assert_eq!(
             store
                 .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
             None
         );
-        let db = store
-            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
-            .ok_or_else(|| anyhow!("cache metadata missing"))?;
-        assert_eq!(db.entries[0].state, CacheEntryState::Invalidated);
-        assert_eq!(store.get_bytes(&blob_namespace(&value.metadata.id))?, None);
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative.clone())
@@ -3494,64 +3454,19 @@ mod tests {
         drop(connection);
         drop(store);
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
-        assert!(
-            load_persistent_value_or_invalidate_from_store(&store, &value.metadata, |_| true)?
-                .is_none()
-        );
         let native_after = store
             .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?;
         assert_eq!(native_after, None);
-        let session_after_metadata = store
-            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
-            .ok_or_else(|| anyhow!("cache metadata missing after reopen"))?;
-        let session_after_blob = store.get_bytes(&blob_namespace(&value.metadata.id))?;
         let mut native_after_bytes = serde_json::to_vec_pretty(&native_after)?;
         native_after_bytes.push(b'\n');
         assert_eq!(
             native_after_bytes,
             include_bytes!("../fixtures/compat/cache-native-prefix-after-state-v1.json")
         );
-        let mut session_after_bytes =
-            serde_json::to_vec_pretty(&W1SessionCacheAfterLogicalState {
-                metadata: &session_after_metadata,
-                blob: session_after_blob.as_deref(),
-            })?;
-        session_after_bytes.push(b'\n');
-        assert_eq!(
-            session_after_bytes,
-            include_bytes!("../fixtures/compat/cache-session-after-state-v1.json")
-        );
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative.clone())
         );
-
-        let mut missing = test_cache_value("missing", "fingerprint");
-        missing.metadata.tier = CacheTier::SessionPersistent;
-        store.mutate(KV_CACHE_NAMESPACE, KvCacheDb::default, |db| {
-            db.entries.push(missing.metadata.clone());
-            Ok(())
-        })?;
-        assert!(
-            load_persistent_value_or_invalidate_from_store(&store, &missing.metadata, |_| true)?
-                .is_none()
-        );
-        let db = store
-            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
-            .ok_or_else(|| anyhow!("cache metadata missing"))?;
-        assert_eq!(
-            db.entries
-                .iter()
-                .find(|entry| entry.id == "missing")
-                .map(|entry| entry.state),
-            Some(CacheEntryState::Invalidated)
-        );
-        let quarantine_rows: i64 = rusqlite::Connection::open(store.path())?.query_row(
-            "SELECT COUNT(*) FROM encrypted_documents WHERE namespace LIKE 'quarantine.disposable-cache.%'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(quarantine_rows, 1);
 
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
@@ -3561,58 +3476,149 @@ mod tests {
     }
 
     #[test]
-    fn expired_spill_reconstructs_without_decrypting_native_payload_and_preserves_live_spill()
-    -> Result<()> {
+    fn authenticated_session_snapshot_proof_survives_reopen_but_not_serialization() -> Result<()> {
+        let data_dir = std::env::temp_dir().join(format!("mom-v3-cache-proof-{}", Uuid::new_v4()));
+        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
+        let value = authenticated_session_value("v3-proof");
+        assert!(persist_value_to_store(&store, &value, 4, 1024 * 1024)?);
+
+        let loaded = load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?
+            .expect("AEAD-authenticated session value loads");
+        assert!(loaded.sequence.has_authenticated_storage_proof());
+        let serialized = serde_json::to_vec(&loaded)?;
+        let decoded: PrefixCacheValue = serde_json::from_slice(&serialized)?;
+        assert!(!decoded.sequence.has_authenticated_storage_proof());
+
+        drop(store);
+        let reopened = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
+        let loaded_after_reopen =
+            load_persistent_value_or_invalidate_from_store(&reopened, &value.metadata)?
+                .expect("authenticated session value remains loadable after reopen");
+        assert!(
+            loaded_after_reopen
+                .sequence
+                .has_authenticated_storage_proof()
+        );
+        std::fs::remove_dir_all(data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_snapshot_rejects_forged_metadata_before_minting_proof() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-v3-cache-forgery-{}", Uuid::new_v4()));
+        let store = RuntimeStore::open_with_key(&data_dir, [32_u8; 32])?;
+        let value = authenticated_session_value("v3-forgery");
+        assert!(persist_value_to_store(&store, &value, 4, 1024 * 1024)?);
+
+        let mut forged = value.metadata.clone();
+        forged
+            .reconstruction
+            .as_mut()
+            .expect("v3 reconstruction")
+            .sequence_id += 1;
+        assert!(load_persistent_value_or_invalidate_from_store(&store, &forged)?.is_none());
+        assert_eq!(
+            store
+                .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                .expect("metadata")
+                .entries[0]
+                .state,
+            CacheEntryState::Ready,
+            "a stale or forged argument does not invalidate the authenticated current entry"
+        );
+        let loaded = load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?
+            .expect("current authenticated metadata remains usable");
+        assert!(loaded.sequence.has_authenticated_storage_proof());
+        std::fs::remove_dir_all(data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_tampered_session_snapshot_chunk_invalidates_without_proof() -> Result<()> {
+        for (id, tamper) in [("v3-missing", false), ("v3-tampered", true)] {
+            let data_dir =
+                std::env::temp_dir().join(format!("mom-v3-cache-invalid-{id}-{}", Uuid::new_v4()));
+            let store = RuntimeStore::open_with_key(&data_dir, [33_u8; 32])?;
+            let value = authenticated_session_value(id);
+            assert!(persist_value_to_store(&store, &value, 4, 1024 * 1024)?);
+
+            if tamper {
+                let connection = rusqlite::Connection::open(store.path())?;
+                connection.execute(
+                    "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
+                    [blob_chunk_namespace(id, 0)],
+                )?;
+                drop(connection);
+            } else {
+                store.mutate_documents(
+                    KV_CACHE_NAMESPACE,
+                    KvCacheDb::default,
+                    |_, documents| {
+                        documents.delete(&blob_chunk_namespace(id, 0));
+                        Ok(())
+                    },
+                )?;
+            }
+
+            assert!(
+                load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?.is_none()
+            );
+            assert_eq!(
+                store
+                    .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                    .expect("metadata")
+                    .entries[0]
+                    .state,
+                CacheEntryState::Invalidated
+            );
+            drop(store);
+            std::fs::remove_dir_all(data_dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_legacy_snapshot_is_ignored_without_rewriting() -> Result<()> {
         let data_dir = std::env::temp_dir().join(format!("mom-cache-lifetime-{}", Uuid::new_v4()));
         let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
         let mut value = test_cache_value("spill", "fingerprint");
         value.metadata.tier = CacheTier::SessionPersistent;
-        value.sequence.bytes = vec![7; 64 * 1024].into();
+        let mut legacy_bytes = b"native-seq-v1\0\0\0".to_vec();
+        legacy_bytes.extend_from_slice(&[7; 64 * 1024]);
+        value.sequence.bytes = legacy_bytes.into();
         value.sequence.sequence_id = 3;
         value.metadata.state_bytes = value.sequence.bytes.len();
         value.bind_reconstruction();
         persist_value_to_store(&store, &value, 4, 1024 * 1024)?;
-        let live =
-            load_persistent_value_or_invalidate_from_store(&store, &value.metadata, |receipt| {
-                assert_eq!(receipt, &value.sequence.export_receipt());
-                true
-            })?
-            .expect("same-worker spill");
-        assert_eq!(live.sequence, value.sequence);
-        let connection = rusqlite::Connection::open(store.path())?;
-        connection.execute(
-            "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
-            [blob_namespace("spill")],
-        )?;
-        assert!(store.get_bytes(&blob_namespace("spill")).is_err());
-        let replay =
-            load_persistent_value_or_invalidate_from_store(&store, &value.metadata, |_| false)?
-                .expect("expired receipt reconstructs");
-        assert_eq!(
-            replay.sequence.bytes.len(),
-            llama_native_types::SEQUENCE_STATE_HEADER_BYTES
-        );
-        assert_eq!(replay.sequence.token_ids, value.sequence.token_ids);
-        assert_eq!(replay.metadata.fingerprint, value.metadata.fingerprint);
+        let stored_metadata = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("metadata")
+            .entries[0]
+            .clone();
+        assert!(load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?.is_none());
         assert_eq!(
             store
-                .get_bytes(&blob_namespace("spill"))?
-                .expect("compacted")
-                .len(),
-            llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+                .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                .expect("metadata")
+                .entries[0],
+            stored_metadata,
+            "unsupported metadata is left unchanged"
         );
-        assert!(
-            load_persistent_value_or_invalidate_from_store(&store, &value.metadata, |_| false)?
-                .is_none(),
-            "stale metadata cannot overwrite compacted or replaced entry"
+        assert_eq!(
+            store.get_bytes(&blob_namespace("spill"))?,
+            Some(value.sequence.bytes.to_vec()),
+            "unsupported payload is neither read nor rewritten"
         );
-        drop(connection);
         drop(store);
         let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
-        let restored =
-            load_persistent_value_or_invalidate_from_store(&store, &replay.metadata, |_| false)?
-                .expect("restart replay");
-        assert_eq!(restored.sequence, replay.sequence);
+        assert!(
+            load_persistent_value_or_invalidate_from_store(&store, &stored_metadata)?.is_none()
+        );
+        assert_eq!(
+            store.get_bytes(&blob_namespace("spill"))?,
+            Some(value.sequence.bytes.to_vec())
+        );
         drop(store);
         std::fs::remove_dir_all(data_dir)?;
         Ok(())
@@ -3793,7 +3799,7 @@ mod tests {
             std::env::temp_dir().join(format!("mom-llama-cache-rejection-{}", crate::now_ms()));
         let store = RuntimeStore::open_with_key(&data_dir, [29_u8; 32])?;
         let mut invalid = test_cache_value("invalid", "fingerprint");
-        invalid.metadata.token_sha256 = "wrong".to_string();
+        invalid.metadata.token_ids[0] = 99;
         assert!(persist_value_to_store(&store, &invalid, 2, 8).is_err());
 
         let mut oversized = test_cache_value("oversized", "fingerprint");

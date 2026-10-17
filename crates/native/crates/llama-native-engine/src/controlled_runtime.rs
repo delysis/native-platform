@@ -4822,6 +4822,7 @@ mod tests {
         let (pause_tx, pause_rx) = bounded(0);
         handle.inner.send_command(
             WorkerCommand::Snapshot {
+                foreground_waiters: None,
                 expected_request_id: None,
                 conversation: false,
                 sequence_id: 0,
@@ -4854,6 +4855,7 @@ mod tests {
         let (pause_tx, pause_rx) = bounded(0);
         handle.inner.send_command(
             WorkerCommand::Snapshot {
+                foreground_waiters: None,
                 expected_request_id: None,
                 conversation: false,
                 sequence_id: 0,

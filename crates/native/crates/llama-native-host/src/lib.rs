@@ -1129,6 +1129,17 @@ impl NativeHost {
             if !candidate.is_valid() {
                 continue;
             }
+            let Some(reconstruction) = candidate.reconstruction.as_ref() else {
+                continue;
+            };
+            if reconstruction.header.len() != llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+                || !reconstruction
+                    .header
+                    .starts_with(llama_native_types::SEQUENCE_STATE_MAGIC)
+                || candidate.state_bytes < llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+            {
+                continue;
+            }
             let owner_generation = candidate.owner_id.as_deref().map(|owner_id| {
                 self.state
                     .lock()
@@ -1147,30 +1158,21 @@ impl NativeHost {
                 }
                 None => None,
             };
-            let live = candidate
-                .reconstruction
-                .as_ref()
-                .is_some_and(|reconstruction| {
-                    self.state.lock().is_ok_and(|state| {
-                        state.slots.values().any(|slot| {
-                            slot.owner
-                                .handle()
-                                .has_live_sequence_receipt(&reconstruction.export_receipt)
-                        })
-                    })
-                });
-            let value = if live {
+            let durable_native =
+                candidate.state_bytes > llama_native_types::SEQUENCE_STATE_HEADER_BYTES;
+            let value = if durable_native {
                 let Some(value) = store.load_entry(&self.config.cache_namespace, &candidate.id)?
                 else {
                     continue;
                 };
-                if value.metadata != candidate {
+                if value.metadata != candidate || !value.sequence.has_authenticated_storage_proof()
+                {
                     continue;
                 }
                 value
             } else {
-                // Storage also discards obsolete disposable entries that have no
-                // reconstruction metadata, under the same identity comparison.
+                // A current-format compacted header may replay text tokens
+                // without reading the durable native spill.
                 let restored =
                     store.load_reconstruction(&self.config.cache_namespace, &candidate)?;
                 let Some(expected) = candidate.replay_value() else {
@@ -1638,13 +1640,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_compacts_expired_spills_without_reading_native_payloads() {
+    fn restore_replays_current_compacted_headers_without_reading_native_payloads() {
         let store = Arc::new(CountingPrefixStore::default());
         for index in 0..16 {
-            let mut value = cache_value(&format!("entry-{index}"), index + 1);
-            value.sequence.bytes = vec![7; 64 * 1024].into();
-            value.metadata.state_bytes = value.sequence.bytes.len();
-            value.bind_reconstruction();
+            let value = cache_value(&format!("entry-{index}"), index + 1);
             store.save("test", &value).expect("save");
         }
         let host = NativeHost::with_dependencies(
@@ -1676,6 +1675,60 @@ mod tests {
                 cache_value("expected", 1).metadata.fingerprint
             );
         }
+    }
+
+    #[test]
+    fn restore_ignores_unsupported_headers_without_loading_or_rewriting_them() {
+        let store = Arc::new(CountingPrefixStore::default());
+        let mut value = cache_value("legacy", 1);
+        let mut bytes = vec![1; llama_native_types::SEQUENCE_STATE_HEADER_BYTES];
+        bytes[..16].copy_from_slice(b"native-seq-v1\0\0\0");
+        value.sequence.bytes = bytes.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        store.save("test", &value).expect("save legacy fixture");
+        let before = store.inner.list("test").expect("snapshot before");
+
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                cache_namespace: "test".into(),
+                ..Default::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 0);
+        assert_eq!(store.payload_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(store.inner.list("test").expect("snapshot after"), before);
+    }
+
+    #[test]
+    fn restore_requires_storage_proof_for_current_native_payloads() {
+        let store = Arc::new(TestPrefixStore::default());
+        let mut value = cache_value("native", 1);
+        let mut bytes = vec![7; 64 * 1024];
+        bytes[..llama_native_types::SEQUENCE_STATE_MAGIC.len()]
+            .copy_from_slice(llama_native_types::SEQUENCE_STATE_MAGIC);
+        value.sequence.bytes = bytes.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        value.sequence.mark_authenticated_storage();
+        store.save("llama-native-host", &value).expect("save");
+
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(store),
+        );
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 1);
+        let restored = host
+            .cache_lookup(
+                &value.metadata.fingerprint,
+                &[value.metadata.token_ids[0], 2],
+            )
+            .expect("restored native prefix");
+        assert_eq!(restored.sequence.bytes.len(), 64 * 1024);
+        assert!(restored.sequence.has_authenticated_storage_proof());
     }
 
     fn resident_test_config(expected_model_sha256: Option<&str>) -> NativeModelConfig {
@@ -1727,21 +1780,25 @@ mod tests {
             rope_config_sha256: "rope".to_string(),
             kv_layout_sha256: "kv".to_string(),
         };
+        let mut bytes = vec![token as u8; llama_native_types::SEQUENCE_STATE_HEADER_BYTES];
+        bytes[..llama_native_types::SEQUENCE_STATE_MAGIC.len()]
+            .copy_from_slice(llama_native_types::SEQUENCE_STATE_MAGIC);
         let mut value = PrefixCacheValue {
             metadata: PrefixCacheMetadata::new(
                 id,
                 CacheTier::SessionPersistent,
                 fingerprint,
                 vec![token],
-                8,
+                bytes.len(),
                 1,
             ),
             sequence: SequenceStateBlob {
                 sequence_id: 0,
                 token_count: 1,
-                bytes: (vec![token as u8; 8]).into(),
+                bytes: bytes.into(),
                 token_ids: vec![token],
                 cells: Vec::new(),
+                storage_proof: None,
             },
         };
         value.bind_reconstruction();
@@ -2296,8 +2353,8 @@ mod tests {
         let original = cache_value("same", 1);
         host.cache_insert(original.clone()).expect("initial insert");
         let mut large = cache_value("same", 2);
-        Arc::make_mut(&mut large.sequence.bytes).resize(16, 9);
-        large.metadata.state_bytes = 16;
+        Arc::make_mut(&mut large.sequence.bytes).resize(64, 9);
+        large.metadata.state_bytes = 64;
         assert_eq!(
             host.cache_insert(large.clone()).expect("disk-only insert"),
             CacheInsertOutcome::Stored {
@@ -2421,7 +2478,6 @@ mod tests {
         let unowned = cache_value("unowned", 1);
         let mut owned = cache_value("persona", 1);
         owned.metadata.token_ids.push(2);
-        owned.metadata.token_sha256 = llama_native_cache::token_sha256(&owned.metadata.token_ids);
         owned.metadata.state_bytes = 16;
         owned.metadata.owner_id = Some("persona:archived:v7".to_owned());
         owned.sequence.token_ids.push(2);
@@ -2755,7 +2811,6 @@ mod tests {
         ));
         let mut large = cache_value("same", 2);
         large.metadata.token_ids = vec![2; 16 * 1024];
-        large.metadata.token_sha256 = llama_native_cache::token_sha256(&large.metadata.token_ids);
         large.sequence.token_ids = large.metadata.token_ids.clone();
         large.sequence.token_count = large.sequence.token_ids.len();
         assert_eq!(large.metadata.state_bytes, original.metadata.state_bytes);

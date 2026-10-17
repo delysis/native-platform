@@ -1023,7 +1023,8 @@ test("voice latency summary uses native and absolute clocks across event deliver
     { stage: "barge_in_detected", elapsed_ms: 1_930 },
     { stage: "barge_in_playback_stopped", elapsed_ms: 1_948 },
     { stage: "playback_underrun", elapsed_ms: 900, occurrences: 2, total_gap_ms: 21.5, max_gap_ms: 14 },
-    { stage: "playback_renderer", elapsed_ms: 950, reason: "stopped", worklet: true, packets: 8, frames: 24_000,
+    { stage: "playback_renderer", elapsed_ms: 950, reason: "stopped", worklet: true,
+      worklet_final_metrics_received: true, packets: 8, frames: 24_000,
       schedule_cpu_us: 1_250, schedule_max_us: 310, underruns: 2, worklet_recoveries: 1,
       worklet_rebuffered_frames: 2_400, worklet_max_buffered_frames: 8_000,
       worklet_max_queued_frames: 9_000 },
@@ -1790,4 +1791,55 @@ test("late same-conversation events cannot bind a replacement voice owner", () =
   assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), true);
   context.stopped = true;
   assert.equal(owner.acceptsRequest("new-request", "delta", "dispatch-new"), false);
+});
+
+test("playback renderer summary distinguishes missing drain metrics from drained zero and preserves observed facts", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  assert.ok(start >= 0 && end > start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stopped = summarize({ stages: [{ stage: "playback_renderer", elapsed_ms: 20,
+    worklet: true, worklet_metrics_status: "unreported",
+    worklet_final_metrics_received: false, underruns: null,
+    worklet_recoveries: null, worklet_pcm_signal_frames: null,
+    worklet_pcm_signal_rms: null, worklet_pcm_low_energy_frames: null,
+    worklet_max_queued_frames: 512, worklet_first_render_context_frame: 17,
+  }] });
+  const drained = summarize({ stages: [{ stage: "playback_renderer", elapsed_ms: 20,
+    worklet: true, worklet_metrics_status: "complete",
+    worklet_final_metrics_received: true, underruns: 0,
+    worklet_recoveries: 0, worklet_pcm_signal_frames: 0,
+    worklet_pcm_signal_rms: null, worklet_pcm_low_energy_frames: 0,
+    worklet_max_queued_frames: 512, worklet_first_render_context_frame: 17,
+  }] });
+  assert.equal(stopped.playback_renderer_metrics_complete, false);
+  assert.equal(stopped.playback_renderer_recoveries, null);
+  assert.equal(stopped.playback_renderer_pcm_signal_frames, null);
+  assert.equal(stopped.playback_renderer_pcm_low_energy_frames, null);
+  assert.equal(stopped.playback_renderer_max_queued_frames, 512);
+  assert.equal(stopped.playback_renderer_first_render_context_frame, 17);
+  assert.equal(drained.playback_renderer_metrics_complete, true);
+  assert.equal(drained.playback_renderer_recoveries, 0);
+  assert.equal(drained.playback_renderer_pcm_signal_frames, 0);
+  assert.equal(drained.playback_renderer_pcm_low_energy_frames, 0);
+  assert.equal(drained.playback_renderer_max_queued_frames, 512);
+
+  const compactionStart = bridge.indexOf("  const voiceLatencySummary =");
+  const compactionEnd = bridge.indexOf("\n  const markVoiceLatency =", compactionStart);
+  const context = { TextEncoder, Date, Math, Number, Object, Map, Set,
+    performance: { now: () => 1, timeOrigin: 0 },
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    voiceLatencyPending: new Map(), voiceLatencyHistory: [], voiceLatencyFlushTimer: null,
+    voiceLatencyPersistence: Promise.resolve(), invoke: async () => ({ ok: true }) };
+  vm.createContext(context);
+  vm.runInContext(`${bridge.slice(compactionStart, compactionEnd)}\nglobalThis.__helpers = { compactVoiceLatencySnapshot };`, context);
+  const compacted = JSON.parse(context.__helpers.compactVoiceLatencySnapshot(
+    { id: "unknown-drain", mode: "call", stages: [] },
+    { ...stopped, oversized: "x".repeat(100_000) },
+  ));
+  assert.equal(compacted.summary.playback_renderer_metrics_complete, false);
+  assert.equal(compacted.summary.playback_renderer_recoveries, null);
+  assert.equal(compacted.summary.playback_renderer_pcm_signal_frames, null);
+  assert.equal(compacted.summary.playback_renderer_max_queued_frames, 512);
+  assert.equal(compacted.summary.playback_renderer_first_render_context_frame, 17);
 });

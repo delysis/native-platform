@@ -1,5 +1,74 @@
 # Voice reliability qualification
 
+## Cryptographic work budget (17 October 2026)
+
+Encrypted storage owns confidentiality and authenticity of persisted conversation
+and native cache state. The native engine must not layer a MAC, signature, or
+whole-payload digest over that already-authenticated state. Live allocation
+identity and exact metadata equality establish reuse inside the process. A
+storage adapter grants nonserialized import proof only after authenticating
+both metadata and every payload chunk from the same storage snapshot. Cloning
+an immutable allocation preserves its identity; mutation, byte copies and plain
+deserialization do not. Model/context compatibility remains mandatory.
+
+The current export is `native-seq-v3`, without the old HMAC trailer or SHA export
+receipt. Reconstruction copies only the fixed configuration header. The cache
+no longer hashes token lists on validation, and checkpoint publication compares
+the saved conversation directly. Speculative audio retries compare one shared
+request snapshot directly; they do not serialize and hash old audio or KV.
+Voice-window publication also compares inference-authority fields directly;
+its persisted boundary still has a content identity so later edits invalidate it.
+Unsupported stored formats are preserved and refused, not migrated. These
+changes supersede the historical signing/receipt descriptions below.
+
+Every cryptographic operation outside storage needs an explicit purpose, input
+budget and cadence. In particular:
+
+| Boundary | Reason to retain cryptography | Work placement |
+| --- | --- | --- |
+| Acquired models and voice assets | Verify external bytes against the pinned publisher manifest before a native parser consumes them; local AEAD cannot verify a download | Admission or changed-file verification; carry verified file identity forward instead of rescanning unchanged files |
+| Model/context fingerprints | A saved native state must name the exact model and compatible native layout | Small configuration and existing artifact digests; never hash native state to identify it |
+| Media content identities | Caller-supplied IDs/digests cannot authorize different audio/image bytes; a collision could reuse another utterance's evaluated state | At untrusted media admission, bounded by the media byte limit; reuse an already verified identity within that boundary |
+| Canonical audio frames | Reuse projected audio across different WAV wrappers and partial retries without retaining duplicate PCM in every cache key | 640 samples per frame; never the KV tensors |
+| Persisted source/approval identities | A changed prompt, source, tool, or approval must not inherit a prior operation's authority | Bounded source/configuration metadata, outside per-token playback |
+| Build/package evidence | Bind an executable to the actual native objects and source used to build it | Build/qualification time, outside call setup |
+| Explicit controlled-generation/evaluation receipts | Bind recorded interventions and distribution transitions to their evaluated inputs | Opt-in research API; can hash vocabulary-sized arrays per token and must not enter ordinary voice generation |
+
+A duplicate hash does not become necessary by calling it a receipt, signature,
+provenance check or fingerprint. Prefer exact equality for process-local state;
+reuse the verified digest when the same trusted adapter already read the bytes.
+New large scans must identify the trust boundary they cross, explain why an
+existing verified identity cannot be reused, and include startup/resumption
+measurements. TLS for model acquisition and storage key derivation are separate
+required security boundaries, not live-call cache operations.
+
+Regression checks must cover changed metadata/bytes, sole-owner copy-on-write,
+untrusted deserialization, authenticated restart, corrupt/missing chunks and a
+late prompt edit that restores native KV rather than silently replaying it.
+A unit test proving cache eligibility is not a pickup-latency measurement.
+Measure call activation, checkpoint settlement, restoration, prefill, first
+content and first rendered audio separately. Do not use zero missing counters
+as evidence of uninterrupted playback: absent terminal metrics remain unknown.
+
+The focused 12B four-path check after this repair retained 5,270 positions and
+restored 5,262 after a late prompt edit, with zero replayed positions. Resident
+generation took 169 ms; native import plus generation took 214 ms; token replay
+took 10,254 ms; cold generation took 11,907 ms. All four outputs matched. The
+snapshot was 1,813,345,000 bytes. These timings exclude model loading and disk
+decryption: the engine test explicitly simulates the trusted storage adapter,
+while separate product tests cover authenticated reopen and corrupt chunks.
+They are not call-pickup or physical-speaker measurements.
+
+Acquisition now carries a verified file identity into the native loader, avoiding
+its adjacent model/projector scan. Only Unix identities currently qualify for
+this reuse; other platforms rehash. A changed identity forces verification and
+the expected content digest still has to match. Parakeet's existing/shared
+bundle now has one content verification pass on Unix, with metadata checks
+around ONNX initialization. New copied bundles have two passes (copy and
+published destination), down from five; these are source-derived counts, not
+measured startup speedups. Platforms without strong identities retain full
+verification at the load boundaries.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and
@@ -46,7 +115,7 @@ declaration. Each local gate, candidate build, and device run applies only to
 the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
-The latest completed clean-source gate is `b60a82e4` (64 command records).
+At the candidate 09 checkpoint, the clean-source gate was `b60a82e4` (64 command records).
 Candidate 09 was built from that exact tree, with immediate ringing during
 setup. It has not been launched or accepted. Its native cache identity matches
 candidate 08. Candidate 08 (`52c26174`) included the PCM-tail transport repair,

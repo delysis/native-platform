@@ -1457,8 +1457,12 @@ pub fn attachment_transcription_input(
     if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
         return Ok(Err(preview_blocker(&problem.code, problem.message)));
     }
-    let bytes = match load_verified_object(&store, &authority.manifest.graph, &blob.object_id) {
-        Ok(bytes) => bytes,
+    let (bytes, bytes_sha256) = match load_verified_object_with_digest(
+        &store,
+        &authority.manifest.graph,
+        &blob.object_id,
+    ) {
+        Ok(value) => value,
         Err(_) => {
             return Ok(Err(preview_blocker(
                 "attachment_content_mismatch",
@@ -1467,7 +1471,6 @@ pub fn attachment_transcription_input(
             )));
         }
     };
-    let bytes_sha256 = format!("{:x}", Sha256::digest(&bytes));
     if bytes_sha256 != blob.object_id.0 {
         return Ok(Err(preview_blocker(
             "attachment_content_mismatch",
@@ -3423,6 +3426,14 @@ fn load_verified_object(
     graph: &AttachmentGraph,
     object_id: &ObjectId,
 ) -> Result<Vec<u8>> {
+    load_verified_object_with_digest(store, graph, object_id).map(|(bytes, _)| bytes)
+}
+
+fn load_verified_object_with_digest(
+    store: &RuntimeStore,
+    graph: &AttachmentGraph,
+    object_id: &ObjectId,
+) -> Result<(Vec<u8>, String)> {
     let object = graph
         .objects
         .iter()
@@ -3431,10 +3442,18 @@ fn load_verified_object(
     let bytes = store
         .get_bytes(&object_namespace(object_id))?
         .ok_or_else(|| anyhow!("attachment object {object_id} is missing"))?;
-    verify_content(&object.sha256, object.byte_len, bytes)
+    verify_content_with_digest(&object.sha256, object.byte_len, bytes)
 }
 
 fn verify_content(expected_sha256: &str, expected_bytes: u64, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    verify_content_with_digest(expected_sha256, expected_bytes, bytes).map(|(bytes, _)| bytes)
+}
+
+fn verify_content_with_digest(
+    expected_sha256: &str,
+    expected_bytes: u64,
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, String)> {
     let actual_bytes = u64::try_from(bytes.len()).context("attachment byte length overflow")?;
     if actual_bytes != expected_bytes {
         return Err(anyhow!(
@@ -3447,7 +3466,7 @@ fn verify_content(expected_sha256: &str, expected_bytes: u64, bytes: Vec<u8>) ->
             "attachment content mismatch: expected {expected_bytes} bytes and {expected_sha256}, got {actual_bytes} bytes and {actual_sha256}"
         ));
     }
-    Ok(bytes)
+    Ok((bytes, actual_sha256))
 }
 
 fn context_blocker(code: &str, message: String) -> AttachmentContextBlocker {

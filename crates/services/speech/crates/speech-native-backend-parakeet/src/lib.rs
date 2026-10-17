@@ -3,8 +3,10 @@
 //! The backend accepts one exact Parakeet Realtime EOU ONNX manifest. It verifies
 //! the selected manifest-pinned shared Hub snapshot in place, or reuses a verified
 //! managed bundle. Other candidates are copied and verified in private
-//! content-addressed storage. Model bytes are verified before and after load;
-//! mutable refs and cache locators alone confer no authority. Decoder state is
+//! content-addressed storage. Model bytes are verified before load; stable file
+//! identities are checked immediately before and after ONNX initialization,
+//! with content-verification fallback where strong identities are unavailable.
+//! Mutable refs and cache locators alone confer no authority. Decoder state is
 //! independent per request. The backend intentionally advertises only what the
 //! 120M model proves: English PCM/WAV
 //! transcription with partial streaming results, without timestamps,
@@ -120,7 +122,7 @@ struct ExactParakeetModelLoader;
 
 impl ParakeetModelLoader for ExactParakeetModelLoader {
     fn load(&self, config: &ParakeetBackendConfig) -> ModelLoadOutcome {
-        let model_dir = match model_artifact::prepare_model_dir(
+        let prepared_model = match model_artifact::prepare_model_dir(
             config.model_dir.as_deref(),
             config.managed_model_root.as_deref(),
         ) {
@@ -134,14 +136,16 @@ impl ParakeetModelLoader for ExactParakeetModelLoader {
                 )));
             }
         };
-        let loaded = model_artifact::verify_production_model_dir(&model_dir)
+        let loaded = prepared_model
+            .validate_unchanged()
             .map_err(|error| error.to_string())
             .and_then(|()| {
-                ParakeetEOUHandle::from_pretrained(&model_dir, None)
+                ParakeetEOUHandle::from_pretrained(prepared_model.path(), None)
                     .map_err(|error| error.to_string())
             })
             .and_then(|handle| {
-                model_artifact::verify_production_model_dir(&model_dir)
+                prepared_model
+                    .validate_unchanged()
                     .map_err(|error| error.to_string())?;
                 Ok(handle)
             });

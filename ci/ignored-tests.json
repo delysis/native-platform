@@ -348,7 +348,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "074da960ba33a3a80d3f58b5f62e7665718d21d7239387b204ff3379c4e90be5"
+      "sha256": "8406d6c324a4a6380fb4293160f2997e1d7aa182e8fb11a542d8a5c6f498fda4"
     },
     {
       "package": "speech-native-platform",
@@ -1401,7 +1401,7 @@
       "package": "llama-native-engine",
       "target": "lib",
       "source": "crates/native/crates/llama-native-engine/src/lib.rs",
-      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF; tests signed prefix import across worker restart with a multi-thousand-token persona and late prompt edit",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF; tests authenticated-storage prefix import across worker restart with a multi-thousand-token persona and late prompt edit",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",

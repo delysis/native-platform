@@ -602,10 +602,14 @@ fn bind_acquired_model_pair(
     let changed = previous_projector != settings.mmproj_path
         || previous_projection != settings.upstream_settings.get("mmprojPath").cloned()
         || previous_mtp != settings.upstream_settings.get("mtpAssistantPath").cloned();
+    let previous_verified = settings.verified_model_artifacts.clone();
     if changed {
         settings.verified_model_artifacts = None;
     }
-    changed
+    if let Some(verified) = &acquired.verified_model_artifacts {
+        settings.verified_model_artifacts = Some(verified.clone());
+    }
+    changed || previous_verified != settings.verified_model_artifacts
 }
 
 fn first_run_warm_ready(
@@ -1575,7 +1579,8 @@ mod tests {
     fn acquired_default_rebinds_stale_companions_without_changing_custom_model() {
         use std::path::PathBuf;
 
-        let acquired = model_acquisition::AcquiredModels {
+        let mut acquired = model_acquisition::AcquiredModels {
+            verified_model_artifacts: None,
             gemma: PathBuf::from("/cache/gemma.gguf"),
             projector: PathBuf::from("/cache/projector.gguf"),
             mtp_assistant: PathBuf::from("/cache/mtp.gguf"),
@@ -1597,6 +1602,26 @@ mod tests {
         assert_eq!(
             settings.upstream_settings["mtpAssistantPath"],
             json!("/cache/mtp.gguf")
+        );
+        assert!(!bind_acquired_model_pair(&mut settings, &acquired));
+
+        use mom_llama_runtime::config::{VerifiedArtifactDigest, VerifiedModelArtifacts};
+        acquired.verified_model_artifacts = Some(VerifiedModelArtifacts {
+            model: VerifiedArtifactDigest {
+                path: acquired.gemma.clone(),
+                sha256: "a".repeat(64),
+                file_identity: "model-version".into(),
+            },
+            projector: Some(VerifiedArtifactDigest {
+                path: acquired.projector.clone(),
+                sha256: "b".repeat(64),
+                file_identity: "projector-version".into(),
+            }),
+        });
+        assert!(bind_acquired_model_pair(&mut settings, &acquired));
+        assert_eq!(
+            settings.verified_model_artifacts,
+            acquired.verified_model_artifacts
         );
         assert!(!bind_acquired_model_pair(&mut settings, &acquired));
 

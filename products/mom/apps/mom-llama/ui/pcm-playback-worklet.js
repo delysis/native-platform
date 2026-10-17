@@ -28,6 +28,22 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
     this.underrunReported = false;
     this.finished = false;
     this.drained = false;
+    // Signal evidence is numeric only. Count samples copied from the PCM ring;
+    // underrun fills and the deliberate drain grace are never counted.
+    this.signal = {
+      frames: 0,
+      samples: 0,
+      sumSquares: 0,
+      peak: 0,
+      quanta: 0,
+      minQuantumRms: null,
+      maxQuantumRms: 0,
+      lowEnergyFrames: 0,
+      lowEnergyQuanta: 0,
+      currentLowEnergyFrames: 0,
+      maxLowEnergyFrames: 0,
+    };
+    this.lowEnergyThresholdRms = Math.pow(10, -50 / 20);
     // A render quantum is submitted ahead of the device. Keep the node
     // connected briefly after its last PCM frame so the output route can
     // actually play that frame before the main thread tears the node down.
@@ -126,18 +142,32 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
         });
       }
       if (this.available < this.recoveryFrames) {
+        // Starvation zeros are not PCM signal and break a contiguous PCM run.
+        this.signal.currentLowEnergyFrames = 0;
         for (const channel of output) channel.fill(0);
         this.rebufferSilentFrames += frames;
         return true;
       }
       this.reportRecoveredUnderrun();
     }
+    let quantumPcmFrames = 0;
+    let quantumSampleCount = 0;
+    let quantumSumSquares = 0;
+    let quantumPeak = 0;
     for (let frame = 0; frame < frames; frame += 1) {
       const hasSample = this.available > 0;
       for (let channel = 0; channel < output.length; channel += 1) {
-        output[channel][frame] = hasSample ? this.rings[channel][this.read] : 0;
+        const sample = hasSample ? this.rings[channel][this.read] : 0;
+        output[channel][frame] = sample;
+        if (hasSample) {
+          const magnitude = Math.abs(sample);
+          quantumPeak = Math.max(quantumPeak, magnitude);
+          quantumSumSquares += sample * sample;
+          quantumSampleCount += 1;
+        }
       }
       if (hasSample) {
+        quantumPcmFrames += 1;
         if (this.firstRenderContextFrame === null) {
           this.firstRenderContextFrame = currentFrame + frame;
           this.port.postMessage({
@@ -151,6 +181,33 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
         this.renderedFrames += 1;
         this.consumedSinceCredit += 1;
       }
+    }
+    if (quantumPcmFrames > 0) {
+      const signal = this.signal;
+      const rms = Math.sqrt(quantumSumSquares / quantumSampleCount);
+      signal.frames += quantumPcmFrames;
+      signal.samples += quantumSampleCount;
+      signal.sumSquares += quantumSumSquares;
+      signal.peak = Math.max(signal.peak, quantumPeak);
+      signal.quanta += 1;
+      signal.minQuantumRms = signal.minQuantumRms === null
+        ? rms : Math.min(signal.minQuantumRms, rms);
+      signal.maxQuantumRms = Math.max(signal.maxQuantumRms, rms);
+      if (rms <= this.lowEnergyThresholdRms) {
+        signal.lowEnergyFrames += quantumPcmFrames;
+        signal.lowEnergyQuanta += 1;
+        signal.currentLowEnergyFrames += quantumPcmFrames;
+        signal.maxLowEnergyFrames = Math.max(
+          signal.maxLowEnergyFrames, signal.currentLowEnergyFrames,
+        );
+      } else {
+        signal.currentLowEnergyFrames = 0;
+      }
+      // A partial quantum ends at a non-PCM output frame. Count only its PCM
+      // prefix, then close the run so later audio cannot bridge that gap.
+      if (quantumPcmFrames < frames) signal.currentLowEnergyFrames = 0;
+    } else {
+      this.signal.currentLowEnergyFrames = 0;
     }
     if (this.receivedAudio && !this.finished && !this.rebuffering) {
       this.minBufferedFrames = this.minBufferedFrames === null
@@ -193,6 +250,16 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
         minBufferedFrames: this.minBufferedFrames,
         firstReceiveContextFrame: this.firstReceiveContextFrame,
         firstRenderContextFrame: this.firstRenderContextFrame,
+        pcmSignalFrames: this.signal.frames,
+        pcmSignalRms: this.signal.samples > 0
+          ? Math.sqrt(this.signal.sumSquares / this.signal.samples) : null,
+        pcmSignalPeak: this.signal.samples > 0 ? this.signal.peak : null,
+        pcmSignalMinQuantumRms: this.signal.minQuantumRms,
+        pcmSignalMaxQuantumRms: this.signal.quanta > 0 ? this.signal.maxQuantumRms : null,
+        pcmLowEnergyThresholdRms: this.lowEnergyThresholdRms,
+        pcmLowEnergyFrames: this.signal.lowEnergyFrames,
+        pcmLowEnergyQuanta: this.signal.lowEnergyQuanta,
+        pcmMaxLowEnergyFrames: this.signal.maxLowEnergyFrames,
       });
     }
     return true;

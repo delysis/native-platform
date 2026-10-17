@@ -881,6 +881,16 @@
       worklet_min_buffered_frames: null,
       worklet_first_receive_context_frame: null,
       worklet_first_render_context_frame: null,
+      worklet_final_metrics_received: false,
+      worklet_pcm_signal_frames: null,
+      worklet_pcm_signal_rms: null,
+      worklet_pcm_signal_peak: null,
+      worklet_pcm_signal_min_quantum_rms: null,
+      worklet_pcm_signal_max_quantum_rms: null,
+      worklet_pcm_low_energy_threshold_rms: null,
+      worklet_pcm_low_energy_frames: null,
+      worklet_pcm_low_energy_quanta: null,
+      worklet_pcm_max_low_energy_frames: null,
     };
     const rendererNow = () => globalThis.performance?.now?.() ?? Date.now();
     const segmentSequences = new Map();
@@ -1013,7 +1023,30 @@
     const reportRendererMetrics = (reason) => {
       if (metricsReported) return;
       metricsReported = true;
-      onRendererMetrics?.({ ...rendererMetrics, reason });
+      const workletMetricsStatus = !rendererMetrics.worklet
+        ? "not_applicable"
+        : rendererMetrics.worklet_final_metrics_received ? "complete" : "unreported";
+      const finalOnlyMetrics = [
+        "worklet_render_quanta", "worklet_max_buffered_frames", "underruns",
+        "worklet_recoveries", "worklet_rebuffered_frames",
+        "worklet_min_buffered_frames", "worklet_first_receive_context_frame",
+        "worklet_pcm_signal_frames", "worklet_pcm_signal_rms",
+        "worklet_pcm_signal_peak", "worklet_pcm_signal_min_quantum_rms",
+        "worklet_pcm_signal_max_quantum_rms", "worklet_pcm_low_energy_threshold_rms",
+        "worklet_pcm_low_energy_frames", "worklet_pcm_low_energy_quanta",
+        "worklet_pcm_max_low_energy_frames",
+      ];
+      const metrics = { ...rendererMetrics, reason, worklet_metrics_status: workletMetricsStatus };
+      if (rendererMetrics.worklet) {
+        metrics.worklet_final_metrics_received = rendererMetrics.worklet_final_metrics_received;
+        metrics.worklet_underrun_events_observed = rendererMetrics.underruns;
+        if (!rendererMetrics.worklet_final_metrics_received) {
+          for (const key of finalOnlyMetrics) metrics[key] = null;
+        }
+      }
+      // Queue depth and first-render frame are main-thread observations and
+      // remain available when stopped playback never reports its final drain.
+      onRendererMetrics?.(metrics);
     };
 
     const schedulePending = () => {
@@ -1170,16 +1203,40 @@
           } else if (data?.type === "error") {
             onPlaybackError?.(new Error(`speech_stream_worklet_failed: ${data.message || "PCM output failed."}`));
           } else if (data?.type === "drained" && playing && !stopped) {
-            rendererMetrics.worklet_render_quanta = Number(data.renderQuanta || 0);
-            rendererMetrics.worklet_max_buffered_frames = Number(data.maxBufferedFrames || 0);
-            rendererMetrics.underruns = Math.max(rendererMetrics.underruns, Number(data.underruns || 0));
-            rendererMetrics.worklet_recoveries = Number(data.recoveries || 0);
-            rendererMetrics.worklet_rebuffered_frames = Number(data.rebufferedFrames || 0);
-            rendererMetrics.worklet_min_buffered_frames = Number.isFinite(Number(data.minBufferedFrames))
+            rendererMetrics.worklet_final_metrics_received = true;
+            rendererMetrics.worklet_pcm_signal_frames = Number.isFinite(data.pcmSignalFrames)
+              ? Number(data.pcmSignalFrames) : null;
+            rendererMetrics.worklet_pcm_signal_rms = Number.isFinite(data.pcmSignalRms)
+              ? Number(data.pcmSignalRms) : null;
+            rendererMetrics.worklet_pcm_signal_peak = Number.isFinite(data.pcmSignalPeak)
+              ? Number(data.pcmSignalPeak) : null;
+            rendererMetrics.worklet_pcm_signal_min_quantum_rms = Number.isFinite(data.pcmSignalMinQuantumRms)
+              ? Number(data.pcmSignalMinQuantumRms) : null;
+            rendererMetrics.worklet_pcm_signal_max_quantum_rms = Number.isFinite(data.pcmSignalMaxQuantumRms)
+              ? Number(data.pcmSignalMaxQuantumRms) : null;
+            rendererMetrics.worklet_pcm_low_energy_threshold_rms = Number.isFinite(data.pcmLowEnergyThresholdRms)
+              ? Number(data.pcmLowEnergyThresholdRms) : null;
+            rendererMetrics.worklet_pcm_low_energy_frames = Number.isFinite(data.pcmLowEnergyFrames)
+              ? Number(data.pcmLowEnergyFrames) : null;
+            rendererMetrics.worklet_pcm_low_energy_quanta = Number.isFinite(data.pcmLowEnergyQuanta)
+              ? Number(data.pcmLowEnergyQuanta) : null;
+            rendererMetrics.worklet_pcm_max_low_energy_frames = Number.isFinite(data.pcmMaxLowEnergyFrames)
+              ? Number(data.pcmMaxLowEnergyFrames) : null;
+            rendererMetrics.worklet_render_quanta = Number.isFinite(data.renderQuanta)
+              ? Number(data.renderQuanta) : null;
+            rendererMetrics.worklet_max_buffered_frames = Number.isFinite(data.maxBufferedFrames)
+              ? Number(data.maxBufferedFrames) : null;
+            rendererMetrics.underruns = Number.isFinite(data.underruns)
+              ? Number(data.underruns) : null;
+            rendererMetrics.worklet_recoveries = Number.isFinite(data.recoveries)
+              ? Number(data.recoveries) : null;
+            rendererMetrics.worklet_rebuffered_frames = Number.isFinite(data.rebufferedFrames)
+              ? Number(data.rebufferedFrames) : null;
+            rendererMetrics.worklet_min_buffered_frames = Number.isFinite(data.minBufferedFrames)
               ? Number(data.minBufferedFrames) : null;
-            rendererMetrics.worklet_first_receive_context_frame = Number.isFinite(Number(data.firstReceiveContextFrame))
+            rendererMetrics.worklet_first_receive_context_frame = Number.isFinite(data.firstReceiveContextFrame)
               ? Number(data.firstReceiveContextFrame) : null;
-            rendererMetrics.worklet_first_render_context_frame = Number.isFinite(Number(data.firstRenderContextFrame))
+            rendererMetrics.worklet_first_render_context_frame = Number.isFinite(data.firstRenderContextFrame)
               ? Number(data.firstRenderContextFrame) : rendererMetrics.worklet_first_render_context_frame;
             playing = false;
             workletNode.disconnect();
@@ -2267,11 +2324,17 @@
     await stopCallBed();
     if (voiceCallEpoch !== epoch || !voiceCallActive) return false;
     const context = new AudioContext();
-    try {
-      await context.resume();
-    } catch (error) {
+    // Request resume synchronously on the user-gesture path, then let the
+    // Calling surface cross a paint boundary before scheduling audible tones.
+    const resumeResult = context.resume().then(
+      () => ({ ok: true }),
+      (error) => ({ error }),
+    );
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const resumed = await resumeResult;
+    if (resumed.error) {
       await context.close().catch(() => {});
-      throw error;
+      throw resumed.error;
     }
     if (voiceCallEpoch !== epoch || !voiceCallActive) {
       await context.close().catch(() => {});
@@ -2560,9 +2623,9 @@
     setText("voice-call-name", name);
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
-    // Establish the visible call and begin ringing from the user's gesture.
-    // Model, microphone, and history-recovery setup continues in parallel;
-    // the exact audio context result is checked before we admit the greeting.
+    // Request audio resume on the gesture path. The helper waits for the
+    // Calling surface to paint before it schedules tones; call preparation
+    // then proceeds while the ring and setup waits settle.
     const ringingReady = startCallRinging(epoch).then(
       (started) => {
         if (started && voiceCallEpoch === epoch && voiceCallActive) {
@@ -2573,7 +2636,12 @@
       (error) => ({ error }),
     );
     try {
+      const activityGuardWaitStartedAt = performance.now();
+      markVoiceLatency("call_activity_guard_wait_started");
       await activityGuard.ready;
+      markVoiceLatency("call_activity_guard_ready", {
+        wait_ms: Math.max(0, Math.round(performance.now() - activityGuardWaitStartedAt)),
+      });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       const ringResult = await ringingReady;
       if (ringResult.error) throw ringResult.error;
@@ -2581,7 +2649,12 @@
       // Do not admit Gemma warming or microphone setup while an idle Parakeet
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
+      const recoverySuspendWaitStartedAt = performance.now();
+      markVoiceLatency("call_history_recovery_suspend_wait_started");
       releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
+      markVoiceLatency("call_history_recovery_suspend_wait_finished", {
+        wait_ms: Math.max(0, Math.round(performance.now() - recoverySuspendWaitStartedAt)),
+      });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Start independent resident/worklet readiness while the required
       // microphone authorization and first CoreAudio callback are pending.
@@ -4179,6 +4252,10 @@
     const nextPrefillStarted = latestSinceAttempt("next_turn_prefill_started");
     const nextPrefillReady = latestSinceAttempt("next_turn_prefill_ready");
     const playbackRenderer = latestSinceAttempt("playback_renderer");
+    const playbackWorkletMetricsReported = playbackRenderer?.worklet === true
+      && playbackRenderer?.worklet_final_metrics_received === true;
+    const playbackRendererCountersKnown = playbackRenderer?.worklet !== true
+      || playbackWorkletMetricsReported;
     const playbackUnderrun = latestSinceAttempt("playback_underrun");
     const playbackStarted = latestSinceAttempt("playback_started");
     const playbackRendered = latestSinceAttempt("playback_render_started");
@@ -4239,6 +4316,10 @@
       : null;
     return {
       call_request_to_ringing_ms: delta("call_requested", "call_ringing_started"),
+      call_activity_guard_wait_ms: delta("call_activity_guard_wait_started", "call_activity_guard_ready"),
+      call_history_recovery_suspend_wait_ms: delta(
+        "call_history_recovery_suspend_wait_started", "call_history_recovery_suspend_wait_finished",
+      ),
       call_request_to_microphone_ready_ms: delta("call_requested", "call_microphone_ready"),
       microphone_ready_to_ringing_ms: delta("call_microphone_ready", "call_ringing_started"),
       microphone_native_first_sample_ms:
@@ -4833,32 +4914,59 @@
       playback_renderer_schedule_max_ms: Number.isFinite(Number(playbackRenderer?.schedule_max_us))
         ? Math.round(Number(playbackRenderer.schedule_max_us) / 10) / 100
         : null,
-      playback_renderer_underruns: Number.isFinite(Number(playbackRenderer?.underruns))
-        ? Number(playbackRenderer.underruns)
-        : null,
-      playback_renderer_recoveries: Number.isFinite(Number(playbackRenderer?.worklet_recoveries))
-        ? Number(playbackRenderer.worklet_recoveries)
-        : null,
-      playback_renderer_rebuffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_rebuffered_frames))
-        ? Number(playbackRenderer.worklet_rebuffered_frames)
-        : null,
-      playback_renderer_max_buffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_max_buffered_frames))
-        ? Number(playbackRenderer.worklet_max_buffered_frames)
-        : null,
-      playback_renderer_max_queued_frames: Number.isFinite(Number(playbackRenderer?.worklet_max_queued_frames))
-        ? Number(playbackRenderer.worklet_max_queued_frames)
-        : null,
-      playback_renderer_min_buffered_frames: Number.isFinite(Number(playbackRenderer?.worklet_min_buffered_frames))
-        ? Number(playbackRenderer.worklet_min_buffered_frames)
-        : null,
-      playback_renderer_first_receive_context_frame:
-        Number.isFinite(Number(playbackRenderer?.worklet_first_receive_context_frame))
-          ? Number(playbackRenderer.worklet_first_receive_context_frame)
-          : null,
-      playback_renderer_first_render_context_frame:
-        Number.isFinite(Number(playbackRenderer?.worklet_first_render_context_frame))
-          ? Number(playbackRenderer.worklet_first_render_context_frame)
-          : null,
+      // These samples reached the AudioWorklet output only; they do not
+      // establish what reached the physical speaker.
+      playback_renderer_metrics_complete: playbackRenderer?.worklet === true
+        ? playbackWorkletMetricsReported : null,
+      playback_renderer_underruns: playbackRendererCountersKnown
+        && typeof playbackRenderer?.underruns === "number" && Number.isFinite(playbackRenderer.underruns)
+        ? playbackRenderer.underruns : null,
+      playback_renderer_pcm_signal_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_frames)
+        ? playbackRenderer.worklet_pcm_signal_frames : null,
+      playback_renderer_pcm_signal_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_rms)
+        ? playbackRenderer.worklet_pcm_signal_rms : null,
+      playback_renderer_pcm_signal_peak: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_peak)
+        ? playbackRenderer.worklet_pcm_signal_peak : null,
+      playback_renderer_pcm_signal_min_quantum_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_min_quantum_rms)
+        ? playbackRenderer.worklet_pcm_signal_min_quantum_rms : null,
+      playback_renderer_pcm_signal_max_quantum_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_signal_max_quantum_rms)
+        ? playbackRenderer.worklet_pcm_signal_max_quantum_rms : null,
+      playback_renderer_pcm_low_energy_threshold_rms: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_threshold_rms)
+        ? playbackRenderer.worklet_pcm_low_energy_threshold_rms : null,
+      playback_renderer_pcm_low_energy_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_frames)
+        ? playbackRenderer.worklet_pcm_low_energy_frames : null,
+      playback_renderer_pcm_low_energy_quanta: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_low_energy_quanta)
+        ? playbackRenderer.worklet_pcm_low_energy_quanta : null,
+      playback_renderer_pcm_max_low_energy_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_pcm_max_low_energy_frames)
+        ? playbackRenderer.worklet_pcm_max_low_energy_frames : null,
+      playback_renderer_recoveries: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_recoveries)
+        ? playbackRenderer.worklet_recoveries : null,
+      playback_renderer_rebuffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_rebuffered_frames)
+        ? playbackRenderer.worklet_rebuffered_frames : null,
+      playback_renderer_max_buffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_max_buffered_frames)
+        ? playbackRenderer.worklet_max_buffered_frames : null,
+      playback_renderer_max_queued_frames: typeof playbackRenderer?.worklet_max_queued_frames === "number" && Number.isFinite(playbackRenderer.worklet_max_queued_frames)
+        ? playbackRenderer.worklet_max_queued_frames : null,
+      playback_renderer_min_buffered_frames: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_min_buffered_frames)
+        ? playbackRenderer.worklet_min_buffered_frames : null,
+      playback_renderer_first_receive_context_frame: playbackWorkletMetricsReported
+        && Number.isFinite(playbackRenderer?.worklet_first_receive_context_frame)
+        ? playbackRenderer.worklet_first_receive_context_frame : null,
+      playback_renderer_first_render_context_frame: typeof playbackRenderer?.worklet_first_render_context_frame === "number" && Number.isFinite(playbackRenderer.worklet_first_render_context_frame)
+        ? playbackRenderer.worklet_first_render_context_frame : null,
       playback_underrun_occurrences: Number.isFinite(Number(playbackUnderrun?.occurrences))
         ? Number(playbackUnderrun.occurrences)
         : 0,
@@ -4925,7 +5033,9 @@
     "playback_packet_admitted",
   ]);
   const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
-    "call_requested", "call_ringing_started", "call_conversation_ready",
+    "call_requested", "call_ringing_started", "call_activity_guard_wait_started",
+    "call_activity_guard_ready", "call_history_recovery_suspend_wait_started",
+    "call_history_recovery_suspend_wait_finished", "call_conversation_ready",
     "audio_prefill_begin_requested", "audio_prefill_session_ready",
     "audio_prefill_begin_failed", "audio_prefill_push_failed",
     "audio_prefill_wait_expired", "audio_prefill_drain_failed",
@@ -5164,8 +5274,21 @@
       for (const key of [
         "silence_to_first_content_ms", "silence_to_first_token_ms", "silence_to_tts_pcm_ms",
         "generation_first_token_ms", "generation_finish_ms", "capture_to_first_sample_ms",
-        "barge_in_playback_stop_ms", "playback_underrun_total_gap_ms",
-        "playback_underrun_max_gap_ms", "tts_segments", "tts_total_ms",
+        "barge_in_playback_stop_ms", "call_activity_guard_wait_ms",
+        "call_history_recovery_suspend_wait_ms", "playback_underrun_total_gap_ms",
+        "playback_underrun_max_gap_ms", "playback_renderer_metrics_complete",
+        "playback_renderer_underruns", "playback_renderer_pcm_signal_frames",
+        "playback_renderer_pcm_signal_rms", "playback_renderer_pcm_signal_peak",
+        "playback_renderer_pcm_signal_min_quantum_rms",
+        "playback_renderer_pcm_signal_max_quantum_rms",
+        "playback_renderer_pcm_low_energy_threshold_rms",
+        "playback_renderer_pcm_low_energy_frames",
+        "playback_renderer_pcm_low_energy_quanta",
+        "playback_renderer_pcm_max_low_energy_frames",
+        "playback_renderer_recoveries", "playback_renderer_rebuffered_frames",
+        "playback_renderer_max_buffered_frames", "playback_renderer_max_queued_frames",
+        "playback_renderer_min_buffered_frames", "playback_renderer_first_receive_context_frame",
+        "playback_renderer_first_render_context_frame", "tts_segments", "tts_total_ms",
       ]) {
         const value = summary?.[key];
         if (value === null || typeof value === "number" || typeof value === "boolean") compactSummary[key] = value;
@@ -6762,13 +6885,16 @@
           const samples = physicalCapture.samples();
           const identity = physicalCapture.transcription.metrics();
           const source = live?.source;
-          const digest = await sha256Hex(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength));
+          // The same resampled PCM chunks are retained in capturedPcm and
+          // appended to the native transcription producer. Its completed
+          // receipt binds that accepted stream to this capture identity/count.
+          // Hash the archival WAV below to bind the durable attachment; avoid
+          // rescanning the same PCM buffer in JavaScript.
           const archivedWavSha256 = await sha256Hex(encodePcmWav(samples));
           if (source?.identity?.turn !== identity.turn
               || source?.identity?.capture !== identity.capture
               || source?.identity?.conversation !== conversation
               || source?.samples !== samples.length
-              || source?.pcm_f32le_sha256 !== digest
               || catalog.root_sha256 !== archivedWavSha256) {
             throw new Error("live_transcription_source_mismatch");
           }

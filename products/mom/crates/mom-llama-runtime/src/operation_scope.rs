@@ -1,6 +1,6 @@
 use llama_native_host::{NativeClient, NativeHost};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const MENTION_RUNNING: u8 = 0;
@@ -168,6 +168,22 @@ struct OperationScopeInner {
     native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
     voice_call_sessions: Arc<Mutex<HashSet<String>>>,
+    voice_call_waiters: Arc<AtomicUsize>,
+}
+
+struct VoiceCallWaiter<'a>(&'a AtomicUsize);
+
+impl<'a> VoiceCallWaiter<'a> {
+    fn new(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self(waiters)
+    }
+}
+
+impl Drop for VoiceCallWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Runtime-local authority for every live Mom product operation.
@@ -258,6 +274,7 @@ impl OperationScope {
                 children: Vec::new(),
             }),
             voice_call_sessions: Arc::new(Mutex::new(HashSet::new())),
+            voice_call_waiters: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -298,6 +315,9 @@ impl OperationScope {
         Arc::get_mut(&mut child.0)
             .expect("new operation scope has one owner")
             .voice_call_sessions = Arc::clone(&self.0.voice_call_sessions);
+        Arc::get_mut(&mut child.0)
+            .expect("new operation scope has one owner")
+            .voice_call_waiters = Arc::clone(&self.0.voice_call_waiters);
         registries.children.push(Arc::downgrade(&child.0));
         Ok(child)
     }
@@ -365,9 +385,9 @@ impl OperationScope {
         {
             anyhow::bail!("voice call activity identity is invalid");
         }
-        // Serialize call activation against a checkpoint's native snapshot.
-        // If a snapshot has already started, setup waits before opening the
-        // microphone; once activated, no later checkpoint can enter.
+        // Signal before acquiring the snapshot lock. Its native copy must
+        // settle, but allocation and snapshot publication can yield to this caller.
+        let _waiting = active.then(|| VoiceCallWaiter::new(&self.0.voice_call_waiters));
         let mut sessions = self
             .0
             .voice_call_sessions
@@ -386,19 +406,19 @@ impl OperationScope {
 
     pub(crate) fn with_idle_voice_checkpoint<T>(
         &self,
-        operation: impl FnOnce() -> anyhow::Result<T>,
+        operation: impl FnOnce(Arc<AtomicUsize>) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
         let sessions = self
             .0
             .voice_call_sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?;
-        if !sessions.is_empty() {
+        if !sessions.is_empty() || self.0.voice_call_waiters.load(Ordering::Acquire) != 0 {
             return Ok(None);
         }
-        // Keep the shared session lock through the snapshot. Call activation
-        // on the parent or any child waits before microphone setup can begin.
-        operation().map(Some)
+        // Keep admission until native copying settles. The independent counter
+        // lets foreground calls preempt without acquiring this snapshot lock.
+        operation(Arc::clone(&self.0.voice_call_waiters)).map(Some)
     }
 
     pub(crate) fn has_active_voice_call(&self) -> bool {
@@ -749,7 +769,7 @@ mod tests {
         assert!(child.has_active_voice_call());
         let mut snapshot_started = false;
         let skipped = child
-            .with_idle_voice_checkpoint(|| {
+            .with_idle_voice_checkpoint(|_| {
                 snapshot_started = true;
                 Ok(())
             })
@@ -762,13 +782,71 @@ mod tests {
         assert!(!scope.has_active_voice_call());
         assert!(!child.has_active_voice_call());
         let snapshot = child
-            .with_idle_voice_checkpoint(|| Ok("idle"))
+            .with_idle_voice_checkpoint(|_| Ok("idle"))
             .expect("idle checkpoint");
         assert_eq!(snapshot, Some("idle"));
         assert!(
             scope
                 .set_voice_call_activity("bad\nidentity", true)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn waiting_calls_preempt_checkpoint_before_acquiring_its_lock() {
+        use std::sync::{atomic::Ordering, mpsc};
+        use std::time::{Duration, Instant};
+        let scope = OperationScope::detached();
+        let child = scope.child().expect("child");
+        let (started_tx, started_rx) = mpsc::channel();
+        let snapshot = std::thread::spawn(move || {
+            child
+                .with_idle_voice_checkpoint(|waiters| {
+                    started_tx.send(()).expect("started");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while waiters.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    assert_eq!(
+                        waiters.load(Ordering::Acquire),
+                        2,
+                        "activation must signal without waiting for the checkpoint mutex"
+                    );
+                    Ok(())
+                })
+                .expect("checkpoint")
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot entered");
+        let calls: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|id| {
+                let scope = scope.clone();
+                std::thread::spawn(move || scope.set_voice_call_activity(id, true))
+            })
+            .collect();
+        assert_eq!(snapshot.join().expect("snapshot thread"), Some(()));
+        for call in calls {
+            call.join().expect("caller").expect("activated");
+        }
+        assert_eq!(scope.0.voice_call_waiters.load(Ordering::Acquire), 0);
+        assert!(
+            scope
+                .with_idle_voice_checkpoint(|_| Ok(()))
+                .expect("guard")
+                .is_none()
+        );
+        scope
+            .set_voice_call_activity("first", false)
+            .expect("close first");
+        assert!(scope.has_active_voice_call());
+        scope
+            .set_voice_call_activity("second", false)
+            .expect("close second");
+        assert_eq!(
+            scope.with_idle_voice_checkpoint(|_| Ok(())).expect("idle"),
+            Some(())
         );
     }
 

@@ -8,7 +8,6 @@ use llama_native_types::{
     PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob, SequenceStateCell,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -69,7 +68,6 @@ pub struct PrefixCacheMetadata {
     pub label: String,
     pub fingerprint: CacheFingerprint,
     pub token_ids: Vec<i32>,
-    pub token_sha256: String,
     pub state_bytes: usize,
     pub created_at_ms: u128,
     pub last_used_at_ms: u128,
@@ -92,7 +90,6 @@ impl PrefixCacheMetadata {
         now_ms: u128,
     ) -> Self {
         let id = id.into();
-        let token_sha256 = token_sha256(&token_ids);
         Self {
             label: id.clone(),
             id,
@@ -100,7 +97,6 @@ impl PrefixCacheMetadata {
             owner_id: None,
             fingerprint,
             token_ids,
-            token_sha256,
             state_bytes,
             created_at_ms: now_ms,
             last_used_at_ms: now_ms,
@@ -142,7 +138,6 @@ impl PrefixCacheMetadata {
         self.state == CacheEntryState::Ready
             && (!self.token_ids.is_empty() || !self.cells.is_empty())
             && self.state_bytes > 0
-            && self.token_sha256 == token_sha256(&self.token_ids)
     }
 }
 
@@ -355,7 +350,6 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         label,
         fingerprint,
         token_ids,
-        token_sha256,
         state_bytes: _,
         created_at_ms: _,
         last_used_at_ms: _,
@@ -386,12 +380,12 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         bytes,
         token_ids: sequence_tokens,
         cells,
+        storage_proof: _,
     } = sequence;
     let reconstruction_bytes = match reconstruction {
         Some(SequenceReconstruction {
             sequence_id: _,
             header,
-            export_receipt: _,
             token_replay_allowed: _,
         }) => header.capacity(),
         None => 0,
@@ -406,7 +400,6 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         id.capacity(),
         owner_id.as_ref().map_or(0, String::capacity),
         label.capacity(),
-        token_sha256.capacity(),
         token_ids.capacity().checked_mul(size_of::<i32>())?,
         sequence_tokens.capacity().checked_mul(size_of::<i32>())?,
         cells
@@ -417,6 +410,7 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
             .checked_mul(size_of::<llama_native_types::SequenceStateCell>())?,
         bytes.capacity(),
         reconstruction_bytes,
+        sequence.storage_proof_metadata_bytes(),
         lora_adapters_sha256
             .capacity()
             .checked_mul(size_of::<String>())?,
@@ -687,15 +681,6 @@ impl MemoryPrefixCache {
     }
 }
 
-#[must_use]
-pub fn token_sha256(token_ids: &[i32]) -> String {
-    let mut hasher = Sha256::new();
-    for token in token_ids {
-        hasher.update(token.to_le_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +727,7 @@ mod tests {
                 bytes: (vec![7; bytes]).into(),
                 token_ids: tokens.to_vec(),
                 cells: Vec::new(),
+                storage_proof: None,
             },
         }
     }
@@ -1090,7 +1076,7 @@ mod tests {
     fn corrupt_metadata_or_state_never_enters_memory_cache() {
         let mut cache = MemoryPrefixCache::new(64);
         let mut corrupt = value("corrupt", CacheTier::PersonaPack, &[1, 2], 4, 1);
-        corrupt.metadata.token_sha256 = "wrong".to_string();
+        corrupt.metadata.token_ids[0] = 99;
         assert_eq!(cache.insert(corrupt), CacheInsertOutcome::InvalidRejected);
         assert!(cache.is_empty());
     }

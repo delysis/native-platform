@@ -899,6 +899,64 @@ test("worklet playback joins producer, admission, render, and consumption on the
   await controller.stop();
 });
 
+test("stopped worklet reports unknown final counters but keeps observed queue and first render", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const receipts = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onRendererMetrics: (metrics) => receipts.push(metrics),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  node.port.onmessage({ data: {
+    type: "render_started", bufferedFrames: 3_000, audioContextFrame: 17,
+  } });
+  await controller.stop();
+  const receipt = receipts.at(-1);
+  assert.equal(receipt.worklet_metrics_status, "unreported");
+  assert.equal(receipt.worklet_final_metrics_received, false);
+  assert.equal(receipt.underruns, null);
+  assert.equal(receipt.worklet_underrun_events_observed, 0);
+  assert.equal(receipt.worklet_render_quanta, null);
+  assert.equal(receipt.worklet_pcm_low_energy_frames, null);
+  assert.equal(receipt.worklet_max_queued_frames, 3_000);
+  assert.equal(receipt.worklet_first_render_context_frame, 17);
+});
+
+test("drained worklet preserves measured zeros and an unknown nullable minimum", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const receipts = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onRendererMetrics: (metrics) => receipts.push(metrics),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  controller.finish();
+  node.port.onmessage({ data: {
+    type: "drained", renderQuanta: 0, maxBufferedFrames: 0,
+    underruns: 0, recoveries: 0, rebufferedFrames: 0,
+    minBufferedFrames: null, firstReceiveContextFrame: 0,
+    firstRenderContextFrame: null, pcmSignalFrames: 0, pcmSignalRms: null,
+    pcmSignalPeak: null, pcmSignalMinQuantumRms: null,
+    pcmSignalMaxQuantumRms: null, pcmLowEnergyThresholdRms: null,
+    pcmLowEnergyFrames: 0, pcmLowEnergyQuanta: 0,
+    pcmMaxLowEnergyFrames: 0,
+  } });
+  const receipt = receipts.at(-1);
+  assert.equal(receipt.worklet_metrics_status, "complete");
+  assert.equal(receipt.worklet_final_metrics_received, true);
+  assert.equal(receipt.underruns, 0);
+  assert.equal(receipt.worklet_render_quanta, 0);
+  assert.equal(receipt.worklet_pcm_low_energy_frames, 0);
+  assert.equal(receipt.worklet_min_buffered_frames, null);
+  assert.equal(receipt.worklet_first_receive_context_frame, 0);
+  assert.equal(receipt.worklet_first_render_context_frame, null);
+  await controller.stop();
+});
+
 test("retained voice playback uses the audio-thread ring and can replay", async () => {
   const h = speechLifetimeHarness({ worklet: true });
   const ended = [];

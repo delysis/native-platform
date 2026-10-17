@@ -198,6 +198,16 @@ pub(crate) struct AcquiredModels {
     pub projector: PathBuf,
     pub mtp_assistant: PathBuf,
     pub qwen_root: PathBuf,
+    pub verified_model_artifacts: Option<mom_llama_runtime::config::VerifiedModelArtifacts>,
+}
+
+struct AcquiredArtifact {
+    path: PathBuf,
+    verified_identity: Option<String>,
+}
+
+fn file_identity(metadata: &fs::Metadata) -> String {
+    mom_llama_runtime::engine::model_artifact_file_identity(metadata)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -444,10 +454,29 @@ fn acquire_required_models_in(
         .ok_or(AcquisitionError::InvalidManifest("qwen-config"))?
         .to_path_buf();
     Ok(AcquiredModels {
-        gemma: installed[0].clone(),
-        projector: installed[1].clone(),
-        mtp_assistant: installed[2].clone(),
+        gemma: installed[0].path.clone(),
+        projector: installed[1].path.clone(),
+        mtp_assistant: installed[2].path.clone(),
         qwen_root,
+        verified_model_artifacts: installed[0]
+            .verified_identity
+            .as_ref()
+            .zip(installed[1].verified_identity.as_ref())
+            .map(|(model_identity, projector_identity)| {
+                use mom_llama_runtime::config::{VerifiedArtifactDigest, VerifiedModelArtifacts};
+                VerifiedModelArtifacts {
+                    model: VerifiedArtifactDigest {
+                        path: installed[0].path.clone(),
+                        sha256: REQUIRED_ARTIFACTS[0].sha256.to_owned(),
+                        file_identity: model_identity.clone(),
+                    },
+                    projector: Some(VerifiedArtifactDigest {
+                        path: installed[1].path.clone(),
+                        sha256: REQUIRED_ARTIFACTS[1].sha256.to_owned(),
+                        file_identity: projector_identity.clone(),
+                    }),
+                }
+            }),
     })
 }
 
@@ -477,7 +506,7 @@ fn acquire_one(
     client: &Client,
     verify_existing: bool,
     mut progress: impl FnMut(u64),
-) -> Result<PathBuf, AcquisitionError> {
+) -> Result<AcquiredArtifact, AcquisitionError> {
     let paths = cache_paths(root, artifact)?;
     real_dir(paths.blob.parent().expect("blob parent"), artifact.id)?;
     real_dir(
@@ -490,11 +519,16 @@ fn acquire_one(
 
     match verified_snapshot(&paths, artifact) {
         Ok(true) => {
-            if verify_existing {
-                verify_regular_file(&paths.blob, artifact)?;
-            }
+            let verified_identity = if verify_existing {
+                Some(verify_regular_file(&paths.blob, artifact)?)
+            } else {
+                None
+            };
             progress(artifact.bytes);
-            return Ok(paths.snapshot);
+            return Ok(AcquiredArtifact {
+                path: paths.snapshot,
+                verified_identity,
+            });
         }
         Ok(false) => {}
         Err(AcquisitionError::SizeMismatch { .. }) => {
@@ -505,10 +539,13 @@ fn acquire_one(
     }
     if paths.blob.exists() {
         match verify_regular_file(&paths.blob, artifact) {
-            Ok(()) => {
+            Ok(identity) => {
                 publish(&paths, artifact)?;
                 progress(artifact.bytes);
-                return Ok(paths.snapshot);
+                return Ok(AcquiredArtifact {
+                    path: paths.snapshot,
+                    verified_identity: Some(identity),
+                });
             }
             Err(AcquisitionError::SizeMismatch { .. } | AcquisitionError::DigestMismatch(_)) => {
                 fs::remove_file(&paths.blob).map_err(|source| AcquisitionError::Io {
@@ -524,9 +561,12 @@ fn acquire_one(
     let mut last_error = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         match download_attempt(&paths, artifact, client, &artifact.url(), &mut progress) {
-            Ok(()) => {
+            Ok(identity) => {
                 publish(&paths, artifact)?;
-                return Ok(paths.snapshot);
+                return Ok(AcquiredArtifact {
+                    path: paths.snapshot,
+                    verified_identity: Some(identity),
+                });
             }
             Err(error) => {
                 last_error = error;
@@ -549,7 +589,7 @@ fn download_attempt(
     client: &Client,
     url: &str,
     progress: &mut impl FnMut(u64),
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut partial = OpenOptions::new()
         .read(true)
         .write(true)
@@ -628,10 +668,16 @@ fn download_attempt(
     if digest != artifact.sha256 {
         return Err("SHA-256 mismatch".to_string());
     }
-    drop(partial);
+    // Keep the verified download descriptor open across publication. Metadata
+    // equality binds the receipt to the exact published file without rereading it.
     fs::rename(&paths.partial, &paths.blob).map_err(|error| error.to_string())?;
+    let identity = file_identity(&partial.metadata().map_err(|error| error.to_string())?);
+    let published = file_identity(&fs::metadata(&paths.blob).map_err(|error| error.to_string())?);
+    if identity != published {
+        return Err("published model file changed".into());
+    }
     progress(downloaded);
-    Ok(())
+    Ok(identity)
 }
 
 fn reject_encoded(response: &Response) -> Result<(), String> {
@@ -826,27 +872,26 @@ fn verified_snapshot(paths: &CachePaths, artifact: Artifact) -> Result<bool, Acq
     Ok(true)
 }
 
-fn verify_regular_file(path: &Path, artifact: Artifact) -> Result<(), AcquisitionError> {
+fn verify_regular_file(path: &Path, artifact: Artifact) -> Result<String, AcquisitionError> {
     let mut file = File::open(path).map_err(|source| AcquisitionError::Io {
         operation: "open cached blob",
         path: path.to_path_buf(),
         source,
     })?;
-    let actual = file
-        .metadata()
-        .map_err(|source| AcquisitionError::Io {
-            operation: "inspect cached blob",
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    if actual != artifact.bytes {
+    let metadata = file.metadata().map_err(|source| AcquisitionError::Io {
+        operation: "inspect cached blob",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let actual = metadata.len();
+    if !metadata.is_file() || actual != artifact.bytes {
         return Err(AcquisitionError::SizeMismatch {
             artifact: artifact.id,
             expected: artifact.bytes,
             actual,
         });
     }
+    let before = file_identity(&metadata);
     let digest = hash_prefix(&mut file, actual).map_err(|source| AcquisitionError::Io {
         operation: "hash cached blob",
         path: path.to_path_buf(),
@@ -855,7 +900,23 @@ fn verify_regular_file(path: &Path, artifact: Artifact) -> Result<(), Acquisitio
     if format!("{:x}", digest.finalize()) != artifact.sha256 {
         return Err(AcquisitionError::DigestMismatch(artifact.id));
     }
-    Ok(())
+    let after = file.metadata().map_err(|source| AcquisitionError::Io {
+        operation: "reinspect verified blob",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let path_after = fs::metadata(path).map_err(|source| AcquisitionError::Io {
+        operation: "reinspect verified path",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if before != file_identity(&after) || before != file_identity(&path_after) {
+        return Err(AcquisitionError::UnsafePath {
+            artifact: artifact.id,
+            detail: "file changed during verification".into(),
+        });
+    }
+    Ok(before)
 }
 
 fn hash_prefix(file: &mut File, bytes: u64) -> io::Result<Sha256> {
@@ -967,7 +1028,7 @@ mod tests {
         });
 
         let mut observed = Vec::new();
-        download_attempt(
+        let identity = download_attempt(
             &paths,
             FIXTURE,
             &client().expect("client"),
@@ -978,6 +1039,7 @@ mod tests {
         server.join().expect("fixture server completed");
         assert_eq!(fs::read(&paths.blob).expect("blob"), BYTES);
         assert_eq!(observed.last(), Some(&FIXTURE.bytes));
+        assert_eq!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
     }
 
     #[test]
@@ -995,6 +1057,27 @@ mod tests {
         publish(&paths, FIXTURE).expect("publish");
         assert!(verified_snapshot(&paths, FIXTURE).expect("cached"));
         publish(&paths, FIXTURE).expect("idempotent publish");
+    }
+
+    #[test]
+    fn verified_existing_artifact_carries_file_identity_but_presence_probe_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = cache_paths(root.path(), FIXTURE).unwrap();
+        real_dir(paths.blob.parent().unwrap(), FIXTURE.id).unwrap();
+        real_dir(paths.snapshot.parent().unwrap(), FIXTURE.id).unwrap();
+        fs::write(&paths.blob, BYTES).unwrap();
+        publish(&paths, FIXTURE).unwrap();
+        let acquired = acquire_one(root.path(), FIXTURE, &client().unwrap(), true, |_| {}).unwrap();
+        let identity = acquired.verified_identity.unwrap();
+        assert_eq!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
+        let probe = acquire_one(root.path(), FIXTURE, &client().unwrap(), false, |_| {}).unwrap();
+        assert!(
+            probe.verified_identity.is_none(),
+            "metadata-only discovery cannot mint verification"
+        );
+        fs::write(&paths.blob, b"wrong fixture!").unwrap();
+        assert_ne!(identity, file_identity(&fs::metadata(&paths.blob).unwrap()));
+        assert!(acquire_one(root.path(), FIXTURE, &client().unwrap(), true, |_| {}).is_err());
     }
 
     #[test]

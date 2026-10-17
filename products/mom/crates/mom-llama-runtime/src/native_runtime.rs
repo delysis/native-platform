@@ -353,6 +353,19 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
         namespace: &str,
         expected: &PrefixCacheMetadata,
     ) -> Result<Option<PrefixCacheValue>, NativeError> {
+        if !expected
+            .reconstruction
+            .as_ref()
+            .is_some_and(|reconstruction| {
+                reconstruction.header.len() == llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+                    && reconstruction
+                        .header
+                        .starts_with(llama_native_types::SEQUENCE_STATE_MAGIC)
+            })
+            || expected.state_bytes < llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+        {
+            return Ok(None);
+        }
         self.store
             .mutate_documents(
                 &Self::document(namespace),
@@ -373,8 +386,9 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
                         return Ok(None);
                     }
                     let Some(value) = expected.replay_value() else {
-                        documents.delete(&Self::entry(namespace, &expected.id));
-                        entries.retain(|entry| entry.id != expected.id);
+                        // An unsupported or incomplete reconstruction is not
+                        // evidence that the durable entry is corrupt. Preserve
+                        // its metadata and encrypted payload for a newer reader.
                         return Ok(None);
                     };
                     if current.state_bytes != value.metadata.state_bytes {
@@ -405,9 +419,15 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
         namespace: &str,
         id: &str,
     ) -> Result<Option<PrefixCacheValue>, NativeError> {
-        self.store
-            .get_disposable_cache(&Self::entry(namespace, id))
-            .map_err(prefix_store_error)
+        let value = self
+            .store
+            .get_disposable_cache::<PrefixCacheValue>(&Self::entry(namespace, id))
+            .map_err(prefix_store_error)?;
+        Ok(value.filter(PrefixCacheValue::is_valid).map(|mut value| {
+            // RuntimeStore authenticated the full serialized metadata/payload.
+            value.sequence.mark_authenticated_storage();
+            value
+        }))
     }
 
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -581,7 +601,6 @@ fn unchecked_model_configuration_for_profile(
 ) -> Result<NativeModelConfig, ValidationBlocker> {
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
-    config.state_cache_directory = Some(settings.data_dir.join("native-state-authority"));
     desktop_generation_policy::ModelExecutionLimits {
         context_tokens: settings.context_tokens,
         batch_tokens: settings.batch_tokens,
@@ -997,6 +1016,7 @@ mod tests {
                 1,
             ),
             sequence: SequenceStateBlob {
+                storage_proof: None,
                 sequence_id: 0,
                 token_count: token_ids.len(),
                 bytes: (vec![4, 5, 6]).into(),
@@ -1288,7 +1308,10 @@ mod tests {
         let connection = rusqlite::Connection::open(store.path()).expect("connection");
         let cache = ProductPrefixCacheStore { store };
         let mut value = cache_value();
-        value.sequence.bytes = vec![9; 64 * 1024].into();
+        let mut snapshot = vec![0; 64 * 1024];
+        snapshot[..llama_native_types::SEQUENCE_STATE_MAGIC.len()]
+            .copy_from_slice(llama_native_types::SEQUENCE_STATE_MAGIC);
+        value.sequence.bytes = snapshot.into();
         value.metadata.state_bytes = value.sequence.bytes.len();
         value.bind_reconstruction();
         cache.save("compact", &value).expect("save");
@@ -1336,6 +1359,39 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_reconstruction_header_preserves_persistent_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "mom-prefix-unsupported-header-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::RuntimeStore::open_with_key(&dir, [27; 32]).expect("store");
+        let cache = ProductPrefixCacheStore { store };
+        let mut value = cache_value();
+        let mut bytes = vec![0; 64 * 1024];
+        bytes[..16].copy_from_slice(b"native-seq-v1\0\0\0");
+        value.sequence.bytes = bytes.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        cache.save("unsupported", &value).expect("save");
+
+        assert!(
+            cache
+                .load_reconstruction("unsupported", &value.metadata)
+                .expect("unsupported header is a cache miss")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .load_entry("unsupported", &value.metadata.id)
+                .expect("entry remains readable"),
+            Some(value)
+        );
+
+        drop(cache);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn product_prefix_cache_round_trips_through_encrypted_storage() {
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-prefix-cache-test-{}",
@@ -1346,7 +1402,13 @@ mod tests {
         let cache = ProductPrefixCacheStore { store };
         let value = cache_value();
         cache.save("test", &value).expect("save prefix");
-        assert_eq!(cache.load("test").expect("load prefix"), vec![value]);
+        let loaded = cache.load("test").expect("load prefix");
+        assert_eq!(loaded, vec![value]);
+        assert!(loaded[0].sequence.has_authenticated_storage_proof());
+        let decoded: PrefixCacheValue =
+            serde_json::from_slice(&serde_json::to_vec(&loaded[0]).expect("serialize loaded"))
+                .expect("deserialize loaded");
+        assert!(!decoded.sequence.has_authenticated_storage_proof());
         cache
             .delete("test", "persistent-test")
             .expect("delete prefix");

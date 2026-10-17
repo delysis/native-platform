@@ -94,10 +94,6 @@ pub enum NativeDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NativeModelConfig {
-    /// Application-owned private directory for authenticating durable native
-    /// state exports. None restricts raw restoration to this live worker.
-    #[serde(default)]
-    pub state_cache_directory: Option<PathBuf>,
     pub model_id: String,
     pub model_path: PathBuf,
     /// Optional trusted digest supplied by the caller. When present, the held
@@ -144,7 +140,6 @@ impl NativeModelConfig {
             .unwrap_or("local-model")
             .to_string();
         Self {
-            state_cache_directory: None,
             model_id,
             model_path,
             expected_model_sha256: None,
@@ -2879,7 +2874,7 @@ pub enum ModelRuntimeState {
 }
 
 /// How a saved prefix was reconstructed. Native restore requires a live export
-/// receipt or a verified persistent native-export signature.
+/// allocation identity or authenticated persistent storage.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceRestoreKind {
@@ -2903,7 +2898,7 @@ pub enum SequenceStateCell {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceStateBlob {
     pub sequence_id: i32,
     pub token_count: usize,
@@ -2914,17 +2909,50 @@ pub struct SequenceStateBlob {
     /// the legacy text-only representation in `token_ids`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cells: Vec<SequenceStateCell>,
+    /// Process-local proof that this exact allocation and its sequence
+    /// metadata were authenticated by a trusted persistent-storage adapter.
+    /// Never serialized or accepted from an external caller.
+    #[serde(skip)]
+    pub storage_proof: Option<SequenceStateStorageProof>,
 }
+
+/// Process-local evidence that an authenticated stored sequence still refers
+/// to the same byte allocation and metadata. Fields stay private so callers
+/// cannot mint or rebind evidence by constructing the proof directly.
+#[derive(Clone)]
+pub struct SequenceStateStorageProof {
+    identity: SequenceStateIdentity,
+}
+
+impl std::fmt::Debug for SequenceStateStorageProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SequenceStateStorageProof")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SequenceStateBlob {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence_id == other.sequence_id
+            && self.token_count == other.token_count
+            && self.bytes == other.bytes
+            && self.token_ids == other.token_ids
+            && self.cells == other.cells
+    }
+}
+
+impl Eq for SequenceStateBlob {}
 
 /// The fixed configuration envelope is sufficient for checked token replay.
 /// Opaque native payloads require independent export authentication.
+pub const SEQUENCE_STATE_MAGIC: &[u8; 16] = b"native-seq-v3\0\0\0";
 pub const SEQUENCE_STATE_HEADER_BYTES: usize = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SequenceReconstruction {
     pub sequence_id: i32,
     pub header: Vec<u8>,
-    pub export_receipt: [u8; 32],
     /// Authenticated mixed state may restore natively but is never reduced to
     /// text-only token replay. Missing means the legacy text-only contract.
     #[serde(default = "sequence_replay_allowed")]
@@ -2935,42 +2963,76 @@ const fn sequence_replay_allowed() -> bool {
     true
 }
 
-impl SequenceStateBlob {
+/// Noncryptographic identity of an immutable allocation and its exact metadata.
+/// Weak ownership means `Arc::make_mut` detaches even with a single strong owner.
+/// Copying or deserializing bytes never transfers this identity.
+#[derive(Debug, Clone)]
+pub struct SequenceStateIdentity {
+    allocation: std::sync::Weak<Vec<u8>>,
+    sequence_id: i32,
+    token_count: usize,
+    token_ids: std::sync::Arc<[i32]>,
+    cells: std::sync::Arc<[SequenceStateCell]>,
+}
+
+impl SequenceStateIdentity {
     #[must_use]
-    pub fn export_receipt(&self) -> [u8; 32] {
-        self.export_receipt_while(|| true)
-            .expect("unconditional receipt hashing is admitted")
+    pub fn matches(&self, state: &SequenceStateBlob) -> bool {
+        self.allocation
+            .upgrade()
+            .is_some_and(|bytes| std::sync::Arc::ptr_eq(&bytes, &state.bytes))
+            && self.sequence_id == state.sequence_id
+            && self.token_count == state.token_count
+            && self.token_ids.as_ref() == state.token_ids.as_slice()
+            && self.cells.as_ref() == state.cells.as_slice()
     }
 
-    /// Hash bounded pieces so background persistence can yield to foreground
-    /// work without accepting a partial receipt or changing its byte contract.
-    pub fn export_receipt_while(&self, admitted: impl Fn() -> bool) -> Option<[u8; 32]> {
-        if !admitted() {
-            return None;
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.allocation.strong_count() > 0
+    }
+
+    #[must_use]
+    pub fn metadata_bytes(&self) -> usize {
+        std::mem::size_of_val(self.token_ids.as_ref())
+            + std::mem::size_of_val(self.cells.as_ref())
+            + 4 * std::mem::size_of::<usize>()
+    }
+}
+
+impl SequenceStateBlob {
+    /// Capture allocation identity without scanning or hashing native payload bytes.
+    #[must_use]
+    pub fn allocation_identity(&self) -> SequenceStateIdentity {
+        SequenceStateIdentity {
+            allocation: std::sync::Arc::downgrade(&self.bytes),
+            sequence_id: self.sequence_id,
+            token_count: self.token_count,
+            token_ids: self.token_ids.clone().into(),
+            cells: self.cells.clone().into(),
         }
-        use sha2::{Digest as _, Sha256};
-        let mut hash = Sha256::new();
-        hash.update(b"native-sequence-export-receipt-v1");
-        hash.update(self.sequence_id.to_le_bytes());
-        hash.update((self.token_count as u64).to_le_bytes());
-        hash.update((self.token_ids.len() as u64).to_le_bytes());
-        for token in &self.token_ids {
-            hash.update(token.to_le_bytes());
-        }
-        // Keep text-only receipts byte-for-byte compatible with v1. Mixed
-        // state adds a separately tagged, deterministic cell encoding.
-        if !self.cells.is_empty() {
-            hash.update(b"native-sequence-export-cells-v1");
-            hash.update((self.cells.len() as u64).to_le_bytes());
-            hash_cells(&mut hash, &self.cells);
-        }
-        for chunk in self.bytes.chunks(1024 * 1024) {
-            if !admitted() {
-                return None;
-            }
-            hash.update(chunk);
-        }
-        admitted().then(|| hash.finalize().into())
+    }
+
+    /// Call only after a trusted storage adapter authenticates the complete
+    /// payload AND its metadata through AEAD. Deserialization alone is not proof.
+    pub fn mark_authenticated_storage(&mut self) {
+        self.storage_proof = Some(SequenceStateStorageProof {
+            identity: self.allocation_identity(),
+        });
+    }
+
+    #[must_use]
+    pub fn has_authenticated_storage_proof(&self) -> bool {
+        self.storage_proof
+            .as_ref()
+            .is_some_and(|proof| proof.identity.matches(self))
+    }
+
+    #[must_use]
+    pub fn storage_proof_metadata_bytes(&self) -> usize {
+        self.storage_proof
+            .as_ref()
+            .map_or(0, |proof| proof.identity.metadata_bytes())
     }
 
     #[must_use]
@@ -2979,42 +3041,16 @@ impl SequenceStateBlob {
             .expect("unconditional reconstruction is admitted")
     }
 
+    /// Replay metadata requires only the fixed header, never a native-state scan.
     pub fn reconstruction_while(
         &self,
         admitted: impl Fn() -> bool,
     ) -> Option<SequenceReconstruction> {
-        Some(SequenceReconstruction {
+        admitted().then(|| SequenceReconstruction {
             sequence_id: self.sequence_id,
             header: self.bytes[..self.bytes.len().min(SEQUENCE_STATE_HEADER_BYTES)].to_vec(),
-            export_receipt: self.export_receipt_while(admitted)?,
             token_replay_allowed: self.cells.is_empty(),
         })
-    }
-}
-
-fn hash_cells(hash: &mut sha2::Sha256, cells: &[SequenceStateCell]) {
-    use sha2::Digest as _;
-    for cell in cells {
-        match cell {
-            SequenceStateCell::Text(token) => {
-                hash.update([0]);
-                hash.update(token.to_le_bytes());
-            }
-            SequenceStateCell::Media {
-                digest,
-                chunk,
-                offset,
-            } => {
-                hash.update([1]);
-                hash.update(digest);
-                hash.update((*chunk as u64).to_le_bytes());
-                hash.update((*offset as u64).to_le_bytes());
-            }
-            SequenceStateCell::AudioFrame { digest } => {
-                hash.update([2]);
-                hash.update(digest);
-            }
-        }
     }
 }
 
@@ -3027,19 +3063,14 @@ impl SequenceReconstruction {
         {
             return None;
         }
-        // Reconstruction carries tokens and a configuration binding, never an
-        // authenticated native payload. Keep the stored header unchanged so
-        // persistence can still identify the original signed full snapshot.
-        let mut header = self.header.clone();
-        if header.starts_with(b"native-seq-v2\0\0\0") {
-            header[..16].copy_from_slice(b"native-seq-v1\0\0\0");
-        }
+        // Replay carries tokens and the current configuration header only.
         Some(SequenceStateBlob {
             sequence_id: self.sequence_id,
             token_count: token_ids.len(),
-            bytes: header.into(),
+            bytes: self.header.clone().into(),
             token_ids,
             cells: Vec::new(),
+            storage_proof: None,
         })
     }
 }
@@ -3336,60 +3367,78 @@ mod tests {
             bytes: std::sync::Arc::new(vec![0x5a; byte_len]),
             token_ids: vec![11, 12],
             cells: Vec::new(),
+            storage_proof: None,
         }
     }
 
     #[test]
-    fn bounded_export_receipt_and_reconstruction_keep_the_original_contract() {
-        let blob = test_sequence_blob(2 * 1024 * 1024 + 17);
-        use sha2::Digest as _;
-        let mut legacy_hash = sha2::Sha256::new();
-        legacy_hash.update(b"native-sequence-export-receipt-v1");
-        legacy_hash.update(blob.sequence_id.to_le_bytes());
-        legacy_hash.update((blob.token_count as u64).to_le_bytes());
-        legacy_hash.update((blob.token_ids.len() as u64).to_le_bytes());
-        for token in &blob.token_ids {
-            legacy_hash.update(token.to_le_bytes());
-        }
-        legacy_hash.update(blob.bytes.as_slice());
-        let legacy_receipt: [u8; 32] = legacy_hash.finalize().into();
+    fn authenticated_storage_proof_clones_but_is_not_serialized_or_compared() {
+        let mut authenticated = test_sequence_blob(32);
+        authenticated.mark_authenticated_storage();
+        let cloned = authenticated.clone();
+        assert!(authenticated.has_authenticated_storage_proof());
+        assert!(cloned.has_authenticated_storage_proof());
 
-        assert_eq!(blob.export_receipt(), legacy_receipt);
-        assert_eq!(blob.export_receipt_while(|| true), Some(legacy_receipt));
-        let expected_reconstruction = blob.reconstruction();
-        let actual_reconstruction = blob
-            .reconstruction_while(|| true)
-            .expect("uninterrupted checkpoint hashing should complete");
-        assert_eq!(actual_reconstruction, expected_reconstruction);
-        assert_eq!(actual_reconstruction.export_receipt, legacy_receipt);
+        let untrusted = test_sequence_blob(32);
+        assert_eq!(authenticated, untrusted);
+        let encoded = serde_json::to_value(&authenticated).expect("blob serializes");
+        assert!(encoded.get("storage_proof").is_none());
+        let decoded: SequenceStateBlob =
+            serde_json::from_value(encoded).expect("blob deserializes");
+        assert!(!decoded.has_authenticated_storage_proof());
+        assert_eq!(decoded, authenticated);
     }
 
     #[test]
-    fn bounded_export_receipt_cancels_between_large_byte_chunks() {
+    fn authenticated_storage_proof_rejects_changed_bytes_and_metadata() {
+        let mut changed_bytes = test_sequence_blob(32);
+        changed_bytes.mark_authenticated_storage();
+        std::sync::Arc::make_mut(&mut changed_bytes.bytes)[0] ^= 1;
+        assert!(!changed_bytes.has_authenticated_storage_proof());
+
+        let mut changed_sequence = test_sequence_blob(32);
+        changed_sequence.mark_authenticated_storage();
+        changed_sequence.sequence_id += 1;
+        assert!(!changed_sequence.has_authenticated_storage_proof());
+
+        let mut changed_count = test_sequence_blob(32);
+        changed_count.mark_authenticated_storage();
+        changed_count.token_count += 1;
+        assert!(!changed_count.has_authenticated_storage_proof());
+
+        let mut changed_tokens = test_sequence_blob(32);
+        changed_tokens.mark_authenticated_storage();
+        changed_tokens.token_ids.push(13);
+        assert!(!changed_tokens.has_authenticated_storage_proof());
+
+        let mut changed_cells = test_sequence_blob(32);
+        changed_cells.mark_authenticated_storage();
+        changed_cells.cells.push(SequenceStateCell::Text(11));
+        assert!(!changed_cells.has_authenticated_storage_proof());
+    }
+
+    #[test]
+    fn authenticated_storage_proof_cannot_be_rebound_to_another_allocation() {
+        let mut authenticated = test_sequence_blob(32);
+        authenticated.mark_authenticated_storage();
+
+        let mut copied = test_sequence_blob(32);
+        copied.storage_proof = authenticated.storage_proof.clone();
+        assert!(!copied.has_authenticated_storage_proof());
+    }
+
+    #[test]
+    fn reconstruction_reads_only_fixed_header_and_respects_cancellation() {
         let blob = test_sequence_blob(4 * 1024 * 1024 + 17);
-        let checks = std::cell::Cell::new(0);
-        let receipt = blob.export_receipt_while(|| {
-            let check = checks.get();
-            checks.set(check + 1);
-            check < 3
-        });
-
-        assert_eq!(receipt, None);
-        assert_eq!(
-            checks.get(),
-            4,
-            "admission is checked before the third 1 MiB chunk"
-        );
-
-        let checks = std::cell::Cell::new(0);
-        let reconstruction = blob.reconstruction_while(|| {
-            let check = checks.get();
-            checks.set(check + 1);
-            check < 3
-        });
-        assert_eq!(
-            reconstruction, None,
-            "canceled hashing exposes no partial receipt"
+        assert_eq!(blob.reconstruction_while(|| false), None);
+        let replay = blob.reconstruction_while(|| true).expect("admitted");
+        assert_eq!(replay.header, blob.bytes[..SEQUENCE_STATE_HEADER_BYTES]);
+        assert_eq!(replay.sequence_id, blob.sequence_id);
+        assert!(replay.token_replay_allowed);
+        assert!(
+            !serde_json::to_string(&replay)
+                .unwrap()
+                .contains("export_receipt")
         );
     }
 

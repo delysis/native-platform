@@ -82,7 +82,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "0eda11257a189bd26484d9b751eb6710fec0d7c0";
+pub const LLAMA_CPP_BINDING_REV: &str = "b514de816072c4024ca734016f74b196d35d3910";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -2066,7 +2066,6 @@ struct NativeModelInner {
 
 #[derive(Debug)]
 struct WorkerIdentity {
-    state_authority: Option<Arc<state_buffer::PersistentAuthority>>,
     cooperative_decodes: cooperative::DecodeHub,
     kv_unified: bool,
     exports: state_buffer::LiveExports,
@@ -2075,7 +2074,6 @@ struct WorkerIdentity {
 impl Default for WorkerIdentity {
     fn default() -> Self {
         Self {
-            state_authority: None,
             cooperative_decodes: cooperative::DecodeHub::default(),
             kv_unified: true,
             exports: state_buffer::LiveExports::default(),
@@ -2365,6 +2363,7 @@ enum WorkerCommand {
         response: Sender<NativeResult<ResidentConversationInspection>>,
     },
     Snapshot {
+        foreground_waiters: Option<Arc<AtomicUsize>>,
         expected_request_id: Option<String>,
         conversation: bool,
         sequence_id: i32,
@@ -2458,11 +2457,6 @@ impl NativeModelHandle {
         }));
         let worker_status = Arc::clone(&status);
         let worker_identity = Arc::new(WorkerIdentity {
-            state_authority: config
-                .state_cache_directory
-                .as_deref()
-                .map(state_buffer::PersistentAuthority::open)
-                .transpose()?,
             kv_unified: config.kv_unified,
             ..WorkerIdentity::default()
         });
@@ -2543,28 +2537,13 @@ impl NativeModelHandle {
         ))
     }
 
-    /// Storage hint only: a live receipt can justify reading a same-worker spill.
-    /// Native import independently checks full bytes, binding, and worker identity.
+    /// Fast admission hint: immutable live allocation or authenticated storage.
+    /// Native import independently checks the model/context binding.
     #[must_use]
     pub fn has_reusable_sequence(&self, state: &SequenceStateBlob) -> bool {
         self.inner.ensure_accepting().is_ok()
-            && (self
-                .inner
-                .worker_identity
-                .state_authority
-                .as_ref()
-                .is_some_and(|key| key.verifies(state))
-                || self.has_live_sequence_receipt(&state.export_receipt()))
-    }
-
-    pub fn has_live_sequence_receipt(&self, receipt: &[u8; 32]) -> bool {
-        self.inner.ensure_accepting().is_ok()
-            && self
-                .inner
-                .worker_identity
-                .exports
-                .lock()
-                .is_ok_and(|exports| exports.contains(receipt))
+            && (state.has_authenticated_storage_proof()
+                || state_buffer::has_reusable_export(&self.inner.worker_identity.exports, state))
     }
 
     pub fn status(&self) -> ResidentModelStatus {
@@ -3030,7 +3009,7 @@ impl NativeModelHandle {
         sequence_id: i32,
         max_bytes: usize,
     ) -> NativeResult<Option<SequenceStateBlob>> {
-        self.snapshot_sequence_internal(sequence_id, max_bytes, false, None)
+        self.snapshot_sequence_internal(sequence_id, max_bytes, false, None, None)
     }
 
     /// Export the latest retained conversation without re-evaluating its prompt.
@@ -3039,7 +3018,7 @@ impl NativeModelHandle {
         &self,
         max_bytes: usize,
     ) -> NativeResult<Option<SequenceStateBlob>> {
-        self.snapshot_sequence_internal(0, max_bytes, true, None)
+        self.snapshot_sequence_internal(0, max_bytes, true, None, None)
     }
 
     pub fn resident_conversation_covers_cells(
@@ -3087,7 +3066,24 @@ impl NativeModelHandle {
         request_id: &str,
         max_bytes: usize,
     ) -> NativeResult<Option<SequenceStateBlob>> {
-        self.snapshot_sequence_internal(0, max_bytes, true, Some(request_id.to_owned()))
+        self.snapshot_sequence_internal(0, max_bytes, true, Some(request_id.to_owned()), None)
+    }
+
+    /// Idle persistence yields when a foreground caller is waiting. Native
+    /// copying settles before return; partial exports are never published.
+    pub fn snapshot_conversation_for_request_if_idle(
+        &self,
+        request_id: &str,
+        max_bytes: usize,
+        foreground_waiters: Arc<AtomicUsize>,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
+        self.snapshot_sequence_internal(
+            0,
+            max_bytes,
+            true,
+            Some(request_id.to_owned()),
+            Some(foreground_waiters),
+        )
     }
 
     fn snapshot_sequence_internal(
@@ -3096,11 +3092,13 @@ impl NativeModelHandle {
         max_bytes: usize,
         conversation: bool,
         expected_request_id: Option<String>,
+        foreground_waiters: Option<Arc<AtomicUsize>>,
     ) -> NativeResult<Option<SequenceStateBlob>> {
         self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
             WorkerCommand::Snapshot {
+                foreground_waiters,
                 expected_request_id,
                 conversation,
                 sequence_id,
@@ -3378,11 +3376,15 @@ impl ModelArtifactGuard {
         let observed_file_identity = artifact_file_identity(&initial_state);
         #[cfg(all(test, unix))]
         let payload_bytes_read = std::sync::atomic::AtomicU64::new(0);
-        let reusable_digest = caller_expected_sha256
-            .zip(caller_expected_file_identity)
-            .and_then(|(digest, identity)| {
-                (identity == observed_file_identity).then(|| digest.to_owned())
-            });
+        let reusable_digest = if cfg!(unix) {
+            caller_expected_sha256
+                .zip(caller_expected_file_identity)
+                .and_then(|(digest, identity)| {
+                    (identity == observed_file_identity).then(|| digest.to_owned())
+                })
+        } else {
+            None
+        };
         #[cfg(all(test, unix))]
         let expected_sha256 = match reusable_digest {
             Some(digest) => digest,
@@ -3409,8 +3411,7 @@ impl ModelArtifactGuard {
                 "identity or metadata changed while computing the initial SHA-256",
             ));
         }
-        if caller_expected_file_identity.is_none()
-            && let Some(expected) = caller_expected_sha256
+        if let Some(expected) = caller_expected_sha256
             && expected != expected_sha256
         {
             return Err(NativeError::new(
@@ -3553,11 +3554,18 @@ impl ModelArtifactGuards {
     }
 }
 
+/// File-version identity for an acquisition adapter that has verified bytes
+/// through an open file. This is metadata, not proof of content verification.
+/// Capture it from that same descriptor before and after verification; native
+/// loading rechecks it before reusing the supplied digest.
+#[must_use]
+pub fn model_artifact_file_identity(metadata: &Metadata) -> String {
+    artifact_file_identity(&artifact_file_state(metadata))
+}
+
 fn artifact_file_identity(state: &ArtifactFileState) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"llama-native-artifact-file-identity-v1\0");
-    hasher.update(format!("{state:?}").as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    // Exact metadata equality needs no cryptographic operation.
+    format!("native-file-v2:{state:?}")
 }
 
 #[cfg(unix)]
@@ -3752,7 +3760,6 @@ fn run_worker(
     let load_started = Instant::now();
     let _decode_lifetime = worker_identity.cooperative_decodes.worker_lifetime();
     let _export_lifetime = state_buffer::bind_worker_exports(&worker_identity.exports);
-    state_buffer::bind_persistent_authority(worker_identity.state_authority.clone());
     let WorkerLanes {
         command_rx,
         speculative_rx,
@@ -4807,18 +4814,21 @@ fn run_worker(
                 }));
             }
             WorkerCommand::Snapshot {
+                foreground_waiters,
                 expected_request_id,
                 conversation,
                 sequence_id,
                 max_bytes,
                 response,
             } => {
-                // Background persistence yields to work already admitted ahead
-                // of the copy. Serialization itself is a bounded native call;
-                // disk encryption/writes happen after this worker returns.
-                if expected_request_id.is_some()
-                    && (!command_rx.is_empty() || !speculative_rx.is_empty())
-                {
+                let admitted = || {
+                    foreground_waiters
+                        .as_ref()
+                        .is_none_or(|waiters| waiters.load(Ordering::Acquire) == 0)
+                        && (expected_request_id.is_none()
+                            || (command_rx.is_empty() && speculative_rx.is_empty()))
+                };
+                if !admitted() {
                     let _ = response.send(Ok(None));
                     continue;
                 }
@@ -4848,13 +4858,14 @@ fn run_worker(
                             return Ok(None);
                         }
                         if count == prefix.cells.len() {
-                            return state_buffer::export_sequence_cells_bounded(
+                            return state_buffer::export_sequence_cells_bounded_while(
                                 &context,
                                 &fingerprint,
                                 prefix.sequence_id,
                                 0,
                                 prefix.cells.clone(),
                                 max_bytes,
+                                &admitted,
                             );
                         }
                         // Only idle snapshot work uses lane two. Export exactly the last
@@ -4876,13 +4887,14 @@ fn run_worker(
                                 native_decode_error("failed to copy committed checkpoint", e)
                             });
                         let exported = copied.and_then(|()| {
-                            state_buffer::export_sequence_cells_bounded(
+                            state_buffer::export_sequence_cells_bounded_while(
                                 &context,
                                 &fingerprint,
                                 scratch as i32,
                                 0,
                                 prefix.cells[..count].to_vec(),
                                 max_bytes,
+                                &admitted,
                             )
                         });
                         let cleared = context
@@ -4900,7 +4912,7 @@ fn run_worker(
                     .get(&sequence_id)
                     .copied()
                     .unwrap_or_default();
-                let _ = response.send(state_buffer::export_sequence_bounded(
+                let _ = response.send(state_buffer::export_sequence_bounded_while(
                     &context,
                     &fingerprint,
                     sequence_id,
@@ -4910,6 +4922,7 @@ fn run_worker(
                         .cloned()
                         .unwrap_or_default(),
                     max_bytes,
+                    &admitted,
                 ));
             }
             WorkerCommand::Restore {
@@ -8347,11 +8360,11 @@ fn prefill_multimodal_cached(
     Ok((position as i32, kind, reused))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ResidentAudioCheckpoint {
     sequence_id: i32,
     resume_key: String,
-    request_sha256: String,
+    request_identity: IncrementalAudioRequestIdentity,
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
@@ -8504,41 +8517,47 @@ fn invalidate_resident_audio_checkpoint(
     }
 }
 
-fn incremental_audio_request_sha256(request: &GenerationRequest) -> NativeResult<String> {
-    // The native prefix can be hundreds of megabytes. Cloned retries retain
-    // the same Arc, so bind its live allocation identity and size while
-    // serializing only borrowed request metadata. Retaining the Arc in both
-    // the prepared request and queued command prevents allocator-address
-    // reuse; borrowing avoids a second deep clone of the chat and token IDs.
-    let prefix_binding = request.cached_prefix.as_ref().map(|state| {
-        (
-            state.sequence_id,
-            state.token_count,
-            state.token_ids.as_slice(),
-            state.cells.as_slice(),
-            Arc::as_ptr(&state.bytes) as usize,
-            state.bytes.len(),
-        )
-    });
-    let binding = (
-        request.model_id.as_str(),
-        &request.input,
-        &request.sampling,
-        request.media.as_slice(),
-        prefix_binding,
-    );
-    let encoded = serde_json::to_vec(&binding).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::Internal,
-            format!("failed to bind incremental audio retry: {error}"),
-        )
-    });
-    Ok(format!("{:x}", Sha256::digest(encoded?)))
+/// A retry is an in-process equality decision, not a cryptographic identity.
+/// Keep one shared request snapshot; checkpoint updates clone only its Arc.
+#[derive(Debug, Clone)]
+struct IncrementalAudioRequestIdentity(Arc<GenerationRequest>);
+
+impl IncrementalAudioRequestIdentity {
+    fn matches(&self, request: &GenerationRequest) -> bool {
+        let original = self.0.as_ref();
+        original.model_id == request.model_id
+            && original.input == request.input
+            && original.sampling == request.sampling
+            && original.media == request.media
+            && match (&original.cached_prefix, &request.cached_prefix) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    Arc::ptr_eq(&a.bytes, &b.bytes)
+                        && a.sequence_id == b.sequence_id
+                        && a.token_count == b.token_count
+                        && a.token_ids == b.token_ids
+                        && a.cells == b.cells
+                }
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for IncrementalAudioRequestIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(&other.0)
+    }
+}
+
+fn incremental_audio_request_identity(
+    request: &GenerationRequest,
+) -> IncrementalAudioRequestIdentity {
+    IncrementalAudioRequestIdentity(Arc::new(request.clone()))
 }
 
 struct AudioCheckpointContents<'a> {
     resume_key: &'a str,
-    request_sha256: &'a str,
+    request_identity: &'a IncrementalAudioRequestIdentity,
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
@@ -8552,7 +8571,7 @@ fn fork_resident_audio_checkpoint(
 ) -> NativeResult<ResidentAudioCheckpoint> {
     let AudioCheckpointContents {
         resume_key,
-        request_sha256,
+        request_identity,
         next_position,
         prompt_tokens,
         projected_samples,
@@ -8581,7 +8600,7 @@ fn fork_resident_audio_checkpoint(
     Ok(ResidentAudioCheckpoint {
         sequence_id: destination_sequence_id,
         resume_key: resume_key.to_owned(),
-        request_sha256: request_sha256.to_owned(),
+        request_identity: request_identity.clone(),
         next_position,
         prompt_tokens,
         projected_samples,
@@ -8598,7 +8617,7 @@ fn capture_resident_audio_checkpoint(
     fingerprint: &ModelFingerprint,
     source_sequence_id: i32,
     resume_key: &str,
-    request_sha256: &str,
+    request_identity: &IncrementalAudioRequestIdentity,
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
@@ -8610,7 +8629,7 @@ fn capture_resident_audio_checkpoint(
             source_sequence_id,
             AudioCheckpointContents {
                 resume_key,
-                request_sha256,
+                request_identity,
                 next_position,
                 prompt_tokens,
                 projected_samples,
@@ -8621,7 +8640,7 @@ fn capture_resident_audio_checkpoint(
     Ok(ResidentAudioCheckpoint {
         sequence_id: source_sequence_id,
         resume_key: resume_key.to_owned(),
-        request_sha256: request_sha256.to_owned(),
+        request_identity: request_identity.clone(),
         next_position,
         prompt_tokens,
         projected_samples,
@@ -8771,18 +8790,26 @@ fn generate_incremental_audio(
     // Validation and selection below are read-only. Mutate resident KV state
     // only after the selected prefix is proven to match this audio turn.
     let binding_started = Instant::now();
-    let request_sha256 = incremental_audio_request_sha256(request)?;
-    let binding_us = binding_started
-        .elapsed()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64;
     let checkpoint_available = resident_audio_checkpoint.is_some();
     let resume_key_matched = resident_audio_checkpoint
         .as_ref()
         .is_some_and(|checkpoint| resume_key == Some(checkpoint.resume_key.as_str()));
     let request_matched = resident_audio_checkpoint
         .as_ref()
-        .is_some_and(|checkpoint| checkpoint.request_sha256 == request_sha256);
+        .is_some_and(|checkpoint| checkpoint.request_identity.matches(request));
+    let request_identity = if request_matched {
+        resident_audio_checkpoint
+            .as_ref()
+            .expect("matched checkpoint")
+            .request_identity
+            .clone()
+    } else {
+        incremental_audio_request_identity(request)
+    };
+    let binding_us = binding_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
     let audio_checkpoint_matches =
         audio_checkpoint_supported && resume_key_matched && request_matched;
     let resident_text_prefix_supported = audio_checkpoint_supported
@@ -8894,7 +8921,7 @@ fn generate_incremental_audio(
                         fingerprint,
                         active_sequence_id,
                         resume_key,
-                        &request_sha256,
+                        &request_identity,
                         next_position,
                         prompt_tokens,
                         projected_full_samples,
@@ -8932,7 +8959,7 @@ fn generate_incremental_audio(
                             fingerprint,
                             active_sequence_id,
                             resume_key,
-                            &request_sha256,
+                            &request_identity,
                             next_position,
                             prompt_tokens,
                             projected_full_samples,
@@ -8967,7 +8994,7 @@ fn generate_incremental_audio(
                         fingerprint,
                         active_sequence_id,
                         resume_key,
-                        &request_sha256,
+                        &request_identity,
                         next_position,
                         prompt_tokens,
                         projected_full_samples,
@@ -9155,7 +9182,7 @@ fn generate_incremental_audio(
             fingerprint,
             active_sequence_id,
             resume_key,
-            &request_sha256,
+            &request_identity,
             next_position,
             prompt_tokens,
             projected_full_samples,
@@ -11838,6 +11865,7 @@ mod tests {
     #[test]
     fn incremental_audio_cache_requires_an_exact_nonempty_token_prefix() {
         let exact = SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 0,
             token_count: 3,
@@ -11866,6 +11894,7 @@ mod tests {
         );
 
         let empty = SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 0,
             token_count: 0,
@@ -11884,6 +11913,7 @@ mod tests {
     fn incremental_audio_retry_binding_ignores_only_request_identity() {
         let mut first = admission_generation_request("first-attempt");
         first.cached_prefix = Some(SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 0,
             token_count: 2,
@@ -11893,8 +11923,8 @@ mod tests {
         let mut retry = first.clone();
         retry.request_id = "retry-attempt".to_owned();
         assert_eq!(
-            incremental_audio_request_sha256(&first).expect("first binding"),
-            incremental_audio_request_sha256(&retry).expect("retry binding"),
+            incremental_audio_request_identity(&first),
+            incremental_audio_request_identity(&retry),
             "a replacement request may change only its cancellation identity"
         );
 
@@ -11905,15 +11935,15 @@ mod tests {
             .expect("fixture has a prefix");
         prefix.bytes = Arc::new(prefix.bytes.as_ref().clone());
         assert_ne!(
-            incremental_audio_request_sha256(&first).expect("first binding"),
-            incremental_audio_request_sha256(&detached_prefix).expect("detached binding"),
+            incremental_audio_request_identity(&first),
+            incremental_audio_request_identity(&detached_prefix),
             "byte-identical state without the same resident allocation must fall back"
         );
 
         retry.sampling.max_tokens = retry.sampling.max_tokens.saturating_add(1);
         assert_ne!(
-            incremental_audio_request_sha256(&first).expect("first binding"),
-            incremental_audio_request_sha256(&retry).expect("changed binding"),
+            incremental_audio_request_identity(&first),
+            incremental_audio_request_identity(&retry),
             "changed generation policy must never consume resident audio KV"
         );
     }
@@ -12037,6 +12067,7 @@ mod tests {
     #[test]
     fn request_level_cache_is_selected_for_every_shared_prefix_branch() {
         let shared = SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 0,
             token_count: 1,
@@ -13584,7 +13615,7 @@ mod tests {
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "0eda11257a189bd26484d9b751eb6710fec0d7c0"
+            "b514de816072c4024ca734016f74b196d35d3910"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
@@ -14105,6 +14136,7 @@ mod tests {
 
         let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
         request.cases[0].cached_prefix = Some(SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 0,
             token_count: 1,
@@ -14461,6 +14493,7 @@ mod tests {
 
         let mut cached = request.clone();
         cached.cases[0].cached_prefix = Some(SequenceStateBlob {
+            storage_proof: None,
             cells: Vec::new(),
             sequence_id: 77,
             token_count: 1,
@@ -15187,6 +15220,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn acquisition_file_identity_skips_the_native_payload_scan() {
+        let directory = TestArtifactDirectory::new("acquisition-identity");
+        let path = directory.join("model.gguf");
+        let bytes = b"acquired artifact bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let acquired = File::open(&path).unwrap();
+        let identity = model_artifact_file_identity(&acquired.metadata().unwrap());
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let loaded =
+            ModelArtifactGuard::open(&path, "model", Some(&digest), Some(&identity)).unwrap();
+        assert_eq!(loaded.expected_sha256, digest);
+        assert_eq!(
+            loaded.payload_bytes_read(),
+            0,
+            "verified acquisition must not rescan model weights"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn changed_file_identity_forces_payload_reverification() {
         let directory = TestArtifactDirectory::new("stale-identity-cache");
         let configured_path = directory.join("model.gguf");
@@ -15198,11 +15251,37 @@ mod tests {
         drop(first);
         std::fs::write(&configured_path, b"artifact-bb").expect("replace artifact bytes");
 
+        let error =
+            ModelArtifactGuard::open(&configured_path, "model", Some(&digest), Some(&identity))
+                .expect_err("stale identity must rehash and reject an expected-digest mismatch");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+        assert!(error.message.contains("expected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_file_identity_rehashes_same_content_and_accepts_expected_digest() {
+        let directory = TestArtifactDirectory::new("same-content-new-identity");
+        let configured_path = directory.join("model.gguf");
+        let replacement_path = directory.join("replacement.gguf");
+        let bytes = b"same verified artifact";
+        std::fs::write(&configured_path, bytes).expect("write artifact");
+        let first = ModelArtifactGuard::open(&configured_path, "model", None, None)
+            .expect("initial verification");
+        let digest = first.expected_sha256.clone();
+        let identity = artifact_file_identity(&first.initial_state);
+        drop(first);
+        std::fs::write(&replacement_path, bytes).expect("write replacement");
+        std::fs::rename(&replacement_path, &configured_path).expect("replace inode");
+        let replacement = File::open(&configured_path).expect("open replacement");
+        let replacement_state = artifact_file_state(&replacement.metadata().expect("metadata"));
+        assert_ne!(artifact_file_identity(&replacement_state), identity);
+
         let refreshed =
             ModelArtifactGuard::open(&configured_path, "model", Some(&digest), Some(&identity))
-                .expect("stale cache triggers a fresh verification");
-        assert_ne!(refreshed.expected_sha256, digest);
-        assert_eq!(refreshed.payload_bytes_read(), 11);
+                .expect("same content remains valid after identity-triggered rehash");
+        assert_eq!(refreshed.expected_sha256, digest);
+        assert_eq!(refreshed.payload_bytes_read(), bytes.len() as u64);
     }
 
     #[test]
@@ -15780,8 +15859,6 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
         let mut config = NativeModelConfig::local(std::env::var("MOM_LLAMA_MODEL_PATH")?.into());
-        let state_directory = RealTestDirectory::new();
-        config.state_cache_directory = Some(state_directory.0.clone());
         config.device = NativeDevice::Cpu;
         config.context_tokens = 512;
         config.batch_tokens = 128;
@@ -15858,8 +15935,7 @@ mod tests {
             handle.restore_sequence(prefix.clone(), 0)?,
             SequenceRestoreKind::NativeState
         );
-        let export_receipt = prefix.export_receipt();
-        assert!(handle.has_live_sequence_receipt(&export_receipt));
+        assert!(handle.has_reusable_sequence(&prefix));
         let compact = prefix
             .reconstruction()
             .sequence(prefix.token_ids.clone())
@@ -15977,26 +16053,30 @@ mod tests {
             handle.snapshot_sequence(1).is_err(),
             "uncertain native mutation invalidates the whole context"
         );
+        let mut persisted_prefix = prefix.clone();
+        persisted_prefix.mark_authenticated_storage();
         assert_eq!(
-            handle.restore_sequence(prefix.clone(), 0)?,
+            handle.restore_sequence(persisted_prefix, 0)?,
             SequenceRestoreKind::NativeState,
-            "an authenticated persisted prefix survives uncertain in-memory mutation"
+            "explicitly authenticated persisted state survives worker receipt invalidation"
         );
         assert_eq!(handle.snapshot_sequence(0)?.token_ids, prefix.token_ids);
         let serialized = serde_json::to_vec(&compact)?;
         let serialized_native = serde_json::to_vec(&prefix)?;
         owner.shutdown_joined()?;
-        assert!(!handle.has_live_sequence_receipt(&export_receipt));
+        assert!(!handle.has_reusable_sequence(&prefix));
         drop(handle);
         let owner = NativeModelOwner::load(config.clone())?;
         let handle = owner.handle();
-        let signed: SequenceStateBlob = serde_json::from_slice(&serialized_native)?;
+        let mut signed: SequenceStateBlob = serde_json::from_slice(&serialized_native)?;
+        assert!(!signed.has_authenticated_storage_proof());
+        signed.mark_authenticated_storage();
         assert_eq!(
             handle.restore_sequence(signed, 0)?,
             SequenceRestoreKind::NativeState,
             "authenticated native state must restore in a new model worker"
         );
-        assert!(!handle.has_live_sequence_receipt(&export_receipt));
+        assert!(!handle.has_reusable_sequence(&prefix));
         let durable: SequenceStateBlob = serde_json::from_slice(&serialized)?;
         assert_eq!(
             handle.restore_sequence(durable.clone(), 0)?,
@@ -16045,8 +16125,6 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
         let mut config = NativeModelConfig::local(std::env::var("MOM_LLAMA_MODEL_PATH")?.into());
-        let state_directory = RealTestDirectory::new();
-        config.state_cache_directory = Some(state_directory.0.clone());
         config.device = NativeDevice::Metal;
         // This matches the app's resolved long-persona context under its
         // 21,845 MiB budget. NativeModelConfig does not enforce that budget.
@@ -16248,13 +16326,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
-        let state_directory = RealTestDirectory::new();
         let mut warm_config = NativeModelConfig::local(PathBuf::from(&model_path));
         warm_config.device = NativeDevice::Auto;
         warm_config.context_tokens = 8192;
         warm_config.batch_tokens = 512;
         warm_config.max_sequences = 1;
-        warm_config.state_cache_directory = Some(state_directory.0.clone());
         let owner = NativeModelOwner::load(warm_config.clone())?;
         let handle = owner.handle();
         let model_id = handle.status().model_id;
@@ -16292,7 +16368,7 @@ mod tests {
                 .wait_timeout(Duration::from_mins(2))?,
         )?;
         assert_eq!(warm.len(), 1);
-        let prefix = handle.snapshot_sequence(0)?;
+        let mut prefix = handle.snapshot_sequence(0)?;
         assert!(
             prefix.token_count > 3_000,
             "warm persona prompt should retain a multi-thousand-token prefix, got {}",
@@ -16316,6 +16392,9 @@ mod tests {
         owner.shutdown_joined()?;
         drop(handle);
 
+        // This engine test simulates the trusted storage adapter. Product
+        // tests separately exercise AEAD authentication and corrupt chunks.
+        prefix.mark_authenticated_storage();
         let imported_owner = NativeModelOwner::load(warm_config.clone())?;
         let imported_handle = imported_owner.handle();
         let imported_started = Instant::now();
@@ -16331,7 +16410,8 @@ mod tests {
         let imported_elapsed = imported_started.elapsed();
         let cache_metrics = &imported[0].metrics.cache;
         assert!(
-            cache_metrics.restored_prefix_tokens + cache_metrics.replayed_prefix_tokens > 0,
+            cache_metrics.restored_prefix_tokens > 3_000
+                && cache_metrics.replayed_prefix_tokens == 0,
             "changed prompt should import and reuse its longest shared native prefix: {cache_metrics:?}"
         );
         imported_owner.shutdown_joined()?;
@@ -16492,7 +16572,6 @@ mod tests {
         let mut config =
             NativeModelConfig::local(std::env::var("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?.into());
         config.mmproj_path = Some(std::env::var("MOM_LLAMA_MM_PROJ_PATH")?.into());
-        config.state_cache_directory = Some(directory.0.clone());
         config.device = NativeDevice::Auto;
         config.context_tokens = 1024;
         config.batch_tokens = 128;
@@ -16729,12 +16808,18 @@ mod tests {
         let (sequence_id, token_count, token_ids, cells) =
             serde_json::from_slice(&std::fs::read(directory.0.join("conversation.json"))?)?;
         request.cached_prefix = Some(SequenceStateBlob {
+            storage_proof: None,
             sequence_id,
             token_count,
             token_ids,
             cells,
             bytes: std::fs::read(directory.0.join("conversation.kv"))?.into(),
         });
+        request
+            .cached_prefix
+            .as_mut()
+            .expect("restored fixture")
+            .mark_authenticated_storage();
         request.request_id = "audio-retention-restarted".into();
         let restored = handle.generate_incremental_audio(request)?;
         restored.wait_for_resume()?;

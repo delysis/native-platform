@@ -2938,25 +2938,30 @@ pub async fn mom_llama_kv_cache_checkpoint_voice_session(
 }
 
 #[tauri::command]
-pub fn mom_llama_kv_cache_set_voice_call_activity(
+pub async fn mom_llama_kv_cache_set_voice_call_activity(
     runtime: State<'_, AppRuntimeHandle>,
     session_id: String,
     active: bool,
 ) -> Result<Value, String> {
     let scope = runtime.operation_scope();
-    let _lease = runtime.admit(command_spec("mom_llama_kv_cache_set_voice_call_activity"))?;
-    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, &session_id, active)
-        .map_err(to_error)?;
-    to_value(mom_llama_runtime::CommandResult::passed(
-        "mom_llama.kv_cache_set_voice_call_activity",
-        "host_integrated",
-        (),
-        Vec::new(),
-        Vec::new(),
-        false,
-        false,
-    ))
-    .map_err(to_error)
+    blocking_value(
+        runtime.admit(command_spec("mom_llama_kv_cache_set_voice_call_activity"))?,
+        move || {
+            mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, &session_id, active)
+                .map_err(to_error)?;
+            to_value(mom_llama_runtime::CommandResult::passed(
+                "mom_llama.kv_cache_set_voice_call_activity",
+                "host_integrated",
+                (),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false,
+            ))
+            .map_err(to_error)
+        },
+    )
+    .await
 }
 
 #[tauri::command]

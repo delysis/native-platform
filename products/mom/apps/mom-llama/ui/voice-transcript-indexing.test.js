@@ -19,11 +19,12 @@ assert.ok(canContinueStart >= 0 && canContinueEnd > canContinueStart);
 assert.ok(suspendStart >= 0 && suspendEnd > suspendStart);
 
 function makeHarness({ transcription, commit, preview, stopSpeechOperationAndWait,
-  attachment = "recording-a", message = "message-a" } = {}) {
+  attachment = "recording-a", message = "message-a", sourceCapture = null } = {}) {
   const calls = [];
   const stages = [];
   const errors = [];
   const retries = [];
+  const hashInputs = [];
   let now = 0;
   const context = {
     voiceCallActive: false,
@@ -54,6 +55,8 @@ function makeHarness({ transcription, commit, preview, stopSpeechOperationAndWai
     retryCallPrefillAfterTranscript: (conversation) => retries.push(conversation),
     attachmentPreviewResult: (value) => value?.result ?? value,
     attachmentPreviewAnchor: () => ({}),
+    sha256Hex: async (bytes) => { hashInputs.push(bytes.byteLength); return "archive-sha"; },
+    encodePcmWav: () => new Uint8Array([1, 2, 3]),
     invoke: async (command, args) => {
       calls.push({ command, args });
       if (command === "mom_llama_attachment_preview") {
@@ -93,13 +96,14 @@ function makeHarness({ transcription, commit, preview, stopSpeechOperationAndWai
     errors,
     retries,
     context,
+    hashInputs,
     idleJobs: context.idleJobs,
     canContinueRecovery: () => context.canContinueRecovery(),
     suspend: (reason = "foreground") => context.suspend(reason),
     run: (options = {}) => context.indexVoiceTurn("conversation-a", {
       voice_attachment_id: attachment,
       user_message_id: message,
-    }, null, null, "trace-a", options),
+    }, null, sourceCapture, "trace-a", options),
   };
 }
 
@@ -131,6 +135,73 @@ test("only a successful durable transcript commit returns true and finishes the 
   assert.deepEqual(harness.retries, ["conversation-a"]);
   assert.equal(harness.stages.filter(({ stage }) => stage === "voice_transcript_finished").length, 1);
   assert.equal(harness.stages.filter(({ stage }) => stage === "voice_transcript_failed").length, 0);
+});
+
+test("live PCM uses the native accepted-capture receipt and hashes only its archived WAV", async () => {
+  const identity = { turn: "turn-a", capture: "capture-a", conversation: "conversation-a" };
+  const samples = new Float32Array([0.25, -0.5]);
+  const sourceCapture = {
+    transcription: {
+      finished: Promise.resolve({ source: {
+        identity,
+        samples: samples.length,
+        // The accepted PCM digest is native-authored. The renderer does not
+        // rescan retained PCM to recreate this binding.
+        pcm_f32le_sha256: "native-digest",
+      }, transcript: "A grounded live transcript." }),
+      metrics: () => identity,
+    },
+    samples: () => samples,
+  };
+  const harness = makeHarness({
+    sourceCapture,
+    preview: async () => ({ result: {
+      primary: { kind: "audio", id: "audio-a" }, root_sha256: "archive-sha",
+    } }),
+    transcription: contractedTranscript("Fallback should not run."),
+    commit: contractedCommit,
+  });
+
+  assert.equal(await harness.run(), true);
+  assert.deepEqual(harness.hashInputs, [3], "only the encoded archival WAV is hashed");
+  assert.equal(harness.calls.some(({ command }) => command === "mom_llama_speech_transcribe_attachment"), false);
+  const record = harness.calls.find(({ command }) => command === "mom_llama_message_record_voice_transcript");
+  assert.equal(record?.args.transcript, "A grounded live transcript.");
+  assert.ok(harness.stages.some(({ stage }) => stage === "voice_transcript_live_verified"));
+});
+
+test("live source identity and archived-audio mismatches still fall back to stored-audio ASR", async () => {
+  for (const mismatch of ["capture", "archive"]) {
+    const identity = { turn: "turn-a", capture: "capture-a", conversation: "conversation-a" };
+    const sourceIdentity = mismatch === "capture" ? { ...identity, capture: "stale-capture" } : identity;
+    const samples = new Float32Array([0.25, -0.5]);
+    const harness = makeHarness({
+      sourceCapture: {
+        transcription: {
+          finished: Promise.resolve({ source: {
+            identity: sourceIdentity,
+            samples: samples.length,
+            pcm_f32le_sha256: "native-digest",
+          }, transcript: "Unadmitted live transcript." }),
+          metrics: () => identity,
+        },
+        samples: () => samples,
+      },
+      preview: async () => ({ result: {
+        primary: { kind: "audio", id: "audio-a" },
+        root_sha256: mismatch === "archive" ? "different-archive" : "archive-sha",
+      } }),
+      transcription: contractedTranscript("Stored-audio fallback."),
+      commit: contractedCommit,
+    });
+
+    assert.equal(await harness.run(), true, `${mismatch} mismatch falls back safely`);
+    assert.deepEqual(harness.hashInputs, [3]);
+    assert.equal(harness.calls.filter(({ command }) => command === "mom_llama_speech_transcribe_attachment").length, 1);
+    const record = harness.calls.find(({ command }) => command === "mom_llama_message_record_voice_transcript");
+    assert.equal(record?.args.transcript, "Stored-audio fallback.");
+    assert.equal(harness.stages.some(({ stage }) => stage === "voice_transcript_live_verified"), false);
+  }
 });
 
 test("blocked ASR stays an error and cannot commit or retry", async () => {

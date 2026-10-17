@@ -50,5 +50,5 @@
   },
   "tampered_ciphertext_hex": "00",
   "native_prefix_disposition": "quarantine_then_cold_miss",
-  "session_blob_disposition": "invalidate_delete_then_cold_miss"
+  "session_blob_disposition": "unsupported_legacy_snapshot_preserved"
 }

@@ -92,9 +92,6 @@ impl LocalModelProfile {
 
     pub fn as_native_config(&self) -> Result<NativeModelConfig, NativeError> {
         let mut config = NativeModelConfig {
-            // Loom has no application-owned native-state authority directory;
-            // keep sequence restoration scoped to this worker.
-            state_cache_directory: None,
             model_id: self.model_id.clone(),
             model_path: self.model_path.clone(),
             expected_model_sha256: self.expected_model_sha256.clone(),
