@@ -5437,62 +5437,48 @@
     text,
     flush = false,
     first = false,
-    wordLimit = null,
     speechMode = "call",
   ) => {
     const words = [...text.matchAll(/\S+/g)];
-    // Qwen streams PCM within each request. Restarting it every four words
-    // creates an audible prosody reset and costs more than waiting briefly for
-    // a clause. Calls retain a shorter first runway; voice notes favor complete
-    // phrases because they do not need sub-second interruption boundaries.
-    const voiceNote = speechMode === "voice_note";
-    const requestedMaximum = Number.isFinite(wordLimit) ? Math.floor(wordLimit) : null;
-    const maximum = voiceNote
-      ? (first ? 20 : 28)
-      : (first
-        ? Math.min(16, Math.max(6, requestedMaximum ?? 16))
-        : Math.min(24, Math.max(8, requestedMaximum ?? 24)));
-    const minimum = first ? (voiceNote ? 10 : 6) : Math.min(voiceNote ? 12 : 8, maximum);
-    // A voice note can afford to collect a full phrase. Qwen starts a fresh
-    // acoustic trajectory per request, so honoring every short generated
-    // sentence as its own request creates the conspicuous four-word cadence
-    // the UI used to produce. Calls retain short punctuation boundaries for
-    // responsiveness; voice notes do not split before their prosody runway.
-    const sentenceBoundaryMinimum = voiceNote ? minimum : (first ? 2 : 3);
-    const weakBoundaryMinimum = voiceNote ? minimum : (first ? 3 : Math.min(6, minimum));
     if (!words.length) return null;
-    const limit = Math.min(words.length, maximum);
-    for (let index = 0; index < limit; index += 1) {
-      const completeSentence = /[.!?][\]"')]*$/.test(words[index][0])
-        && ((!voiceNote && flush) || index >= sentenceBoundaryMinimum - 1);
-      const weakBoundary = /[;:,][\]"')]*$/.test(words[index][0])
-        && index >= weakBoundaryMinimum - 1;
-      if (completeSentence || weakBoundary) {
-        const end = words[index].index + words[index][0].length;
-        return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+    const splitAt = (index, boundary) => {
+      const end = words[index].index + words[index][0].length;
+      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart(), boundary };
+    };
+    if (speechMode === "call") {
+      // Each Qwen request starts a fresh acoustic trajectory. Let it see a
+      // complete sentence; audio runway controls dispatch, not text phrasing.
+      // A completed-word cap bounds exceptionally long/unpunctuated output.
+      const maximum = 64;
+      const completeWords = words.length - (!flush && !/\s$/.test(text) ? 1 : 0);
+      const limit = Math.min(completeWords, maximum);
+      let clause = -1;
+      for (let index = 0; index < limit; index += 1) {
+        const word = words[index][0];
+        const abbreviation = /^(?:[A-Za-z]\.)+$/.test(word)
+          || /^(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e)\.$/i.test(word)
+          || /^\d+\.$/.test(word);
+        if (/[.!?…][\]"')”’]*$/u.test(word) && !abbreviation) {
+          return splitAt(index, "sentence");
+        }
+        if (index >= 15 && /[;:,][\]"')”’]*$/u.test(word)) clause = index;
       }
+      if (completeWords >= maximum) {
+        return splitAt(clause >= 0 ? clause : maximum - 1,
+          clause >= 0 ? "limit_clause" : "limit_words");
+      }
+      return flush ? splitAt(words.length - 1, "end") : null;
     }
-    if (!flush && words.length < minimum) return null;
-    // Streaming deltas can end in the middle of a word. A trailing separator
-    // proves the runway's final word is complete; otherwise wait for the next
-    // token before cutting the phrase.
-    if (!voiceNote && first && !flush && words.length === minimum && /\s$/.test(text)) {
-      const end = words[minimum - 1].index + words[minimum - 1][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
-    }
-    if (!voiceNote && first && !flush && words.length > minimum) {
-      const end = words[minimum - 1].index + words[minimum - 1][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+    // Voice notes join short sentences into a phrase before starting Qwen.
+    const maximum = first ? 20 : 28;
+    const minimum = first ? 10 : 12;
+    const limit = Math.min(words.length, maximum);
+    for (let index = minimum - 1; index < limit; index += 1) {
+      if (/[.!?;:,][\]"')]*$/.test(words[index][0])) return splitAt(index, "phrase");
     }
     if (words.length >= maximum || flush) {
       if (!flush && words.length === maximum && !/\s$/.test(text)) return null;
-      // Closing the text stream makes a short tail dispatchable; it does not
-      // suspend the segment bound. Sending an entire completed reply as one
-      // Qwen request can synthesize seconds ahead of playback and removes the
-      // scheduler's next opportunity to yield compute or honor interruption.
-      const index = Math.min(words.length, maximum) - 1;
-      const end = words[index].index + words[index][0].length;
-      return { chunk: text.slice(0, end).trim(), rest: text.slice(end).trimStart() };
+      return splitAt(Math.min(words.length, maximum) - 1, flush ? "end" : "limit_words");
     }
     return null;
   };
@@ -5652,9 +5638,9 @@
       const words = pendingWordCount();
       // Eight words of hysteresis gives Gemma a useful decode quantum between
       // handoffs. Never pause unless the queued text contains a chunk the TTS
-      // pump can actually consume; this makes an unpunctuated partial segment
-      // release Gemma instead of deadlocking below the 24-word boundary.
-      const readyChunk = takeLiveSpeechChunk(pendingText, false, firstRequest, null, mode);
+      // pump can actually consume. A partial sentence must keep Gemma running
+      // until punctuation (or the bounded long-sentence fallback) arrives.
+      const readyChunk = takeLiveSpeechChunk(pendingText, false, firstRequest, mode);
       semanticBackpressureDesired = semanticLeadController.shouldPause({
         queuedWords: words,
         readyChunk: Boolean(readyChunk),
@@ -6035,11 +6021,7 @@
     pump = () => {
       if (running || stopped) return;
       const bufferedRunwayMs = controller.bufferedMs();
-      const chunkWordLimit = leadController.chunkWordLimit({
-        first: firstRequest,
-        bufferedMs: bufferedRunwayMs,
-      });
-      const next = takeLiveSpeechChunk(pendingText, closed, firstRequest, chunkWordLimit, mode);
+      const next = takeLiveSpeechChunk(pendingText, closed, firstRequest, mode);
       if (!next) {
         if (closed) {
           window.clearTimeout(audioProgressWatchdog);
@@ -6139,7 +6121,7 @@
         segment, operation_id: operation, request_id: requestId,
       });
       const wordCount = next.chunk.match(/\S+/g)?.length || 1;
-      const maxSegmentFrames = Math.ceil(Math.min(20, Math.max(2.5, wordCount / 2 + 1)) * 24000);
+      const maxSegmentFrames = Math.ceil(Math.min(40, Math.max(2.5, wordCount / 2 + 1)) * 24000);
       let segmentFrames = 0;
       let segmentPcmPackets = 0;
       let segmentPcmAudioMs = 0;
@@ -6154,7 +6136,7 @@
           overlap: "content_delta",
           characters: next.chunk.length,
           words: wordCount,
-          chunk_word_limit: chunkWordLimit,
+          segmentation_boundary: next.boundary,
         });
         markTtsLatency("tts_started", { overlap: "content_delta" });
       }
@@ -6286,7 +6268,7 @@
           transport_drain_ms: Math.round(performance.now() - receiptAt),
           characters: next.chunk.length,
           words: wordCount,
-          chunk_word_limit: chunkWordLimit,
+          segmentation_boundary: next.boundary,
           queue_ms: binding.tts_queue_ms ?? null,
           queue_us: binding.tts_queue_us ?? null,
           host_route_us: binding.tts_host_route_us ?? null,

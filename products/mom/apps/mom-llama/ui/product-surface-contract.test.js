@@ -1436,46 +1436,62 @@ test("next-turn prefetch is never charged to the current microphone session", ()
   assert.equal(ordinary.voice_session_handoff_ms, 11);
 });
 
-test("live speech uses punctuation or a mode-appropriate PCM runway", () => {
+test("call speech waits for sentence boundaries while voice notes retain phrase boundaries", () => {
   const start = bridge.indexOf("  const takeLiveSpeechChunk =");
   const end = bridge.indexOf("\n  const beginLiveVoiceTts =", start);
   assert.ok(start >= 0 && end > start);
   const chunk = Function(`${bridge.slice(start, end)}\nreturn takeLiveSpeechChunk;`)();
 
   assert.equal(chunk("One two three four five six", false, true), null);
-  assert.deepEqual(chunk("One two three four five six seven", false, true), {
-    chunk: "One two three four five six",
-    rest: "seven",
+  assert.deepEqual(chunk("One two three four five six. ", false, true), {
+    chunk: "One two three four five six.", rest: "", boundary: "sentence",
   });
-  assert.deepEqual(chunk("One two three,", false, true), {
-    chunk: "One two three,",
-    rest: "",
+  assert.equal(chunk("A partial sentence keeps arriving without punctuation", false, true), null);
+  assert.deepEqual(chunk("Dr. Smith works with the U.S. team on 3.14 meter samples. Next sentence. ", false, true), {
+    chunk: "Dr. Smith works with the U.S. team on 3.14 meter samples.",
+    rest: "Next sentence. ",
+    boundary: "sentence",
   });
-  assert.equal(chunk("One two thr", false, true), null);
-  assert.deepEqual(chunk("One two", true, true), {
-    chunk: "One two",
-    rest: "",
+  const sentenceStream = "First sentence ends. Second sentence ends. ";
+  const firstSentence = chunk(sentenceStream, false, true);
+  const secondSentence = chunk(firstSentence.rest, false, true);
+  assert.equal(firstSentence.boundary, "sentence");
+  assert.equal(secondSentence.boundary, "sentence");
+  assert.equal(`${firstSentence.chunk} ${secondSentence.chunk}`, sentenceStream.trim());
+  assert.deepEqual(chunk("The final line has no punctuation", true, true), {
+    chunk: "The final line has no punctuation", rest: "", boundary: "end",
   });
-  assert.equal(chunk("Yes. More text is arriving", false, true), null);
-  assert.deepEqual(chunk("Hello, Jan. How are you", false, true), {
-    chunk: "Hello, Jan.",
-    rest: "How are you",
+
+  const cappedClauseWords = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  cappedClauseWords[18] += ",";
+  const cappedClauseText = `${cappedClauseWords.join(" ")} `;
+  const clause = chunk(cappedClauseText, false, true);
+  assert.deepEqual(clause, {
+    chunk: cappedClauseWords.slice(0, 19).join(" "),
+    rest: `${cappedClauseWords.slice(19).join(" ")} `,
+    boundary: "limit_clause",
   });
-  assert.equal(chunk("Hello, Jan", false, true), null);
+  const cappedWordsText = `${Array.from({ length: 70 }, (_, index) => `word${index + 1}`).join(" ")} `;
+  const cappedWords = chunk(cappedWordsText, false, true);
+  assert.deepEqual(cappedWords, {
+    chunk: Array.from({ length: 64 }, (_, index) => `word${index + 1}`).join(" "),
+    rest: `${Array.from({ length: 6 }, (_, index) => `word${index + 65}`).join(" ")} `,
+    boundary: "limit_words",
+  });
   assert.equal(
-    chunk("One two three four five six seven eight nine ten", false, true, 10, "voice_note"),
+    chunk("One two three four five six seven eight nine ten", false, true, "voice_note"),
     null,
   );
   assert.equal(
-    chunk("Yes. This short sentence must not reset prosody", false, true, 10, "voice_note"),
+    chunk("Yes. This short sentence must not reset prosody", false, true, "voice_note"),
     null,
   );
   assert.deepEqual(
-    chunk("Yes. This short sentence joins the following complete phrase naturally.", false, true, 10, "voice_note"),
-    { chunk: "Yes. This short sentence joins the following complete phrase naturally.", rest: "" },
+    chunk("Yes. This short sentence joins the following complete phrase naturally.", false, true, "voice_note"),
+    { chunk: "Yes. This short sentence joins the following complete phrase naturally.", rest: "", boundary: "phrase" },
   );
   assert.equal(
-    chunk("One two three four five six seven eight nine ten eleven", false, true, 10, "voice_note"),
+    chunk("One two three four five six seven eight nine ten eleven", false, true, "voice_note"),
     null,
   );
 });

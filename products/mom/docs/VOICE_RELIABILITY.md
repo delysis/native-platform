@@ -84,6 +84,27 @@ application directory cannot qualify a fresh profile. Existing profiles without
 their own receipt verify the acquired assets and complete runtime warming once;
 the old application-directory receipt is left untouched.
 
+## Sentence prosody and streaming PCM continuity
+
+Call speech normally submits one complete sentence per Qwen request. It does
+not start a fresh acoustic trajectory after six words or at ordinary commas.
+Only an unusually long/unpunctuated sentence reaches the 64-complete-word cap;
+that fallback prefers a clause boundary and is recorded in segment telemetry.
+A final unpunctuated tail is sent when Gemma finishes. The audio runway scheduler
+still controls when a ready sentence is dispatched, but cannot shorten its text.
+The helper's acoustic-token ceiling and renderer's duration budget accommodate
+these longer requests. Streaming audio and cancellation remain active within a
+sentence; this does not require buffering the full audio sentence before playing.
+
+The rolling vocoder crossfade must blend two decodes of the same timeline.
+Previously it withheld 512 samples, then blended that tail over the next batch's
+new samples. Four batches of 2/3/5/5 codec frames plus the final tail emitted
+27,264 samples rather than 28,800, dropping 64 ms at 24 kHz. Decoding the retained
+overlap as well as the new frames preserves duration and boundary alignment.
+Regression checks compare a continuous synthetic waveform across varying batch
+sizes, including both empty and nonempty final remainders. This repairs sample
+loss; it does not establish the cause of multi-second physical-output pauses.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and

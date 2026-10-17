@@ -217,23 +217,6 @@ test("semantic terminal always releases exact-request backpressure", () => {
   assert.equal(lead.shouldPause({ queuedWords: 18, readyChunk: true, terminal: true }), false);
 });
 
-test("fast TTS uses short quanta so one segment cannot grossly overfill PCM", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  lead.noteSegment({ synthesisMs: 600, audioMs: 2_000, firstAudioMs: 120, words: 5 });
-  const words = lead.chunkWordLimit({ bufferedMs: lead.targetRunwayMs() });
-  assert.ok(words >= 4 && words <= 6, `expected a short fast-producer quantum, got ${words}`);
-});
-
-test("near-real-time TTS uses a larger quantum to amortize switching", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  for (let index = 0; index < 4; index += 1) {
-    lead.noteSegment({ synthesisMs: 2_100, audioMs: 2_000, firstAudioMs: 220, words: 5 });
-  }
-  const slowWords = lead.chunkWordLimit({ bufferedMs: 0 });
-  assert.ok(slowWords >= 8 && slowWords <= 16, `expected a bounded slow-producer quantum, got ${slowWords}`);
-  assert.equal(lead.chunkWordLimit({ first: true, bufferedMs: 0 }), 4);
-});
-
 test("complete buffering activates after sustained slow segments or one severe first segment", () => {
   const sustained = new AdaptiveVoiceLeadController();
   assert.equal(sustained.shouldBufferCompleteReply(), false);
@@ -330,15 +313,7 @@ test("progress timeout grows with measured slow-machine cadence and stays bounde
   assert.equal(verySlow.progressTimeoutMs(), 60_000);
 });
 
-test("speech-rate observations tune segment size without escaping hard bounds", () => {
-  const lead = new AdaptiveVoiceLeadController();
-  lead.noteSegment({ synthesisMs: 400, audioMs: 1_000, firstAudioMs: 90, words: 5 });
-  assert.ok(lead.snapshot().observed_speech_ms_per_word < 400);
-  assert.ok(lead.chunkWordLimit({ bufferedMs: 10_000 }) >= 4);
-  assert.ok(lead.chunkWordLimit({ bufferedMs: 0 }) <= 16);
-});
-
-test("speech chunks preserve call latency and voice-note prosody", () => {
+test("call speech waits for complete sentences and voice notes retain phrase rules", () => {
   const fs = require("node:fs");
   const vm = require("node:vm");
   const source = fs.readFileSync(require.resolve("./coop-hx.js"), "utf8");
@@ -348,98 +323,96 @@ test("speech chunks preserve call latency and voice-note prosody", () => {
   const context = {};
   vm.createContext(context);
   vm.runInContext(`${source.slice(start, end)}\nthis.takeLiveSpeechChunk = takeLiveSpeechChunk;`, context);
-  assert.equal(context.takeLiveSpeechChunk("One two three four five six", false, true, 6), null);
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six ", false, true, 6))),
-    { chunk: "One two three four five six", rest: "" },
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six s", false, true, 6))),
-    { chunk: "One two three four five six", rest: "s" },
-  );
-  // Every call segment must wait for a partial final word at its dynamic cap.
-  // Once a separator arrives, dispatch the complete capped chunk; once a new
-  // word starts, dispatch the complete prefix and retain that partial tail.
-  assert.equal(
-    context.takeLiveSpeechChunk("One two three four five six seven eigh", false, false, 8),
-    null,
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk("One two three four five six seven eight ", false, false, 8))),
-    { chunk: "One two three four five six seven eight", rest: "" },
-  );
-  const callSplit = context.takeLiveSpeechChunk(
-    "One two three four five six seven eight nin",
-    false,
-    false,
-    8,
-  );
-  assert.deepEqual(JSON.parse(JSON.stringify(callSplit)), {
-    chunk: "One two three four five six seven eight",
-    rest: "nin",
+  const chunk = (text, flush = false, first = false, mode = "call") =>
+    context.takeLiveSpeechChunk(text, flush, first, mode);
+
+  assert.equal(chunk("One two three four five six"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("One two three four five six. "))), {
+    chunk: "One two three four five six.", rest: "", boundary: "sentence",
   });
-  assert.equal(`${callSplit.chunk} ${callSplit.rest}`, "One two three four five six seven eight nin");
-  assert.equal(
-    context.takeLiveSpeechChunk("One two three four five six seven eight nine ten", false, true, 10, "voice_note"),
-    null,
-  );
-  assert.equal(
-    context.takeLiveSpeechChunk(
-      "One two three four five six seven eight nine ten eleven ",
-      false,
-      true,
-      10,
-      "voice_note",
-    ),
-    null,
-  );
+  assert.equal(chunk("A partial sentence keeps arriving without punctuation"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("Dr. Smith met the U.S. team at 3.14 p.m. today. Next sentence. "))), {
+    chunk: "Dr. Smith met the U.S. team at 3.14 p.m. today.",
+    rest: "Next sentence. ", boundary: "sentence",
+  });
+  const sentenceStream = "First one ends. Second one ends. ";
+  const firstSentence = chunk(sentenceStream);
+  const secondSentence = chunk(firstSentence.rest);
+  assert.equal(`${firstSentence.chunk} ${secondSentence.chunk}`, sentenceStream.trim());
+
+  const streamedInput = "Dr. Smith met the U.S. team at 3.14 p.m. today. The next sentence is complete. final unpunctuated tail";
+  const streamedSentences = [];
+  let pending = "";
+  for (const character of streamedInput) {
+    pending += character;
+    const ready = chunk(pending);
+    if (ready) {
+      streamedSentences.push(ready.chunk);
+      pending = ready.rest;
+    }
+  }
+  assert.deepEqual(streamedSentences, [
+    "Dr. Smith met the U.S. team at 3.14 p.m. today.",
+    "The next sentence is complete.",
+  ]);
+  assert.equal(pending, "final unpunctuated tail");
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(pending, true))), {
+    chunk: "final unpunctuated tail", rest: "", boundary: "end",
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk("A final unterminated sentence", true))), {
+    chunk: "A final unterminated sentence", rest: "", boundary: "end",
+  });
+
+  const clauseWords = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  clauseWords[18] += ",";
+  const clause = chunk(`${clauseWords.join(" ")} `);
+  assert.deepEqual(JSON.parse(JSON.stringify(clause)), {
+    chunk: clauseWords.slice(0, 19).join(" "),
+    rest: `${clauseWords.slice(19).join(" ")} `, boundary: "limit_clause",
+  });
+  const words = Array.from({ length: 70 }, (_, index) => `word${index + 1}`);
+  const sixtyFourWithoutSeparator = words.slice(0, 64).join(" ");
+  assert.equal(chunk(sixtyFourWithoutSeparator), null, "the 64th partial word is not dispatched");
+  const sixtyFourComplete = chunk(`${sixtyFourWithoutSeparator} `);
+  assert.equal(sixtyFourComplete.boundary, "limit_words");
+  assert.equal(sixtyFourComplete.chunk.split(/\s+/).length, 64);
+  const capped = chunk(`${words.join(" ")} `);
+  assert.equal(capped.boundary, "limit_words");
+  assert.equal(capped.chunk.split(/\s+/).length, 64);
+  assert.equal(`${capped.chunk} ${capped.rest}`.trim().split(/\s+/).length, 70);
+
+  const semanticLead = new SemanticLeadController();
+  const longSentence = Array.from({ length: 24 }, (_, index) => `word${index + 1}`).join(" ");
+  assert.equal(chunk(longSentence), null);
+  assert.equal(semanticLead.shouldPause({ queuedWords: 24, readyChunk: false }), false);
+  const completedLongSentence = chunk(`${longSentence}. `);
+  assert.equal(completedLongSentence.boundary, "sentence");
+  assert.equal(semanticLead.shouldPause({ queuedWords: 24, readyChunk: true }), true);
+
+  assert.equal(chunk("One two three four five six seven eight nine ten", false, true, "voice_note"), null);
   const voiceNotePartial = Array.from({ length: 27 }, (_, index) => `word${index + 1}`).join(" ") + " partial";
-  assert.equal(context.takeLiveSpeechChunk(voiceNotePartial, false, false, 28, "voice_note"), null);
+  assert.equal(chunk(voiceNotePartial, false, false, "voice_note"), null);
   const voiceNoteComplete = `${voiceNotePartial} `;
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(voiceNoteComplete, false, false, 28, "voice_note"))),
-    { chunk: voiceNotePartial, rest: "" },
-  );
-  const voiceNoteNextWord = context.takeLiveSpeechChunk(
-    `${voiceNotePartial} next`,
-    false,
-    false,
-    28,
-    "voice_note",
-  );
-  assert.deepEqual(JSON.parse(JSON.stringify(voiceNoteNextWord)), { chunk: voiceNotePartial, rest: "next" });
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(voiceNoteComplete, false, false, "voice_note"))), {
+    chunk: voiceNotePartial, rest: "", boundary: "limit_words",
+  });
+  const voiceNoteNextWord = chunk(`${voiceNotePartial} next`, false, false, "voice_note");
+  assert.deepEqual(JSON.parse(JSON.stringify(voiceNoteNextWord)), {
+    chunk: voiceNotePartial, rest: "next", boundary: "limit_words",
+  });
   assert.equal(`${voiceNoteNextWord.chunk} ${voiceNoteNextWord.rest}`, `${voiceNotePartial} next`);
-  assert.equal(
-    context.takeLiveSpeechChunk(
-      "That sounds hard, and I am listening",
-      false,
-      true,
-      10,
-      "voice_note",
-    ),
-    null,
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(
-      "That sounds hard, and I am listening carefully to you now.",
-      false,
-      true,
-      10,
-      "voice_note",
-    ))),
-    { chunk: "That sounds hard, and I am listening carefully to you now.", rest: "" },
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.takeLiveSpeechChunk(
-      "I hear you. That sounds difficult, and I am listening carefully to what happened.",
-      true,
-      true,
-      10,
-      "voice_note",
-    ))),
-    {
-      chunk: "I hear you. That sounds difficult, and I am listening carefully to what happened.",
-      rest: "",
-    },
-  );
+  assert.equal(chunk("That sounds hard, and I am listening", false, true, "voice_note"), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(
+    "That sounds hard, and I am listening carefully to you now and I can stay with you, then we can talk.", false, false, "voice_note",
+  ))), {
+    chunk: "That sounds hard, and I am listening carefully to you now and I can stay with you,",
+    rest: "then we can talk.", boundary: "phrase",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk(
+    "I hear you. That sounds difficult, and I am listening carefully to what happened.", true, true, "voice_note",
+  ))), {
+    chunk: "I hear you. That sounds difficult, and I am listening carefully to what happened.",
+    rest: "", boundary: "phrase",
+  });
 });

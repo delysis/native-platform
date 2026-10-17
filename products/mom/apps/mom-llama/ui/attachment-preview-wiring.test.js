@@ -1102,7 +1102,6 @@ const liveTtsTailHarness = () => {
   let now = 0;
   let timerNumber = 0;
   class AdaptiveVoiceLeadController {
-    chunkWordLimit() { return 8; }
     shouldDispatch() { return true; }
     shouldBufferCompleteReply() { return false; }
     shouldPrepareNextCall() { return false; }
@@ -1208,13 +1207,13 @@ const liveTtsTailHarness = () => {
 test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
   const h = liveTtsTailHarness();
   const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
-  playback.push("alpha beta gamma delta epsilon zeta ");
+  playback.push("alpha beta gamma delta epsilon zeta. ");
   const first = h.synthesis()[0];
   assert.ok(first, "first synthesis segment is dispatched");
   first.args.pcmStream.onmessage(h.pcm("head"));
 
-  playback.push("eta theta iota kappa lambda mu nu xi ");
-  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
   first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
   await new Promise((resolve) => setImmediate(resolve));
   const prematureNextSegment = h.synthesis().length > 1;
@@ -1239,12 +1238,12 @@ test("live TTS keeps the next segment behind the old channel's terminal PCM tail
 test("stopping live TTS releases promptly while it waits for channel EOF", async () => {
   const h = liveTtsTailHarness();
   const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
-  playback.push("alpha beta gamma delta epsilon zeta ");
+  playback.push("alpha beta gamma delta epsilon zeta. ");
   const first = h.synthesis()[0];
   assert.ok(first);
   first.args.pcmStream.onmessage(h.pcm("head"));
-  playback.push("eta theta iota kappa lambda mu nu xi ");
-  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
   first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -1266,13 +1265,13 @@ test("stopping live TTS releases promptly while it waits for channel EOF", async
 test("live TTS also waits for native success when channel EOF arrives first", async () => {
   const h = liveTtsTailHarness();
   const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
-  playback.push("alpha beta gamma delta epsilon zeta ");
+  playback.push("alpha beta gamma delta epsilon zeta. ");
   const first = h.synthesis()[0];
   assert.ok(first);
   first.args.pcmStream.onmessage(h.pcm("head"));
   first.args.pcmStream.onmessage(h.pcm("eof", true));
-  playback.push("eta theta iota kappa lambda mu nu xi ");
-  const completed = playback.finish("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi ");
+  playback.push("eta theta iota kappa lambda mu nu xi. ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. eta theta iota kappa lambda mu nu xi. ");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.synthesis().length, 1, "terminal PCM alone cannot release the next synthesis request");
 
@@ -1290,11 +1289,11 @@ test("live TTS also waits for native success when channel EOF arrives first", as
 test("missing PCM EOF is bounded by the progress watchdog", async () => {
   const h = liveTtsTailHarness();
   const playback = h.context.beginLiveVoiceTts({ conversation: "fixture", mode: "call" });
-  playback.push("alpha beta gamma delta epsilon zeta ");
+  playback.push("alpha beta gamma delta epsilon zeta. ");
   const first = h.synthesis()[0];
   assert.ok(first);
   first.args.pcmStream.onmessage(h.pcm("head"));
-  const completed = playback.finish("alpha beta gamma delta epsilon zeta ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. ");
   first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.synthesis().length, 1, "the operation remains owned while EOF is outstanding");
@@ -1311,7 +1310,7 @@ test("PCM callbacks after terminal EOF fail the active segment instead of extend
   const playback = h.context.beginLiveVoiceTts({
     conversation: "fixture", mode: "call", onFailure: (error) => failures.push(String(error)),
   });
-  playback.push("alpha beta gamma delta epsilon zeta ");
+  playback.push("alpha beta gamma delta epsilon zeta. ");
   const first = h.synthesis()[0];
   assert.ok(first);
   first.args.pcmStream.onmessage(h.pcm("head"));
@@ -1319,7 +1318,7 @@ test("PCM callbacks after terminal EOF fail the active segment instead of extend
   first.args.pcmStream.onmessage(h.pcm("late"));
   assert.deepEqual(h.delivered.map(({ frame }) => frame.label), ["head", "eof"]);
   assert.equal(failures.length, 1);
-  const completed = playback.finish("alpha beta gamma delta epsilon zeta ");
+  const completed = playback.finish("alpha beta gamma delta epsilon zeta. ");
   first.reply.resolve({ status: "passed", result: { binding: { tts_total_ms: 1, duration_ms: 1 } } });
   assert.equal(await completed, false);
   assert.equal(h.synthesis().length, 1);

@@ -258,22 +258,6 @@
       ));
     }
 
-    chunkWordLimit({ first = false, bufferedMs = 0 } = {}) {
-      if (first) return 4;
-      const runway = Number.isFinite(bufferedMs) ? Math.max(0, bufferedMs) : 0;
-      const missingLeadMs = Math.max(0, this.targetRunwayMs() - runway);
-      // Each TTS invocation pays a first-audio/switching cost. Ask for enough
-      // speech to amortize roughly six such costs, but cap the net lead a fast
-      // producer can add before the scheduler gets another decision point.
-      const switchingQuantumMs = Math.max(1_200, this.firstAudioMs * 6);
-      const desiredLeadMs = Math.max(300, missingLeadMs + this.underrunPenaltyMs);
-      const leadGainPerWordMs = this.speechMsPerWord
-        * Math.max(0.05, 1 - Math.min(this.productionRtf, 0.95));
-      const switchingWords = Math.ceil(switchingQuantumMs / this.speechMsPerWord);
-      const leadWords = Math.ceil(desiredLeadMs / leadGainPerWordMs);
-      return Math.round(clamp(Math.max(switchingWords, leadWords), 4, 16));
-    }
-
     noteWait(durationMs) {
       if (!Number.isFinite(durationMs) || durationMs < 0) return;
       this.waits += 1;

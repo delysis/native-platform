@@ -355,7 +355,9 @@ private enum Qwen3TTSHelperMain {
                     // A large fixed floor let a missed EOS extend a tiny live
                     // phrase into seconds of repeated codec frames. Budget by
                     // text length and retain a small prosodic tail.
-                    let maxTokens = min(180, max(24, TextChunker.estimateTokens(for: textChunk) + 12))
+                    // Allow the app's bounded 64-word sentences to finish instead
+                    // of exhausting the old short-phrase ceiling mid-word.
+                    let maxTokens = min(384, max(24, TextChunker.estimateTokens(for: textChunk) + 12))
                     let stream = pipeline.generateStream(
                         text: textChunk,
                         speakerEmbedding: voice.speakerEmbedding,
