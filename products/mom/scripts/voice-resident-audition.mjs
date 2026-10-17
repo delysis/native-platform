@@ -58,6 +58,28 @@ function wav(pcm, sampleRate) {
   return Buffer.concat([header, pcm]);
 }
 
+function levelMatchedPCM(pcm, targetRmsDb = -22, maxPeakDb = -1) {
+  const count = pcm.length / 2;
+  let sumSquares = 0;
+  let peak = 0;
+  for (let offset = 0; offset < pcm.length; offset += 2) {
+    const sample = pcm.readInt16LE(offset) / 32768;
+    sumSquares += sample * sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+  const rms = Math.sqrt(sumSquares / count);
+  if (!rms || !peak) throw new Error('Cannot level-match silent PCM');
+  const requestedGain = 10 ** (targetRmsDb / 20) / rms;
+  const peakLimit = 10 ** (maxPeakDb / 20) / peak;
+  const gain = Math.min(requestedGain, peakLimit);
+  const matched = Buffer.alloc(pcm.length);
+  for (let offset = 0; offset < pcm.length; offset += 2) {
+    matched.writeInt16LE(Math.max(-32768, Math.min(32767,
+      Math.round(pcm.readInt16LE(offset) * gain))), offset);
+  }
+  return { pcm: matched, gainDb: 20 * Math.log10(gain), peakLimited: gain < requestedGain };
+}
+
 const receipt = {
   schema: 'mom-voice-resident-audition-v1',
   route: 'Qwen3TTSHelper --resident; same bounded streaming generation as the app',
@@ -102,8 +124,13 @@ async function finish(event) {
   if (event.event !== 'done') throw new Error(`${item.reference.label}: ${event.event}: ${event.detail ?? ''}`);
   if (!item.samples || !item.sampleRate) throw new Error(`${item.reference.label}: no playable PCM`);
   const output = join(outputDir, `${item.reference.label}.wav`);
-  const buffer = wav(Buffer.concat(item.packets), item.sampleRate);
+  const pcm = Buffer.concat(item.packets);
+  const buffer = wav(pcm, item.sampleRate);
   await writeFile(output, buffer);
+  const matched = levelMatchedPCM(pcm);
+  const matchedOutput = join(outputDir, `${item.reference.label}.level-matched.wav`);
+  const matchedBuffer = wav(matched.pcm, item.sampleRate);
+  await writeFile(matchedOutput, matchedBuffer);
   receipt.results.push({
     label: item.reference.label,
     reference_audio: item.reference.audio,
@@ -111,6 +138,11 @@ async function finish(event) {
     transcript_status: item.reference.transcript_status ?? 'not_used_by_resident_route',
     output,
     output_sha256: createHash('sha256').update(buffer).digest('hex'),
+    level_matched_output: matchedOutput,
+    level_matched_sha256: createHash('sha256').update(matchedBuffer).digest('hex'),
+    level_match_target_rms_dbfs: -22,
+    level_match_gain_db: matched.gainDb,
+    level_match_peak_limited: matched.peakLimited,
     sample_rate: item.sampleRate,
     samples: item.samples,
     audio_seconds: item.samples / item.sampleRate,
