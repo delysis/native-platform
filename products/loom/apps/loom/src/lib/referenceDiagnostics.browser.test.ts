@@ -61,6 +61,15 @@ it('follows the visual caret with accessible diagnostics without changing the wr
   await userEvent.keyboard('{Meta>}{ArrowRight}{/Meta}');
   await expect.element(editor).toHaveAttribute('aria-description', 'Source missing');
   await userEvent.keyboard('{Meta>}{ArrowLeft}{/Meta}');
+  await expect.poll(() => {
+    const selection = window.getSelection();
+    const root = editor.element();
+    if (!selection?.isCollapsed || !selection.anchorNode || !root.contains(selection.anchorNode)) return null;
+    const range = document.createRange();
+    range.selectNodeContents(root);
+    range.setEnd(selection.anchorNode, selection.anchorOffset);
+    return range.toString().length;
+  }).toBe(0);
   await expect.element(editor).toHaveAttribute('aria-description', '');
   expect(onChange).not.toHaveBeenCalled();
 });
