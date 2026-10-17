@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 64,
+  "expected_test_count": 66,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -348,7 +348,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "30443d155b4ea8b96b3a23e74ca1d97fe0d94f7a7aa3b7b97c712eeffb2776dd"
+      "sha256": "63a464999b07678042b4332070c6d77230e6e500fe84cd52d10e209961e4b4f6"
     },
     {
       "package": "speech-native-platform",

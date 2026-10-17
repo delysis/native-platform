@@ -650,6 +650,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
       "speech::tests::real_local_saved_voice_transcription_diagnostic",
       ["macos"],
     ],
+    [
+      "real_long_voice_persona_cache_reloads_from_encrypted_chunks_after_worker_restart",
+      ["macos"],
+    ],
   ]);
   assert.match(
     fs.readFileSync(path.join(root, "products/loom/crates/tauri-plugin-loom/src/peer_compute_batch.rs"), "utf8"),
