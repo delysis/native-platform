@@ -742,6 +742,8 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_skill_apply,
         commands::mom_llama_kv_cache_status,
         commands::mom_llama_kv_cache_save,
+        commands::mom_llama_kv_cache_checkpoint_voice_session,
+        commands::mom_llama_kv_cache_set_voice_call_activity,
         commands::mom_llama_kv_cache_restore,
         commands::mom_llama_kv_cache_clear,
         commands::mom_llama_mcp_status,

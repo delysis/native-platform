@@ -66,8 +66,8 @@ use llama_native_types::{
     NativeModelDescriptor, NativeModelLoadMetrics, NativeTransport, PreparedPrompt,
     ProjectorRequirement, PromptForm, PromptInputCapabilities, PromptTokenPolicy,
     ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceRestoreKind,
-    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
-    exact_token_batch_cell_budget,
+    SequenceStateBlob, SequenceStateCell as MultimodalPrefixCell, SharedPrefixBatchRequest,
+    SpecialTokenPolicy, TokenizedPrompt, exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
 
@@ -736,6 +736,14 @@ const INCREMENTAL_AUDIO_RING_SAMPLES: usize = 16_000 * 30;
 // capture instead of retaining nearly a second of already-heard speech.
 const INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES: usize = 640;
 
+// Match the browser PCM16 contract, including negative half-step rounding.
+// Quantization is idempotent; archived WAV decode equals the projected input.
+fn canonical_pcm16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * 32768.0 + 0.5)
+        .floor()
+        .clamp(-32768.0, 32767.0) as i16
+}
+
 /// Fixed-capacity SPSC storage for the microphone producer and projector
 /// consumer. Ownership is serialized by `IncrementalAudioBuffer::state`; this
 /// accepted samples remain in one fixed allocation for both projector reads
@@ -871,11 +879,16 @@ struct IncrementalAudioBuffer {
 }
 
 impl IncrementalAudioBuffer {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_archive_capacity(INCREMENTAL_AUDIO_RING_SAMPLES)
+    }
+
+    fn with_archive_capacity(samples: usize) -> Self {
         Self {
             created_at: Instant::now(),
             state: Mutex::new(IncrementalAudioBufferState {
-                samples: PcmRing::new(INCREMENTAL_AUDIO_RING_SAMPLES),
+                samples: PcmRing::new(samples),
                 terminal: None,
                 accepted_samples: 0,
                 consumed_samples: 0,
@@ -955,10 +968,16 @@ impl IncrementalAudioBuffer {
                 "incremental audio stream is already closed",
             ));
         }
-        if samples.len() > state.samples.remaining() {
+        if samples.len() > INCREMENTAL_AUDIO_RING_SAMPLES.saturating_sub(state.samples.len()) {
             return Err(NativeError::new(
                 NativeErrorCode::QueueFull,
-                "incremental audio ring is full",
+                "incremental audio consumer backlog is full",
+            ));
+        }
+        if samples.len() > state.samples.remaining() {
+            return Err(NativeError::new(
+                NativeErrorCode::PromptTooLarge,
+                "incremental audio exceeds the context-sized recording archive",
             ));
         }
         let was_projector_ready = state.samples.len() >= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
@@ -966,8 +985,12 @@ impl IncrementalAudioBuffer {
         // Admission is atomic: reject the whole push above if it will not fit,
         // then copy it in projector-sized frames. An input push is not an
         // utterance boundary and has no four-second duration limit.
+        let mut canonical = [0.0_f32; INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES];
         for frame in samples.chunks(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES) {
-            let accepted = state.samples.push(frame);
+            for (output, sample) in canonical.iter_mut().zip(frame) {
+                *output = f32::from(canonical_pcm16(*sample)) / 32768.0;
+            }
+            let accepted = state.samples.push(&canonical[..frame.len()]);
             debug_assert!(accepted);
         }
         let ring_write_us = ring_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1362,7 +1385,7 @@ impl IncrementalAudioBuffer {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&data_bytes.to_le_bytes());
         for sample in retained {
-            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            let sample = canonical_pcm16(*sample);
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         Ok(wav)
@@ -2319,7 +2342,13 @@ enum WorkerCommand {
         participant_id: String,
         response: Sender<NativeResult<llama_native_types::ControlledModelIdentity>>,
     },
+    InspectConversation {
+        cells: Vec<MultimodalPrefixCell>,
+        response: Sender<NativeResult<bool>>,
+    },
     Snapshot {
+        expected_request_id: Option<String>,
+        conversation: bool,
         sequence_id: i32,
         max_bytes: usize,
         response: Sender<NativeResult<Option<SequenceStateBlob>>>,
@@ -2598,10 +2627,35 @@ impl NativeModelHandle {
         request: GenerationRequest,
         resume_key: Option<String>,
     ) -> NativeResult<IncrementalAudioGeneration> {
-        validate_incremental_audio_request(&request, &self.status())?;
+        let status = self.status();
+        validate_incremental_audio_request(&request, &status)?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let reasoning_force = Arc::new(AtomicBool::new(false));
-        let audio = Arc::new(IncrementalAudioBuffer::new());
+        // The queue limit bounds unread producer backlog, not utterance length.
+        // One retained allocation is shared by the read cursor and WAV export;
+        // it cannot outgrow the model's total audio-cell capacity. Actual prompt
+        // admission still reserves completion/framing and checks every frame.
+        let context_tokens = status
+            .fingerprint
+            .as_ref()
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ModelNotLoaded,
+                    "audio context fingerprint is unavailable",
+                )
+            })?
+            .context_tokens;
+        let archive_samples = (context_tokens as usize)
+            .checked_mul(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::PromptTooLarge,
+                    "audio context capacity overflows",
+                )
+            })?;
+        let audio = Arc::new(IncrementalAudioBuffer::with_archive_capacity(
+            archive_samples,
+        ));
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let (resume_tx, resume_rx) = bounded(1);
@@ -2952,10 +3006,57 @@ impl NativeModelHandle {
         sequence_id: i32,
         max_bytes: usize,
     ) -> NativeResult<Option<SequenceStateBlob>> {
+        self.snapshot_sequence_internal(sequence_id, max_bytes, false, None)
+    }
+
+    /// Export the latest retained conversation without re-evaluating its prompt.
+    /// Call only from idle persistence work: native serialization occupies this worker.
+    pub fn snapshot_conversation_if_fits(
+        &self,
+        max_bytes: usize,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
+        self.snapshot_sequence_internal(0, max_bytes, true, None)
+    }
+
+    pub fn resident_conversation_covers_cells(
+        &self,
+        cells: Vec<MultimodalPrefixCell>,
+    ) -> NativeResult<bool> {
+        self.inner.ensure_accepting()?;
+        let (response, receiver) = bounded(1);
+        self.inner.send_command(
+            WorkerCommand::InspectConversation { cells, response },
+            "checking resident conversation",
+        )?;
+        receiver.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native conversation probe stopped: {error}"),
+            )
+        })?
+    }
+
+    pub fn snapshot_conversation_for_request_if_fits(
+        &self,
+        request_id: &str,
+        max_bytes: usize,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
+        self.snapshot_sequence_internal(0, max_bytes, true, Some(request_id.to_owned()))
+    }
+
+    fn snapshot_sequence_internal(
+        &self,
+        sequence_id: i32,
+        max_bytes: usize,
+        conversation: bool,
+        expected_request_id: Option<String>,
+    ) -> NativeResult<Option<SequenceStateBlob>> {
         self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
             WorkerCommand::Snapshot {
+                expected_request_id,
+                conversation,
                 sequence_id,
                 max_bytes,
                 response: response_tx,
@@ -3747,6 +3848,8 @@ fn run_worker(
             WorkerCommand::GenerateIncrementalAudio { .. }
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
+                | WorkerCommand::Restore { .. }
+                | WorkerCommand::InspectConversation { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
@@ -3766,6 +3869,8 @@ fn run_worker(
                 | WorkerCommand::PrefillPrefix { .. }
                 | WorkerCommand::InspectControlledIdentity { .. }
                 | WorkerCommand::Snapshot { .. }
+                | WorkerCommand::Restore { .. }
+                | WorkerCommand::InspectConversation { .. }
                 | WorkerCommand::Tokenize { .. }
                 | WorkerCommand::PrepareInput { .. }
                 | WorkerCommand::MeasurePrompt { .. }
@@ -3791,6 +3896,8 @@ fn run_worker(
             // The opt-in pool owns every physical sequence until it drains.
             // Resident prefixes and exports cannot cross that ownership boundary.
             context.clear_kv_cache();
+            resident_audio_text_prefix = None;
+            resident_audio_checkpoint = None;
             state_buffer::forget_live_exports();
             sequence_token_counts.clear();
             sequence_token_ids.clear();
@@ -4117,10 +4224,11 @@ fn run_worker(
                 };
                 if generated.is_err() {
                     context.clear_kv_cache();
+                    resident_audio_text_prefix = None;
+                    resident_audio_checkpoint = None;
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
-                    resident_audio_text_prefix = None;
                     emit_failed_case_events(&event_tx, &request);
                 }
                 // A one-branch text reply can be followed immediately by a
@@ -4156,6 +4264,31 @@ fn run_worker(
                         &mut context,
                         &mut resident_audio_text_prefix,
                     );
+                }
+                if request.media.is_empty()
+                    && request.cases.len() == 1
+                    && generated.as_ref().is_ok_and(|execution| {
+                        execution
+                            .outputs
+                            .first()
+                            .is_some_and(|output| output.state == GenerationState::Completed)
+                    })
+                {
+                    resident_text_prefix.source_request_id = Some(request.request_id.clone());
+                }
+                if request.media.is_empty()
+                    && request.cases.len() == 1
+                    && generated.as_ref().is_ok_and(|execution| {
+                        execution
+                            .outputs
+                            .first()
+                            .is_some_and(|output| output.state == GenerationState::Completed)
+                    })
+                    && let Some(prefix) = resident_audio_text_prefix.as_mut()
+                    && prefix.token_ids == resident_text_prefix.token_ids
+                {
+                    prefix.source_request_id = Some(request.request_id.clone());
+                    prefix.source_cell_count = prefix.cells.len();
                 }
                 if retain_authority_evidence {
                     unrecorded_control_used |= reasoning_forces
@@ -4249,6 +4382,8 @@ fn run_worker(
                 );
                 if result.is_err() {
                     context.clear_kv_cache();
+                    resident_audio_text_prefix = None;
+                    resident_audio_checkpoint = None;
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
@@ -4421,6 +4556,8 @@ fn run_worker(
                         .any(|flag| flag.load(Ordering::Acquire))
                 {
                     context.clear_kv_cache();
+                    resident_audio_text_prefix = None;
+                    resident_audio_checkpoint = None;
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
@@ -4458,6 +4595,8 @@ fn run_worker(
                     .is_ok_and(|completion| completion.has_live_authority())
                 {
                     context.clear_kv_cache();
+                    resident_audio_text_prefix = None;
+                    resident_audio_checkpoint = None;
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
@@ -4480,11 +4619,102 @@ fn run_worker(
                 });
                 let _ = response.send(result);
             }
+            WorkerCommand::InspectConversation { cells, response } => {
+                let covers = !cells.is_empty() && (resident_audio_text_prefix.as_ref().is_some_and(|prefix| prefix.cells.starts_with(&cells))
+                    || (resident_text_prefix.token_ids.len() >= cells.len() && cells.iter().zip(&resident_text_prefix.token_ids)
+                        .all(|(cell, token)| matches!(cell, MultimodalPrefixCell::Text(value) if value == token))));
+                let _ = response.send(Ok(covers));
+            }
             WorkerCommand::Snapshot {
+                expected_request_id,
+                conversation,
                 sequence_id,
                 max_bytes,
                 response,
             } => {
+                // Background persistence yields to work already admitted ahead
+                // of the copy. Serialization itself is a bounded native call;
+                // disk encryption/writes happen after this worker returns.
+                if expected_request_id.is_some()
+                    && (!command_rx.is_empty() || !speculative_rx.is_empty())
+                {
+                    let _ = response.send(Ok(None));
+                    continue;
+                }
+                if let Some(expected) = expected_request_id.as_deref()
+                    && resident_audio_text_prefix
+                        .as_ref()
+                        .and_then(|prefix| prefix.source_request_id.as_deref())
+                        != Some(expected)
+                    && resident_text_prefix.source_request_id.as_deref() != Some(expected)
+                {
+                    let _ = response.send(Ok(None));
+                    continue;
+                }
+                if conversation
+                    && let Some(prefix) = resident_audio_text_prefix.as_ref()
+                    && expected_request_id.as_deref().is_none_or(|expected| {
+                        prefix.source_request_id.as_deref() == Some(expected)
+                    })
+                {
+                    let count = if expected_request_id.is_some() {
+                        prefix.source_cell_count
+                    } else {
+                        prefix.cells.len()
+                    };
+                    let result = (|| {
+                        if count == 0 || count > prefix.cells.len() {
+                            return Ok(None);
+                        }
+                        if count == prefix.cells.len() {
+                            return state_buffer::export_sequence_cells_bounded(
+                                &context,
+                                &fingerprint,
+                                prefix.sequence_id,
+                                0,
+                                prefix.cells.clone(),
+                                max_bytes,
+                            );
+                        }
+                        // Only idle snapshot work uses lane two. Export exactly the last
+                        // committed span; the next capture's uncommitted suffix stays private.
+                        let scratch = 2;
+                        context
+                            .clear_kv_cache_seq(Some(scratch), None, None)
+                            .map_err(|e| {
+                                native_decode_error("failed to clear checkpoint scratch", e)
+                            })?;
+                        let copied = context
+                            .copy_kv_cache_seq(
+                                prefix.sequence_id,
+                                scratch as i32,
+                                Some(0),
+                                Some(count as u32),
+                            )
+                            .map_err(|e| {
+                                native_decode_error("failed to copy committed checkpoint", e)
+                            });
+                        let exported = copied.and_then(|()| {
+                            state_buffer::export_sequence_cells_bounded(
+                                &context,
+                                &fingerprint,
+                                scratch as i32,
+                                0,
+                                prefix.cells[..count].to_vec(),
+                                max_bytes,
+                            )
+                        });
+                        let cleared = context
+                            .clear_kv_cache_seq(Some(scratch), None, None)
+                            .map_err(|e| {
+                                native_decode_error("failed to release checkpoint scratch", e)
+                            });
+                        cleared?;
+                        exported
+                    })();
+                    let _ = response.send(result);
+                    continue;
+                }
                 let token_count = sequence_token_counts
                     .get(&sequence_id)
                     .copied()
@@ -4516,17 +4746,65 @@ fn run_worker(
                     &fingerprint,
                 )
                 .and_then(|()| {
-                    resident_text_prefix.invalidate();
-                    let result = restore_saved_sequence(
-                        &model,
+                    let prepared = state_buffer::prepare_sequence_import(&fingerprint, &state)?;
+                    if prepared.is_none() && !state.cells.is_empty() {
+                        return Err(NativeError::new(
+                            NativeErrorCode::CacheIncompatible,
+                            "mixed audio state requires an authenticated native export",
+                        ));
+                    }
+                    invalidate_resident_audio_checkpoint(
                         &mut context,
-                        &fingerprint,
-                        &state,
-                        destination_sequence_id,
+                        &mut resident_audio_checkpoint,
                     );
+                    invalidate_resident_audio_text_prefix(
+                        &mut context,
+                        &mut resident_audio_text_prefix,
+                    );
+                    resident_text_prefix.invalidate();
+                    let result = if let Some(prepared) = prepared {
+                        prepared
+                            .restore(&mut context, destination_sequence_id)
+                            .map(|()| SequenceRestoreKind::NativeState)
+                    } else {
+                        restore_saved_sequence(
+                            &model,
+                            &mut context,
+                            &fingerprint,
+                            &state,
+                            destination_sequence_id,
+                        )
+                    };
                     if result.is_ok() {
+                        if !state.cells.is_empty()
+                            && destination_sequence_id == 0
+                            && worker_identity.kv_unified
+                            && fingerprint.max_sequences
+                                > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32
+                        {
+                            if let Err(error) = retain_multimodal_prefix(
+                                &mut context,
+                                0,
+                                state.cells.clone(),
+                                &mut resident_audio_text_prefix,
+                            ) {
+                                context.clear_kv_cache();
+                                resident_audio_text_prefix = None;
+                                resident_audio_checkpoint = None;
+                                sequence_token_counts.clear();
+                                sequence_token_ids.clear();
+                                return Err(error);
+                            }
+                        }
                         sequence_token_counts.insert(destination_sequence_id, state.token_count);
-                        sequence_token_ids.insert(destination_sequence_id, state.token_ids);
+                        sequence_token_ids.insert(
+                            destination_sequence_id,
+                            if state.cells.is_empty() {
+                                state.token_ids
+                            } else {
+                                Vec::new()
+                            },
+                        );
                         // Only an authenticated import from this live worker
                         // restores an already evaluated KV prefix. Checked token
                         // replay must not gain physical prefill reuse authority.
@@ -4563,6 +4841,8 @@ fn run_worker(
                         // Discard every sequence, including valid peer sequences,
                         // rather than mint snapshots from uncertain KV contents.
                         context.clear_kv_cache();
+                        resident_audio_text_prefix = None;
+                        resident_audio_checkpoint = None;
                         state_buffer::forget_live_exports();
                         sequence_token_counts.clear();
                         sequence_token_ids.clear();
@@ -4609,10 +4889,11 @@ fn run_worker(
                 }
                 if result.is_err() {
                     context.clear_kv_cache();
+                    resident_audio_text_prefix = None;
+                    resident_audio_checkpoint = None;
                     sequence_token_counts.clear();
                     sequence_token_ids.clear();
                     resident_text_prefix.invalidate();
-                    resident_audio_text_prefix = None;
                 }
                 let _ = response.send(result);
             }
@@ -4827,6 +5108,9 @@ fn reject_queued_command(command: WorkerCommand) {
             );
         }
         WorkerCommand::InspectControlledIdentity { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::InspectConversation { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
         WorkerCommand::Snapshot { response, .. } => {
@@ -6052,28 +6336,14 @@ fn generate_multimodal_batch(
         supervision.emit_state(&normalized, branch, index, 0, GenerationState::Prefilling);
     }
     let started = Instant::now();
-    let leading_tokens = multimodal_prefix_cells(&chunks)?
-        .into_iter()
-        .take_while(|cell| matches!(cell, MultimodalPrefixCell::Text(_)))
-        .filter_map(|cell| {
-            if let MultimodalPrefixCell::Text(token) = cell {
-                Some(token)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let audio_sources = audio_frame_sources(model, &bitmaps);
+    let prompt_cells = multimodal_prefix_cells(&chunks, &audio_sources)?;
     let cached_prefix = request
         .cases
         .iter()
         .filter_map(|case| case.cached_prefix.as_ref())
         .max_by_key(|state| {
-            state
-                .token_ids
-                .iter()
-                .zip(&leading_tokens)
-                .take_while(|(a, b)| a == b)
-                .count()
+            common_multimodal_prefix(&saved_prefix_cells(state), &prompt_cells, true)
         })
         .cloned();
     let first = &request.cases[0];
@@ -6095,6 +6365,7 @@ fn generate_multimodal_batch(
         fingerprint,
         &prefill_request,
         &chunks,
+        &audio_sources,
         resident,
         kv_unified && fingerprint.max_sequences > RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32,
         || {
@@ -7159,6 +7430,12 @@ fn restore_saved_prefix(
     {
         return Ok(SequenceRestoreKind::NativeState);
     }
+    if !state.cells.is_empty() {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "mixed audio state requires an authenticated rewindable native export",
+        ));
+    }
     // Some recurrent architectures cannot roll back arbitrary positions. Only
     // report native reuse if the backend actually retained the common prefix.
     let cleared = context
@@ -7185,6 +7462,12 @@ fn restore_saved_sequence(
     validate_saved_sequence(state, destination_sequence_id, model.n_vocab(), fingerprint)?;
     if state_buffer::import_sequence(context, fingerprint, state, destination_sequence_id)? {
         return Ok(SequenceRestoreKind::NativeState);
+    }
+    if !state.cells.is_empty() {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "mixed audio state cannot be reconstructed by token replay",
+        ));
     }
     // Serialized data is not native parser authority. Recompute a durable
     // prefix through the ordinary checked token decode path instead.
@@ -7246,7 +7529,10 @@ fn validate_saved_sequence(
     if destination < 0
         || destination as u32 >= fingerprint.max_sequences
         || state.token_count == 0
-        || state.token_count != state.token_ids.len()
+        || (state.cells.is_empty() && state.token_count != state.token_ids.len())
+        || (!state.cells.is_empty() && (state.cells.len() != state.token_count
+            || leading_cell_tokens(&state.cells) != state.token_ids
+            || state.cells.iter().any(|cell| matches!(cell, MultimodalPrefixCell::Text(token) if *token < 0 || *token >= vocabulary_size))))
         || state.token_count > fingerprint.context_tokens as usize
         || state
             .token_ids
@@ -7392,17 +7678,70 @@ fn prefill_shared_prefix(
 // Cache keys describe evaluated positions, including verified media content.
 // Text substitution stops reuse at the first changed token; an unchanged audio
 // chunk is reusable only in full, never from a partially matched embedding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MultimodalPrefixCell {
-    Text(i32),
-    Media {
-        digest: [u8; 32],
-        chunk: usize,
-        offset: usize,
-    },
+// Gemma 4 UA projects independent 640-sample frames. Identity is the padded
+// PCM frame, not its WAV container, transport packet, or position in a file.
+fn audio_frame_cell(samples: &[f32]) -> MultimodalPrefixCell {
+    let mut hash = Sha256::new();
+    hash.update(b"gemma4ua-pcm-frame-v1");
+    for index in 0..INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES {
+        hash.update(samples.get(index).copied().unwrap_or(0.0).to_le_bytes());
+    }
+    MultimodalPrefixCell::AudioFrame {
+        digest: hash.finalize().into(),
+    }
 }
 
-fn multimodal_prefix_cells(chunks: &MtmdInputChunks) -> NativeResult<Vec<MultimodalPrefixCell>> {
+type AudioFrameSources = HashMap<String, Vec<f32>>;
+
+fn audio_frame_sources(model: &LlamaModel, bitmaps: &[MtmdBitmap]) -> AudioFrameSources {
+    if !model
+        .meta_val_str("general.architecture")
+        .is_ok_and(|value| value == "gemma4")
+    {
+        return HashMap::new();
+    }
+    bitmaps
+        .iter()
+        .filter(|bitmap| bitmap.is_audio())
+        .filter_map(|bitmap| {
+            let id = bitmap.id()?;
+            let samples = bitmap
+                .data()
+                .chunks_exact(4)
+                .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four byte sample")))
+                .collect();
+            Some((id, samples))
+        })
+        .collect()
+}
+
+fn saved_prefix_cells(state: &SequenceStateBlob) -> Vec<MultimodalPrefixCell> {
+    if state.cells.is_empty() {
+        state
+            .token_ids
+            .iter()
+            .copied()
+            .map(MultimodalPrefixCell::Text)
+            .collect()
+    } else {
+        state.cells.clone()
+    }
+}
+
+fn leading_cell_tokens(cells: &[MultimodalPrefixCell]) -> Vec<i32> {
+    cells
+        .iter()
+        .map_while(|cell| match cell {
+            MultimodalPrefixCell::Text(token) => Some(*token),
+            _ => None,
+        })
+        .collect()
+}
+
+fn multimodal_prefix_cells(
+    chunks: &MtmdInputChunks,
+    audio_sources: &AudioFrameSources,
+) -> NativeResult<Vec<MultimodalPrefixCell>> {
     let mut cells = Vec::with_capacity(chunks.total_tokens());
     let mut media_parts = HashMap::<String, usize>::new();
     for index in 0..chunks.len() {
@@ -7425,6 +7764,20 @@ fn multimodal_prefix_cells(chunks: &MtmdInputChunks) -> NativeResult<Vec<Multimo
                 break;
             };
             let part = media_parts.entry(id.clone()).or_default();
+            if let Some(samples) = audio_sources.get(&id)
+                && chunk.n_tokens()
+                    == samples
+                        .len()
+                        .div_ceil(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES)
+            {
+                cells.extend(
+                    samples
+                        .chunks(INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES)
+                        .map(audio_frame_cell),
+                );
+                *part += 1;
+                continue;
+            }
             let digest = Sha256::digest(id.as_bytes()).into();
             cells.extend(
                 (0..chunk.n_tokens()).map(|offset| MultimodalPrefixCell::Media {
@@ -7467,12 +7820,13 @@ fn prefill_multimodal_cached(
     fingerprint: &ModelFingerprint,
     request: &GenerationRequest,
     chunks: &MtmdInputChunks,
+    audio_sources: &AudioFrameSources,
     resident: &mut Option<ResidentAudioTextPrefix>,
     cache_supported: bool,
     cancelled: impl Fn() -> bool,
     final_logits: bool,
 ) -> NativeResult<(i32, Option<SequenceRestoreKind>, usize)> {
-    let cells = multimodal_prefix_cells(chunks)?;
+    let cells = multimodal_prefix_cells(chunks, audio_sources)?;
     let leading_text = cells
         .iter()
         .take_while(|cell| matches!(cell, MultimodalPrefixCell::Text(_)))
@@ -7491,14 +7845,16 @@ fn prefill_multimodal_cached(
     } else {
         0
     };
+    let mut retained_source = resident.as_ref().and_then(|prefix| {
+        (prefix.source_cell_count > 0 && resident_tokens > 0).then(|| {
+            (
+                prefix.source_request_id.clone(),
+                prefix.source_cell_count.min(resident_tokens),
+            )
+        })
+    });
     let supplied_tokens = request.cached_prefix.as_ref().map_or(0, |state| {
-        state
-            .token_ids
-            .iter()
-            .zip(&leading_text)
-            .take(leading_text.len().saturating_sub(usize::from(final_logits)))
-            .take_while(|(a, b)| a == b)
-            .count()
+        common_multimodal_prefix(&saved_prefix_cells(state), &cells, final_logits)
     });
     let supplied = request
         .cached_prefix
@@ -7549,6 +7905,10 @@ fn prefill_multimodal_cached(
             if trimmed && resident_tokens > 0 {
                 prefix.cells.truncate(resident_tokens);
                 prefix.token_ids.truncate(resident_tokens);
+                prefix.source_cell_count = prefix.source_cell_count.min(resident_tokens);
+                if prefix.source_cell_count == 0 {
+                    prefix.source_request_id = None;
+                }
             } else {
                 // Architectures without partial removal cannot promise a
                 // rewindable prefix. Drop that lane and evaluate from zero.
@@ -7557,6 +7917,7 @@ fn prefill_multimodal_cached(
                     .map_err(|e| native_decode_error("failed to release media prefix", e))?;
                 resident.take();
                 resident_tokens = 0;
+                retained_source = None;
             }
         }
         if resident_tokens > 0 {
@@ -7606,10 +7967,65 @@ fn prefill_multimodal_cached(
             position = end;
         } else {
             if position != chunk_start {
-                return Err(NativeError::new(
-                    NativeErrorCode::CacheIncompatible,
-                    "cached prefix splits a media chunk",
-                ));
+                let samples = chunk
+                    .id()
+                    .and_then(|id| audio_sources.get(&id))
+                    .filter(|_| {
+                        matches!(
+                            cells.get(position),
+                            Some(MultimodalPrefixCell::AudioFrame { .. })
+                        )
+                    })
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::CacheIncompatible,
+                            "cached prefix splits an indivisible media chunk",
+                        )
+                    })?;
+                let offset = (position - chunk_start) * INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES;
+                let tail = MtmdBitmap::from_audio_data(&samples[offset..]).map_err(|e| {
+                    native_decode_error("failed to construct uncached audio frames", e)
+                })?;
+                let tail_chunks = multimodal
+                    .tokenize(
+                        MtmdInputText {
+                            text: mtmd_default_marker().to_string(),
+                            add_special: false,
+                            parse_special: true,
+                        },
+                        &[&tail],
+                    )
+                    .map_err(|e| {
+                        native_decode_error("failed to tokenize uncached audio frames", e)
+                    })?;
+                for tail_index in 0..tail_chunks.len() {
+                    let tail_chunk = tail_chunks
+                        .get(tail_index)
+                        .ok_or_else(|| native_decode_error("missing audio tail", tail_index))?;
+                    if tail_chunk.chunk_type() == MtmdInputChunkType::Audio {
+                        position = tail_chunk
+                            .eval(
+                                multimodal,
+                                context,
+                                position as i32,
+                                0,
+                                context.n_batch() as i32,
+                                final_logits && index + 1 == chunks.len(),
+                            )
+                            .map_err(|e| {
+                                native_decode_error("failed to evaluate uncached audio frames", e)
+                            })?
+                            .max(0) as usize;
+                    }
+                }
+                if position != end {
+                    return Err(NativeError::new(
+                        NativeErrorCode::CacheIncompatible,
+                        "audio frame accounting changed",
+                    ));
+                }
+                chunk_start = end;
+                continue;
             }
             position = chunk
                 .eval(
@@ -7641,10 +8057,18 @@ fn prefill_multimodal_cached(
             )
             .map_err(|e| native_decode_error("failed to retain media prefix", e))?;
         *resident = Some(ResidentAudioTextPrefix {
+            source_request_id: None,
+            source_cell_count: 0,
             sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
             token_ids: leading_text,
             cells,
         });
+        if let Some((source_request_id, count)) = retained_source
+            && let Some(prefix) = resident.as_mut()
+        {
+            prefix.source_request_id = source_request_id;
+            prefix.source_cell_count = count;
+        }
     }
     Ok((position as i32, kind, reused))
 }
@@ -7657,6 +8081,7 @@ struct ResidentAudioCheckpoint {
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
+    cells: Vec<MultimodalPrefixCell>,
 }
 
 /// Verified text/audio prompt state retained inside the live Gemma worker for
@@ -7665,6 +8090,8 @@ struct ResidentAudioCheckpoint {
 /// a persona/history prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResidentAudioTextPrefix {
+    source_request_id: Option<String>,
+    source_cell_count: usize,
     sequence_id: i32,
     token_ids: Vec<i32>,
     cells: Vec<MultimodalPrefixCell>,
@@ -7720,6 +8147,37 @@ fn clear_audio_working_sequences(
     Ok(())
 }
 
+fn retain_multimodal_prefix(
+    context: &mut LlamaContext<'_>,
+    source: i32,
+    cells: Vec<MultimodalPrefixCell>,
+    resident: &mut Option<ResidentAudioTextPrefix>,
+) -> NativeResult<()> {
+    if cells.is_empty() || source == RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE {
+        return Ok(());
+    }
+    resident.take();
+    context
+        .clear_kv_cache_seq(Some(RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE as u32), None, None)
+        .map_err(|e| native_decode_error("failed to release prior conversation prefix", e))?;
+    context
+        .copy_kv_cache_seq(
+            source,
+            RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+            Some(0),
+            Some(cells.len() as u32),
+        )
+        .map_err(|e| native_decode_error("failed to retain completed conversation", e))?;
+    *resident = Some(ResidentAudioTextPrefix {
+        source_request_id: None,
+        source_cell_count: 0,
+        sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
+        token_ids: leading_cell_tokens(&cells),
+        cells,
+    });
+    Ok(())
+}
+
 fn retain_incremental_audio_text_prefix(
     context: &mut LlamaContext<'_>,
     source_sequence_id: i32,
@@ -7750,6 +8208,8 @@ fn retain_incremental_audio_text_prefix(
             native_decode_error("failed to retain the resident audio prefix", error)
         })?;
     *prefix = Some(ResidentAudioTextPrefix {
+        source_request_id: None,
+        source_cell_count: 0,
         sequence_id: destination,
         token_ids: token_ids.to_vec(),
         cells: token_ids
@@ -7781,6 +8241,7 @@ fn incremental_audio_request_sha256(request: &GenerationRequest) -> NativeResult
             state.sequence_id,
             state.token_count,
             state.token_ids.as_slice(),
+            state.cells.as_slice(),
             Arc::as_ptr(&state.bytes) as usize,
             state.bytes.len(),
         )
@@ -7809,6 +8270,7 @@ fn fork_resident_audio_checkpoint(
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
+    cells: &[MultimodalPrefixCell],
 ) -> NativeResult<ResidentAudioCheckpoint> {
     let destination_sequence_id = alternate_checkpoint_sequence(source_sequence_id)?;
     let copy_end = u32::try_from(next_position).map_err(|_| {
@@ -7837,6 +8299,7 @@ fn fork_resident_audio_checkpoint(
         next_position,
         prompt_tokens,
         projected_samples,
+        cells: cells.to_vec(),
     })
 }
 
@@ -7853,6 +8316,7 @@ fn capture_resident_audio_checkpoint(
     next_position: i32,
     prompt_tokens: usize,
     projected_samples: usize,
+    cells: &[MultimodalPrefixCell],
 ) -> NativeResult<ResidentAudioCheckpoint> {
     if fingerprint.max_sequences >= 2 {
         return fork_resident_audio_checkpoint(
@@ -7863,6 +8327,7 @@ fn capture_resident_audio_checkpoint(
             next_position,
             prompt_tokens,
             projected_samples,
+            cells,
         );
     }
     Ok(ResidentAudioCheckpoint {
@@ -7872,6 +8337,7 @@ fn capture_resident_audio_checkpoint(
         next_position,
         prompt_tokens,
         projected_samples,
+        cells: cells.to_vec(),
     })
 }
 
@@ -7991,6 +8457,7 @@ fn generate_incremental_audio(
                 format!("failed to tokenize incremental audio prefix: {error}"),
             )
         })?;
+    let audio_sources = audio_frame_sources(model, &historical_bitmaps);
     let mut prefix_token_ids = Vec::with_capacity(prefix_chunks.total_tokens());
     // Text before the first historical recording is still an exact reusable
     // prefix. The projector's later chunks do not invalidate those cells.
@@ -8081,6 +8548,7 @@ fn generate_incremental_audio(
             fingerprint,
             request,
             &prefix_chunks,
+            &audio_sources,
             resident_audio_text_prefix,
             resident_text_prefix_supported,
             || supervision.cancellation.load(Ordering::Acquire),
@@ -8089,6 +8557,15 @@ fn generate_incremental_audio(
         resident_prefix_tokens = reused;
         (0, position, kind, prefix_chunks.total_tokens(), 0)
     };
+    let mut evaluated_cells = if let Some(checkpoint) = matched_audio.as_ref() {
+        checkpoint.cells.clone()
+    } else {
+        multimodal_prefix_cells(&prefix_chunks, &audio_sources)?
+    };
+    let mut cells_complete = evaluated_cells.len() == next_position.max(0) as usize
+        && model
+            .meta_val_str("general.architecture")
+            .is_ok_and(|value| value == "gemma4");
     let resume = IncrementalAudioResume {
         reused: matched_audio.is_some(),
         sample_offset: projected_full_samples,
@@ -8133,6 +8610,7 @@ fn generate_incremental_audio(
                         next_position,
                         prompt_tokens,
                         projected_full_samples,
+                        &evaluated_cells,
                     )?,
                 };
                 publish_cancelled_audio_checkpoint(
@@ -8170,6 +8648,7 @@ fn generate_incremental_audio(
                             next_position,
                             prompt_tokens,
                             projected_full_samples,
+                            &evaluated_cells,
                         )?,
                     };
                     publish_cancelled_audio_checkpoint(
@@ -8204,6 +8683,7 @@ fn generate_incremental_audio(
                         next_position,
                         prompt_tokens,
                         projected_full_samples,
+                        &evaluated_cells,
                     )?);
                 }
                 let bitmap = MtmdBitmap::from_audio_data(&audio_block).map_err(|error| {
@@ -8337,6 +8817,21 @@ fn generate_incremental_audio(
                                 )
                             })?;
                     }
+                    if cells_complete {
+                        if let Some(tokens) = chunk.text_tokens() {
+                            evaluated_cells.extend(
+                                tokens
+                                    .iter()
+                                    .map(|token| MultimodalPrefixCell::Text(token.0)),
+                            );
+                        } else if chunk_tokens == 1
+                            && audio_block.len() <= INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES
+                        {
+                            evaluated_cells.push(audio_frame_cell(&audio_block));
+                        } else {
+                            cells_complete = false;
+                        }
+                    }
                     prompt_tokens = prompt_tokens.saturating_add(chunk_tokens);
                 }
                 admitted_audio = true;
@@ -8376,6 +8871,7 @@ fn generate_incremental_audio(
             next_position,
             prompt_tokens,
             projected_full_samples,
+            &evaluated_cells,
         )?);
     }
     if deferred_audio_end.is_empty() {
@@ -8417,6 +8913,13 @@ fn generate_incremental_audio(
                     "incremental audio closing boundary exceeded the native position range",
                 )
             })?);
+        if cells_complete {
+            evaluated_cells.extend(
+                tokens
+                    .iter()
+                    .map(|token| MultimodalPrefixCell::Text(token.0)),
+            );
+        }
         prompt_tokens = prompt_tokens.saturating_add(chunk_tokens);
     }
     audio.record_closing_boundary_finish();
@@ -8478,6 +8981,13 @@ fn generate_incremental_audio(
     tracking
         .token_counts
         .insert(active_sequence_id, next_position.max(0) as usize);
+    if cells_complete {
+        evaluated_cells.extend(
+            suffix_tokens
+                .iter()
+                .map(|token| MultimodalPrefixCell::Text(token.0)),
+        );
+    }
     audio.record_suffix_eval_finish();
     emit_generation_state(
         supervision.event_tx,
@@ -8490,7 +9000,10 @@ fn generate_incremental_audio(
         context,
         request,
         supervision,
-        tracking,
+        SequenceTracking {
+            token_counts: tracking.token_counts,
+            token_ids: tracking.token_ids,
+        },
         prompt_tokens,
         next_position,
         active_sequence_id,
@@ -8529,6 +9042,34 @@ fn generate_incremental_audio(
             *resident_audio_checkpoint = None;
         }
     } else {
+        if cells_complete && resident_text_prefix_supported {
+            let decoded = tracking
+                .token_counts
+                .get(&active_sequence_id)
+                .copied()
+                .unwrap_or(0);
+            let completed = decoded.saturating_sub(evaluated_cells.len());
+            evaluated_cells.extend(
+                output
+                    .generated_token_ids
+                    .iter()
+                    .take(completed)
+                    .copied()
+                    .map(MultimodalPrefixCell::Text),
+            );
+            if evaluated_cells.len() == decoded {
+                retain_multimodal_prefix(
+                    context,
+                    active_sequence_id,
+                    evaluated_cells,
+                    resident_audio_text_prefix,
+                )?;
+                if let Some(prefix) = resident_audio_text_prefix.as_mut() {
+                    prefix.source_request_id = Some(request.request_id.clone());
+                    prefix.source_cell_count = prefix.cells.len();
+                }
+            }
+        }
         if let Some(checkpoint) = next_checkpoint.as_ref() {
             let _ = context.clear_kv_cache_seq(Some(checkpoint.sequence_id as u32), None, None);
         }
@@ -8630,6 +9171,7 @@ fn generate_multimodal(
         0,
         GenerationState::Prefilling,
     );
+    let audio_sources = audio_frame_sources(model, &bitmaps);
     let (next_position, restore_kind, reused) = prefill_multimodal_cached(
         model,
         context,
@@ -8637,6 +9179,7 @@ fn generate_multimodal(
         fingerprint,
         request,
         &chunks,
+        &audio_sources,
         resident_prefix,
         cache_supported,
         || supervision.cancellation.load(Ordering::Acquire),
@@ -8656,7 +9199,10 @@ fn generate_multimodal(
         context,
         request,
         supervision,
-        tracking,
+        SequenceTracking {
+            token_counts: tracking.token_counts,
+            token_ids: tracking.token_ids,
+        },
         prompt_tokens,
         next_position,
         0,
@@ -8664,6 +9210,27 @@ fn generate_multimodal(
         2,
         None,
     )?;
+    if output.state == GenerationState::Completed && cache_supported {
+        let mut cells = multimodal_prefix_cells(&chunks, &audio_sources)?;
+        if cells.len() == prompt_tokens {
+            let decoded = tracking.token_counts.get(&0).copied().unwrap_or(0);
+            cells.extend(
+                output
+                    .generated_token_ids
+                    .iter()
+                    .take(decoded.saturating_sub(prompt_tokens))
+                    .copied()
+                    .map(MultimodalPrefixCell::Text),
+            );
+            if cells.len() == decoded {
+                retain_multimodal_prefix(context, 0, cells, resident_prefix)?;
+                if let Some(prefix) = resident_prefix.as_mut() {
+                    prefix.source_request_id = Some(request.request_id.clone());
+                    prefix.source_cell_count = prefix.cells.len();
+                }
+            }
+        }
+    }
     output.metrics.cache.supplied_prefix_tokens = request
         .cached_prefix
         .as_ref()
@@ -8903,6 +9470,7 @@ impl ResidentTextPrefixBinding {
 
 #[derive(Debug)]
 struct ResidentTextPrefixCache {
+    source_request_id: Option<String>,
     binding: ResidentTextPrefixBinding,
     token_ids: Vec<i32>,
 }
@@ -8922,6 +9490,7 @@ impl ResidentTextPrefixCache {
     }
     fn new(binding: ResidentTextPrefixBinding) -> Self {
         Self {
+            source_request_id: None,
             binding,
             token_ids: Vec::new(),
         }
@@ -8952,6 +9521,7 @@ impl ResidentTextPrefixCache {
     }
 
     fn invalidate(&mut self) {
+        self.source_request_id = None;
         self.token_ids.clear();
     }
 
@@ -8970,6 +9540,7 @@ impl ResidentTextPrefixCache {
             self.invalidate();
             return;
         }
+        self.source_request_id = None;
         self.token_ids.clone_from(token_ids);
     }
 }
@@ -10839,7 +11410,7 @@ mod tests {
             input: Arc::clone(&ring),
         };
         let first = (0..INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES + 320)
-            .map(|sample| sample as f32)
+            .map(|sample| sample as f32 / 32768.0)
             .collect::<Vec<_>>();
         assert_eq!(ring.push(&first).expect("ring accepts PCM"), first.len());
 
@@ -10882,7 +11453,12 @@ mod tests {
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(wav.len(), 44 + first.len() * 2);
         assert_eq!(i16::from_le_bytes([wav[44], wav[45]]), 0);
-        assert_eq!(i16::from_le_bytes([wav[46], wav[47]]), i16::MAX);
+        assert_eq!(i16::from_le_bytes([wav[46], wav[47]]), 1);
+        let decoded = wav[44..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, first);
     }
 
     #[test]
@@ -10898,6 +11474,53 @@ mod tests {
                 .expect_err("one sample beyond capacity is refused")
                 .code,
             NativeErrorCode::QueueFull
+        );
+    }
+
+    #[test]
+    fn drained_audio_can_exceed_thirty_seconds_without_losing_archive_or_backpressure() {
+        let ring = IncrementalAudioBuffer::with_archive_capacity(16_000 * 45);
+        let cancelled = AtomicBool::new(false);
+        let mut output = Vec::new();
+        for frame in 0..1125 {
+            let expected = (frame as i16) as f32 / 32768.0;
+            let samples = [expected; INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES];
+            ring.push(&samples)
+                .expect("consumer keeps up for 45 seconds");
+            assert!(ring.read_into(&mut output, &cancelled).expect("frame read"));
+            assert_eq!(output, samples);
+        }
+        assert_eq!(ring.stats().accepted_samples, 16_000 * 45);
+        assert_eq!(
+            ring.stats().high_water_samples,
+            INCREMENTAL_AUDIO_PROJECTOR_BLOCK_SAMPLES
+        );
+        assert_eq!(
+            ring.push(&[0.0]).unwrap_err().code,
+            NativeErrorCode::PromptTooLarge
+        );
+        let wav = ring
+            .wav_bytes()
+            .expect("all consumed audio remains archival");
+        assert_eq!(wav.len(), 44 + 16_000 * 45 * 2);
+        for (frame, bytes) in wav[44..].chunks_exact(640 * 2).enumerate() {
+            assert!(
+                bytes
+                    .chunks_exact(2)
+                    .all(|sample| i16::from_le_bytes([sample[0], sample[1]]) == frame as i16)
+            );
+        }
+        let blocked = IncrementalAudioBuffer::with_archive_capacity(16_000 * 45);
+        blocked
+            .push(&vec![0.0; INCREMENTAL_AUDIO_RING_SAMPLES])
+            .expect("30 second backlog");
+        assert_eq!(
+            blocked.push(&[0.0]).unwrap_err().code,
+            NativeErrorCode::QueueFull
+        );
+        assert_eq!(
+            blocked.stats().accepted_samples,
+            INCREMENTAL_AUDIO_RING_SAMPLES as u64
         );
     }
 
@@ -10922,6 +11545,7 @@ mod tests {
     #[test]
     fn incremental_audio_cache_requires_an_exact_nonempty_token_prefix() {
         let exact = SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 0,
             token_count: 3,
             token_ids: vec![11, 22, 33],
@@ -10949,6 +11573,7 @@ mod tests {
         );
 
         let empty = SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 0,
             token_count: 0,
             token_ids: Vec::new(),
@@ -10966,6 +11591,7 @@ mod tests {
     fn incremental_audio_retry_binding_ignores_only_request_identity() {
         let mut first = admission_generation_request("first-attempt");
         first.cached_prefix = Some(SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 0,
             token_count: 2,
             token_ids: vec![11, 22],
@@ -11118,6 +11744,7 @@ mod tests {
     #[test]
     fn request_level_cache_is_selected_for_every_shared_prefix_branch() {
         let shared = SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 0,
             token_count: 1,
             token_ids: vec![1],
@@ -13185,6 +13812,7 @@ mod tests {
 
         let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
         request.cases[0].cached_prefix = Some(SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 0,
             token_count: 1,
             bytes: (vec![1, 2, 3]).into(),
@@ -13540,6 +14168,7 @@ mod tests {
 
         let mut cached = request.clone();
         cached.cases[0].cached_prefix = Some(SequenceStateBlob {
+            cells: Vec::new(),
             sequence_id: 77,
             token_count: 1,
             bytes: (vec![0xde, 0xad, 0xbe, 0xef]).into(),
@@ -14690,6 +15319,8 @@ mod tests {
     #[test]
     fn resident_audio_prefix_reuse_is_token_exact_and_keeps_one_token_live() {
         let prefix = ResidentAudioTextPrefix {
+            source_request_id: None,
+            source_cell_count: 0,
             sequence_id: RESIDENT_AUDIO_TEXT_PREFIX_SEQUENCE,
             token_ids: vec![1, 2, 3, 4, 90],
             cells: vec![1, 2, 3, 4, 90]
@@ -15404,6 +16035,305 @@ mod tests {
             wav.extend_from_slice(&((phase.sin() * 8_000.0) as i16).to_le_bytes());
         }
         wav
+    }
+
+    #[test]
+    fn audio_frame_keys_reuse_only_the_longest_exact_sample_prefix() {
+        let first = audio_frame_cell(&[0.25; 640]);
+        let second = audio_frame_cell(&[-0.5; 640]);
+        let tail = audio_frame_cell(&[0.25; 13]);
+        let mut padded = vec![0.0; 640];
+        padded[..13].fill(0.25);
+        assert_eq!(tail, audio_frame_cell(&padded));
+        let cached = vec![
+            MultimodalPrefixCell::Text(1),
+            first.clone(),
+            second.clone(),
+            tail.clone(),
+        ];
+        let changed = vec![MultimodalPrefixCell::Text(1), first, tail, second];
+        assert_eq!(common_multimodal_prefix(&cached, &changed, false), 2);
+        assert_eq!(common_multimodal_prefix(&cached, &cached, true), 3);
+        let mut altered = padded;
+        altered[12] = f32::from_bits(altered[12].to_bits() + 1);
+        assert_ne!(audio_frame_cell(&altered), audio_frame_cell(&[0.25; 13]));
+    }
+
+    #[test]
+    #[ignore = "requires real Gemma 4 and its matching audio projector"]
+    fn real_completed_audio_survives_next_turn_and_authenticated_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
+        let directory = RealTestDirectory::new();
+        let mut config =
+            NativeModelConfig::local(std::env::var("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?.into());
+        config.mmproj_path = Some(std::env::var("MOM_LLAMA_MM_PROJ_PATH")?.into());
+        config.state_cache_directory = Some(directory.0.clone());
+        config.device = NativeDevice::Auto;
+        config.context_tokens = 1024;
+        config.batch_tokens = 128;
+        config.max_sequences = 4;
+        let owner = NativeModelOwner::load(config.clone())?;
+        let handle = owner.handle();
+        let wav = one_second_tone_wav();
+        let pcm = wav[44..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        let prior = ChatMessage {
+            role: ChatRole::System,
+            content: "Listen carefully and answer briefly. ".repeat(30),
+        };
+        let mut request = GenerationRequest {
+            request_id: "audio-retention-first".into(),
+            model_id: handle.status().model_id,
+            input: GenerationInput::Chat {
+                messages: vec![
+                    prior.clone(),
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: "Listen.\n\n[[native-media:live-microphone]]".into(),
+                    },
+                ],
+                template: ChatTemplateChoice::PreferNonThinking,
+            },
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                max_tokens: 8,
+                seed: 17,
+                ..SamplingConfig::default()
+            },
+            media: vec![],
+            cached_prefix: None,
+        };
+        let audio = handle.generate_incremental_audio(request.clone())?;
+        audio.wait_for_resume()?;
+        let monitor = audio.monitor();
+        // Prove projection begins before the producer seals the utterance.
+        for frame in pcm[..6400].chunks(640) {
+            audio.push_pcm(frame)?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while monitor.stats().projected_samples < 6400 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(monitor.stats().projected_samples, 6400);
+        for frame in pcm[6400..].chunks(640) {
+            audio.push_pcm(frame)?;
+        }
+        let first = require_ready(audio.finish()?.wait_timeout(Duration::from_mins(2))?)?;
+        assert!(
+            handle
+                .snapshot_conversation_for_request_if_fits("not-committed", 2 * 1024 * 1024 * 1024)?
+                .is_none()
+        );
+        let state = handle
+            .snapshot_conversation_for_request_if_fits(
+                "audio-retention-first",
+                2 * 1024 * 1024 * 1024,
+            )?
+            .ok_or("snapshot exceeds test budget")?;
+        let audio_end = state
+            .cells
+            .iter()
+            .rposition(|c| matches!(c, MultimodalPrefixCell::AudioFrame { .. }))
+            .ok_or("no audio cells retained")?
+            + 1;
+        assert_eq!(
+            state
+                .cells
+                .iter()
+                .filter(|c| matches!(c, MultimodalPrefixCell::AudioFrame { .. }))
+                .count(),
+            25
+        );
+        assert!(state.token_count >= first[0].metrics.prompt_tokens);
+        let mut altered = state.clone();
+        if let MultimodalPrefixCell::AudioFrame { digest } = &mut altered.cells[audio_end - 1] {
+            digest[0] ^= 1;
+        }
+        assert_eq!(
+            handle.restore_sequence(altered, 0).unwrap_err().code,
+            NativeErrorCode::CacheIncompatible
+        );
+        assert!(
+            handle.resident_conversation_covers_cells(state.cells.clone())?,
+            "rejected restore evicted valid RAM state"
+        );
+        let metadata = serde_json::to_vec(&(
+            state.sequence_id,
+            state.token_count,
+            &state.token_ids,
+            &state.cells,
+        ))?;
+        std::fs::write(directory.0.join("conversation.kv"), state.bytes.as_slice())?;
+        std::fs::write(directory.0.join("conversation.json"), metadata)?;
+        request.request_id = "audio-retention-next".into();
+        request.input = GenerationInput::Chat {
+            messages: vec![
+                prior,
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Listen.\n\n[[native-media:recorded]]".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: first[0].text.clone(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Again.\n\n[[native-media:live-microphone]]".into(),
+                },
+            ],
+            template: ChatTemplateChoice::PreferNonThinking,
+        };
+        request.media = vec![MediaInput {
+            id: "recorded".into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: format!("{:x}", Sha256::digest(&wav)),
+            bytes: wav,
+        }];
+        let probe = handle.generate_incremental_audio(request.clone())?;
+        probe.wait_for_resume()?;
+        probe.cancel();
+        let idle = handle
+            .snapshot_conversation_for_request_if_fits(
+                "audio-retention-first",
+                2 * 1024 * 1024 * 1024,
+            )?
+            .ok_or("next capture lost committed checkpoint authority")?;
+        assert!(idle.token_count >= audio_end && idle.token_count <= state.token_count);
+        assert!(state.cells.starts_with(&idle.cells));
+        assert!(handle.resident_conversation_covers_cells(idle.cells.clone())?);
+        drop(idle);
+        let next = handle.generate_incremental_audio(request.clone())?;
+        next.wait_for_resume()?;
+        let live_stats = next.monitor().stats();
+        assert!(
+            live_stats.restored_prefix_tokens >= audio_end,
+            "old audio was recomputed: {live_stats:?}, audio_end={audio_end}"
+        );
+        next.push_pcm(&pcm)?;
+        let live = require_ready(next.finish()?.wait_timeout(Duration::from_mins(2))?)?;
+        drop(state);
+        drop(handle);
+        drop(owner);
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
+        let (sequence_id, token_count, token_ids, cells) =
+            serde_json::from_slice(&std::fs::read(directory.0.join("conversation.json"))?)?;
+        request.cached_prefix = Some(SequenceStateBlob {
+            sequence_id,
+            token_count,
+            token_ids,
+            cells,
+            bytes: std::fs::read(directory.0.join("conversation.kv"))?.into(),
+        });
+        request.request_id = "audio-retention-restarted".into();
+        let restored = handle.generate_incremental_audio(request)?;
+        restored.wait_for_resume()?;
+        restored.push_pcm(&pcm)?;
+        let resumed = require_ready(restored.finish()?.wait_timeout(Duration::from_mins(2))?)?;
+        assert!(
+            resumed[0].metrics.cache.restored_prefix_tokens >= audio_end,
+            "restart lost old audio: {:?}",
+            resumed[0].metrics
+        );
+        assert_eq!(resumed[0].metrics.cache.replayed_prefix_tokens, 0);
+        assert_eq!(live[0].generated_token_ids, resumed[0].generated_token_ids);
+        eprintln!(
+            "live_audio_cache retained_audio_end={audio_end} live_reused={} restart_reused={} projected_while_producer_open=6400",
+            live_stats.restored_prefix_tokens, resumed[0].metrics.cache.restored_prefix_tokens
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the real Gemma 4 12B GGUF and matching audio projector"]
+    fn real_audio_edit_reuses_exact_frame_prefix_with_cold_parity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
+        let mut config =
+            NativeModelConfig::local(std::env::var("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?.into());
+        config.mmproj_path = Some(std::env::var("MOM_LLAMA_MM_PROJ_PATH")?.into());
+        config.device = NativeDevice::Auto;
+        config.context_tokens = 1024;
+        config.batch_tokens = 128;
+        config.max_sequences = 4;
+        let owner = NativeModelOwner::load(config.clone())?;
+        let handle = owner.handle();
+        let wav = one_second_tone_wav();
+        let mut request = GenerationRequest {
+            request_id: "audio-edit-original".into(),
+            model_id: handle.status().model_id,
+            input: GenerationInput::Chat {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "Describe this sound briefly. [[native-media:recording]]".into(),
+                }],
+                template: ChatTemplateChoice::PreferNonThinking,
+            },
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                max_tokens: 12,
+                seed: 17,
+                ..SamplingConfig::default()
+            },
+            media: vec![MediaInput {
+                id: "recording".into(),
+                kind: MediaKind::Audio,
+                mime: "audio/wav".into(),
+                sha256: format!("{:x}", Sha256::digest(&wav)),
+                bytes: wav,
+            }],
+            cached_prefix: None,
+        };
+        require_ready(
+            handle
+                .generate(request.clone())?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        let state = handle
+            .snapshot_conversation_if_fits(2 * 1024 * 1024 * 1024)?
+            .ok_or("snapshot budget")?;
+        let audio_start = state
+            .cells
+            .iter()
+            .position(|cell| matches!(cell, MultimodalPrefixCell::AudioFrame { .. }))
+            .ok_or("missing audio frames")?;
+        drop(state);
+        // Keep twelve complete frames unchanged; replace every later sample.
+        for bytes in request.media[0].bytes[44 + 12 * 640 * 2..].chunks_exact_mut(2) {
+            bytes.copy_from_slice(&1200_i16.to_le_bytes());
+        }
+        request.media[0].sha256 = format!("{:x}", Sha256::digest(&request.media[0].bytes));
+        request.request_id = "audio-edit-cached".into();
+        let cached = require_ready(
+            handle
+                .generate(request.clone())?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(
+            cached[0].metrics.cache.resident_prefix_tokens,
+            audio_start + 12
+        );
+        drop(handle);
+        drop(owner);
+        let owner = NativeModelOwner::load(config)?;
+        request.request_id = "audio-edit-cold".into();
+        let cold = require_ready(
+            owner
+                .handle()
+                .generate(request)?
+                .wait_timeout(Duration::from_mins(2))?,
+        )?;
+        assert_eq!(cached[0].generated_token_ids, cold[0].generated_token_ids);
+        eprintln!(
+            "partial_audio_cache unchanged_frames=12 reused_tokens={} cold_parity=true",
+            cached[0].metrics.cache.resident_prefix_tokens
+        );
+        Ok(())
     }
 
     #[test]

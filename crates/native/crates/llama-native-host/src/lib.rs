@@ -1741,6 +1741,7 @@ mod tests {
                 token_count: 1,
                 bytes: (vec![token as u8; 8]).into(),
                 token_ids: vec![token],
+                cells: Vec::new(),
             },
         };
         value.bind_reconstruction();

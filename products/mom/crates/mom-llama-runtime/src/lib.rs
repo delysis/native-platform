@@ -28,10 +28,12 @@ pub use attachments::{
     AttachmentPreviewArtifact, AttachmentPreviewCatalog, AttachmentPreviewContent,
     AttachmentPreviewKind, AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
     AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
-    AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
-    attachment_import_pasted_text, attachment_import_voice_message, attachment_library_input,
-    attachment_list, attachment_preview, attachment_preview_content, attachment_preview_media,
-    attachment_transcription_input, prepare_document_chat_in_scope,
+    AttachmentRecord, AttachmentState, AttachmentTranscriptionInput,
+    INFERENCE_AUDIO_CANONICALIZER_VERSION, InferenceAudioProvenance, InferenceAudioSampleRange,
+    attachment_import, attachment_import_pasted_text, attachment_import_voice_message,
+    attachment_library_input, attachment_list, attachment_preview, attachment_preview_content,
+    attachment_preview_media, attachment_transcription_input, prepare_document_chat_in_scope,
+    store_inference_audio_derivative,
 };
 pub use chat::{
     ChatCancelOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ChatSkipReasoningOutput,
@@ -70,8 +72,10 @@ pub use engine::{
     runtime_warm_until_cancelled,
 };
 pub use kv_cache::{
-    VoicePersonaPrefixPreparation, kv_cache_clear, kv_cache_prepare_voice_persona_resident,
-    kv_cache_restore, kv_cache_save, kv_cache_save_voice_persona, kv_cache_status,
+    VoicePersonaPrefixPreparation, flush_committed_session_checkpoints,
+    kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
+    kv_cache_prepare_voice_persona_resident, kv_cache_restore, kv_cache_save,
+    kv_cache_save_voice_persona, kv_cache_set_voice_call_activity, kv_cache_status,
 };
 pub use llama_native_engine::{
     GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,

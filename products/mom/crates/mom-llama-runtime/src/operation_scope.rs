@@ -1,5 +1,5 @@
 use llama_native_host::{NativeClient, NativeHost};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -167,6 +167,7 @@ struct OperationScopeInner {
     quiescing: AtomicBool,
     native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
+    voice_call_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Runtime-local authority for every live Mom product operation.
@@ -256,6 +257,7 @@ impl OperationScope {
                 tool_loops: HashMap::new(),
                 children: Vec::new(),
             }),
+            voice_call_sessions: Arc::new(Mutex::new(HashSet::new())),
         }))
     }
 
@@ -293,6 +295,9 @@ impl OperationScope {
         Arc::get_mut(&mut child.0)
             .expect("new operation scope has one owner")
             .parent = Some(Arc::downgrade(&self.0));
+        Arc::get_mut(&mut child.0)
+            .expect("new operation scope has one owner")
+            .voice_call_sessions = Arc::clone(&self.0.voice_call_sessions);
         registries.children.push(Arc::downgrade(&child.0));
         Ok(child)
     }
@@ -348,6 +353,68 @@ impl OperationScope {
                         .then(|| request_id.clone())
                 })
         })
+    }
+
+    /// Tracks one UI-owned voice call across model preparation, microphone
+    /// gaps, and the streamed playback tail. The opaque session ID ensures a
+    /// late close from an older call cannot clear a newer one.
+    pub fn set_voice_call_activity(&self, session_id: &str, active: bool) -> anyhow::Result<()> {
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || session_id.chars().any(char::is_control)
+        {
+            anyhow::bail!("voice call activity identity is invalid");
+        }
+        // Serialize call activation against a checkpoint's native snapshot.
+        // If a snapshot has already started, setup waits before opening the
+        // microphone; once activated, no later checkpoint can enter.
+        let mut sessions = self
+            .0
+            .voice_call_sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?;
+        if active && self.cancellation_requested() {
+            anyhow::bail!("application is shutting down");
+        }
+        if active {
+            sessions.insert(session_id.to_owned());
+        } else {
+            sessions.remove(session_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_idle_voice_checkpoint<T>(
+        &self,
+        operation: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let sessions = self
+            .0
+            .voice_call_sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?;
+        if !sessions.is_empty() {
+            return Ok(None);
+        }
+        // Keep the shared session lock through the snapshot. Call activation
+        // on the parent or any child waits before microphone setup can begin.
+        operation().map(Some)
+    }
+
+    pub(crate) fn has_active_voice_call(&self) -> bool {
+        self.0
+            .voice_call_sessions
+            .lock()
+            .is_ok_and(|sessions| !sessions.is_empty())
+    }
+
+    pub(crate) fn clear_voice_call_activity(&self) -> anyhow::Result<()> {
+        self.0
+            .voice_call_sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?
+            .clear();
+        Ok(())
     }
 
     pub(crate) fn request_chat_cancellation(&self, request_id: &str) -> bool {
@@ -664,6 +731,46 @@ impl Drop for ToolLoopOperationLease {
 mod tests {
     use super::{MentionCancelControl, OperationScope};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn voice_call_checkpoint_guard_tracks_exact_sessions() {
+        let scope = OperationScope::detached();
+        let child = scope.child().expect("dispatch child");
+        scope
+            .set_voice_call_activity("call-old", true)
+            .expect("activate first call");
+        scope
+            .set_voice_call_activity("call-new", true)
+            .expect("activate replacement call");
+        scope
+            .set_voice_call_activity("call-old", false)
+            .expect("late close for old call");
+        assert!(scope.has_active_voice_call());
+        assert!(child.has_active_voice_call());
+        let mut snapshot_started = false;
+        let skipped = child
+            .with_idle_voice_checkpoint(|| {
+                snapshot_started = true;
+                Ok(())
+            })
+            .expect("guard lookup");
+        assert!(skipped.is_none());
+        assert!(!snapshot_started);
+        scope
+            .set_voice_call_activity("call-new", false)
+            .expect("close exact active call");
+        assert!(!scope.has_active_voice_call());
+        assert!(!child.has_active_voice_call());
+        let snapshot = child
+            .with_idle_voice_checkpoint(|| Ok("idle"))
+            .expect("idle checkpoint");
+        assert_eq!(snapshot, Some("idle"));
+        assert!(
+            scope
+                .set_voice_call_activity("bad\nidentity", true)
+                .is_err()
+        );
+    }
 
     #[test]
     fn child_stop_is_independent_and_parent_quit_reaches_late_operations() {

@@ -4,8 +4,9 @@
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { resolveCandidateDataDirectory, runtimeReadyLogConfirmsPath } from './voice-candidate-launch-policy.mjs';
 
 const [operation, ...args] = process.argv.slice(2);
 const fail = message => { throw new Error(message); };
@@ -40,33 +41,42 @@ function processIdentity(pid, executable) {
 }
 
 function runtimeReady(logPath, expectedDataDir) {
-  const log = readFileSync(logPath, 'utf8');
-  return log.split(/\r?\n/).some(line => line.includes(`mom-llama runtime ready: ${expectedDataDir}`));
+  return runtimeReadyLogConfirmsPath(readFileSync(logPath, 'utf8'), expectedDataDir);
 }
 
 async function start(candidatePath, receiptPath) {
-  if (!candidatePath || !receiptPath || args.length !== 2) fail('Usage: launch-voice-candidate.mjs start <candidate.json> <new-launch-receipt.json>');
+  const [dataDirectoryFlag, explicitDataDirectory] = args.slice(2);
+  if (!candidatePath || !receiptPath || (args.length !== 2 && !(args.length === 4 && dataDirectoryFlag === '--data-dir'))) {
+    fail('Usage: launch-voice-candidate.mjs start <candidate.json> <new-launch-receipt.json> [--data-dir <isolated-directory>]');
+  }
   const receipt = resolve(receiptPath);
-  const logPath = `${receipt.slice(0, -5)}.stdout.log`;
+  const logPath = `${receipt.replace(/\.json$/i, '')}.stdout.log`;
   if (existsSync(receipt) || existsSync(logPath)) fail('Preserve prior evidence: choose new receipt and log paths');
   const { candidate, executable, executableSha256 } = candidateExecutable(resolve(candidatePath));
-  // Match the release runtime's normal fallback namespace explicitly. This
-  // keeps the UI driver independent of whether an inherited shell survives.
-  const expectedDataDir = join(homedir(), '.local', 'share', 'llama-native-kit', 'mom-llama', candidate.data_namespace);
+  // Honor an explicitly prepared isolated store first. An absent override uses
+  // the compiled namespace, never the ordinary installed-app default store.
+  const explicitPath = dataDirectoryFlag === '--data-dir'
+    ? explicitDataDirectory
+    : process.env.LLAMA_NATIVE_KIT_DATA_DIR || null;
+  const dataDirectory = resolveCandidateDataDirectory({
+    home: homedir(), namespace: candidate.data_namespace, explicitPath,
+  });
+  const expectedDataDir = dataDirectory.path;
   const startedAt = new Date().toISOString();
   const evidence = {
     status: 'starting', candidate_manifest: resolve(candidatePath), candidate_source: candidate.source,
     bundle: resolve(candidate.bundle), executable, executable_sha256: executableSha256,
-    data_namespace: candidate.data_namespace, effective_data_directory: expectedDataDir,
+    data_namespace: candidate.data_namespace, data_directory_source: dataDirectory.source,
+    effective_data_directory: expectedDataDir,
     started_at: startedAt, stdout_log: logPath,
   };
   let receiptFd;
-  try { receiptFd = openSync(receipt, 'wx'); }
+  try { receiptFd = openSync(receipt, 'wx', 0o600); }
   catch { fail('Cannot exclusively create launch receipt; preserve existing evidence'); }
   closeSync(receiptFd);
   writeJson(receipt, evidence);
   let logFd;
-  try { logFd = openSync(logPath, 'wx'); }
+  try { logFd = openSync(logPath, 'wx', 0o600); }
   catch { evidence.status = 'failed'; evidence.error = 'Cannot exclusively create launch log'; writeJson(receipt, evidence); fail(evidence.error); }
 
   const child = spawn(executable, [], {
@@ -96,7 +106,11 @@ async function start(candidatePath, receiptPath) {
     if (!identity) break;
     await new Promise(resolvePromise => setTimeout(resolvePromise, 250));
   }
-  try { process.kill(child.pid, 'SIGTERM'); } catch {}
+  // Only stop the exact candidate process we launched. A vanished/reused PID
+  // must never turn timeout cleanup into a signal to an unrelated process.
+  if (processIdentity(child.pid, executable)) {
+    try { process.kill(child.pid, 'SIGTERM'); } catch {}
+  }
   evidence.status = 'failed';
   evidence.error = 'Candidate did not remain alive and report the expected runtime data directory within 120 seconds';
   writeJson(receipt, evidence);
@@ -111,8 +125,14 @@ function verify(receiptPath) {
   const { candidate, executable, executableSha256 } = candidateExecutable(evidence.candidate_manifest);
   if (candidate.source?.sha !== evidence.candidate_source?.sha || executable !== evidence.executable
       || executableSha256 !== evidence.executable_sha256) fail('Candidate identity no longer matches the ready receipt');
-  if (evidence.effective_data_directory !== join(homedir(), '.local', 'share', 'llama-native-kit', 'mom-llama', candidate.data_namespace)) {
-    fail('Receipt data directory does not match the compiled candidate namespace');
+  const expectedDataDirectory = resolveCandidateDataDirectory({
+    home: homedir(), namespace: candidate.data_namespace,
+    explicitPath: evidence.data_directory_source === 'explicit-isolated-directory'
+      ? evidence.effective_data_directory : null,
+  });
+  if (expectedDataDirectory.path !== evidence.effective_data_directory
+      || expectedDataDirectory.source !== evidence.data_directory_source) {
+    fail('Receipt data directory does not match the candidate isolation policy');
   }
   const identity = processIdentity(evidence.pid, executable);
   if (!identity || identity.process_start !== evidence.process_start) fail('Candidate PID is absent or has been reused');

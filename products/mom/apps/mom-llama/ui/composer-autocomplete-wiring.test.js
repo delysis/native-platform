@@ -91,6 +91,7 @@ test("acceptance gates interaction and reconciles every committed backend result
 
 const vm = require("node:vm");
 const composer = require("./composer-key-policy.js");
+const voiceCapturePolicy = require("./voice-capture-policy.js");
 const wireFixtures = JSON.parse(fs.readFileSync(path.join(
   __dirname, "..", "..", "..", "crates", "mom-llama-runtime", "tests", "fixtures",
   "composer-autocomplete-results.json",
@@ -159,6 +160,7 @@ const autocompleteBridge = async (generation, acceptance, selectionOffset = 0) =
   vm.runInNewContext(ui, {
     document, window, localStorage: { getItem: () => null, setItem() {} },
     TextEncoder, TextDecoder, MomLlamaComposerKeyPolicy: composer,
+    MomVoiceCapturePolicy: voiceCapturePolicy,
     Event: class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } },
   }, { filename: "coop-hx.js", timeout: 1000 });
   // The existing boot refusal settles before the fixture enables IPC. None of

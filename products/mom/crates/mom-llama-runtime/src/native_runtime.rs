@@ -902,6 +902,7 @@ mod tests {
                 token_count: token_ids.len(),
                 bytes: (vec![4, 5, 6]).into(),
                 token_ids,
+                cells: Vec::new(),
             },
         };
         value.bind_reconstruction();

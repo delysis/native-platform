@@ -5,6 +5,49 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(`${__dirname}/coop-hx.js`, "utf8");
 
+test("voice call activity guard waits for activation and clears only its own session", async () => {
+  const start = source.indexOf("  const createVoiceCallActivityGuard = (sessionId) => {");
+  const end = source.indexOf("\n  const sha256Hex =", start);
+  assert.ok(start >= 0 && end > start, "the production activity guard must remain testable");
+  const calls = [];
+  let activateOld;
+  const context = {
+    invoke: (command, args) => {
+      calls.push([command, args]);
+      if (args.sessionId === "old-call" && args.active) {
+        return new Promise((resolve) => { activateOld = resolve; });
+      }
+      return Promise.resolve({ status: "passed" });
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(start, end)}\nthis.createGuard = createVoiceCallActivityGuard;`,
+    context,
+  );
+
+  const oldCall = context.createGuard("old-call");
+  const oldClose = oldCall.clear();
+  const nextCall = context.createGuard("new-call");
+  await nextCall.ready;
+  await Promise.resolve();
+  assert.deepEqual(calls.map(([, args]) => [args.sessionId, args.active]), [
+    ["old-call", true],
+    ["new-call", true],
+  ], "closing must wait for its in-flight activation before sending the matching clear");
+
+  activateOld({ status: "passed" });
+  assert.equal(await oldClose, true);
+  assert.equal(await nextCall.clear(), true);
+  assert.deepEqual(calls.map(([, args]) => [args.sessionId, args.active]), [
+    ["old-call", true],
+    ["new-call", true],
+    ["old-call", false],
+    ["new-call", false],
+  ], "a delayed old close must never clear the newer call's guard");
+  assert.ok(calls.every(([command]) => command === "mom_llama_kv_cache_set_voice_call_activity"));
+});
+
 test("unacknowledged speech preemption permanently disables call transcript admission", async () => {
   const start = source.indexOf("  const stopSpeechOperationAndWait = async (");
   const end = source.indexOf("\n  const startStreamedCallGreeting", start);

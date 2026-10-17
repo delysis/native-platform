@@ -2,7 +2,9 @@
 
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::session::LlamaStateSeqFlags;
-use llama_native_types::{ModelFingerprint, NativeError, NativeErrorCode, SequenceStateBlob};
+use llama_native_types::{
+    ModelFingerprint, NativeError, NativeErrorCode, SequenceStateBlob, SequenceStateCell,
+};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -74,6 +76,32 @@ impl PersistentAuthority {
         mac.update(&(state.token_ids.len() as u64).to_le_bytes());
         for token in &state.token_ids {
             mac.update(&token.to_le_bytes());
+        }
+        if !state.cells.is_empty() {
+            mac.update(b"native-state-auth-cells-v1");
+            mac.update(&(state.cells.len() as u64).to_le_bytes());
+            for cell in &state.cells {
+                match cell {
+                    SequenceStateCell::Text(token) => {
+                        mac.update(&[0]);
+                        mac.update(&token.to_le_bytes());
+                    }
+                    SequenceStateCell::Media {
+                        digest,
+                        chunk,
+                        offset,
+                    } => {
+                        mac.update(&[1]);
+                        mac.update(digest);
+                        mac.update(&(*chunk as u64).to_le_bytes());
+                        mac.update(&(*offset as u64).to_le_bytes());
+                    }
+                    SequenceStateCell::AudioFrame { digest } => {
+                        mac.update(&[2]);
+                        mac.update(digest);
+                    }
+                }
+            }
         }
         mac.update(bytes);
         mac
@@ -182,7 +210,35 @@ fn envelope(
         token_count,
         bytes: bytes.into(),
         token_ids,
+        cells: Vec::new(),
     })
+}
+
+fn validate_cell_metadata(state: &SequenceStateBlob) -> Result<(), NativeError> {
+    if state.cells.is_empty() {
+        if state.token_count != state.token_ids.len() {
+            return Err(incompatible("text sequence token metadata is inconsistent"));
+        }
+        return Ok(());
+    }
+    if state.token_count != state.cells.len() {
+        return Err(incompatible("mixed sequence cell metadata is inconsistent"));
+    }
+    let leading_text: Vec<i32> = state
+        .cells
+        .iter()
+        .take_while(|cell| matches!(cell, SequenceStateCell::Text(_)))
+        .filter_map(|cell| match cell {
+            SequenceStateCell::Text(token) => Some(*token),
+            _ => None,
+        })
+        .collect();
+    if state.token_ids != leading_text {
+        return Err(incompatible(
+            "mixed sequence leading text metadata is inconsistent",
+        ));
+    }
+    Ok(())
 }
 
 fn validated_payload<'a>(
@@ -220,6 +276,7 @@ pub(crate) fn validate_binding(
     state: &SequenceStateBlob,
     fingerprint: &ModelFingerprint,
 ) -> Result<(), NativeError> {
+    validate_cell_metadata(state)?;
     if state.bytes.starts_with(MAGIC) || state.bytes.starts_with(SIGNED_MAGIC) {
         validated_payload(state, fingerprint)?;
     }
@@ -252,11 +309,81 @@ pub(crate) fn export_sequence_bounded(
     token_ids: Vec<i32>,
     max_bytes: usize,
 ) -> Result<Option<SequenceStateBlob>, NativeError> {
-    if sequence_id < 0
-        || sequence_id as u32 >= fingerprint.max_sequences
+    export_sequence_cells_internal(
+        context,
+        fingerprint,
+        sequence_id,
+        sequence_id,
+        token_count,
+        token_ids,
+        Vec::new(),
+        max_bytes,
+    )
+}
+
+/// Export a complete mixed text/media lane while publishing its identity as
+/// the ordinary cache sequence. This allows the resident media lane (seq 3)
+/// to be restored into the cache's external seq 0 identity after a restart.
+pub(crate) fn export_sequence_cells_bounded(
+    context: &LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    source_sequence_id: i32,
+    export_sequence_id: i32,
+    cells: Vec<SequenceStateCell>,
+    max_bytes: usize,
+) -> Result<Option<SequenceStateBlob>, NativeError> {
+    if cells.is_empty() {
+        return Err(incompatible("mixed sequence export requires cells"));
+    }
+    let token_ids = cells
+        .iter()
+        .take_while(|cell| matches!(cell, SequenceStateCell::Text(_)))
+        .filter_map(|cell| match cell {
+            SequenceStateCell::Text(token) => Some(*token),
+            _ => None,
+        })
+        .collect();
+    let token_count = cells.len();
+    export_sequence_cells_internal(
+        context,
+        fingerprint,
+        source_sequence_id,
+        export_sequence_id,
+        token_count,
+        token_ids,
+        cells,
+        max_bytes,
+    )
+}
+
+fn export_sequence_cells_internal(
+    context: &LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    source_sequence_id: i32,
+    export_sequence_id: i32,
+    token_count: usize,
+    token_ids: Vec<i32>,
+    cells: Vec<SequenceStateCell>,
+    max_bytes: usize,
+) -> Result<Option<SequenceStateBlob>, NativeError> {
+    if source_sequence_id < 0
+        || source_sequence_id as u32 >= fingerprint.max_sequences
+        || export_sequence_id < 0
+        || export_sequence_id as u32 >= fingerprint.max_sequences
         || token_count == 0
-        || token_count != token_ids.len()
         || token_count > fingerprint.context_tokens as usize
+        || (cells.is_empty() && token_count != token_ids.len())
+        || (!cells.is_empty()
+            && (token_count != cells.len()
+                || token_ids
+                    != cells
+                        .iter()
+                        .take_while(|cell| matches!(cell, SequenceStateCell::Text(_)))
+                        .filter_map(|cell| match cell {
+                            SequenceStateCell::Text(token) => Some(*token),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()))
     {
         return Err(incompatible(
             "sequence export is outside the resident context",
@@ -264,7 +391,7 @@ pub(crate) fn export_sequence_bounded(
     }
     // Compact SWA exports discard keys needed after a longest-prefix rewind.
     let flags = LlamaStateSeqFlags::KEEP_ALL_SWA_CELLS;
-    let size = context.state_seq_get_size_ext(sequence_id, flags);
+    let size = context.state_seq_get_size_ext(source_sequence_id, flags);
     if size == 0 {
         return Err(incompatible("llama.cpp reported an empty sequence state"));
     }
@@ -286,15 +413,17 @@ pub(crate) fn export_sequence_bounded(
     bytes.resize(payload_end, 0);
     // Write directly into the final envelope. A full SWA state can be gigabytes;
     // a second raw buffer would needlessly double the export's peak memory.
-    let written = context.state_seq_get_data_ext(&mut bytes[HEADER_BYTES..], sequence_id, flags);
+    let written =
+        context.state_seq_get_data_ext(&mut bytes[HEADER_BYTES..], source_sequence_id, flags);
     if written != size {
         return Err(incompatible("llama.cpp sequence export size changed"));
     }
     let mut state = SequenceStateBlob {
-        sequence_id,
+        sequence_id: export_sequence_id,
         token_count,
         bytes: bytes.into(),
         token_ids,
+        cells,
     };
     PERSISTENT_AUTHORITY.with_borrow(|authority| {
         if let Some(authority) = authority {
@@ -308,6 +437,53 @@ pub(crate) fn export_sequence_bounded(
     Ok(Some(state))
 }
 
+/// An authenticated, fingerprint-bound native export. Construct this before
+/// releasing useful resident state so rejected disk entries cannot evict it.
+pub(crate) struct PreparedSequenceImport<'a> {
+    raw: &'a [u8],
+}
+
+impl PreparedSequenceImport<'_> {
+    pub(crate) fn restore(
+        self,
+        context: &mut LlamaContext<'_>,
+        destination_sequence_id: i32,
+    ) -> Result<(), NativeError> {
+        // SAFETY: construction checks a native export signature or a live
+        // worker receipt and the complete model/context binding. The borrowed
+        // bytes cannot change between authentication and native import.
+        let restored = unsafe {
+            context.state_seq_set_data_ext(
+                self.raw,
+                destination_sequence_id,
+                LlamaStateSeqFlags::empty(),
+            )
+        };
+        if !restored {
+            return Err(incompatible("llama.cpp rejected the sequence state"));
+        }
+        Ok(())
+    }
+}
+
+/// None permits checked text-token replay, never the raw native parser.
+pub(crate) fn prepare_sequence_import<'a>(
+    fingerprint: &ModelFingerprint,
+    state: &'a SequenceStateBlob,
+) -> Result<Option<PreparedSequenceImport<'a>>, NativeError> {
+    validate_cell_metadata(state)?;
+    if !(state.bytes.starts_with(MAGIC) || state.bytes.starts_with(SIGNED_MAGIC)) {
+        return Ok(None);
+    }
+    let raw = validated_payload(state, fingerprint)?;
+    let authenticated = PERSISTENT_AUTHORITY
+        .with_borrow(|authority| authority.as_ref().is_some_and(|key| key.verifies(state)));
+    if raw.is_empty() || !(authenticated || has_live_export(&receipt(state))) {
+        return Ok(None);
+    }
+    Ok(Some(PreparedSequenceImport { raw }))
+}
+
 /// `false` requests token replay. It never authorizes the raw native parser.
 pub(crate) fn import_sequence(
     context: &mut LlamaContext<'_>,
@@ -315,29 +491,10 @@ pub(crate) fn import_sequence(
     state: &SequenceStateBlob,
     destination_sequence_id: i32,
 ) -> Result<bool, NativeError> {
-    // Legacy serialized snapshots have no binding envelope and cannot enter
-    // the native parser. Their already-validated token IDs remain replayable.
-    if !(state.bytes.starts_with(MAGIC) || state.bytes.starts_with(SIGNED_MAGIC)) {
+    let Some(prepared) = prepare_sequence_import(fingerprint, state)? else {
         return Ok(false);
-    }
-    let raw = validated_payload(state, fingerprint)?;
-    let authenticated = PERSISTENT_AUTHORITY
-        .with_borrow(|authority| authority.as_ref().is_some_and(|key| key.verifies(state)));
-    if raw.is_empty() || !(authenticated || has_live_export(&receipt(state))) {
-        return Ok(false);
-    }
-    // SAFETY: the full state and token metadata have either an authenticated
-    // native-export signature or a same-worker SHA-256 receipt created
-    // only after successful native export on this worker. The envelope binds
-    // the full model/context fingerprint, checked above. Caller-constructed,
-    // altered or receipt-expired bytes never reach this call. A serialized
-    // round-trip on this same worker is allowed only while its receipt survives.
-    let restored = unsafe {
-        context.state_seq_set_data_ext(raw, destination_sequence_id, LlamaStateSeqFlags::empty())
     };
-    if !restored {
-        return Err(incompatible("llama.cpp rejected the sequence state"));
-    }
+    prepared.restore(context, destination_sequence_id)?;
     Ok(true)
 }
 
@@ -484,6 +641,66 @@ mod tests {
         let signature = authority.mac(&state, &state.bytes).finalize().into_bytes();
         Arc::make_mut(&mut state.bytes).extend_from_slice(&signature);
         state
+    }
+
+    fn authenticated_mixed_fixture(
+        authority: &PersistentAuthority,
+        fingerprint: &ModelFingerprint,
+    ) -> SequenceStateBlob {
+        use hmac::Mac;
+        let mut state = envelope(vec![9, 8, 7, 6], fingerprint, 0, 3, vec![7]).expect("envelope");
+        state.token_count = 3;
+        state.cells = vec![
+            SequenceStateCell::Text(7),
+            SequenceStateCell::Media {
+                digest: [0x11; 32],
+                chunk: 2,
+                offset: 640,
+            },
+            SequenceStateCell::AudioFrame { digest: [0x22; 32] },
+        ];
+        Arc::make_mut(&mut state.bytes)[..MAGIC.len()].copy_from_slice(SIGNED_MAGIC);
+        let signature = authority.mac(&state, &state.bytes).finalize().into_bytes();
+        Arc::make_mut(&mut state.bytes).extend_from_slice(&signature);
+        state
+    }
+
+    #[test]
+    fn persistent_authority_binds_mixed_cells_across_reopen() {
+        let directory = TestTempDir::new();
+        let fingerprint = fingerprint();
+        let original = {
+            let authority = PersistentAuthority::open(&directory.0).expect("authority");
+            authenticated_mixed_fixture(&authority, &fingerprint)
+        };
+        assert!(validate_cell_metadata(&original).is_ok());
+        let original_receipt = receipt(&original);
+
+        let reopened = PersistentAuthority::open(&directory.0).expect("reopened authority");
+        assert!(reopened.verifies(&original));
+        let persisted = serde_json::to_vec(&original).expect("serialize mixed export");
+        let reopened_state: SequenceStateBlob =
+            serde_json::from_slice(&persisted).expect("decode mixed export");
+        assert!(reopened.verifies(&reopened_state));
+        assert!(
+            reopened_state
+                .reconstruction()
+                .sequence(reopened_state.token_ids.clone())
+                .is_none()
+        );
+        let mut changed = original.clone();
+        changed.cells[1] = SequenceStateCell::Media {
+            digest: [0x33; 32],
+            chunk: 2,
+            offset: 640,
+        };
+        assert_ne!(receipt(&changed), original_receipt);
+        assert!(!reopened.verifies(&changed));
+        assert!(validate_cell_metadata(&changed).is_ok());
+
+        let mut malformed = original;
+        malformed.cells[0] = SequenceStateCell::Text(99);
+        assert!(validate_cell_metadata(&malformed).is_err());
     }
 
     #[test]

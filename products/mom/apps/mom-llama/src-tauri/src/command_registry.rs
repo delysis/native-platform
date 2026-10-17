@@ -218,6 +218,8 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_skill_apply", true, false),
     read("mom_llama_kv_cache_status", true, false),
     long("mom_llama_kv_cache_save", true, true),
+    long("mom_llama_kv_cache_checkpoint_voice_session", true, true),
+    mutation("mom_llama_kv_cache_set_voice_call_activity", false, false),
     long("mom_llama_kv_cache_restore", true, true),
     long("mom_llama_kv_cache_clear", true, true),
     read("mom_llama_mcp_status", true, false),
@@ -389,6 +391,7 @@ mod tests {
             "mom_llama_settings_reset",
             "mom_llama_settings_update",
             "mom_llama_kv_cache_save",
+            "mom_llama_kv_cache_checkpoint_voice_session",
             "mom_llama_kv_cache_restore",
             "mom_llama_kv_cache_clear",
             "mom_llama_tool_loop_run",
@@ -443,7 +446,8 @@ mod tests {
                     || body.contains("commit_managed_removal(")
                     || body.contains("voice_audio_finish_in_scope(")
                     || body.contains("voice_audio_finish_with_precommit_in_scope(")
-                    || body.contains("chat_cancel_in_scope(");
+                    || body.contains("chat_cancel_in_scope(")
+                    || body.contains("kv_cache_checkpoint_committed_voice_session(");
                 assert_eq!(
                     spec.mutates_store, expected_store_mutation,
                     "{} implementation {} store authority",
@@ -470,6 +474,16 @@ mod tests {
         assert!(prepare.starts_operation);
         assert!(prepare.mutates_store);
         assert!(prepare.uses_native);
+    }
+
+    #[test]
+    fn voice_call_activity_guard_is_a_short_runtime_mutation() {
+        let activity = super::command_spec("mom_llama_kv_cache_set_voice_call_activity");
+        assert_eq!(activity.admission, super::AdmissionClass::Foreground);
+        assert_eq!(activity.class, super::CommandClass::Mutation);
+        assert!(!activity.starts_operation);
+        assert!(!activity.mutates_store);
+        assert!(!activity.uses_native);
     }
 
     #[test]

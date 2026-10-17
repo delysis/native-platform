@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 66,
+  "expected_test_count": 68,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1465,6 +1465,28 @@
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
       "platforms": ["macos"]
+    },
+    {
+      "test_id": "tests::real_completed_audio_survives_next_turn_and_authenticated_restart",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector; verifies committed audio history survives later live audio, an authenticated worker restart, and tampered-state rejection",
+      "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH"],
+      "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "tests::real_audio_edit_reuses_exact_frame_prefix_with_cold_parity",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires real Gemma 4 12B GGUF and matching audio projector; checks exact frame-prefix reuse after an audio edit against cold output",
+      "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH"],
+      "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
     }
   ]
 }

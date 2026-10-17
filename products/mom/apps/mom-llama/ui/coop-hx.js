@@ -344,6 +344,50 @@
     if (!value) throw new Error("Secure opaque speech operation IDs are unavailable.");
     return value;
   };
+  const createVoiceCallActivityGuard = (sessionId) => {
+    let active = false;
+    let clearPromise = null;
+    let activation;
+    try {
+      activation = invoke("mom_llama_kv_cache_set_voice_call_activity", {
+        sessionId,
+        active: true,
+      });
+    } catch (error) {
+      activation = Promise.reject(error);
+    }
+    const ready = Promise.resolve(activation).then((response) => {
+      if (response?.status === "blocked") {
+        throw new Error(response?.blocker?.message || "Voice cache activity could not be recorded.");
+      }
+      active = true;
+      return true;
+    });
+    return {
+      sessionId,
+      ready,
+      clear: async () => {
+        await ready.catch(() => false);
+        if (!active) return false;
+        if (!clearPromise) {
+          clearPromise = Promise.resolve().then(() => invoke("mom_llama_kv_cache_set_voice_call_activity", {
+            sessionId,
+            active: false,
+          })).then((response) => {
+            if (response?.status === "blocked") {
+              throw new Error(response?.blocker?.message || "Voice cache activity could not be cleared.");
+            }
+            active = false;
+            return true;
+          }).catch((error) => {
+            clearPromise = null;
+            throw error;
+          });
+        }
+        return clearPromise;
+      },
+    };
+  };
   const sha256Hex = async (bytes) => {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
     return [...new Uint8Array(digest)]
@@ -1357,6 +1401,7 @@
       pause,
       stop,
       wavBytes,
+      reconsiderStartup: maybeStartPlayback,
       echoReference() {
         if (!playing || !echoReference || !echoReferenceSamples || !context) return null;
         echoReference.getFloatTimeDomainData(echoReferenceSamples);
@@ -2404,6 +2449,14 @@
       reportError(new Error("The selected contact is unavailable for voice preparation."));
       return;
     }
+    let activityGuard;
+    try {
+      activityGuard = createVoiceCallActivityGuard(speechOperationToken());
+    } catch (error) {
+      reportError(error);
+      return;
+    }
+    voiceCallActivityGuard = activityGuard;
     voiceCallPreparing = true;
     const epoch = {};
     voiceCallEpoch = epoch;
@@ -2427,6 +2480,8 @@
     setModalVisibility("voice-call-modal", true);
     modal.querySelector('[data-action="voice-call-close"]')?.focus();
     try {
+      await activityGuard.ready;
+      if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Do not admit Gemma warming or microphone setup while an idle Parakeet
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
@@ -2514,6 +2569,8 @@
   };
 
   const closeVoiceCallSurface = async () => {
+    const activityGuard = voiceCallActivityGuard;
+    voiceCallActivityGuard = null;
     const conversation = voiceCallConversation;
     const microphoneStream = voiceCallMicrophoneStream;
     const callTts = liveVoiceTts?.mode === "call" ? liveVoiceTts : null;
@@ -2550,6 +2607,20 @@
     }
     await Promise.allSettled(stops.filter(Boolean));
     releaseCallMicrophoneStream(microphoneStream);
+    if (activityGuard) {
+      try {
+        await activityGuard.clear();
+      } catch (error) {
+        console.warn("voice cache activity guard could not be cleared", error);
+      }
+    }
+    if (conversation) {
+      // The call surface is already dismissed and native stop/cancel work has
+      // settled. Checkpointing can serialize a large state, so keep it off the
+      // UI path and let the runtime skip it if the request is still active.
+      void invoke("mom_llama_kv_cache_checkpoint_voice_session", { conversation })
+        .catch((error) => console.warn("voice session checkpoint unavailable", error));
+    }
     void recoverPendingVoiceHistory().catch(() => {});
   };
 
@@ -3805,6 +3876,7 @@
   let voiceCallActive = false;
   let voiceCallTranscriptSlotsDisabled = false;
   let voiceCallEpoch = null;
+  let voiceCallActivityGuard = null;
   let voiceCallAudio = null;
   let voiceCallConversation = null;
   let retryCallPrefillAfterTranscript = null;
@@ -5023,7 +5095,7 @@
       markVoiceLatencyIn(ttsLatencyTrace, stage, detail);
     };
     const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController(
-      voiceLeadCalibration || { initialBufferComplete: true },
+      voiceLeadCalibration || { initialBufferComplete: true, initialProbePending: true },
     );
     const semanticLeadController = new globalThis.MomVoicePipelineScheduler.SemanticLeadController();
     const mountVoiceReplyPlayer = () => {
@@ -5244,7 +5316,7 @@
       retainHistory: mode !== "call",
       startupBufferMs: mode === "call" ? () => leadController.startupRunwayMs() : 120,
       startupDelayMs: mode === "call" ? () => leadController.startupDelayMs() : 0,
-      waitForCompletion: mode === "call" && leadController.shouldBufferCompleteReply(),
+      waitForCompletion: () => mode === "call" && leadController.shouldBufferCompleteReply(),
       onFirstChunk: (firstPcm) => {
         firstPcmSeen = true;
         markTtsLatency("tts_first_pcm", {
@@ -5693,6 +5765,9 @@
           words: wordCount,
         });
         voiceLeadCalibration = leadController.calibration();
+        // Completion of the cold probe can release playback without waiting
+        // for another PCM packet (or the entire reply) to wake the player.
+        if (mode === "call") void controller.reconsiderStartup();
         markTtsLatency("tts_segment_finished", {
           segment,
           characters: next.chunk.length,
@@ -6063,6 +6138,11 @@
     return new Uint8Array(buffer);
   };
 
+  // Live inference and its retained derivative share the same integer PCM16
+  // samples; the policy module owns the canonical quantizer/encoder.
+  const { quantizeInferencePcm16, truncateInferencePcm16, encodeInferencePcm16Wav }
+    = globalThis.MomVoiceCapturePolicy;
+
   const voiceModePrompt = (call) => call
     ? "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation."
     : "[Voice note] Reply naturally and briefly, as a conversational voice message. No headings, lists, or preamble.";
@@ -6081,14 +6161,16 @@
     const block = mergeFloat32(recording.prefillParts);
     recording.prefillParts = [];
     recording.prefillSamples = 0;
-    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block);
-    const queuedSamples = blocks.reduce((count, chunk) => count + chunk.length, 0);
+    const blocks = globalThis.MomVoiceCapturePolicy.splitPrefillPcm(block)
+      .map((chunk) => quantizeInferencePcm16(chunk));
+    const queuedSamples = blocks.reduce((count, chunk) => count + chunk.pcm16.length, 0);
     // The native consumer has a 30-second ring. Bound the browser IPC queue
     // to the same capacity; the complete physical recording remains available
     // for the explicit fallback if this producer cannot keep up.
     const queueLimitSamples = 16_000 * 30;
     if (recording.prefillQueuedSamples + queuedSamples > queueLimitSamples) {
       recording.prefillFailed = true;
+      recording.modelInputReliable = false;
       recording.prefillEpoch += 1;
       markVoiceLatencyIn(recording.trace, "audio_prefill_producer_overflow", {
         queued_samples: recording.prefillQueuedSamples,
@@ -6113,11 +6195,13 @@
         const pushStarted = performance.now();
         const accepted = await invoke("mom_llama_voice_audio_push", {
           session: live.session,
-          samples: Array.from(chunk),
+          samples: Array.from(chunk.decoded),
         });
         if (recording.prefillEpoch !== epoch) return;
+        recording.modelInputPcm16Parts.push(chunk.pcm16);
+        recording.modelInputSampleCount += chunk.pcm16.length;
         recording.prefillPushes += 1;
-        recording.prefillAcceptedSamples += chunk.length;
+        recording.prefillAcceptedSamples += chunk.pcm16.length;
         const pushMs = performance.now() - pushStarted;
         recording.prefillIpcMs += pushMs;
         recording.prefillMaxIpcMs = Math.max(recording.prefillMaxIpcMs, pushMs);
@@ -6128,7 +6212,7 @@
         if (!recording.firstPrefillChunkAccepted) {
           recording.firstPrefillChunkAccepted = true;
           markVoiceLatencyIn(recording.trace, "audio_prefill_first_chunk_accepted", {
-            samples: chunk.length,
+            samples: chunk.pcm16.length,
             native_buffered_samples: accepted?.buffered_samples,
           });
         }
@@ -6136,6 +6220,7 @@
     }).catch(async (error) => {
       if (recording.prefillEpoch !== epoch) return;
       recording.prefillFailed = true;
+      recording.modelInputReliable = false;
       markVoiceLatencyIn(recording.trace, "audio_prefill_push_failed", {
         message: errorMessage(error),
         producer_pushes: recording.prefillPushes || 0,
@@ -6635,13 +6720,22 @@
     recording.transcription?.seal();
     if (flushPrefill) {
       enqueueVoicePrefill(recording, new Float32Array(), true);
-      await recording.pushChain;
     }
+    await recording.pushChain;
+    const modelInputWavBytes = recording.modelInputReliable && !recording.prefillFailed
+      && Number.isSafeInteger(recording.prefillInputStartSample)
+      && recording.prefillInputStartSample + recording.modelInputSampleCount <= recording.capturedSamples
+      ? encodeInferencePcm16Wav(recording.modelInputPcm16Parts, recording.modelInputSampleCount)
+      : null;
     return {
       heardVoice: recording.heardVoice,
       metrics: captureMetrics,
       transcription: recording.transcription,
       trace: recording.trace,
+      modelInputWavBytes,
+      modelInputStartSample: recording.prefillInputStartSample,
+      modelInputSampleCount: recording.modelInputSampleCount,
+      sourceSampleCount: recording.capturedSamples,
       // The saved turn is the physical microphone stream. Editing it here
       // would make the archive differ from Parakeet's parallel PCM consumer.
       samples: () => mergeFloat32(recording.capturedPcm),
@@ -6703,9 +6797,10 @@
       stream, context, source, processor, silence, capturedPcm,
       trace: voiceLatencyTrace,
       // Optional staged tap. Default callers remain unchanged until the native
-      // owner/command and exact saved-source binding are implemented.
+      // owner/command and derived-input source binding are implemented.
       transcription,
       capturedSamples: 0, prefillInputStartSample: null,
+      modelInputPcm16Parts: [], modelInputSampleCount: 0, modelInputReliable: true,
       sharedCallStream: stream === voiceCallMicrophoneStream,
       sharedCallGraph: Boolean(sharedCallGraph),
       resampler: globalThis.MomVoiceCapturePolicy.createStreamingMonoResampler(context.sampleRate),
@@ -7130,6 +7225,11 @@
         || origin + resumeOffset > captured.length) {
       throw new Error("The voice checkpoint is outside the captured audio.");
     }
+    if ((recording.modelInputSampleCount || 0) < resumeOffset) {
+      recording.modelInputReliable = false;
+    } else {
+      truncateInferencePcm16(recording, resumeOffset);
+    }
     const priorAudio = captured.subarray(origin + resumeOffset);
     recording.prefillParts = [];
     recording.prefillSamples = 0;
@@ -7296,11 +7396,29 @@
     return Array.from(bytes);
   };
 
+  const sealedVoiceInferenceRecording = (capture) => {
+    const bytes = capture?.modelInputWavBytes;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength <= 44) return null;
+    return {
+      recording: Array.from(bytes),
+      sourceSampleCount: capture.sourceSampleCount,
+      acceptedSampleCount: capture.modelInputSampleCount,
+      sourceStartSample: capture.modelInputStartSample,
+    };
+  };
+
   const confirmRecordedSpeculation = (speculation, stoppedCapture) => stoppedCapture
-    .then((capture) => invoke("mom_llama_voice_audio_speculation_confirm", {
-      speculation: speculation.id,
-      recording: sealedVoiceRecordingBytes(capture),
-    }))
+    .then((capture) => {
+      const modelInput = sealedVoiceInferenceRecording(capture);
+      return invoke("mom_llama_voice_audio_speculation_confirm", {
+        speculation: speculation.id,
+        recording: sealedVoiceRecordingBytes(capture),
+        ...(modelInput ? { modelInputRecording: modelInput.recording,
+          sourceSampleCount: modelInput.sourceSampleCount,
+          acceptedSampleCount: modelInput.acceptedSampleCount,
+          sourceStartSample: modelInput.sourceStartSample } : {}),
+      });
+    })
     .catch(async (error) => {
       await speculation.tts.stop().catch(() => {});
       await invoke("mom_llama_voice_audio_speculation_abort", {
@@ -7646,6 +7764,7 @@
         conversation,
         requestId: live.request_id,
         recording: sealedVoiceRecordingBytes(capture),
+        modelInput: sealedVoiceInferenceRecording(capture),
         sourceCapture: capture,
       };
     } else {
@@ -9445,6 +9564,12 @@
               const finished = await invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
                 recording: liveVoice.recording,
+                ...(liveVoice.modelInput ? {
+                  modelInputRecording: liveVoice.modelInput.recording,
+                  sourceSampleCount: liveVoice.modelInput.sourceSampleCount,
+                  acceptedSampleCount: liveVoice.modelInput.acceptedSampleCount,
+                  sourceStartSample: liveVoice.modelInput.sourceStartSample,
+                } : {}),
               });
               result = finished?.result ? {
                 ...finished,

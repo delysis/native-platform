@@ -683,6 +683,44 @@ test("call playback releases scheduled IPC packets instead of retaining replay h
   await controller.stop();
 });
 
+test("a cold reply's pending segment stays gated until its measured completion reconsiders startup", async () => {
+  const h = speechLifetimeHarness();
+  let probePending = true;
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    waitForCompletion: () => probePending,
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.ready, true, "the first PCM is playable in size");
+  assert.equal(h.audioContexts.length, 0, "the cold probe still blocks audible playback");
+
+  probePending = false;
+  await controller.reconsiderStartup();
+  assert.equal(h.audioContexts.length, 1, "clearing the measured gate starts without another packet or reply finish");
+  assert.equal(h.audioContexts[0].sources.length, 1);
+  await controller.stop();
+});
+
+test("a stopped player cannot be woken by clearing its cold startup gate", async () => {
+  const h = speechLifetimeHarness();
+  let probePending = true;
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    waitForCompletion: () => probePending,
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000), 0, false));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.audioContexts.length, 0);
+
+  await controller.stop();
+  probePending = false;
+  await controller.reconsiderStartup();
+  assert.equal(h.audioContexts.length, 0, "stopped buffers cannot restart after late calibration");
+});
+
 test("call playback waits a bounded wall-clock guard without hoarding another PCM packet", async () => {
   const h = speechLifetimeHarness();
   let startupDelayMs = 11;

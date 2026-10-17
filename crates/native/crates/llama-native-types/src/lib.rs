@@ -569,7 +569,7 @@ impl TryFrom<Vec<TokenLogitBias>> for SparseLogitBias {
 /// their exact behavior until they opt into a separate, capability-checked
 /// extended-sampling path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ExtendedSampler {
     MirostatV1 { config: MirostatV1Config },
     MirostatV2 { config: MirostatV2Config },
@@ -2887,6 +2887,22 @@ pub enum SequenceRestoreKind {
     TokenReplay,
 }
 
+/// Per-position identity for an authenticated mixed text/media sequence.
+/// Audio frames are identified by a digest of the canonical padded frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SequenceStateCell {
+    Text(i32),
+    Media {
+        digest: [u8; 32],
+        chunk: usize,
+        offset: usize,
+    },
+    AudioFrame {
+        digest: [u8; 32],
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SequenceStateBlob {
     pub sequence_id: i32,
@@ -2894,6 +2910,10 @@ pub struct SequenceStateBlob {
     pub bytes: std::sync::Arc<Vec<u8>>,
     #[serde(default)]
     pub token_ids: Vec<i32>,
+    /// Complete per-position identity for mixed native state. Empty retains
+    /// the legacy text-only representation in `token_ids`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<SequenceStateCell>,
 }
 
 /// The fixed configuration envelope is sufficient for checked token replay.
@@ -2905,6 +2925,14 @@ pub struct SequenceReconstruction {
     pub sequence_id: i32,
     pub header: Vec<u8>,
     pub export_receipt: [u8; 32],
+    /// Authenticated mixed state may restore natively but is never reduced to
+    /// text-only token replay. Missing means the legacy text-only contract.
+    #[serde(default = "sequence_replay_allowed")]
+    pub token_replay_allowed: bool,
+}
+
+const fn sequence_replay_allowed() -> bool {
+    true
 }
 
 impl SequenceStateBlob {
@@ -2919,6 +2947,13 @@ impl SequenceStateBlob {
         for token in &self.token_ids {
             hash.update(token.to_le_bytes());
         }
+        // Keep text-only receipts byte-for-byte compatible with v1. Mixed
+        // state adds a separately tagged, deterministic cell encoding.
+        if !self.cells.is_empty() {
+            hash.update(b"native-sequence-export-cells-v1");
+            hash.update((self.cells.len() as u64).to_le_bytes());
+            hash_cells(&mut hash, &self.cells);
+        }
         hash.update(self.bytes.as_slice());
         hash.finalize().into()
     }
@@ -2929,6 +2964,33 @@ impl SequenceStateBlob {
             sequence_id: self.sequence_id,
             header: self.bytes[..self.bytes.len().min(SEQUENCE_STATE_HEADER_BYTES)].to_vec(),
             export_receipt: self.export_receipt(),
+            token_replay_allowed: self.cells.is_empty(),
+        }
+    }
+}
+
+fn hash_cells(hash: &mut sha2::Sha256, cells: &[SequenceStateCell]) {
+    use sha2::Digest as _;
+    for cell in cells {
+        match cell {
+            SequenceStateCell::Text(token) => {
+                hash.update([0]);
+                hash.update(token.to_le_bytes());
+            }
+            SequenceStateCell::Media {
+                digest,
+                chunk,
+                offset,
+            } => {
+                hash.update([1]);
+                hash.update(digest);
+                hash.update((*chunk as u64).to_le_bytes());
+                hash.update((*offset as u64).to_le_bytes());
+            }
+            SequenceStateCell::AudioFrame { digest } => {
+                hash.update([2]);
+                hash.update(digest);
+            }
         }
     }
 }
@@ -2936,7 +2998,10 @@ impl SequenceStateBlob {
 impl SequenceReconstruction {
     #[must_use]
     pub fn sequence(&self, token_ids: Vec<i32>) -> Option<SequenceStateBlob> {
-        if self.header.is_empty() || self.header.len() > SEQUENCE_STATE_HEADER_BYTES {
+        if !self.token_replay_allowed
+            || self.header.is_empty()
+            || self.header.len() > SEQUENCE_STATE_HEADER_BYTES
+        {
             return None;
         }
         // Reconstruction carries tokens and a configuration binding, never an
@@ -2951,6 +3016,7 @@ impl SequenceReconstruction {
             token_count: token_ids.len(),
             bytes: header.into(),
             token_ids,
+            cells: Vec::new(),
         })
     }
 }

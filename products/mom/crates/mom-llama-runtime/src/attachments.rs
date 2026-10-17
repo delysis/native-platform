@@ -11,8 +11,10 @@ use attachment_native_host::{
     AttachmentHost, AttachmentHostConfig, CanonicalizedAttachment, ProvidedAttachment,
 };
 use attachment_native_types::{
-    ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt, BlobValidationGrade,
-    CanonicalArtifact, Coverage, DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
+    ArtifactId, ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt,
+    BlobValidationGrade, CanonicalArtifact, Coverage, DerivationEdge, DetectedFormat, EdgeOutcome,
+    LogicalName, MediaFamily, ObjectId, SegmentKind, TextFormat, TransformKind,
+    TransformProvenance,
 };
 use llama_native_types::{MediaInput, MediaKind};
 use serde::de::DeserializeOwned;
@@ -36,6 +38,7 @@ const MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS: usize = 256;
 const MAX_ATTACHMENT_PREVIEW_ARTIFACTS: usize = 64;
 const MAX_ATTACHMENT_PREVIEW_NOTICES: usize = 32;
 const MAX_ATTACHMENT_PREVIEW_NOTICE_BYTES: usize = 512;
+pub const INFERENCE_AUDIO_CANONICALIZER_VERSION: &str = "pcm16le-16khz-mono-v1";
 const MAX_ACTIVE_ATTACHMENT_REFERENCES: usize = 32;
 const MAX_ACTIVE_ATTACHMENT_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS: u32 = 16;
@@ -109,6 +112,31 @@ struct AttachmentManifest {
     artifacts: Vec<CanonicalArtifact>,
     policy_fingerprint: String,
     receipt: Option<AttachmentReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inference_audio: Option<InferenceAudioSelection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceAudioSampleRange {
+    pub start: u64,
+    pub end_exclusive: u64,
+}
+
+/// Provenance for the exact mono 16 kHz PCM16 WAV admitted as model input.
+/// The canonicalizer version fixes rate, channel count, encoding, and byte order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceAudioProvenance {
+    pub source_sample_count: u64,
+    pub accepted_sample_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ranges: Option<Vec<InferenceAudioSampleRange>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InferenceAudioSelection {
+    source_sha256: String,
+    artifact_id: ArtifactId,
+    provenance: InferenceAudioProvenance,
 }
 
 /// Host-only exact source authority for the Attachment -> Information bridge.
@@ -416,6 +444,442 @@ pub fn attachment_import_voice_message(
     )
 }
 
+/// Attach the exact PCM16/16 kHz/mono WAV supplied to inference as a derived
+/// child of the immutable physical recording. The source attachment and its
+/// message occurrence are never rewritten. Repeating the exact same request is
+/// idempotent; a conflicting second model-input artifact is rejected.
+pub fn store_inference_audio_derivative(
+    attachment_id: &str,
+    expected_source_sha256: &str,
+    wav_bytes: Vec<u8>,
+    provenance: InferenceAudioProvenance,
+) -> Result<()> {
+    validate_inference_audio_provenance(&provenance)?;
+    anyhow::ensure!(!wav_bytes.is_empty(), "model-input WAV is empty");
+
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let settings = resolve_settings()?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let mut attachment_db = load_attachment_db()?;
+    let record = attachment_db
+        .attachments
+        .iter_mut()
+        .find(|record| record.id == attachment_id)
+        .ok_or_else(|| anyhow!("source recording attachment no longer exists"))?;
+    anyhow::ensure!(
+        record.kind == AttachmentKind::Audio
+            && record.sha256 == expected_source_sha256
+            && matches!(
+                record.state,
+                AttachmentState::Staged | AttachmentState::Committed
+            ),
+        "source recording identity or state changed before model-input audio was attached"
+    );
+    let namespace = record
+        .manifest_namespace
+        .as_deref()
+        .ok_or_else(|| anyhow!("source recording has no canonical manifest"))?;
+    let mut manifest = store
+        .get::<AttachmentManifest>(namespace)?
+        .ok_or_else(|| anyhow!("source recording manifest is missing"))?;
+    validate_preview_manifest(record, &manifest)
+        .map_err(|problem| anyhow!("source recording manifest is invalid: {}", problem.message))?;
+    anyhow::ensure!(
+        matches!(manifest.graph.coverage, Coverage::Complete),
+        "source recording graph is incomplete"
+    );
+
+    let input_sha256 = format!("{:x}", Sha256::digest(&wav_bytes));
+    if let Some(existing) = &manifest.inference_audio {
+        let selected = selected_inference_audio_artifact(record, &manifest)
+            .map_err(|blocked| {
+                anyhow!(
+                    "selected model-input audio is invalid: {}",
+                    blocked.blocker.message
+                )
+            })?
+            .ok_or_else(|| anyhow!("selected model-input audio disappeared"))?;
+        if existing.source_sha256 == expected_source_sha256
+            && existing.provenance == provenance
+            && selected.id == existing.artifact_id
+            && media_artifact_blob(selected).is_some_and(|blob| blob.sha256 == input_sha256)
+        {
+            let blob = media_artifact_blob(selected).expect("validated media artifact");
+            let retained = load_verified_object(&store, &manifest.graph, &blob.object_id)?;
+            anyhow::ensure!(retained == wav_bytes, "retained model-input audio changed");
+            return Ok(());
+        }
+        anyhow::bail!("a different model-input WAV is already attached to this recording");
+    }
+
+    let host = attachment_host()?;
+    let provided = ProvidedAttachment::from_bytes(
+        format!("voice-model-input-{attachment_id}.wav"),
+        Some("audio/wav".to_string()),
+        wav_bytes.clone(),
+    );
+    let derived = host.inspect_and_canonicalize(provided).map_err(|error| {
+        anyhow!(
+            "model-input WAV failed canonical validation: {}",
+            error.safe_message
+        )
+    })?;
+    anyhow::ensure!(
+        derived.bundle.validate().is_ok()
+            && derived
+                .receipt
+                .validate_against(&derived.bundle, None)
+                .is_ok()
+            && derived.receipt.policy_fingerprint == manifest.policy_fingerprint
+            && matches!(derived.bundle.graph.coverage, Coverage::Complete),
+        "model-input WAV canonicalization did not produce valid attachment authority"
+    );
+    anyhow::ensure!(
+        derived.bundle.graph.objects.len() == 1 && derived.bundle.graph.edges.is_empty(),
+        "model-input WAV canonicalization produced an unexpected nested graph"
+    );
+    let child_id = derived.bundle.graph.root.clone();
+    anyhow::ensure!(
+        child_id.0 == input_sha256,
+        "model-input WAV hash changed during canonicalization"
+    );
+    let child_artifact = derived
+        .bundle
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            matches!(
+                &artifact.payload,
+                ArtifactPayload::Media { family: MediaFamily::Audio, blob, validation, .. }
+                    if blob.media_type == "audio/wav" && validation.grade.permits_direct_media()
+            )
+        })
+        .ok_or_else(|| anyhow!("model-input WAV has no fully validated audio artifact"))?
+        .clone();
+    anyhow::ensure!(
+        derived.bundle.artifacts.len() == 1,
+        "model-input WAV produced unexpected canonical artifacts"
+    );
+    validate_model_input_wav_metadata(&child_artifact, &wav_bytes, &provenance)?;
+
+    if child_id == manifest.graph.root {
+        let source_artifact_id = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.source == manifest.graph.root
+                    && matches!(
+                        &artifact.payload,
+                        ArtifactPayload::Media { family: MediaFamily::Audio, blob, .. }
+                            if blob.object_id == manifest.graph.root && blob.sha256 == expected_source_sha256
+                    )
+            })
+            .map(|artifact| artifact.id.clone())
+            .ok_or_else(|| anyhow!("source WAV has no validated root audio artifact"))?;
+        manifest.inference_audio = Some(InferenceAudioSelection {
+            source_sha256: expected_source_sha256.to_string(),
+            artifact_id: source_artifact_id,
+            provenance,
+        });
+        store.put(namespace, &manifest)?;
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !manifest
+            .graph
+            .objects
+            .iter()
+            .any(|object| object.id == child_id),
+        "model-input WAV already exists in the source graph without a voice-input binding"
+    );
+
+    let mut graph = manifest.graph.clone();
+    let mut child = derived
+        .bundle
+        .graph
+        .objects
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("model-input WAV graph has no root object"))?;
+    child.first_depth = 1;
+    graph.objects.push(child);
+    graph.edges.push(DerivationEdge {
+        parent: graph.root.clone(),
+        child: Some(child_id.clone()),
+        depth: 1,
+        name: LogicalName::provided("voice-inference-audio.pcm16le-16khz-mono.wav"),
+        transform: TransformProvenance {
+            kind: TransformKind::VoiceInferenceAudio,
+            implementation: "mom_voice_model_input_audio".to_string(),
+            version: INFERENCE_AUDIO_CANONICALIZER_VERSION.to_string(),
+        },
+        declared_uncompressed_bytes: None,
+        compressed_bytes: None,
+        source_range: None,
+        outcome: EdgeOutcome::Derived,
+    });
+    let mut artifact = child_artifact;
+    artifact.processor.name = "mom_voice_model_input_audio".to_string();
+    artifact.processor.version = INFERENCE_AUDIO_CANONICALIZER_VERSION.to_string();
+    // The runtime canonicalizer, not an external parser, established this
+    // transform's relation to the original recording. Keep the independent
+    // payload validator provenance from the attachment host.
+    artifact.source = child_id.clone();
+    let child_artifact_id = artifact.id.clone();
+    graph
+        .objects
+        .iter_mut()
+        .find(|object| object.id == child_id)
+        .expect("just-appended derived object")
+        .artifact_ids = vec![child_artifact_id.clone()];
+    manifest.artifacts.push(artifact);
+    graph.usage.total_derived_bytes = graph
+        .usage
+        .total_derived_bytes
+        .checked_add(u64::try_from(wav_bytes.len())?)
+        .ok_or_else(|| anyhow!("derived audio byte accounting overflow"))?;
+    graph.usage.retained_bytes = graph
+        .usage
+        .retained_bytes
+        .checked_add(u64::try_from(wav_bytes.len())?)
+        .ok_or_else(|| anyhow!("retained audio byte accounting overflow"))?;
+    graph.usage.objects = u32::try_from(graph.objects.len())?;
+    graph.usage.edges = u32::try_from(graph.edges.len())?;
+    graph.usage.entries = graph
+        .usage
+        .entries
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("derived audio entry accounting overflow"))?;
+    graph.usage.deepest_object = graph.usage.deepest_object.max(1);
+    graph.usage.transform_requests = graph
+        .usage
+        .transform_requests
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("derived audio transform accounting overflow"))?;
+    recalculate_artifact_usage(&mut graph, &manifest.artifacts)?;
+    manifest.graph = graph;
+    manifest.inference_audio = Some(InferenceAudioSelection {
+        source_sha256: expected_source_sha256.to_string(),
+        artifact_id: child_artifact_id,
+        provenance,
+    });
+    if let Some(receipt) = manifest.receipt.as_mut() {
+        receipt.usage = manifest.graph.usage.clone();
+        receipt.processor_versions.insert(
+            "mom_voice_model_input_audio".to_string(),
+            INFERENCE_AUDIO_CANONICALIZER_VERSION.to_string(),
+        );
+    } else {
+        anyhow::bail!("source recording predates exact attachment receipts");
+    }
+    record.artifact_count = manifest.artifacts.len();
+    record.canonical_text_bytes = manifest.graph.usage.text_bytes;
+    record.media_objects = manifest.graph.usage.media_objects;
+
+    let mut blobs = BTreeMap::new();
+    for object in &manifest.graph.objects {
+        let bytes = if object.id == child_id {
+            wav_bytes.clone()
+        } else {
+            load_verified_object(&store, &manifest.graph, &object.id)?
+        };
+        blobs.insert(object.id.clone(), Arc::<[u8]>::from(bytes));
+    }
+    let bundle = AttachmentBundle {
+        graph: manifest.graph.clone(),
+        artifacts: manifest.artifacts.clone(),
+        blobs,
+    };
+    bundle
+        .validate()
+        .map_err(|error| anyhow!("derived model-input graph is invalid: {error}"))?;
+    manifest
+        .receipt
+        .as_ref()
+        .expect("receipt checked above")
+        .validate_against(&bundle, None)
+        .map_err(|error| anyhow!("derived model-input receipt is invalid: {error}"))?;
+
+    let manifest_namespace = record
+        .manifest_namespace
+        .clone()
+        .expect("manifest namespace checked above");
+    store.put_documents_atomically(vec![
+        (
+            ATTACHMENTS_NAMESPACE.to_string(),
+            serde_json::to_vec(&attachment_db)?,
+        ),
+        (manifest_namespace, serde_json::to_vec(&manifest)?),
+        (object_namespace(&child_id), wav_bytes),
+    ])?;
+    Ok(())
+}
+
+fn validate_inference_audio_provenance(provenance: &InferenceAudioProvenance) -> Result<()> {
+    anyhow::ensure!(
+        provenance.source_sample_count > 0
+            && provenance.accepted_sample_count > 0
+            && provenance.accepted_sample_count <= provenance.source_sample_count,
+        "inference audio sample counts are invalid"
+    );
+    if let Some(ranges) = &provenance.source_ranges {
+        anyhow::ensure!(
+            !ranges.is_empty(),
+            "inference audio source ranges are empty"
+        );
+        let mut previous_end = 0_u64;
+        let mut accepted = 0_u64;
+        for range in ranges {
+            anyhow::ensure!(
+                range.start < range.end_exclusive
+                    && range.end_exclusive <= provenance.source_sample_count
+                    && range.start >= previous_end,
+                "inference audio source ranges are invalid or overlap"
+            );
+            accepted = accepted
+                .checked_add(range.end_exclusive - range.start)
+                .ok_or_else(|| anyhow!("inference audio source-range length overflow"))?;
+            previous_end = range.end_exclusive;
+        }
+        anyhow::ensure!(
+            accepted == provenance.accepted_sample_count,
+            "inference audio source ranges do not match the accepted sample count"
+        );
+    }
+    Ok(())
+}
+
+fn validate_model_input_wav_metadata(
+    artifact: &CanonicalArtifact,
+    wav_bytes: &[u8],
+    provenance: &InferenceAudioProvenance,
+) -> Result<()> {
+    let ArtifactPayload::Media { blob, metadata, .. } = &artifact.payload else {
+        anyhow::bail!("model-input WAV is not a media artifact");
+    };
+    anyhow::ensure!(
+        metadata.channels == Some(1) && metadata.sample_rate_hz == Some(16_000),
+        "model-input WAV is not mono 16 kHz audio"
+    );
+    // WAV duration metadata may be rounded to milliseconds. A one-ms tolerance
+    // preserves exact sample-count provenance without trusting the duration.
+    let expected_ms = provenance.accepted_sample_count.saturating_mul(1_000) / 16_000;
+    if let Some(actual_ms) = metadata.duration_ms {
+        anyhow::ensure!(
+            actual_ms.abs_diff(expected_ms) <= 1,
+            "model-input WAV duration does not match its accepted sample count"
+        );
+    }
+    anyhow::ensure!(
+        blob.sha256.len() == 64 && blob.byte_len > 44,
+        "model-input WAV blob metadata is invalid"
+    );
+    validate_pcm16le_16khz_mono_wav(wav_bytes, provenance.accepted_sample_count)?;
+    Ok(())
+}
+
+fn validate_pcm16le_16khz_mono_wav(bytes: &[u8], expected_samples: u64) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() >= 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "model-input audio is not a complete RIFF WAV"
+    );
+    let declared_len = u32::from_le_bytes(bytes[4..8].try_into()?) as usize + 8;
+    anyhow::ensure!(
+        declared_len == bytes.len(),
+        "model-input WAV length is not canonical"
+    );
+    let mut offset = 12_usize;
+    let mut format = None;
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut block_align = None;
+    let mut bits_per_sample = None;
+    let mut sample_bytes = None;
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = usize::try_from(u32::from_le_bytes(
+            bytes[offset + 4..offset + 8].try_into()?,
+        ))?;
+        let body = offset
+            .checked_add(8)
+            .ok_or_else(|| anyhow!("model-input WAV chunk offset overflow"))?;
+        let end = body
+            .checked_add(chunk_len)
+            .ok_or_else(|| anyhow!("model-input WAV chunk size overflow"))?;
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "model-input WAV chunk exceeds its RIFF boundary"
+        );
+        if chunk_id == b"fmt " {
+            anyhow::ensure!(chunk_len >= 16, "model-input WAV format chunk is truncated");
+            format = Some(u16::from_le_bytes(bytes[body..body + 2].try_into()?));
+            channels = Some(u16::from_le_bytes(bytes[body + 2..body + 4].try_into()?));
+            sample_rate = Some(u32::from_le_bytes(bytes[body + 4..body + 8].try_into()?));
+            block_align = Some(u16::from_le_bytes(bytes[body + 12..body + 14].try_into()?));
+            bits_per_sample = Some(u16::from_le_bytes(bytes[body + 14..body + 16].try_into()?));
+        } else if chunk_id == b"data" {
+            anyhow::ensure!(
+                sample_bytes.is_none(),
+                "model-input WAV has multiple data chunks"
+            );
+            sample_bytes = Some(chunk_len);
+        }
+        offset = end
+            .checked_add(chunk_len & 1)
+            .ok_or_else(|| anyhow!("model-input WAV chunk padding overflow"))?;
+    }
+    let sample_bytes = sample_bytes.ok_or_else(|| anyhow!("model-input WAV has no data chunk"))?;
+    anyhow::ensure!(
+        format == Some(1)
+            && channels == Some(1)
+            && sample_rate == Some(16_000)
+            && block_align == Some(2)
+            && bits_per_sample == Some(16)
+            && sample_bytes % 2 == 0
+            && u64::try_from(sample_bytes / 2)? == expected_samples,
+        "model-input WAV is not the declared PCM16LE mono 16 kHz sample sequence"
+    );
+    Ok(())
+}
+
+fn media_artifact_blob(artifact: &CanonicalArtifact) -> Option<&attachment_native_types::BlobRef> {
+    match &artifact.payload {
+        ArtifactPayload::Media { blob, .. } => Some(blob),
+        ArtifactPayload::Text { .. } | ArtifactPayload::Opaque { .. } => None,
+    }
+}
+
+fn recalculate_artifact_usage(
+    graph: &mut AttachmentGraph,
+    artifacts: &[CanonicalArtifact],
+) -> Result<()> {
+    let mut text_bytes = 0_u64;
+    let mut media_objects = 0_u32;
+    let mut media_bytes = 0_u64;
+    for artifact in artifacts {
+        match &artifact.payload {
+            ArtifactPayload::Text { text, .. } => {
+                text_bytes = text_bytes
+                    .checked_add(u64::try_from(text.len())?)
+                    .ok_or_else(|| anyhow!("attachment text accounting overflow"))?;
+            }
+            ArtifactPayload::Media { blob, .. } => {
+                media_objects = media_objects
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("attachment media count overflow"))?;
+                media_bytes = media_bytes
+                    .checked_add(blob.byte_len)
+                    .ok_or_else(|| anyhow!("attachment media byte accounting overflow"))?;
+            }
+            ArtifactPayload::Opaque { .. } => {}
+        }
+    }
+    graph.usage.text_bytes = text_bytes;
+    graph.usage.media_objects = media_objects;
+    graph.usage.media_bytes = media_bytes;
+    Ok(())
+}
+
 fn attachment_import_with_identity(
     scope: &crate::OperationScope,
     conversation_id: &str,
@@ -595,6 +1059,7 @@ fn canonical_attachment_record(
         artifacts: canonicalized.bundle.artifacts,
         policy_fingerprint: host.policy_fingerprint().to_string(),
         receipt: Some(canonicalized.receipt),
+        inference_audio: None,
     };
     let blobs = canonicalized
         .bundle
@@ -2228,6 +2693,71 @@ fn validate_preview_manifest(
     Ok(())
 }
 
+fn selected_inference_audio_artifact<'a>(
+    record: &AttachmentRecord,
+    manifest: &'a AttachmentManifest,
+) -> std::result::Result<Option<&'a CanonicalArtifact>, AttachmentContextBlocker> {
+    let Some(selection) = &manifest.inference_audio else {
+        return Ok(None);
+    };
+    let invalid = || {
+        context_blocker(
+            "attachment_inference_audio_invalid",
+            "The selected model-input audio no longer matches its source attachment and derivation record.".into(),
+        )
+    };
+    if selection.source_sha256 != record.sha256
+        || validate_inference_audio_provenance(&selection.provenance).is_err()
+    {
+        return Err(invalid());
+    }
+    let Some(artifact) = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == selection.artifact_id)
+    else {
+        return Err(invalid());
+    };
+    let ArtifactPayload::Media {
+        family,
+        blob,
+        validation,
+        ..
+    } = &artifact.payload
+    else {
+        return Err(invalid());
+    };
+    let child_id = &artifact.source;
+    let source_artifact = child_id == &manifest.graph.root
+        && blob.object_id == manifest.graph.root
+        && blob.sha256 == record.sha256;
+    let has_child = manifest.graph.objects.iter().any(|object| {
+        &object.id == child_id && object.status == attachment_native_types::ObjectStatus::Complete
+    });
+    let has_edge = manifest.graph.edges.iter().any(|edge| {
+        edge.parent == manifest.graph.root
+            && edge.child.as_ref() == Some(child_id)
+            && edge.transform.kind == TransformKind::VoiceInferenceAudio
+            && edge.transform.implementation == "mom_voice_model_input_audio"
+            && edge.transform.version == INFERENCE_AUDIO_CANONICALIZER_VERSION
+            && edge.outcome == EdgeOutcome::Derived
+    });
+    if *family != MediaFamily::Audio
+        || blob.media_type != "audio/wav"
+        || blob.object_id != *child_id
+        || !validation.grade.permits_direct_media()
+        || artifact.processor.policy_fingerprint != manifest.policy_fingerprint
+        || !has_child
+        || (!source_artifact && !has_edge)
+        || (!source_artifact
+            && (artifact.processor.name != "mom_voice_model_input_audio"
+                || artifact.processor.version != INFERENCE_AUDIO_CANONICALIZER_VERSION))
+    {
+        return Err(invalid());
+    }
+    Ok(Some(artifact))
+}
+
 fn exact_preview_authority(
     store: &RuntimeStore,
     anchor: &AttachmentPreviewAnchor,
@@ -2254,6 +2784,19 @@ fn exact_preview_authority(
             "The attachment root or safety policy changed before its preview completed.",
         )));
     }
+    if manifest.inference_audio.as_ref().is_some_and(|selection| {
+        selection.artifact_id.0 == anchor.artifact_id
+            && manifest
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == selection.artifact_id)
+                .is_some_and(|artifact| artifact.source != manifest.graph.root)
+    }) {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_model_input_hidden",
+            "This derived audio is retained only as an internal model-input representation.",
+        )));
+    }
     Ok(Ok(PreviewAuthority { record, manifest }))
 }
 
@@ -2265,6 +2808,11 @@ fn preview_catalog(
     let mut artifacts = manifest
         .artifacts
         .iter()
+        .filter(|artifact| {
+            manifest.inference_audio.as_ref().is_none_or(|selection| {
+                artifact.id != selection.artifact_id || artifact.source == manifest.graph.root
+            })
+        })
         .map(|artifact| preview_artifact(manifest, artifact))
         .collect::<Vec<_>>();
     let preferred_kind = match record.kind {
@@ -3145,6 +3693,14 @@ mod tests {
     const STRUCTURALLY_VALID_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
         fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
         data\x02\x00\x00\x00\x00\x00";
+
+    fn pcm16le_mono_16khz_wav(sample: i16) -> Vec<u8> {
+        let mut bytes = STRUCTURALLY_VALID_WAV.to_vec();
+        bytes[24..28].copy_from_slice(&16_000_u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&32_000_u32.to_le_bytes());
+        bytes[44..46].copy_from_slice(&sample.to_le_bytes());
+        bytes
+    }
     const STRUCTURALLY_VALID_MP4: &[u8] = b"\0\0\0\x10ftypisom\0\0\0\0\0\0\0\x08mdat";
 
     struct TestDataDir {
@@ -3657,6 +4213,7 @@ mod tests {
             artifacts: vec![artifact],
             policy_fingerprint: "fixture".to_string(),
             receipt: None,
+            inference_audio: None,
         };
         let value = canonical_text(&record, &manifest);
         assert!(value.contains("BEGIN UNTRUSTED ATTACHMENT DATA id=attachment-1"));
@@ -5438,6 +5995,277 @@ mod tests {
             .expect("long voice history preparation")
             .expect("transcribed old WAVs must not cap the number of turns");
         assert!(prepared.media.is_empty());
+    }
+
+    #[test]
+    fn exact_model_input_audio_is_a_derived_child_without_rewriting_source_history() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("voice-model-input-child");
+        let source_bytes = STRUCTURALLY_VALID_WAV.to_vec();
+        let model_input_bytes = pcm16le_mono_16khz_wav(1);
+        let attachment = attachment_import_voice_message(&scope, "chat", source_bytes.clone())
+            .expect("import physical voice message")
+            .result
+            .expect("physical voice attachment");
+        let source = attachment.attachment;
+        // Bind the staged source to its committed message as the normal voice
+        // turn commit does, without replacing the retained recording bytes.
+        let store = RuntimeStore::current().expect("store");
+        let mut attachment_db = load_attachment_db().expect("attachment db");
+        let record = attachment_db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == source.id)
+            .expect("source attachment record");
+        record.state = AttachmentState::Committed;
+        record.message_id = "voice-turn".to_string();
+        store
+            .put(ATTACHMENTS_NAMESPACE, &attachment_db)
+            .expect("commit source record");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear staged voice draft");
+        let original_fields = (
+            source.id.clone(),
+            source.sha256.clone(),
+            source.bytes,
+            source.root_object_id.clone(),
+            "voice-turn".to_string(),
+            source.stored_path.clone(),
+        );
+        const VOICE_PROMPT: &str = "[Phone call] Reply naturally in at most two short sentences. No headings, lists, preamble, or extended explanation.";
+        let mut source_message = message("voice-turn", vec![source.id.clone()]);
+        source_message.content = VOICE_PROMPT.to_string();
+        let fallback = prepare_live_audio_history("chat", std::slice::from_ref(&source_message))
+            .expect("resolve source audio without a derivative")
+            .expect("original WAV remains the fallback model input");
+        assert_eq!(fallback.media.len(), 1);
+        assert_eq!(fallback.media[0].bytes, source_bytes);
+
+        let provenance = InferenceAudioProvenance {
+            source_sample_count: 1,
+            accepted_sample_count: 1,
+            source_ranges: Some(vec![InferenceAudioSampleRange {
+                start: 0,
+                end_exclusive: 1,
+            }]),
+        };
+        store_inference_audio_derivative(
+            &source.id,
+            &source.sha256,
+            model_input_bytes.clone(),
+            provenance.clone(),
+        )
+        .expect("persist exact model input as a graph child");
+        store_inference_audio_derivative(
+            &source.id,
+            &source.sha256,
+            model_input_bytes.clone(),
+            provenance,
+        )
+        .expect("identical retry is idempotent");
+
+        let message = source_message;
+        let original_message = message.clone();
+        let prepared = prepare_live_audio_history("chat", std::slice::from_ref(&message))
+            .expect("resolve committed voice history")
+            .expect("valid model-input child");
+        assert_eq!(prepared.media.len(), 1);
+        assert_eq!(prepared.media[0].bytes, model_input_bytes);
+        assert_ne!(prepared.media[0].sha256, source.sha256);
+        let selected_marker = format!("[[native-media:{}]]", prepared.media[0].id);
+        assert_eq!(
+            prepared.text_by_message_id.get("voice-turn"),
+            Some(&selected_marker),
+            "history carries only the model-input placeholder at the source message boundary"
+        );
+        let native_messages = crate::chat::build_native_messages(
+            "system",
+            "",
+            std::slice::from_ref(&message),
+            "",
+            false,
+            &prepared.text_by_message_id,
+            &prepared.current_text,
+        );
+        assert_eq!(native_messages.len(), 3);
+        assert_eq!(native_messages[1].role, llama_native_types::ChatRole::User);
+        let normalized_history_boundary = native_messages[1]
+            .content
+            .replace(&selected_marker, "[[native-media:live-microphone]]");
+        assert_eq!(
+            normalized_history_boundary,
+            format!("{VOICE_PROMPT}\n\n[[native-media:live-microphone]]"),
+            "saved history and the live request must place the same exact audio marker after the voice prompt"
+        );
+        assert_eq!(
+            prepared.media[0].bytes, model_input_bytes,
+            "the equivalent history marker must select the exact archived model-input WAV bytes"
+        );
+        assert_eq!(
+            message, original_message,
+            "model-input selection must not rewrite message content or attachment IDs"
+        );
+        assert_eq!(
+            attachment_bytes(&source.id)
+                .expect("read original source")
+                .as_deref(),
+            Some(source_bytes.as_slice()),
+            "the original physical recording remains intact"
+        );
+
+        let persisted_db = load_attachment_db().expect("updated attachment db");
+        let persisted = persisted_db
+            .attachments
+            .iter()
+            .find(|record| record.id == source.id)
+            .expect("retained source record");
+        assert_eq!(
+            (
+                persisted.id.clone(),
+                persisted.sha256.clone(),
+                persisted.bytes,
+                persisted.root_object_id.clone(),
+                persisted.message_id.clone(),
+                persisted.stored_path.clone(),
+            ),
+            original_fields,
+            "the model-input child must not replace original attachment identity"
+        );
+        let manifest = store
+            .get::<AttachmentManifest>(persisted.manifest_namespace.as_deref().unwrap())
+            .expect("load source manifest")
+            .expect("source manifest");
+        let selected = selected_inference_audio_artifact(persisted, &manifest)
+            .expect("validate selected child")
+            .expect("model-input artifact");
+        assert_eq!(
+            selected.source.0,
+            format!("{:x}", Sha256::digest(&prepared.media[0].bytes))
+        );
+        assert!(manifest.graph.edges.iter().any(|edge| {
+            edge.transform.kind == TransformKind::VoiceInferenceAudio
+                && edge.child.as_ref() == Some(&selected.source)
+                && edge.parent == manifest.graph.root
+        }));
+        assert_eq!(
+            attachment_preview(&source.id)
+                .expect("preview source attachment")
+                .result
+                .expect("source preview")
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.artifact_id == selected.id.0)
+                .count(),
+            0,
+            "the inference-only artifact must not replace or alter the original preview"
+        );
+
+        let mut corrupted = manifest;
+        corrupted
+            .inference_audio
+            .as_mut()
+            .expect("selected model input")
+            .source_sha256 = "0".repeat(64);
+        store
+            .put(persisted.manifest_namespace.as_deref().unwrap(), &corrupted)
+            .expect("corrupt selection for fail-closed assertion");
+        let blocked = prepare_live_audio_history("chat", std::slice::from_ref(&message))
+            .expect("resolve malformed selected model input")
+            .expect_err("an invalid selected derivative must not silently fall back");
+        assert_eq!(blocked.blocker.code, "attachment_inference_audio_invalid");
+    }
+
+    #[test]
+    fn identical_inference_audio_keeps_distinct_message_occurrences() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("voice-model-input-occurrences");
+        let store = RuntimeStore::current().expect("store");
+        let source_a = STRUCTURALLY_VALID_WAV.to_vec();
+        let mut source_b = source_a.clone();
+        *source_b.last_mut().expect("PCM sample") = 2;
+        let model_input = pcm16le_mono_16khz_wav(1);
+
+        let imported_a = attachment_import_voice_message(&scope, "chat", source_a)
+            .expect("import first recording")
+            .result
+            .expect("first recording");
+        let imported_b = attachment_import_voice_message(&scope, "chat", source_b)
+            .expect("import second recording")
+            .result
+            .expect("second recording");
+        let mut db = load_attachment_db().expect("attachment db");
+        for (attachment, message_id) in [
+            (&imported_a.attachment, "voice-turn-a"),
+            (&imported_b.attachment, "voice-turn-b"),
+        ] {
+            let record = db
+                .attachments
+                .iter_mut()
+                .find(|record| record.id == attachment.id)
+                .expect("imported source record");
+            record.state = AttachmentState::Committed;
+            record.message_id = message_id.to_string();
+        }
+        store
+            .put(ATTACHMENTS_NAMESPACE, &db)
+            .expect("commit both source records");
+        store
+            .put(DRAFTS_NAMESPACE, &DraftDb::default())
+            .expect("clear staged voice draft");
+        let provenance = || InferenceAudioProvenance {
+            source_sample_count: 1,
+            accepted_sample_count: 1,
+            source_ranges: Some(vec![InferenceAudioSampleRange {
+                start: 0,
+                end_exclusive: 1,
+            }]),
+        };
+        for attachment in [&imported_a.attachment, &imported_b.attachment] {
+            store_inference_audio_derivative(
+                &attachment.id,
+                &attachment.sha256,
+                model_input.clone(),
+                provenance(),
+            )
+            .expect("store exact selected audio bytes");
+        }
+
+        let first = message("voice-turn-a", vec![imported_a.attachment.id.clone()]);
+        let second = message("voice-turn-b", vec![imported_b.attachment.id.clone()]);
+        let history = [first.clone(), second.clone()];
+        let prepared = prepare_live_audio_history("chat", &history)
+            .expect("prepare two selected recordings")
+            .expect("identical PCM is valid in two message positions");
+        assert_eq!(prepared.media.len(), 2);
+        assert_eq!(prepared.media[0].bytes, model_input);
+        assert_eq!(prepared.media[1].bytes, model_input);
+        assert_ne!(prepared.media[0].id, prepared.media[1].id);
+        for (message, media) in history.iter().zip(&prepared.media) {
+            assert_eq!(
+                prepared.text_by_message_id.get(&message.id),
+                Some(&format!("[[native-media:{}]]", media.id)),
+                "each source turn must bind its own media occurrence exactly once"
+            );
+        }
+
+        // The same attachment can also be cited by more than one saved turn.
+        // Its deterministic per-message IDs preserve both utterance positions.
+        let repeated = [
+            message("voice-repeat-a", vec![imported_a.attachment.id.clone()]),
+            message("voice-repeat-b", vec![imported_a.attachment.id.clone()]),
+        ];
+        let prepared = prepare_live_audio_history("chat", &repeated)
+            .expect("prepare repeated attachment")
+            .expect("both references remain valid");
+        assert_eq!(prepared.media.len(), 2);
+        assert_ne!(prepared.media[0].id, prepared.media[1].id);
+        for (message, media) in repeated.iter().zip(&prepared.media) {
+            assert_eq!(
+                prepared.text_by_message_id.get(&message.id),
+                Some(&format!("[[native-media:{}]]", media.id))
+            );
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::conversation_store::{
 use crate::kv_cache::{
     compatible_cached_prefix_for_owner_with_settings,
     compatible_memory_prefix_for_owner_with_settings, invalidate_cache, invalidate_memory,
-    persist_session_checkpoint,
+    note_committed_session_request, schedule_committed_session_checkpoint,
 };
 use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
@@ -701,6 +701,11 @@ pub fn voice_audio_begin_in_scope(
     )
     .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
     let model_acquire_us = elapsed_us(stage_started);
+    // Keep the live microphone marker at the current user-message boundary.
+    // The stored Message.content remains the user-facing call/note prompt;
+    // later history replaces this placeholder with its verified derived-audio
+    // occurrence at the same boundary, preserving text-prefix identity.
+    let projected_current_message = format!("{message}\n\n[[native-media:live-microphone]]");
     let resident_context_tokens = handle
         .status()
         .fingerprint
@@ -717,7 +722,7 @@ pub fn voice_audio_begin_in_scope(
             settings: &settings,
             system: &system_message,
             skill: &skill_prompt.prompt,
-            current: message,
+            current: &projected_current_message,
             template: ChatTemplateChoice::PreferNonThinking,
             completion_tokens: 96,
             mode: crate::voice_context::VoiceHistoryMode::Live,
@@ -1028,6 +1033,7 @@ where
         &user_message_id,
         attachments.draft_snapshot.as_ref(),
     )?;
+    note_committed_session_request(&prepared.conversation_id, &session.request_id);
     let cache_reused = prefix_cells_reused(&output.metrics.cache);
     let result = ChatSendOutput {
         request_id: session.request_id,
@@ -1254,6 +1260,9 @@ where
         .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
     let model_path = settings.model_path.clone().unwrap_or_default();
     let request_id = Uuid::new_v4().to_string();
+    if !voice_reply && !options.fake_fixture {
+        crate::kv_cache::checkpoint_pending_sessions_before_chat(scope, &conversation.id);
+    }
     let operation = scope.register_chat(&request_id, &conversation.id)?;
     let voice_handle = if voice_reply && !options.fake_fixture {
         match resident_model_for_profile(
@@ -1604,12 +1613,6 @@ where
         if output.state == GenerationState::Cancelled {
             return stream.finish_cancelled();
         }
-        if !phone_call
-            && media.is_empty()
-            && settings.kv_cache_policy.persists_conversation_checkpoints()
-        {
-            let _ = persist_session_checkpoint(&conversation.id, &handle)?;
-        }
         let parsed = parse_reasoning_output(&output.text, parse_reasoning);
         (
             strip_reserved_attribution_prefix(&parsed.content),
@@ -1713,6 +1716,10 @@ where
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
     )?;
+    note_committed_session_request(&conversation.id, &request_id);
+    if !voice_reply {
+        schedule_committed_session_checkpoint(scope, &conversation.id, &request_id);
+    }
     let result = ChatSendOutput {
         request_id: request_id.clone(),
         conversation_id: conversation.id,
@@ -2353,6 +2360,7 @@ mod tests {
                     token_count: tokens,
                     bytes: vec![1].into(),
                     token_ids: vec![1; tokens],
+                    cells: Vec::new(),
                 },
             )
         };

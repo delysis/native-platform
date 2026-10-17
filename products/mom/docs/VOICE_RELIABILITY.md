@@ -7,6 +7,13 @@ declaration. Each local gate, candidate build, and device run applies only to
 the exact source SHA and tree recorded in its receipt or manifest; a later
 receipt supersedes an earlier one only for its own exact identity.
 
+The 244/244 frontend result and Rust counts below predate the current
+uncommitted live-audio derivative, pre-call checkpoint, and shutdown-flush
+integration changes. The latest candidate attempt is not valid for this tree.
+Do not treat those historical focused checks as validation of the current
+checkout; the current consolidated gate and a new package receipt must bind the
+final clean source/tree identity before promotion.
+
 The M4 Max runtime evidence below covers bounded voice-history rollover with
 synthetic input. Under a manual 21,845 MiB memory budget, the initial
 8,192-token setting resolved to 18,944 native context cells in that run. It is
@@ -52,7 +59,12 @@ history: pending audio stays present until an exact transcript is committed.
 Empty archival transcription is an observed skip, retaining the recording for
 later recovery; source, backend and durable-commit failures remain errors.
 The initial speculative reply pause is now 350 ms, while interruption onset
-remains independent and responsive. All streamed speech segments preserve an
+remains independent and responsive. An uncalibrated call initially buffers audio;
+a complete first segment may release playback when measured production RTF is
+at most 0.85, it holds at least one second and twice the measured startup/refill
+runway, and no excessive jitter or underrun has been observed. Slow, short or
+unknown probes retain complete-reply buffering. Previously slow producers still
+require two healthy segments to recover. No first-packet-only probe is used. All streamed speech segments preserve an
 incomplete final word until another token or end-of-stream establishes it.
 
 Qualification also exposed a process failure: attaching a UI tool to an exited
@@ -129,7 +141,14 @@ worker-owned resident prefixes without inventing serialized cache metadata. The
 real Gemma 4 12B prefix receipt below verifies repeat preparation reused 11
 resident tokens and retained the existing restore/replay checks; a packaged
 call still needs request-scoped filesystem evidence for the no-disk-I/O
-boundary. No automatic full-conversation KV checkpoint at hangup is claimed.
+boundary. Hangup now requests a conversation-scoped checkpoint without waiting
+on the UI path, and graceful shutdown flushes eligible committed checkpoints
+after work drain but before native teardown. A per-call opaque activity ID is
+registered before microphone/model setup and remains active until call-owned
+stop acknowledgements settle; a matching-ID clear precedes the hangup
+checkpoint. Active calls suppress idle persistence, and graceful shutdown
+clears remaining IDs only after work drain. These paths are source-level
+implementation until the focused tests and a package receipt verify them.
 
 The optional staged Parakeet transcription tap remains bounded to 40,960
 samples (2.56 s at 16 kHz), including in-flight audio; it is not a live ASR
@@ -137,7 +156,33 @@ fan-out on the Gemma microphone path. A live call sends microphone PCM through
 the bounded Gemma prefill queue, with the saved recording retained as recovery
 source. Overflow and stalled native acknowledgements fail explicitly. Deferred
 PCM replay is tested for exactly-once delivery, including chunks received
-during an asynchronous drain. The saved recording remains authoritative.
+during an asynchronous drain. The full physical recording remains the original
+attachment and recovery source; selected derived audio can represent the exact
+PCM sent to live inference.
+
+## Live audio and retained inference input
+
+For a browser-captured voice turn, the complete physical microphone recording
+remains the original attachment and is not rewritten. Samples accepted by live
+Gemma prefill are quantized to canonical PCM16 before native submission; a
+successful commit may retain those exact accepted samples as a
+`VoiceInferenceAudio` derived artifact with its source range and canonicalizer
+version. This preserves live-to-history media identity while keeping the full
+physical capture available for playback and recovery. The live request and
+selected derived history append their `native-media` placeholder at the same
+current-user message boundary; the placeholder is projected into inference,
+not stored in visible message content.
+
+Speculative cancellation truncates the accepted-sample ledger to the native
+resume checkpoint before replaying the source suffix. A focused Node test
+verifies byte-identical PCM16 samples across that reconstruction and rejects a
+mismatched sample count; the runtime abort test verifies that a cancelled
+speculation releases no recording for import. If derivative metadata is invalid
+or persistence fails, the original physical attachment still commits. The
+runtime emits structured `model_input_derivative_unavailable` reason data,
+leaves the derived artifact unlinked, and history falls back to the original
+audio path. Such a fallback must not be reported as a live-prefix/cache hit.
+Rust integration and packaged confirmation for this new path remain pending.
 
 ## Evidence history and limitations
 
@@ -164,8 +209,9 @@ attempt lacked its model environment and is retained separately as
 
 The old `/tmp/mom-live-parakeet-app.log` names a development data identity but
 does not bind the executable, bundle digest, or source commit. It is diagnostic
-context only. No release app has been launched for this qualification. No
-paired baseline/ABBA comparison has been performed; `97e6e459` remains a
+context only. A release candidate was launched, but the first attempt failed
+process/data-directory identity verification and is not acceptance evidence.
+No paired baseline/ABBA comparison has been performed; `97e6e459` remains a
 comparison candidate, not an established release baseline.
 
 The encrypted-cache restart receipt is correctness evidence, not an application
@@ -204,6 +250,16 @@ The candidate builder requires the passing summary for the exact clean source
 tree, verifies source identity before and after packaging, and writes a
 per-file SHA-256 manifest. It does not install or launch the app. The exact
 candidate must then be identified before any device run.
+
+For every packaged run, keep the exact candidate executable in a foreground
+terminal session, verify its PID and SHA-256 against the manifest before CUA
+attaches, and confirm that the same PID has the expected isolated
+`runtime.sqlite3` open. Recheck PID identity after attachment because app
+selection can auto-launch after process exit. A configured memory budget or
+settings receipt without that live process/store binding does not establish an
+isolated run. A package is not promoted from a build or source test alone:
+retain the exact clean-tree gate, manifest, effective settings/store identity,
+request traces, playback evidence, failed runs, and explicit hardware limits.
 
 Packaged qualification must record the app and executable paths and hashes,
 bundle identity/version, commit and dirty state, OS/build, Mac model/RAM,

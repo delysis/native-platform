@@ -1,5 +1,7 @@
 use crate::config::{KvCachePolicy, Settings, resolve_settings, upstream_setting_string};
-use crate::native_runtime::{clear_native_prefix_cache, resident_model};
+use crate::native_runtime::{
+    clear_native_prefix_cache, resident_model, resident_model_for_profile_if_loaded,
+};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::load_skill_db;
@@ -14,22 +16,23 @@ use llama_native_engine::NativeModelHandle;
 use llama_native_types::{
     BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, GenerationInput, GenerationRequest,
     GenerationState, NativeErrorCode, PromptForm, PromptTokenPolicy, SamplingConfig,
-    SequenceStateBlob, SharedPrefixBatchRequest,
+    SequenceStateBlob, SequenceStateCell, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const KV_CACHE_NAMESPACE: &str = "kv-cache.v3";
 const KV_CACHE_BLOB_PREFIX: &str = "kv-cache.v3.blob.";
 const DEFAULT_MEMORY_CACHE_BYTES: usize = 512 * 1024 * 1024;
-const DEFAULT_PERSISTENT_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const MAX_PERSISTENT_ENTRY_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const DEFAULT_PERSISTENT_CACHE_BYTES: usize = 64 * 1024 * 1024 * 1024;
 // SQLite limits individual values; keep encryption scratch bounded as well.
 const CACHE_BLOB_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_PERSISTENT_CACHE_ENTRIES: usize = 64;
-const AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const BUILTIN_CACHE_OWNER: &str = "builtin:kind-local-assistant";
 const BUILTIN_CACHE_PROMPT: &str =
     "You are a kind, concise local assistant. Answer clearly and acknowledge uncertainty.";
@@ -156,6 +159,109 @@ impl MemoryCacheState {
 }
 
 static MEMORY_CACHE: OnceLock<Mutex<MemoryCacheState>> = OnceLock::new();
+static COMMITTED_SESSION_REQUESTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static SESSION_CHECKPOINT_SCHEDULER: OnceLock<Arc<SessionCheckpointScheduler>> = OnceLock::new();
+
+struct ScheduledSessionCheckpoint {
+    scope: crate::OperationScope,
+    request_id: String,
+    deadline: Instant,
+}
+
+struct SessionCheckpointScheduler {
+    pending: Mutex<HashMap<String, ScheduledSessionCheckpoint>>,
+    wake: Condvar,
+}
+
+pub(crate) fn note_committed_session_request(conversation_id: &str, request_id: &str) {
+    let requests = COMMITTED_SESSION_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut requests) = requests.lock() {
+        requests.insert(conversation_id.to_owned(), request_id.to_owned());
+    }
+}
+
+/// Debounce text-session persistence until there has been a short idle window.
+/// The registry retains the committed request even when this bounded queue is
+/// full or foreground work preempts the snapshot, so hangup/shutdown can retry.
+pub(crate) fn schedule_committed_session_checkpoint(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    request_id: &str,
+) {
+    const MAX_PENDING_CHECKPOINTS: usize = 64;
+    let scheduler = SESSION_CHECKPOINT_SCHEDULER.get_or_init(|| {
+        let scheduler = Arc::new(SessionCheckpointScheduler {
+            pending: Mutex::new(HashMap::new()),
+            wake: Condvar::new(),
+        });
+        let worker = Arc::clone(&scheduler);
+        let _ = std::thread::Builder::new()
+            .name("mom-session-checkpoint-idle".to_owned())
+            .spawn(move || session_checkpoint_worker(worker));
+        scheduler
+    });
+    if let Ok(mut pending) = scheduler.pending.lock() {
+        if !pending.contains_key(conversation_id) && pending.len() >= MAX_PENDING_CHECKPOINTS {
+            return;
+        }
+        pending.insert(
+            conversation_id.to_owned(),
+            ScheduledSessionCheckpoint {
+                scope: scope.clone(),
+                request_id: request_id.to_owned(),
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        scheduler.wake.notify_one();
+    }
+}
+
+fn session_checkpoint_worker(scheduler: Arc<SessionCheckpointScheduler>) {
+    loop {
+        let due = {
+            let Ok(mut pending) = scheduler.pending.lock() else {
+                return;
+            };
+            loop {
+                if pending.is_empty() {
+                    let Ok(next) = scheduler.wake.wait(pending) else {
+                        return;
+                    };
+                    pending = next;
+                    continue;
+                }
+                let next_deadline = pending
+                    .values()
+                    .map(|entry| entry.deadline)
+                    .min()
+                    .unwrap_or_else(Instant::now);
+                let now = Instant::now();
+                if next_deadline > now {
+                    let Ok((next, _)) = scheduler.wake.wait_timeout(pending, next_deadline - now)
+                    else {
+                        return;
+                    };
+                    pending = next;
+                    continue;
+                }
+                let key = pending
+                    .iter()
+                    .filter(|(_, value)| value.deadline <= now)
+                    .min_by_key(|(_, value)| value.deadline)
+                    .map(|(key, _)| key.clone());
+                break key.and_then(|key| pending.remove(&key).map(|entry| (key, entry)));
+            }
+        };
+        let Some((conversation_id, scheduled)) = due else {
+            continue;
+        };
+        let _ = checkpoint_committed_session_request(
+            &scheduled.scope,
+            &conversation_id,
+            Some(&scheduled.request_id),
+        );
+    }
+}
 
 fn memory_cache() -> &'static Mutex<MemoryCacheState> {
     MEMORY_CACHE.get_or_init(|| Mutex::new(MemoryCacheState::new()))
@@ -437,6 +543,7 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ),
         ));
     };
+    let session_owner_id = persona.id.clone();
     if let Some(source) = persona.source_conversation_id.as_ref().and_then(|id| {
         conversations
             .conversations
@@ -467,12 +574,36 @@ pub fn kv_cache_prepare_voice_persona_resident(
             ));
         }
     };
+    let fingerprint = cache_fingerprint(&handle)?;
+    if let Some(metadata) = restore_latest_session_checkpoint_if_needed(
+        &settings,
+        &handle,
+        &fingerprint,
+        &session_owner_id,
+    )? {
+        return Ok(CommandResult::passed(
+            operation,
+            "prompt_smoke_verified",
+            VoicePersonaPrefixPreparation {
+                resident_prefix_tokens: metadata.cells.len().max(metadata.token_ids.len()),
+                metadata: Some(metadata),
+                prefill_us: 0,
+                verification_us: 0,
+                persistence_us: 0,
+                promotion_us: 0,
+                persisted: true,
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        ));
+    }
     let messages = stable_persona_prompt_messages(&settings, &persona)?;
     let template = ChatTemplateChoice::PreferNonThinking;
     // First-run setup and the webview can both request launch warming. A
     // matching worker-owned state is already evaluated; exporting it again
     // merely serialized seconds of duplicate work onto call pickup.
-    let fingerprint = cache_fingerprint(&handle)?;
     let tokenized = handle
         .tokenize_messages_with_template(messages.clone(), template.clone())
         .map_err(|error| anyhow!(error))?;
@@ -931,6 +1062,85 @@ pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvC
     ))
 }
 
+fn restore_latest_session_checkpoint_if_needed(
+    settings: &Settings,
+    handle: &NativeModelHandle,
+    fingerprint: &CacheFingerprint,
+    conversation_id: &str,
+) -> Result<Option<PrefixCacheMetadata>> {
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let db = store
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(metadata) =
+        latest_session_checkpoint(&db.entries, fingerprint, conversation_id).cloned()
+    else {
+        return Ok(None);
+    };
+
+    let resident_cells = if metadata.cells.is_empty() {
+        metadata
+            .token_ids
+            .iter()
+            .copied()
+            .map(SequenceStateCell::Text)
+            .collect()
+    } else {
+        metadata.cells.clone()
+    };
+    if handle
+        .resident_conversation_covers_cells(resident_cells)
+        .map_err(|error| anyhow!(error))?
+    {
+        return Ok(Some(metadata));
+    }
+
+    let Some(lease) = MomCachePromotionLease::acquire(&store, Some(conversation_id))? else {
+        return Ok(None);
+    };
+    let Some(current) = load_current_persistent_value(&store, &metadata.id, handle)? else {
+        return Ok(None);
+    };
+    // Load the large encrypted payload once. `load_current_persistent_value`
+    // validates it against the current metadata and invalidates malformed
+    // entries; this comparison then ensures the selected checkpoint did not
+    // change between the initial selection and the payload read.
+    if !same_cache_authority(&current.metadata, &metadata) {
+        return Ok(None);
+    }
+    let Some(value) = touch_persistent_value_for_promotion(&store, &current, now_ms())? else {
+        return Ok(None);
+    };
+    let kind = handle
+        .restore_sequence(value.sequence.clone(), 0)
+        .map_err(|error| anyhow!(error))?;
+    if kind != llama_native_types::SequenceRestoreKind::NativeState {
+        anyhow::bail!("session checkpoint did not restore authenticated native KV state");
+    }
+    let restored = value.metadata.clone();
+    if !lease.promote(value)? && !lease.current_for(Some(conversation_id))? {
+        anyhow::bail!("session checkpoint owner changed during native restore");
+    }
+    Ok(Some(restored))
+}
+
+fn latest_session_checkpoint<'a>(
+    entries: &'a [PrefixCacheMetadata],
+    fingerprint: &CacheFingerprint,
+    conversation_id: &str,
+) -> Option<&'a PrefixCacheMetadata> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.state == CacheEntryState::Ready
+                && entry.tier == CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(conversation_id)
+                && &entry.fingerprint == fingerprint
+                && (!entry.cells.is_empty() || !entry.token_ids.is_empty())
+        })
+        .max_by_key(|entry| (entry.last_used_at_ms, entry.created_at_ms))
+}
+
 fn compatible_cached_prefix_for_owner(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
@@ -961,7 +1171,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(handle)?;
+    let fingerprint = cache_fingerprint(&handle)?;
     let tokenized = handle
         .tokenize_messages_with_template(messages.to_vec(), template.clone())
         .map_err(|error| anyhow!(error))?;
@@ -1064,7 +1274,7 @@ pub(crate) fn compatible_memory_prefix_for_owner_with_settings(
     if messages.is_empty() || !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(handle)?;
+    let fingerprint = cache_fingerprint(&handle)?;
     let tokenized = handle
         .tokenize_messages_with_template(messages.to_vec(), template)
         .map_err(|error| anyhow!(error))?;
@@ -1159,25 +1369,207 @@ pub(crate) fn ensure_persona_prefix(
     Ok(None)
 }
 
-pub fn persist_session_checkpoint(
+pub fn kv_cache_checkpoint_committed_voice_session(
+    scope: &crate::OperationScope,
     conversation_id: &str,
-    handle: &NativeModelHandle,
 ) -> Result<Option<String>> {
-    let settings = resolve_settings()?;
+    checkpoint_committed_session_request(scope, conversation_id, None)
+}
+
+/// Best-effort checkpoint of other committed conversations before an
+/// ordinary chat request can replace their resident request authority.
+pub(crate) fn checkpoint_pending_sessions_before_chat(
+    scope: &crate::OperationScope,
+    incoming_conversation_id: &str,
+) {
+    if scope.has_active_voice_call() {
+        return;
+    }
+    let requests = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|requests| {
+            pending_session_checkpoint_candidates(&requests, Some(incoming_conversation_id))
+        })
+        .unwrap_or_default();
+    for (conversation_id, request_id) in requests {
+        if let Err(error) =
+            checkpoint_committed_session_request(scope, &conversation_id, Some(&request_id))
+        {
+            eprintln!(
+                "Unable to checkpoint committed conversation {conversation_id} before chat: {error:#}"
+            );
+        }
+    }
+}
+
+/// Capture a conversation using its current frozen profile before that profile
+/// is changed. Cache failures are diagnostic only; model selection remains
+/// available and the pending checkpoint is still eligible for later retry.
+pub(crate) fn checkpoint_session_before_profile_change(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+) {
+    if scope.has_active_voice_call() {
+        return;
+    }
+    if let Err(error) = checkpoint_committed_session_request(scope, conversation_id, None) {
+        eprintln!(
+            "Unable to checkpoint committed conversation {conversation_id} before profile change: {error:#}"
+        );
+    }
+}
+
+pub fn kv_cache_set_voice_call_activity(
+    scope: &crate::OperationScope,
+    session_id: &str,
+    active: bool,
+) -> Result<()> {
+    scope
+        .set_voice_call_activity(session_id, active)
+        .map_err(|error| anyhow!("Unable to update voice call activity: {error:#}"))?;
+    if !active && !scope.has_active_voice_call() {
+        reschedule_committed_session_checkpoints(scope);
+    }
+    Ok(())
+}
+
+fn reschedule_committed_session_checkpoints(scope: &crate::OperationScope) {
+    let requests = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|requests| {
+            requests
+                .iter()
+                .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (conversation_id, request_id) in requests {
+        schedule_committed_session_checkpoint(scope, &conversation_id, &request_id);
+    }
+}
+
+fn pending_session_checkpoint_candidates(
+    requests: &HashMap<String, String>,
+    excluded_conversation_id: Option<&str>,
+) -> Vec<(String, String)> {
+    requests
+        .iter()
+        .filter(|(conversation_id, _)| Some(conversation_id.as_str()) != excluded_conversation_id)
+        .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
+        .collect()
+}
+
+/// Persist every latest committed request the resident worker still owns.
+/// Call from graceful shutdown after operation cancellation/drain and before
+/// native model teardown. Ineligible or over-budget entries remain registered
+/// only for this process and are safely skipped.
+pub fn flush_committed_session_checkpoints(scope: &crate::OperationScope) -> Result<usize> {
+    // Graceful shutdown reaches this only after application work and model
+    // supervisors drain. Clearing the lifecycle markers here lets the final
+    // exact-committed snapshots proceed before native teardown.
+    scope
+        .clear_voice_call_activity()
+        .map_err(|error| anyhow!("Unable to clear voice call activity at shutdown: {error:#}"))?;
+    let requests = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
+        .iter()
+        .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
+        .collect::<Vec<_>>();
+    let mut persisted = 0;
+    let mut first_error = None;
+    for (conversation_id, request_id) in requests {
+        match checkpoint_committed_session_request(scope, &conversation_id, Some(&request_id)) {
+            Ok(Some(_)) => persisted += 1,
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(anyhow!(
+            "one or more committed session checkpoints failed after {persisted} saves: {error:#}"
+        ));
+    }
+    Ok(persisted)
+}
+
+fn checkpoint_committed_session_request(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    expected_request_id: Option<&str>,
+) -> Result<Option<String>> {
+    if scope.has_active_voice_call() {
+        return Ok(None);
+    }
+    let mut settings = resolve_settings()?;
     if !settings.kv_cache_policy.persists_conversation_checkpoints() {
         return Ok(None);
     }
-    let Some(state) = handle
-        .snapshot_sequence_if_fits(0, AUTOMATIC_PERSONA_PERSISTENCE_LIMIT_BYTES)
-        .map_err(|error| anyhow!(error))?
+    if scope
+        .current_chat_request_id(conversation_id, true)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let request_id = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("Committed voice-session checkpoint registry is unavailable"))?
+        .get(conversation_id)
+        .cloned();
+    let Some(request_id) = request_id else {
+        return Ok(None);
+    };
+    if expected_request_id.is_some_and(|expected| expected != request_id) {
+        return Ok(None);
+    }
+    let conversations = crate::conversation_store::load_db_with_settings(&settings)?;
+    let Some(conversation) = conversations
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == conversation_id)
     else {
         return Ok(None);
     };
-    if state.token_ids.is_empty() || state.bytes.is_empty() {
+    crate::chat::apply_conversation_model_pair(
+        &mut settings,
+        conversation.execution_profile.model_path.clone(),
+        conversation.selected_model_path.clone(),
+        conversation.execution_profile.mmproj_path.clone(),
+    );
+    let Some(model_path) = settings.model_path.clone() else {
+        return Ok(None);
+    };
+    let Some(handle) = resident_model_for_profile_if_loaded(
+        scope,
+        &settings,
+        &model_path,
+        settings.mmproj_path.as_deref(),
+    )
+    .map_err(|blocked| anyhow!(blocked.blocker.message))?
+    else {
+        return Ok(None);
+    };
+    let Some(state) = scope
+        .with_idle_voice_checkpoint(|| {
+            handle
+                .snapshot_conversation_for_request_if_fits(&request_id, MAX_PERSISTENT_ENTRY_BYTES)
+                .map_err(|error| anyhow!(error))
+        })?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    if (state.token_ids.is_empty() && state.cells.is_empty()) || state.bytes.is_empty() {
         return Ok(None);
     }
-    let fingerprint = cache_fingerprint(handle)?;
-    let metadata = PrefixCacheMetadata::new(
+    let fingerprint = cache_fingerprint(&handle)?;
+    let mut metadata = PrefixCacheMetadata::new(
         Uuid::new_v4().to_string(),
         CacheTier::SessionPersistent,
         fingerprint,
@@ -1187,6 +1579,7 @@ pub fn persist_session_checkpoint(
     )
     .with_owner(conversation_id)
     .with_label(format!("Conversation {conversation_id}"));
+    metadata.cells.clone_from(&state.cells);
     let value = PrefixCacheValue {
         metadata,
         sequence: state,
@@ -1197,6 +1590,13 @@ pub fn persist_session_checkpoint(
     let promoted = persist_value(&settings, &value)?;
     if !promoted {
         return Ok(None);
+    }
+    if let Ok(mut requests) = COMMITTED_SESSION_REQUESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        && requests.get(conversation_id) == Some(&request_id)
+    {
+        requests.remove(conversation_id);
     }
     Ok(Some(value.metadata.id))
 }
@@ -1516,6 +1916,10 @@ fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<bool> 
     persist_value_with_promotion_hook(&store, value, || {})
 }
 
+fn persistent_entry_fits(bytes: usize) -> bool {
+    bytes > 0 && bytes <= MAX_PERSISTENT_ENTRY_BYTES
+}
+
 fn persist_value_with_promotion_hook(
     store: &RuntimeStore,
     value: &PrefixCacheValue,
@@ -1553,6 +1957,11 @@ fn persist_value_to_store(
     if !value.is_valid() {
         return Err(anyhow!(
             "refusing to persist an invalid native prefix cache"
+        ));
+    }
+    if !persistent_entry_fits(value.metadata.state_bytes) {
+        return Err(anyhow!(
+            "native prefix state exceeds the per-entry persistent cache limit"
         ));
     }
     if value.metadata.state_bytes > max_bytes {
@@ -1688,6 +2097,10 @@ fn load_persistent_value_or_invalidate_from_store(
         invalidate_persistent_entry_in_store(store, &metadata.id)?;
         return Ok(None);
     };
+    if reconstruction.token_replay_allowed != metadata.cells.is_empty() {
+        invalidate_persistent_entry_in_store(store, &metadata.id)?;
+        return Ok(None);
+    }
     // Authenticated exports survive worker/process restart. Their full
     // bytes must reach the engine's signature and fingerprint check; replacing
     // them with token replay here destroyed the durable KV cache on launch.
@@ -1697,6 +2110,10 @@ fn load_persistent_value_or_invalidate_from_store(
             invalidate_persistent_entry_in_store(store, &metadata.id)?;
             return Ok(None);
         };
+        if !persistent_entry_fits(value.metadata.state_bytes) {
+            invalidate_persistent_entry_in_store(store, &metadata.id)?;
+            return Ok(None);
+        }
         return store.mutate_documents(KV_CACHE_NAMESPACE, KvCacheDb::default, |db, documents| {
             if let Some(owner_id) = metadata.owner_id.as_deref()
                 && crate::personas::persona_cache_owner_is_removed_from_documents(
@@ -1726,9 +2143,14 @@ fn load_persistent_value_or_invalidate_from_store(
             metadata: metadata.clone(),
             sequence: SequenceStateBlob {
                 sequence_id: reconstruction.sequence_id,
-                token_count: metadata.token_ids.len(),
+                token_count: if metadata.cells.is_empty() {
+                    metadata.token_ids.len()
+                } else {
+                    metadata.cells.len()
+                },
                 bytes: bytes.into(),
                 token_ids: metadata.token_ids.clone(),
+                cells: metadata.cells.clone(),
             },
         },
         Ok(None) | Err(_) => {
@@ -1803,9 +2225,11 @@ fn same_cache_authority(left: &PrefixCacheMetadata, right: &PrefixCacheMetadata)
         && left.fingerprint == right.fingerprint
         && left.token_ids == right.token_ids
         && left.token_sha256 == right.token_sha256
+        && left.cells == right.cells
         && left.state_bytes == right.state_bytes
         && left.created_at_ms == right.created_at_ms
         && left.state == right.state
+        && left.reconstruction == right.reconstruction
 }
 
 fn invalidate_persistent_entry(settings: &Settings, cache_id: &str) -> Result<()> {
@@ -1980,6 +2404,11 @@ fn write_cache_bytes(
     id: &str,
     bytes: &[u8],
 ) -> Result<()> {
+    if !persistent_entry_fits(bytes.len()) {
+        return Err(anyhow!(
+            "native prefix state exceeds the per-entry persistent cache limit"
+        ));
+    }
     for (index, chunk) in bytes.chunks(CACHE_BLOB_CHUNK_BYTES).enumerate() {
         documents.put_bytes_streamed(&blob_chunk_namespace(id, index), chunk)?;
     }
@@ -1993,7 +2422,7 @@ fn delete_cache_bytes(
     // Invalid metadata must never create an unbounded cleanup loop.
     let chunks = metadata
         .state_bytes
-        .min(DEFAULT_PERSISTENT_CACHE_BYTES)
+        .min(MAX_PERSISTENT_ENTRY_BYTES)
         .div_ceil(CACHE_BLOB_CHUNK_BYTES)
         .max(1);
     for index in 0..chunks {
@@ -2005,7 +2434,7 @@ fn read_cache_bytes(
     store: &RuntimeStore,
     metadata: &PrefixCacheMetadata,
 ) -> Result<Option<Vec<u8>>> {
-    if metadata.state_bytes == 0 || metadata.state_bytes > DEFAULT_PERSISTENT_CACHE_BYTES {
+    if !persistent_entry_fits(metadata.state_bytes) {
         return Ok(None);
     }
     store.read_documents(|snapshot| {
@@ -2098,8 +2527,79 @@ mod tests {
                 token_count: 1,
                 bytes: (vec![1]).into(),
                 token_ids: vec![1],
+                cells: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn session_checkpoint_selection_is_latest_ready_exact_owner_and_profile() {
+        let base = test_cache_value("base", "model-a").metadata;
+        let fingerprint = base.fingerprint.clone();
+        let mut older = base.clone();
+        older.tier = CacheTier::SessionPersistent;
+        older.owner_id = Some("conversation-a".to_owned());
+        older.last_used_at_ms = 2;
+        older.created_at_ms = 1;
+        let mut latest = older.clone();
+        latest.id = "latest".to_owned();
+        latest.last_used_at_ms = 3;
+        latest.created_at_ms = 2;
+        let mut foreign = latest.clone();
+        foreign.id = "foreign".to_owned();
+        foreign.owner_id = Some("conversation-b".to_owned());
+        foreign.last_used_at_ms = u128::MAX;
+        let mut wrong_profile = latest.clone();
+        wrong_profile.id = "wrong-profile".to_owned();
+        wrong_profile.fingerprint.model_sha256 = "model-b".to_owned();
+        wrong_profile.last_used_at_ms = u128::MAX;
+        let mut invalid = latest.clone();
+        invalid.id = "invalid".to_owned();
+        invalid.state = CacheEntryState::Invalidated;
+        invalid.last_used_at_ms = u128::MAX;
+
+        let entries = [older, latest.clone(), foreign, wrong_profile, invalid];
+        let selected = latest_session_checkpoint(&entries, &fingerprint, "conversation-a");
+        assert_eq!(selected.map(|entry| entry.id.as_str()), Some("latest"));
+    }
+
+    #[test]
+    fn cache_authority_includes_mixed_cells_and_reconstruction() {
+        let mut value = test_cache_value("authority", "model");
+        value.bind_reconstruction();
+        let metadata = value.metadata;
+
+        let mut changed_cells = metadata.clone();
+        changed_cells.cells = vec![SequenceStateCell::AudioFrame { digest: [7; 32] }];
+        assert!(!same_cache_authority(&metadata, &changed_cells));
+
+        let mut changed_reconstruction = metadata.clone();
+        changed_reconstruction
+            .reconstruction
+            .as_mut()
+            .expect("test value has native reconstruction")
+            .header
+            .push(0);
+        assert!(!same_cache_authority(&metadata, &changed_reconstruction));
+        assert!(same_cache_authority(&metadata, &metadata.clone()));
+    }
+
+    #[test]
+    fn pre_chat_checkpoint_candidates_exclude_only_the_incoming_conversation() {
+        let requests = HashMap::from([
+            ("incoming".to_owned(), "request-a".to_owned()),
+            ("older-one".to_owned(), "request-b".to_owned()),
+            ("older-two".to_owned(), "request-c".to_owned()),
+        ]);
+        let candidates = pending_session_checkpoint_candidates(&requests, Some("incoming"));
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&("older-one".to_owned(), "request-b".to_owned())));
+        assert!(candidates.contains(&("older-two".to_owned(), "request-c".to_owned())));
+        assert!(
+            !candidates
+                .iter()
+                .any(|(conversation_id, _)| conversation_id == "incoming")
+        );
     }
 
     #[test]
@@ -2285,6 +2785,7 @@ mod tests {
                     token_count: token_ids.len(),
                     bytes: vec![1].into(),
                     token_ids,
+                    cells: Vec::new(),
                 },
             }
         };
@@ -2503,6 +3004,31 @@ mod tests {
         assert_eq!(count_evicted, vec!["invalid", "oldest"]);
         let byte_evicted = persistent_eviction_ids(&entries, "new", 10, 8);
         assert_eq!(byte_evicted, vec!["invalid", "oldest"]);
+    }
+
+    #[test]
+    fn persistent_budget_holds_multiple_full_sessions_with_per_entry_cap() {
+        let entries = (0..8)
+            .map(|index| {
+                let mut metadata = test_cache_value(&format!("session-{index}"), "model").metadata;
+                metadata.tier = CacheTier::SessionPersistent;
+                metadata.state_bytes = MAX_PERSISTENT_ENTRY_BYTES;
+                metadata
+            })
+            .collect::<Vec<_>>();
+
+        assert!(persistent_entry_fits(MAX_PERSISTENT_ENTRY_BYTES));
+        assert!(!persistent_entry_fits(MAX_PERSISTENT_ENTRY_BYTES + 1));
+        assert!(DEFAULT_PERSISTENT_CACHE_BYTES >= 8 * MAX_PERSISTENT_ENTRY_BYTES);
+        assert!(
+            persistent_eviction_ids(
+                &entries,
+                "session-7",
+                DEFAULT_PERSISTENT_CACHE_ENTRIES,
+                DEFAULT_PERSISTENT_CACHE_BYTES,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

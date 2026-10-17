@@ -287,21 +287,51 @@ test("complete buffering recovers only after healthy segments and survives reply
   assert.equal(recoveredReply.shouldBufferCompleteReply(), false);
 });
 
-test("an uncalibrated first call buffers once, then healthy cadence restores streaming", () => {
+test("a cold-call probe releases only for a complete, clearly healthy segment", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
-  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true\s*\}/);
+  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
 
-  const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true });
+  const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true, initialProbePending: true });
   assert.equal(cold.shouldBufferCompleteReply(), true);
-  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
-  assert.equal(cold.shouldBufferCompleteReply(), true);
-  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000 });
-  assert.equal(cold.shouldBufferCompleteReply(), false);
+  cold.noteSegment({ synthesisMs: 700, audioMs: 1_000, firstAudioMs: 150 });
+  assert.equal(cold.shouldBufferCompleteReply(), false, "one complete healthy segment releases the cold gate");
 
   const healthyHandoff = new AdaptiveVoiceLeadController(cold.calibration());
   assert.equal(healthyHandoff.shouldBufferCompleteReply(), false);
+});
+
+test("cold-call buffering remains for short, slow, unknown, jittered, or previously-underrun probes", () => {
+  const makeCold = (extra = {}) => new AdaptiveVoiceLeadController({
+    initialBufferComplete: true,
+    initialProbePending: true,
+    ...extra,
+  });
+  const cases = [
+    ["short", {}, { synthesisMs: 500, audioMs: 900, firstAudioMs: 140 }],
+    ["slow", {}, { synthesisMs: 1_050, audioMs: 1_000, firstAudioMs: 150 }],
+    ["unknown", {}, { synthesisMs: 500, audioMs: 0, firstAudioMs: 150 }],
+    ["previous-underrun", { initialUnderrunPenaltyMs: 120 }, { synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150 }],
+  ];
+  for (const [name, calibration, segment] of cases) {
+    const cold = makeCold(calibration);
+    cold.noteSegment(segment);
+    assert.equal(cold.shouldBufferCompleteReply(), true, `${name} probe must retain complete-reply buffering`);
+    if (name !== "unknown") {
+      assert.equal(cold.snapshot().startup_probe_pending, false, `${name} measurement settles the one-time probe`);
+    }
+  }
+
+  const jittered = makeCold();
+  jittered.notePacket({ audioMs: 139, gapMs: 400, startupDeficitMs: 251 });
+  jittered.noteSegment({ synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150 });
+  assert.equal(jittered.shouldBufferCompleteReply(), true, "measured startup jitter keeps the full-reply gate");
+
+  const noFirstAudioMeasurement = makeCold();
+  noFirstAudioMeasurement.noteSegment({ synthesisMs: 500, audioMs: 1_000 });
+  assert.equal(noFirstAudioMeasurement.shouldBufferCompleteReply(), true);
+  assert.equal(noFirstAudioMeasurement.snapshot().startup_probe_pending, false);
 });
 
 test("progress timeout grows with measured slow-machine cadence and stays bounded", () => {

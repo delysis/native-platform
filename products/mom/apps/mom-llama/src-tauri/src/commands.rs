@@ -21,7 +21,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{Emitter, Manager, State, Window};
 
-use crate::app_runtime::{AppRuntimeHandle, AppWorkLease, complete_voice_wav};
+use crate::app_runtime::{
+    AppRuntimeHandle, AppWorkLease, ConfirmedVoiceRecording, VoiceInferenceRecording,
+    complete_voice_wav, validate_voice_inference_recording,
+};
 use crate::command_registry::command_spec;
 use crate::information::{
     AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalConfirmation,
@@ -79,6 +82,70 @@ fn emit_voice_speculation_stage_with_detail(
             "detail": detail,
         }),
     );
+}
+
+fn emit_model_input_derivative_unavailable(window: &Window, reason: &str) {
+    let _ = window.emit(
+        "mom_llama_model_input_derivative_unavailable",
+        serde_json::json!({
+            "schema": "mom_llama.model_input_derivative_unavailable.v1",
+            "reason": reason,
+        }),
+    );
+}
+
+struct VoiceAttachmentImport {
+    imported: mom_llama_runtime::CommandResult<mom_llama_runtime::AttachmentImportOutput>,
+    derivative_unavailable_reason: Option<String>,
+}
+
+fn preserve_original_import_on_derivative_failure<T>(
+    original: T,
+    persist_derivative: impl FnOnce(&T) -> anyhow::Result<()>,
+) -> (T, Option<String>) {
+    match persist_derivative(&original) {
+        Ok(()) => (original, None),
+        Err(_) => (original, Some("derivative_persistence_failed".to_string())),
+    }
+}
+
+fn import_voice_message_with_inference(
+    operations: &mom_llama_runtime::OperationScope,
+    conversation: &str,
+    physical_wav: Vec<u8>,
+    inference: Option<VoiceInferenceRecording>,
+    mut derivative_unavailable_reason: Option<String>,
+) -> anyhow::Result<VoiceAttachmentImport> {
+    let imported =
+        mom_llama_runtime::attachment_import_voice_message(operations, conversation, physical_wav)?;
+    let (imported, derivative_failure) =
+        preserve_original_import_on_derivative_failure(imported, |original| {
+            if let (Some(attachment), Some(inference)) = (&original.result, inference) {
+                let source_end = inference
+                    .source_start_sample
+                    .checked_add(inference.accepted_sample_count)
+                    .ok_or_else(|| anyhow::anyhow!("model-input source range overflowed"))?;
+                mom_llama_runtime::store_inference_audio_derivative(
+                    &attachment.attachment.id,
+                    &attachment.attachment.sha256,
+                    inference.wav,
+                    mom_llama_runtime::InferenceAudioProvenance {
+                        source_sample_count: inference.source_sample_count,
+                        accepted_sample_count: inference.accepted_sample_count,
+                        source_ranges: Some(vec![mom_llama_runtime::InferenceAudioSampleRange {
+                            start: inference.source_start_sample,
+                            end_exclusive: source_end,
+                        }]),
+                    },
+                )?;
+            }
+            Ok(())
+        });
+    derivative_unavailable_reason = derivative_unavailable_reason.or(derivative_failure);
+    Ok(VoiceAttachmentImport {
+        imported,
+        derivative_unavailable_reason,
+    })
 }
 
 #[tauri::command]
@@ -1870,11 +1937,22 @@ pub async fn mom_llama_voice_audio_finish(
     window: Window,
     session: String,
     recording: Vec<u8>,
+    model_input_recording: Option<Vec<u8>>,
+    source_sample_count: Option<u64>,
+    accepted_sample_count: Option<u64>,
+    source_start_sample: Option<u64>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_voice_audio_finish"))?;
     if !complete_voice_wav(&recording) {
         return Err("The voice turn has no complete recording".to_string());
     }
+    let (inference, inference_unavailable_reason) = validate_voice_inference_recording(
+        &recording,
+        model_input_recording,
+        source_sample_count,
+        accepted_sample_count,
+        source_start_sample,
+    );
     let owner = runtime.inner().clone();
     let voice = owner.take_voice_audio_session(&session)?;
     let conversation = voice.conversation_id().to_string();
@@ -1882,16 +1960,19 @@ pub async fn mom_llama_voice_audio_finish(
     let import = std::thread::Builder::new()
         .name("mom-voice-attachment-import".to_string())
         .spawn(move || {
-            mom_llama_runtime::attachment_import_voice_message(
+            import_voice_message_with_inference(
                 &operations,
                 &conversation,
                 recording,
+                inference,
+                inference_unavailable_reason,
             )
         })
         .map_err(|error| format!("voice_attachment_import_spawn_failed: {error}"))?;
     let import = Arc::new(std::sync::Mutex::new(Some(import)));
     let precommit_import = Arc::clone(&import);
     let events = window.clone();
+    let derivative_events = window.clone();
     lease
         .run_blocking_with_cancellation_evidence(move || {
             let result = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
@@ -1911,10 +1992,14 @@ pub async fn mom_llama_voice_audio_finish(
                     let imported = handle
                         .join()
                         .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
-                    let attachment = imported.result.ok_or_else(|| {
+                    if let Some(reason) = imported.derivative_unavailable_reason.as_deref() {
+                        emit_model_input_derivative_unavailable(&derivative_events, reason);
+                    }
+                    let attachment = imported.imported.result.ok_or_else(|| {
                         anyhow::anyhow!(
                             "{}",
                             imported
+                                .imported
                                 .blocker
                                 .map(|blocker| blocker.message)
                                 .unwrap_or_else(|| "voice attachment import failed".to_string())
@@ -2026,6 +2111,7 @@ pub async fn mom_llama_voice_audio_speculate(
     let worker_control = Arc::clone(&control);
     let events = window.clone();
     let worker_events = window.clone();
+    let derivative_events = window.clone();
     let worker_speculation = speculation.clone();
     let result = lease
         .run_blocking_with_cancellation_evidence(move || {
@@ -2083,13 +2169,15 @@ pub async fn mom_llama_voice_audio_speculate(
             let import = match std::thread::Builder::new()
                 .name("mom-speculative-voice-import".to_string())
                 .spawn(move || {
-                    let recording = import_control
+                    let recording: ConfirmedVoiceRecording = import_control
                         .wait_for_confirmation()
                         .map_err(anyhow::Error::msg)?;
-                    mom_llama_runtime::attachment_import_voice_message(
+                    import_voice_message_with_inference(
                         &import_operations,
                         &import_conversation,
-                        recording,
+                        recording.physical_wav,
+                        recording.inference,
+                        recording.inference_unavailable_reason,
                     )
                 }) {
                 Ok(import) => import,
@@ -2166,10 +2254,14 @@ pub async fn mom_llama_voice_audio_speculate(
                     let imported = handle
                         .join()
                         .map_err(|_| anyhow::anyhow!("voice attachment import panicked"))??;
-                    let attachment = imported.result.ok_or_else(|| {
+                    if let Some(reason) = imported.derivative_unavailable_reason.as_deref() {
+                        emit_model_input_derivative_unavailable(&derivative_events, reason);
+                    }
+                    let attachment = imported.imported.result.ok_or_else(|| {
                         anyhow::anyhow!(
                             "{}",
                             imported
+                                .imported
                                 .blocker
                                 .map(|blocker| blocker.message)
                                 .unwrap_or_else(|| "voice attachment import failed".to_string())
@@ -2300,12 +2392,31 @@ pub async fn mom_llama_voice_audio_speculate(
 #[tauri::command]
 pub async fn mom_llama_voice_audio_speculation_confirm(
     runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
     speculation: String,
     recording: Vec<u8>,
+    model_input_recording: Option<Vec<u8>>,
+    source_sample_count: Option<u64>,
+    accepted_sample_count: Option<u64>,
+    source_start_sample: Option<u64>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_voice_audio_speculation_confirm"))?;
+    let (inference, inference_unavailable_reason) = validate_voice_inference_recording(
+        &recording,
+        model_input_recording,
+        source_sample_count,
+        accepted_sample_count,
+        source_start_sample,
+    );
+    if let Some(reason) = inference_unavailable_reason.as_deref() {
+        emit_model_input_derivative_unavailable(&window, reason);
+    }
     Ok(serde_json::json!({
-        "confirmed": runtime.confirm_voice_speculation(&speculation, recording)?,
+        "confirmed": runtime.confirm_voice_speculation(&speculation, ConfirmedVoiceRecording {
+            physical_wav: recording,
+            inference,
+            inference_unavailable_reason,
+        })?,
     }))
 }
 
@@ -2765,6 +2876,44 @@ pub async fn mom_llama_kv_cache_save(
 }
 
 #[tauri::command]
+pub async fn mom_llama_kv_cache_checkpoint_voice_session(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    blocking_value(
+        runtime.admit(command_spec("mom_llama_kv_cache_checkpoint_voice_session"))?,
+        move || {
+            mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation)
+                .map_err(to_error)
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_kv_cache_set_voice_call_activity(
+    runtime: State<'_, AppRuntimeHandle>,
+    session_id: String,
+    active: bool,
+) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
+    let _lease = runtime.admit(command_spec("mom_llama_kv_cache_set_voice_call_activity"))?;
+    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, &session_id, active)
+        .map_err(to_error)?;
+    to_value(mom_llama_runtime::CommandResult::passed(
+        "mom_llama.kv_cache_set_voice_call_activity",
+        "host_integrated",
+        (),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .map_err(to_error)
+}
+
+#[tauri::command]
 pub async fn mom_llama_kv_cache_restore(
     runtime: State<'_, AppRuntimeHandle>,
     cache: Option<String>,
@@ -3157,7 +3306,8 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 mod tests {
     use super::{
         MAX_VOICE_LATENCY_STAGES, MAX_VOICE_LATENCY_TRACE_BYTES, path_setting_patch,
-        pcm_stream_frame, validate_voice_latency_trace,
+        pcm_stream_frame, preserve_original_import_on_derivative_failure,
+        validate_voice_latency_trace,
     };
     use speech_native_types::{AudioChunk, PcmFormat, PcmSampleFormat};
     use std::path::PathBuf;
@@ -3204,6 +3354,18 @@ mod tests {
                 .expect_err("oversized trace"),
             "voice latency trace exceeds its bounded size"
         );
+    }
+
+    #[test]
+    fn derivative_persistence_failure_keeps_the_staged_physical_voice_import() {
+        let staged_original = ("attachment-source-7", true);
+        let (retained, diagnostic) =
+            preserve_original_import_on_derivative_failure(staged_original, |_| {
+                Err(anyhow::anyhow!("simulated derivative storage failure"))
+            });
+
+        assert_eq!(retained, ("attachment-source-7", true));
+        assert_eq!(diagnostic.as_deref(), Some("derivative_persistence_failed"));
     }
 
     #[test]

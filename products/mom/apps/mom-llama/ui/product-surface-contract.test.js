@@ -472,6 +472,11 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(close.includes("stopSpeechPlayback()"));
   assert.ok(close.includes("stopCallBed()"));
   assert.ok(close.includes('invoke("mom_llama_chat_cancel", { conversation })'));
+  const stopSettlement = close.indexOf("await Promise.allSettled(stops.filter(Boolean))");
+  const activityClear = close.indexOf("await activityGuard.clear()");
+  const checkpoint = close.indexOf('invoke("mom_llama_kv_cache_checkpoint_voice_session"');
+  assert.ok(stopSettlement >= 0 && activityClear > stopSettlement && checkpoint > activityClear,
+    "the exact call activity guard must clear after all stop acknowledgements and before checkpointing");
   assert.ok(
     close.indexOf('setModalVisibility("voice-call-modal", false)')
       < close.indexOf("stopVoiceCapture({ discard: true"),
@@ -496,6 +501,8 @@ test("call startup waits for idle speech cancellation to reach its terminal befo
   const callEnd = bridge.indexOf("\n  const closeVoiceCallSurface = async", callStart);
   const call = bridge.slice(callStart, callEnd);
   const preempt = call.indexOf('suspendVoiceHistoryRecoveryForForeground("call_start")');
+  const activityStart = call.indexOf("createVoiceCallActivityGuard(speechOperationToken())");
+  const activityReady = call.indexOf("await activityGuard.ready");
   const warm = call.indexOf('runtimeWarmPromise.then');
   const microphone = call.indexOf('prepareCallMicrophoneStream()');
   const visiblePreparing = call.indexOf('modal.dataset.callState = "preparing"');
@@ -503,6 +510,8 @@ test("call startup waits for idle speech cancellation to reach its terminal befo
   const cancellationGuard = call.indexOf('if (voiceCallEpoch !== epoch || !voiceCallActive) return;', preempt);
 
   assert.ok(preempt >= 0, "call pickup must suspend and settle idle voice recovery");
+  assert.ok(activityStart >= 0 && activityReady > activityStart && activityReady < preempt,
+    "call activity must be registered before asynchronous setup and before warmup admission");
   assert.ok(bridge.includes('await stopSpeechOperationAndWait(operation, reason, {'));
   assert.ok(bridge.includes('allowColdTranscriptionSettlement: coldInitialization'));
   assert.ok(preempt < warm && preempt < microphone,
@@ -1464,6 +1473,10 @@ test("a degraded voice import binds its exact private prompt before dispatch", (
 });
 
 test("the native presentation contains no Skills, cache, engine, or resident-slot panels", () => {
+  const rendererWithApprovedVoiceCheckpointLifecycle = [
+    "mom_llama_kv_cache_checkpoint_voice_session",
+    "mom_llama_kv_cache_set_voice_call_activity",
+  ].reduce((source, command) => source.replaceAll(command, ""), bridge);
   for (const marker of [
     'data-settings-card="skills"',
     'data-settings-card="cache"',
@@ -1500,7 +1513,10 @@ test("the native presentation contains no Skills, cache, engine, or resident-slo
     '"resident-slot-load"',
     '"resident-slot-unload"',
   ]) {
-    assert.ok(!bridge.includes(marker), `forbidden renderer bridge remains: ${marker}`);
+    assert.ok(
+      !rendererWithApprovedVoiceCheckpointLifecycle.includes(marker),
+      `forbidden renderer bridge remains: ${marker}`,
+    );
   }
 
   assert.ok(!index.includes("cache-inspector.js"));

@@ -5,7 +5,7 @@
 //! fingerprint that encrypted persistent stores must bind.
 
 use llama_native_types::{
-    PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob,
+    PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob, SequenceStateCell,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +76,9 @@ pub struct PrefixCacheMetadata {
     pub state: CacheEntryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconstruction: Option<SequenceReconstruction>,
+    /// Complete mixed prompt identity. Empty retains text-only cache metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<SequenceStateCell>,
 }
 
 impl PrefixCacheMetadata {
@@ -103,13 +106,14 @@ impl PrefixCacheMetadata {
             last_used_at_ms: now_ms,
             state: CacheEntryState::Ready,
             reconstruction: None,
+            cells: Vec::new(),
         }
     }
 
     /// Reconstruct without reading the potentially large native spill object.
     #[must_use]
     pub fn replay_value(&self) -> Option<PrefixCacheValue> {
-        if !self.is_valid() {
+        if !self.is_valid() || !self.cells.is_empty() {
             return None;
         }
         let sequence = self
@@ -136,7 +140,7 @@ impl PrefixCacheMetadata {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.state == CacheEntryState::Ready
-            && !self.token_ids.is_empty()
+            && (!self.token_ids.is_empty() || !self.cells.is_empty())
             && self.state_bytes > 0
             && self.token_sha256 == token_sha256(&self.token_ids)
     }
@@ -151,14 +155,39 @@ pub struct PrefixCacheValue {
 impl PrefixCacheValue {
     /// Bind the small disk index to the exported snapshot once, at publication.
     pub fn bind_reconstruction(&mut self) {
+        self.metadata.cells.clone_from(&self.sequence.cells);
         self.metadata.reconstruction = Some(self.sequence.reconstruction());
     }
 
     #[must_use]
     pub fn is_valid(&self) -> bool {
+        let leading_text: Vec<i32> = self
+            .sequence
+            .cells
+            .iter()
+            .take_while(|cell| matches!(cell, SequenceStateCell::Text(_)))
+            .filter_map(|cell| match cell {
+                SequenceStateCell::Text(token) => Some(*token),
+                _ => None,
+            })
+            .collect();
         self.metadata.is_valid()
-            && self.sequence.token_count == self.metadata.token_ids.len()
+            && self.sequence.token_count
+                == if self.sequence.cells.is_empty() {
+                    self.metadata.token_ids.len()
+                } else {
+                    self.sequence.cells.len()
+                }
             && self.sequence.token_ids == self.metadata.token_ids
+            && self.sequence.cells == self.metadata.cells
+            && (self.sequence.cells.is_empty() || self.sequence.token_ids == leading_text)
+            && self
+                .metadata
+                .reconstruction
+                .as_ref()
+                .is_none_or(|reconstruction| {
+                    reconstruction.token_replay_allowed == self.sequence.cells.is_empty()
+                })
             && self.sequence.bytes.len() == self.metadata.state_bytes
     }
 }
@@ -332,6 +361,7 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         last_used_at_ms: _,
         state: _,
         reconstruction,
+        cells: metadata_cells,
     } = metadata;
     let CacheFingerprint {
         prompt_form: _,
@@ -355,12 +385,14 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         token_count: _,
         bytes,
         token_ids: sequence_tokens,
+        cells,
     } = sequence;
     let reconstruction_bytes = match reconstruction {
         Some(SequenceReconstruction {
             sequence_id: _,
             header,
             export_receipt: _,
+            token_replay_allowed: _,
         }) => header.capacity(),
         None => 0,
     };
@@ -377,6 +409,12 @@ fn retained_memory_bytes(value: &PrefixCacheValue) -> Option<usize> {
         token_sha256.capacity(),
         token_ids.capacity().checked_mul(size_of::<i32>())?,
         sequence_tokens.capacity().checked_mul(size_of::<i32>())?,
+        cells
+            .capacity()
+            .checked_mul(size_of::<llama_native_types::SequenceStateCell>())?,
+        metadata_cells
+            .capacity()
+            .checked_mul(size_of::<llama_native_types::SequenceStateCell>())?,
         bytes.capacity(),
         reconstruction_bytes,
         lora_adapters_sha256
@@ -703,8 +741,40 @@ mod tests {
                 token_count: tokens.len(),
                 bytes: (vec![7; bytes]).into(),
                 token_ids: tokens.to_vec(),
+                cells: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn mixed_cells_round_trip_without_token_replay_authority() {
+        let mut value = value("mixed", CacheTier::SessionPersistent, &[7], 128, 1);
+        value.sequence.token_count = 3;
+        value.sequence.cells = vec![
+            SequenceStateCell::Text(7),
+            SequenceStateCell::Media {
+                digest: [0x41; 32],
+                chunk: 1,
+                offset: 640,
+            },
+            SequenceStateCell::AudioFrame { digest: [0x42; 32] },
+        ];
+        value.bind_reconstruction();
+        assert_eq!(
+            value
+                .metadata
+                .reconstruction
+                .as_ref()
+                .map(|reconstruction| reconstruction.token_replay_allowed),
+            Some(false)
+        );
+        assert!(value.is_valid());
+
+        let encoded = serde_json::to_vec(&value).expect("serialize mixed native value");
+        let decoded: PrefixCacheValue = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, value);
+        assert!(decoded.metadata.replay_value().is_none());
+        assert!(decoded.is_valid());
     }
 
     fn owned_value(

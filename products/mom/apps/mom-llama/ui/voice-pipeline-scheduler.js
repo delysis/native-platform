@@ -82,6 +82,7 @@
       initialSlowSegmentCount = 0,
       initialHealthySegmentCount = 0,
       initialBufferComplete = false,
+      initialProbePending = false,
       minimumTargetMs = 180,
       maximumTargetMs = 1_200,
     } = {}) {
@@ -99,6 +100,7 @@
       this.slowSegmentCount = initialSlowSegmentCount;
       this.healthySegmentCount = initialHealthySegmentCount;
       this.bufferComplete = initialBufferComplete;
+      this.probePending = initialProbePending;
       this.replySegmentCount = 0;
       this.waits = 0;
       this.waitMs = 0;
@@ -134,9 +136,23 @@
       if (Number.isFinite(firstAudioMs) && firstAudioMs > 0) {
         this.firstAudioMs = this.firstAudioMs * 0.7 + firstAudioMs * 0.3;
       }
-      if (Number.isFinite(synthesisMs) && Number.isFinite(audioMs) && audioMs > 0) {
+      if (Number.isFinite(synthesisMs) && synthesisMs >= 0 && Number.isFinite(audioMs) && audioMs > 0) {
         const observed = clamp(synthesisMs / audioMs, 0.05, 4);
         this.productionRtf = this.productionRtf * 0.7 + observed * 0.3;
+        if (this.probePending) {
+          this.probePending = false;
+          // A complete first segment provides measured production speed and
+          // real audio runway. Only a clearly healthy producer may start the
+          // cold call early; slow/unknown output retains full-reply buffering.
+          if (synthesisMs >= 0 && observed <= 0.85
+              && Number.isFinite(firstAudioMs) && firstAudioMs > 0
+              && audioMs >= Math.max(1_000, firstAudioMs * 2, this.targetRunwayMs() * 2)
+              && this.requiredStartupDelayMs <= 250 && this.underrunPenaltyMs === 0) {
+            this.bufferComplete = false;
+            this.healthySegmentCount = 0;
+            this.slowSegmentCount = 0;
+          }
+        }
         if (this.bufferComplete) {
           if (observed <= 0.85) {
             this.healthySegmentCount += 1;
@@ -291,6 +307,7 @@
         observed_max_boundary_gap_ms: Math.round(this.maximumBoundaryGapMs * 100) / 100,
         observed_production_rtf: Math.round(this.productionRtf * 10_000) / 10_000,
         buffer_complete_reply: this.bufferComplete,
+        startup_probe_pending: this.probePending,
         slow_segment_count: this.slowSegmentCount,
         healthy_segment_count: this.healthySegmentCount,
         observed_speech_ms_per_word: Math.round(this.speechMsPerWord * 100) / 100,
@@ -314,6 +331,7 @@
         initialSlowSegmentCount: this.slowSegmentCount,
         initialHealthySegmentCount: this.healthySegmentCount,
         initialBufferComplete: this.bufferComplete,
+        initialProbePending: this.probePending,
         minimumTargetMs: this.minimumTargetMs,
         maximumTargetMs: this.maximumTargetMs,
       };

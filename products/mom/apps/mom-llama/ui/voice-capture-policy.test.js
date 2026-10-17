@@ -9,10 +9,41 @@ const {
   initialPlaybackEchoGuard,
   initialVoiceActivity,
   nextVoiceActivity,
+  quantizeInferencePcm16,
+  truncateInferencePcm16,
+  encodeInferencePcm16Wav,
   speechThreshold,
   splitPrefillPcm,
   updatePlaybackEchoGuard,
 } = require("./voice-capture-policy.js");
+
+test("model-input archive reproduces accepted PCM16 across speculative checkpoint replay", () => {
+  const source = Float32Array.from([-.75, -.125, 0, .25, .625, .999]);
+  const firstAccepted = quantizeInferencePcm16(source.subarray(0, 4));
+  const ledger = {
+    modelInputPcm16Parts: [firstAccepted.pcm16],
+    modelInputSampleCount: firstAccepted.pcm16.length,
+  };
+
+  // The first speculative decode is cancelled at sample 2. Reuse only its
+  // committed prefix, then rebuild the accepted suffix from the source PCM.
+  truncateInferencePcm16(ledger, 2);
+  const replayedTail = quantizeInferencePcm16(source.subarray(2));
+  ledger.modelInputPcm16Parts.push(replayedTail.pcm16);
+  ledger.modelInputSampleCount += replayedTail.pcm16.length;
+
+  const expected = quantizeInferencePcm16(source).pcm16;
+  const wav = encodeInferencePcm16Wav(
+    ledger.modelInputPcm16Parts,
+    ledger.modelInputSampleCount,
+  );
+  assert.ok(wav instanceof Uint8Array);
+  assert.equal(new DataView(wav.buffer, wav.byteOffset).getUint32(40, true), expected.length * 2);
+  const wavView = new DataView(wav.buffer, wav.byteOffset);
+  const archived = Int16Array.from(expected, (_, index) => wavView.getInt16(44 + index * 2, true));
+  assert.deepEqual(archived, expected);
+  assert.equal(encodeInferencePcm16Wav(ledger.modelInputPcm16Parts, expected.length - 1), null);
+});
 
 test("resumed call prefill keeps a long captured utterance in bounded ordered blocks", () => {
   const samples = Float32Array.from({ length: 16_000 * 5 + 17 }, (_, index) => index);
