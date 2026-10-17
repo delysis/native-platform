@@ -79,6 +79,14 @@ not prove disk access. Its recording included room audio as well as a fixture,
 so it cannot qualify fixture-only streaming overlap. Voice-note backfill now
 waits for speech synthesis to finish before starting Parakeet. Calls continue
 to queue work for the existing preemptible idle slot.
+Non-call archival readers now register their exact operation and terminal task
+with foreground suspension. New microphone capture can retain PCM immediately,
+but Gemma preparation waits for ASR cancellation and any already-started
+transcript commit. Readers still examining metadata are marked cancelled before
+they can enter inference. Capture discard/start failure resumes recovery only
+after model cancellation succeeds; a failed acknowledgement keeps background
+work paused. Resident cancellation measurements do not qualify cold model
+initialization, which retains its separate bounded settlement path.
 
 Two playback stops aligned exactly with barge-in events on subsequent capture
 traces. The user could not establish whether they spoke at those moments.

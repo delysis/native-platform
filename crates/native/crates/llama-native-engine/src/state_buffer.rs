@@ -824,7 +824,11 @@ mod tests {
             retained.push(state);
         }
         assert_eq!(
-            authority.verified.lock().unwrap().len(),
+            authority
+                .verified
+                .lock()
+                .expect("verification registry mutex is not poisoned")
+                .len(),
             MAX_VERIFIED_ALLOCATIONS
         );
         let weak = Arc::downgrade(&retained[1].bytes);
@@ -832,7 +836,14 @@ mod tests {
         assert!(weak.upgrade().is_none());
         let state = authenticated_fixture(&authority, &fingerprint());
         assert!(authority.verifies(&state));
-        assert_eq!(authority.verified.lock().unwrap().len(), 1);
+        assert_eq!(
+            authority
+                .verified
+                .lock()
+                .expect("verification registry mutex is not poisoned")
+                .len(),
+            1
+        );
 
         // Even with a sole strong owner, the cached Weak prevents mutation
         // in place. make_mut must detach before exposing mutable bytes.

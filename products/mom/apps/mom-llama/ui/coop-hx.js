@@ -6652,26 +6652,38 @@
   };
 
   const prepareVoicePrefill = async (recording) => {
-    const sourceConversation = recording.call && voiceCallConversation
-      ? voiceCallConversation
-      : recording.sourceConversation;
-    let conversation = sourceConversation;
-    if (sourceConversation !== "default" && recording.sourceKind === "persona_template") {
-      const instantiated = await instantiatePersona(sourceConversation);
-      if (instantiated?.status === "blocked" || !instantiated?.result?.id) return null;
-      conversation = instantiated.result.id;
-      if (selectedConversation() === sourceConversation) {
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
+    // Capture is already running and retaining PCM. Foreground model work
+    // waits for the exact archival ASR terminal, never its stop request alone.
+    const releaseHistoryRecovery = recording.call ? null
+      : await suspendVoiceHistoryRecoveryForForeground("voice_capture");
+    try {
+      if (recording.discarded) return null;
+      const sourceConversation = recording.call && voiceCallConversation
+        ? voiceCallConversation
+        : recording.sourceConversation;
+      let conversation = sourceConversation;
+      if (sourceConversation !== "default" && recording.sourceKind === "persona_template") {
+        const instantiated = await instantiatePersona(sourceConversation);
+        if (instantiated?.status === "blocked" || !instantiated?.result?.id) return null;
+        conversation = instantiated.result.id;
+        if (selectedConversation() === sourceConversation) {
+          chat().dataset.currentConversation = conversation;
+          chat().dataset.conversationKind = "chat";
+        }
       }
+      return await startVoicePrefill(conversation, recording.call, recording.trace);
+    } finally {
+      // Dispatch completion or confirmed cancellation resumes recovery. Do
+      // not restart ASR between capture stop and submission of retained PCM.
+      releaseHistoryRecovery?.({ resume: false });
     }
-    return startVoicePrefill(conversation, recording.call, recording.trace);
   };
 
   let pendingCallTranscriptJobs = [];
   let activeCallTranscriptJob = null;
   let activeCallTranscriptTask = null;
   let activeCallTranscriptOperation = null;
+  const idleVoiceTranscriptJobs = new Set();
 
   const indexVoiceTurn = (conversation, output, fallbackAttachment = null, sourceCapture = null,
     sourceTrace = null, { allowActiveCall = false, callJob = null } = {}) => {
@@ -6707,6 +6719,16 @@
       }
       return Promise.resolve();
     }
+    // Ordinary dispatch holds a recovery suspension through its speech drain.
+    // Its release will revisit this saved recording. Never start a second
+    // archival reader alongside recovery or a new microphone turn.
+    if (!callJob && (voiceHistoryRecoverySuspensions > 0 || voiceRecording || voiceHistoryRecovery)) {
+      markVoiceLatencyIn(trace, "voice_transcript_deferred", { reason: "foreground_or_recovery" });
+      return Promise.resolve();
+    }
+    const idleJob = callJob ? null : { operation: null, task: null, cancelledByForeground: false };
+    if (idleJob) idleVoiceTranscriptJobs.add(idleJob);
+    const preempted = () => callJob?.cancelledByCaller || idleJob?.cancelledByForeground;
     const started = performance.now();
     markVoiceLatencyIn(trace, "voice_transcript_started", {
       source: output?.voice_attachment_id ? "live" : "fallback",
@@ -6718,10 +6740,11 @@
       // Speculative generation can finish before the first audible packet.
       // Its recording becomes authoritative only after confirmation commits.
       const physicalCapture = await Promise.resolve(sourceCapture);
-      if (sourceCapture && !physicalCapture) return false;
+      if (preempted() || (sourceCapture && !physicalCapture)) return false;
       const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
         attachment,
       }));
+      if (preempted()) return false;
       const primary = catalog.primary;
       if (!primary || primary.kind !== "audio") {
         throw new Error("voice_transcript_source_missing: The recorded voice could not be read for conversation memory.");
@@ -6760,8 +6783,9 @@
         }
       }
       if (!transcribed) {
-        if (callJob?.cancelledByCaller) throw new Error("voice_transcript_preempted_by_caller");
+        if (preempted()) return false;
         const operation = speechOperationToken();
+        if (idleJob) idleJob.operation = operation;
         if (callJob && voiceCallActive && activeCallTranscriptJob === callJob) {
           activeCallTranscriptOperation = operation;
         }
@@ -6773,8 +6797,10 @@
           });
         } finally {
           if (activeCallTranscriptOperation === operation) activeCallTranscriptOperation = null;
+          if (idleJob?.operation === operation) idleJob.operation = null;
         }
       }
+      if (preempted()) return false;
       markVoiceLatencyIn(trace, "voice_transcript_inference_finished", {
         duration_ms: Math.round((performance.now() - inferenceStarted) * 100) / 100,
         ...(transcribed?.result?.timing || {}),
@@ -6805,7 +6831,10 @@
       }
       if (callJob) callJob.committed = true;
       return true;
-    })();
+    })().finally(() => {
+      if (idleJob) idleVoiceTranscriptJobs.delete(idleJob);
+    });
+    if (idleJob) idleJob.task = task;
     void task.then((committed) => {
       if (committed !== true) return;
       markVoiceLatencyIn(trace, "voice_transcript_finished", {
@@ -6819,7 +6848,7 @@
         duration_ms: Math.round((performance.now() - started) * 100) / 100,
         message: errorMessage(error),
       });
-      if (!callJob?.cancelledByCaller) reportError(error);
+      if (!preempted()) reportError(error);
     });
     return task;
   };
@@ -6905,7 +6934,7 @@
     foregroundDispatch: activeDispatchConversation !== null,
     callActive: voiceCallActive,
     callPreparing: voiceCallPreparing,
-    recording: Boolean(voiceRecording),
+    recording: Boolean(voiceRecording) || idleVoiceTranscriptJobs.size > 0,
   });
   const recoverPendingVoiceHistory = () => {
     if (!canContinueVoiceHistoryRecovery()) return Promise.resolve();
@@ -7019,6 +7048,20 @@
   const suspendVoiceHistoryRecoveryForForeground = async (reason) => {
     voiceHistoryRecoverySuspensions += 1;
     try {
+      const idleJobs = [...idleVoiceTranscriptJobs];
+      // Mark every owner before awaiting anything: jobs still reading source
+      // metadata must not admit a new backend operation after this snapshot.
+      for (const job of idleJobs) job.cancelledByForeground = true;
+      for (const job of idleJobs) {
+        if (job.operation) {
+          await stopSpeechOperationAndWait(job.operation, reason, {
+            allowColdTranscriptionSettlement: true,
+          });
+        }
+      }
+      // A transcript commit that already began must settle before Gemma reads
+      // the next history. Failed/cancelled readers keep their source recording.
+      await Promise.all(idleJobs.map((job) => job.task?.catch(() => {})));
       const operation = voiceHistoryRecoveryOperation;
       const coldInitialization = voiceHistoryRecoveryColdInitialization;
       if (operation) {
@@ -7040,11 +7083,11 @@
       throw error;
     }
     let released = false;
-    return () => {
+    return ({ resume = true } = {}) => {
       if (released) return;
       released = true;
       voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
-      if (voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
+      if (resume && voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
         void recoverPendingVoiceHistory().catch(() => {});
       }
     };
@@ -7060,11 +7103,29 @@
     return { ...live, conversation };
   };
 
+  const abortStoppedVoicePrefill = (recording, abortPrefill) => {
+    const cancelled = recording.speculation && !recording.speculation.confirmed
+      ? abortCallSpeculation(recording)
+      : abortPrefill ? recording.prefillSession.then((live) => live?.session
+        ? invoke("mom_llama_voice_audio_abort", { session: live.session }) : null)
+        : Promise.resolve();
+    // Keep the gesture responsive, but do not restart archival compute until
+    // the cancelled model owner has acknowledged the stop.
+    void Promise.resolve(cancelled).then(() => {
+      if (!recording.call) void recoverPendingVoiceHistory().catch(() => {});
+    }, (error) => {
+      markVoiceLatencyIn(recording.trace, "voice_capture_prefill_abort_failed", {
+        message: errorMessage(error),
+      });
+    });
+  };
+
   const stopVoiceCapture = async ({ discard = false, abortPrefill = true,
     flushPrefill = true, reason = "sent" } = {}) => {
     const recording = voiceRecording;
     voiceRecording = null;
     if (!recording) return null;
+    if (discard) recording.discarded = true;
     markVoiceLatencyIn(recording.trace, "capture_stopped", {
       reason, discard, producer: recording.native ? "native_ring" : "browser_capture",
     });
@@ -7073,14 +7134,7 @@
       setVoiceRecordingVisible(false);
       await recording.startPromise;
       if (discard) {
-        recording.discarded = true;
-        if (recording.speculation && !recording.speculation.confirmed) {
-          void abortCallSpeculation(recording);
-        } else if (abortPrefill) {
-          void recording.prefillSession.then((live) => live?.session
-            ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-            : null).catch(() => {});
-        }
+        abortStoppedVoicePrefill(recording, abortPrefill);
         await invoke("mom_llama_voice_capture_cancel", { capture: recording.capture });
         return null;
       }
@@ -7130,13 +7184,7 @@
     markVoiceLatencyIn(recording.trace, "capture_processing", { ...captureMetrics, reason, discard });
     if (discard) {
       recording.transcription?.cancel();
-      if (recording.speculation && !recording.speculation.confirmed) {
-        void abortCallSpeculation(recording);
-      } else if (abortPrefill) {
-        void recording.prefillSession.then((live) => live?.session
-          ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-          : null).catch(() => {});
-      }
+      abortStoppedVoicePrefill(recording, abortPrefill);
       return null;
     }
     // Physical stop seals the transcript independently. Never await Parakeet
@@ -7635,11 +7683,10 @@
       await recording.startPromise;
       markVoiceLatencyIn(recording.trace, "native_capture_started");
     } catch (error) {
+      recording.discarded = true;
       if (voiceRecording === recording) voiceRecording = null;
       setVoiceRecordingVisible(false);
-      void recording.prefillSession.then((live) => live?.session
-        ? invoke("mom_llama_voice_audio_abort", { session: live.session })
-        : null).catch(() => {});
+      abortStoppedVoicePrefill(recording, true);
       throw error;
     }
     return recording;
@@ -8196,6 +8243,9 @@
         voiceReplyConversation = null;
       }
       if (activeVoiceSpeculation === speculation) activeVoiceSpeculation = null;
+      if (!recording.call && stillOwnsDispatch) {
+        void recoverPendingVoiceHistory().catch(() => {});
+      }
     }
   };
 

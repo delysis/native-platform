@@ -384,7 +384,8 @@ test("voice dispatch keeps its live PCM row mounted through completion", () => {
   );
   assert.match(submit, /if \(!voiceDispatch\) \{[\s\S]*await refreshConversationProjection\(\);[\s\S]*\} else \{[\s\S]*Keep the live audio rows mounted/);
   assert.match(submit, /const voiceTtsOwner = voiceDispatch/);
-  assert.match(submit, /await voiceTtsOwner\.finish\(output\.assistant_text\)/);
+  assert.match(submit, /finishVoiceReplyAndIndexTurn\([\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*\(\) => voiceTtsOwner\.finish\(output\.assistant_text\)/,
+    "call transcript indexing is admitted before TTS drains; voice-note backfill waits for the helper's successful finish");
   assert.match(submit, /voice_reply_owner_missing/);
   assert.match(submit, /refreshSidebar\(\), refreshConversationSettingsProjection\(\)/);
   assert.match(ui, /const replayBytes = capture\.wavBytes \|\| encodePcmWav\(capture\.samples\(\)\)/);
