@@ -227,28 +227,6 @@ pub(crate) fn export_sequence_bounded_while(
     )
 }
 
-/// Export a complete mixed text/media lane while publishing its identity as
-/// the ordinary cache sequence. This allows the resident media lane (seq 3)
-/// to be restored into the cache's external seq 0 identity after a restart.
-pub(crate) fn export_sequence_cells_bounded(
-    context: &LlamaContext<'_>,
-    fingerprint: &ModelFingerprint,
-    source_sequence_id: i32,
-    export_sequence_id: i32,
-    cells: Vec<SequenceStateCell>,
-    max_bytes: usize,
-) -> Result<Option<SequenceStateBlob>, NativeError> {
-    export_sequence_cells_bounded_while(
-        context,
-        fingerprint,
-        source_sequence_id,
-        export_sequence_id,
-        cells,
-        max_bytes,
-        &|| true,
-    )
-}
-
 pub(crate) fn export_sequence_cells_bounded_while(
     context: &LlamaContext<'_>,
     fingerprint: &ModelFingerprint,
@@ -516,18 +494,18 @@ mod tests {
         assert!(!has_reusable_export(&exports, &compact));
         let mut retained = Vec::new();
         for _ in 0..MAX_LIVE_EXPORTS {
-            let next = envelope(vec![3], &fingerprint(), 0, 1, vec![7]).unwrap();
+            let next = envelope(vec![3], &fingerprint(), 0, 1, vec![7]).expect("next state");
             remember_allocation(&exports, &next);
             retained.push(next);
         }
         assert!(!has_reusable_export(&exports, &state));
         remember_allocation(&exports, &state);
         drop(lifetime);
-        assert!(exports.lock().unwrap().is_empty());
+        assert!(exports.lock().expect("exports lock").is_empty());
         assert!(!has_reusable_export(&exports, &state));
         assert!(
             validated_payload(&compact, &fingerprint())
-                .unwrap()
+                .expect("validate compact replay")
                 .is_empty()
         );
     }
@@ -535,7 +513,7 @@ mod tests {
     #[test]
     fn live_identity_rejects_mutation_and_untrusted_byte_copies_without_hashing() {
         let exports = LiveExports::default();
-        let state = envelope(vec![1, 2, 3], &fingerprint(), 0, 1, vec![7]).unwrap();
+        let state = envelope(vec![1, 2, 3], &fingerprint(), 0, 1, vec![7]).expect("state");
         remember_allocation(&exports, &state);
         assert!(has_reusable_export(&exports, &state.clone()));
         for field in 0..5 {
@@ -550,7 +528,8 @@ mod tests {
             assert!(!has_reusable_export(&exports, &altered));
         }
         let decoded: SequenceStateBlob =
-            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            serde_json::from_slice(&serde_json::to_vec(&state).expect("serialize state"))
+                .expect("deserialize state");
         assert_eq!(state, decoded);
         assert!(!has_reusable_export(&exports, &decoded));
         let mut sole = state;

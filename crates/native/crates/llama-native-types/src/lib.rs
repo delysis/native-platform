@@ -3437,7 +3437,7 @@ mod tests {
         assert!(replay.token_replay_allowed);
         assert!(
             !serde_json::to_string(&replay)
-                .unwrap()
+                .expect("serialize replay metadata")
                 .contains("export_receipt")
         );
     }

@@ -15224,12 +15224,16 @@ mod tests {
         let directory = TestArtifactDirectory::new("acquisition-identity");
         let path = directory.join("model.gguf");
         let bytes = b"acquired artifact bytes";
-        std::fs::write(&path, bytes).unwrap();
-        let acquired = File::open(&path).unwrap();
-        let identity = model_artifact_file_identity(&acquired.metadata().unwrap());
+        std::fs::write(&path, bytes).expect("write acquired artifact");
+        let acquired = File::open(&path).expect("open acquired artifact");
+        let identity = model_artifact_file_identity(
+            &acquired
+                .metadata()
+                .expect("read acquired artifact metadata"),
+        );
         let digest = format!("{:x}", Sha256::digest(bytes));
-        let loaded =
-            ModelArtifactGuard::open(&path, "model", Some(&digest), Some(&identity)).unwrap();
+        let loaded = ModelArtifactGuard::open(&path, "model", Some(&digest), Some(&identity))
+            .expect("verify acquired artifact identity");
         assert_eq!(loaded.expected_sha256, digest);
         assert_eq!(
             loaded.payload_bytes_read(),
