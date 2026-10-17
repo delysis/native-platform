@@ -16039,6 +16039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local Gemma 4 GGUF; measures an approximately 11k-token resident voice prefix"]
     fn real_long_resident_prefix_separates_prefill_from_snapshot_export()
     -> Result<(), Box<dyn std::error::Error>> {

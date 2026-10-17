@@ -611,6 +611,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
       ["linux", "macos"],
     ],
     [
+      "tests::real_long_resident_prefix_separates_prefill_from_snapshot_export",
+      ["macos"],
+    ],
+    [
       "apple_backend::tests::real_apple_tts_returns_silent_wav_bytes_without_permission",
       ["macos"],
     ],
