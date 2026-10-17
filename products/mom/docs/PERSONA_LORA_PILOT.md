@@ -17,8 +17,11 @@ diarize a training corpus.
 
 In this context “OCR” can only reasonably refer to the broader extraction work
 that produced retained captions and Whisper drafts. OCR itself is an image/text
-transform and is not part of the podcast audio path in this repository. There
-is no checked-in executable podcast diarization pipeline to extend.
+transform and is not part of the podcast audio path in this repository. The
+offline `diarize-archive-source.mjs` and `speaker-diarization-ledger.mjs` tools
+now produce acoustic speaker clusters and review records, but those machine
+clusters do not establish a named speaker or verify a transcript. The current
+corpus has no admitted, source-disjoint training split.
 
 Before training, an external/offline corpus builder must emit an immutable
 admission manifest. Every source, normalized audio file, VAD segment, transcript,
