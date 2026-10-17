@@ -1,5 +1,44 @@
 # Voice reliability qualification
 
+## Pickup regression: phase-consistent history
+
+The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and
+started playback in 2.038 seconds. Candidate 13's warm greeting reused only
+11,212 of 15,066 positions; runtime readiness took 2 ms but prefill through
+first content took 12.684 seconds. A boolean cache hit is insufficient evidence
+of conversation reuse. These are different saved-history states, not a paired
+performance benchmark.
+
+The history policy reserved up to 4,096 microphone positions only for Live
+input. Pickup could fill that space with history which the immediately following
+microphone preparation then rolled away. A cancelled preparation did not commit
+its narrower boundary, so redial could select the longer old history again.
+All voice phases now reserve the same microphone budget. A changed boundary is
+saved before generation in a metadata-only compare-and-set transaction, even
+if no subsequent exchange commits. Unchanged windows do not write. The update
+checks source history, active branch, model/persona profile, skills and previous
+boundary; it preserves all messages and unrelated metadata. It does not export
+native KV or change the existing window-profile version.
+
+The regression fails under the previous mode-specific budget (greeting boundary
+0, microphone boundary 6). Eight focused context tests pass with the repair,
+including near-limit rollover followed by cancellation, store reopening and
+redial without a generated exchange, and rejection of stale metadata updates.
+These component results do not establish packaged latency improvement.
+
+For subsequent candidates, compare the same conversation/source state and
+record prompt positions, actually reused positions, prefill time and full
+call-request-to-render time. Exercise greeting, microphone prearm, hangup and
+redial as one sequence; committed-turn-only tests miss this regression. Preserve
+the baseline executable as well as its manifest. Do not call a historical-source
+rebuild the same artifact if the original executable is unavailable.
+
+The latest full user call's completed segments reported zero receipt-to-PCM-EOF
+drain. Natural reply render durations matched emitted PCM duration within about
+a tenth of a second. That does not qualify fluent audio: generated silence and
+prosody breaks require output-PCM measurements, not underrun counters. Do not
+remove the final-packet ownership barrier based on these traces.
+
 ## Evidence snapshot — 17 October 2026
 
 This is a dated implementation and evidence snapshot, not a live qualification

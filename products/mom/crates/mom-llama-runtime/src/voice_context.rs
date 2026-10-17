@@ -5,7 +5,11 @@ use crate::attachments::{
 };
 use crate::chat::{build_native_messages, upstream_setting_bool};
 use crate::config::Settings;
-use crate::conversation_store::{Conversation, ConversationInferenceWindow, Message, MessageRole};
+use crate::conversation_store::{
+    CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationInferenceWindow, Message,
+    MessageRole,
+};
+use crate::store::RuntimeStore;
 use anyhow::{Result, anyhow};
 use llama_native_engine::NativeModelHandle;
 use llama_native_types::{ChatMessage, ChatTemplateChoice, GenerationInput};
@@ -17,6 +21,16 @@ pub(crate) enum VoiceHistoryMode {
     Live,
     Recorded,
     Greeting,
+}
+
+impl VoiceHistoryMode {
+    fn prompt_limit(self, context: usize, completion_tokens: usize) -> usize {
+        // All voice phases share one history projection. Filling the microphone
+        // reserve during pickup makes the next capture roll away that freshly
+        // evaluated history, even when no new caller content has arrived.
+        let microphone_reserve = (context / 4).min(4096);
+        context.saturating_sub(microphone_reserve + completion_tokens + 32)
+    }
 }
 
 pub(crate) struct VoicePrompt<'a> {
@@ -48,12 +62,7 @@ pub(crate) fn fit_voice_context(
         .map_or(prompt.settings.context_tokens, |f| f.context_tokens) as usize;
     // Future microphone samples need their own budget. The worker also checks
     // every live block against the actual context, including closing tokens.
-    let microphone_reserve = if matches!(prompt.mode, VoiceHistoryMode::Live) {
-        (context / 4).min(4096)
-    } else {
-        0
-    };
-    let limit = context.saturating_sub(microphone_reserve + prompt.completion_tokens + 32);
+    let limit = prompt.mode.prompt_limit(context, prompt.completion_tokens);
     let profile = digest(&(
         // Older windows reserved headroom from the entire prompt, which could
         // put the target below the mandatory persona and discard all history.
@@ -127,7 +136,7 @@ pub(crate) fn fit_voice_context(
         .iter()
         .filter(|message| message.role != MessageRole::System)
         .count();
-    conversation.inference_window = if start == 0 {
+    let window = if start == 0 {
         None
     } else {
         Some(ConversationInferenceWindow {
@@ -136,7 +145,62 @@ pub(crate) fn fit_voice_context(
             profile_sha256: profile,
         })
     };
+    if window != conversation.inference_window {
+        // Save only a changed projection boundary, before it can replace the
+        // worker's resident prefix. A prearmed capture may be cancelled without
+        // committing a message; redial must still use this same history. This
+        // small metadata transaction neither exports nor persists native KV.
+        let store = RuntimeStore::open(&prompt.settings.data_dir)?;
+        if !persist_window_if_unchanged(&store, conversation, active, window.as_ref())? {
+            return Err(anyhow!(
+                "voice_context_changed: Conversation history changed during voice preparation"
+            ));
+        }
+        conversation.inference_window = window;
+    }
     Ok(projection)
+}
+
+fn persist_window_if_unchanged(
+    store: &RuntimeStore,
+    expected: &Conversation,
+    expected_active: &[Message],
+    window: Option<&ConversationInferenceWindow>,
+) -> Result<bool> {
+    let expected_source = source_digest(expected_active)?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &expected.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(current) = db
+                .conversations
+                .iter_mut()
+                .find(|item| item.id == expected.id)
+            else {
+                return Ok(false);
+            };
+            if current.active_leaf_message_id != expected.active_leaf_message_id
+                || current.branch_root_message_id != expected.branch_root_message_id
+                || current.execution_profile != expected.execution_profile
+                || current.selected_model_path != expected.selected_model_path
+                || current.current_skill_ids != expected.current_skill_ids
+                || current.source_conversation_id != expected.source_conversation_id
+                || (current.inference_window != expected.inference_window
+                    && current.inference_window.as_ref() != window)
+                || source_digest(&crate::document::checked_active_messages(current)?)?
+                    != expected_source
+            {
+                return Ok(false);
+            }
+            current.inference_window = window.cloned();
+            Ok(true)
+        },
+    )
 }
 
 fn history_budget_exceeded(blocked: &AttachmentContextBlocker) -> bool {
@@ -288,6 +352,191 @@ mod tests {
             attribution: None,
             attachment_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn greeting_to_microphone_keeps_the_same_history_prefix() -> Result<()> {
+        let mut history = Vec::new();
+        for index in 0..5 {
+            history.push(message(
+                &format!("u{index}"),
+                MessageRole::User,
+                "old speech",
+            ));
+            history.push(message(
+                &format!("a{index}"),
+                MessageRole::Assistant,
+                "old reply",
+            ));
+        }
+        let measure =
+            |messages: &[Message]| Ok(Some((11_200 + messages.len() * 400, messages.to_vec())));
+        let (greeting_start, greeting) = fit_window(
+            &history,
+            0,
+            VoiceHistoryMode::Greeting.prompt_limit(18_944, 96),
+            measure,
+        )?;
+        let (live_start, live) = fit_window(
+            &history,
+            greeting_start,
+            VoiceHistoryMode::Live.prompt_limit(18_944, 96),
+            measure,
+        )?;
+        assert_eq!(
+            greeting_start, live_start,
+            "microphone preparation must not discard history just used for pickup"
+        );
+        assert_eq!(
+            greeting, live,
+            "unchanged old content must remain the same cached prefix"
+        );
+        let (recorded_start, recorded) = fit_window(
+            &history,
+            0,
+            VoiceHistoryMode::Recorded.prompt_limit(18_944, 96),
+            measure,
+        )?;
+        assert_eq!((recorded_start, recorded), (greeting_start, greeting));
+        Ok(())
+    }
+
+    fn saved_history() -> Conversation {
+        let mut messages = Vec::new();
+        let mut parent = None;
+        for index in 0..6 {
+            for (prefix, role) in [("u", MessageRole::User), ("a", MessageRole::Assistant)] {
+                let mut item = message(&format!("{prefix}{index}"), role, "saved content");
+                item.parent_id = parent;
+                parent = Some(item.id.clone());
+                messages.push(item);
+            }
+        }
+        Conversation {
+            id: "voice-context-test".into(),
+            title: "Conversation".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: Default::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: parent,
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages,
+            inference_window: None,
+        }
+    }
+
+    fn window_at(active: &[Message], start: usize) -> Result<ConversationInferenceWindow> {
+        Ok(ConversationInferenceWindow {
+            covered_through_message_id: active[start - 1].id.clone(),
+            covered_source_sha256: source_digest(&active[..start])?,
+            profile_sha256: "profile".into(),
+        })
+    }
+
+    #[test]
+    fn prepared_roll_survives_hangup_and_reopen_without_committing_a_turn() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(root.path(), [71; 32])?;
+        let original = saved_history();
+        let active = crate::document::checked_active_messages(&original)?;
+        let mut db = ConversationDb {
+            conversations: vec![original.clone()],
+            selected_conversation_id: Some(original.id.clone()),
+        };
+        store.put(CONVERSATIONS_NAMESPACE, &db)?;
+        // The saved greeting still fits. A slightly larger microphone framing
+        // crosses the same limit, so equal budgets alone cannot cover hangup.
+        let limit = VoiceHistoryMode::Greeting.prompt_limit(18_944, 96);
+        let (greeting_start, _) = fit_window(&active, 0, limit, |messages| {
+            Ok(Some((11_000 + messages.len() * 300, ())))
+        })?;
+        assert_eq!(greeting_start, 0);
+        let (live_start, selected) = fit_window(&active, greeting_start, limit, |messages| {
+            Ok(Some((11_300 + messages.len() * 300, messages.to_vec())))
+        })?;
+        assert!(live_start > 0);
+        let window = window_at(&active, live_start)?;
+        // Concurrent presentation changes survive the metadata-only update.
+        db.conversations[0].title = "Renamed during preparation".into();
+        store.put(CONVERSATIONS_NAMESPACE, &db)?;
+        assert!(persist_window_if_unchanged(
+            &store,
+            &original,
+            &active,
+            Some(&window)
+        )?);
+        // A duplicate preparation of the same boundary is harmless.
+        assert!(persist_window_if_unchanged(
+            &store,
+            &original,
+            &active,
+            Some(&window)
+        )?);
+        drop(store); // Hangup/cancellation: no generated exchange is committed.
+        let reopened = RuntimeStore::open_with_key(root.path(), [71; 32])?;
+        let saved = reopened
+            .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+            .expect("saved history");
+        assert_eq!(saved.conversations[0].messages, original.messages);
+        assert_eq!(saved.conversations[0].updated_at, original.updated_at);
+        assert_eq!(saved.conversations[0].title, "Renamed during preparation");
+        assert_eq!(saved.selected_conversation_id, db.selected_conversation_id);
+        let resumed_start = valid_window_start(
+            &active,
+            saved.conversations[0].inference_window.as_ref(),
+            "profile",
+        )?;
+        let (redial_start, redial) = fit_window(&active, resumed_start, limit, |messages| {
+            Ok(Some((11_000 + messages.len() * 300, messages.to_vec())))
+        })?;
+        assert_eq!(redial_start, live_start);
+        assert_eq!(
+            redial, selected,
+            "redial must reuse the prepared historical prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_preparation_cannot_replace_source_or_a_newer_window() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(root.path(), [72; 32])?;
+        let original = saved_history();
+        let active = crate::document::checked_active_messages(&original)?;
+        let window = window_at(&active, 4)?;
+        for change in 0..8 {
+            let mut concurrent = original.clone();
+            match change {
+                0 => concurrent.messages[0].content = "edited".into(),
+                1 => concurrent.active_leaf_message_id = Some("a4".into()),
+                2 => concurrent.execution_profile.version += 1,
+                3 => concurrent.current_skill_ids.push("different-skill".into()),
+                4 => concurrent.selected_model_path = Some("different-model".into()),
+                5 => concurrent.source_conversation_id = Some("different-persona".into()),
+                6 => concurrent.inference_window = Some(window_at(&active, 8)?),
+                _ => concurrent.branch_root_message_id = Some("u1".into()),
+            }
+            let db = ConversationDb {
+                conversations: vec![concurrent],
+                selected_conversation_id: None,
+            };
+            store.put(CONVERSATIONS_NAMESPACE, &db)?;
+            assert!(
+                !persist_window_if_unchanged(&store, &original, &active, Some(&window))?,
+                "stale authority case {change}"
+            );
+            assert_eq!(
+                store.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
+                Some(db)
+            );
+        }
+        Ok(())
     }
 
     #[test]
