@@ -17,8 +17,11 @@ diarize a training corpus.
 
 In this context “OCR” can only reasonably refer to the broader extraction work
 that produced retained captions and Whisper drafts. OCR itself is an image/text
-transform and is not part of the podcast audio path in this repository. There
-is no checked-in executable podcast diarization pipeline to extend.
+transform and is not part of the podcast audio path in this repository. The
+offline `diarize-archive-source.mjs` and `speaker-diarization-ledger.mjs` tools
+now produce acoustic speaker clusters and review records, but those machine
+clusters do not establish a named speaker or verify a transcript. The current
+corpus has no admitted, source-disjoint training split.
 
 Before training, an external/offline corpus builder must emit an immutable
 admission manifest. Every source, normalized audio file, VAD segment, transcript,
@@ -105,7 +108,7 @@ run as reproducible or packaging its `config_sha256`; the command above is an
 exact pilot execution, not yet a reproducible promotion recipe.
 
 Do not select the last checkpoint automatically. Compare every epoch to the
-unadapted Base ICL route with frozen short, long, emotional, numerical, and
+unadapted resident Base route with frozen short, long, emotional, numerical, and
 out-of-domain prompts. Record validation/test loss, ASR intelligibility,
 speaker similarity as a supporting metric, blind identity/naturalness ratings,
 EOS failures, interviewer leakage, time to first PCM, real-time factor, and
@@ -126,7 +129,8 @@ module sets, selects one resident persona at a time, and clears generation
 caches on every switch. The remaining integration step is to load a configured
 adapter package root when the resident helper starts and carry `persona_id`
 over the serial Rust-to-Swift request protocol. Until admitted data has produced
-a validated package, the shipped request path continues to use Base ICL.
+a validated package, the shipped resident request path continues to use Base
+speaker-embedding conditioning with reference-code decoder context.
 
 Primary guidance: [Thinking Machines Lab, “LoRA Without Regret”](https://thinkingmachines.ai/blog/lora/).
 The Qwen-specific trainer is the pinned community companion above and remains
