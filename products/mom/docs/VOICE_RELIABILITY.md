@@ -690,3 +690,29 @@ regression under two distinct parent Git commits kept the pinned metadata equal;
 the unpinned control followed each parent commit. The earlier failed candidate
 and comparison receipt remain preserved. Always compare native identity between
 app-only builds; a component pass alone does not establish cache compatibility.
+
+## Standalone hashing performance
+
+The Mom-only release build must enable sha2 0.10.9's `asm` feature. That version
+gates its runtime-dispatched ARM SHA-256 implementation behind this feature;
+without it an ARM Mac uses the software implementation. Enabling it only in a
+Loom dependency made workspace checks and standalone Mom builds resolve
+different hashing backends. The workspace dependency now declares the feature
+so every product receives the same implementation choice. Digest formats, HMAC
+authentication, cache fingerprints, and encryption remain unchanged.
+
+Candidate 14's release fingerprints and selected-package feature tree confirmed
+`default,std` without `asm`. An isolated release comparison on this Mac, hashing
+the same 128 MiB input four times per sample, measured median totals of 887.463
+ms without acceleration and 186.381 ms with it; all digests matched. This is a
+hashing measurement, not a pickup-latency or audio-playback acceptance result.
+Retain the selected-product feature tree with performance qualification; a
+workspace-only feature graph can conceal this regression.
+
+Candidate 14's warm redial reused 13,670 of 13,718 prompt tokens, but still took
+12.808 seconds to render. The first 11.916 seconds preceded speech preemption;
+the call-activity registry lock can wait for a background native checkpoint.
+The snapshot includes whole-buffer authentication, but its queue, native copy,
+and authentication phases were not separately timed in that trace. Faster
+hashing must not be presented as proof that this entire delay or the reported
+mid-word audio dropouts have been fixed.
