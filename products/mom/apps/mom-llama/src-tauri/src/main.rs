@@ -363,10 +363,9 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
         } => retry_cached_failure,
     };
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Blessenger could not locate its setup data: {error}"))?;
+    // Setup readiness belongs to the runtime profile. Tauri's application
+    // directory is shared by profiles launched with distinct data overrides.
+    let app_data_dir = mom_llama_runtime::config::resolve_data_dir();
     let first_run = !model_acquisition::installation_receipt_is_current(&app_data_dir);
     let _ = app.emit(
         "mom_llama_setup_state",

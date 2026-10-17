@@ -78,6 +78,12 @@ Two actual native builds with distinct Cargo output directories produced
 the same Mac/compiler/features. No artifact digest was normalized or weakened.
 This does not establish cross-compiler or cross-machine reproducibility.
 
+First-run readiness is scoped to the runtime data directory, including an
+explicit `LLAMA_NATIVE_KIT_DATA_DIR` override. A setup receipt in Tauri's shared
+application directory cannot qualify a fresh profile. Existing profiles without
+their own receipt verify the acquired assets and complete runtime warming once;
+the old application-directory receipt is left untouched.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and
