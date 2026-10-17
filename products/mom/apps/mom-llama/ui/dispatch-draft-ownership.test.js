@@ -616,6 +616,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
       signalFinishStarted();
       return new Promise((resolve) => { resolveSpeech = resolve; });
     },
+    trackGeneration: (operation) => operation,
     stop: async () => true,
   };
   const context = {

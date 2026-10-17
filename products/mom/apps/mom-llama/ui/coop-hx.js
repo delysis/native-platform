@@ -2469,11 +2469,11 @@
       // whose differently shaped stream/result previously stranded pickup.
       markVoiceLatencyIn(greetingTrace, "generation_dispatched", { purpose: "call_greeting" });
       const response = await withProgressDeadline(
-        invoke("mom_llama_chat_send", {
+        tts.trackGeneration(invoke("mom_llama_chat_send", {
           conversation,
           clientRequest: tts.clientRequest,
           message: "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
-        }),
+        })),
         30_000,
         () => tts.lastProgressAt,
         "call_reply_timeout: The contact did not finish answering the call.",
@@ -5507,6 +5507,7 @@
     let activeSynthesis = null;
     let cancelPcmDelivery = null;
     let nextCallPrefill = null;
+    let generationSettlement = Promise.resolve();
     let callTranscriptResidentCheck = null;
     let nextCallPrefillRetryPending = false;
     let retryHook = null;
@@ -5654,12 +5655,25 @@
       if (nextCallPrefill || mode !== "call" || !voiceCallActive || voiceCallEpoch !== callEpoch) {
         return nextCallPrefill;
       }
-      markTtsLatency("next_turn_prefill_started", {
-        overlap: trigger,
-        buffered_runway_ms: controller.bufferedMs(),
-      });
-      const startedAt = performance.now();
-      nextCallPrefill = startVoicePrefill(conversation, true, ttsLatencyTrace).then(async (live) => {
+      const requestedAt = performance.now();
+      let startedAt = requestedAt;
+      // Barge-in can stop speech before the confirmed reply is saved. Keep
+      // capture running, but do not snapshot the next prompt until that exact
+      // native operation has settled. Otherwise the new turn becomes a sibling
+      // of the interrupted reply and subsequent turns follow the wrong branch.
+      nextCallPrefill = generationSettlement.then(() => {
+        if ((stopped && !nextCallPrefillHandedOff)
+            || !voiceCallActive || voiceCallEpoch !== callEpoch) return null;
+        startedAt = performance.now();
+        markTtsLatency("next_turn_history_settled", {
+          wait_ms: Math.round((startedAt - requestedAt) * 100) / 100,
+        });
+        markTtsLatency("next_turn_prefill_started", {
+          overlap: trigger,
+          buffered_runway_ms: controller.bufferedMs(),
+        });
+        return startVoicePrefill(conversation, true, ttsLatencyTrace);
+      }).then(async (live) => {
         if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
         if ((stopped && !nextCallPrefillHandedOff)
             || !voiceCallActive || voiceCallEpoch !== callEpoch) {
@@ -6352,6 +6366,13 @@
         rememberVoiceStreamRequest(candidate);
         void reconcileSemanticBackpressure();
         return true;
+      },
+      trackGeneration(operation) {
+        // Observe the native operation itself, never a renderer timeout or
+        // cancellation request: only settlement establishes that its history
+        // commit can no longer race preparation of the next turn.
+        generationSettlement = operation.then(() => {}, () => {});
+        return operation;
       },
       get button() { return button; },
       get audible() { return controller.playing; },
@@ -8331,13 +8352,13 @@
       const generationTimeoutMs = 30_000;
       const rendererFailsafeMs = generationTimeoutMs + 2_000;
       const waitForNativeSilence = Boolean(prearm && recording.native);
-      const generation = invoke("mom_llama_voice_audio_speculate", {
+      const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate", {
         session: live.session,
         speculation: speculation.id,
         capture: recording.native ? recording.capture : null,
         waitForSilence: waitForNativeSilence,
         generationTimeoutMs,
-      });
+      }));
       // A prearmed request may wait while the caller speaks for any length of
       // time. Start its deadline only when native VAD releases the silence
       // gate. The unguarded branch still propagates an admission error that
@@ -10280,7 +10301,7 @@
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
             if (liveVoice) {
-              const finished = await invoke("mom_llama_voice_audio_finish", {
+              const operation = invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
                 recording: liveVoice.recording,
                 ...(liveVoice.modelInput ? {
@@ -10292,6 +10313,8 @@
                     : { sourceStartSample: liveVoice.modelInput.sourceStartSample }),
                 } : {}),
               });
+              const finished = await (voiceTtsOwner
+                ? voiceTtsOwner.trackGeneration(operation) : operation);
               result = finished?.result ? {
                 ...finished,
                 result: { kind: "direct", conversation_id: conversation, output: finished.result },
@@ -10304,10 +10327,12 @@
               if (fallbackVoice) {
                 await persistDraftNow(message, [fallbackVoice.attachment], conversation);
               }
-              result = await invoke("mom_llama_chat_dispatch", {
+              const operation = invoke("mom_llama_chat_dispatch", {
                 conversation, message,
                 ...(voiceTtsOwner?.clientRequest ? { clientRequest: voiceTtsOwner.clientRequest } : {}),
               });
+              result = await (voiceTtsOwner
+                ? voiceTtsOwner.trackGeneration(operation) : operation);
             }
             if (voiceDispatch) {
               const output = result?.result?.output;

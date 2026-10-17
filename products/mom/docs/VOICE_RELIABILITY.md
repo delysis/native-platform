@@ -152,6 +152,30 @@ Regression checks compare a continuous synthetic waveform across varying batch
 sizes, including both empty and nonempty final remainders. This repairs sample
 loss; it does not establish the cause of multi-second physical-output pauses.
 
+## Interrupted replies and next-turn history
+
+Stopping speech is not evidence that the reply has finished saving. A call can
+already be capturing the next utterance while the previous confirmed reply is
+still completing its native operation. Preparing the next prompt during that
+interval reads the previous leaf and creates sibling exchanges; the store
+correctly preserves the existing active branch, but subsequent replies can then
+follow a different branch from the one the caller just heard.
+
+Each live speech controller tracks its exact native generation promise. The
+next prompt is prepared only after that promise settles, including failure or
+cancellation, and after rechecking the call epoch. Microphone capture continues
+and playback interruption remains immediate. A renderer timeout, speech-backend stop,
+or cancellation request is not a substitute for native operation settlement.
+This applies to call greetings, speculative audio, and complete-recording
+fallback dispatches. `next_turn_history_settled.wait_ms` separates this ordering
+wait from the subsequent prompt-preparation measurement.
+
+The behavioral regression interrupts playback before the prior operation
+commits, verifies capture remains available and preparation has not started,
+then verifies the next prompt sees the committed leaf. It also covers native
+failure and hangup during the wait. These checks establish ordering only;
+physical speaker testing remains a separate acceptance step.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and
