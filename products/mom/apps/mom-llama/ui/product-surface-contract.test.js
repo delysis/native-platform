@@ -355,7 +355,7 @@ test("window chrome is centered and every native resize edge is discoverable", (
   const windowConfig = JSON.parse(read("apps/mom-llama/src-tauri/tauri.conf.json")).app.windows[0];
   assert.equal(windowConfig.titleBarStyle, "Overlay");
   assert.equal(windowConfig.decorations, true);
-  assert.deepEqual(windowConfig.trafficLightPosition, { x: 20, y: 26 });
+  assert.deepEqual(windowConfig.trafficLightPosition, { x: 20, y: 30 });
   assert.ok(styles.includes(".chrome .icon-button,\n.composer .round-button,"));
 
 });

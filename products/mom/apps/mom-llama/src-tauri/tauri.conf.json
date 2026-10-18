@@ -24,7 +24,7 @@
         "useHttpsScheme": true,
         "trafficLightPosition": {
           "x": 20,
-          "y": 26
+          "y": 30
         }
       }
     ],
