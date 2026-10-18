@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { AdaptiveVoiceLeadController } = require("./voice-pipeline-scheduler.js");
 
 const ui = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
 const style = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
@@ -709,6 +710,65 @@ test("a cold reply's pending segment stays gated until its measured completion r
   assert.equal(h.audioContexts.length, 1, "clearing the measured gate starts without another packet or reply finish");
   assert.equal(h.audioContexts[0].sources.length, 1);
   await controller.stop();
+});
+
+test("the packet-level cold probe starts the playback controller before EOF and cannot wake a stopped player", async () => {
+  const timeline = [
+    [3_328, 0], [5_760, 123.7], [9_600, 319.3], [9_600, 517.6], [9_600, 720.5],
+  ];
+  const make = () => {
+    const h = speechLifetimeHarness();
+    const lead = new AdaptiveVoiceLeadController({
+      initialBufferComplete: true,
+      initialProbePending: true,
+    });
+    const playback = h.createPcmPlaybackBuffer({
+      autoplay: true,
+      retainHistory: false,
+      waitForCompletion: () => lead.shouldBufferCompleteReply(),
+    });
+    let previousArrival = 0;
+    let previousPcmMs = 0;
+    let sampleOffset = 0;
+    const push = async (index) => {
+      const [samples, arrivalMs] = timeline[index];
+      const audioMs = samples / 24;
+      lead.notePacket({
+        audioMs,
+        gapMs: index === 0 ? null : arrivalMs - previousArrival,
+        startupDeficitMs: Math.max(0, arrivalMs - previousPcmMs),
+      });
+      playback.push(h.pcmFrame(new Uint8Array(samples * 2), index, false, sampleOffset));
+      previousArrival = arrivalMs;
+      previousPcmMs += audioMs;
+      sampleOffset += samples;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    return { h, lead, playback, push };
+  };
+
+  const active = make();
+  for (let index = 0; index < 4; index += 1) {
+    await active.push(index);
+    assert.equal(active.h.audioContexts.length, 0, `packet ${index + 1} stays behind the cold gate`);
+  }
+  assert.equal(active.lead.shouldBufferCompleteReply(), true);
+  await active.push(4);
+  assert.equal(active.lead.shouldBufferCompleteReply(), false);
+  assert.equal(active.playback.ready, true);
+  assert.equal(active.h.audioContexts.length, 1, "packet five creates the test renderer before EOF");
+  assert.equal(active.playback.playing, true);
+  await active.playback.stop();
+
+  const stopped = make();
+  for (let index = 0; index < 4; index += 1) await stopped.push(index);
+  assert.equal(stopped.h.audioContexts.length, 0);
+  await stopped.playback.stop();
+  await stopped.push(4);
+  await stopped.playback.reconsiderStartup();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped.lead.shouldBufferCompleteReply(), false, "the evidence can settle after stop");
+  assert.equal(stopped.h.audioContexts.length, 0, "late packet evidence cannot wake the stopped renderer");
 });
 
 test("a stopped player cannot be woken by clearing its cold startup gate", async () => {

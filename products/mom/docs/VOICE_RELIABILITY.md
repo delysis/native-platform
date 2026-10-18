@@ -106,6 +106,28 @@ and agreement between live routing and final parsing.
 
 ## Sentence prosody and streaming PCM continuity
 
+Sentence-level text admission and PCM startup buffering are separate decisions.
+Give Qwen complete sentences for prosody, but do not require all of a healthy
+sentence's PCM before playback. A cold producer may release the startup probe
+after five measured packets, at least 1.2 seconds of PCM, and sustained production
+faster than playback. Both recent and cumulative cadence must qualify, with
+headroom for the observed startup deficit and packet gap. Missing measurements,
+slow production, and prior underrun evidence retain the conservative fallback.
+This is a bounded startup decision, not a guarantee against a later producer
+stall. Retain sentence boundaries, cancellation, and adaptive underrun recovery.
+
+TTS completion receipts distinguish EOS from token-budget exhaustion, pad/cycle
+guards, and cancellation. Unreported counts remain unknown. A bounded packet
+timeline records arrival offsets and cumulative frame counts, without speech
+text or microphone PCM, so startup policies can be replayed against actual
+production. A replay verifies the observed schedule, not physical speaker
+quality or behavior on another Mac.
+
+Speculative failures cannot acquire the next microphone turn before playback is
+authorized, or replace an existing capture. Native blocked/no-result envelopes
+must release an unconfirmed recording-import waiter before joining its worker,
+just as transport errors do. An already confirmed recording remains confirmed.
+
 The vocoder decodes generated acoustic codes only. Speaker conditioning belongs
 to the talker; unrelated reference-waveform codes must not fill an initial or
 expanding decoder window. Filling the early 32-frame window with reference codes
