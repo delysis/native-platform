@@ -625,6 +625,10 @@
 
   let voiceReplyPlayRequested = false;
   const voiceReplyPlayback = new WeakMap();
+  const failedVoiceReplyOwners = new Map();
+  const MAX_FAILED_VOICE_REPLY_OWNERS = 1;
+  const activeVoiceNotePublications = new Set();
+  const voiceReplyPersistenceKey = (conversation, message) => `${conversation}\u0000${message}`;
   const pendingVoiceReply = () => {
     return createTypingIndicator();
   };
@@ -663,19 +667,16 @@
     row.classList.remove("voice-reply-pending");
   };
 
-  const settleDurableVoiceReply = (button, controller) => {
+  const settleInMemoryVoiceReply = (button, controller, trace = voiceLatencyTrace) => {
     const row = button?.closest?.(".message-row");
     const card = row?.querySelector?.(".message-card");
     const player = button?.closest?.(".voice-message-player");
     const bytes = controller?.wavBytes?.();
-    const traceId = voiceLatencyTrace?.id || null;
-    const markThisTrace = (stage, detail = {}) => {
-      if (traceId && voiceLatencyTrace?.id === traceId) markVoiceLatency(stage, detail);
-    };
+    const markThisTrace = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
     if (!row?.classList.contains("voice-reply-row") || !card || !player
         || !controller?.ready || !isCanonicalPcmWav(bytes)) {
       settleUnavailableVoiceReply(button);
-      markThisTrace("durable_voice_audio_failed", {
+      markThisTrace("in_memory_voice_audio_failed", {
         reason: bytes?.byteLength ? "invalid_wav" : "missing_wav",
         wav_bytes: bytes?.byteLength || 0,
       });
@@ -697,7 +698,7 @@
     button.removeAttribute("aria-pressed");
     player.classList.remove("voice-message-pending", "voice-message-unavailable");
     player.classList.toggle("is-playing", controller.playing);
-    markThisTrace("durable_voice_audio_ready", { wav_bytes: bytes.byteLength });
+    markThisTrace("in_memory_voice_audio_ready", { wav_bytes: bytes.byteLength });
     row.hidden = false;
     row.classList.remove("voice-reply-pending");
     return true;
@@ -1921,29 +1922,6 @@
     }, { rootMargin: "320px 0px" });
   }
 
-  const prepareVoiceReplyRow = (messageId, root = document) => {
-    if (!messageId) return null;
-    const row = root?.querySelector?.(
-      `.message-row.assistant[data-message-id='${CSS.escape(messageId)}']`,
-    );
-    const button = row?.querySelector?.("[data-action='message-read-aloud']");
-    if (!row || !button) return null;
-    button.dataset.personaVoice = "true";
-    button.dataset.prepareOnly = "true";
-    if (voiceReplyPlayRequested) {
-      button.dataset.autoplayWhenReady = "true";
-      button.classList.add("is-loading");
-    }
-    row.classList.add("voice-reply-pending");
-    row.classList.add("voice-reply-row");
-    button.classList.add("voice-reply-play");
-    const card = row.querySelector(".message-card");
-    card?.replaceChildren(button, waveform());
-    row.querySelector(".message-actions")?.remove();
-    row.hidden = false;
-    return button;
-  };
-
   const hydrateAttachmentPreviews = async (root = document) => {
     const previews = attachmentPreviewsWithin(root);
     previews.forEach((preview) => {
@@ -1971,30 +1949,52 @@
       const next = row.nextElementSibling;
       if (row.classList.contains("call-turn")) next?.classList.add("call-turn");
       if (!row.querySelector(".voice-message-bubble") || !next?.classList.contains("assistant")) return;
-      const button = next.querySelector("[data-action='message-read-aloud']");
-      if (!button) return;
+      const hasSavedVoiceAttachment = Boolean(
+        next.querySelector(".message-attachments [data-attachment-preview]"),
+      );
+      // Saved audio and native unavailable markers are authoritative; only
+      // the exact live result may remain hidden while its owner publishes.
+      if (hasSavedVoiceAttachment) return;
       const preparingLiveReply = voiceReplyConversation === selectedConversation()
         && voiceReplyMessageId
         && next.dataset.messageId === voiceReplyMessageId;
       if (preparingLiveReply) {
-        button.dataset.personaVoice = "true";
-        button.dataset.prepareOnly = "true";
         next.classList.add("voice-reply-pending");
         next.hidden = true;
+        return;
       } else {
+        if (next.classList.contains("voice-message-row")) return;
+        const button = next.querySelector("[data-action='message-read-aloud']");
+        if (!button) return;
         // A preceding user voice attachment proves how the user spoke; it does
         // not prove that the assistant reply has retained audio. Historical
         // text therefore keeps its ordinary read-aloud action. A voice-message
         // play control is published only by the live PCM controller or by an
         // actual assistant audio attachment.
-        delete button.dataset.personaVoice;
-        delete button.dataset.prepareOnly;
         next.classList.remove("voice-reply-pending", "voice-reply-row");
         button.classList.remove("voice-reply-play", "is-loading", "is-awaiting-audio");
         button.removeAttribute("aria-pressed");
         next.hidden = false;
       }
     });
+    const conversation = selectedConversation();
+    for (const row of root?.querySelectorAll?.(".message-row.assistant") || []) {
+      const message = row.dataset.messageId;
+      if (!message) continue;
+      const playback = failedVoiceReplyOwners.get(voiceReplyPersistenceKey(conversation, message));
+      if (!playback || row.querySelector(".message-attachments [data-attachment-preview]")) continue;
+      const card = row.querySelector(".message-card");
+      if (!card) continue;
+      row.classList.add("voice-message-row", "voice-reply-row", "voice-reply-has-audio");
+      row.hidden = false;
+      const player = pendingVoiceReplyPlayer();
+      card.replaceChildren(player);
+      const button = player.querySelector(".voice-reply-play");
+      if (!button || !playback.bindButton(button)) continue;
+      button.dataset.audioPersistence = "failed";
+      button.title = "Audio is available in this session; retry saving";
+      settleInMemoryVoiceReply(button, playback.controller, playback.trace);
+    }
   };
 
   window.addEventListener("beforeunload", () => {
@@ -5049,7 +5049,7 @@
     "first_content_delta_received", "tts_first_chunk_ready", "tts_native_dispatched",
     "tts_first_pcm", "tts_segment_finished", "tts_all_segments_finished",
     "tts_segment_dispatched", "tts_segment_first_pcm", "tts_segment_pcm_complete",
-    "tts_segment_receipt_received",
+    "tts_segment_receipt_received", "tts_backend_complete", "tts_pcm_complete",
     "next_turn_prefill_started", "next_turn_prefill_ready", "next_turn_prefill_failed",
     "barge_in_detected", "barge_in_playback_stopped", "barge_in_playback_stop_failed",
     "playable", "playback_started", "playback_render_started",
@@ -5495,6 +5495,15 @@
     onPlaybackStarted = null,
     onFailure = null,
   }) => {
+    const voiceNotePublicationReservation = mode === "voice_note" ? {} : null;
+    if (voiceNotePublicationReservation) {
+      activeVoiceNotePublications.add(voiceNotePublicationReservation);
+    }
+    const releaseVoiceNotePublicationReservation = () => {
+      if (voiceNotePublicationReservation && !durableVoiceStorePromise) {
+        activeVoiceNotePublications.delete(voiceNotePublicationReservation);
+      }
+    };
     if (requestId) rememberVoiceStreamRequest(requestId);
     let pendingText = "";
     let streamedText = "";
@@ -5546,11 +5555,127 @@
     let firstPcmSeen = false;
     let voiceNoteComplete = false;
     let durablePending = false;
+    let voiceAudioReadySettled = false;
+    let resolveVoiceAudioReady;
+    const voiceAudioReady = new Promise((resolve) => { resolveVoiceAudioReady = resolve; });
+    const settleVoiceAudioReady = (ready) => {
+      if (voiceAudioReadySettled) return;
+      voiceAudioReadySettled = true;
+      resolveVoiceAudioReady(ready);
+    };
+    let durableVoiceTarget = null;
+    let durableVoiceStorePromise = null;
+    let durableVoiceAttachmentId = null;
+    let durableVoiceStoreError = null;
     let resolveFinished;
     const finished = new Promise((resolve) => { resolveFinished = resolve; });
     const ttsLatencyTrace = voiceLatencyTrace;
     const markTtsLatency = (stage, detail = {}) => {
       markVoiceLatencyIn(ttsLatencyTrace, stage, detail);
+    };
+    const bindDurableVoiceReply = (target) => {
+      if (mode !== "voice_note") return Promise.resolve(null);
+      const exactTarget = {
+        conversation: typeof target?.conversation === "string" ? target.conversation : "",
+        message: typeof target?.message === "string" ? target.message : "",
+        text: typeof target?.text === "string" ? target.text : "",
+      };
+      if (!exactTarget.conversation || !exactTarget.message || !exactTarget.text.trim()) {
+        return Promise.reject(new Error("voice_reply_attachment_target_missing"));
+      }
+      if (durableVoiceTarget && (durableVoiceTarget.conversation !== exactTarget.conversation
+        || durableVoiceTarget.message !== exactTarget.message
+        || durableVoiceTarget.text !== exactTarget.text)) {
+        return Promise.reject(new Error("voice_reply_attachment_target_conflict"));
+      }
+      durableVoiceTarget ||= exactTarget;
+      if (durableVoiceAttachmentId) return Promise.resolve(durableVoiceAttachmentId);
+      if (durableVoiceStorePromise) return durableVoiceStorePromise;
+      if (voiceNotePublicationReservation) {
+        activeVoiceNotePublications.add(voiceNotePublicationReservation);
+      }
+      let storeAttempted = false;
+      durableVoiceStorePromise = (async () => {
+        if (!await voiceAudioReady) {
+          throw new Error("voice_reply_audio_incomplete: The reply audio did not finish.");
+        }
+        const bytes = controller.wavBytes();
+        if (!isCanonicalPcmWav(bytes)) {
+          throw new Error("voice_reply_audio_invalid: The completed reply audio is unavailable.");
+        }
+        storeAttempted = true;
+        const response = await invoke("mom_llama_voice_reply_store", {
+          conversation: exactTarget.conversation,
+          message: exactTarget.message,
+          text: exactTarget.text,
+          bytes: Array.from(bytes),
+        });
+        const attachmentId = response?.result?.attachment?.id;
+        if (response?.status !== "contracted" || !attachmentId) {
+          const blocker = response?.blocker;
+          throw new Error(blocker
+            ? `${blocker.code}: ${blocker.message}`
+            : "voice_reply_attachment_uncommitted: The reply audio was not saved.");
+        }
+        durableVoiceAttachmentId = attachmentId;
+        durableVoiceStoreError = null;
+        if (voiceNotePublicationReservation) {
+          activeVoiceNotePublications.delete(voiceNotePublicationReservation);
+        }
+        failedVoiceReplyOwners.delete(voiceReplyPersistenceKey(
+          exactTarget.conversation, exactTarget.message,
+        ));
+        if (button) {
+          button.dataset.committedAttachment = attachmentId;
+          delete button.dataset.audioPersistence;
+          button.title = "Play voice message";
+        }
+        markTtsLatency("durable_voice_audio_ready", {
+          attachment_id: attachmentId,
+          wav_bytes: bytes.byteLength,
+        });
+        refreshVoiceReplyProjectionIfNeeded(exactTarget);
+        return attachmentId;
+      })().catch((error) => {
+        durableVoiceStorePromise = null;
+        durableVoiceStoreError = storeAttempted ? error : null;
+        const key = voiceReplyPersistenceKey(exactTarget.conversation, exactTarget.message);
+        if (storeAttempted) {
+          failedVoiceReplyOwners.set(key, playback);
+          if (button) {
+            button.dataset.audioPersistence = "failed";
+            button.title = "Audio is available in this session; retry saving";
+          }
+          markTtsLatency("durable_voice_audio_failed", { message: errorMessage(error) });
+          reportError(error);
+          refreshVoiceReplyProjectionIfNeeded(exactTarget);
+        } else {
+          markTtsLatency("durable_voice_audio_not_stored", { message: errorMessage(error) });
+        }
+        releaseVoiceNotePublicationReservation();
+        return null;
+      });
+      return durableVoiceStorePromise;
+    };
+    const refreshVoiceReplyProjectionIfNeeded = (target) => {
+      if (selectedConversation() !== target.conversation || button?.isConnected) return;
+      let attempts = 0;
+      const refreshWhenIdle = () => {
+        if (selectedConversation() !== target.conversation) return;
+        if (activeDispatchConversation === target.conversation && attempts++ < 40) {
+          window.setTimeout(refreshWhenIdle, 50);
+          return;
+        }
+        if (activeDispatchConversation === target.conversation) return;
+        void retainComposerDraft().then(() => {
+          if (selectedConversation() === target.conversation
+              && activeDispatchConversation !== target.conversation) {
+            return refreshChat();
+          }
+          return null;
+        }).catch(reportError);
+      };
+      window.setTimeout(refreshWhenIdle, 0);
     };
     const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController(
       voiceLeadCalibration || { initialBufferComplete: true, initialProbePending: true },
@@ -5865,7 +5990,7 @@
         }
         if (mode === "voice_note" && durablePending && button) {
           durablePending = false;
-          settleDurableVoiceReply(button, controller);
+          settleInMemoryVoiceReply(button, controller, ttsLatencyTrace);
         }
         if (mode === "call" && voiceCallActive && voiceCallEpoch === callEpoch) {
           // Playback may end before the start callback on an exceptionally
@@ -6011,6 +6136,8 @@
           ".message-row.voice-reply-row.voice-reply-pending",
         )?.remove();
       }
+      if (mode === "voice_note") settleVoiceAudioReady(false);
+      releaseVoiceNotePublicationReservation();
       if (onFailure) {
         onFailure(error);
       } else if (continueCall) {
@@ -6024,6 +6151,7 @@
         });
       }
       markTtsLatency("failed", { component: "tts", message: errorMessage(error) });
+      if (mode === "voice_note") settleVoiceAudioReady(false);
       if (!onFailure) reportError(error);
       resolveFinished(false);
     };
@@ -6077,10 +6205,11 @@
           controller.finish();
           if (mode === "voice_note") {
             voiceNoteComplete = true;
+            settleVoiceAudioReady(true);
             const voiceButton = mountVoiceReplyPlayer();
             if (voiceButton) {
               if (controller.playing) durablePending = true;
-              else settleDurableVoiceReply(voiceButton, controller);
+              else settleInMemoryVoiceReply(voiceButton, controller, ttsLatencyTrace);
             }
           }
           resolveFinished(true);
@@ -6414,10 +6543,19 @@
         if (!voiceNoteComplete) return button;
         const voiceButton = mountVoiceReplyPlayer();
         if (voiceButton && !controller.playing) {
-          settleDurableVoiceReply(voiceButton, controller);
+          settleInMemoryVoiceReply(voiceButton, controller, ttsLatencyTrace);
         }
         return voiceButton;
       },
+      bindDurableVoiceReply(target) { return bindDurableVoiceReply(target); },
+      retryDurableVoiceReply() {
+        if (!durableVoiceTarget || !durableVoiceStoreError) {
+          return Promise.resolve(durableVoiceAttachmentId);
+        }
+        return bindDurableVoiceReply(durableVoiceTarget);
+      },
+      get durableVoiceAttachmentId() { return durableVoiceAttachmentId; },
+      get durableVoiceStoreError() { return durableVoiceStoreError; },
       bindButton(nextButton) {
         if (!nextButton || stopped) return false;
         if (button && button !== nextButton) voiceReplyPlayback.delete(button);
@@ -6493,6 +6631,8 @@
       async cancel() {
         if (stopped) return;
         stopped = true;
+        if (mode === "voice_note") settleVoiceAudioReady(false);
+        releaseVoiceNotePublicationReservation();
         cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
@@ -6523,6 +6663,8 @@
       async stop() {
         if (stopped) return;
         stopped = true;
+        if (mode === "voice_note") settleVoiceAudioReady(false);
+        releaseVoiceNotePublicationReservation();
         cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
@@ -7013,9 +7155,16 @@
     return task;
   };
 
-  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish) => {
+  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish, persist = null) => {
     if (callTurn) index();
+    const persistence = persist
+      ? Promise.resolve().then(persist).catch((error) => {
+        reportError(error);
+        return null;
+      })
+      : null;
     const synthesized = await finish();
+    if (persistence) await persistence;
     if (synthesized && !callTurn) index();
     return synthesized;
   };
@@ -7853,6 +8002,10 @@
   };
 
   const beginVoiceCapture = async (options = {}) => {
+    if (!options.call && (failedVoiceReplyOwners.size >= MAX_FAILED_VOICE_REPLY_OWNERS
+        || activeVoiceNotePublications.size >= MAX_FAILED_VOICE_REPLY_OWNERS)) {
+      throw new Error("voice_reply_save_retry_required: Save the previous voice reply before recording another.");
+    }
     // This runs from the user's microphone/call gesture. Compile and suspend
     // the audio-thread renderer while capture and model prefill are already
     // in flight, so first PCM never waits for AudioWorklet setup.
@@ -8424,9 +8577,14 @@
       const synthesized = await finishVoiceReplyAndIndexTurn(recording.call,
         () => indexVoiceTurn(live.conversation, response.result, null,
           speculation.captureReady, recording.trace),
-        () => tts.finish(response.result.assistant_text || tts.text));
+        () => tts.finish(response.result.assistant_text || tts.text),
+        recording.call ? null : () => tts.bindDurableVoiceReply({
+          conversation: live.conversation,
+          message: response.result.assistant_message_id,
+          text: response.result.assistant_text || tts.text,
+        }));
       if (!synthesized) {
-        throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
+        throw new Error("voice_reply_incomplete: The completed reply did not produce complete audio.");
       }
       if (!recording.call) {
         void Promise.all([refreshSidebar(), refreshConversationSettingsProjection()]).catch(reportError);
@@ -9334,6 +9492,9 @@
         settleUnavailableVoiceReply(button);
         return;
       }
+      if (playback.durableVoiceStoreError) {
+        void playback.retryDurableVoiceReply();
+      }
       voiceReplyPlayRequested = true;
       if (playback.controller.playing) {
         await playback.pause();
@@ -9369,7 +9530,6 @@
       report(result);
     },
     "message-read-aloud": async (button) => {
-      const personaVoice = button.dataset.personaVoice === "true";
       if (activeSpeechPlayback?.button === button) {
         if (activeSpeechPlayback.controller?.ready
             && !activeSpeechPlayback.controller.playing
@@ -9404,54 +9564,51 @@
       const message = button.dataset.message;
       const operation = speechOperationToken();
       button.dataset.operation = operation;
-      const prepareOnly = button.dataset.prepareOnly === "true";
       const panel = document.createElement("section");
       panel.className = "speech-playback";
       let retainedPlayback = null;
       let controller = null;
       let endedBeforeCommit = false;
+      // Explicit reading shares the call renderer and measured packet runway,
+      // but keeps its own calibration: reading a long document must not change
+      // the next live call's startup policy.
+      const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController();
+      const trace = { id: crypto.randomUUID(), mode: "read_aloud", began_at: Date.now(),
+        started: performance.now(), stages: [] };
+      const markReadLatency = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
+      let firstPacketAt = null;
+      let previousPacketAt = null;
+      let audioMs = 0;
+      let packetCount = 0;
       try {
-        if (personaVoice) markVoiceLatency("tts_started");
+        markReadLatency("tts_started");
         controller = createPcmPlaybackBuffer({
-          autoplay: !prepareOnly,
+          autoplay: true,
+          startupBufferMs: () => leadController.startupRunwayMs(),
+          startupDelayMs: () => leadController.startupDelayMs(),
+          onUnderrun: (gapMs) => {
+            leadController.noteUnderrun(gapMs);
+            markReadLatency("playback_underrun", { gap_ms: gapMs, scheduler: leadController.snapshot() });
+          },
           onFirstChunk: () => {
             if (activeSpeechPlayback?.controller !== controller || !button.isConnected) return;
-            if (personaVoice) markVoiceLatency("tts_first_pcm");
+            markReadLatency("tts_first_pcm");
             const row = button.closest(".message-row");
             const card = row?.querySelector(".message-card");
-            // Preparing a reply to a voice note changes that exact reply into
-            // a voice-note row. Explicit Read Aloud is only transport for the
-            // existing text row: it must never destroy or replace its text.
-            if (prepareOnly && personaVoice && row && card) {
-              row.classList.add("voice-reply-row");
-              button.classList.add("voice-reply-play");
-              card.replaceChildren(button, waveform(), panel);
-              row.querySelector(".message-actions")?.remove();
-              row.hidden = false;
-              row.classList.remove("voice-reply-pending");
-              markVoiceLatency("playable");
-            } else {
-              card?.append(panel);
-            }
-            if (prepareOnly) {
-              restoreReadAloudButton(button);
-              button.dataset.operation = operation;
-            } else {
-              commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
-              button.title = "Stop reading";
-              button.setAttribute("aria-pressed", "true");
-              button.querySelector(".sr-only")?.replaceChildren("Stop reading");
-            }
-            delete button.dataset.prepareOnly;
+            card?.append(panel);
+            commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
+            button.title = "Stop reading";
+            button.setAttribute("aria-pressed", "true");
+            button.querySelector(".sr-only")?.replaceChildren("Stop reading");
           },
-          onPlaybackStarted: () => {
-            if (personaVoice) markVoiceLatency("playback_started");
+          onPlaybackStarted: (metrics) => {
+            markReadLatency("playback_started", metrics);
           },
           onRendererEvent: (event) => {
-            if (personaVoice) markVoiceLatency(`playback_${event.type}`, event);
+            markReadLatency(`playback_${event.type}`, event);
           },
           onRendererMetrics: (metrics) => {
-            if (personaVoice) markVoiceLatency("playback_renderer", metrics);
+            markReadLatency("playback_renderer", metrics);
           },
           onEnded: () => {
             if (activeSpeechPlayback?.controller !== controller) return;
@@ -9465,14 +9622,32 @@
           },
         });
         const stream = pcmChannel((frame) => {
-          try { controller.push(frame); } catch (error) { reportError(error); }
+          if (activeSpeechPlayback?.controller !== controller || epoch !== speechPlaybackEpoch) return;
+          try {
+            const decoded = decodePcmFrame(frame);
+            if (decoded.data.byteLength > 0) {
+              const now = performance.now();
+              const packetMs = decoded.data.byteLength * 1000 / (2 * decoded.channels * decoded.sampleRate);
+              firstPacketAt ??= now;
+              audioMs += packetMs;
+              packetCount += 1;
+              leadController.notePacket({ audioMs: packetMs,
+                gapMs: previousPacketAt === null ? null : now - previousPacketAt,
+                startupDeficitMs: Math.max(0, now - firstPacketAt - (audioMs - packetMs)) });
+              previousPacketAt = now;
+            }
+            controller.push(frame);
+            if (decoded.end) markReadLatency("tts_pcm_complete", {
+              pcm_packets: packetCount, output_audio_ms: audioMs, scheduler: leadController.snapshot(),
+            });
+          } catch (error) { reportError(error); }
         });
         activeSpeechPlayback = { id: null, operation, controller, panel, button };
         const response = await invoke("mom_llama_speech_read_aloud", {
           conversation,
           message,
           operation,
-          requirePersonaVoice: personaVoice,
+          requirePersonaVoice: false,
           pcmStream: stream,
         });
         // A cancelled request may still finish natively and return a retained
@@ -9480,12 +9655,13 @@
         // do not publish the cancellation response or mutate the row.
         retainedPlayback = response?.result?.playback_id || null;
         if (activeSpeechPlayback?.controller !== controller || epoch !== speechPlaybackEpoch) return;
-        if (personaVoice && response?.result?.binding) {
-          markVoiceLatency("tts_backend_complete", {
+        if (response?.result?.binding) {
+          markReadLatency("tts_backend_complete", {
             backend_ms: response.result.binding.tts_time_to_first_audio_ms,
+            generation_segments: response.result.binding.tts_generation_segments ?? null,
           });
         }
-        if (personaVoice) markVoiceLatency("tts_finished");
+        markReadLatency("tts_finished");
         report(response);
         if (response?.status === "blocked" || !response?.result) return;
         const result = response.result;
@@ -9517,11 +9693,6 @@
           && (button.dataset.operation === operation
             || (retainedPlayback && button.dataset.playback === retainedPlayback))) {
           restoreReadAloudButton(button);
-        }
-        const voiceRow = personaVoice ? button.closest(".message-row") : null;
-        if (voiceRow?.classList.contains("voice-reply-pending")) {
-          if (activeSpeechPlayback?.button === button) await stopSpeechPlayback();
-          settleUnavailableVoiceReply(button);
         }
       }
     },
@@ -10445,9 +10616,14 @@
                   }
                 },
                 () => voiceTtsOwner.finish(output.assistant_text),
+                callReplyConversation === conversation ? null : () => voiceTtsOwner.bindDurableVoiceReply({
+                  conversation,
+                  message: output.assistant_message_id,
+                  text: output.assistant_text,
+                }),
               );
               if (!synthesized) {
-                throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
+                throw new Error("voice_reply_incomplete: The completed reply did not produce complete audio.");
               }
             } else {
               await voiceTtsOwner?.stop().catch(() => {});

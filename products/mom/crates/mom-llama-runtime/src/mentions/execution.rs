@@ -14,6 +14,20 @@ pub(super) type GroupCompletion = (
     Vec<PlannedTarget>,
 );
 
+fn content_deltas(parser: &mut ReasoningStreamParser, fragment: &str, finish: bool) -> Vec<String> {
+    let routed = if finish {
+        parser.finish()
+    } else {
+        parser.push(fragment)
+    };
+    routed
+        .into_iter()
+        .filter(|delta| delta.target == ReasoningTarget::Content)
+        .map(|delta| delta.text)
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CaseShape {
     identity: String,
@@ -413,6 +427,9 @@ where
             .iter()
             .map(|target| target.snapshot.target_id.clone())
             .collect::<Vec<_>>();
+        let mut reasoning_parsers = (0..ids.len())
+            .map(|_| ReasoningStreamParser::default())
+            .collect::<Vec<_>>();
         let drained = drain(
             ticket,
             invocation_id,
@@ -435,8 +452,57 @@ where
             },
             |event| {
                 let target = &targets[event.input_index];
+                if let GenerationEventKind::Delta { text } = &event.event {
+                    for delta in
+                        content_deltas(&mut reasoning_parsers[event.input_index], text, false)
+                    {
+                        emit(
+                            on_event,
+                            MentionStreamEvent {
+                                schema: "mom_llama.mention_stream_event.v1".into(),
+                                invocation_id: invocation_id.into(),
+                                target_id: target.snapshot.target_id.clone(),
+                                handle: target.snapshot.handle.clone(),
+                                label: target.snapshot.label.clone(),
+                                event: "delta".into(),
+                                delta: Some(delta),
+                                state: None,
+                                real_engine_invoked: true,
+                                fake_fixture: false,
+                            },
+                        )?;
+                    }
+                    return Ok(());
+                }
+                if matches!(
+                    event.event,
+                    GenerationEventKind::State {
+                        state: GenerationState::Completed
+                            | GenerationState::Cancelled
+                            | GenerationState::Failed
+                    }
+                ) {
+                    for delta in content_deltas(&mut reasoning_parsers[event.input_index], "", true)
+                    {
+                        emit(
+                            on_event,
+                            MentionStreamEvent {
+                                schema: "mom_llama.mention_stream_event.v1".into(),
+                                invocation_id: invocation_id.into(),
+                                target_id: target.snapshot.target_id.clone(),
+                                handle: target.snapshot.handle.clone(),
+                                label: target.snapshot.label.clone(),
+                                event: "delta".into(),
+                                delta: Some(delta),
+                                state: None,
+                                real_engine_invoked: true,
+                                fake_fixture: false,
+                            },
+                        )?;
+                    }
+                }
                 let (name, delta, state) = match event.event {
-                    GenerationEventKind::Delta { text } => ("delta", Some(text), None),
+                    GenerationEventKind::Delta { .. } => unreachable!(),
                     GenerationEventKind::State { state } => ("state", None, Some(state)),
                     GenerationEventKind::Warning { message, .. } => {
                         ("warning", Some(message), None)
@@ -460,6 +526,26 @@ where
                 )
             },
         );
+        for (index, parser) in reasoning_parsers.iter_mut().enumerate() {
+            let target = &targets[index];
+            for delta in content_deltas(parser, "", true) {
+                emit(
+                    on_event,
+                    MentionStreamEvent {
+                        schema: "mom_llama.mention_stream_event.v1".into(),
+                        invocation_id: invocation_id.into(),
+                        target_id: target.snapshot.target_id.clone(),
+                        handle: target.snapshot.handle.clone(),
+                        label: target.snapshot.label.clone(),
+                        event: "delta".into(),
+                        delta: Some(delta),
+                        state: None,
+                        real_engine_invoked: true,
+                        fake_fixture: false,
+                    },
+                )?;
+            }
+        }
         let outcome = drained.outcome.and_then(|outputs| {
             validate_outputs(
                 invocation_id,
@@ -483,6 +569,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persona_content_stream_hides_thought_for_every_marker_split() {
+        let raw = "<|channel>thought\nprivate reasoning<channel|>Since you haven’t received an answer yet, continue.";
+        let marker = "<|channel>thought\n";
+        let mut boundaries = (0..=marker.len()).collect::<Vec<_>>();
+        boundaries.extend((marker.len()..=raw.len()).collect::<Vec<_>>());
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for boundary in boundaries {
+            if !raw.is_char_boundary(boundary) {
+                continue;
+            }
+            let mut parser = ReasoningStreamParser::default();
+            let mut visible = content_deltas(&mut parser, &raw[..boundary], false).join("");
+            visible.push_str(&content_deltas(&mut parser, &raw[boundary..], false).join(""));
+            visible.push_str(&content_deltas(&mut parser, "", true).join(""));
+            assert_eq!(
+                visible,
+                "Since you haven’t received an answer yet, continue."
+            );
+            assert!(!visible.contains("private reasoning"));
+            assert!(!visible.contains("<|channel>"));
+        }
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn case(identity: &str, cells: usize, media: bool) -> CaseShape {

@@ -258,6 +258,70 @@ fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
 }
 
 #[test]
+fn legacy_disable_reasoning_parsing_cannot_leak_direct_chat_fixture_output() -> Result<()> {
+    let _session = TestSession::new("retired-reasoning-parser-setting")?;
+    let mut stored_settings = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("settings missing"))?;
+    // Simulate an older encrypted settings document. This key is no longer a
+    // writable control, but old documents remain readable without migration.
+    stored_settings
+        .upstream_settings
+        .insert("disableReasoningParsing".into(), json!(true));
+    mom_llama_runtime::config::save_settings(&stored_settings)?;
+    assert_eq!(
+        mom_llama_runtime::settings_get()?
+            .result
+            .unwrap()
+            .upstream_settings["disableReasoningParsing"],
+        json!(true)
+    );
+
+    let conversation = mom_llama_runtime::conversation_new(Some("Parser fixture".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("conversation missing"))?;
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &mom_llama_runtime::OperationScope::detached(),
+        ChatSendInput {
+            conversation_id: conversation.id.clone(),
+            message: "[[fixture:reasoning-marker-regression]]".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    assert_eq!(result.readiness, "fake_fixture_exercised");
+    assert!(!result.receipt.real_engine_invoked);
+    assert!(result.receipt.fake_fixture);
+    let output = result
+        .result
+        .ok_or_else(|| anyhow!("fixture output missing"))?;
+    assert_eq!(output.assistant_text, "Fixture assistant response.");
+    assert_eq!(
+        output.reasoning_content.as_deref(),
+        Some("fixture private reasoning")
+    );
+
+    let stored = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("conversation missing after fixture"))?;
+    let assistant = stored
+        .messages
+        .iter()
+        .find(|message| message.id == output.assistant_message_id)
+        .ok_or_else(|| anyhow!("assistant fixture message missing"))?;
+    assert_eq!(assistant.content, "Fixture assistant response.");
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some("fixture private reasoning")
+    );
+    assert!(!assistant.content.contains("<think>"));
+    assert!(!assistant.content.contains("</think>"));
+    Ok(())
+}
+
+#[test]
 fn cache_mode_is_coherent_and_off_blocks_manual_cache_access() -> Result<()> {
     let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("cache-policy-surface")?;
@@ -3315,10 +3379,6 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         )?))),
         resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let owner = initialize_product_runtime()?;
@@ -3515,10 +3575,6 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         // Match the application profile so cancelled turns exercise the
         // alternate-sequence resident audio checkpoint used for fast resume.
         max_parallel_sequences: Some(4),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         ..SettingsUpdate::default()
     })?;
@@ -3995,10 +4051,6 @@ fn real_incremental_voice_prefill_reports_silence_to_first_token() -> Result<()>
         // the token-exact text prefix while the first two lanes ping-pong
         // incremental audio checkpoints.
         max_parallel_sequences: Some(4),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -4306,10 +4358,10 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
         model_path: Some(Some(model_path)),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
         max_tokens: Some(192),
-        upstream_settings: Some(BTreeMap::from([
-            ("disableReasoningParsing".to_string(), json!(false)),
-            ("excludeReasoningFromContext".to_string(), json!(false)),
-        ])),
+        upstream_settings: Some(BTreeMap::from([(
+            "excludeReasoningFromContext".to_string(),
+            json!(false),
+        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -4516,10 +4568,6 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         max_parallel_sequences: Some(4),
         // This scenario verifies independent execution, cancellation, and
         // source ownership; reasoning extraction has its own model scenarios.
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;

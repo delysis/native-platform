@@ -57,7 +57,6 @@ pub struct VoiceAudioPreparedTurn {
     expected_active_leaf: Option<String>,
     settings: crate::Settings,
     model_path: PathBuf,
-    parse_reasoning: bool,
     handle: NativeModelHandle,
     request_template: GenerationRequest,
     cache_id: Option<String>,
@@ -478,33 +477,38 @@ pub struct ChatStreamEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReasoningTarget {
+pub(crate) enum ReasoningTarget {
     Content,
     Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RoutedDelta {
-    target: ReasoningTarget,
-    text: String,
+pub(crate) struct RoutedDelta {
+    pub(crate) target: ReasoningTarget,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Default)]
-struct ReasoningStreamParser {
+pub(crate) struct ReasoningStreamParser {
     buffer: String,
     in_reasoning: bool,
     saw_reasoning: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ParsedReasoning {
-    content: String,
-    reasoning: String,
-    incomplete: bool,
+pub(crate) struct ParsedReasoning {
+    pub(crate) content: String,
+    pub(crate) reasoning: String,
+    pub(crate) incomplete: bool,
 }
 
 const REASONING_START_MARKERS: &[&str] = &[
     "<|channel>thought\n",
+    // Some Gemma outputs close an empty thought channel directly rather than
+    // placing a newline between the channel name and its closing delimiter.
+    // Treat this complete pair atomically so streaming never exposes either
+    // half while the other half is still arriving.
+    "<|channel>thought<channel|>",
     "<think>",
     "<<<reasoning_content_start>>>",
     "[Start thinking]",
@@ -517,12 +521,12 @@ const REASONING_END_MARKERS: &[&str] = &[
 ];
 
 impl ReasoningStreamParser {
-    fn push(&mut self, delta: &str) -> Vec<RoutedDelta> {
+    pub(crate) fn push(&mut self, delta: &str) -> Vec<RoutedDelta> {
         self.buffer.push_str(delta);
         self.drain(false)
     }
 
-    fn finish(&mut self) -> Vec<RoutedDelta> {
+    pub(crate) fn finish(&mut self) -> Vec<RoutedDelta> {
         self.drain(true)
     }
 
@@ -540,6 +544,10 @@ impl ReasoningStreamParser {
                     self.push_routed(&mut routed, prefix);
                 }
                 self.buffer.drain(..index + marker.len());
+                if marker == "<|channel>thought<channel|>" {
+                    self.saw_reasoning = true;
+                    continue;
+                }
                 self.in_reasoning = !self.in_reasoning;
                 self.saw_reasoning = true;
                 continue;
@@ -604,13 +612,7 @@ fn longest_marker_prefix_suffix(value: &str, markers: &[&str]) -> usize {
         .unwrap_or_default()
 }
 
-fn parse_reasoning_output(value: &str, enabled: bool) -> ParsedReasoning {
-    if !enabled {
-        return ParsedReasoning {
-            content: value.to_string(),
-            ..ParsedReasoning::default()
-        };
-    }
+pub(crate) fn parse_reasoning_output(value: &str) -> ParsedReasoning {
     let mut parser = ReasoningStreamParser::default();
     let mut parsed = ParsedReasoning::default();
     for delta in parser.push(value).into_iter().chain(parser.finish()) {
@@ -621,6 +623,37 @@ fn parse_reasoning_output(value: &str, enabled: bool) -> ParsedReasoning {
     }
     parsed.incomplete = parser.saw_reasoning && parser.in_reasoning;
     parsed
+}
+
+/// Return the visible assistant body without reasoning-channel protocol text.
+/// The stored message is deliberately left untouched; callers use this only
+/// for rendering or speech projections of an existing assistant message.
+pub fn assistant_visible_content(message: &crate::conversation_store::Message) -> Option<String> {
+    (message.role == crate::conversation_store::MessageRole::Assistant)
+        .then(|| parse_reasoning_output(&message.content).content)
+}
+
+/// Create an assistant-only display copy with legacy reasoning markers routed
+/// into the reasoning field. User, tool, and system messages are returned
+/// unchanged, and no conversation storage is modified.
+pub fn assistant_display_projection(
+    message: &crate::conversation_store::Message,
+) -> crate::conversation_store::Message {
+    let mut projected = message.clone();
+    if projected.role == crate::conversation_store::MessageRole::Assistant {
+        let parsed = parse_reasoning_output(&projected.content);
+        projected.content = parsed.content;
+        if !parsed.reasoning.is_empty()
+            && projected
+                .reasoning_content
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            projected.reasoning_content = Some(parsed.reasoning);
+        }
+        projected.reasoning_incomplete |= parsed.incomplete;
+    }
+    projected
 }
 
 pub fn chat_send_in_scope(
@@ -694,7 +727,6 @@ pub fn voice_audio_begin_in_scope(
         .system_message
         .clone()
         .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
-    let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
     let prompt_us = elapsed_us(stage_started);
     let model_path = settings.model_path.clone().unwrap_or_default();
     let stage_started = Instant::now();
@@ -826,7 +858,6 @@ pub fn voice_audio_begin_in_scope(
         expected_active_leaf,
         settings,
         model_path,
-        parse_reasoning,
         handle,
         request_template,
         cache_id,
@@ -943,7 +974,6 @@ where
         &session.request_id,
         &prepared.conversation_id,
         options,
-        prepared.parse_reasoning,
         stream.callback(),
     )
     .map_err(chat_ticket_error)?;
@@ -962,7 +992,7 @@ where
     if output.state == GenerationState::Cancelled || stream.arbitrate_terminal() {
         return stream.finish_cancelled();
     }
-    let parsed = parse_reasoning_output(&output.text, prepared.parse_reasoning);
+    let parsed = parse_reasoning_output(&output.text);
     let assistant_text = strip_reserved_attribution_prefix(&parsed.content)
         .split("\n\n")
         .next()
@@ -1401,7 +1431,6 @@ where
             ),
         ));
     }
-    let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
     let exclude_reasoning_from_context =
         upstream_setting_bool(&settings, "excludeReasoningFromContext");
     let context_messages = if let Some(user_id) = regenerate_user_id.as_deref() {
@@ -1474,8 +1503,15 @@ where
         cache_reused,
         cache_metrics,
     ) = if options.fake_fixture {
+        // This deterministic branch exercises the same final-output parser as
+        // native generation without loading a model.
+        let fixture_text = if input.message == "[[fixture:reasoning-marker-regression]]" {
+            "<think>fixture private reasoning</think>Fixture assistant response."
+        } else {
+            "Fixture assistant response."
+        };
         (
-            "Fixture assistant response.".to_string(),
+            fixture_text.to_string(),
             None,
             false,
             messages.iter().map(|message| message.content.len()).sum(),
@@ -1577,7 +1613,6 @@ where
             &request_id,
             &conversation.id,
             options,
-            parse_reasoning,
             stream.callback(),
         ) {
             Ok(outputs) => {
@@ -1609,7 +1644,6 @@ where
                         &request_id,
                         &conversation.id,
                         options,
-                        parse_reasoning,
                         stream.callback(),
                     )
                     .map_err(chat_ticket_error)?,
@@ -1632,11 +1666,10 @@ where
         if output.state == GenerationState::Cancelled {
             return stream.finish_cancelled();
         }
-        let parsed = parse_reasoning_output(&output.text, parse_reasoning);
         (
-            strip_reserved_attribution_prefix(&parsed.content),
-            (!parsed.reasoning.is_empty()).then_some(parsed.reasoning),
-            parsed.incomplete,
+            output.text,
+            None,
+            false,
             output.metrics.prompt_tokens,
             output.metrics.completion_tokens,
             output.metrics.duration_ms,
@@ -1646,6 +1679,12 @@ where
             output.metrics.cache.clone(),
         )
     };
+    let parsed = parse_reasoning_output(&assistant_text);
+    assistant_text = strip_reserved_attribution_prefix(&parsed.content);
+    let reasoning_content = (!parsed.reasoning.is_empty())
+        .then_some(parsed.reasoning)
+        .or(reasoning_content);
+    let reasoning_incomplete = reasoning_incomplete || parsed.incomplete;
     if stream.arbitrate_terminal() {
         return stream.finish_cancelled();
     }
@@ -2072,7 +2111,6 @@ fn consume_chat_ticket<F>(
     request_id: &str,
     conversation_id: &str,
     options: ChatSendOptions,
-    parse_reasoning: bool,
     on_event: &mut Option<F>,
 ) -> std::result::Result<Vec<GenerationOutput>, ChatTicketError>
 where
@@ -2086,7 +2124,10 @@ where
         .min(Duration::from_secs(600))
         .max(timeout);
     let mut timed_out = false;
-    let mut reasoning_parser = parse_reasoning.then(ReasoningStreamParser::default);
+    // Reserved model protocol is always routed before content reaches the UI,
+    // storage, or speech. The original native GenerationOutput remains the
+    // authoritative raw-generation evidence.
+    let mut reasoning_parser = ReasoningStreamParser::default();
     let mut first_content_emitted = false;
     loop {
         if ticket.is_backpressured() {
@@ -2104,36 +2145,20 @@ where
                     if !text.is_empty() {
                         last_progress = Instant::now();
                     }
-                    if let Some(parser) = reasoning_parser.as_mut() {
-                        for routed in parser.push(&text) {
-                            let content = routed.target == ReasoningTarget::Content;
-                            let mut event = stream_event(
-                                request_id,
-                                conversation_id,
-                                match routed.target {
-                                    ReasoningTarget::Content => "delta",
-                                    ReasoningTarget::Reasoning => "reasoning_delta",
-                                },
-                                Some(routed.text),
-                                None,
-                                options,
-                            );
-                            if content && !first_content_emitted {
-                                event.emitted_at_unix_us = Some(unix_now_us());
-                                first_content_emitted = true;
-                            }
-                            emit(on_event, event).map_err(ChatTicketError::Callback)?;
-                        }
-                    } else {
+                    for routed in reasoning_parser.push(&text) {
+                        let content = routed.target == ReasoningTarget::Content;
                         let mut event = stream_event(
                             request_id,
                             conversation_id,
-                            "delta",
-                            Some(text),
+                            match routed.target {
+                                ReasoningTarget::Content => "delta",
+                                ReasoningTarget::Reasoning => "reasoning_delta",
+                            },
+                            Some(routed.text),
                             None,
                             options,
                         );
-                        if !first_content_emitted {
+                        if content && !first_content_emitted {
                             event.emitted_at_unix_us = Some(unix_now_us());
                             first_content_emitted = true;
                         }
@@ -2173,26 +2198,24 @@ where
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
-    if let Some(parser) = reasoning_parser.as_mut() {
-        for routed in parser.finish() {
-            let content = routed.target == ReasoningTarget::Content;
-            let mut event = stream_event(
-                request_id,
-                conversation_id,
-                match routed.target {
-                    ReasoningTarget::Content => "delta",
-                    ReasoningTarget::Reasoning => "reasoning_delta",
-                },
-                Some(routed.text),
-                None,
-                options,
-            );
-            if content && !first_content_emitted {
-                event.emitted_at_unix_us = Some(unix_now_us());
-                first_content_emitted = true;
-            }
-            emit(on_event, event).map_err(ChatTicketError::Callback)?;
+    for routed in reasoning_parser.finish() {
+        let content = routed.target == ReasoningTarget::Content;
+        let mut event = stream_event(
+            request_id,
+            conversation_id,
+            match routed.target {
+                ReasoningTarget::Content => "delta",
+                ReasoningTarget::Reasoning => "reasoning_delta",
+            },
+            Some(routed.text),
+            None,
+            options,
+        );
+        if content && !first_content_emitted {
+            event.emitted_at_unix_us = Some(unix_now_us());
+            first_content_emitted = true;
         }
+        emit(on_event, event).map_err(ChatTicketError::Callback)?;
     }
     match ticket.wait() {
         _ if timed_out => Err(ChatTicketError::Callback(anyhow::anyhow!(
@@ -2361,9 +2384,10 @@ mod tests {
     use super::{
         ChatAttachmentContext, ChatSendOptions, ChatStreamLifecycle, Message, MessageRole,
         ReasoningStreamParser, ReasoningTarget, apply_conversation_model_pair,
-        build_native_messages, configure_voice_sampling, empty_native_response_result,
-        native_context_messages, parse_reasoning_output, prefer_longer_prefix,
-        reusable_prefix_owner_ids, user_turn_is_empty,
+        assistant_display_projection, assistant_visible_content, build_native_messages,
+        configure_voice_sampling, empty_native_response_result, native_context_messages,
+        parse_reasoning_output, prefer_longer_prefix, reusable_prefix_owner_ids,
+        user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
@@ -2509,18 +2533,84 @@ mod tests {
 
     #[test]
     fn gemma_empty_thought_channel_is_not_assistant_content() {
-        let parsed =
-            parse_reasoning_output("<|channel>thought\n<channel|>The answer is ready.", true);
+        let parsed = parse_reasoning_output("<|channel>thought\n<channel|>The answer is ready.");
         assert_eq!(parsed.content, "The answer is ready.");
         assert_eq!(parsed.reasoning, "");
         assert!(!parsed.incomplete);
     }
 
     #[test]
+    fn gemma_empty_thought_channel_without_newline_is_consumed_at_every_split() {
+        let input = "<|channel>thought<channel|>Since you haven’t received an answer.";
+        let expected = vec![(
+            ReasoningTarget::Content,
+            "Since you haven’t received an answer.".to_string(),
+        )];
+        let boundaries = input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(input.len()))
+            .collect::<Vec<_>>();
+
+        for boundary in boundaries.iter().copied() {
+            assert_eq!(
+                collect_live_reasoning_routes(&[&input[..boundary], &input[boundary..]]),
+                expected,
+                "split at byte {boundary}"
+            );
+        }
+
+        let one_char_chunks = input
+            .char_indices()
+            .map(|(start, character)| &input[start..start + character.len_utf8()])
+            .collect::<Vec<_>>();
+        assert_eq!(collect_live_reasoning_routes(&one_char_chunks), expected);
+        let parsed = parse_reasoning_output(input);
+        assert_eq!(parsed.content, "Since you haven’t received an answer.");
+        assert_eq!(parsed.reasoning, "");
+        assert!(!parsed.incomplete);
+    }
+
+    #[test]
+    fn legacy_assistant_projection_hides_channel_tokens_without_changing_stored_or_user_text() {
+        let raw = "<|channel>thought\nprivate reasoning<channel|>Visible answer.";
+        let assistant = assistant_message(None, raw);
+        let projected = assistant_display_projection(&assistant);
+        assert_eq!(
+            assistant.content, raw,
+            "projection must not mutate stored data"
+        );
+        assert_eq!(projected.content, "Visible answer.");
+        assert_eq!(
+            projected.reasoning_content.as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(
+            assistant_visible_content(&assistant).as_deref(),
+            Some("Visible answer.")
+        );
+
+        let literal = "Please include the literal <|channel>thought and <channel|> tokens.";
+        let mut user = assistant_message(None, literal);
+        user.role = MessageRole::User;
+        assert_eq!(assistant_visible_content(&user), None);
+        assert_eq!(assistant_display_projection(&user), user);
+        assert_eq!(native_context_messages(&user, false)[0].content, literal);
+
+        let prose = parse_reasoning_output(
+            "A literal token name is <|channel>thought, with no protocol boundary.",
+        );
+        assert_eq!(
+            prose.content,
+            "A literal token name is <|channel>thought, with no protocol boundary."
+        );
+        assert_eq!(prose.reasoning, "");
+    }
+
+    #[test]
     fn gemma_thought_channel_routes_reasoning_and_preserves_final_text() {
         let parsed = parse_reasoning_output(
             "<|channel>thought\nConsider the evidence. 🌱<channel|>The answer is ready.",
-            true,
         );
         assert_eq!(parsed.reasoning, "Consider the evidence. 🌱");
         assert_eq!(parsed.content, "The answer is ready.");
@@ -2529,7 +2619,7 @@ mod tests {
 
     #[test]
     fn gemma_unfinished_thought_is_not_routed_as_assistant_content() {
-        let parsed = parse_reasoning_output("<|channel>thought\nUnfinished private plan", true);
+        let parsed = parse_reasoning_output("<|channel>thought\nUnfinished private plan");
         assert_eq!(parsed.content, "");
         assert_eq!(parsed.reasoning, "Unfinished private plan");
         assert!(parsed.incomplete);
@@ -2581,12 +2671,12 @@ mod tests {
                     ReasoningTarget::Reasoning => reasoning.push_str(&text),
                 }
             }
-            let final_parse = parse_reasoning_output(sample, true);
+            let final_parse = parse_reasoning_output(sample);
             assert_eq!(content, final_parse.content);
             assert_eq!(reasoning, final_parse.reasoning);
             assert!(!final_parse.incomplete);
         }
-        assert_eq!(parse_reasoning_output(samples[0], true).content, samples[0]);
+        assert_eq!(parse_reasoning_output(samples[0]).content, samples[0]);
     }
 
     #[test]
@@ -2616,18 +2706,31 @@ mod tests {
 
     #[test]
     fn reasoning_parser_records_incomplete_reasoning_without_losing_text() {
-        let parsed = parse_reasoning_output("<think>unfinished thought", true);
+        let parsed = parse_reasoning_output("<think>unfinished thought");
         assert_eq!(parsed.content, "");
         assert_eq!(parsed.reasoning, "unfinished thought");
         assert!(parsed.incomplete);
     }
 
     #[test]
-    fn disabling_reasoning_parsing_preserves_raw_model_output() {
-        let parsed = parse_reasoning_output("<think>private</think>answer", false);
-        assert_eq!(parsed.content, "<think>private</think>answer");
-        assert_eq!(parsed.reasoning, "");
+    fn reserved_reasoning_markers_are_separated_from_visible_content() {
+        let raw = "<think>private</think>answer";
+        let parsed = parse_reasoning_output(raw);
+        assert_eq!(parsed.content, "answer");
+        assert_eq!(parsed.reasoning, "private");
         assert!(!parsed.incomplete);
+        assert_eq!(
+            assistant_visible_content(&assistant_message(None, raw)).as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            collect_live_reasoning_routes(&["<think>private</think>answer"]),
+            vec![
+                (ReasoningTarget::Reasoning, "private".into()),
+                (ReasoningTarget::Content, "answer".into()),
+            ],
+            "the legacy preference cannot route reserved markers to visible content"
+        );
     }
 
     #[test]

@@ -2088,7 +2088,50 @@ impl SessionConversationAuthority {
         else {
             return Ok(false);
         };
-        Ok(conversation == &self.conversation)
+        if conversation == &self.conversation {
+            return Ok(true);
+        }
+
+        let expected_voice_replies = crate::attachments::generated_voice_reply_ids_from_mutations(
+            documents,
+            &self.conversation_id,
+            &self.conversation.messages,
+        )?;
+        let current_voice_replies = crate::attachments::generated_voice_reply_ids_from_mutations(
+            documents,
+            &self.conversation_id,
+            &conversation.messages,
+        )?;
+        if !current_voice_replies.is_superset(&expected_voice_replies) {
+            return Ok(false);
+        }
+        if current_voice_replies == expected_voice_replies {
+            return Ok(false);
+        }
+
+        // Saving a generated assistant WAV updates only its attachment ID and
+        // the conversation timestamp. Treat precisely that authenticated,
+        // additive publication as non-inference metadata; compare every other
+        // conversation field and attachment ID normally.
+        let published_pairs = current_voice_replies
+            .difference(&expected_voice_replies)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut normalized_expected = self.conversation.clone();
+        let mut normalized_current = conversation.clone();
+        normalized_expected
+            .updated_at
+            .clone_from(&normalized_current.updated_at);
+        for item in [&mut normalized_expected, &mut normalized_current] {
+            for message in &mut item.messages {
+                message.attachment_ids.retain(|attachment_id| {
+                    !published_pairs.iter().any(|(message_id, published_id)| {
+                        message_id == &message.id && published_id == attachment_id
+                    })
+                });
+            }
+        }
+        Ok(normalized_current == normalized_expected)
     }
 }
 
@@ -3803,6 +3846,152 @@ mod tests {
                 .map(|entry| entry.id.as_str()),
             Some("session-b")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_voice_attachment_publication_preserves_session_authority_only_for_exact_owner()
+    -> Result<()> {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-cache-generated-voice-authority-{}",
+            crate::now_ms()
+        ));
+        let store = RuntimeStore::open_with_key(&data_dir, [42_u8; 32])?;
+        let conversation_id = Uuid::new_v4().to_string();
+        let mut original = Conversation {
+            id: conversation_id.clone(),
+            title: "authority fixture".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: Default::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some("assistant-1".into()),
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages: vec![crate::conversation_store::Message {
+                id: "assistant-1".into(),
+                conversation_id: conversation_id.clone(),
+                role: crate::conversation_store::MessageRole::Assistant,
+                content: "A stable answer.".into(),
+                created_at: "1".into(),
+                parent_id: None,
+                model: None,
+                receipt_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_content: None,
+                reasoning_incomplete: false,
+                branch_index: None,
+                branch_count: None,
+                attribution: None,
+                attachment_ids: Vec::new(),
+            }],
+            inference_window: None,
+        };
+        let authority = SessionConversationAuthority::from_conversation(&original)?;
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![original.clone()],
+                selected_conversation_id: Some(conversation_id.clone()),
+            },
+        )?;
+
+        let generated_id = "generated-reply-1";
+        original.messages[0]
+            .attachment_ids
+            .push(generated_id.to_string());
+        original.updated_at = "2".into();
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![original.clone()],
+                selected_conversation_id: Some(conversation_id.clone()),
+            },
+        )?;
+        let mut attachment_db = crate::attachments::AttachmentDb::default();
+        attachment_db
+            .attachments
+            .push(crate::attachments::AttachmentRecord {
+                id: generated_id.into(),
+                conversation_id: conversation_id.clone(),
+                message_id: "assistant-1".into(),
+                kind: crate::attachments::AttachmentKind::Audio,
+                file_name: "reply.wav".into(),
+                source_path: "generated://assistant-voice".into(),
+                stored_path: "private://fixture".into(),
+                mime: "audio/wav".into(),
+                bytes: 48,
+                sha256: "0".repeat(64),
+                created_at: "2".into(),
+                state: crate::attachments::AttachmentState::Committed,
+                root_object_id: Some("root".into()),
+                detected_format: Some(attachment_native_types::DetectedFormat::Wav),
+                coverage: Some(attachment_native_types::Coverage::Complete),
+                manifest_namespace: Some("manifest".into()),
+                policy_fingerprint: Some("policy".into()),
+                artifact_count: 1,
+                canonical_text_bytes: 0,
+                media_objects: 1,
+            });
+        store.put(crate::attachments::ATTACHMENTS_NAMESPACE, &attachment_db)?;
+        assert!(store.mutate_documents(
+            crate::attachments::ATTACHMENTS_NAMESPACE,
+            crate::attachments::AttachmentDb::default,
+            |_attachments, documents| authority.still_authoritative_in_documents(documents),
+        )?);
+
+        let mut wrongly_owned = store
+            .get::<crate::attachments::AttachmentDb>(crate::attachments::ATTACHMENTS_NAMESPACE)?
+            .expect("generated reply registry");
+        wrongly_owned.attachments[0].message_id = "different-assistant".into();
+        store.put(crate::attachments::ATTACHMENTS_NAMESPACE, &wrongly_owned)?;
+        assert!(
+            !store.mutate_documents(
+                crate::attachments::ATTACHMENTS_NAMESPACE,
+                crate::attachments::AttachmentDb::default,
+                |_attachments, documents| authority.still_authoritative_in_documents(documents),
+            )?,
+            "a moved or spoofed registry owner cannot relax checkpoint authority"
+        );
+        wrongly_owned.attachments[0].message_id = "assistant-1".into();
+        store.put(crate::attachments::ATTACHMENTS_NAMESPACE, &wrongly_owned)?;
+
+        let mut edited = original.clone();
+        edited.messages[0].content.push_str(" changed");
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![edited],
+                selected_conversation_id: Some(conversation_id.clone()),
+            },
+        )?;
+        assert!(!store.mutate_documents(
+            crate::attachments::ATTACHMENTS_NAMESPACE,
+            crate::attachments::AttachmentDb::default,
+            |_attachments, documents| authority.still_authoritative_in_documents(documents),
+        )?);
+
+        let mut ordinary = original;
+        ordinary.messages[0]
+            .attachment_ids
+            .push("ordinary-image".into());
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![ordinary],
+                selected_conversation_id: Some(conversation_id),
+            },
+        )?;
+        assert!(!store.mutate_documents(
+            crate::attachments::ATTACHMENTS_NAMESPACE,
+            crate::attachments::AttachmentDb::default,
+            |_attachments, documents| authority.still_authoritative_in_documents(documents),
+        )?);
         Ok(())
     }
 

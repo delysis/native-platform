@@ -253,7 +253,6 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "agenticMaxTurns",
     "alwaysShowToolCallContent",
     "preEncodeConversation",
-    "disableReasoningParsing",
     "excludeReasoningFromContext",
     "showRawOutputSwitch",
     "customJson",
@@ -445,7 +444,6 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("dry_penalty_last_n".to_string(), Value::Null),
         ("agenticMaxTurns".to_string(), json!(8)),
         ("preEncodeConversation".to_string(), json!(true)),
-        ("disableReasoningParsing".to_string(), json!(false)),
         ("excludeReasoningFromContext".to_string(), json!(false)),
         ("showRawOutputSwitch".to_string(), json!(false)),
         ("customJson".to_string(), json!("")),
@@ -1288,7 +1286,7 @@ mod tests {
     #[test]
     fn supported_upstream_setting_registry_is_complete_and_distinct_from_extensions() {
         let defaults = upstream_settings_defaults();
-        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 43);
+        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 42);
         for key in UPSTREAM_SETTING_KEYS {
             assert!(
                 defaults.contains_key(*key),
@@ -1312,16 +1310,26 @@ mod tests {
         stored
             .upstream_settings
             .insert("apiKey".to_string(), json!("retained inert value"));
+        stored
+            .upstream_settings
+            .insert("disableReasoningParsing".to_string(), json!(true));
         let resolved =
             settings_from_document_with_model_sources(data_dir, Some(stored), None, None, None)
                 .expect("unconsumed stored fields do not require a migration");
         assert_eq!(resolved.upstream_settings["apiKey"], "retained inert value");
+        assert_eq!(resolved.upstream_settings["disableReasoningParsing"], true);
         let blocker = validate_settings_update(&BTreeMap::from([(
             "apiKey".to_string(),
             json!("new value"),
         )]))
         .expect("inactive settings are not writable product controls");
         assert_eq!(blocker.code, "setting_key_unknown");
+        let retired = validate_settings_update(&BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(false),
+        )]))
+        .expect("retired parser bypass cannot be written");
+        assert_eq!(retired.code, "setting_key_unknown");
     }
 
     #[test]
@@ -1360,9 +1368,10 @@ mod tests {
                 .max_tokens,
             DEFAULT_MAX_TOKENS
         );
-        assert_eq!(
-            settings.upstream_settings.get("disableReasoningParsing"),
-            Some(&json!(false))
+        assert!(
+            !settings
+                .upstream_settings
+                .contains_key("disableReasoningParsing")
         );
     }
 

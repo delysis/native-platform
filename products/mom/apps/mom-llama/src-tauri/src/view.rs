@@ -1302,14 +1302,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
     },
     SettingsFieldSpec {
         section: "developer",
-        key: "disableReasoningParsing",
-        label: "Disable reasoning parsing",
-        kind: "checkbox",
-        help: "Keep model reasoning markers in the raw assistant output.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "developer",
         key: "excludeReasoningFromContext",
         label: "Exclude reasoning from context",
         kind: "checkbox",
@@ -1763,6 +1755,7 @@ fn chat_view_with_draft(
                                         && message.attribution.is_none()
                                 }),
                                 assistant_contact_id,
+                                active.is_some_and(|conversation| is_voice_note_turn(conversation, message)),
                             ))
                         }
                     }
@@ -1998,7 +1991,9 @@ fn sidebar(
                                                 !is_call_turn(conversation, message)
                                                     && !is_voice_note_turn(conversation, message)
                                             }) {
-                                                small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
+                                                @let preview = mom_llama_runtime::assistant_visible_content(message)
+                                                    .unwrap_or_else(|| message.content.clone());
+                                                small { (preview.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
                                             }
                                         }
                                     }
@@ -2289,14 +2284,32 @@ fn message_row(
     allow_freeze: bool,
     allow_generation_actions: bool,
     assistant_contact_id: Option<&str>,
+    voice_note_turn: bool,
 ) -> Markup {
+    // Generated speech belongs to one immutable message occurrence. An edit
+    // creates a new ID and cannot inherit the prior wording's recording.
+    let attachments = attachments
+        .iter()
+        .copied()
+        .filter(|attachment| {
+            !mom_llama_runtime::is_generated_voice_reply(attachment)
+                || attachment.message_id == message.id
+        })
+        .collect::<Vec<_>>();
+    let raw_message = message;
+    let display_message = mom_llama_runtime::assistant_display_projection(message);
+    let message = &display_message;
     let role = role_label(&message.role);
     let call_turn = message.content.starts_with("[Phone call]");
-    let voice_message = message.role == MessageRole::User
-        && attachments.iter().any(|attachment| {
-            attachment.kind == AttachmentKind::Audio
-                && attachment.file_name.starts_with("voice-message-")
-        });
+    let voice_message = attachments.iter().any(|attachment| {
+        (message.role == MessageRole::User
+            && attachment.kind == AttachmentKind::Audio
+            && attachment.file_name.starts_with("voice-message-"))
+            || (message.role == MessageRole::Assistant
+                && mom_llama_runtime::is_generated_voice_reply(attachment))
+    });
+    let missing_voice_reply =
+        voice_note_turn && message.role == MessageRole::Assistant && !voice_message;
     let show_stats = upstream_settings_bool(settings, "showMessageStats");
     let enable_continue = upstream_settings_bool(settings, "enableContinueGeneration");
     let user_markdown = upstream_settings_bool(settings, "renderUserContentAsMarkdown");
@@ -2315,7 +2328,7 @@ fn message_row(
             class=(format!(
                 "message-row {role}{}{}",
                 if call_turn { " call-turn" } else { "" },
-                if voice_message { " voice-message-row" } else { "" },
+                if voice_message || missing_voice_reply { " voice-message-row" } else { "" },
             ))
             data-message-id=(message.id.clone())
             aria-label=(format!("{role} message")) {
@@ -2350,9 +2363,16 @@ fn message_row(
                         }
                     }
                 }
-                @if message.role == MessageRole::Tool {
+                @if missing_voice_reply {
+                    div class="voice-message-player voice-message-unavailable" {
+                        button type="button" class="voice-message-play" disabled
+                            data-audio-state="failed" aria-label="Voice recording unavailable"
+                            title="This earlier reply has no saved recording" { (icon_markup("volume-x")) }
+                        (waveform_bars())
+                    }
+                } @else if message.role == MessageRole::Tool {
                     (tool_message_content(message, expand_tool_content, show_agentic_stats))
-                } @else if message.role == MessageRole::User && voice_message {
+                } @else if voice_message {
                     span class="sr-only" { "Voice message" }
                 } @else if message.role == MessageRole::User && !user_markdown {
                     p class="plain-message-content" { (message.content) }
@@ -2383,7 +2403,7 @@ fn message_row(
                     }
                     (markdown_content(&message.content))
                     @if message.role == MessageRole::Assistant && show_raw_output_switch {
-                        pre class="raw-message-content is-hidden" { (message.content.clone()) }
+                        pre class="raw-message-content is-hidden" { (raw_message.content.clone()) }
                     }
                 }
                 @if message.role == MessageRole::Assistant && show_stats {
@@ -2396,7 +2416,7 @@ fn message_row(
                 }
             }
             (message_actions(
-                message,
+                raw_message,
                 allow_freeze,
                 allow_generation_actions,
                 enable_continue,
@@ -4965,6 +4985,7 @@ mod tests {
             true,
             true,
             Some("persona-ad_de_jongh"),
+            false,
         )
         .into_string();
         assert!(html.contains(r#"class="message-speaker-avatar""#));
@@ -4977,6 +4998,49 @@ mod tests {
         assert!(html.contains("Private reasoning"));
         assert!(html.contains("Visible answer"));
         assert!(!html.contains("&lt;think&gt;"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_assistant_channel_markers_are_hidden_in_the_message_projection() -> Result<()> {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let message = Message {
+            id: "assistant-legacy".to_string(),
+            conversation_id: "conversation".to_string(),
+            role: MessageRole::Assistant,
+            content: "<|channel>thought\nprivate reasoning<channel|>Visible answer.".to_string(),
+            created_at: "1".to_string(),
+            parent_id: None,
+            model: Some("model.gguf".to_string()),
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        };
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
+        assert!(html.contains("Visible answer."));
+        assert!(html.contains("private reasoning"));
+        let visible_body = html.split("data-message-content=").next().unwrap_or(&html);
+        assert!(!visible_body.contains("&lt;|channel&gt;thought"));
+        assert!(!visible_body.contains("&lt;channel|&gt;"));
+        assert!(html.contains("data-message-content=\"&lt;|channel&gt;thought"));
+        assert_eq!(
+            message.content, "<|channel>thought\nprivate reasoning<channel|>Visible answer.",
+            "rendering must not mutate the persisted message"
+        );
         Ok(())
     }
 
@@ -4994,12 +5058,40 @@ mod tests {
         let mut message = test_message("assistant", MessageRole::Assistant, "Stored reply");
         message.parent_id = Some("voice-note".to_string());
 
-        let html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
 
         assert!(html.contains("Stored reply"));
         assert!(!html.contains("voice-reply-row"));
         assert!(!html.contains("voice-message-player"));
         assert!(html.contains(r#"data-action="message-read-aloud""#));
+    }
+
+    #[test]
+    fn historical_voice_reply_without_recording_does_not_become_a_text_note() {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let message = test_message(
+            "reply",
+            MessageRole::Assistant,
+            "Model transcript stays available.",
+        );
+        let html = message_row(&message, &settings, &[], true, true, None, true).into_string();
+        assert!(html.contains("voice-message-unavailable"));
+        assert!(
+            !html
+                .split("data-message-content=")
+                .next()
+                .unwrap_or(&html)
+                .contains("Model transcript stays available.")
+        );
+        assert_eq!(message.content, "Model transcript stays available.");
     }
 
     #[test]
@@ -5244,7 +5336,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["second", "first"]
         );
-        let html = message_row(&message, &settings, &records, true, false, None).into_string();
+        let html =
+            message_row(&message, &settings, &records, true, false, None, false).into_string();
         let second_position = html.find("photo.png").expect("second attachment");
         let first_position = html.find("notes.md").expect("first attachment");
         assert!(second_position < first_position);
@@ -5627,18 +5720,20 @@ mod tests {
         message.prompt_tokens = Some(7);
         message.completion_tokens = Some(11);
 
-        let html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!html.contains("frozen-conversation-Q4_K_M"));
         assert!(!html.contains("global-default-Q8_0"));
         assert!(html.contains("7 prompt · 11 generated"));
 
         message.model = None;
-        let legacy_html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let legacy_html =
+            message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!legacy_html.contains("Unknown model"));
         assert!(!legacy_html.contains("global-default-Q8_0"));
 
         message.model = Some("  ".to_string());
-        let blank_html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let blank_html =
+            message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!blank_html.contains("Unknown model"));
     }
 
@@ -5654,6 +5749,50 @@ mod tests {
         assert!(!js.contains("persona_mmproj_path"));
         assert!(!js.contains("persona_model_path"));
         assert!(js.contains("persona_model_choice"));
+    }
+
+    #[test]
+    fn saved_persona_voice_reply_restores_audio_without_exposing_model_transcript() {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut message =
+            test_message("reply", MessageRole::Assistant, "Transcript for the model.");
+        message.attachment_ids.push("speech".into());
+        let mut attachment = attachment_record(
+            "speech",
+            "reply",
+            "voice-message-reply-fixture.wav",
+            AttachmentKind::Audio,
+        );
+        attachment.source_path = "generated://assistant-voice".into();
+        attachment.mime = "audio/wav".into();
+        attachment.detected_format =
+            Some(serde_json::from_value(serde_json::json!("wav")).expect("WAV format"));
+        attachment.state = mom_llama_runtime::AttachmentState::Committed;
+        let html =
+            message_row(&message, &settings, &[&attachment], true, true, None, false).into_string();
+        assert!(html.contains("voice-message-player"));
+        assert!(html.contains("data-attachment-preview=\"speech\""));
+        assert!(
+            !html
+                .split("data-message-content=")
+                .next()
+                .unwrap_or(&html)
+                .contains("Transcript for the model.")
+        );
+        assert_eq!(message.content, "Transcript for the model.");
+        message.id = "edited-reply".into();
+        let edited =
+            message_row(&message, &settings, &[&attachment], true, true, None, false).into_string();
+        assert!(!edited.contains("voice-message-player"));
+        assert!(edited.contains("Transcript for the model."));
     }
 
     #[test]

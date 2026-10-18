@@ -197,6 +197,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_import_paste", true, false),
     long("mom_llama_attachment_import", true, false),
     long("mom_llama_voice_message_import", true, false),
+    long("mom_llama_voice_reply_store", true, false),
     read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", true, false),
     long("mom_llama_attachment_preview_content", true, false),

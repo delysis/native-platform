@@ -599,6 +599,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   const indexed = [];
   const finishedSpeech = [];
   const ordering = [];
+  const boundVoiceTargets = [];
   let resolveSpeech;
   let signalFinishStarted;
   const finishStarted = new Promise((resolve) => { signalFinishStarted = resolve; });
@@ -617,6 +618,11 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
       return new Promise((resolve) => { resolveSpeech = resolve; });
     },
     trackGeneration: (operation) => operation,
+    bindDurableVoiceReply: (target) => {
+      ordering.push("persist");
+      boundVoiceTargets.push(target);
+      return Promise.resolve("voice-attachment");
+    },
     stop: async () => true,
   };
   const context = {
@@ -678,7 +684,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   const submitted = submit({ preventDefault() {}, target: { id: "chat-form", dataset: {}, querySelector: () => null } });
   await finishStarted;
   assert.deepEqual(indexed, [], "voice-note ASR waits while reply TTS is still active");
-  assert.deepEqual(ordering, ["finish"]);
+  assert.deepEqual(ordering, ["finish", "persist"], "audio publication starts without waiting for the UI row");
   resolveSpeech(true);
   await submitted;
   assert.equal(persistedDrafts.length, 1);
@@ -687,7 +693,10 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   assert.equal(indexed[0][2], attachment);
   assert.equal(indexed[0][3], capture, "the fallback source capture remains in scope after dispatch");
   assert.deepEqual(finishedSpeech, [output.assistant_text], "the retained owner must receive the direct output");
-  assert.deepEqual(ordering, ["finish", "index"], "successful reply playback releases backfill after TTS");
+  assert.deepEqual(JSON.parse(JSON.stringify(boundVoiceTargets)), [{
+    conversation: "conversation-a", message: "assistant-message", text: "A spoken reply.",
+  }], "the committed assistant identity binds the completed reply audio");
+  assert.deepEqual(ordering, ["finish", "persist", "index"], "backfill waits for audio publication");
   assert.ok(stages.some(([stage]) => stage === "tts_text_admitted"));
 });
 
@@ -961,7 +970,7 @@ test("voice replies keep typing chrome until a durable voice note is complete", 
   assert.match(pending, /return createTypingIndicator\(\)/);
   assert.match(pending, /const pendingVoiceReplyPlayer =/);
   assert.doesNotMatch(source, /firstPcmSeen = true;\s*mountVoiceReplyPlayer\(\)/);
-  assert.match(source, /voiceNoteComplete = true;\s*const voiceButton = mountVoiceReplyPlayer\(\)/);
+  assert.match(source, /voiceNoteComplete = true;\s*settleVoiceAudioReady\(true\);\s*const voiceButton = mountVoiceReplyPlayer\(\)/);
   assert.match(source, /bindPendingRow\(\) \{\s*if \(!voiceNoteComplete\) return button/);
 
   const calls = [];
@@ -1000,7 +1009,7 @@ test("voice completion remains owned until durable PCM succeeds or fails", () =>
   const speculateStart = source.indexOf("  const startVoiceSpeculation = async");
   const speculateEnd = source.indexOf("\n  const sendVoiceCapture = async", speculateStart);
   const speculate = source.slice(speculateStart, speculateEnd);
-  assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*tts\.finish\(response\.result\.assistant_text \|\| tts\.text\)\)/);
+  assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*tts\.finish\(response\.result\.assistant_text \|\| tts\.text\),/);
   assert.match(speculate, /if \(!synthesized\)[\s\S]*voice_reply_incomplete/);
 
   const greetingStart = source.indexOf("  const startStreamedCallGreeting = async");
@@ -1356,25 +1365,25 @@ test("a voice reply that fails after first PCM cannot leave a dead play button",
 });
 
 test("a completed voice reply keeps the validated PCM controller as its replay owner", () => {
-  const durable = source.slice(
-    source.indexOf("  const settleDurableVoiceReply ="),
-    source.indexOf("\n  const restoreReadAloudButton", source.indexOf("  const settleDurableVoiceReply =")),
+  const inMemory = source.slice(
+    source.indexOf("  const settleInMemoryVoiceReply ="),
+    source.indexOf("\n  const restoreReadAloudButton", source.indexOf("  const settleInMemoryVoiceReply =")),
   );
-  assert.match(durable, /controller\?\.wavBytes\?\.\(\)/);
-  assert.match(durable, /controller\?\.ready/);
-  assert.match(durable, /isCanonicalPcmWav\(bytes\)/);
-  assert.match(durable, /button\.dataset\.audioProof = "pcm-complete"/);
-  assert.match(durable, /button\.disabled = false/);
-  assert.match(durable, /durable_voice_audio_ready/);
-  assert.doesNotMatch(durable, /createObjectURL|compactAudioPlayer|voiceReplyPlayback\.delete/);
+  assert.match(inMemory, /controller\?\.wavBytes\?\.\(\)/);
+  assert.match(inMemory, /controller\?\.ready/);
+  assert.match(inMemory, /isCanonicalPcmWav\(bytes\)/);
+  assert.match(inMemory, /button\.dataset\.audioProof = "pcm-complete"/);
+  assert.match(inMemory, /button\.disabled = false/);
+  assert.match(inMemory, /in_memory_voice_audio_ready/);
+  assert.doesNotMatch(inMemory, /createObjectURL|compactAudioPlayer|voiceReplyPlayback\.delete/);
 
   const live = source.slice(
     source.indexOf("  const beginLiveVoiceTts ="),
     source.indexOf("\n  const renderChatBusyState", source.indexOf("  const beginLiveVoiceTts =")),
   );
   assert.match(live, /if \(controller\.playing\) durablePending = true/);
-  assert.match(live, /else settleDurableVoiceReply\(voiceButton, controller\)/);
-  assert.match(live, /settleDurableVoiceReply\(button, controller\);[\s\S]*if \(mode === "call"/);
+  assert.match(live, /else settleInMemoryVoiceReply\(voiceButton, controller, ttsLatencyTrace\)/);
+  assert.match(live, /settleInMemoryVoiceReply\(button, controller, ttsLatencyTrace\);[\s\S]*if \(mode === "call"/);
   assert.doesNotMatch(
     live,
     /onPlayable: \(\) => \{[\s\S]{0,500}button\.dataset\.audioState = "ready"/,

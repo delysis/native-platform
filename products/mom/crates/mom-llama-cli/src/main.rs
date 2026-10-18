@@ -7,6 +7,7 @@ use mom_llama_runtime::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -588,6 +589,18 @@ enum MessageCommand {
 
 #[derive(Debug, Subcommand)]
 enum AttachmentCommand {
+    StoreVoiceReply {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Import {
         #[arg(long)]
         conversation: String,
@@ -1362,6 +1375,27 @@ fn run() -> Result<()> {
             ),
         },
         Command::Attachment { command } => match command {
+            AttachmentCommand::StoreVoiceReply {
+                conversation,
+                message,
+                text,
+                path,
+                json,
+            } => {
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?
+                    .take(16 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                print_result(
+                    mom_llama_runtime::attachment_store_voice_reply(
+                        &conversation,
+                        &message,
+                        &text,
+                        bytes,
+                    )?,
+                    json,
+                )
+            }
             AttachmentCommand::Import {
                 conversation,
                 path,

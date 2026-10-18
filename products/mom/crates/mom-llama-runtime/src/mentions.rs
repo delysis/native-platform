@@ -6,7 +6,8 @@ pub use sources::{ConsultSourcePreview, consult_source_open, consult_sources};
 mod target_resolution;
 use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{
-    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, native_context_messages,
+    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, ReasoningStreamParser,
+    ReasoningTarget, native_context_messages, parse_reasoning_output,
 };
 use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
@@ -102,6 +103,10 @@ pub struct MentionTargetResult {
     pub label: String,
     pub state: GenerationState,
     pub text: String,
+    #[serde(default)]
+    pub reasoning_content: String,
+    #[serde(default)]
+    pub reasoning_incomplete: bool,
     pub model_id: String,
     pub message_id: Option<String>,
     pub metrics: GenerationMetrics,
@@ -1180,13 +1185,16 @@ fn mention_tool_approval_decide_supported_in_scope(
                 .map(|receipt| vec![receipt.receipt.task_id.clone()])
                 .unwrap_or_default();
             let output = success.output;
+            let parsed = parse_reasoning_output(&output.text);
             (
                 MentionTargetResult {
                     target_id: claim.snapshot.target_id.clone(),
                     handle: claim.snapshot.handle.clone(),
                     label: claim.snapshot.label.clone(),
                     state: output.state,
-                    text: strip_reserved_attribution_prefix(&output.text),
+                    text: strip_reserved_attribution_prefix(&parsed.content),
+                    reasoning_content: parsed.reasoning,
+                    reasoning_incomplete: parsed.incomplete,
                     model_id: output.model_id,
                     message_id: None,
                     metrics: output.metrics,
@@ -2924,10 +2932,11 @@ pub fn mention_synthesize(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("native mention synthesis returned no output"))?;
+    let parsed_output = parse_reasoning_output(&output.text);
     if output.state != GenerationState::Completed
         || !output.real_engine_invoked
         || output.fake_fixture
-        || output.text.trim().is_empty()
+        || parsed_output.content.trim().is_empty()
     {
         return Ok(CommandResult::blocked_with_evidence(
             "mom_llama.mention_synthesize",
@@ -2965,15 +2974,16 @@ pub fn mention_synthesize(
         id: message_id.clone(),
         conversation_id: host.id.clone(),
         role: MessageRole::Assistant,
-        content: output.text.clone(),
+        content: parsed_output.content.clone(),
         created_at: now_ms().to_string(),
         parent_id: active_leaf_id(host),
         model: Some(output.model_id.clone()),
         receipt_id: Some(format!("mom_llama.mention_synthesize:{invocation_id}")),
         prompt_tokens: Some(output.metrics.prompt_tokens),
         completion_tokens: Some(output.metrics.completion_tokens),
-        reasoning_content: None,
-        reasoning_incomplete: false,
+        reasoning_content: (!parsed_output.reasoning.is_empty())
+            .then(|| parsed_output.reasoning.clone()),
+        reasoning_incomplete: parsed_output.incomplete,
         branch_index: None,
         branch_count: None,
         attribution: Some(MessageAttribution {
@@ -2992,7 +3002,7 @@ pub fn mention_synthesize(
     host.updated_at = now_ms().to_string();
     let updated_host = host.clone();
     let conversation_path = upsert_conversation(db, updated_host)?;
-    let synthesis_sha256 = format!("{:x}", Sha256::digest(output.text.as_bytes()));
+    let synthesis_sha256 = format!("{:x}", Sha256::digest(parsed_output.content.as_bytes()));
     store.mutate(INVOCATIONS_NAMESPACE, MentionInvocationDb::default, |db| {
         if let Some(stored) = db
             .invocations
@@ -3009,7 +3019,7 @@ pub fn mention_synthesize(
         invocation_id: invocation_id.to_string(),
         host_conversation_id: invocation.host_conversation_id.clone(),
         message_id,
-        text: output.text,
+        text: parsed_output.content,
         model_id: output.model_id,
         source_message_ids: completed
             .iter()
@@ -3185,6 +3195,8 @@ where
                 label: snapshot.label.clone(),
                 state: GenerationState::Completed,
                 text,
+                reasoning_content: String::new(),
+                reasoning_incomplete: false,
                 model_id: "fake_fixture".to_string(),
                 message_id: None,
                 metrics: GenerationMetrics::default(),
@@ -3362,6 +3374,7 @@ where
                             &target.snapshot.target_id,
                         )?;
                         let cache_reused = execution::cache_was_reused(&output.metrics.cache);
+                        let parsed = parse_reasoning_output(&output.text);
                         // Cancellation retains the exact native prefix. A user who
                         // stops a response has still sent the invitation and seen
                         // this text; both belong in the conversation record.
@@ -3374,7 +3387,9 @@ where
                             } else {
                                 output.state
                             },
-                            text: strip_reserved_attribution_prefix(&output.text),
+                            text: strip_reserved_attribution_prefix(&parsed.content),
+                            reasoning_content: parsed.reasoning,
+                            reasoning_incomplete: parsed.incomplete,
                             model_id: output.model_id,
                             message_id: None,
                             metrics: output.metrics,
@@ -3823,6 +3838,12 @@ fn append_attributed_results(host: &mut Conversation, invocation: &mut MentionIn
                 });
     let mut parent = Some(invocation.user_message_id.clone());
     for (order, result) in invocation.results.iter_mut().enumerate() {
+        let parsed = parse_reasoning_output(&result.text);
+        result.text = strip_reserved_attribution_prefix(&parsed.content);
+        if result.reasoning_content.is_empty() {
+            result.reasoning_content = parsed.reasoning;
+        }
+        result.reasoning_incomplete |= parsed.incomplete;
         let publishable = result.state == GenerationState::Completed
             || (result.state == GenerationState::Cancelled
                 && result.real_engine_invoked
@@ -3863,8 +3884,9 @@ fn append_attributed_results(host: &mut Conversation, invocation: &mut MentionIn
             receipt_id: Some(format!("mom_llama.mention_dispatch:{}", invocation.id)),
             prompt_tokens: Some(result.metrics.prompt_tokens),
             completion_tokens: Some(result.metrics.completion_tokens),
-            reasoning_content: None,
-            reasoning_incomplete: false,
+            reasoning_content: (!result.reasoning_content.is_empty())
+                .then(|| result.reasoning_content.clone()),
+            reasoning_incomplete: result.reasoning_incomplete,
             branch_index: None,
             branch_count: None,
             attribution: Some(MessageAttribution {
@@ -4041,6 +4063,8 @@ fn blocked_target_result(
         label: snapshot.label.clone(),
         state,
         text: message.to_string(),
+        reasoning_content: String::new(),
+        reasoning_incomplete: false,
         model_id: String::new(),
         message_id: None,
         metrics: GenerationMetrics::default(),
@@ -4454,7 +4478,9 @@ mod tests {
                 handle: "researcher".into(),
                 label: "Researcher".into(),
                 state: GenerationState::Cancelled,
-                text: "The retained partial answer".into(),
+                text: "<|channel>thought\nprivate plan<channel|>The retained partial answer".into(),
+                reasoning_content: String::new(),
+                reasoning_incomplete: false,
                 model_id: "model".into(),
                 message_id: None,
                 metrics: GenerationMetrics::default(),
@@ -4492,6 +4518,10 @@ mod tests {
         );
         assert_eq!(messages[0].content, "@researcher explain this");
         assert_eq!(messages[1].content, "The retained partial answer");
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("private plan")
+        );
         assert!(
             messages[1]
                 .attribution
@@ -4513,6 +4543,8 @@ mod tests {
             label: "Researcher".into(),
             state: GenerationState::Cancelled,
             text: String::new(),
+            reasoning_content: String::new(),
+            reasoning_incomplete: false,
             model_id: String::new(),
             message_id: None,
             metrics: GenerationMetrics::default(),

@@ -1674,6 +1674,23 @@ pub async fn mom_llama_voice_message_import(
 }
 
 #[tauri::command]
+pub async fn mom_llama_voice_reply_store(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+    text: String,
+    bytes: Vec<u8>,
+) -> Result<Value, String> {
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_voice_reply_store"))?,
+        move || {
+            mom_llama_runtime::attachment_store_voice_reply(&conversation, &message, &text, bytes)
+        },
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn mom_llama_voice_audio_begin(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,

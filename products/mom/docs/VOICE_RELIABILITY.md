@@ -104,6 +104,54 @@ qualifying this parser repair. Regression coverage includes empty/nonempty and
 unfinished thought blocks, every UTF-8 split boundary, single-character deltas,
 and agreement between live routing and final parsing.
 
+## Shared generation and speech admission
+
+Direct chat and persona/mention dispatch must use the same incremental model
+output parser, including tool continuations and final persisted results. A
+successful direct-chat test does not qualify persona streaming. Protocol markers
+and reasoning must be separated before visible content reaches any speech
+consumer. Stored assistant messages are projected through the same parser for
+display, copy and Read Aloud; the original storage and explicit raw exports are
+preserved. User and tool text are never rewritten by that assistant projection.
+
+Read Aloud and precommit speech share one synthesis-request constructor and the
+same Qwen helper, voice reference cache, sampling, PCM framing and renderer.
+The helper owns the final bounded-text admission for every request: already
+bounded inputs remain one unchanged normalized utterance; long inputs split at
+complete sentences, then clauses or a 64-word limit. Live text availability can
+cause earlier dispatch, but must not bypass this admission or invent a second
+normalizer. Explicit reading uses the shared adaptive PCM runway with local
+calibration so a long reading does not retune a later call.
+
+Regression evidence must cross both entry points: persona output routing and
+persistence, exact Read Aloud target selection, shared request parity, long-input
+word conservation, and short-input audio parity. Renderer tests do not establish
+pleasant audio; keep real helper stop reasons, packet timing and audition audio
+separate from physical playback acceptance.
+
+## Voice-note storage and visibility
+
+A persona voice note has two projections: saved audio for the user and the
+assistant transcript for model context. Publish its WAV through encrypted
+attachment storage, atomically binding it to the exact committed assistant
+message and visible text. In-memory playback is not durable publication.
+Navigation must not cancel a completed recording's pending publication; failed
+publication retains the session recording and offers retry. Restored recordings
+render as audio bubbles. Generated assistant audio is excluded before model
+media budgeting, without excluding ordinary user audio. An edit creates a new
+message occurrence and cannot inherit the previous wording's recording.
+Publishing this presentation-only recording must preserve the rolled inference
+window and checkpoint eligibility. Exclusions use authenticated attachment
+metadata with exact conversation/message ownership, never a filename. Ordinary
+media, transcript edits, branch changes and profile changes still invalidate the
+relevant inference authority.
+
+Regression checks cover both PCM/message-ID completion orders, failed-save retry,
+encrypted-store reopen, exact audio bytes, stale-message rejection, and separate
+rendered/model projections. Older session-only recordings cannot be recovered
+from their text: show an unavailable voice bubble rather than silently replacing
+the note with text or claiming a regenerated recording is the original.
+
 ## Sentence prosody and streaming PCM continuity
 
 Sentence-level text admission and PCM startup buffering are separate decisions.

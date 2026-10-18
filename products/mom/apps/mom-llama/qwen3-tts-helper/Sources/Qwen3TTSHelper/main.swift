@@ -360,15 +360,12 @@ private enum Qwen3TTSHelperMain {
                     continue
                 }
                 let textChunkStarted = DispatchTime.now().uptimeNanoseconds
-                // The app scheduler is the sole segmentation authority for
-                // live speech. Splitting the same phrase again here reset the
-                // talker and codec at helper-private boundaries, producing
-                // the conspicuous short prosody blocks heard in voice notes.
-                // Retain formatting cleanup, then synthesize this request as
-                // one continuous utterance.
-                let speechText = TextChunker.spokenChunks(request.text, maxWords: .max)
-                    .joined(separator: " ")
-                let speechChunks = speechText.isEmpty ? [] : [speechText]
+                // Live call/voice-note requests already arrive bounded by the
+                // app scheduler and remain one acoustic segment. Read Aloud
+                // can contain an entire long message, so split only above the
+                // same 64-word ceiling while keeping one helper job and one
+                // final terminal event for the streamed PCM.
+                let speechChunks = TextChunker.boundedSpokenChunks(request.text, maxWords: 64)
                 let textChunkMicros = elapsedMicros(since: textChunkStarted)
                 guard !speechChunks.isEmpty else {
                     throw NSError(domain: "MomQwen3TTSHelper", code: 9,

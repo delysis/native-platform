@@ -242,6 +242,11 @@ struct AssistantMessageTarget {
     persona_voice_id: Option<String>,
 }
 
+struct AssistantMessageSpeechText {
+    text: String,
+    raw_content_sha256: String,
+}
+
 #[derive(Debug, Clone)]
 struct QwenSelection {
     descriptor_sha256: String,
@@ -298,6 +303,7 @@ pub struct ReadAloudBinding {
     pub duration_ms: Option<u64>,
     pub tts_time_to_first_audio_ms: Option<u64>,
     pub tts_total_ms: Option<u64>,
+    pub tts_generation_segments: Vec<SpeechGenerationSegment>,
     pub network: NetworkBehavior,
 }
 
@@ -1040,6 +1046,7 @@ impl MomSpeech {
         }
         let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
         let tts_total_ms = response.usage.total_ms;
+        let tts_generation_segments = response.usage.helper_generation_segments.clone();
         let validated = validate_read_aloud_response(response, &request_id, &selection);
         let duration_ms = match validated {
             Ok(output) => output,
@@ -1060,6 +1067,7 @@ impl MomSpeech {
             duration_ms,
             tts_time_to_first_audio_ms,
             tts_total_ms,
+            tts_generation_segments,
             network: NetworkBehavior::Never,
         };
         let playback_id = match self.publish_playback(operation, &request_id, binding.clone()) {
@@ -1912,18 +1920,18 @@ fn assistant_message_target(
             Vec::new(),
         )));
     }
-    if message.content.trim().is_empty() {
+    let Some(speech_text) = assistant_message_speech_text(message) else {
         return Ok(Err(Blocker::new(
             "speech_read_aloud_empty",
             "The assistant message has no text to read aloud.",
             Vec::new(),
         )));
-    }
+    };
     Ok(Ok(AssistantMessageTarget {
         conversation_id: conversation_id.to_string(),
         message_id: message_id.to_string(),
-        text_sha256: sha256_hex(message.content.as_bytes()),
-        text: message.content.clone(),
+        text_sha256: speech_text.raw_content_sha256,
+        text: speech_text.text,
         persona_voice_id: persona_voice_key_for_conversation(
             &conversation.recipient_ids,
             conversation.source_conversation_id.as_deref(),
@@ -1932,6 +1940,19 @@ fn assistant_message_target(
         // Qwen Base ICL route; generic speech keeps the VoiceDesign route.
         .map(|key| format!("mom.qwen.icl.{key}")),
     }))
+}
+
+fn assistant_message_speech_text(
+    message: &mom_llama_runtime::conversation_store::Message,
+) -> Option<AssistantMessageSpeechText> {
+    let text = mom_llama_runtime::assistant_visible_content(message)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(AssistantMessageSpeechText {
+        text,
+        raw_content_sha256: sha256_hex(message.content.as_bytes()),
+    })
 }
 
 fn elapsed_us(started: Instant) -> u64 {
@@ -2031,32 +2052,18 @@ fn read_aloud_request(
     selection: &ReadAloudSelection,
     request_id: SpeechRequestId,
 ) -> SynthesisRequest {
-    let voice_id = selection.voice_id();
-    SynthesisRequest {
-        context: request_context(
-            request_id,
-            SpeechRouteSelector::ExactBackend {
-                backend_id: selection.backend_id().to_string(),
-                model_id: selection.model_id(),
-                voice_id: Some(voice_id.clone()),
-            },
-            240_000,
-        ),
-        input: SynthesisInput::Text {
-            text: target.text.clone(),
-        },
-        voice: VoiceSelector::Exact { voice_id },
-        language: Some(READ_ALOUD_LANGUAGE.to_string()),
-        rate: 1.0,
-        pitch: 1.0,
-        volume: 1.0,
-        output: qwen_stream_output(),
-        alignment: AlignmentGranularity::None,
-        stream: true,
-    }
+    persona_synthesis_request(&target.text, selection, request_id)
 }
 
 fn precommit_synthesis_request(
+    text: &str,
+    selection: &ReadAloudSelection,
+    request_id: SpeechRequestId,
+) -> SynthesisRequest {
+    persona_synthesis_request(text, selection, request_id)
+}
+
+fn persona_synthesis_request(
     text: &str,
     selection: &ReadAloudSelection,
     request_id: SpeechRequestId,
@@ -3407,6 +3414,11 @@ mod tests {
             &qwen,
             SpeechRequestId("request".to_string()),
         );
+        assert_eq!(
+            request,
+            precommit_synthesis_request("hello", &qwen, SpeechRequestId("request".to_string())),
+            "Read Aloud and precommit must share one persona synthesis contract"
+        );
         assert!(request.stream);
         assert_eq!(request.output, qwen_stream_output());
         assert!(qwen.descriptor().capabilities.iter().all(|capability| {
@@ -3619,6 +3631,7 @@ mod tests {
                         duration_ms: None,
                         tts_time_to_first_audio_ms: None,
                         tts_total_ms: None,
+                        tts_generation_segments: Vec::new(),
                         network: NetworkBehavior::Never,
                     },
                 )
@@ -3739,6 +3752,41 @@ mod tests {
         const ATTACHMENT_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
             fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
             data\x02\x00\x00\x00\x00\x00";
+
+        #[test]
+        fn read_aloud_speaks_visible_text_but_binds_raw_stored_content() {
+            let raw = "<|channel>thought\nprivate reasoning<channel|>Visible answer.";
+            let message = Message {
+                id: "message".to_string(),
+                conversation_id: "conversation".to_string(),
+                role: MessageRole::Assistant,
+                content: raw.to_string(),
+                created_at: "1".to_string(),
+                parent_id: None,
+                model: None,
+                receipt_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_content: None,
+                reasoning_incomplete: false,
+                branch_index: None,
+                branch_count: None,
+                attribution: None,
+                attachment_ids: Vec::new(),
+            };
+
+            let speech_text = assistant_message_speech_text(&message).expect("visible answer");
+            assert_eq!(speech_text.text, "Visible answer.");
+            assert_eq!(speech_text.raw_content_sha256, sha256_hex(raw.as_bytes()));
+            assert_eq!(
+                message.content, raw,
+                "speech projection must not mutate storage"
+            );
+
+            let mut thought_only = message;
+            thought_only.content = "<|channel>thought\nprivate reasoning<channel|>".to_string();
+            assert!(assistant_message_speech_text(&thought_only).is_none());
+        }
 
         struct OwnedSpeechStore {
             _directory: tempfile::TempDir,

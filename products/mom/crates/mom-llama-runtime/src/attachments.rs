@@ -26,12 +26,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
-const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
+pub(crate) const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
 const ATTACHMENT_MANIFEST_SCHEMA: &str = "mom_llama.attachment_manifest.v1";
 const ATTACHMENT_PREVIEW_CATALOG_SCHEMA: &str = "mom_llama.attachment_preview_catalog.v1";
 const ATTACHMENT_PREVIEW_CONTENT_SCHEMA: &str = "mom_llama.attachment_preview_content.v1";
 const MAX_PASTED_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_GENERATED_VOICE_REPLY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_PREVIEW_TEXT_BYTES: usize = 128 * 1024;
 const MAX_ATTACHMENT_PREVIEW_TEXT_LINES: usize = 1_200;
 const MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS: usize = 256;
@@ -43,6 +44,7 @@ const MAX_ACTIVE_ATTACHMENT_REFERENCES: usize = 32;
 const MAX_ACTIVE_ATTACHMENT_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS: u32 = 16;
 const MAX_ACTIVE_ATTACHMENT_MEDIA_BYTES: u64 = 128 * 1024 * 1024;
+const GENERATED_VOICE_REPLY_SOURCE: &str = "generated://assistant-voice";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1072,6 +1074,297 @@ fn canonical_attachment_record(
         manifest,
         blobs,
     })
+}
+
+/// Persist a generated voice reply WAV as an attachment owned by the exact
+/// assistant message whose visible text produced it. Attachment metadata,
+/// encrypted payload, manifest, and message reference commit atomically.
+pub fn attachment_store_voice_reply(
+    conversation_id: &str,
+    message_id: &str,
+    expected_text: &str,
+    wav: Vec<u8>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let attachment = match store_voice_reply(conversation_id, message_id, expected_text, wav) {
+        Ok(attachment) => attachment,
+        Err(_error) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.voice_reply_store",
+                "blocked_voice_reply_persistence",
+                Blocker::new(
+                    "voice_reply_persistence_rejected",
+                    "The voice reply recording could not be saved.".to_string(),
+                    vec!["Retry saving the voice reply recording.".to_string()],
+                ),
+            ));
+        }
+    };
+    let attachment_id = attachment.id.clone();
+    Ok(CommandResult::passed(
+        "mom_llama.voice_reply_store",
+        "contracted",
+        AttachmentImportOutput {
+            attachment,
+            multimodal_ready: false,
+            multimodal_blocker: None,
+        },
+        vec![
+            format!("conversation:{conversation_id}/message:{message_id}"),
+            format!("attachment:{attachment_id}"),
+        ],
+        vec![attachment_id],
+        false,
+        false,
+    ))
+}
+
+fn store_voice_reply(
+    conversation_id: &str,
+    message_id: &str,
+    expected_text: &str,
+    wav: Vec<u8>,
+) -> Result<AttachmentRecord> {
+    anyhow::ensure!(
+        !expected_text.trim().is_empty(),
+        "generated voice reply requires visible assistant text"
+    );
+    anyhow::ensure!(
+        wav.len() >= 12
+            && wav.len() <= MAX_GENERATED_VOICE_REPLY_BYTES
+            && &wav[..4] == b"RIFF"
+            && &wav[8..12] == b"WAVE",
+        "generated voice reply must be a bounded RIFF WAV"
+    );
+
+    let host = attachment_host()?;
+    let file_name = format!("voice-message-reply-{}.wav", Uuid::new_v4().simple());
+    let canonicalized = host
+        .inspect_and_canonicalize(ProvidedAttachment::from_bytes(
+            file_name.clone(),
+            Some("audio/wav".to_string()),
+            wav.clone(),
+        ))
+        .map_err(|error| {
+            anyhow!(
+                "generated voice reply failed canonical audio validation: {}",
+                error.safe_message
+            )
+        })?;
+    anyhow::ensure!(
+        canonicalized.bundle.validate().is_ok()
+            && canonicalized
+                .receipt
+                .validate_against(&canonicalized.bundle, None)
+                .is_ok()
+            && canonicalized.bundle.graph.objects.len() == 1
+            && canonicalized.bundle.graph.edges.is_empty()
+            && canonicalized.bundle.graph.coverage == Coverage::Complete
+            && canonicalized.bundle.graph.objects[0].detection.selected
+                == Some(DetectedFormat::Wav),
+        "generated voice reply did not produce a complete canonical WAV"
+    );
+    let mut prepared = canonical_attachment_record(
+        canonicalized,
+        &host,
+        conversation_id,
+        file_name,
+        GENERATED_VOICE_REPLY_SOURCE.to_string(),
+        None,
+    )?;
+    anyhow::ensure!(
+        prepared.record.kind == AttachmentKind::Audio && prepared.record.mime == "audio/wav",
+        "generated voice reply was not classified as WAV audio"
+    );
+
+    let settings = resolve_settings()?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let _lifecycle = lock_attachment_lifecycle()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |conversations, documents| {
+            let conversation = conversations
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+                .ok_or_else(|| anyhow!("voice reply conversation no longer exists"))?;
+            let message = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+                .ok_or_else(|| anyhow!("voice reply assistant message no longer exists"))?;
+            anyhow::ensure!(
+                message.role == crate::conversation_store::MessageRole::Assistant,
+                "generated voice reply target must be an assistant message"
+            );
+            anyhow::ensure!(
+                crate::chat::assistant_visible_content(message).as_deref() == Some(expected_text),
+                "assistant message text changed before voice reply persistence"
+            );
+
+            let mut attachment_db = documents
+                .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+                .unwrap_or_default();
+            let existing = attachment_db
+                .attachments
+                .iter()
+                .filter(|record| {
+                    record.conversation_id == conversation_id
+                        && record.message_id == message_id
+                        && is_generated_voice_reply(record)
+                })
+                .collect::<Vec<_>>();
+            if !existing.is_empty() {
+                anyhow::ensure!(
+                    existing.len() == 1,
+                    "assistant message has conflicting generated voice replies"
+                );
+                let record = existing[0];
+                anyhow::ensure!(
+                    record.state == AttachmentState::Committed
+                        && message.attachment_ids.iter().any(|id| id == &record.id)
+                        && record.sha256 == prepared.record.sha256,
+                    "a different generated voice reply is already bound to this message"
+                );
+                let namespace = record
+                    .manifest_namespace
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("generated voice reply manifest is missing"))?;
+                let manifest = documents
+                    .get::<AttachmentManifest>(namespace)?
+                    .ok_or_else(|| anyhow!("generated voice reply manifest is missing"))?;
+                validate_preview_manifest(record, &manifest).map_err(|problem| {
+                    anyhow!(
+                        "generated voice reply manifest is invalid: {}",
+                        problem.message
+                    )
+                })?;
+                let root = manifest
+                    .graph
+                    .objects
+                    .iter()
+                    .find(|object| object.id == manifest.graph.root)
+                    .ok_or_else(|| anyhow!("generated voice reply WAV object is missing"))?;
+                let retained = store
+                    .get_bytes(&object_namespace(&root.id))?
+                    .ok_or_else(|| anyhow!("generated voice reply WAV object is missing"))?;
+                let (retained, _) =
+                    verify_content_with_digest(&record.sha256, record.bytes, retained)?;
+                anyhow::ensure!(
+                    retained == wav,
+                    "a different generated voice reply is already bound to this message"
+                );
+                return Ok(record.clone());
+            }
+            anyhow::ensure!(
+                !attachment_db.attachments.iter().any(|record| {
+                    record.conversation_id == conversation_id
+                        && record.message_id == message_id
+                        && record.source_path == GENERATED_VOICE_REPLY_SOURCE
+                }),
+                "assistant message has a conflicting generated voice attachment"
+            );
+
+            prepared.record.message_id = message_id.to_string();
+            prepared.record.state = AttachmentState::Committed;
+            validate_preview_manifest(&prepared.record, &prepared.manifest).map_err(|problem| {
+                anyhow!(
+                    "generated voice reply manifest is invalid: {}",
+                    problem.message
+                )
+            })?;
+            let id = prepared.record.id.clone();
+            let manifest_namespace = prepared
+                .record
+                .manifest_namespace
+                .as_deref()
+                .expect("canonical attachment manifest namespace")
+                .to_string();
+            attachment_db.attachments.insert(0, prepared.record.clone());
+            message.attachment_ids.push(id);
+            conversation.updated_at = now_ms().to_string();
+            documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+            documents.put_bytes(
+                &manifest_namespace,
+                &serde_json::to_vec(&prepared.manifest)?,
+            )?;
+            for (namespace, bytes) in &prepared.blobs {
+                documents.put_bytes_streamed(namespace, bytes)?;
+            }
+            Ok(prepared.record.clone())
+        },
+    )
+}
+
+/// Identify only the reserved native generated-voice origin. File names are
+/// descriptive metadata and never establish generated media provenance.
+pub fn is_generated_voice_reply(record: &AttachmentRecord) -> bool {
+    record.source_path == GENERATED_VOICE_REPLY_SOURCE
+        && record.kind == AttachmentKind::Audio
+        && record.mime == "audio/wav"
+        && record.detected_format == Some(DetectedFormat::Wav)
+}
+
+/// Return only committed generated reply IDs whose authenticated registry
+/// metadata binds them to an assistant message in this conversation. This is
+/// a metadata-only inference projection; it does not read or hash WAV payloads.
+pub(crate) fn generated_voice_reply_ids_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    conversation_id: &str,
+    messages: &[Message],
+) -> Result<BTreeSet<(String, String)>> {
+    if !has_assistant_attachment_refs(messages) {
+        return Ok(BTreeSet::new());
+    }
+    let db = snapshot
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(generated_voice_reply_ids(&db, conversation_id, messages))
+}
+
+/// Read the same exact generated-reply predicate inside the transaction that
+/// validates a conversation metadata CAS or session checkpoint authority.
+pub(crate) fn generated_voice_reply_ids_from_mutations(
+    documents: &DocumentMutations<'_, '_, '_>,
+    conversation_id: &str,
+    messages: &[Message],
+) -> Result<BTreeSet<(String, String)>> {
+    if !has_assistant_attachment_refs(messages) {
+        return Ok(BTreeSet::new());
+    }
+    let db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(generated_voice_reply_ids(&db, conversation_id, messages))
+}
+
+fn has_assistant_attachment_refs(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.role == crate::conversation_store::MessageRole::Assistant
+            && !message.attachment_ids.is_empty()
+    })
+}
+
+fn generated_voice_reply_ids(
+    db: &AttachmentDb,
+    conversation_id: &str,
+    messages: &[Message],
+) -> BTreeSet<(String, String)> {
+    db.attachments
+        .iter()
+        .filter(|record| {
+            record.conversation_id == conversation_id
+                && record.state == AttachmentState::Committed
+                && is_generated_voice_reply(record)
+                && messages.iter().any(|message| {
+                    message.conversation_id == conversation_id
+                        && message.role == crate::conversation_store::MessageRole::Assistant
+                        && message.id == record.message_id
+                        && message.attachment_ids.iter().any(|id| id == &record.id)
+                })
+        })
+        .map(|record| (record.message_id.clone(), record.id.clone()))
+        .collect()
 }
 
 #[expect(
@@ -3772,6 +4065,184 @@ mod tests {
             .expect("create conversation")
             .result
             .expect("conversation result")
+    }
+
+    fn assistant_message(
+        conversation_id: &str,
+        id: &str,
+        content: &str,
+        parent_id: Option<String>,
+    ) -> Message {
+        Message {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            role: crate::conversation_store::MessageRole::Assistant,
+            content: content.to_string(),
+            created_at: now_ms().to_string(),
+            parent_id,
+            model: Some("test-model".to_string()),
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn generated_voice_reply_commits_atomically_and_is_exactly_idempotent() {
+        let data_dir = TestDataDir::new("voice-reply-commit");
+        let mut conversation = new_conversation("Voice reply");
+        let conversation_id = conversation.id.clone();
+        let message_id = "assistant-message";
+        let user_message_id = "user-message";
+        let assistant = assistant_message(&conversation_id, message_id, "Visible answer.", None);
+        let mut user = message(user_message_id, Vec::new());
+        user.conversation_id = conversation_id.clone();
+        user.parent_id = Some(message_id.to_string());
+        conversation
+            .messages
+            .extend([assistant.clone(), user.clone()]);
+        conversation.active_leaf_message_id = Some(user_message_id.to_string());
+        let db = crate::conversation_store::load_db().expect("load database");
+        crate::conversation_store::upsert_conversation(db, conversation.clone())
+            .expect("persist exact messages");
+
+        let wav = pcm16le_mono_16khz_wav(321);
+        let committed = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "Visible answer.",
+            wav.clone(),
+        )
+        .expect("typed voice reply result");
+        assert_eq!(committed.command, "mom_llama.voice_reply_store");
+        assert_eq!(committed.status, "contracted");
+        assert_eq!(committed.readiness, "contracted");
+        let record = committed.result.expect("committed voice record").attachment;
+        assert_eq!(record.source_path, GENERATED_VOICE_REPLY_SOURCE);
+        assert!(record.file_name.starts_with("voice-message-reply-"));
+        assert!(record.file_name.ends_with(".wav"));
+        assert_eq!(record.message_id, message_id);
+        assert_eq!(record.state, AttachmentState::Committed);
+        assert!(is_generated_voice_reply(&record));
+
+        let repeated = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "Visible answer.",
+            wav.clone(),
+        )
+        .expect("idempotent typed result");
+        assert_eq!(
+            repeated.result.expect("existing record").attachment.id,
+            record.id
+        );
+
+        let conflicting = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "Visible answer.",
+            pcm16le_mono_16khz_wav(322),
+        )
+        .expect("conflict is typed");
+        assert_eq!(conflicting.readiness, "blocked_voice_reply_persistence");
+        let blocker = conflicting.blocker.expect("safe persistence blocker");
+        assert_eq!(
+            blocker.message,
+            "The voice reply recording could not be saved."
+        );
+        assert_eq!(
+            blocker.next_actions,
+            ["Retry saving the voice reply recording."]
+        );
+        let stale = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "A stale answer.",
+            wav.clone(),
+        )
+        .expect("stale target is typed");
+        assert_eq!(stale.readiness, "blocked_voice_reply_persistence");
+        let wrong_role = attachment_store_voice_reply(
+            &conversation_id,
+            user_message_id,
+            "host message",
+            wav.clone(),
+        )
+        .expect("wrong role is typed");
+        assert_eq!(wrong_role.readiness, "blocked_voice_reply_persistence");
+        let malformed = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "Visible answer.",
+            b"not a WAV".to_vec(),
+        )
+        .expect("malformed WAV is typed");
+        assert_eq!(malformed.readiness, "blocked_voice_reply_persistence");
+        let oversized = attachment_store_voice_reply(
+            &conversation_id,
+            message_id,
+            "Visible answer.",
+            vec![0; MAX_GENERATED_VOICE_REPLY_BYTES + 1],
+        )
+        .expect("oversized WAV is typed");
+        assert_eq!(oversized.readiness, "blocked_voice_reply_persistence");
+
+        let reopened = RuntimeStore::open(&data_dir.path).expect("reopen encrypted store");
+        let stored_conversations: ConversationDb = reopened
+            .get(CONVERSATIONS_NAMESPACE)
+            .expect("read conversation document")
+            .expect("conversation document");
+        let stored_conversation = stored_conversations
+            .conversations
+            .iter()
+            .find(|candidate| candidate.id == conversation_id)
+            .expect("stored target conversation");
+        let stored_assistant = stored_conversation
+            .messages
+            .iter()
+            .find(|candidate| candidate.id == message_id)
+            .expect("stored assistant message");
+        assert_eq!(stored_assistant.content, "Visible answer.");
+        assert_eq!(stored_assistant.attachment_ids, [record.id.clone()]);
+        let stored_attachments: AttachmentDb = reopened
+            .get(ATTACHMENTS_NAMESPACE)
+            .expect("read attachment registry")
+            .expect("attachment registry");
+        let stored_record = stored_attachments
+            .attachments
+            .iter()
+            .find(|candidate| candidate.id == record.id)
+            .expect("committed attachment row");
+        let manifest: AttachmentManifest = reopened
+            .get(
+                stored_record
+                    .manifest_namespace
+                    .as_deref()
+                    .expect("manifest"),
+            )
+            .expect("read manifest")
+            .expect("manifest record");
+        let root = manifest
+            .graph
+            .objects
+            .iter()
+            .find(|object| object.id == manifest.graph.root)
+            .expect("root WAV object");
+        assert_eq!(
+            load_verified_object(&reopened, &manifest.graph, &root.id).expect("read exact WAV"),
+            wav
+        );
+
+        let mut spoofed_name = stored_record.clone();
+        spoofed_name.file_name = "voice-message-reply-forged.wav".to_string();
+        spoofed_name.source_path = "/tmp/voice-message-reply-forged.wav".to_string();
+        assert!(!is_generated_voice_reply(&spoofed_name));
     }
 
     fn stage_text(conversation_id: &str, text: &str) -> AttachmentRecord {

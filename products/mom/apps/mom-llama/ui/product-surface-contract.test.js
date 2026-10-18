@@ -39,6 +39,7 @@ const backendOnlyCommandIds = [
   "mom_llama.skill_create",
   "mom_llama.skill_list",
   "mom_llama.skill_update",
+  "mom_llama.voice_reply_store",
 ];
 
 const controlPattern =
@@ -1695,9 +1696,8 @@ test("the startup TTS compile probe primes one bounded exact-persona emission", 
 });
 
 test("live speech has one segmentation authority before Qwen synthesis", () => {
-  assert.ok(qwenHelper.includes("The app scheduler is the sole segmentation authority"));
-  assert.ok(qwenHelper.includes("TextChunker.spokenChunks(request.text, maxWords: .max)"));
-  assert.ok(qwenHelper.includes('let speechChunks = speechText.isEmpty ? [] : [speechText]'));
+  assert.ok(qwenHelper.includes("TextChunker.boundedSpokenChunks(request.text, maxWords: 64)"));
+  assert.ok(qwenHelper.includes("for (segmentIndex, textChunk) in speechChunks.enumerated()"));
   assert.ok(!qwenHelper.includes("let speechChunks = TextChunker.spokenChunks(request.text)"));
 });
 

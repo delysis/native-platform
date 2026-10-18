@@ -1636,7 +1636,8 @@ pub fn message_copy(conversation_id: &str, message_id: &str) -> Result<CommandRe
         MessageCopy {
             conversation_id: conversation_id.to_string(),
             message_id: message_id.to_string(),
-            content: message.content.clone(),
+            content: crate::chat::assistant_visible_content(message)
+                .unwrap_or_else(|| message.content.clone()),
         },
         Vec::new(),
         Vec::new(),
@@ -2742,6 +2743,47 @@ mod tests {
             let after: serde_json::Value =
                 store.get(super::CONVERSATIONS_NAMESPACE)?.expect("source");
             assert_eq!(after, before);
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn message_copy_projects_legacy_assistant_markers_without_rewriting_storage() {
+        with_rename_store(|store| {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    crate::config::set_data_dir_override_for_tests(None);
+                }
+            }
+            crate::config::set_data_dir_override_for_tests(Some(
+                store
+                    .path()
+                    .parent()
+                    .expect("store directory")
+                    .to_path_buf(),
+            ));
+            let _reset = Reset;
+            let raw = "<|channel>thought\nprivate reasoning<channel|>Visible answer.";
+            let mut conversation = document_fixture();
+            conversation.messages[1].content = raw.to_string();
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![conversation],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+
+            let copied = super::message_copy("host", "a")?
+                .result
+                .expect("assistant copy");
+            assert_eq!(copied.content, "Visible answer.");
+            let stored = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("stored source");
+            assert_eq!(stored.conversations[0].messages[1].content, raw);
             Ok(())
         });
     }

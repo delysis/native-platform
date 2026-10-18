@@ -302,6 +302,9 @@ mod tests {
         \x00\x00\x00\x09pHYs\x00\x00\x00\x01\x00\x00\x00\x01\x00\x4f\x25\xc4\xd6\
         \x00\x00\x00\x10IDAT\x78\x9c\x63\xfc\xc3\x00\x02\x2c\x0c\x58\x28\x00\x1b\x74\x01\x0a\x5f\x82\xdc\x5d\
         \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+    const STRUCTURALLY_VALID_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
+        fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
+        data\x02\x00\x00\x00\x00\x00";
 
     struct Session(PathBuf);
     impl Session {
@@ -352,6 +355,140 @@ mod tests {
                 .expect("unchanged"),
             before
         );
+    }
+
+    #[test]
+    fn assistant_voice_reply_history_skips_media_budget_but_user_filename_spoof_is_admitted() {
+        let session = Session::new();
+        let mut conversation =
+            crate::conversation_store::conversation_new(Some("Voice history budget".to_string()))
+                .expect("create conversation")
+                .result
+                .expect("conversation");
+        let conversation_id = conversation.id.clone();
+        let mut parent_id = None;
+        let mut assistant_ids = Vec::new();
+        for index in 0..(MAX_ACTIVE_ATTACHMENT_REFERENCES + 1) {
+            let id = format!("assistant-{index}");
+            conversation.messages.push(Message {
+                id: id.clone(),
+                conversation_id: conversation_id.clone(),
+                role: crate::conversation_store::MessageRole::Assistant,
+                content: format!("Answer {index}."),
+                created_at: index.to_string(),
+                parent_id: parent_id.clone(),
+                model: None,
+                receipt_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_content: None,
+                reasoning_incomplete: false,
+                branch_index: None,
+                branch_count: None,
+                attribution: None,
+                attachment_ids: Vec::new(),
+            });
+            parent_id = Some(id.clone());
+            assistant_ids.push(id);
+        }
+        let user_id = "user-audio";
+        conversation.messages.push(Message {
+            id: user_id.to_string(),
+            conversation_id: conversation_id.clone(),
+            role: crate::conversation_store::MessageRole::User,
+            content: "Please consider this recording.".to_string(),
+            created_at: now_ms().to_string(),
+            parent_id,
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        });
+        conversation.active_leaf_message_id = Some(user_id.to_string());
+        let conversations = crate::conversation_store::load_db().expect("load conversations");
+        crate::conversation_store::upsert_conversation(conversations, conversation.clone())
+            .expect("persist test history");
+
+        for (index, id) in assistant_ids.iter().enumerate() {
+            let result = crate::attachments::attachment_store_voice_reply(
+                &conversation_id,
+                id,
+                &format!("Answer {index}."),
+                STRUCTURALLY_VALID_WAV.to_vec(),
+            )
+            .expect("typed generated voice reply");
+            assert_eq!(result.readiness, "contracted");
+        }
+
+        let spoof_path = session.0.join("voice-message-reply-forged.wav");
+        std::fs::write(&spoof_path, STRUCTURALLY_VALID_WAV).expect("write user audio");
+        let imported = attachment_import(
+            &crate::OperationScope::detached(),
+            &conversation_id,
+            &spoof_path,
+        )
+        .expect("import user audio")
+        .result
+        .expect("import result")
+        .attachment;
+        let mut attachment_db = load_attachment_db().expect("attachment registry");
+        let user_record = attachment_db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == imported.id)
+            .expect("imported user audio record");
+        user_record.state = AttachmentState::Committed;
+        user_record.message_id = user_id.to_string();
+        assert!(!is_generated_voice_reply(user_record));
+        let mut stored_db = crate::conversation_store::load_db().expect("read conversation db");
+        stored_db
+            .conversations
+            .iter_mut()
+            .find(|candidate| candidate.id == conversation_id)
+            .expect("stored conversation")
+            .messages
+            .iter_mut()
+            .find(|message| message.id == user_id)
+            .expect("stored user message")
+            .attachment_ids = vec![imported.id.clone()];
+        let store = RuntimeStore::current().expect("runtime store");
+        store
+            .put(ATTACHMENTS_NAMESPACE, &attachment_db)
+            .expect("commit user fixture");
+        crate::conversation_store::save_db(&stored_db).expect("bind user fixture");
+
+        let reopened = crate::conversation_store::load_db().expect("read history");
+        let stored_conversation = reopened
+            .conversations
+            .iter()
+            .find(|candidate| candidate.id == conversation_id)
+            .expect("stored conversation");
+        let prepared = prepare_scoped_chat_attachments(
+            &conversation_id,
+            &stored_conversation.messages,
+            CurrentAttachmentSelection::HistoryOnly,
+        )
+        .expect("prepare context")
+        .expect("voice media does not consume context budget");
+        assert_eq!(prepared.media.len(), 1);
+        assert_eq!(prepared.media[0].bytes, STRUCTURALLY_VALID_WAV);
+        for (index, id) in assistant_ids.iter().enumerate() {
+            assert_eq!(
+                stored_conversation
+                    .messages
+                    .iter()
+                    .find(|message| &message.id == id)
+                    .expect("assistant output")
+                    .content,
+                format!("Answer {index}.")
+            );
+        }
     }
 
     #[test]

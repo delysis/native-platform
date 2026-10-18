@@ -49,7 +49,7 @@ test("preview failures use the shared total error formatter", () => {
   assert.match(load, /preview\.title = errorMessage\(error\)/);
 });
 
-test("a failed persona synthesis republishes its pending voice row", () => {
+test("failed live voice synthesis republishes its unavailable reply row", () => {
   const settle = block(
     ui,
     "const settleUnavailableVoiceReply =",
@@ -58,15 +58,8 @@ test("a failed persona synthesis republishes its pending voice row", () => {
   assert.match(settle, /card\.replaceChildren\(unavailableVoiceMessage\(\)\)/);
   assert.match(settle, /row\.hidden = false/);
   assert.match(settle, /row\.classList\.remove\("voice-reply-pending"\)/);
-  const action = block(
-    ui,
-    '"message-read-aloud": async',
-    '"attachment-transcribe": async',
-  );
-  assert.match(action, /finally \{/);
-  assert.match(action, /voiceRow\?\.classList\.contains\("voice-reply-pending"\)/);
-  assert.match(action, /activeSpeechPlayback\?\.button === button\) await stopSpeechPlayback\(\)/);
-  assert.match(action, /settleUnavailableVoiceReply\(button\)/);
+  const live = block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =");
+  assert.match(live, /if \(!continueCall\) abortUnclaimedCallPrefill\(\);[\s\S]*?settleUnavailableVoiceReply\(button\)/);
 });
 
 test("explicit Read Aloud preserves the text card", () => {
@@ -75,11 +68,9 @@ test("explicit Read Aloud preserves the text card", () => {
     '"message-read-aloud": async',
     '"attachment-transcribe": async',
   );
-  assert.match(action, /if \(prepareOnly && personaVoice && row && card\)/);
-  assert.doesNotMatch(
-    action,
-    /if \(personaVoice && row && card\) \{\s*row\.classList\.add\("voice-reply-row"\)/,
-  );
+  assert.doesNotMatch(action, /personaVoice|prepareOnly|voice-reply-row/);
+  assert.match(action, /card\?\.append\(panel\)/);
+  assert.match(action, /requirePersonaVoice: false/);
   const playbackStyle = style.match(/\.speech-playback\s*\{([^}]*)\}/)?.[1] || "";
   assert.match(playbackStyle, /display:\s*none/);
   assert.doesNotMatch(playbackStyle, /border|margin|padding/);
@@ -287,7 +278,7 @@ test("voice players expose play only after structural and media validation", () 
   assert.doesNotMatch(activeStyle, /inset/);
 });
 
-test("only the exact generated voice reply is hidden while preparing", async () => {
+test("hydration preserves saved or unavailable voice rows and hides only the exact live reply", async () => {
   const classList = (initial = []) => {
     const values = new Set(initial);
     return {
@@ -298,15 +289,19 @@ test("only the exact generated voice reply is hidden while preparing", async () 
       has: (name) => values.has(name),
     };
   };
-  const pairs = ["old", "newest"].map((id) => {
+  const pairs = ["old", "missing", "saved", "newest"].map((id) => {
     const assistant = {
       hidden: false,
       dataset: { messageId: id },
-      classList: classList(["assistant"]),
+      classList: classList(id === "missing" || id === "saved"
+        ? ["assistant", "voice-message-row"] : ["assistant"]),
       querySelector(selector) {
         if (selector === "[data-action='message-read-aloud']") return this.button;
         if (selector === ".message-card") return this.card;
         if (selector === ".message-actions") return null;
+        if (selector === ".message-attachments [data-attachment-preview]") {
+          return id === "saved" ? {} : null;
+        }
         return null;
       },
     };
@@ -339,7 +334,9 @@ test("only the exact generated voice reply is hidden while preparing", async () 
   const root = {
     matches: () => false,
     querySelectorAll(selector) {
-      return selector === ".message-row.user" ? pairs.map(({ user }) => user) : [];
+      if (selector === ".message-row.user") return pairs.map(({ user }) => user);
+      if (selector === ".message-row.assistant") return pairs.map(({ assistant }) => assistant);
+      return [];
     },
   };
   const hydrate = block(ui, "  const hydrateAttachmentPreviews = async", "  window.addEventListener(\"beforeunload\"");
@@ -351,6 +348,8 @@ test("only the exact generated voice reply is hidden while preparing", async () 
     waveform: () => ({ kind: "waveform" }),
     voiceReplyConversation: "fixture-conversation",
     voiceReplyMessageId: "newest",
+    failedVoiceReplyOwners: new Map(),
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
     voiceCallActive: false,
     pendingVoiceMessage: () => { shellCount += 1; return {}; },
     registerPreview(preview) {
@@ -370,11 +369,104 @@ test("only the exact generated voice reply is hidden while preparing", async () 
   assert.equal(pairs[0].assistant.classList.has("voice-reply-pending"), false);
   assert.equal(pairs[0].assistant.classList.has("voice-reply-row"), false);
   assert.equal(pairs[0].assistant.button.classList.has("voice-reply-play"), false);
-  assert.equal(pairs[1].assistant.hidden, true, "only the exact generated voice reply may hide during preparation");
-  assert.equal(pairs[1].assistant.classList.has("voice-reply-pending"), true);
-  assert.equal(pairs[0].assistant.button.dataset.prepareOnly, undefined);
-  assert.equal(pairs[1].assistant.button.dataset.prepareOnly, "true");
+  assert.equal(pairs[1].assistant.hidden, false, "a missing historical recording stays an unavailable voice row");
+  assert.equal(pairs[1].assistant.classList.has("voice-message-row"), true);
+  assert.equal(pairs[2].assistant.hidden, false, "a saved voice attachment remains visible");
+  assert.equal(pairs[2].assistant.classList.has("voice-message-row"), true);
+  assert.equal(pairs[3].assistant.hidden, true, "only the exact live reply stays hidden until publication");
+  assert.equal(pairs[3].assistant.classList.has("voice-reply-pending"), true);
+  assert.equal(pairs[3].assistant.button.dataset.prepareOnly, undefined);
   assert.deepEqual(observedPreviews, ["newest", "old"], "lazy attachment hydration must begin nearest the composer");
+});
+
+test("navigation rebinds a retained failed-save owner to its exact voice reply", async () => {
+  const classes = new Set(["assistant", "voice-message-row"]);
+  const buttonClasses = new Set();
+  const button = {
+    dataset: { action: "voice-reply-pending-play" },
+    classList: { add: (...values) => values.forEach((value) => buttonClasses.add(value)) },
+    setAttribute(name, value) { this[name] = value; },
+    removeAttribute(name) { delete this[name]; },
+  };
+  const player = { querySelector: (selector) => selector === ".voice-reply-play" ? button : null };
+  const card = { replaceChildren(...children) { this.children = children; } };
+  const row = {
+    hidden: true,
+    dataset: { messageId: "assistant-20" },
+    classList: { add: (...values) => values.forEach((value) => classes.add(value)) },
+    querySelector(selector) {
+      if (selector === ".message-card") return card;
+      if (selector === ".message-attachments [data-attachment-preview]") return null;
+      return null;
+    },
+  };
+  const playback = {
+    controller: { ready: true },
+    trace: { id: "trace-20" },
+    bindButton(next) { this.button = next; return true; },
+  };
+  const retained = new Map([["chat-20\u0000assistant-20", playback]]);
+  const root = {
+    matches: () => false,
+    querySelectorAll: (selector) => selector === ".message-row.assistant" ? [row] : [],
+  };
+  const hydrate = block(ui, "  const hydrateAttachmentPreviews = async", "  window.addEventListener(\"beforeunload\"");
+  const context = {
+    document: root,
+    attachmentPreviewsWithin: () => [],
+    selectedConversation: () => "chat-20",
+    voiceReplyConversation: null,
+    voiceReplyMessageId: null,
+    failedVoiceReplyOwners: retained,
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
+    pendingVoiceReplyPlayer: () => player,
+    settleInMemoryVoiceReply(nextButton, controller, trace) {
+      assert.equal(nextButton, button);
+      assert.equal(controller, playback.controller);
+      assert.equal(trace, playback.trace);
+      nextButton.dataset.audioState = "ready";
+    },
+  };
+  speechVm.createContext(context);
+  speechVm.runInContext(hydrate + "\nthis.hydrate = hydrateAttachmentPreviews;", context);
+  await context.hydrate(root);
+
+  assert.equal(row.hidden, false);
+  assert.ok(classes.has("voice-reply-row"));
+  assert.equal(playback.button, button);
+  assert.equal(button.dataset.action, "voice-reply-pending-play");
+  assert.equal(button.dataset.audioPersistence, "failed");
+  assert.equal(button.dataset.audioState, "ready");
+});
+
+test("a retained failed voice-note save blocks another capture but leaves calls available", async () => {
+  const begin = block(ui, "  const beginVoiceCapture = async", "  const resumeBrowserVoicePrefill =");
+  const prepared = [];
+  const context = {
+    failedVoiceReplyOwners: new Map([["chat\u0000message", {}]]),
+    MAX_FAILED_VOICE_REPLY_OWNERS: 1,
+    activeVoiceNotePublications: new Set(),
+    preparePcmWorklet: () => prepared.push("worklet"),
+    beginBrowserVoiceCapture: async (options) => ({ call: options.call }),
+    beginNativeVoiceCapture: async () => ({ native: true }),
+    markVoiceLatency() {},
+    errorMessage: String,
+  };
+  speechVm.createContext(context);
+  speechVm.runInContext(`${begin}\nthis.beginVoiceCapture = beginVoiceCapture;`, context);
+
+  await assert.rejects(
+    context.beginVoiceCapture(),
+    /voice_reply_save_retry_required/,
+  );
+  assert.deepEqual(prepared, [], "blocked note capture must not start microphone preparation");
+  context.failedVoiceReplyOwners.clear();
+  context.activeVoiceNotePublications.add({});
+  await assert.rejects(context.beginVoiceCapture(), /voice_reply_save_retry_required/);
+  assert.deepEqual(prepared, [], "a pending publication also reserves the single note slot");
+  context.activeVoiceNotePublications.clear();
+  assert.deepEqual(await context.beginVoiceCapture({ call: true }), { call: true });
+  assert.deepEqual(prepared, ["worklet"], "call capture remains available and starts its normal setup");
 });
 
 test("voice dispatch keeps its live PCM row mounted through completion", () => {
@@ -392,15 +484,8 @@ test("voice dispatch keeps its live PCM row mounted through completion", () => {
   assert.match(ui, /const replayBytes = capture\.wavBytes \|\| encodePcmWav\(capture\.samples\(\)\)/);
   assert.match(ui, /appendOptimisticVoiceMessage\(replayBytes\)/);
 
-  const binding = block(
-    ui,
-    "  const prepareVoiceReplyRow =",
-    "  const hydrateAttachmentPreviews = async",
-  );
-  assert.match(binding, /button\.dataset\.personaVoice = "true"/);
-  assert.match(binding, /card\?\.replaceChildren\(button, waveform\(\)\)/);
-  assert.match(binding, /row\.classList\.add\("voice-reply-pending"\)/);
-  assert.doesNotMatch(binding, /row\.hidden = true/);
+  assert.doesNotMatch(ui, /prepareVoiceReplyRow/);
+  assert.doesNotMatch(ui, /dataset\.personaVoice\s*=|dataset\.prepareOnly\s*=/);
 
   const liveVoice = block(
     ui,
@@ -431,6 +516,8 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const workletNodes = [];
   const timers = [];
   let selected = "fixture-conversation";
+  let now = 1;
+  const traces = [];
   let serial = 0;
   let automaticReplies = false;
   let automaticReadResult = null;
@@ -469,7 +556,10 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   transcribe.closest = () => preview;
   const context = {
     Blob, Uint8Array, ArrayBuffer, DataView, JSON,
-    performance: { now: () => 1 },
+    performance: { now: () => now },
+    crypto: { randomUUID: () => `fixture-trace-${++serial}` },
+    MomVoicePipelineScheduler: { AdaptiveVoiceLeadController },
+    markVoiceLatencyIn: (trace, stage, detail = {}) => traces.push({ id: trace.id, stage, ...detail }),
     HTMLMediaElement: { HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3 },
     document: {
       createElement: element,
@@ -637,13 +727,38 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
-  return { ...context.api, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
+  return { ...context.api, traces, advance(ms) { now += ms; }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
     holdSuspend() { suspendGateEnabled = true; },
     hangPlaybackResume() { playbackResumePending = true; },
     navigate() { selected = "fixture-other-conversation"; } };
 };
+
+test("Read Aloud buffers packet jitter through the shared adaptive renderer", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const { task, read } = await h.start();
+  const firstFrames = 3328; // The real helper's short initial codec packet (~139 ms).
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(firstFrames * 2), 0, false));
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  assert.equal(h.workletNodes.length, 0, "one short packet must not start Read Aloud");
+  h.advance(220);
+  const nextFrames = 11520;
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(nextFrames * 2), 1, false, firstFrames));
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  assert.equal(h.workletNodes.length, 1, "bounded headroom permits playback before message EOF");
+  const started = h.traces.find((entry) => entry.stage === "playback_started");
+  assert.ok(started.buffered_ms >= 600);
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(), 2, true, firstFrames + nextFrames));
+  const response = h.result();
+  response.result.binding.tts_generation_segments = [{ stop_reason: "eos", generated_codec_frames: 7 }];
+  read.reply.resolve(response);
+  await task;
+  assert.equal(h.traces.find((entry) => entry.stage === "tts_backend_complete")
+    .generation_segments[0].stop_reason, "eos");
+  assert.equal(h.traces.find((entry) => entry.stage === "tts_pcm_complete").pcm_packets, 2);
+  h.settle();
+});
 
 test("a completed streamed voice reply retains PCM for a real replay", async () => {
   const h = speechLifetimeHarness();
@@ -1163,6 +1278,19 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   let timerNumber = 0;
   let playbackCallbacks = null;
   let firstPcmObserved = false;
+  const wavBytes = new Uint8Array(46);
+  wavBytes.set(Buffer.from("RIFF"), 0);
+  new DataView(wavBytes.buffer).setUint32(4, 38, true);
+  wavBytes.set(Buffer.from("WAVEfmt "), 8);
+  new DataView(wavBytes.buffer).setUint32(16, 16, true);
+  new DataView(wavBytes.buffer).setUint16(20, 1, true);
+  new DataView(wavBytes.buffer).setUint16(22, 1, true);
+  new DataView(wavBytes.buffer).setUint32(24, 24_000, true);
+  new DataView(wavBytes.buffer).setUint32(28, 48_000, true);
+  new DataView(wavBytes.buffer).setUint16(32, 2, true);
+  new DataView(wavBytes.buffer).setUint16(34, 16, true);
+  wavBytes.set(Buffer.from("data"), 36);
+  new DataView(wavBytes.buffer).setUint32(40, 2, true);
   let activeLeaf = "previous-leaf";
   const prefills = [];
   const capture = { retainedSamples: [1, 2, 3] };
@@ -1183,7 +1311,9 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   }
   const controller = {
     playing: false,
+    ready: true,
     bufferedMs: () => 0,
+    wavBytes: () => wavBytes.slice(),
     reconsiderStartup: async () => false,
     pushSegment(frame, operation) {
       delivered.push({ frame, operation });
@@ -1223,8 +1353,20 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
     },
     voiceLeadCalibration: null,
     voiceLatencyTrace: { stages: [] },
+    MAX_FAILED_VOICE_REPLY_OWNERS: 1,
+    failedVoiceReplyOwners: new Map(),
+    activeVoiceNotePublications: new Set(),
+    selectedConversation: () => "voice-note-conversation",
+    activeDispatchConversation: null,
+    retainComposerDraft: async () => {},
+    refreshChat: async () => {},
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
     markVoiceLatencyIn(trace, stage, detail) { trace.stages.push({ stage, ...detail }); },
     decodePcmFrame: (frame) => frame,
+    isCanonicalPcmWav: (bytes) => bytes instanceof Uint8Array
+      && bytes.byteLength === 46
+      && Buffer.from(bytes.subarray(0, 4)).toString() === "RIFF"
+      && Buffer.from(bytes.subarray(8, 12)).toString() === "WAVE",
     pcmChannel: (onmessage) => ({ onmessage }),
     createPcmPlaybackBuffer: (callbacks) => {
       playbackCallbacks = callbacks;
@@ -1324,8 +1466,126 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
     context, invocations, delivered, synthesis, pcm, fireLatestTimer,
     startPlayback, notifyBufferLevel, prefills, capture, wireChatEvents,
     setActiveLeaf(value) { activeLeaf = value; },
+    wavBytes: () => wavBytes.slice(),
   };
 };
+
+const finishVoiceNoteAudio = async (h, playback) => {
+  const completed = playback.finish("A saved spoken reply.");
+  assert.equal(h.synthesis().length, 1, "one bounded sentence starts one TTS request");
+  const segment = h.synthesis()[0];
+  segment.args.pcmStream.onmessage(h.pcm("audio"));
+  segment.args.pcmStream.onmessage(h.pcm("eof", true));
+  segment.reply.resolve({
+    status: "passed",
+    result: { binding: { tts_total_ms: 2, duration_ms: 1 } },
+  });
+  assert.equal(await completed, true);
+};
+
+test("voice-note audio publication waits for both committed message identity and completed PCM", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  const target = {
+    conversation: "voice-note-conversation",
+    message: "assistant-message-17",
+    text: "A saved spoken reply.",
+  };
+  const saved = playback.bindDurableVoiceReply(target);
+  assert.equal(h.invocations.some(({ command }) => command === "mom_llama_voice_reply_store"), false,
+    "native persistence must wait for the complete WAV");
+  await finishVoiceNoteAudio(h, playback);
+  const store = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.ok(store, "publication runs even with no mounted message row");
+  assert.deepEqual({ ...store.args, bytes: undefined }, {
+    ...target, bytes: undefined,
+  });
+  assert.equal(store.args.bytes.length, 46);
+  store.reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-17" } },
+  });
+  assert.equal(await saved, "voice-attachment-17");
+  assert.equal(playback.durableVoiceAttachmentId, "voice-attachment-17");
+  assert.ok(playback.trace.stages.some(({ stage }) => stage === "durable_voice_audio_ready"));
+});
+
+test("voice-note audio completed before the native message ID is still published", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  await finishVoiceNoteAudio(h, playback);
+  const saved = playback.bindDurableVoiceReply({
+    conversation: "voice-note-conversation",
+    message: "assistant-message-18",
+    text: "A saved spoken reply.",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const store = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.ok(store, `completed audio remains owned after TTS EOF and view navigation: ${String(playback.durableVoiceStoreError)}`);
+  store.reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-18" } },
+  });
+  assert.equal(await saved, "voice-attachment-18");
+});
+
+test("failed voice-note audio save stays in-memory and can be retried", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  await finishVoiceNoteAudio(h, playback);
+  const target = {
+    conversation: "voice-note-conversation",
+    message: "assistant-message-19",
+    text: "A saved spoken reply.",
+  };
+  const failedSave = playback.bindDurableVoiceReply(target);
+  await new Promise((resolve) => setImmediate(resolve));
+  const failedStore = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "pending native persistence keeps the note slot reserved");
+  failedStore.reply.resolve({ status: "blocked", blocker: { code: "offline", message: "Offline" } });
+  assert.equal(await failedSave, null);
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "save failure transfers ownership to the retryable PCM map");
+  assert.equal(h.context.failedVoiceReplyOwners.size, 1);
+  assert.equal(playback.durableVoiceAttachmentId, null);
+  assert.ok(playback.durableVoiceStoreError);
+  assert.equal(h.wavBytes().byteLength, 46, "the completed PCM remains available in this session");
+  const retried = playback.retryDurableVoiceReply();
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "retry reserves the capture slot while native save is pending");
+  await new Promise((resolve) => setImmediate(resolve));
+  const stores = h.invocations.filter(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.equal(stores.length, 2);
+  stores[1].reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-19" } },
+  });
+  assert.equal(await retried, "voice-attachment-19");
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "successful retry releases the capture slot");
+});
+
+test("failed synthesis does not occupy the retryable save-owner slot", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "the note slot is reserved during synthesis");
+  await playback.unavailable(new Error("synthetic generation failure"));
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "a synthesis failure releases the reservation");
+  const save = playback.bindDurableVoiceReply({
+    conversation: "voice-note-conversation",
+    message: "assistant-message-failed-synthesis",
+    text: "A reply that has no completed audio.",
+  });
+  assert.equal(await save, null);
+  assert.equal(h.context.failedVoiceReplyOwners.size, 0, "no unplayable PCM is retained as a retryable save");
+  assert.equal(h.invocations.some(({ command }) => command === "mom_llama_voice_reply_store"), false);
+  assert.equal(h.context.activeVoiceNotePublications.size, 0);
+});
 
 test("failed unconfirmed speculation leaves the caller's capture and prefill alone", async () => {
   const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });

@@ -207,6 +207,8 @@ mod tests {
                 label: "Mom".into(),
                 state: GenerationState::Completed,
                 text: "retained reply".into(),
+                reasoning_content: String::new(),
+                reasoning_incomplete: false,
                 model_id: "test".into(),
                 message_id: Some("reply".into()),
                 metrics: GenerationMetrics::default(),
