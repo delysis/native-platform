@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
   AdaptiveVoiceLeadController,
+  VoiceLeadCalibrationCache,
   SemanticLeadController,
   shouldRunCallTranscriptSlot,
   shouldDisableCallTranscriptSlotsAfterStop,
@@ -202,6 +203,38 @@ test("a following turn starts from measured machine cadence without inheriting q
   assert.equal(second.snapshot().maximum_runway_ms, 0);
 });
 
+test("call/Pocket and voice-note/Qwen retain independent adaptive lead measurements", () => {
+  const cache = new VoiceLeadCalibrationCache();
+  const coldCalibration = { initialBufferComplete: true, initialProbePending: true };
+
+  const call = new AdaptiveVoiceLeadController(cache.get("call") || coldCalibration);
+  call.noteUnderrun(220);
+  cache.set("call", call.calibration());
+
+  const voiceNote = new AdaptiveVoiceLeadController(cache.get("voice_note") || coldCalibration);
+  voiceNote.noteSegment({ synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150, words: 3 });
+  cache.set("voice_note", voiceNote.calibration());
+
+  const nextCall = new AdaptiveVoiceLeadController(cache.get("call"));
+  const nextVoiceNote = new AdaptiveVoiceLeadController(cache.get("voice_note"));
+  assert.ok(nextCall.startupDelayMs() > nextVoiceNote.startupDelayMs(),
+    "Pocket call underrun protection must not be replaced by faster Qwen cadence");
+  assert.ok(nextVoiceNote.snapshot().observed_production_rtf < 0.7,
+    "Qwen note keeps its own measured production rate");
+  assert.throws(() => cache.get("read_aloud"), /unsupported voice synthesis purpose/);
+
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
+  const start = source.indexOf("  const beginLiveVoiceTts =");
+  const end = source.indexOf("\n  const chatRequestIsCancellable =", start);
+  const liveTts = source.slice(start, end);
+  assert.match(liveTts, /const synthesisPurpose = mode === "call" \? "call" : "voice_note"/);
+  assert.match(liveTts, /calibrationCache\.get\(synthesisPurpose\)/);
+  assert.equal((liveTts.match(/calibrationCache\.set\(synthesisPurpose/g) || []).length, 3);
+  assert.match(liveTts, /purpose: synthesisPurpose/);
+});
+
 test("semantic lead uses hysteresis and never pauses on an unusable partial chunk", () => {
   const lead = new SemanticLeadController();
   assert.equal(lead.shouldPause({ queuedWords: 24, readyChunk: false }), false);
@@ -253,7 +286,7 @@ test("a cold-call probe releases only for a complete, clearly healthy segment", 
   const fs = require("node:fs");
   const path = require("node:path");
   const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
-  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
+  assert.match(source, /calibrationCache\.get\(synthesisPurpose\)\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
 
   const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true, initialProbePending: true });
   assert.equal(cold.shouldBufferCompleteReply(), true);

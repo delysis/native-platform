@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 69,
+  "expected_test_count": 70,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -123,6 +123,22 @@
       ],
       "src_path": "crates/services/speech/crates/speech-native-backend-parakeet/tests/real_parakeet.rs",
       "manifest_path": "crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "speech-native-backend-pocket",
+      "selector": "test:real_pocket",
+      "name": "real_pocket",
+      "kinds": [
+        "test"
+      ],
+      "src_path": "crates/services/speech/crates/speech-native-backend-pocket/tests/real_pocket.rs",
+      "manifest_path": "crates/services/speech/crates/speech-native-backend-pocket/Cargo.toml",
       "platforms": [
         "linux",
         "macos",
@@ -787,6 +803,23 @@
       ],
       "evidence_class": "real-model-audio-runtime",
       "promotion_prohibition": "Passing this test cannot promote transcription accuracy, microphone capture, product integration, or cross-platform readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "real_pocket_host_stream_cancel_recovery_and_join",
+      "package": "speech-native-backend-pocket",
+      "target": "test:real_pocket",
+      "source": "crates/services/speech/crates/speech-native-backend-pocket/tests/real_pocket.rs",
+      "prerequisite": "requires the pinned local Pocket model in the Hugging Face cache and packaged voice resources",
+      "required_environment": [
+        "SPEECH_NATIVE_POCKET_VOICES"
+      ],
+      "evidence_class": "real-model-audio-runtime",
+      "promotion_prohibition": "Passing this local model exercise cannot promote voice quality, consultant likeness, product playback, packaging, or cross-platform readiness.",
       "platforms": [
         "linux",
         "macos",

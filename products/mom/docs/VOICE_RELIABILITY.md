@@ -1055,3 +1055,28 @@ The snapshot includes whole-buffer authentication, but its queue, native copy,
 and authentication phases were not separately timed in that trace. Faster
 hashing must not be presented as proof that this entire delay or the reported
 mid-word audio dropouts have been fixed.
+
+
+## Speech backend selection and evidence
+
+Calls select the in-process PocketTTS CPU backend. Voice notes and Read Aloud
+select Qwen. Both enter the same persona speech operation registry, sentence
+buffering, contiguous PCM validation, cancellation settlement, and renderer.
+A missing requested backend is an actionable failure; it must not silently
+fall back to the other model. Only an admitted Qwen request owns a Metal lease.
+Pocket never reserves Metal, and call startup does not warm Qwen in the
+background. Notes and Read Aloud retain cooperative Metal arbitration with Gemma.
+
+Pocket voice conditioning is prepared offline from the full official encoder
+checkpoint and the same reviewed reference clips used by Qwen. The package
+contains the projected embeddings, tokenizer, configuration and provenance;
+first-run acquisition installs the pinned public generation checkpoint. Runtime
+calls do not require Python, network access, a voice encoder, or fresh reference
+encoding. Each embedding is bound to its source clip and model revision.
+
+Qualification must use the packaged UI and preserve selected backend/model IDs,
+first PCM and first render timestamps, renderer underruns, completion status,
+request cancellation settlement, and Metal lease counts. A measured zero is
+not missing data. Standalone engine benchmarks may explain a component but
+cannot establish call pickup or continuity. Keep the previous candidate and
+its traces intact until the replacement has passed its actual app checks.

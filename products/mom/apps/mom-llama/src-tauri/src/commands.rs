@@ -1553,6 +1553,7 @@ pub async fn mom_llama_speech_precommit_synthesize(
     conversation: String,
     operation: String,
     text: String,
+    purpose: crate::speech::PrecommitPurpose,
     pcm_stream: Channel<InvokeResponseBody>,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_speech_precommit_synthesize"))?;
@@ -1562,6 +1563,7 @@ pub async fn mom_llama_speech_precommit_synthesize(
             &conversation,
             &operation,
             &text,
+            purpose,
             Arc::new(move |chunk| {
                 pcm_stream
                     .send(InvokeResponseBody::Raw(pcm_stream_frame(chunk)?))

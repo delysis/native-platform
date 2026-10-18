@@ -10,6 +10,7 @@ use std::sync::Arc;
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
 };
+use speech_native_backend_pocket::{PocketBackendConfig, PocketSpeechBackend};
 use speech_native_backend_qwen::{QwenBackendConfig, QwenSpeechBackend};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
@@ -60,6 +61,12 @@ pub async fn discover_local_host_with_qwen(
     #[cfg(not(target_os = "macos"))] _prepared_qwen: Option<Arc<QwenSpeechBackend>>,
 ) -> Result<Arc<SpeechHost>, SpeechHostError> {
     let host = Arc::new(SpeechHost::default());
+    let pocket_root = installed_voice_root
+        .as_ref()
+        .map(|root| root.with_file_name("pocket"));
+    host.register_backend(Arc::new(PocketSpeechBackend::discover(
+        PocketBackendConfig::discover_with_reference_root(pocket_root.as_deref()),
+    )))?;
     let parakeet = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
         model_dir: None,
         managed_model_root: managed_model_root.clone(),

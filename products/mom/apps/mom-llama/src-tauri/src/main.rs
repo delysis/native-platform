@@ -38,11 +38,12 @@ struct PreparedSpeech {
 
 impl PreparedSpeech {
     fn new(app_data_dir: &std::path::Path) -> Self {
-        let qwen = desktop_speech::prepare_local_qwen(
-            Some(app_data_dir.join("speech-models")),
-            Some(app_data_dir.join("speech-voices/qwen-icl")),
-            mom_llama_runtime::acquire_realtime_compute,
-        );
+        let qwen = Arc::new(speech_native_backend_qwen::QwenSpeechBackend::discover(
+            speech_native_backend_qwen::QwenBackendConfig::discover_with_reference_root(
+                Some(&app_data_dir.join("speech-models")),
+                Some(&app_data_dir.join("speech-voices/qwen-icl")),
+            ),
+        ));
         Self {
             qwen: Arc::new(Mutex::new(qwen)),
             claimed_by_runtime: Arc::new(AtomicBool::new(false)),
@@ -56,11 +57,12 @@ impl PreparedSpeech {
     }
 
     fn refresh(&self, app_data_dir: &std::path::Path, voice_root: &std::path::Path) {
-        let qwen = desktop_speech::prepare_local_qwen(
-            Some(app_data_dir.join("speech-models")),
-            Some(voice_root.to_path_buf()),
-            mom_llama_runtime::acquire_realtime_compute,
-        );
+        let qwen = Arc::new(speech_native_backend_qwen::QwenSpeechBackend::discover(
+            speech_native_backend_qwen::QwenBackendConfig::discover_with_reference_root(
+                Some(&app_data_dir.join("speech-models")),
+                Some(voice_root),
+            ),
+        ));
         *self.qwen.lock().expect("prepared speech lock") = qwen;
     }
 
@@ -447,7 +449,8 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
     tauri::async_runtime::spawn_blocking(move || {
         model_acquisition::validate_persona_voices(&voice_root, |progress| {
             let _ = voice_app.emit("mom_llama_voice_initialization_progress", progress);
-        })
+        })?;
+        model_acquisition::validate_pocket_voices(&voice_root.with_file_name("pocket"))
     })
     .await
     .map_err(|error| format!("Blessenger voice setup worker failed: {error}"))?

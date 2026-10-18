@@ -1,0 +1,26 @@
+[package]
+name = "speech-native-backend-pocket"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+desktop-model-defaults.workspace = true
+ptts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+speech-native-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+xn.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+speech-native-host.workspace = true
+
+[lints]
+workspace = true

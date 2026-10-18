@@ -359,6 +359,29 @@
     }
   }
 
+  // Synthesis purpose is also the enforced backend route: calls use Pocket
+  // CPU, while voice notes use Qwen. Keep their learned cadence separate so
+  // one backend cannot set the other's playback runway.
+  class VoiceLeadCalibrationCache {
+    constructor() {
+      this.values = new Map();
+    }
+
+    key(purpose) {
+      if (purpose === "call") return "call:pocket";
+      if (purpose === "voice_note") return "voice_note:qwen";
+      throw new RangeError(`unsupported voice synthesis purpose: ${purpose}`);
+    }
+
+    get(purpose) {
+      return this.values.get(this.key(purpose)) || null;
+    }
+
+    set(purpose, calibration) {
+      this.values.set(this.key(purpose), calibration);
+    }
+  }
+
   class SemanticLeadController {
     constructor({ lowWaterWords = 8, highWaterWords = 16 } = {}) {
       if (!(lowWaterWords >= 0 && highWaterWords > lowWaterWords)) {
@@ -391,6 +414,7 @@
 
   return {
     AdaptiveVoiceLeadController,
+    VoiceLeadCalibrationCache,
     SemanticLeadController,
     shouldRunCallTranscriptSlot,
     shouldDisableCallTranscriptSlotsAfterStop,

@@ -72,6 +72,8 @@ test("explicit Read Aloud preserves the text card", () => {
   assert.doesNotMatch(action, /personaVoice|prepareOnly|voice-reply-row/);
   assert.match(action, /card\?\.append\(panel\)/);
   assert.match(action, /requirePersonaVoice: false/);
+  assert.doesNotMatch(action, /mom_llama_speech_precommit_synthesize|purpose:\s*["']call/,
+    "Read Aloud remains on its separate native request");
   const playbackStyle = style.match(/\.speech-playback\s*\{([^}]*)\}/)?.[1] || "";
   assert.match(playbackStyle, /display:\s*none/);
   assert.doesNotMatch(playbackStyle, /border|margin|padding/);
@@ -752,11 +754,19 @@ test("Read Aloud buffers packet jitter through the shared adaptive renderer", as
   assert.ok(started.buffered_ms >= 600);
   read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(), 2, true, firstFrames + nextFrames));
   const response = h.result();
+  response.result.binding.backend_id = "fixture-qwen";
+  response.result.binding.model_id = "fixture-read-aloud-model";
+  response.result.binding.voice_id = "fixture-persona-voice";
   response.result.binding.tts_generation_segments = [{ stop_reason: "eos", generated_codec_frames: 7 }];
   read.reply.resolve(response);
   await task;
   assert.equal(h.traces.find((entry) => entry.stage === "tts_backend_complete")
     .generation_segments[0].stop_reason, "eos");
+  const route = h.traces.find((entry) => entry.stage === "tts_backend_complete");
+  assert.deepEqual(
+    { backend_id: route.backend_id, model_id: route.model_id, voice_id: route.voice_id },
+    { backend_id: "fixture-qwen", model_id: "fixture-read-aloud-model", voice_id: "fixture-persona-voice" },
+  );
   assert.equal(h.traces.find((entry) => entry.stage === "tts_pcm_complete").pcm_packets, 2);
   h.settle();
 });
@@ -1476,6 +1486,7 @@ test("production voice route excludes reasoning and dispatches whole sentences a
   send("delta", "what matters most to you. ");
   assert.equal(h.synthesis().length, 1);
   assert.equal(h.synthesis()[0].args.text, firstSentence);
+  assert.equal(h.synthesis()[0].args.purpose, "call");
 
   const secondSentence = "There is no need to rush this conversation.";
   send("delta", secondSentence);
@@ -1487,6 +1498,7 @@ test("production voice route excludes reasoning and dispatches whole sentences a
     segment.args.pcmStream.onmessage(h.pcm(label));
     segment.args.pcmStream.onmessage(h.pcm(`${label}-eof`, true));
     segment.reply.resolve({ status: "passed", result: { binding: {
+      backend_id: "fixture-pocket-cpu", model_id: "fixture-model", voice_id: "fixture-voice",
       tts_total_ms: 1, duration_ms: 1,
     } } });
   };
@@ -1506,6 +1518,12 @@ test("production voice route excludes reasoning and dispatches whole sentences a
   assert.equal(await completed, true);
   assert.deepEqual(h.delivered.map(({ frame }) => frame.label),
     ["first", "first-eof", "second", "second-eof"]);
+  const finished = h.context.voiceLatencyTrace.stages.filter(
+    ({ stage }) => stage === "tts_segment_finished",
+  );
+  assert.equal(finished[0].backend_id, "fixture-pocket-cpu");
+  assert.equal(finished[0].model_id, "fixture-model");
+  assert.equal(finished[0].voice_id, "fixture-voice");
 });
 
 const finishVoiceNoteAudio = async (h, playback) => {
@@ -1535,6 +1553,7 @@ test("voice-note audio publication waits for both committed message identity and
   assert.equal(h.invocations.some(({ command }) => command === "mom_llama_voice_reply_store"), false,
     "native persistence must wait for the complete WAV");
   await finishVoiceNoteAudio(h, playback);
+  assert.equal(h.synthesis()[0].args.purpose, "voice_note");
   const store = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
   assert.ok(store, "publication runs even with no mounted message row");
   assert.deepEqual({ ...store.args, bytes: undefined }, {

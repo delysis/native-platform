@@ -100,6 +100,24 @@ try {
   const destination = join(output, 'Blessenger Voice Candidate.app');
   cpSync(bundle, destination, { recursive: true, dereference: false });
   const files = [];
+  const inventoryTree = (base, path = base, rows = []) => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const full = join(path, entry.name);
+      if (entry.isDirectory()) inventoryTree(base, full, rows);
+      else if (entry.isFile()) rows.push({ path: relative(base, full), bytes: statSync(full).size,
+        sha256: createHash('sha256').update(readFileSync(full)).digest('hex') });
+      else throw new Error(`Unexpected resource link or special file: ${full}`);
+    }
+    return rows;
+  };
+  const sourceVoiceResources = join(root, 'products/mom/apps/mom-llama/src-tauri/resources/speech-voices');
+  const bundledVoiceResources = join(destination, 'Contents/Resources/speech-voices');
+  if (!existsSync(bundledVoiceResources)) throw new Error('Packaged speech voice resources are absent');
+  const expectedVoiceFiles = inventoryTree(sourceVoiceResources).sort((a, b) => a.path.localeCompare(b.path));
+  const packagedVoiceFiles = inventoryTree(bundledVoiceResources).sort((a, b) => a.path.localeCompare(b.path));
+  if (JSON.stringify(expectedVoiceFiles) !== JSON.stringify(packagedVoiceFiles)) {
+    throw new Error('Packaged speech voice resources do not exactly match the source resource tree');
+  }
   function inventory(path) {
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);

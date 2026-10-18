@@ -53,6 +53,7 @@
     ],
     "service-speech": [
       "speech-native-backend-parakeet",
+      "speech-native-backend-pocket",
       "speech-native-backend-qwen",
       "speech-native-host",
       "speech-native-platform",
@@ -130,6 +131,7 @@
       "mom-llama-runtime",
       "operation-lifecycle",
       "speech-native-host",
+      "speech-native-backend-pocket",
       "speech-native-router",
       "speech-native-types",
       "workspace-document"

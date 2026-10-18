@@ -1011,6 +1011,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
     { stage: "playback_started", elapsed_ms: 860, observed_at_unix_us: 1_750_000 },
     { stage: "tts_segment_finished", elapsed_ms: 1_000, total_ms: 400,
       output_audio_ms: 800, production_rtf: 0.5,
+      backend_id: "qwen", model_id: "qwen-model", voice_id: "qwen-gabor",
       compute_lease_acquisitions: 1, compute_lease_releases: 1,
       compute_lease_held_us: 410000, compute_lease_released_us: 90000,
       generation_yields: 1, generation_yield_us: 135_250,
@@ -1018,6 +1019,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
       compute_low_water_ms: 180, compute_high_water_ms: 350 },
     { stage: "tts_segment_finished", elapsed_ms: 1_800, total_ms: 800,
       output_audio_ms: 1_000, production_rtf: 0.8,
+      backend_id: "qwen", model_id: "qwen-model", voice_id: "qwen-gabor",
       compute_lease_acquisitions: 1, compute_lease_releases: 1,
       compute_lease_held_us: 320000, compute_lease_released_us: 80000,
       generation_yields: 0, generation_yield_us: 0,
@@ -1084,6 +1086,9 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.tts_worst_segment_rtf, 0.8);
   assert.equal(summary.tts_compute_lease_acquisitions, 2);
   assert.equal(summary.tts_compute_lease_releases, 2);
+  assert.deepEqual(summary.tts_backend_ids, ["qwen"]);
+  assert.deepEqual(summary.tts_model_ids, ["qwen-model"]);
+  assert.deepEqual(summary.tts_voice_ids, ["qwen-gabor"]);
   assert.equal(summary.tts_generation_yields, 1);
   assert.equal(summary.tts_generation_yield_ms, 135.25);
   assert.equal(summary.tts_compute_lease_held_ms, 730);
@@ -1112,6 +1117,58 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.playback_underrun_occurrences, 2);
   assert.equal(summary.playback_underrun_total_gap_ms, 21.5);
   assert.equal(summary.playback_underrun_max_gap_ms, 14);
+});
+
+test("TTS summary preserves measured zero, unknown counters, identities, and Qwen totals", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stage = (metrics) => ({ stage: "tts_segment_finished", ...metrics });
+
+  const zero = summarize({ stages: [stage({ backend_id: "pocket-cpu", model_id: "pocket",
+    voice_id: "dolores", compute_lease_acquisitions: 0, compute_lease_releases: 0,
+    compute_lease_held_us: 0, compute_lease_released_us: 0 })] });
+  assert.equal(zero.tts_compute_lease_acquisitions, 0);
+  assert.equal(zero.tts_compute_lease_releases, 0);
+  assert.equal(zero.tts_compute_lease_held_ms, 0);
+  assert.equal(zero.tts_compute_lease_released_ms, 0);
+  assert.deepEqual(zero.tts_backend_ids, ["pocket-cpu"]);
+  assert.deepEqual(zero.tts_model_ids, ["pocket"]);
+  assert.deepEqual(zero.tts_voice_ids, ["dolores"]);
+
+  const nullCounters = summarize({ stages: [stage({ compute_lease_acquisitions: null,
+    compute_lease_releases: null, compute_lease_held_us: null, compute_lease_released_us: null })] });
+  assert.equal(nullCounters.tts_compute_lease_acquisitions, null);
+  assert.equal(nullCounters.tts_compute_lease_releases, null);
+  assert.equal(nullCounters.tts_compute_lease_held_ms, null);
+  assert.equal(nullCounters.tts_compute_lease_released_ms, null);
+
+  const missingCounters = summarize({ stages: [stage({ compute_lease_acquisitions: 0 })] });
+  assert.equal(missingCounters.tts_compute_lease_acquisitions, 0,
+    "an observed zero remains evidence even when unrelated fields are absent");
+  assert.equal(missingCounters.tts_compute_lease_releases, null);
+  assert.equal(missingCounters.tts_compute_lease_held_ms, null);
+
+  const partialAcrossSegments = summarize({ stages: [
+    stage({ compute_lease_acquisitions: 1 }),
+    stage({}),
+  ] });
+  assert.equal(partialAcrossSegments.tts_compute_lease_acquisitions, null,
+    "a missing segment count keeps the aggregate unknown");
+
+  const qwen = summarize({ stages: [
+    stage({ backend_id: "qwen", model_id: "qwen-model", voice_id: "gabor",
+      compute_lease_acquisitions: 1, compute_lease_releases: 1,
+      compute_lease_held_us: 120_000, compute_lease_released_us: 30_000 }),
+    stage({ backend_id: "qwen", model_id: "qwen-model", voice_id: "gabor",
+      compute_lease_acquisitions: 1, compute_lease_releases: 1,
+      compute_lease_held_us: 80_000, compute_lease_released_us: 20_000 }),
+  ] });
+  assert.equal(qwen.tts_compute_lease_acquisitions, 2);
+  assert.equal(qwen.tts_compute_lease_releases, 2);
+  assert.equal(qwen.tts_compute_lease_held_ms, 200);
+  assert.equal(qwen.tts_compute_lease_released_ms, 50);
+  assert.deepEqual(qwen.tts_backend_ids, ["qwen"]);
 });
 
 test("voice latency recorder coalesces only high-volume deltas and packet events by owner", () => {

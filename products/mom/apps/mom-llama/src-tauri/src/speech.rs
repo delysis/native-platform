@@ -6,7 +6,7 @@ use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult,
     ConversationPersonaIdentity, MessageRole, conversation_persona_identity,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
@@ -248,7 +248,7 @@ struct AssistantMessageSpeechText {
 }
 
 #[derive(Debug, Clone)]
-struct QwenSelection {
+struct EmbeddedVoiceSelection {
     descriptor_sha256: String,
     descriptor: SpeechBackendDescriptor,
     model_id: String,
@@ -257,18 +257,26 @@ struct QwenSelection {
 
 #[derive(Debug, Clone)]
 enum ReadAloudSelection {
-    Qwen(QwenSelection),
+    Qwen(EmbeddedVoiceSelection),
+    Pocket(EmbeddedVoiceSelection),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrecommitPurpose {
+    Call,
+    VoiceNote,
 }
 
 impl ReadAloudSelection {
     fn descriptor(&self) -> &SpeechBackendDescriptor {
         match self {
-            Self::Qwen(value) => &value.descriptor,
+            Self::Qwen(value) | Self::Pocket(value) => &value.descriptor,
         }
     }
     fn descriptor_sha256(&self) -> &str {
         match self {
-            Self::Qwen(value) => &value.descriptor_sha256,
+            Self::Qwen(value) | Self::Pocket(value) => &value.descriptor_sha256,
         }
     }
     fn backend_id(&self) -> &str {
@@ -283,14 +291,15 @@ impl ReadAloudSelection {
     ) -> Option<RealtimeTtsComputeArbiter> {
         match self {
             Self::Qwen(_) => Some(reserved.unwrap_or_else(RealtimeTtsComputeArbiter::new)),
+            Self::Pocket(_) => None,
         }
     }
     fn model_id(&self) -> Option<String> {
-        let Self::Qwen(value) = self;
+        let (Self::Qwen(value) | Self::Pocket(value)) = self;
         Some(value.model_id.clone())
     }
     fn voice_id(&self) -> String {
-        let Self::Qwen(value) = self;
+        let (Self::Qwen(value) | Self::Pocket(value)) = self;
         value.voice_id.clone()
     }
 }
@@ -621,14 +630,14 @@ impl HostSpeechExecutor {
             if let SynthesisEvent::Audio { chunk, .. } = event {
                 if chunk.sequence != expected_sequence {
                     return Err(
-                        "speech_stream_sequence_invalid: Qwen PCM chunks were not contiguous"
+                        "speech_stream_sequence_invalid: Speech PCM chunks were not contiguous"
                             .to_string(),
                     );
                 }
                 expected_sequence = expected_sequence.saturating_add(1);
                 if chunk.sample_offset != expected_sample_offset {
                     return Err(
-                        "speech_stream_offset_invalid: Qwen PCM chunks overlapped or skipped samples"
+                        "speech_stream_offset_invalid: Speech PCM chunks overlapped or skipped samples"
                             .to_string(),
                     );
                 }
@@ -636,13 +645,13 @@ impl HostSpeechExecutor {
                 let frames = u64::try_from(chunk.data.len() / frame_bytes).unwrap_or(u64::MAX);
                 expected_sample_offset =
                     expected_sample_offset.checked_add(frames).ok_or_else(|| {
-                        "speech_stream_offset_invalid: Qwen PCM sample offset overflowed"
+                        "speech_stream_offset_invalid: Speech PCM sample offset overflowed"
                             .to_string()
                     })?;
                 if let Some(expected) = &format {
                     if expected != &chunk.format {
                         return Err(
-                            "speech_stream_format_changed: Qwen PCM format changed mid-stream"
+                            "speech_stream_format_changed: Speech PCM format changed mid-stream"
                                 .to_string(),
                         );
                     }
@@ -656,7 +665,8 @@ impl HostSpeechExecutor {
                     })?;
                 if emitted_bytes > u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) {
                     return Err(
-                        "speech_stream_too_large: Qwen PCM exceeded the playback bound".to_string(),
+                        "speech_stream_too_large: Speech PCM exceeded the playback bound"
+                            .to_string(),
                     );
                 }
                 if let Some(sink) = &sink {
@@ -669,16 +679,18 @@ impl HostSpeechExecutor {
             .final_response()
             .await
             .map_err(|error| speech_error_message(&error))?;
-        let format =
-            format.ok_or_else(|| "speech_stream_empty: Qwen returned no PCM".to_string())?;
+        let format = format
+            .ok_or_else(|| "speech_stream_empty: Speech backend returned no PCM".to_string())?;
         if !saw_end {
-            return Err("speech_stream_incomplete: Qwen closed without an end marker".to_string());
+            return Err(
+                "speech_stream_incomplete: Speech backend closed without an end marker".to_string(),
+            );
         }
         match &response.output {
             SynthesisOutput::Streamed { format: output, emitted_bytes: output_bytes }
                 if output == &AudioOutputFormat::Pcm { format }
                     && *output_bytes == emitted_bytes => {}
-            _ => return Err("speech_stream_receipt_invalid: Qwen's final streamed receipt did not match the emitted PCM".to_string()),
+            _ => return Err("speech_stream_receipt_invalid: Speech backend's final streamed receipt did not match the emitted PCM".to_string()),
         }
         Ok(response)
     }
@@ -804,11 +816,12 @@ impl MomSpeech {
         #[cfg(target_os = "macos")]
         let (prepared_qwen, qwen_startup_warm) = {
             let qwen = prepared_qwen.unwrap_or_else(|| {
-                desktop_speech::prepare_local_qwen(
-                    Some(data_dir.join("speech-models")),
-                    Some(installed_voice_root.to_path_buf()),
-                    mom_llama_runtime::acquire_realtime_compute,
-                )
+                Arc::new(QwenSpeechBackend::discover(
+                    speech_native_backend_qwen::QwenBackendConfig::discover_with_reference_root(
+                        Some(&data_dir.join("speech-models")),
+                        Some(installed_voice_root),
+                    ),
+                ))
             });
             let warm = qwen
                 .wait_for_icl_background_warm()
@@ -1104,10 +1117,10 @@ impl MomSpeech {
         ))
     }
 
-    /// One scheduling boundary for all persona synthesis. The lease spans
-    /// backend admission, cold loading and generation, and is released on
-    /// success, failure or dropped futures. Only the existing bounded PCM
-    /// runway policy can yield it while a Metal request is running.
+    /// One scheduling boundary for all persona synthesis. Metal backends hold
+    /// a lease across admission, cold loading and generation; CPU speech has
+    /// no Metal lease. Both use identical output validation and cancellation.
+    /// The PCM runway policy can yield the lease while Qwen is running.
     async fn synthesize_selected(
         &self,
         selection: &ReadAloudSelection,
@@ -1149,6 +1162,7 @@ impl MomSpeech {
         conversation_id: &str,
         operation: &str,
         text: &str,
+        purpose: PrecommitPurpose,
         stream_sink: PcmStreamSink,
     ) -> anyhow::Result<CommandResult<PrecommitSpeechOutput>> {
         validate_operation_token(operation)?;
@@ -1163,11 +1177,10 @@ impl MomSpeech {
                 ),
             ));
         }
-        // Qwen remains the only precommit backend in this build. Preserve its
-        // early reservation: a Gemma decode admitted during voice lookup could
-        // otherwise delay the first packet. A future CPU call route must choose
-        // its backend before this point and omit this Metal reservation.
-        let compute_reservation = RealtimeTtsComputeArbiter::new();
+        // Reserve Metal early only for the Qwen voice-note route. Calls select
+        // the CPU backend explicitly; they must never fall back to Qwen.
+        let compute_reservation =
+            (purpose == PrecommitPurpose::VoiceNote).then(RealtimeTtsComputeArbiter::new);
         let stage_started = Instant::now();
         let voice_id = match self
             .resolve_precommit_voice(conversation_id)
@@ -1190,15 +1203,13 @@ impl MomSpeech {
         let descriptors = self.executor.descriptors()?;
         let tts_descriptor_snapshot_us = elapsed_us(stage_started);
         let stage_started = Instant::now();
-        let selection =
-            match select_read_aloud(&descriptors, character_count, Some(&voice_id), true) {
-                Ok(selection) => selection,
-                Err(blocker) => {
-                    return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
-                }
-            };
+        let selection = match select_precommit(&descriptors, character_count, &voice_id, purpose) {
+            Ok(selection) => selection,
+            Err(blocker) => {
+                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+            }
+        };
         let tts_route_selection_us = elapsed_us(stage_started);
-        let ReadAloudSelection::Qwen(qwen) = &selection;
         let request_id = SpeechRequestId(format!("mom-precommit-{operation}"));
         let stage_started = Instant::now();
         if let Err(blocker) = self.begin_operation(
@@ -1214,7 +1225,7 @@ impl MomSpeech {
                 &selection,
                 precommit_synthesis_request(text, &selection, request_id.clone()),
                 Some(stream_sink),
-                Some(compute_reservation),
+                compute_reservation,
             )
             .await;
         let response = match response {
@@ -1239,7 +1250,7 @@ impl MomSpeech {
             })
             .map_err(anyhow::Error::msg)?;
         let tts_postflight_voice_lookup_us = elapsed_us(stage_started);
-        if current_voice.as_ref() != Some(&qwen.voice_id) {
+        if current_voice.as_ref() != Some(&voice_id) {
             self.finish_operation(operation, &request_id);
             return Ok(blocked(
                 "mom_llama.speech_precommit_synthesize",
@@ -1289,10 +1300,10 @@ impl MomSpeech {
             operation: operation.to_string(),
             conversation_id: conversation_id.to_string(),
             text_sha256: sha256_hex(text.as_bytes()),
-            backend_id: qwen.descriptor.id.clone(),
-            backend_descriptor_sha256: qwen.descriptor_sha256.clone(),
-            model_id: qwen.model_id.clone(),
-            voice_id: qwen.voice_id.clone(),
+            backend_id: selection.backend_id().to_string(),
+            backend_descriptor_sha256: selection.descriptor_sha256().to_string(),
+            model_id: selection.model_id().expect("embedded speech model"),
+            voice_id: selection.voice_id(),
             request_id: request_id.0.clone(),
             duration_ms,
             tts_queue_ms,
@@ -1881,7 +1892,7 @@ impl MomSpeech {
         if binding.request_id != request_id.0 {
             self.finish_operation(operation, request_id);
             return Err(speech_provenance_mismatch(
-                "Qwen playback binding did not match the admitted request and streamed audio.",
+                "Speech playback binding did not match the admitted request and streamed audio.",
             ));
         }
         let mut state = self.state.lock().map_err(|_| {
@@ -2029,18 +2040,59 @@ fn select_read_aloud(
     persona_voice_id: Option<&str>,
     _require_persona_voice: bool,
 ) -> Result<ReadAloudSelection, Blocker> {
-    let Some(voice_id) = persona_voice_id.filter(|voice_id| voice_id.starts_with("mom.qwen.icl."))
-    else {
-        return Err(speech_unavailable(
-            "The selected consultant's streaming Qwen voice is unavailable.",
-        ));
-    };
+    let voice_id = persona_voice_id
+        .filter(|id| id.starts_with("mom.qwen.icl."))
+        .ok_or_else(|| speech_unavailable("The consultant voice is unavailable."))?;
+    select_embedded_voice(
+        descriptors,
+        input_characters,
+        voice_id,
+        QWEN_BACKEND_ID,
+        QWEN_ICL_MODEL_ID,
+    )
+    .map(ReadAloudSelection::Qwen)
+}
+
+fn select_precommit(
+    descriptors: &[SpeechBackendDescriptor],
+    input_characters: usize,
+    persona_voice_id: &str,
+    purpose: PrecommitPurpose,
+) -> Result<ReadAloudSelection, Blocker> {
+    match purpose {
+        PrecommitPurpose::VoiceNote => {
+            select_read_aloud(descriptors, input_characters, Some(persona_voice_id), true)
+        }
+        PrecommitPurpose::Call => {
+            let persona = persona_voice_id
+                .strip_prefix("mom.qwen.icl.")
+                .ok_or_else(|| speech_unavailable("The consultant voice is unavailable."))?;
+            let voice = format!("mom.pocket.{persona}");
+            select_embedded_voice(
+                descriptors,
+                input_characters,
+                &voice,
+                speech_native_backend_pocket::POCKET_BACKEND_ID,
+                speech_native_backend_pocket::POCKET_MODEL_ID,
+            )
+            .map(ReadAloudSelection::Pocket)
+        }
+    }
+}
+
+fn select_embedded_voice(
+    descriptors: &[SpeechBackendDescriptor],
+    input_characters: usize,
+    voice_id: &str,
+    backend_id: &str,
+    model_id: &str,
+) -> Result<EmbeddedVoiceSelection, Blocker> {
     if let Some(descriptor) = descriptors.iter().find(|descriptor| {
-        descriptor.id == QWEN_BACKEND_ID
+        descriptor.id == backend_id
             && descriptor.readiness.is_ready()
             && descriptor.capabilities.iter().any(|capability| {
                 (capability.eligible_for_local_only() || capability.deferred_load_admissible())
-                    && capability.model_id.as_deref() == Some(QWEN_ICL_MODEL_ID)
+                    && capability.model_id.as_deref() == Some(model_id)
                     && capability.limits.max_input_characters.is_none_or(|limit| {
                         u64::try_from(input_characters).unwrap_or(u64::MAX) <= limit
                     })
@@ -2057,19 +2109,19 @@ fn select_read_aloud(
         .iter()
         .any(|voice| voice.installed && voice.id == voice_id)
     {
-        return Ok(ReadAloudSelection::Qwen(QwenSelection {
+        return Ok(EmbeddedVoiceSelection {
             descriptor_sha256: descriptor_sha256(descriptor)?,
             descriptor: descriptor.clone(),
-            model_id: QWEN_ICL_MODEL_ID.to_string(),
+            model_id: model_id.to_string(),
             voice_id: voice_id.to_string(),
-        }));
+        });
     }
     Err(speech_unavailable(
-        "The selected consultant's streaming Qwen voice is unavailable.",
+        "The selected consultant's requested speech backend is unavailable.",
     ))
 }
 
-fn qwen_stream_output() -> AudioOutputFormat {
+fn persona_stream_output() -> AudioOutputFormat {
     AudioOutputFormat::Pcm {
         format: PcmFormat {
             sample_rate_hz: 24_000,
@@ -2120,7 +2172,7 @@ fn persona_synthesis_request(
         rate: 1.0,
         pitch: 1.0,
         volume: 1.0,
-        output: qwen_stream_output(),
+        output: persona_stream_output(),
         alignment: AlignmentGranularity::None,
         stream: true,
     }
@@ -2229,23 +2281,23 @@ fn validate_read_aloud_response(
     request_id: &SpeechRequestId,
     selection: &ReadAloudSelection,
 ) -> Result<Option<u64>, Blocker> {
-    let ReadAloudSelection::Qwen(qwen) = selection;
     if response.request_id != *request_id
-        || response.route.backend_id != QWEN_BACKEND_ID
-        || response.route.model_id.as_deref() != Some(&qwen.model_id)
-        || response.route.voice_id.as_deref() != Some(&qwen.voice_id)
+        || response.route.backend_id != selection.backend_id()
+        || response.route.model_id != selection.model_id()
+        || response.route.voice_id.as_deref() != Some(selection.voice_id().as_str())
         || response.route.network != NetworkBehavior::Never
+        || response.route.backend_kind != speech_native_types::SpeechBackendKind::EmbeddedModel
         || !response.usage.real_local_inference
     {
         return Err(speech_provenance_mismatch(
-            "Qwen3 TTS response route did not match the admitted local model and voice.",
+            "Speech response route did not match the admitted local model and voice.",
         ));
     }
     match response.output {
         SynthesisOutput::Streamed {
             format,
             emitted_bytes,
-        } if format == qwen_stream_output()
+        } if format == persona_stream_output()
             && emitted_bytes > 0
             && emitted_bytes <= u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) =>
         {
@@ -2253,7 +2305,7 @@ fn validate_read_aloud_response(
         }
         _ => Err(Blocker::new(
             "speech_stream_invalid",
-            "Qwen3 TTS did not complete the admitted PCM stream.",
+            "Speech did not complete the admitted PCM stream.",
             Vec::new(),
         )),
     }
@@ -2752,6 +2804,21 @@ mod tests {
         }
     }
 
+    fn pocket_descriptor() -> SpeechBackendDescriptor {
+        let mut descriptor = qwen_descriptor();
+        descriptor.id = speech_native_backend_pocket::POCKET_BACKEND_ID.to_string();
+        descriptor.display_name = "Pocket TTS CPU".to_string();
+        descriptor.capabilities[0].backend_id = descriptor.id.clone();
+        descriptor.capabilities[0].id = "pocket-tts.native-cpu.synthesis".to_string();
+        descriptor.capabilities[0].model_id =
+            Some(speech_native_backend_pocket::POCKET_MODEL_ID.to_string());
+        descriptor.models[0].id = speech_native_backend_pocket::POCKET_MODEL_ID.to_string();
+        descriptor.models[0].display_name = "Pocket TTS".to_string();
+        descriptor.models[0].family = "pocket-tts".to_string();
+        descriptor.voices[0].id = "mom.pocket.gabor_mate".to_string();
+        descriptor
+    }
+
     fn deferred_parakeet_descriptor() -> SpeechBackendDescriptor {
         let mut descriptor = parakeet_descriptor();
         descriptor.models[0].resident = false;
@@ -2790,7 +2857,7 @@ mod tests {
             "Read Aloud and precommit must share one persona synthesis contract"
         );
         assert!(request.stream);
-        assert_eq!(request.output, qwen_stream_output());
+        assert_eq!(request.output, persona_stream_output());
         assert!(qwen.descriptor().capabilities.iter().all(|capability| {
             capability.network == NetworkBehavior::Never
                 && matches!(
@@ -2860,6 +2927,73 @@ mod tests {
     }
 
     #[test]
+    fn precommit_purpose_routes_notes_to_qwen_and_calls_to_pocket_without_fallback() {
+        let descriptors = [qwen_descriptor(), pocket_descriptor()];
+        let persona_voice = "mom.qwen.icl.gabor_mate";
+        let note = select_precommit(&descriptors, 62, persona_voice, PrecommitPurpose::VoiceNote)
+            .expect("voice note retains Qwen");
+        assert!(matches!(note, ReadAloudSelection::Qwen(_)));
+        assert_eq!(note.backend_id(), QWEN_BACKEND_ID);
+        assert!(
+            note.compute_arbiter(None).is_some(),
+            "Qwen stays compute-coordinated"
+        );
+
+        let call = select_precommit(&descriptors, 62, persona_voice, PrecommitPurpose::Call)
+            .expect("call selects Pocket CPU");
+        assert!(matches!(call, ReadAloudSelection::Pocket(_)));
+        assert_eq!(
+            call.backend_id(),
+            speech_native_backend_pocket::POCKET_BACKEND_ID
+        );
+        assert_eq!(
+            call.model_id().as_deref(),
+            Some(speech_native_backend_pocket::POCKET_MODEL_ID)
+        );
+        assert_eq!(call.voice_id(), "mom.pocket.gabor_mate");
+        assert!(
+            call.compute_arbiter(None).is_none(),
+            "Pocket does not reserve Metal"
+        );
+
+        assert!(
+            select_precommit(
+                &[qwen_descriptor()],
+                62,
+                persona_voice,
+                PrecommitPurpose::Call,
+            )
+            .is_err(),
+            "missing Pocket blocks instead of falling back to Qwen"
+        );
+        assert!(
+            select_precommit(
+                &[pocket_descriptor()],
+                62,
+                persona_voice,
+                PrecommitPurpose::VoiceNote,
+            )
+            .is_err(),
+            "missing Qwen blocks voice notes instead of falling back to Pocket"
+        );
+    }
+
+    #[test]
+    fn precommit_purpose_accepts_only_explicit_snake_case_values() {
+        assert_eq!(
+            serde_json::from_str::<PrecommitPurpose>("\"call\"")
+                .expect("call purpose is a valid wire value"),
+            PrecommitPurpose::Call
+        );
+        assert_eq!(
+            serde_json::from_str::<PrecommitPurpose>("\"voice_note\"")
+                .expect("voice note purpose is a valid wire value"),
+            PrecommitPurpose::VoiceNote
+        );
+        assert!(serde_json::from_str::<PrecommitPurpose>("\"read_aloud\"").is_err());
+    }
+
+    #[test]
     fn prepared_turn_voice_binding_is_resident_and_immutable() {
         let speech = MomSpeech::empty_for_tests();
         let conversation = "conversation-resident-voice";
@@ -2901,7 +3035,7 @@ mod tests {
     fn qwen_icl_response_validates_against_the_selected_model() {
         let request_id = SpeechRequestId("qwen-icl-validation".to_string());
         let voice_id = "mom.qwen.icl.gabor_mate";
-        let selection = ReadAloudSelection::Qwen(QwenSelection {
+        let selection = ReadAloudSelection::Qwen(EmbeddedVoiceSelection {
             descriptor_sha256: "descriptor".to_string(),
             descriptor: qwen_descriptor(),
             model_id: QWEN_ICL_MODEL_ID.to_string(),
@@ -2917,7 +3051,7 @@ mod tests {
                 network: NetworkBehavior::Never,
             },
             output: SynthesisOutput::Streamed {
-                format: qwen_stream_output(),
+                format: persona_stream_output(),
                 emitted_bytes: 3,
             },
             duration_ms: Some(800),
@@ -2931,6 +3065,50 @@ mod tests {
         assert_eq!(
             validate_read_aloud_response(response, &request_id, &selection),
             Ok(Some(800))
+        );
+    }
+
+    #[test]
+    fn pocket_call_response_must_match_the_selected_cpu_route() {
+        let request_id = SpeechRequestId("pocket-call-validation".to_string());
+        let selection = ReadAloudSelection::Pocket(EmbeddedVoiceSelection {
+            descriptor_sha256: "descriptor".to_string(),
+            descriptor: pocket_descriptor(),
+            model_id: speech_native_backend_pocket::POCKET_MODEL_ID.to_string(),
+            voice_id: "mom.pocket.gabor_mate".to_string(),
+        });
+        let response = SynthesisResponse {
+            request_id: request_id.clone(),
+            route: speech_native_types::SpeechResolvedRoute {
+                backend_id: speech_native_backend_pocket::POCKET_BACKEND_ID.to_string(),
+                model_id: Some(speech_native_backend_pocket::POCKET_MODEL_ID.to_string()),
+                voice_id: Some("mom.pocket.gabor_mate".to_string()),
+                backend_kind: SpeechBackendKind::EmbeddedModel,
+                network: NetworkBehavior::Never,
+            },
+            output: SynthesisOutput::Streamed {
+                format: persona_stream_output(),
+                emitted_bytes: 3,
+            },
+            duration_ms: Some(800),
+            alignments: Vec::new(),
+            usage: speech_native_types::SpeechUsage {
+                real_local_inference: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            validate_read_aloud_response(response.clone(), &request_id, &selection),
+            Ok(Some(800))
+        );
+
+        let mut wrong_route = response;
+        wrong_route.route.backend_id = QWEN_BACKEND_ID.to_string();
+        assert_eq!(
+            validate_read_aloud_response(wrong_route, &request_id, &selection)
+                .expect_err("a Qwen response cannot satisfy a Pocket call")
+                .code,
+            "speech_provenance_mismatch"
         );
     }
 
@@ -3340,7 +3518,7 @@ mod tests {
                     },
                     // Envelope bytes only; no synthesis, decoding or playback.
                     output: SynthesisOutput::Streamed {
-                        format: qwen_stream_output(),
+                        format: persona_stream_output(),
                         emitted_bytes: u64::try_from(MOCK_WAV.len()).expect("mock WAV length"),
                     },
                     duration_ms: Some(1),
@@ -3850,7 +4028,7 @@ mod selected_synthesis_scheduling_tests {
                     network: NetworkBehavior::Never,
                 },
                 output: SynthesisOutput::Streamed {
-                    format: qwen_stream_output(),
+                    format: persona_stream_output(),
                     emitted_bytes: 4_800,
                 },
                 duration_ms: Some(100),

@@ -4525,6 +4525,17 @@
     const ttsMetricValues = (name) => ttsSegments
       .map((stage) => Number(stage[name]))
       .filter(Number.isFinite);
+    const measuredTtsSum = (name, divisor = 1) => {
+      if (ttsSegments.length === 0 || !ttsSegments.every((stage) =>
+        typeof stage[name] === "number" && Number.isFinite(stage[name]))) return null;
+      return Math.round(ttsSegments.reduce((total, stage) => total + stage[name], 0) / divisor * 100) / 100;
+    };
+    const ttsIdentitySet = (name) => {
+      const values = [...new Set(ttsSegments
+        .map((stage) => stage[name])
+        .filter((value) => typeof value === "string" && value.length > 0))];
+      return values.length ? values : null;
+    };
     const ttsComplete = latestSinceAttempt("tts_all_segments_finished");
     const semanticBackpressure = latestSinceAttempt("semantic_backpressure_finished")
       || ttsComplete?.semantic_backpressure || null;
@@ -5035,6 +5046,9 @@
         ? Number(tts.time_to_first_audio_ms)
         : null,
       tts_segment_count: ttsSegments.length,
+      tts_backend_ids: ttsIdentitySet("backend_id"),
+      tts_model_ids: ttsIdentitySet("model_id"),
+      tts_voice_ids: ttsIdentitySet("voice_id"),
       tts_total_synthesis_ms: Number.isFinite(Number(ttsComplete?.synthesis_ms))
         ? Number(ttsComplete.synthesis_ms)
         : null,
@@ -5104,14 +5118,8 @@
         const candidate = Number(segment.production_rtf);
         return Number.isFinite(candidate) ? Math.max(worst, candidate) : worst;
       }, 0) || null,
-      tts_compute_lease_acquisitions: ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_acquisitions))
-          ? Number(segment.compute_lease_acquisitions) : 0)
-      ), 0) || null,
-      tts_compute_lease_releases: ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_releases))
-          ? Number(segment.compute_lease_releases) : 0)
-      ), 0) || null,
+      tts_compute_lease_acquisitions: measuredTtsSum("compute_lease_acquisitions"),
+      tts_compute_lease_releases: measuredTtsSum("compute_lease_releases"),
       tts_generation_yields: ttsSegments.reduce((total, segment) => (
         total + (Number.isFinite(Number(segment.generation_yields))
           ? Number(segment.generation_yields) : 0)
@@ -5124,14 +5132,8 @@
         total + (Number.isFinite(Number(segment.generation_fair_passes))
           ? Number(segment.generation_fair_passes) : 0)
       ), 0) || null,
-      tts_compute_lease_held_ms: Math.round(ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_held_us))
-          ? Number(segment.compute_lease_held_us) : 0)
-      ), 0) / 10) / 100 || null,
-      tts_compute_lease_released_ms: Math.round(ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_released_us))
-          ? Number(segment.compute_lease_released_us) : 0)
-      ), 0) / 10) / 100 || null,
+      tts_compute_lease_held_ms: measuredTtsSum("compute_lease_held_us", 1_000),
+      tts_compute_lease_released_ms: measuredTtsSum("compute_lease_released_us", 1_000),
       tts_compute_minimum_lead_ms: ttsMetricValues("compute_minimum_lead_ms").length
         ? Math.min(...ttsMetricValues("compute_minimum_lead_ms")) : null,
       tts_compute_maximum_lead_ms: ttsMetricValues("compute_maximum_lead_ms").length
@@ -5956,8 +5958,12 @@
       };
       window.setTimeout(refreshWhenIdle, 0);
     };
+    const synthesisPurpose = mode === "call" ? "call" : "voice_note";
+    const calibrationCache = voiceLeadCalibration || (voiceLeadCalibration =
+      new globalThis.MomVoicePipelineScheduler.VoiceLeadCalibrationCache());
     const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController(
-      voiceLeadCalibration || { initialBufferComplete: true, initialProbePending: true },
+      calibrationCache.get(synthesisPurpose)
+        || { initialBufferComplete: true, initialProbePending: true },
     );
     const semanticLeadController = new globalThis.MomVoicePipelineScheduler.SemanticLeadController();
     const mountVoiceReplyPlayer = () => {
@@ -6247,7 +6253,7 @@
       onPlaybackError: (error) => fail(error),
       onUnderrun: (gapMs) => {
         leadController.noteUnderrun(gapMs);
-        voiceLeadCalibration = leadController.calibration();
+        calibrationCache.set(synthesisPurpose, leadController.calibration());
         markTtsLatency("playback_underrun", {
           gap_ms: Math.round(gapMs),
           scheduler: leadController.snapshot(),
@@ -6645,7 +6651,7 @@
               boundary: segmentBoundary,
               startupDeficitMs,
             });
-            voiceLeadCalibration = leadController.calibration();
+            calibrationCache.set(synthesisPurpose, leadController.calibration());
             const segmentLead = segmentPcmAudioMs - (packetAt - segmentFirstPacketAt);
             const aggregateLead = ttsPcmAudioMs - (packetAt - ttsFirstPacketAt);
             segmentMinimumProducerLeadMs = segmentMinimumProducerLeadMs === null
@@ -6676,6 +6682,7 @@
         conversation,
         operation,
         text: next.chunk,
+        purpose: synthesisPurpose,
         pcmStream: stream,
       });
       activeSynthesis = synthesis;
@@ -6704,7 +6711,7 @@
           firstAudioMs: Number(binding.tts_time_to_first_audio_ms),
           words: wordCount,
         });
-        voiceLeadCalibration = leadController.calibration();
+        calibrationCache.set(synthesisPurpose, leadController.calibration());
         // Completion of the cold probe can release playback without waiting
         // for another PCM packet (or the entire reply) to wake the player.
         if (mode === "call") void controller.reconsiderStartup();
@@ -6712,6 +6719,9 @@
           segment,
           operation_id: operation,
           request_id: requestId,
+          backend_id: binding.backend_id ?? null,
+          model_id: binding.model_id ?? null,
+          voice_id: binding.voice_id ?? null,
           transport_drain_ms: Math.round(performance.now() - receiptAt),
           characters: next.chunk.length,
           words: wordCount,
@@ -9947,6 +9957,9 @@
         if (activeSpeechPlayback?.controller !== controller || epoch !== speechPlaybackEpoch) return;
         if (response?.result?.binding) {
           markReadLatency("tts_backend_complete", {
+            backend_id: response.result.binding.backend_id ?? null,
+            model_id: response.result.binding.model_id ?? null,
+            voice_id: response.result.binding.voice_id ?? null,
             backend_ms: response.result.binding.tts_time_to_first_audio_ms,
             generation_segments: response.result.binding.tts_generation_segments ?? null,
           });
@@ -11549,6 +11562,7 @@
         projector: "listening model",
         mtp: "response accelerator",
         "qwen-weights": "voice model",
+        "pocket-weights": "call voice",
         "qwen-codec-weights": "speech decoder",
       })[artifact] || "voice support";
       const stopSetupState = await events?.listen?.("mom_llama_setup_state", ({ payload }) => {
