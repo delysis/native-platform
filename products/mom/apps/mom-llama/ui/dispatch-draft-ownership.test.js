@@ -403,6 +403,9 @@ test("the real call-open prefix shows Calling before the first ring tone paint b
 });
 
 test("call startup failure persists in the status surface and checkpoints only safe diagnostics", async () => {
+  const statusHelperStart = source.indexOf("  const renderStatusContent = (status, label, onDismiss) => {");
+  const statusHelperEnd = source.indexOf("\n  const report = (value) =>", statusHelperStart);
+  const statusHelper = source.slice(statusHelperStart, statusHelperEnd);
   const reportStart = source.indexOf("  const report = (value) =>");
   const reportEnd = source.indexOf("\n  const errorMessage =", reportStart);
   const report = source.slice(reportStart, reportEnd);
@@ -421,6 +424,7 @@ test("call startup failure persists in the status surface and checkpoints only s
     classList: {
       add: (name) => statusClasses.add(name),
       remove: (name) => statusClasses.delete(name),
+      toggle: (name, enabled) => enabled ? statusClasses.add(name) : statusClasses.delete(name),
     },
   };
   let dismiss;
@@ -446,7 +450,7 @@ test("call startup failure persists in the status surface and checkpoints only s
         };
       },
     },
-    window: { clearTimeout() {} },
+    window: { clearTimeout() {}, setTimeout: () => 10 },
     recordCommandResult() {},
     errorMessage: (error) => error.message,
     setText() {},
@@ -491,7 +495,7 @@ test("call startup failure persists in the status surface and checkpoints only s
   };
   vm.createContext(context);
   vm.runInContext(
-    `${report}\nthis.report = report;\nconst errorMessage = (error) => error?.message || String(error);\n${safeHelpers}\n${call}\nthis.openCall = openVoiceCallSurface;`,
+    `${statusHelper}\n${report}\nthis.report = report;\nconst errorMessage = (error) => error?.message || String(error);\n${safeHelpers}\n${call}\nthis.openCall = openVoiceCallSurface;`,
     context,
   );
 
@@ -510,6 +514,11 @@ test("call startup failure persists in the status surface and checkpoints only s
   assert.equal(status.children[0].textContent, "Microphone access was denied.", "cleanup reports cannot hide the call failure");
   dismiss();
   assert.equal(statusClasses.has("is-hidden"), true, "the explicit dismiss control clears the failure");
+
+  context.report({ status: "blocked", blocker: { message: "ordinary failure" } });
+  assert.equal(status.children[0].textContent, "ordinary failure");
+  dismiss();
+  assert.equal(statusClasses.has("is-hidden"), true, "ordinary status dismissal follows its own report(null) route");
   assert.ok(source.includes('"call_requested", "call_start_failed", "call_ringing_started"'));
 });
 
@@ -2219,9 +2228,11 @@ test("a send rejection remains visible while the user repairs or retries it", ()
     window: { clearTimeout() {}, setTimeout: (callback) => { timers.push(callback); return timers.length; } },
   };
   vm.createContext(context);
+  const helperStart = source.indexOf("  const renderStatusContent = (status, label, onDismiss) => {");
+  const helperEnd = source.indexOf("\n  const report =", helperStart);
   const start = source.indexOf("  const report =");
   const end = source.indexOf("\n  const reportError =", start);
-  vm.runInContext(`${source.slice(start, end)}\nthis.report = report;`, context);
+  vm.runInContext(`${source.slice(helperStart, helperEnd)}\n${source.slice(start, end)}\nthis.report = report;`, context);
   context.report({ status: "blocked", blocker: { message: "The model rejected this request" } });
   assert.equal(status.children[0].textContent, "The model rejected this request");
   assert.equal(classes.has("is-hidden"), false);

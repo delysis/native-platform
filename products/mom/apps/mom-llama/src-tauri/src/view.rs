@@ -5109,18 +5109,44 @@ mod tests {
                 assert_eq!(
                     js.matches(unmanaged).count(),
                     1,
-                    "only the command-status dismissal may create a local button",
+                    "command-status dismissals must share one button construction site",
                 );
-                let dismiss_start = js
-                    .find(r#"const dismiss = document.createElement("button")"#)
-                    .expect("status dismissal button exists");
-                let dismiss_end = js[dismiss_start..]
-                    .find("status.replaceChildren(message, dismiss)")
-                    .map(|offset| dismiss_start + offset)
-                    .expect("status dismissal is mounted");
-                let dismiss = &js[dismiss_start..dismiss_end];
-                assert!(dismiss.contains(r#"aria-label", "Dismiss""#));
-                assert!(dismiss.contains(r#"addEventListener("click", () => report(null)"#));
+                let helper_start = js
+                    .find("const renderStatusContent = (status, label, onDismiss) => {")
+                    .expect("shared status content helper exists");
+                let helper_end = js[helper_start..]
+                    .find("\n  const report = (value) => {")
+                    .map(|offset| helper_start + offset)
+                    .expect("shared status helper is bounded before report");
+                let helper = &js[helper_start..helper_end];
+                assert!(helper.contains(r#"dismiss.setAttribute("aria-label", "Dismiss")"#));
+                assert!(
+                    helper.contains(
+                        r#"dismiss.addEventListener("click", onDismiss, { once: true })"#
+                    )
+                );
+                assert!(helper.contains("status.replaceChildren(message, dismiss)"));
+
+                let report_start = js
+                    .find("const report = (value) => {")
+                    .expect("command status report exists");
+                let persistent_start = js
+                    .find("const renderPersistentVoiceCallFailure = () => {")
+                    .expect("persistent call failure projection exists");
+                let report = &js[report_start..persistent_start];
+                assert!(report.contains("renderStatusContent(status, String(label).replaceAll(\"_\", \" \"), () => report(null))"));
+
+                let persistent_end = js[persistent_start..]
+                    .find("\n  const setPersistentVoiceCallFailure =")
+                    .map(|offset| persistent_start + offset)
+                    .expect("persistent status projection is bounded");
+                let persistent = &js[persistent_start..persistent_end];
+                assert!(persistent.contains(
+                    "renderStatusContent(status, persistentVoiceCallFailure.message, () => {"
+                ));
+                assert!(
+                    persistent.contains("persistentVoiceCallFailure = null;\n      report(null);")
+                );
                 continue;
             }
             if unmanaged == r#"document.createElement("input")"# {

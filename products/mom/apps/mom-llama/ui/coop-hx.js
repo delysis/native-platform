@@ -134,6 +134,18 @@
     if (output) output.value = JSON.stringify(value);
   };
 
+  const renderStatusContent = (status, label, onDismiss) => {
+    const message = document.createElement("span");
+    message.textContent = String(label);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "command-status-dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", onDismiss, { once: true });
+    status.replaceChildren(message, dismiss);
+  };
+
   const report = (value) => {
     recordCommandResult(value);
     if (persistentVoiceCallFailure) {
@@ -152,15 +164,7 @@
         status.replaceChildren();
         return;
       }
-      const message = document.createElement("span");
-      message.textContent = String(label).replaceAll("_", " ");
-      const dismiss = document.createElement("button");
-      dismiss.type = "button";
-      dismiss.className = "command-status-dismiss";
-      dismiss.setAttribute("aria-label", "Dismiss");
-      dismiss.textContent = "×";
-      dismiss.addEventListener("click", () => report(null), { once: true });
-      status.replaceChildren(message, dismiss);
+      renderStatusContent(status, String(label).replaceAll("_", " "), () => report(null));
       const blocked = Boolean(blocker) || value?.status === "blocked";
       status.classList.toggle("blocked", blocked);
       status.classList.remove("is-hidden");
@@ -177,18 +181,10 @@
     const status = document.getElementById("command-status");
     if (!status || !persistentVoiceCallFailure) return;
     window.clearTimeout(status.hideTimer);
-    const message = document.createElement("span");
-    message.textContent = persistentVoiceCallFailure.message;
-    const dismiss = document.createElement("button");
-    dismiss.type = "button";
-    dismiss.className = "command-status-dismiss";
-    dismiss.setAttribute("aria-label", "Dismiss");
-    dismiss.textContent = "×";
-    dismiss.addEventListener("click", () => {
+    renderStatusContent(status, persistentVoiceCallFailure.message, () => {
       persistentVoiceCallFailure = null;
       report(null);
-    }, { once: true });
-    status.replaceChildren(message, dismiss);
+    });
     status.classList.add("blocked");
     status.classList.remove("is-hidden");
     delete status.hideTimer;
