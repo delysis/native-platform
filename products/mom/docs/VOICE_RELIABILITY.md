@@ -78,6 +78,15 @@ Two actual native builds with distinct Cargo output directories produced
 the same Mac/compiler/features. No artifact digest was normalized or weakened.
 This does not establish cross-compiler or cross-machine reproducibility.
 
+The engine build identity includes its resolved Cargo dependency closure,
+not the entire workspace manifest and lockfile. Adding an unrelated speech
+backend must not invalidate saved Gemma state. Package versions, sources,
+checksums and resolved dependency edges remain included, alongside engine/type
+sources, compiler, target, features and native artifact evidence. A change to
+this identity recipe itself invalidates earlier checkpoints once; it does not
+authorize importing incompatible state. A warm callback alone cannot qualify
+this boundary: verify persisted restoration after an application restart.
+
 First-run readiness is scoped to the runtime data directory, including an
 explicit `LLAMA_NATIVE_KIT_DATA_DIR` override. A setup receipt in Tauri's shared
 application directory cannot qualify a fresh profile. Existing profiles without
@@ -120,6 +129,15 @@ I/O to test ownership, reasoning exclusion, sentence admission, EOF ordering,
 backpressure and cancellation. Its synthetic clocks and PCM are not latency or
 physical-playback evidence. Backend integration tests must call the same `MomSpeech` synthesis
 entry points as the app; isolated model tests qualify only that model boundary.
+
+The shared PCM worklet context keeps its output clock running between turns.
+Natural completion and cancellation retire only the owning node, analyser and
+ring; they never suspend a shared context that could retain device-bound audio
+for a later speaker. Explicit pause holds the processor's ring position while
+rendering silence. Late callbacks have authority only over their exact node
+and owner. Tests cover drain/pause races, cancellation during startup, and
+cross-owner teardown. These lifecycle checks do not establish audible speaker
+isolation; a packaged cross-persona stop-and-call test remains necessary.
 
 Call performance is measured by starting the exact packaged candidate through
 its normal UI in an isolated profile and reading its persisted

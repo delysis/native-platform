@@ -516,6 +516,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const media = [];
   const urls = [];
   const audioContexts = [];
+  const analysers = [];
   const workletNodes = [];
   const timers = [];
   let selected = "fixture-conversation";
@@ -615,7 +616,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     constructor(options) {
       this.options = options; this.sampleRate = options?.sampleRate || 24_000;
       this.currentTime = 0; this.destination = {}; this.sources = [];
-      this.closed = false; this.state = "running";
+      this.closed = false; this.state = "running"; this.suspendCount = 0;
       if (worklet) this.audioWorklet = { addModule: () => workletPreparationGate?.promise || Promise.resolve() };
       audioContexts.push(this);
     }
@@ -626,13 +627,21 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
       this.state = "running";
     }
     async suspend() {
+      this.suspendCount += 1;
       this.suspendCalled = true;
       if (suspendGate && suspendGateEnabled) await suspendGate.promise;
       this.state = "suspended";
     }
     async close() { this.closed = true; this.state = "closed"; }
     createAnalyser() {
-      return { fftSize: 0, connect() {}, getFloatTimeDomainData(samples) { samples.fill(0); } };
+      const analyser = {
+        fftSize: 0, connected: false, disconnected: false,
+        connect() { this.connected = true; },
+        disconnect() { this.connected = false; this.disconnected = true; },
+        getFloatTimeDomainData(samples) { samples.fill(0); },
+      };
+      analysers.push(analyser);
+      return analyser;
     }
     createBuffer(channels, length, sampleRate) {
       return { channels, length, sampleRate, duration: length / sampleRate, copyToChannel() {} };
@@ -730,7 +739,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
-  return { ...context.api, traces, advance(ms) { now += ms; }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
+  return { ...context.api, traces, advance(ms) { now += ms; }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, analysers, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
     holdSuspend() { suspendGateEnabled = true; },
@@ -943,7 +952,7 @@ test("stop during delayed worklet preparation settles queued playback without cr
   assert.deepEqual(ended, [], "stopped queued completion is not reported as natural playback end");
 });
 
-test("stop during delayed context resume prevents playback-start callbacks and re-suspends late resume", async () => {
+test("cancelled delayed resume cannot suspend a successor on the shared context", async () => {
   const resume = speechDeferred();
   const h = speechLifetimeHarness({ worklet: true, playbackResumeGate: resume });
   const started = [];
@@ -956,13 +965,36 @@ test("stop during delayed context resume prevents playback-start callbacks and r
   const playback = controller.play();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.workletNodes.length, 1);
+  const context = h.audioContexts[0];
+  const oldNode = h.workletNodes[0];
+  const oldMessageHandler = oldNode.port.onmessage;
+  const suspendsBeforeStop = context.suspendCount;
 
   await controller.stop();
   assert.equal(await playback, false, "stop settles even while browser resume is pending");
+  assert.equal(context.suspendCount, suspendsBeforeStop, "stopping a cancelled owner does not suspend the shared clock");
+
+  const successorStarted = [];
+  const successor = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => successorStarted.push(true),
+  });
+  successor.push(h.pcmFrame(new Uint8Array(6_000)));
+  const successorPlayback = successor.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 2);
+  const successorNode = h.workletNodes[1];
   resume.resolve();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(started, [], "stale resume cannot announce playback or open capture");
-  assert.equal(h.audioContexts[0].state, "suspended", "a late resume is returned to the stopped state");
+  assert.equal(await successorPlayback, true);
+  assert.deepEqual(successorStarted, [true]);
+  assert.equal(context.state, "running", "late completion from the cancelled owner cannot suspend its successor");
+  assert.equal(successorNode.connected, true);
+  assert.doesNotThrow(() => oldMessageHandler({ data: { type: "drained", renderedFrames: 0 } }));
+  assert.equal(context.state, "running");
+  await successor.stop();
 });
 
 test("stop during a paused-context resume cannot schedule queued PCM or announce playback", async () => {
@@ -1034,8 +1066,97 @@ test("call playback transfers PCM to the preallocated audio-thread ring", async 
   assert.equal(h.workletNodes[0].port.messages.at(-1).type, "finish");
   h.workletNodes[0].port.onmessage({ data: { type: "drained", renderedFrames: 3_000 } });
   assert.equal(ended.length, 1);
-  assert.equal(h.audioContexts[0].state, "suspended");
+  assert.equal(h.audioContexts[0].state, "running", "drain leaves the shared output clock running");
+  assert.equal(h.analysers[0].disconnected, true);
   await controller.stop();
+});
+
+test("shared worklet context survives drain and stop; stale old drain cannot pause its successor", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const firstEnded = [];
+  const first = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onEnded: () => firstEnded.push(true),
+  });
+  first.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const context = h.audioContexts[0];
+  const oldNode = h.workletNodes[0];
+  const alreadyQueuedDrainHandler = oldNode.port.onmessage;
+  const suspendsAfterStart = context.suspendCount;
+  first.finish();
+  alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000 } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(context.state, "running", "natural drain keeps the prepared shared audio clock alive");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.deepEqual(firstEnded, [true]);
+  assert.equal(h.analysers[0].disconnected, true, "natural EOF releases the old analyser graph");
+
+  const second = h.createPcmPlaybackBuffer({ autoplay: true, retainHistory: false });
+  second.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const newNode = h.workletNodes[1];
+  assert.equal(h.audioContexts.length, 1, "the successor reuses the prepared context");
+  assert.equal(context.state, "running");
+  assert.doesNotThrow(() => alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000 } }));
+  assert.equal(context.state, "running", "a late old-owner event cannot suspend successor playback");
+  assert.equal(newNode.connected, true, "late old-owner events leave the successor renderer connected");
+  assert.deepEqual(firstEnded, [true], "a stale duplicate drain is ignored after the old renderer ended");
+  assert.equal(h.analysers[1].connected, true, "the successor retains its own connected analyser graph");
+
+  await second.stop();
+  assert.equal(context.state, "running", "stopping one owner does not suspend the shared context");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+});
+
+test("explicit worklet pause and resume preserve the running shared audio clock", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const controller = h.createPcmPlaybackBuffer({ autoplay: true, retainHistory: false });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const context = h.audioContexts[0];
+  const node = h.workletNodes[0];
+  const suspendsAfterStart = context.suspendCount;
+
+  assert.equal(await controller.pause(), true);
+  assert.equal(context.state, "running", "pause is implemented in the worklet, not by suspending the shared context");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.equal(node.port.messages.at(-1).type, "pause");
+  assert.equal(await controller.play(), true);
+  assert.equal(context.state, "running");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.equal(node.port.messages.at(-1).type, "resume");
+  await controller.stop();
+  assert.equal(h.analysers[0].disconnected, true, "stop disconnects the paused owner graph");
+});
+
+test("a drain already queued before pause still settles natural playback", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const ended = [];
+  const metrics = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onEnded: () => ended.push(true),
+    onRendererMetrics: (value) => metrics.push(value),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  const alreadyQueuedDrainHandler = node.port.onmessage;
+  controller.finish();
+  assert.equal(node.port.messages.at(-1).type, "finish");
+  assert.equal(await controller.pause(), true);
+  assert.equal(controller.playing, false);
+  assert.equal(node.port.messages.at(-1).type, "pause");
+
+  alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000, underruns: 0 } });
+  assert.deepEqual(ended, [true], "a valid terminal drain is honored even after pause changed UI playback state");
+  assert.equal(metrics.at(-1).reason, "ended");
+  assert.equal(metrics.at(-1).underruns, 0);
+  assert.equal(node.connected, false);
+  assert.equal(h.analysers[0].disconnected, true);
+  assert.equal(h.audioContexts[0].state, "running");
 });
 
 test("worklet playback joins producer, admission, render, and consumption on the audio clock", async () => {
@@ -2299,29 +2420,24 @@ test("late worklet callbacks after stop neither schedule stale PCM nor update ow
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(await playing, true);
   const node = h.workletNodes[0];
+  const alreadyQueuedHandler = node.port.onmessage;
   assert.equal(node.port.messages.filter((message) => message.type === "pcm").length, 8);
 
   // Fill the 8-second ring and leave one packet queued in the main-thread
   // buffer. A consumed callback arriving after stop must not schedule it.
   controller.push(h.pcmFrame(oneSecond, 8, false, 8 * 24_000));
   assert.equal(h.audioContexts[0].sources.length, 0);
-  h.holdSuspend();
-  let stopped = false;
-  const stopping = controller.stop().then(() => { stopped = true; });
-  for (let attempt = 0; attempt < 100 && !h.audioContexts[0].suspendCalled; attempt += 1) {
-    await Promise.resolve();
-  }
-  assert.equal(h.audioContexts[0].suspendCalled, true);
-  assert.equal(stopped, false, "the simulated context suspension is still pending");
-
-  node.port.onmessage({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
-  node.port.onmessage({ data: { type: "underrun", missingFrames: 240 } });
+  await controller.stop();
+  assert.equal(h.audioContexts[0].state, "running", "stop retires only the old graph on the shared context");
+  assert.equal(node.connected, false);
+  assert.equal(node.port.onmessage, null, "teardown detaches future event delivery");
+  // This saved callback models an event already queued in the renderer before
+  // teardown detached the port handler.
+  alreadyQueuedHandler({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
+  alreadyQueuedHandler({ data: { type: "underrun", missingFrames: 240 } });
   const observed = {
     staleBufferSources: h.audioContexts[0].sources.length,
     lateUnderrunFeedback: lateUnderruns.length,
   };
-  suspendGate.resolve();
-  await stopping;
-  assert.equal(stopped, true);
   assert.deepEqual(observed, { staleBufferSources: 0, lateUnderrunFeedback: 0 });
 });

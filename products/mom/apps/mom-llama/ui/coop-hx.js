@@ -1123,6 +1123,28 @@
       onPlayable?.();
     };
 
+    // Keep the shared output clock running once playback has started. WebKit
+    // may retain device-bound PCM across suspend/resume, so suspending at a
+    // turn boundary can cut off a tail and replay it under the next speaker.
+    // Only this renderer's graph and ring are retired; the idle graph is silent.
+    const disconnectWorklet = () => {
+      const shared = workletOwner !== null;
+      if (workletNode) {
+        workletNode.port.postMessage({ type: "reset" });
+        workletNode.port.onmessage = null;
+        workletNode.disconnect();
+        workletNode = null;
+      }
+      echoReference?.disconnect();
+      echoReference = null;
+      echoReferenceSamples = null;
+      if (workletOwner && pcmWorkletEngine.owner === workletOwner) {
+        pcmWorkletEngine.owner = null;
+      }
+      workletOwner = null;
+      return shared;
+    };
+
     const resumeContext = async (candidate) => {
       let timeout = null;
       try {
@@ -1179,8 +1201,11 @@
           },
         });
         rendererMetrics.worklet = true;
+        const ownedNode = workletNode;
+        const ownedEngine = workletOwner;
         workletNode.port.onmessage = ({ data }) => {
-          if (stopped) return;
+          if (stopped || workletNode !== ownedNode
+              || pcmWorkletEngine.owner !== ownedEngine) return;
           const audioContextMs = Number(data?.audioContextFrame || 0) * 1_000 / format.sampleRate;
           if (data?.type === "packet_admitted") {
             const packetIndex = Number(data.packetIndex || 0);
@@ -1238,7 +1263,7 @@
             onBufferLevel?.(bufferedPlaybackSeconds() * 1000);
           } else if (data?.type === "error") {
             onPlaybackError?.(new Error(`speech_stream_worklet_failed: ${data.message || "PCM output failed."}`));
-          } else if (data?.type === "drained" && playing && !stopped) {
+          } else if (data?.type === "drained" && !stopped) {
             rendererMetrics.worklet_final_metrics_received = true;
             rendererMetrics.worklet_pcm_signal_frames = Number.isFinite(data.pcmSignalFrames)
               ? Number(data.pcmSignalFrames) : null;
@@ -1275,13 +1300,7 @@
             rendererMetrics.worklet_first_render_context_frame = Number.isFinite(data.firstRenderContextFrame)
               ? Number(data.firstRenderContextFrame) : rendererMetrics.worklet_first_render_context_frame;
             playing = false;
-            workletNode.disconnect();
-            workletNode = null;
-            if (pcmWorkletEngine.owner === workletOwner) {
-              pcmWorkletEngine.owner = null;
-              void context.suspend().catch(() => {});
-            }
-            workletOwner = null;
+            disconnectWorklet();
             context = null;
             reportRendererMetrics("ended");
             onEnded?.();
@@ -1308,31 +1327,21 @@
           startCancellation.then(() => "cancelled"),
         ]);
         if (resumeResult === "cancelled" || !isStartCurrent()) {
-          // stop() has already torn down this renderer. A resume that settles
-          // afterward can wake its AudioContext again, so put it back to sleep
-          // only while the shared worklet context is still ours (or unowned).
-          void resume.then(async () => {
-            if (startOwner && pcmWorkletEngine.owner && pcmWorkletEngine.owner !== startOwner) return;
-            if (startOwner) await startContext.suspend().catch(() => {});
-            else await startContext.close().catch(() => {});
-          }).catch(() => {});
+          // A retired renderer has no authority to pause the shared clock.
+          // Its graph is disconnected by stop(), including for a late resume.
+          if (!startOwner) {
+            void resume.then(() => startContext.close()).catch(() => {});
+          }
           return false;
         }
       } catch (error) {
         playing = false;
         sources.forEach((source) => { try { source.stop(); } catch (_) {} });
         sources.clear();
-        if (workletNode) {
-          workletNode.port.postMessage({ type: "reset" });
-          workletNode.disconnect();
-          workletNode = null;
-          if (pcmWorkletEngine.owner === workletOwner) pcmWorkletEngine.owner = null;
-          await context.suspend().catch(() => {});
-          workletOwner = null;
-        } else {
-          await context.close().catch(() => {});
-        }
+        const failedContext = context;
+        const shared = disconnectWorklet();
         context = null;
+        if (!shared && failedContext) await failedContext.close().catch(() => {});
         throw error;
       }
       onPlaybackStarted?.({
@@ -1372,11 +1381,25 @@
 
     const play = async () => {
       if (stopped || playing) return false;
+      if (workletNode && context) {
+        playing = true;
+        playWhenReady = true;
+        workletNode.port.postMessage({ type: "resume" });
+        schedulePending();
+        onPlaybackStarted?.({
+          renderer: "audio_worklet_ring",
+          buffered_ms: Math.round(bufferedSeconds() * 100_000) / 100,
+          resume_ms: 0,
+          total_start_ms: 0,
+          resumed: true,
+        });
+        armEnd();
+        return true;
+      }
       if (context?.state === "suspended") {
         playing = true;
         playWhenReady = true;
         const resumedContext = context;
-        const resumedOwner = workletOwner;
         try {
           const resume = resumeContext(resumedContext);
           const resumeResult = await Promise.race([
@@ -1386,10 +1409,7 @@
           if (!resumeResult || stopped || !playing || context !== resumedContext) {
             playing = false;
             void resume.then(async () => {
-              if (resumedOwner && pcmWorkletEngine.owner
-                  && pcmWorkletEngine.owner !== resumedOwner) return;
-              if (resumedOwner) await resumedContext.suspend().catch(() => {});
-              else await resumedContext.close().catch(() => {});
+              await resumedContext.close().catch(() => {});
             }).catch(() => {});
             return false;
           }
@@ -1429,7 +1449,8 @@
       playing = false;
       playWhenReady = false;
       endGeneration += 1;
-      await context.suspend();
+      if (workletNode) workletNode.port.postMessage({ type: "pause" });
+      else await context.suspend();
       onPlaybackPaused?.();
       return true;
     };
@@ -1510,19 +1531,10 @@
       endGeneration += 1;
       sources.forEach((source) => { try { source.stop(); } catch (_) {} });
       sources.clear();
-      if (workletNode) {
-        workletNode.port.postMessage({ type: "reset" });
-        workletNode.disconnect();
-        workletNode = null;
-      }
-      if (workletOwner && pcmWorkletEngine.owner === workletOwner) {
-        pcmWorkletEngine.owner = null;
-        if (context) await context.suspend().catch(() => {});
-      } else if (context) {
-        await context.close().catch(() => {});
-      }
-      workletOwner = null;
+      const stoppedContext = context;
+      const shared = disconnectWorklet();
       context = null;
+      if (!shared && stoppedContext) await stoppedContext.close().catch(() => {});
       rendererPacketOwners.clear();
       reportRendererMetrics("stopped");
     };

@@ -50,6 +50,7 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
     this.drainGraceFrames = Math.ceil(sampleRate / 10);
     this.silentDrainFrames = 0;
     this.stopped = false;
+    this.paused = false;
     this.firstReceiveContextFrame = null;
     this.firstRenderContextFrame = null;
     this.port.onmessage = ({ data }) => this.receive(data);
@@ -59,6 +60,11 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
     if (message?.type === "reset") {
       this.stopped = true;
       this.available = 0;
+      return;
+    }
+    if (this.stopped) return;
+    if (message?.type === "pause" || message?.type === "resume") {
+      this.paused = message.type === "pause";
       return;
     }
     if (message?.type === "finish") {
@@ -127,7 +133,15 @@ class MomPcmRingProcessor extends AudioWorkletProcessor {
 
   process(_inputs, outputs) {
     const output = outputs[0];
-    if (!output?.length || this.stopped) return !this.stopped;
+    if (!output?.length) return !this.stopped;
+    if (this.stopped) {
+      for (const channel of output) channel.fill(0);
+      return false;
+    }
+    if (this.paused) {
+      for (const channel of output) channel.fill(0);
+      return true;
+    }
     const frames = output[0].length;
     this.renderQuanta += 1;
     if (this.receivedAudio && !this.finished && (this.rebuffering || this.available < frames)) {

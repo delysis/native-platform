@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 
 const PRIVATE_FIELD_DOMAIN: &[u8] = b"llama-native-private-build-field-v1\0";
-const PRIVATE_MANIFEST_DOMAIN: &[u8] = b"llama-native-private-build-manifest-v3\0";
+const PRIVATE_MANIFEST_DOMAIN: &[u8] = b"llama-native-private-build-manifest-v4\0";
 pub(crate) const BINDING_EVIDENCE_FORMAT: &str = "llama.native-build-evidence.v1";
+const CARGO_CLOSURE_DOMAIN: &[u8] = b"llama-native-cargo-closure-v1\0";
 const REVIEWED_STATIC_LINKAGE: &str =
     "local=static;ggml-origin=vendored;ggml=static;backends=linked";
 const BASE_REQUIRED_ARTIFACT_GROUPS: &[&[&str]] = &[
@@ -27,6 +29,13 @@ const METAL_REQUIRED_ARTIFACT_GROUPS: &[&[&str]] = &[
     &["llama/llama/link"],
     &["mtmd/mtmd/link"],
 ];
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoPackageKey {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
 
 pub(crate) fn reviewed_binding_profile(
     target: &str,
@@ -292,12 +301,707 @@ fn hash_frame(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// Returns a canonical, private serialization of the resolved dependency
+/// closure for one package. Workspace membership and unrelated lock entries
+/// are deliberately excluded; package identities, checksums, and resolved
+/// dependency edges remain bound into the native build identity.
+pub(crate) fn cargo_dependency_closure(
+    lock_text: &str,
+    root_name: &str,
+    root_version: &str,
+) -> Result<Vec<u8>, String> {
+    let lock: toml::Value = toml::from_str(lock_text)
+        .map_err(|_| "Cargo lock could not be parsed for native dependency identity".to_string())?;
+    if lock
+        .get("version")
+        .and_then(toml::Value::as_integer)
+        .is_none_or(|version| !matches!(version, 3 | 4))
+    {
+        return Err("Cargo lock version is unsupported for native dependency identity".to_string());
+    }
+    let package_values = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "Cargo lock package list is missing or malformed".to_string())?;
+    if package_values.is_empty() {
+        return Err("Cargo lock package list is empty".to_string());
+    }
+
+    #[derive(Clone, Debug)]
+    struct PackageRecord {
+        key: CargoPackageKey,
+        checksum: Option<String>,
+        dependency_specs: Vec<String>,
+    }
+
+    let mut packages = BTreeMap::<CargoPackageKey, PackageRecord>::new();
+    for value in package_values {
+        let name = required_lock_string(value, "name")?;
+        let version = required_lock_string(value, "version")?;
+        if !valid_package_component(&name) || !valid_package_component(&version) {
+            return Err("Cargo lock contains an invalid package identity".to_string());
+        }
+        let source = optional_lock_string(value, "source")?;
+        let checksum = optional_lock_string(value, "checksum")?;
+        if checksum
+            .as_deref()
+            .is_some_and(|value| !is_lower_sha256(value))
+        {
+            return Err("Cargo lock contains a malformed package checksum".to_string());
+        }
+        if source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+"))
+            && checksum.is_none()
+        {
+            return Err("Cargo lock registry package omits its checksum".to_string());
+        }
+        let dependency_specs = match value.get("dependencies") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| "Cargo lock dependencies list is malformed".to_string())?
+                .iter()
+                .map(|dependency| {
+                    dependency
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "Cargo lock dependency entry is malformed".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let key = CargoPackageKey {
+            name,
+            version,
+            source,
+        };
+        let record = PackageRecord {
+            key: key.clone(),
+            checksum,
+            dependency_specs,
+        };
+        if packages.insert(key, record).is_some() {
+            return Err("Cargo lock contains an ambiguous duplicate package identity".to_string());
+        }
+    }
+
+    let roots = packages
+        .keys()
+        .filter(|key| key.name == root_name && key.version == root_version && key.source.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let root = match roots.as_slice() {
+        [root] => root.clone(),
+        [] => return Err("Cargo lock omits the native engine package".to_string()),
+        _ => return Err("Cargo lock contains an ambiguous native engine package".to_string()),
+    };
+
+    let mut reachable = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    let mut pending = vec![root.clone()];
+    while let Some(parent) = pending.pop() {
+        if !reachable.insert(parent.clone()) {
+            continue;
+        }
+        let record = packages
+            .get(&parent)
+            .ok_or_else(|| "Cargo lock dependency closure is incomplete".to_string())?;
+        for dependency in &record.dependency_specs {
+            let spec = parse_dependency_spec(dependency)?;
+            let matches = packages
+                .keys()
+                .filter(|candidate| {
+                    candidate.name == spec.name
+                        && spec
+                            .version
+                            .as_ref()
+                            .is_none_or(|version| &candidate.version == version)
+                        && spec
+                            .source
+                            .as_ref()
+                            .is_none_or(|source| candidate.source.as_ref() == Some(source))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let target = match matches.as_slice() {
+                [target] => target.clone(),
+                [] => {
+                    return Err(
+                        "Cargo lock dependency closure references a missing package".to_string()
+                    );
+                }
+                _ => {
+                    return Err(
+                        "Cargo lock dependency closure has an ambiguous package reference"
+                            .to_string(),
+                    );
+                }
+            };
+            edges.insert((parent.clone(), target.clone()));
+            if !reachable.contains(&target) {
+                pending.push(target);
+            }
+        }
+    }
+
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(CARGO_CLOSURE_DOMAIN);
+    canonical.extend_from_slice(&(reachable.len() as u64).to_le_bytes());
+    for key in &reachable {
+        let record = packages
+            .get(key)
+            .ok_or_else(|| "Cargo lock dependency closure is incomplete".to_string())?;
+        append_closure_field(&mut canonical, record.key.name.as_bytes());
+        append_closure_field(&mut canonical, record.key.version.as_bytes());
+        append_closure_field(
+            &mut canonical,
+            record.key.source.as_deref().unwrap_or("").as_bytes(),
+        );
+        append_closure_field(
+            &mut canonical,
+            record.checksum.as_deref().unwrap_or("").as_bytes(),
+        );
+    }
+    canonical.extend_from_slice(&(edges.len() as u64).to_le_bytes());
+    for (parent, target) in edges {
+        append_package_key(&mut canonical, &parent);
+        append_package_key(&mut canonical, &target);
+    }
+    Ok(canonical)
+}
+
+/// Canonicalizes only workspace settings inherited by the native engine or
+/// its DTO crate. Workspace membership and unrelated shared dependencies are
+/// intentionally excluded.
+pub(crate) fn cargo_workspace_build_inputs(
+    workspace_manifest: &str,
+    engine_manifest: &str,
+    types_manifest: &str,
+) -> Result<Vec<u8>, String> {
+    let workspace: toml::Value = toml::from_str(workspace_manifest).map_err(|_| {
+        "workspace manifest could not be parsed for native build identity".to_string()
+    })?;
+    let engine: toml::Value = toml::from_str(engine_manifest)
+        .map_err(|_| "engine manifest could not be parsed for native build identity".to_string())?;
+    let types: toml::Value = toml::from_str(types_manifest)
+        .map_err(|_| "types manifest could not be parsed for native build identity".to_string())?;
+
+    let workspace_package = workspace
+        .get("workspace")
+        .and_then(|value| value.get("package"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "workspace package settings are missing or malformed".to_string())?;
+    let workspace_dependencies = workspace
+        .get("workspace")
+        .and_then(|value| value.get("dependencies"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "workspace dependencies are missing or malformed".to_string())?;
+    let workspace_table = workspace
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "workspace table is missing or malformed".to_string())?;
+
+    let mut output = Vec::new();
+    output.extend_from_slice(b"llama-native-workspace-inputs-v1\0");
+    let resolver = workspace_table
+        .get("resolver")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| "workspace dependency resolver is missing or malformed".to_string())?;
+    append_closure_field(&mut output, b"resolver");
+    append_closure_field(&mut output, resolver.as_bytes());
+    let mut inherited_package = BTreeSet::new();
+    let mut inherited_dependencies = BTreeSet::new();
+    let mut inherits_workspace_lints = false;
+    for manifest in [&engine, &types] {
+        let package = manifest
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| "native package manifest is missing its package table".to_string())?;
+        for (key, value) in package {
+            if value
+                .as_table()
+                .and_then(|table| table.get("workspace"))
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                inherited_package.insert(key.clone());
+            }
+        }
+        collect_workspace_dependencies(manifest, &mut inherited_dependencies)?;
+        inherits_workspace_lints |= manifest
+            .get("lints")
+            .and_then(|value| value.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true);
+    }
+
+    append_closure_field(&mut output, b"package");
+    append_closure_field(&mut output, &(inherited_package.len() as u64).to_le_bytes());
+    for key in inherited_package {
+        let value = workspace_package
+            .get(&key)
+            .ok_or_else(|| "inherited workspace package setting is missing".to_string())?;
+        append_closure_field(&mut output, key.as_bytes());
+        append_toml_value(&mut output, value);
+    }
+
+    append_closure_field(&mut output, b"dependencies");
+    append_closure_field(
+        &mut output,
+        &(inherited_dependencies.len() as u64).to_le_bytes(),
+    );
+    for name in inherited_dependencies {
+        let value = workspace_dependencies
+            .get(&name)
+            .ok_or_else(|| "inherited workspace dependency is missing".to_string())?;
+        append_closure_field(&mut output, name.as_bytes());
+        append_toml_value(&mut output, value);
+    }
+
+    append_closure_field(&mut output, b"lints");
+    if inherits_workspace_lints {
+        let value = workspace_table
+            .get("lints")
+            .ok_or_else(|| "inherited workspace lints are missing".to_string())?;
+        output.push(1);
+        append_toml_value(&mut output, value);
+    } else {
+        output.push(0);
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod cargo_workspace_tests {
+    use super::cargo_workspace_build_inputs;
+
+    fn manifests(
+        edition: &str,
+        resolver: &str,
+        serde_dependency: &str,
+        extra_member: &str,
+        unrelated_dependency: &str,
+    ) -> Vec<u8> {
+        let workspace = format!(
+            r#"[workspace]
+members = ["engine", "types"{extra_member}]
+resolver = "{resolver}"
+
+[workspace.package]
+edition = "{edition}"
+
+[workspace.dependencies]
+serde = {serde_dependency}
+{unrelated_dependency}
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+"#
+        );
+        let engine = r#"[package]
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+"#;
+        let types = r#"[package]
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
+"#;
+        cargo_workspace_build_inputs(&workspace, engine, types).expect("workspace inputs")
+    }
+
+    #[test]
+    fn workspace_projection_ignores_members_and_unreferenced_dependencies() {
+        let base = manifests(
+            "2024",
+            "3",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        let unrelated = manifests(
+            "2024",
+            "3",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            ", \"pocket-backend\"",
+            "pocket-backend = \"0.1\"",
+        );
+        assert_eq!(base, unrelated);
+    }
+
+    #[test]
+    fn workspace_projection_tracks_inherited_package_and_dependency_features() {
+        let baseline = manifests(
+            "2024",
+            "3",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        let changed_edition = manifests(
+            "2021",
+            "3",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        let changed_features = manifests(
+            "2024",
+            "3",
+            "{ version = \"1\", default-features = true, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        assert_ne!(baseline, changed_edition);
+        assert_ne!(baseline, changed_features);
+        let changed_resolver = manifests(
+            "2024",
+            "2",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        assert_ne!(baseline, changed_resolver);
+    }
+
+    #[test]
+    fn workspace_projection_is_independent_of_toml_table_key_order() {
+        let first = manifests(
+            "2024",
+            "3",
+            "{ version = \"1\", default-features = false, features = [\"derive\"] }",
+            "",
+            "",
+        );
+        let reordered = manifests(
+            "2024",
+            "3",
+            "{ features = [\"derive\"], version = \"1\", default-features = false }",
+            "",
+            "",
+        );
+        assert_eq!(first, reordered);
+    }
+}
+
+fn collect_workspace_dependencies(
+    manifest: &toml::Value,
+    output: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        if let Some(table) = manifest.get(section).and_then(toml::Value::as_table) {
+            collect_workspace_dependency_table(table, output)?;
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+                if let Some(table) = target.get(section).and_then(toml::Value::as_table) {
+                    collect_workspace_dependency_table(table, output)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_workspace_dependency_table(
+    table: &toml::map::Map<String, toml::Value>,
+    output: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for (name, value) in table {
+        if value
+            .as_table()
+            .and_then(|table| table.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            output.insert(name.clone());
+        }
+    }
+    Ok(())
+}
+
+fn append_toml_value(output: &mut Vec<u8>, value: &toml::Value) {
+    match value {
+        toml::Value::String(value) => {
+            output.push(1);
+            append_closure_field(output, value.as_bytes());
+        }
+        toml::Value::Integer(value) => {
+            output.push(2);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        toml::Value::Float(value) => {
+            output.push(3);
+            append_closure_field(output, value.to_string().as_bytes());
+        }
+        toml::Value::Boolean(value) => {
+            output.extend_from_slice(&[4, u8::from(*value)]);
+        }
+        toml::Value::Datetime(value) => {
+            output.push(5);
+            append_closure_field(output, value.to_string().as_bytes());
+        }
+        toml::Value::Array(values) => {
+            output.push(6);
+            append_closure_field(output, &(values.len() as u64).to_le_bytes());
+            for value in values {
+                append_toml_value(output, value);
+            }
+        }
+        toml::Value::Table(values) => {
+            output.push(7);
+            append_closure_field(output, &(values.len() as u64).to_le_bytes());
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                append_closure_field(output, key.as_bytes());
+                append_toml_value(output, value);
+            }
+        }
+    }
+}
+
+struct DependencySpec {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+}
+
+fn parse_dependency_spec(value: &str) -> Result<DependencySpec, String> {
+    let (identity, source) = if let Some(without_close) = value.strip_suffix(')') {
+        if let Some((identity, source)) = without_close.split_once(" (") {
+            if source.is_empty()
+                || source
+                    .chars()
+                    .any(|character| matches!(character, '(' | ')' | '\n' | '\r'))
+            {
+                return Err("Cargo lock dependency source is malformed".to_string());
+            }
+            (identity, Some(source.to_string()))
+        } else {
+            (value, None)
+        }
+    } else {
+        (value, None)
+    };
+    let fields = identity.split_whitespace().collect::<Vec<_>>();
+    let (name, version) = match fields.as_slice() {
+        [name] => (*name, None),
+        [name, version] => (*name, Some((*version).to_string())),
+        _ => return Err("Cargo lock dependency identity is malformed".to_string()),
+    };
+    if !valid_package_component(name)
+        || version
+            .as_deref()
+            .is_some_and(|version| !valid_package_component(version))
+    {
+        return Err("Cargo lock dependency identity is malformed".to_string());
+    }
+    Ok(DependencySpec {
+        name: name.to_string(),
+        version,
+        source,
+    })
+}
+
+fn required_lock_string(value: &toml::Value, field: &str) -> Result<String, String> {
+    value
+        .get(field)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Cargo lock contains a missing or malformed package field".to_string())
+}
+
+fn optional_lock_string(value: &toml::Value, field: &str) -> Result<Option<String>, String> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| "Cargo lock contains a malformed optional package field".to_string()),
+    }
+}
+
+fn valid_package_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+' | b':')
+        })
+}
+
+fn append_closure_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+fn append_package_key(output: &mut Vec<u8>, key: &CargoPackageKey) {
+    append_closure_field(output, key.name.as_bytes());
+    append_closure_field(output, key.version.as_bytes());
+    append_closure_field(output, key.source.as_deref().unwrap_or("").as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn reversible_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn fixture_lock(root_dependencies: &str, checksum: &str, extra: &str) -> String {
+        format!(
+            r#"version = 4
+
+[[package]]
+name = "llama-native-engine"
+version = "1.0.0"
+dependencies = [{root_dependencies}]
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{checksum}"
+dependencies = ["serde_core 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]
+
+[[package]]
+name = "serde_core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{}"
+
+{extra}
+"#,
+            "b".repeat(64)
+        )
+    }
+
+    fn fixture_closure(lock: &str) -> Result<Vec<u8>, String> {
+        cargo_dependency_closure(lock, "llama-native-engine", "1.0.0")
+    }
+
+    #[test]
+    fn cargo_closure_ignores_unrelated_workspace_packages() {
+        let base = fixture_lock(
+            "\"serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"",
+            &"a".repeat(64),
+            "",
+        );
+        let with_unrelated_pocket_member = fixture_lock(
+            "\"serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"",
+            &"a".repeat(64),
+            r#"[[package]]
+name = "speech-native-backend-pocket"
+version = "0.1.0"
+dependencies = ["ndarray 0.16.1 (registry+https://github.com/rust-lang/crates.io-index)"]
+
+[[package]]
+name = "ndarray"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#,
+        );
+
+        assert_eq!(
+            fixture_closure(&base).expect("base closure"),
+            fixture_closure(&with_unrelated_pocket_member).expect("closure with unrelated member")
+        );
+    }
+
+    #[test]
+    fn cargo_closure_ignores_lock_reference_qualification_for_same_resolution() {
+        let unqualified = fixture_lock("\"serde\"", &"a".repeat(64), "");
+        let qualified_with_duplicate_unrelated_version = fixture_lock(
+            "\"serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"",
+            &"a".repeat(64),
+            r#"[[package]]
+name = "serde"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+"#,
+        );
+
+        assert_eq!(
+            fixture_closure(&unqualified).expect("unqualified reference resolves uniquely"),
+            fixture_closure(&qualified_with_duplicate_unrelated_version)
+                .expect("qualified reference resolves despite unrelated duplicate version")
+        );
+    }
+
+    #[test]
+    fn cargo_closure_tracks_reachable_package_version_and_checksum() {
+        let base = fixture_lock(
+            "\"serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"",
+            &"a".repeat(64),
+            "",
+        );
+        let checksum_changed = fixture_lock(
+            "\"serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"",
+            &"d".repeat(64),
+            "",
+        );
+        assert_ne!(
+            fixture_closure(&base).expect("base closure"),
+            fixture_closure(&checksum_changed).expect("changed checksum closure")
+        );
+
+        let version_changed = base
+            .replace("serde 1.0.0 (registry+", "serde 1.1.0 (registry+")
+            .replace(
+                "name = \"serde\"\nversion = \"1.0.0\"",
+                "name = \"serde\"\nversion = \"1.1.0\"",
+            );
+        assert_ne!(
+            fixture_closure(&base).expect("base closure"),
+            fixture_closure(&version_changed).expect("changed version closure")
+        );
+    }
+
+    #[test]
+    fn cargo_closure_rejects_missing_and_ambiguous_resolution() {
+        let missing = fixture_lock("\"missing 1.0.0\"", &"a".repeat(64), "");
+        assert!(
+            fixture_closure(&missing)
+                .expect_err("missing lock package must fail closed")
+                .contains("missing package")
+        );
+
+        let ambiguous = fixture_lock(
+            "\"serde\"",
+            &"a".repeat(64),
+            r#"[[package]]
+name = "serde"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+"#,
+        );
+        assert!(
+            fixture_closure(&ambiguous)
+                .expect_err("ambiguous lock package must fail closed")
+                .contains("ambiguous package reference")
+        );
+    }
+
+    #[test]
+    fn cargo_closure_rejects_malformed_lockfile() {
+        assert!(
+            fixture_closure("version = [invalid")
+                .expect_err("malformed lockfile must fail closed")
+                .contains("could not be parsed")
+        );
     }
 
     #[test]

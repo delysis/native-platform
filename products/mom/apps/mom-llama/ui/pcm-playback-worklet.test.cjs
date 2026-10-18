@@ -73,6 +73,43 @@ test("the audio-thread ring converts and drains exact PCM order", () => {
   });
 });
 
+test("explicit pause freezes the ring without consuming frames, and resume continues at the same sample", () => {
+  const { processor, messages } = harness({ channels: 1, capacityFrames: 128 });
+  const buffer = pcm16(8192, 4096, -4096, -8192, ...Array(124).fill(0));
+  processor.receive({ type: "pcm", buffer, byteOffset: 0, byteLength: buffer.byteLength, channels: 1 });
+  processor.receive({ type: "pause" });
+  const pausedOutput = new Float32Array(4);
+  assert.equal(processor.process([], [[pausedOutput]]), true);
+  assert.deepEqual(Array.from(pausedOutput), [0, 0, 0, 0]);
+  assert.equal(processor.available, 128, "pause leaves every buffered source frame queued");
+  assert.equal(processor.read, 0);
+  assert.equal(processor.renderedFrames, 0);
+  assert.equal(messages.some((message) => message.type === "underrun_started"), false);
+
+  processor.receive({ type: "resume" });
+  const resumedOutput = new Float32Array(4);
+  assert.equal(processor.process([], [[resumedOutput]]), true);
+  assert.deepEqual(Array.from(resumedOutput), [0.25, 0.125, -0.125, -0.25]);
+  assert.equal(processor.available, 124);
+  assert.equal(processor.read, 4);
+  assert.equal(processor.renderedFrames, 4);
+});
+
+test("reset remains terminal if a paused renderer later receives resume", () => {
+  const { processor, messages } = harness({ channels: 1, capacityFrames: 128 });
+  const buffer = pcm16(8192, 4096, -4096, -8192);
+  processor.receive({ type: "pcm", buffer, byteOffset: 0, byteLength: buffer.byteLength, channels: 1 });
+  processor.receive({ type: "pause" });
+  processor.receive({ type: "reset" });
+  processor.receive({ type: "resume" });
+  const output = new Float32Array([1, -1, 0.5, -0.5]);
+  assert.equal(processor.process([], [[output]]), false, "reset terminates the old processor");
+  assert.deepEqual(Array.from(output), [0, 0, 0, 0]);
+  assert.equal(processor.available, 0);
+  assert.equal(processor.renderedFrames, 0);
+  assert.equal(messages.some((message) => message.type === "render_started"), false);
+});
+
 test("PCM signal aggregates cross packet boundaries and count only the partial PCM tail", () => {
   const { processor, messages } = harness({ channels: 1, capacityFrames: 32 });
   const send = (samples, packetIndex) => {
