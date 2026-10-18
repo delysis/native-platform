@@ -1267,6 +1267,54 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   };
 };
 
+test("failed unconfirmed speculation leaves the caller's capture and prefill alone", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const caller = { trace: { id: "caller" }, retainedSamples: [1, 2, 3] };
+  h.context.voiceRecording = caller;
+  let admissions = 0;
+  h.context.beginVoiceCapture = async () => {
+    admissions += 1;
+    throw new Error("Voice capture is already active.");
+  };
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+    deferPlayback: true,
+  });
+  assert.equal(await playback.unavailable(new Error("empty model response")), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admissions, 0, "unconfirmed failure must not reopen an owned microphone");
+  assert.equal(h.context.voiceRecording, caller);
+  assert.deepEqual(h.prefills, [], "the speculative owner must not create a competing prompt");
+});
+
+test("late reply failure cannot replace a newer capture in the same call", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  const newer = { trace: { id: "newer-capture" } };
+  h.context.voiceRecording = newer;
+  let admissions = 0;
+  h.context.beginVoiceCapture = async () => { admissions += 1; };
+  await playback.unavailable(new Error("late producer failure"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admissions, 0);
+  assert.equal(h.context.voiceRecording, newer);
+  assert.deepEqual(h.prefills, []);
+});
+
+test("failed audible reply preserves its capture and prepares its next turn", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  await h.startPlayback(playback);
+  await playback.unavailable(new Error("producer failed after playback"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.context.voiceRecording, h.capture);
+  assert.equal(h.prefills.length, 1);
+});
+
 test("text EOF flushes a held call reply and history waits for confirmed commit", async () => {
   for (const text of [
     "This short answer is complete.",

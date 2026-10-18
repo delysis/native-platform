@@ -5513,6 +5513,7 @@
     let retryHook = null;
     let nextCallPrefillHandedOff = false;
     let callCaptureStarted = false;
+    let playbackAuthorized = !deferPlayback;
     let settleNextCallPrefillGate = null;
     const nextCallPrefillGate = mode === "call" ? new Promise((resolve) => {
       settleNextCallPrefillGate = resolve;
@@ -5744,8 +5745,15 @@
       return nextCallPrefill;
     };
     const startCallCapture = () => {
-      if (callCaptureStarted || mode !== "call" || !voiceCallActive
+      if (!playbackAuthorized || callCaptureStarted || mode !== "call" || !voiceCallActive
           || voiceCallEpoch !== callEpoch) return;
+      if (voiceRecording) {
+        markTtsLatency("call_capture_start_skipped", {
+          reason: "capture_owned",
+          capture_trace_id: voiceRecording.trace?.id || null,
+        });
+        return;
+      }
       callCaptureStarted = true;
       nextCallPrefillHandedOff = true;
       const deferPrefill = pendingCallTranscriptJobs.length > 0 || Boolean(activeCallTranscriptJob);
@@ -5989,7 +5997,7 @@
       const operation = activeOperation;
       const synthesis = activeSynthesis;
       activeOperation = null;
-      const continueCall = !onFailure && mode === "call"
+      const continueCall = playbackAuthorized && !onFailure && mode === "call"
         && voiceCallActive && voiceCallEpoch === callEpoch;
       if (!continueCall) abortUnclaimedCallPrefill();
       const releaseProducer = Promise.allSettled([
@@ -6012,7 +6020,7 @@
         void releaseProducer.then(() => {
           if (!voiceCallActive || voiceCallEpoch !== callEpoch) return;
           startCallCapture();
-          startNextCallPrefill();
+          if (callCaptureStarted) startNextCallPrefill();
         });
       }
       markTtsLatency("failed", { component: "tts", message: errorMessage(error) });
@@ -6437,6 +6445,7 @@
         return finished;
       },
       async play() {
+        playbackAuthorized = true;
         markTtsLatency("playback_requested", { pcm_ready: controller.ready });
         button?.classList.add("is-loading");
         let started = false;

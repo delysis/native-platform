@@ -582,8 +582,8 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(live.includes("prefillSession: deferPrefill ? null : (nextCallPrefill || nextCallPrefillGate)"));
   assert.ok(live.includes("deferPrefill,"));
   assert.ok(live.includes("startNextCallPrefill();\n          controller.finish();"));
-  assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
-  assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
+  assert.ok(live.includes("const continueCall = playbackAuthorized && !onFailure && mode === \"call\""));
+  assert.ok(live.includes("startCallCapture();\n          if (callCaptureStarted) startNextCallPrefill();"));
   assert.ok(!live.includes("void beginVoiceCapture({ call: true }).catch(reportError);"));
   assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
   assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));

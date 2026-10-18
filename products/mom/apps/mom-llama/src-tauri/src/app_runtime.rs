@@ -295,6 +295,21 @@ impl VoiceSpeculationControl {
     }
 }
 
+pub(crate) fn abort_unconfirmed_voice_import_if_needed<T>(
+    control: &VoiceSpeculationControl,
+    result: &Result<mom_llama_runtime::CommandResult<T>, String>,
+) where
+    T: Serialize,
+{
+    let needs_abort = match result {
+        Err(_) => true,
+        Ok(envelope) => envelope.status == "blocked" || envelope.result.is_none(),
+    };
+    if needs_abort {
+        control.abort();
+    }
+}
+
 fn wav_sample_count(recording: &[u8]) -> Option<u64> {
     if !complete_voice_wav(recording) {
         return None;
@@ -1569,7 +1584,8 @@ mod tests {
         AppRuntimeConstruction, AppRuntimeHandle, ConfirmedVoiceRecording, MomSpeech,
         NativeFinalizer, PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
         PersonaApprovalRecoveryWorker, VoiceInferenceRecording, VoiceSpeculationControl,
-        complete_voice_wav, validate_voice_inference_recording,
+        abort_unconfirmed_voice_import_if_needed, complete_voice_wav,
+        validate_voice_inference_recording,
     };
     use crate::command_registry::command_spec;
     use crate::information::MomInformation;
@@ -1646,6 +1662,127 @@ mod tests {
         };
         assert_eq!(control.confirm_with_recording(confirmed.clone()), Ok(true));
         assert_eq!(control.wait_for_confirmation(), Ok(confirmed));
+    }
+
+    #[test]
+    fn blocked_and_failed_speculation_release_import_waiters_but_success_keeps_confirmation() {
+        let blocked = mom_llama_runtime::CommandResult::<serde_json::Value>::blocked(
+            "mom_llama.voice_audio_finish",
+            "blocked_native_runtime",
+            mom_llama_runtime::Blocker::new(
+                "native_response_missing",
+                "The native model returned no response.",
+                vec![],
+            ),
+        );
+        let blocked_control = Arc::new(VoiceSpeculationControl::new(None));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_control = Arc::clone(&blocked_control);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("test remains connected");
+            done_tx
+                .send(waiting_control.wait_for_confirmation())
+                .expect("test remains connected");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("import waiter started");
+        let blocked_result = Ok(blocked.clone());
+        abort_unconfirmed_voice_import_if_needed(&blocked_control, &blocked_result);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocked result releases import waiter"),
+            Err("voice_speculation_aborted".to_string())
+        );
+        waiter.join().expect("import waiter joins");
+
+        let mut missing_result = mom_llama_runtime::CommandResult::<serde_json::Value>::blocked(
+            "mom_llama.voice_audio_finish",
+            "blocked_native_runtime",
+            mom_llama_runtime::Blocker::new(
+                "native_response_missing",
+                "The native model returned no response.",
+                vec![],
+            ),
+        );
+        missing_result.status = "ready".to_string();
+        let missing_result = Ok(missing_result);
+        let missing_control = Arc::new(VoiceSpeculationControl::new(None));
+        let waiting_control = Arc::clone(&missing_control);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx
+                .send(waiting_control.wait_for_confirmation())
+                .expect("test remains connected");
+        });
+        abort_unconfirmed_voice_import_if_needed(&missing_control, &missing_result);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("no-result envelope releases import waiter"),
+            Err("voice_speculation_aborted".to_string())
+        );
+        waiter.join().expect("no-result import waiter joins");
+
+        let failed_control = Arc::new(VoiceSpeculationControl::new(None));
+        let waiting_control = Arc::clone(&failed_control);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx
+                .send(waiting_control.wait_for_confirmation())
+                .expect("test remains connected");
+        });
+        let failed: Result<mom_llama_runtime::CommandResult<serde_json::Value>, String> =
+            Err("native generation failed".to_string());
+        abort_unconfirmed_voice_import_if_needed(&failed_control, &failed);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("error result releases import waiter"),
+            Err("voice_speculation_aborted".to_string())
+        );
+        waiter.join().expect("failed import waiter joins");
+
+        let successful = mom_llama_runtime::CommandResult::passed(
+            "mom_llama.voice_audio_finish",
+            "ready",
+            serde_json::json!({"text": "hello"}),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        let successful = Ok(successful);
+        let success_control = VoiceSpeculationControl::new(None);
+        let mut wav = vec![0; 46];
+        wav[..4].copy_from_slice(b"RIFF");
+        wav[4..8].copy_from_slice(&38_u32.to_le_bytes());
+        wav[8..16].copy_from_slice(b"WAVEfmt ");
+        wav[16..20].copy_from_slice(&16_u32.to_le_bytes());
+        wav[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        wav[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        wav[24..28].copy_from_slice(&16_000_u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&32_000_u32.to_le_bytes());
+        wav[32..34].copy_from_slice(&2_u16.to_le_bytes());
+        wav[34..36].copy_from_slice(&16_u16.to_le_bytes());
+        wav[36..40].copy_from_slice(b"data");
+        wav[40..44].copy_from_slice(&2_u32.to_le_bytes());
+        let recording = ConfirmedVoiceRecording {
+            physical_wav: wav,
+            inference: None,
+            inference_unavailable_reason: None,
+        };
+        assert_eq!(
+            success_control.confirm_with_recording(recording.clone()),
+            Ok(true)
+        );
+        abort_unconfirmed_voice_import_if_needed(&success_control, &successful);
+        // A late blocked result may attempt the same cleanup after capture
+        // confirmation; the existing control transition preserves its payload.
+        abort_unconfirmed_voice_import_if_needed(&success_control, &blocked_result);
+        assert_eq!(success_control.wait_for_confirmation(), Ok(recording));
     }
 
     #[test]

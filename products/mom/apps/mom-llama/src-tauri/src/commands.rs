@@ -23,7 +23,8 @@ use tauri::{Emitter, Manager, State, Window};
 
 use crate::app_runtime::{
     AppRuntimeHandle, AppWorkLease, ConfirmedVoiceRecording, VoiceInferenceRecording,
-    complete_voice_wav, validate_voice_inference_recording,
+    abort_unconfirmed_voice_import_if_needed, complete_voice_wav,
+    validate_voice_inference_recording,
 };
 use crate::command_registry::command_spec;
 use crate::information::{
@@ -2397,12 +2398,10 @@ pub async fn mom_llama_voice_audio_speculate(
                 command_started,
                 Value::Object(detail),
             );
-            if result.is_err() {
-                // A failed or cancelled decode may return before reaching the
-                // pre-commit latch. Release the conditional import before
-                // joining it so cancellation can never strand this worker.
-                failure_control.abort();
-            }
+            // A failed, cancelled, or blocked decode may return before reaching
+            // the pre-commit latch. Release the conditional import before
+            // joining it so no-output results cannot strand this worker.
+            abort_unconfirmed_voice_import_if_needed(&failure_control, &result);
             if let Some(handle) = import
                 .lock()
                 .map_err(|_| "voice_attachment_import_lock_poisoned".to_string())?
