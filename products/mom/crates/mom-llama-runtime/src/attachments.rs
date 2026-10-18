@@ -4209,7 +4209,10 @@ mod tests {
             .find(|candidate| candidate.id == message_id)
             .expect("stored assistant message");
         assert_eq!(stored_assistant.content, "Visible answer.");
-        assert_eq!(stored_assistant.attachment_ids, [record.id.clone()]);
+        assert_eq!(
+            stored_assistant.attachment_ids.as_slice(),
+            std::slice::from_ref(&record.id)
+        );
         let stored_attachments: AttachmentDb = reopened
             .get(ATTACHMENTS_NAMESPACE)
             .expect("read attachment registry")
