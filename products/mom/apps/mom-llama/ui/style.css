@@ -17,7 +17,7 @@
   --sidebar-width: 256px;
   --settings-width: clamp(320px, 30vw, 400px);
   --content-width: 780px;
-  --toolbar-height: 64px;
+  --toolbar-height: 56px;
   --titlebar-leading-inset: 6px;
   font-family: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -159,9 +159,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   user-select: none;
 }
 
-.chrome .icon-button { width: 40px; height: 40px; flex: 0 0 40px; }
+.chrome .icon-button { width: 36px; height: 36px; flex: 0 0 36px; }
 .boot-chrome { background: transparent; }
-html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 76px; }
+html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 100px; }
 .chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }
 .titlebar-drag-surface { position: relative; flex: 1; height: 100%; min-width: 28px; }
 .sidebar-titlebar-zone,
@@ -1646,8 +1646,8 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   --glass-edge: color-mix(in srgb, var(--text) 16%, transparent);
   --glass-glyph: color-mix(in srgb, var(--text) 94%, transparent);
   --glass-shadow:
-    0 4px 14px rgba(0, 0, 0, .07),
-    0 1px 3px rgba(0, 0, 0, .05),
+    0 2px 7px rgba(0, 0, 0, .06),
+    0 1px 2px rgba(0, 0, 0, .04),
     inset 0 1px 0 rgba(255, 255, 255, .82);
 }
 
@@ -1663,8 +1663,8 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   --glass-edge: rgba(60, 60, 67, .18);
   --glass-glyph: #1d1d1f;
   --glass-shadow:
-    0 4px 14px rgba(0, 0, 0, .055),
-    0 1px 3px rgba(0, 0, 0, .04),
+    0 2px 7px rgba(0, 0, 0, .045),
+    0 1px 2px rgba(0, 0, 0, .03),
     inset 0 1px 0 rgba(255, 255, 255, .98);
 }
 @media (prefers-color-scheme: light) {
@@ -1680,8 +1680,8 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
     --glass-edge: rgba(60, 60, 67, .18);
     --glass-glyph: #1d1d1f;
     --glass-shadow:
-      0 4px 14px rgba(0, 0, 0, .055),
-      0 1px 3px rgba(0, 0, 0, .04),
+      0 2px 7px rgba(0, 0, 0, .045),
+      0 1px 2px rgba(0, 0, 0, .03),
       inset 0 1px 0 rgba(255, 255, 255, .98);
   }
 }
@@ -1700,14 +1700,15 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
 }
 
 .llama-ui-shell .sidebar {
-  padding: 10px 10px 12px;
-  gap: 10px;
+  padding: 6px 10px 12px;
+  gap: 8px;
   background: var(--sidebar);
   border-right: 0;
 }
 
 .llama-ui-shell .chat-main { background: var(--chat-pane); }
 
+.chrome .icon-button,
 .composer .round-button,
 .composer .send-button {
   color: var(--glass-glyph);
@@ -1722,15 +1723,17 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   backdrop-filter: blur(24px) saturate(1.65) brightness(1.06);
 }
 
+.chrome .icon-button:hover,
 .composer .round-button:hover,
 .composer .send-button:hover:not(:disabled) {
   background:
     linear-gradient(180deg,
       color-mix(in srgb, var(--glass-fill) 64%, white 36%),
       color-mix(in srgb, var(--glass-fill) 90%, var(--surface) 10%));
-  transform: translateY(-1px);
+  transform: none;
 }
 
+.chrome .icon-button:active,
 .composer .round-button:active,
 .composer .send-button:active:not(:disabled) {
   transform: scale(.96);
@@ -1740,19 +1743,9 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
     inset 0 1px 0 rgba(255, 255, 255, .66);
 }
 
-/* Messages-style toolbar items sit directly in the shared titlebar material.
-   A second raised glass disc made the phone control read like Siri's hardware
-   flashlight affordance and introduced a third surface tone. */
-.chrome .icon-button {
-  color: var(--glass-glyph);
-  border: 0;
-  background: transparent;
-  box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-.chrome .icon-button:hover { background: color-mix(in srgb, var(--surface) 72%, transparent); transform: none; }
-.chrome .icon-button:active { background: var(--surface-active); transform: scale(.96); box-shadow: none; }
+/* Toolbar controls share the composer's quiet, rounded material. The native
+   traffic-light inset in tauri.conf.json centers the window controls on this row. */
+.chrome .icon-button { border-radius: 50%; }
 
 .composer .send-button:disabled {
   color: color-mix(in srgb, var(--muted) 76%, transparent);
@@ -1770,8 +1763,8 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   min-height: 30px;
   padding: 5px 10px;
   font-size: 12px;
-  font-weight: 650;
-  letter-spacing: .02em;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .conversation-list { gap: 4px; }
@@ -1780,26 +1773,26 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   min-height: 48px;
   border-radius: 13px;
 }
-.conversation-item { padding: 7px 9px; }
+.conversation-item { padding: 6px 9px; }
 .conversation-item.active {
   color: white;
-  background: linear-gradient(135deg, var(--message-blue), #2997ff);
-  box-shadow: 0 7px 18px rgba(10, 132, 255, .24), inset 0 1px 0 rgba(255, 255, 255, .2);
+  background: var(--message-blue);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16);
 }
 .conversation-item.active small { color: rgba(255, 255, 255, .76); }
-.conversation-item.active .contact-avatar { box-shadow: 0 0 0 2px rgba(255, 255, 255, .75); }
+.conversation-item.active .contact-avatar { box-shadow: 0 0 0 1px rgba(255, 255, 255, .55); }
 .sidebar-persona-row { padding: 1px 3px; }
 .sidebar-persona-row:hover,
 .sidebar-persona-row:focus-within { background: color-mix(in srgb, var(--surface) 78%, transparent); }
 .sidebar-persona-copy { padding: 6px; border-radius: 12px; }
 .sidebar-persona-copy .contact-copy span,
-.conversation-copy > span { font-weight: 620; }
+.conversation-copy > span { font-weight: 500; }
 
 .contact-avatar {
-  flex-basis: 40px;
-  width: 40px;
-  height: 40px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .16), inset 0 0 0 1px rgba(255, 255, 255, .22);
+  flex-basis: 36px;
+  width: 36px;
+  height: 36px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .10);
 }
 
 .chat-main.has-messages { padding: 0 18px 14px; }
@@ -1807,8 +1800,8 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   position: fixed;
   z-index: 37;
   top: 0;
-  left: calc(var(--sidebar-width) + 50px);
-  right: 58px;
+  left: calc(var(--sidebar-width) + 48px);
+  right: 48px;
   width: auto;
   height: var(--toolbar-height);
   padding: 0 10px;
@@ -1833,9 +1826,9 @@ body .message-row.voice-message-row .voice-message-play[data-audio-state="playin
   font-weight: 620;
 }
 .recipients-header[data-unsent="false"] .recipient-chip .contact-avatar {
-  flex-basis: 32px;
-  width: 32px;
-  height: 32px;
+  flex-basis: 28px;
+  width: 28px;
+  height: 28px;
 }
 .recipients-header[data-unsent="true"] .recipient-chip {
   flex: 0 1 auto;
@@ -1999,4 +1992,19 @@ body .message-row.assistant .message-card > .voice-message-player {
   padding: 7px 10px;
   border-radius: 22px;
   background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .llama-ui-shell .chrome, .llama-ui-shell .sidebar,
+  .chrome .icon-button, .composer .round-button, .composer .send-button,
+  .composer-editor {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .chrome .icon-button, .composer .round-button, .composer .send-button {
+    background: var(--bg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chrome .icon-button, .composer .round-button, .composer .send-button { transition: none; }
 }

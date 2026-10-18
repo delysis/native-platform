@@ -313,7 +313,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
     styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)"),
-    styles.indexOf("/* Messages-style toolbar items", styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)")),
+    styles.indexOf("/* Toolbar controls share", styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)")),
   );
   assert.ok(glassControls.includes("border: 1px solid var(--glass-edge)"));
   assert.ok(glassControls.includes("linear-gradient(180deg"));
@@ -330,7 +330,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
 });
 
 test("window chrome is centered and every native resize edge is discoverable", () => {
-  assert.ok(styles.includes("--toolbar-height: 64px"));
+  assert.ok(styles.includes("--toolbar-height: 56px"));
   assert.ok(!styles.includes(".chrome { padding-bottom:"));
   assert.ok(styles.includes(".window-resize-north-east"));
   assert.ok(styles.includes("cursor: ns-resize"));
@@ -352,14 +352,12 @@ test("window chrome is centered and every native resize edge is discoverable", (
   assert.ok(sharedChrome.includes("var(--chat-pane) var(--sidebar-width) 100%"));
   assert.ok(sharedChrome.includes("border-bottom: 0"));
   assert.ok(styles.includes(".llama-ui-shell .chat-main { background: var(--chat-pane); }"));
-  const flatToolbar = styles.slice(
-    styles.indexOf("/* Messages-style toolbar items"),
-    styles.indexOf(".composer .send-button:disabled"),
-  );
-  assert.ok(flatToolbar.includes("border: 0"));
-  assert.ok(flatToolbar.includes("background: transparent"));
-  assert.ok(flatToolbar.includes("box-shadow: none"));
-  assert.ok(!flatToolbar.includes("linear-gradient"));
+  const windowConfig = JSON.parse(read("apps/mom-llama/src-tauri/tauri.conf.json")).app.windows[0];
+  assert.equal(windowConfig.titleBarStyle, "Overlay");
+  assert.equal(windowConfig.decorations, true);
+  assert.deepEqual(windowConfig.trafficLightPosition, { x: 20, y: 26 });
+  assert.ok(styles.includes(".chrome .icon-button,\n.composer .round-button,"));
+
 });
 
 test("titlebar gives search to the sidebar and voice identity to the chat", () => {
@@ -402,7 +400,7 @@ test("titlebar gives search to the sidebar and voice identity to the chat", () =
   assert.doesNotMatch(callStart, /throw new Error\("The call was not answered\."\)/);
   assert.ok(bridge.includes('.sidebar-titlebar-zone")?.classList.toggle("searching", enabled)'));
   assert.ok(styles.includes(".chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }"));
-  assert.ok(styles.includes("left: calc(var(--sidebar-width) + 50px)"));
+  assert.ok(styles.includes("left: calc(var(--sidebar-width) + 48px)"));
   assert.ok(styles.includes("flex-wrap: nowrap"));
   assert.ok(styles.includes("max-width: calc(100% - 34px)"));
   assert.ok(styles.includes("height: min(520px, calc(100dvh - 24px))"));

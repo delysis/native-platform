@@ -21,7 +21,11 @@
         "minWidth": 640,
         "minHeight": 480,
         "resizable": true,
-        "useHttpsScheme": true
+        "useHttpsScheme": true,
+        "trafficLightPosition": {
+          "x": 20,
+          "y": 26
+        }
       }
     ],
     "security": {
