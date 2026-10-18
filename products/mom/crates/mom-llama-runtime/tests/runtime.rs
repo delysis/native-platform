@@ -272,7 +272,7 @@ fn legacy_disable_reasoning_parsing_cannot_leak_direct_chat_fixture_output() -> 
     assert_eq!(
         mom_llama_runtime::settings_get()?
             .result
-            .unwrap()
+            .ok_or_else(|| anyhow!("settings missing"))?
             .upstream_settings["disableReasoningParsing"],
         json!(true)
     );
