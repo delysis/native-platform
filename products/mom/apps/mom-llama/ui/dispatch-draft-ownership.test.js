@@ -334,16 +334,21 @@ test("the real call-open prefix shows Calling before the first ring tone paint b
     voiceCallActive: false,
     voiceCallPreparing: false,
     voiceCallEpoch: null,
+    voiceLatencyTrace: { mode: "call_greeting", stages: [] },
+    conversationNavigationRevision: 0,
     voiceCallConversation: null,
     voiceCallActivityGuard: null,
+    voiceLatencyTrace: { mode: "call_greeting", stages: [] },
     createVoiceCallActivityGuard: () => {
       calls.push("guard-created");
       return { ready: new Promise(() => {}), clear: async () => {} };
     },
     speechOperationToken: () => "session-live",
     reportError: (error) => { throw error; },
+    clearPersistentVoiceCallFailure() {},
     startVoiceLatency() {},
     markVoiceLatency: (stage) => stages.push(stage),
+    markVoiceLatencyIn() {},
     setText: (id, value) => { if (id === "voice-call-title") modal.title = value; },
     setModalVisibility: (_id, visible) => { modal.visible = visible; },
     startCallRinging: (epoch) => {
@@ -397,6 +402,117 @@ test("the real call-open prefix shows Calling before the first ring tone paint b
   assert.equal(opened.epoch, calls.find((entry) => Array.isArray(entry) && entry[0] === "ring-start")[1]);
 });
 
+test("call startup failure persists in the status surface and checkpoints only safe diagnostics", async () => {
+  const reportStart = source.indexOf("  const report = (value) =>");
+  const reportEnd = source.indexOf("\n  const errorMessage =", reportStart);
+  const report = source.slice(reportStart, reportEnd);
+  const errorMessageStart = reportEnd + 1;
+  const safeHelpersStart = source.indexOf("  let persistentVoiceCallFailure = null;", errorMessageStart);
+  const safeHelpersEnd = source.indexOf("\n  const visiblyReportedErrors", safeHelpersStart);
+  const safeHelpers = source.slice(safeHelpersStart, safeHelpersEnd);
+  const callStart = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const callEnd = source.indexOf("\n  const closeVoiceCallSurface = async", callStart);
+  const call = source.slice(callStart, callEnd);
+  const statusClasses = new Set(["is-hidden"]);
+  const status = {
+    hideTimer: 9,
+    children: [],
+    replaceChildren(...children) { this.children = children; },
+    classList: {
+      add: (name) => statusClasses.add(name),
+      remove: (name) => statusClasses.delete(name),
+    },
+  };
+  let dismiss;
+  const modal = {
+    dataset: {},
+    setAttribute() {},
+    querySelector: () => null,
+  };
+  const recipient = {
+    dataset: { recipientId: "persona-safe-id" },
+    querySelector: () => ({ textContent: "Contact" }),
+  };
+  const trace = { stages: [] };
+  const context = {
+    document: {
+      getElementById: (id) => id === "voice-call-modal" ? modal : (id === "command-status" ? status : null),
+      querySelector: () => recipient,
+      createElement() {
+        return {
+          className: "", textContent: "", type: "",
+          setAttribute() {},
+          addEventListener(name, callback) { if (name === "click") dismiss = callback; },
+        };
+      },
+    },
+    window: { clearTimeout() {} },
+    recordCommandResult() {},
+    errorMessage: (error) => error.message,
+    setText() {},
+    setModalVisibility() {},
+    createVoiceCallActivityGuard: () => ({
+      ready: Promise.reject(Object.assign(new Error("Microphone access was denied."), { code: "permission_denied" })),
+      clear: async () => {},
+    }),
+    startVoiceLatency(mode, stage) { trace.mode = mode; trace.stages.push({ stage }); },
+    markVoiceLatency(stage, detail = {}) { trace.stages.push({ stage, ...detail }); },
+    voiceLatencyTrace: trace,
+    markVoiceLatencyIn(target, stage, detail = {}) { target.stages.push({ stage, ...detail }); },
+    performance: { now: () => 1 },
+    speechOperationToken: () => "safe-operation-id",
+    startCallRinging: async () => false,
+    closeVoiceCallSurface: async () => {
+      context.voiceCallActive = false;
+      context.voiceCallEpoch = null;
+      context.voiceCallPreparing = false;
+      context.report(null);
+    },
+    reportError(error) {
+      context.report({ status: "blocked", blocker: { message: error.message } });
+    },
+    voiceCallActive: false,
+    voiceCallPreparing: false,
+    voiceCallEpoch: null,
+    voiceCallActivityGuard: null,
+    voiceCallConversation: null,
+    conversationNavigationRevision: 0,
+    runtimeWarmPromise: Promise.resolve({ ready: true }),
+    voiceCallMicrophoneStream: null,
+    voiceCallCaptureGraph: null,
+    voiceCallAudio: null,
+    retryCallPrefillAfterTranscript: null,
+    voiceReplyConversation: null,
+    callReplyConversation: null,
+    activeDispatchConversation: null,
+    liveVoiceTts: null,
+    activeCallPlayback: null,
+    voiceCallTranscriptSlotsDisabled: false,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${report}\nthis.report = report;\nconst errorMessage = (error) => error?.message || String(error);\n${safeHelpers}\n${call}\nthis.openCall = openVoiceCallSurface;`,
+    context,
+  );
+
+  await context.openCall();
+  const failure = trace.stages.find(({ stage }) => stage === "call_start_failed");
+  assert.deepEqual(failure, {
+    stage: "call_start_failed", phase: "activity_guard", error_code: "permission_denied",
+  });
+  assert.doesNotMatch(JSON.stringify(failure), /Microphone access|transcript|prompt|persona-safe-id/);
+  assert.equal(statusClasses.has("is-hidden"), false);
+  assert.equal(status.children[0].textContent, "Microphone access was denied.");
+  assert.equal(status.hideTimer, undefined);
+
+  context.report(null);
+  context.report({ status: "passed", result: { message: "cleanup complete" } });
+  assert.equal(status.children[0].textContent, "Microphone access was denied.", "cleanup reports cannot hide the call failure");
+  dismiss();
+  assert.equal(statusClasses.has("is-hidden"), true, "the explicit dismiss control clears the failure");
+  assert.ok(source.includes('"call_requested", "call_start_failed", "call_ringing_started"'));
+});
+
 test("a late ring-context resume after hangup closes without installing a timer", async () => {
   const start = source.indexOf("  const stopCallBed = async () => {");
   const end = source.indexOf("\n  const prepareVoicePersonaForCall", start);
@@ -441,6 +557,604 @@ test("a late ring-context resume after hangup closes without installing a timer"
   assert.equal(closes, 1, "the stale resumed context is closed");
   assert.equal(intervals, 0, "hangup cannot install a late ring timer");
   assert.equal(context.voiceCallAudio, null);
+});
+
+test("late microphone permission after hangup cannot replace or release a newer call's stream", async () => {
+  const start = source.indexOf("  const prepareCallMicrophoneStream = async (epoch) => {");
+  const end = source.indexOf("\n  const openVoiceCallSurface = async", start);
+  assert.ok(start >= 0 && end > start);
+  const oldEpoch = {};
+  const newEpoch = {};
+  let resolvePermission;
+  const oldTrack = { stopped: false, stop() { this.stopped = true; } };
+  const oldStream = {
+    active: true,
+    getTracks: () => [oldTrack],
+  };
+  const newTrack = { readyState: "live", stop() {} };
+  const newStream = { active: true, getAudioTracks: () => [newTrack], getTracks: () => [newTrack] };
+  const context = {
+    voiceCallActive: true,
+    voiceCallEpoch: oldEpoch,
+    voiceCallMicrophoneStream: null,
+    voiceCallMicrophoneEpoch: null,
+    voiceCallCaptureGraph: null,
+    performance: { now: () => 1 },
+    navigator: { mediaDevices: { getUserMedia: () => new Promise((resolve) => { resolvePermission = resolve; }) } },
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.prepareMicrophone = prepareCallMicrophoneStream;`, context);
+  const pending = context.prepareMicrophone(oldEpoch);
+  await Promise.resolve();
+  context.voiceCallEpoch = newEpoch;
+  context.voiceCallMicrophoneStream = newStream;
+  context.voiceCallMicrophoneEpoch = newEpoch;
+  resolvePermission(oldStream);
+  await assert.rejects(pending, /call was closed during microphone setup/);
+  assert.equal(oldTrack.stopped, true, "stale permission stops its own stream");
+  assert.equal(context.voiceCallMicrophoneStream, newStream, "the late result cannot replace the new owner");
+  assert.equal(context.voiceCallMicrophoneEpoch, newEpoch);
+});
+
+test("microphone graph and resume failures release the exact stream before propagating", async () => {
+  const start = source.indexOf("  const prepareCallMicrophoneStream = async (epoch) => {");
+  const end = source.indexOf("\n  const openVoiceCallSurface =", start);
+  assert.ok(start >= 0 && end > start);
+  const epoch = {};
+  const track = { readyState: "live", stopped: false, stop() { this.stopped = true; }, getSettings: () => ({}) };
+  const stream = { active: true, getAudioTracks: () => [track], getTracks: () => [track] };
+  let closed = 0;
+  const node = () => ({ connect() {}, disconnect() {}, gain: { value: 1 } });
+  class FailingAudioContext {
+    constructor() { this.state = "running"; this.sampleRate = 48_000; this.destination = {}; }
+    createMediaStreamSource() { return node(); }
+    createScriptProcessor() { return Object.assign(node(), { onaudioprocess: null }); }
+    createGain() { return node(); }
+    resume() { return Promise.reject(new Error("audio route unavailable")); }
+    close() { closed += 1; this.state = "closed"; return Promise.resolve(); }
+  }
+  const context = {
+    voiceCallActive: true,
+    voiceCallEpoch: epoch,
+    voiceCallMicrophoneStream: null,
+    voiceCallMicrophoneEpoch: null,
+    voiceCallCaptureGraph: null,
+    performance: { now: () => 1 },
+    navigator: { mediaDevices: { getUserMedia: async () => stream } },
+    AudioContext: FailingAudioContext,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.prepareMicrophone = prepareCallMicrophoneStream;`, context);
+  await assert.rejects(context.prepareMicrophone(epoch), /audio route unavailable/);
+  assert.equal(track.stopped, true);
+  assert.equal(closed, 1);
+  assert.equal(context.voiceCallMicrophoneStream, null);
+  assert.equal(context.voiceCallMicrophoneEpoch, null);
+  assert.equal(context.voiceCallCaptureGraph, null);
+});
+
+test("microphone graph construction failure stops its stream and closes its partial context", async () => {
+  const start = source.indexOf("  const prepareCallMicrophoneStream = async (epoch) => {");
+  const end = source.indexOf("\n  const openVoiceCallSurface =", start);
+  const epoch = {};
+  const track = { readyState: "live", stopped: false, stop() { this.stopped = true; } };
+  const stream = { active: true, getAudioTracks: () => [track], getTracks: () => [track] };
+  let closed = 0;
+  class FailingAudioContext {
+    constructor() { this.state = "running"; this.destination = {}; }
+    createMediaStreamSource() { throw new Error("graph creation failed"); }
+    close() { closed += 1; return Promise.resolve(); }
+  }
+  const context = {
+    voiceCallActive: true,
+    voiceCallEpoch: epoch,
+    voiceCallMicrophoneStream: null,
+    voiceCallMicrophoneEpoch: null,
+    voiceCallCaptureGraph: null,
+    performance: { now: () => 1 },
+    navigator: { mediaDevices: { getUserMedia: async () => stream } },
+    AudioContext: FailingAudioContext,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.prepareMicrophone = prepareCallMicrophoneStream;`, context);
+  await assert.rejects(context.prepareMicrophone(epoch), /graph creation failed/);
+  assert.equal(track.stopped, true);
+  assert.equal(closed, 1);
+  assert.equal(context.voiceCallMicrophoneStream, null);
+  assert.equal(context.voiceCallMicrophoneEpoch, null);
+});
+
+test("a late greeting completion cannot clear a newer same-conversation dispatch", async () => {
+  const start = source.indexOf("  const startStreamedCallGreeting = async");
+  const end = source.indexOf("\n  const prepareCallMicrophoneStream =", start);
+  assert.ok(start >= 0 && end > start);
+  const epoch = {};
+  let resolveGeneration;
+  const newerOwner = { mode: "call" };
+  const trace = {};
+  const greetingTts = {
+    mode: "call",
+    clientRequest: "old-request",
+    lastProgressAt: 0,
+    text: "",
+    trackGeneration: (promise) => promise,
+    finish: async () => true,
+  };
+  const context = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    voiceLatencyTrace: trace,
+    liveVoiceTts: null,
+    activeDispatchConversation: null,
+    activeDispatchOwner: null,
+    callReplyConversation: null,
+    speechOperationToken: () => "old-operation",
+    beginLiveVoiceTts: () => greetingTts,
+    markVoiceLatencyIn() {},
+    markVoiceLatency() {},
+    withProgressDeadline: (operation) => operation,
+    invoke: (command) => {
+      assert.equal(command, "mom_llama_chat_send");
+      return new Promise((resolve) => { resolveGeneration = resolve; });
+    },
+    stopCallBed: async () => {},
+    setText() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.startGreeting = startStreamedCallGreeting;`, context);
+  const pending = context.startGreeting(epoch, "same-conversation");
+  await Promise.resolve();
+  context.liveVoiceTts = newerOwner;
+  context.activeDispatchOwner = newerOwner;
+  context.activeDispatchConversation = "same-conversation";
+  context.callReplyConversation = "same-conversation";
+  resolveGeneration({ result: { assistant_text: "A greeting" } });
+  assert.equal(await pending, false);
+  assert.equal(context.activeDispatchConversation, "same-conversation");
+  assert.equal(context.callReplyConversation, "same-conversation");
+  assert.equal(context.liveVoiceTts, newerOwner);
+});
+
+test("a short greeting releases its dispatch when playback ends before generation settles", async () => {
+  const start = source.indexOf("  const startStreamedCallGreeting = async");
+  const end = source.indexOf("\n  const prepareCallMicrophoneStream =", start);
+  assert.ok(start >= 0 && end > start);
+  const epoch = {};
+  let resolveGeneration;
+  const trace = {};
+  const greetingTts = {
+    mode: "call",
+    clientRequest: "short-request",
+    lastProgressAt: 0,
+    text: "A short greeting",
+    trackGeneration: (promise) => promise,
+    // The final packet can end playback immediately while the native result
+    // is still completing. The stable dispatch owner must survive this.
+    finish: async () => {
+      context.liveVoiceTts = null;
+      return true;
+    },
+  };
+  const context = {
+    voiceCallEpoch: epoch,
+    voiceCallActive: true,
+    voiceLatencyTrace: trace,
+    liveVoiceTts: null,
+    activeDispatchConversation: null,
+    activeDispatchOwner: null,
+    callReplyConversation: null,
+    speechOperationToken: () => "short-operation",
+    beginLiveVoiceTts: () => greetingTts,
+    markVoiceLatencyIn() {},
+    markVoiceLatency() {},
+    withProgressDeadline: (operation) => operation,
+    invoke: () => new Promise((resolve) => { resolveGeneration = resolve; }),
+    stopCallBed: async () => {},
+    setText() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.startGreeting = startStreamedCallGreeting;`, context);
+  const pending = context.startGreeting(epoch, "same-conversation");
+  await Promise.resolve();
+  resolveGeneration({ result: { assistant_text: "A short greeting" } });
+  assert.equal(await pending, true);
+  assert.equal(context.liveVoiceTts, null);
+  assert.equal(context.activeDispatchConversation, null);
+  assert.equal(context.activeDispatchOwner, null);
+  assert.equal(context.callReplyConversation, null);
+});
+
+test("a late speculation abort cannot clear a replacement TTS dispatch in the same conversation", async () => {
+  const start = source.indexOf("  const abortCallSpeculation = async");
+  const end = source.indexOf("\n  const sealedVoiceRecordingBytes", start);
+  assert.ok(start >= 0 && end > start);
+  let resolveAbort;
+  const conversation = "same-chat";
+  const oldTts = { stop: async () => {} };
+  const replacementTts = {};
+  const speculation = { id: "old-spec", conversation, tts: oldTts, confirmed: false, aborting: false };
+  const replacementSpeculation = { id: "new-spec" };
+  const recording = { speculation, trace: {}, native: true, call: true };
+  const context = {
+    performance: { now: () => 1 },
+    markVoiceLatencyIn() {},
+    voiceModePrompt: () => "",
+    invoke: async () => new Promise((resolve) => { resolveAbort = resolve; }),
+    recording,
+    activeVoiceSpeculation: speculation,
+    liveVoiceTts: oldTts,
+    activeDispatchConversation: conversation,
+    activeDispatchOwner: oldTts,
+    callReplyConversation: conversation,
+    voiceReplyConversation: null,
+    voiceRecording: recording,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.abortSpeculation = abortCallSpeculation;`, context);
+  const aborting = context.abortSpeculation(recording);
+  await Promise.resolve();
+  assert.equal(typeof resolveAbort, "function");
+  context.recording.speculation = replacementSpeculation;
+  context.activeVoiceSpeculation = replacementSpeculation;
+  context.liveVoiceTts = replacementTts;
+  context.activeDispatchOwner = replacementTts;
+  context.activeDispatchConversation = conversation;
+  context.callReplyConversation = conversation;
+  resolveAbort({ status: "passed" });
+  await aborting;
+  assert.equal(context.recording.speculation, replacementSpeculation);
+  assert.equal(context.activeVoiceSpeculation, replacementSpeculation);
+  assert.equal(context.liveVoiceTts, replacementTts);
+  assert.equal(context.activeDispatchConversation, conversation);
+  assert.equal(context.callReplyConversation, conversation);
+  assert.equal(context.activeDispatchOwner, replacementTts);
+});
+
+test("hangup dismisses and releases startup ownership before slow stops, without touching a newer call", async () => {
+  const start = source.indexOf("  const closeVoiceCallSurface = async () => {");
+  const end = source.indexOf("\n  const setText =", start);
+  assert.ok(start >= 0 && end > start);
+  let resolveStops;
+  let released = null;
+  let visible = true;
+  const oldEpoch = {};
+  const oldStream = { id: "old" };
+  const newEpoch = {};
+  const newStream = { id: "new" };
+  const context = {
+    voiceCallActive: true,
+    voiceCallEpoch: oldEpoch,
+    voiceCallPreparing: true,
+    voiceCallConversation: null,
+    voiceCallMicrophoneStream: oldStream,
+    voiceCallActivityGuard: null,
+    liveVoiceTts: null,
+    activeCallPlayback: null,
+    activeDispatchConversation: "unrelated-note-chat",
+    callReplyConversation: null,
+    retryCallPrefillAfterTranscript: null,
+    voiceReplyConversation: null,
+    setModalVisibility(_id, shown) { visible = shown; },
+    stopVoiceCapture: () => new Promise((resolve) => { resolveStops = resolve; }),
+    stopCallTranscriptForClose: () => Promise.resolve(),
+    stopSpeechPlayback: () => Promise.resolve(),
+    stopCallBed: () => Promise.resolve(),
+    releaseCallMicrophoneStream(stream) { released = stream; },
+    recoverPendingVoiceHistory: () => Promise.resolve(),
+    invoke: () => Promise.resolve(),
+    console: { warn() {} },
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.closeCall = closeVoiceCallSurface;`, context);
+  const closing = context.closeCall();
+  assert.equal(visible, false, "hangup hides the call immediately");
+  assert.equal(context.voiceCallActive, false);
+  assert.equal(context.voiceCallPreparing, false, "startup UI ownership clears before any stop settles");
+  assert.equal(context.voiceCallEpoch, null);
+
+  context.voiceCallActive = true;
+  context.voiceCallPreparing = true;
+  context.voiceCallEpoch = newEpoch;
+  context.voiceCallMicrophoneStream = newStream;
+  resolveStops();
+  await closing;
+  assert.equal(released, oldStream, "cleanup releases only the microphone owned by the closed call");
+  assert.equal(context.voiceCallActive, true);
+  assert.equal(context.voiceCallPreparing, true, "late cleanup leaves the newer call's flags alone");
+  assert.equal(context.voiceCallEpoch, newEpoch);
+  assert.equal(context.voiceCallMicrophoneStream, newStream);
+  assert.equal(context.activeDispatchConversation, "unrelated-note-chat",
+    "hangup does not clear an unrelated voice-note dispatch");
+});
+
+test("hangup clears its held greeting dispatch before waiting and preserves a newer same-chat owner", async () => {
+  const start = source.indexOf("  const closeVoiceCallSurface = async () => {");
+  const end = source.indexOf("\n  const setText =", start);
+  assert.ok(start >= 0 && end > start);
+  let resolveGreetingStop;
+  const conversation = "same-chat";
+  const oldOwner = { mode: "call", stop: () => new Promise((resolve) => { resolveGreetingStop = resolve; }) };
+  const newerOwner = { mode: "call" };
+  const context = {
+    voiceCallActive: true,
+    voiceCallEpoch: {},
+    voiceCallPreparing: false,
+    voiceCallConversation: conversation,
+    voiceCallMicrophoneStream: null,
+    voiceCallActivityGuard: null,
+    liveVoiceTts: oldOwner,
+    activeCallPlayback: null,
+    activeDispatchConversation: conversation,
+    activeDispatchOwner: oldOwner,
+    callReplyConversation: conversation,
+    retryCallPrefillAfterTranscript: null,
+    voiceReplyConversation: null,
+    setModalVisibility() {},
+    stopVoiceCapture: async () => {},
+    stopCallTranscriptForClose: async () => {},
+    stopSpeechPlayback: async () => {},
+    stopCallBed: async () => {},
+    releaseCallMicrophoneStream() {},
+    recoverPendingVoiceHistory: async () => {},
+    invoke: async () => ({}),
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.closeCall = closeVoiceCallSurface;`, context);
+  const closing = context.closeCall();
+  assert.equal(context.activeDispatchConversation, null,
+    "hangup releases the greeting's dispatch slot synchronously");
+  assert.equal(context.activeDispatchOwner, null);
+  context.voiceCallActive = true;
+  context.voiceCallEpoch = {};
+  context.voiceCallPreparing = true;
+  context.voiceCallConversation = conversation;
+  context.liveVoiceTts = newerOwner;
+  context.activeDispatchConversation = conversation;
+  context.activeDispatchOwner = newerOwner;
+  context.callReplyConversation = conversation;
+  resolveGreetingStop();
+  await closing;
+  assert.equal(context.activeDispatchConversation, conversation);
+  assert.equal(context.callReplyConversation, conversation);
+  assert.equal(context.liveVoiceTts, newerOwner);
+  assert.equal(context.voiceCallPreparing, true);
+});
+
+test("a stale call startup finally cannot clear a newer call's preparing state", async () => {
+  const start = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const end = source.indexOf("\n  const closeVoiceCallSurface = async", start);
+  assert.ok(start >= 0 && end > start);
+  let rejectGuard;
+  const firstEpoch = {};
+  const secondEpoch = {};
+  const targetAvatar = {
+    className: "",
+    classList: { add() {} },
+    setAttribute() {},
+    replaceChildren() {},
+  };
+  const modal = {
+    dataset: {},
+    setAttribute() {},
+    querySelector: (selector) => selector === "#voice-call-avatar" ? targetAvatar : ({ focus() {} }),
+    classList: { add() {} },
+  };
+  const sourceAvatar = {
+    className: "contact-avatar",
+    getAttribute: () => "",
+    childNodes: [],
+  };
+  const recipient = {
+    dataset: { recipientId: "contact" },
+    querySelector: (selector) => selector === ".contact-avatar"
+      ? sourceAvatar
+      : ({ textContent: "Contact" }),
+  };
+  const context = {
+    voiceCallActive: false,
+    voiceCallPreparing: false,
+    voiceCallEpoch: null,
+    voiceLatencyTrace: { mode: "call_greeting", stages: [] },
+    conversationNavigationRevision: 0,
+    document: { getElementById: () => modal, querySelector: () => recipient },
+    clearPersistentVoiceCallFailure() {},
+    speechOperationToken: () => ({}),
+    createVoiceCallActivityGuard: () => ({ ready: new Promise((_resolve, reject) => { rejectGuard = reject; }), clear: async () => {} }),
+    startVoiceLatency() {},
+    markVoiceLatency() {},
+    markVoiceLatencyIn() {},
+    startCallRinging: () => new Promise(() => {}),
+    reportError: () => assert.fail("a stale cancellation must not be presented as a call failure"),
+    recordCommandResult() {},
+    errorMessage: (error) => error.message,
+    report() {},
+    setModalVisibility() {},
+    setText() {},
+    releaseHistoryRecovery() {},
+    releaseCallMicrophoneStream() {},
+    performance: { now: () => 1 },
+    console,
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.openCall = openVoiceCallSurface;`, context);
+  const opening = context.openCall();
+  await Promise.resolve();
+  assert.equal(typeof rejectGuard, "function");
+  const staleEpoch = context.voiceCallEpoch;
+  context.voiceCallEpoch = secondEpoch;
+  context.voiceCallActive = true;
+  context.voiceCallPreparing = true;
+  rejectGuard(Object.assign(new Error("call closed"), { code: "call_closed" }));
+  await opening;
+  assert.notEqual(staleEpoch, secondEpoch);
+  assert.equal(context.voiceCallEpoch, secondEpoch);
+  assert.equal(context.voiceCallPreparing, true, "the old call's finally is conditional on its epoch");
+});
+
+test("a late draft-call result cannot retarget a chat after hangup and navigation", async () => {
+  const start = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const end = source.indexOf("\n  const closeVoiceCallSurface = async", start);
+  assert.ok(start >= 0 && end > start);
+  let resolveDraft;
+  const modal = {
+    dataset: {}, setAttribute() {},
+    querySelector: () => ({ focus() {} }),
+  };
+  const recipient = {
+    dataset: { recipientId: "contact" },
+    querySelector: (selector) => selector === ".contact-avatar"
+      ? null : ({ textContent: "Contact" }),
+  };
+  const chatView = { dataset: { currentConversation: "default", conversationKind: "chat" } };
+  let conversationMutation = Promise.resolve();
+  let nativeSelection = "default";
+  const commands = [];
+  let refreshes = 0;
+  const context = {
+    voiceCallActive: false,
+    voiceCallPreparing: false,
+    voiceCallEpoch: null,
+    voiceCallActivityGuard: null,
+    voiceCallConversation: null,
+    voiceLatencyTrace: { mode: "call_greeting" },
+    conversationNavigationRevision: 0,
+    document: { getElementById: () => modal, querySelector: () => recipient },
+    clearPersistentVoiceCallFailure() {},
+    speechOperationToken: () => "op",
+    createVoiceCallActivityGuard: () => ({ ready: Promise.resolve(), clear: async () => {} }),
+    startVoiceLatency() {},
+    markVoiceLatency() {},
+    markVoiceLatencyIn() {},
+    startCallRinging: async () => true,
+    setModalVisibility() {}, setText() {},
+    suspendVoiceHistoryRecoveryForForeground: async () => async () => {},
+    runtimeWarmPromise: Promise.resolve({ ready: true }),
+    preparePcmWorklet: async () => {},
+    prepareCallMicrophoneStream: async () => ({ stream: { id: "old-mic" }, metrics: {} }),
+    releaseCallMicrophoneStream() {},
+    selectedConversation: () => chatView.dataset.currentConversation,
+    selectedConversationKind: () => "chat",
+    chat: () => chatView,
+    mutateConversationSelection(operation) {
+      const mutation = conversationMutation.catch(() => {}).then(operation);
+      conversationMutation = mutation.catch(() => {});
+      return mutation;
+    },
+    invoke: (command) => {
+      commands.push(command);
+      if (command === "mom_llama_conversation_draft_call_start") {
+        return new Promise((resolve) => {
+          resolveDraft = () => {
+            nativeSelection = "stale-draft";
+            resolve({ result: { id: "stale-draft", source_conversation_id: "contact" } });
+          };
+        });
+      }
+      if (command === "mom_llama_conversation_select") {
+        nativeSelection = "newly-selected-chat";
+        return Promise.resolve({ status: "passed" });
+      }
+      assert.fail(`unexpected native command ${command}`);
+    },
+    report() {},
+    setPersistentVoiceCallFailure() {},
+    errorMessage: (error) => error.message,
+    closeVoiceCallSurface: async () => {},
+    reportError: (error) => { throw error; },
+    performance: { now: () => 1 },
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.openCall = openVoiceCallSurface;`, context);
+  const opening = context.openCall();
+  for (let i = 0; i < 30 && !resolveDraft; i += 1) await Promise.resolve();
+  assert.equal(typeof resolveDraft, "function", "startup reached the deferred conversation creation");
+  context.conversationNavigationRevision += 1;
+  const navigation = context.mutateConversationSelection(
+    () => context.invoke("mom_llama_conversation_select", { conversation: "newly-selected-chat" }),
+  );
+  chatView.dataset.currentConversation = "newly-selected-chat";
+  resolveDraft();
+  await Promise.all([opening, navigation]);
+  assert.deepEqual(commands, ["mom_llama_conversation_draft_call_start", "mom_llama_conversation_select"]);
+  assert.equal(nativeSelection, "newly-selected-chat", "the serialized user navigation wins native selection");
+  assert.equal(chatView.dataset.currentConversation, "newly-selected-chat");
+});
+
+test("a draft call that finishes after hangup is published for the next call", async () => {
+  const start = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const end = source.indexOf("\n  const closeVoiceCallSurface = async", start);
+  assert.ok(start >= 0 && end > start);
+  let resolveDraft;
+  const modal = { dataset: {}, setAttribute() {}, querySelector: () => ({ focus() {} }) };
+  const recipient = {
+    dataset: { recipientId: "contact" },
+    querySelector: (selector) => selector === ".contact-avatar" ? null : ({ textContent: "Contact" }),
+  };
+  const chatView = { dataset: { currentConversation: "default", conversationKind: "chat" } };
+  let mutation = Promise.resolve();
+  let nativeSelection = "default";
+  const commands = [];
+  let refreshes = 0;
+  const context = {
+    voiceCallActive: false, voiceCallPreparing: false, voiceCallEpoch: null,
+    voiceCallActivityGuard: null, voiceCallConversation: null,
+    voiceLatencyTrace: { mode: "call_greeting" }, conversationNavigationRevision: 0,
+    document: { getElementById: () => modal, querySelector: () => recipient },
+    clearPersistentVoiceCallFailure() {}, speechOperationToken: () => "op",
+    createVoiceCallActivityGuard: () => ({ ready: Promise.resolve(), clear: async () => {} }),
+    startVoiceLatency() {}, markVoiceLatency() {}, markVoiceLatencyIn() {},
+    startCallRinging: async () => true, setModalVisibility() {}, setText() {},
+    suspendVoiceHistoryRecoveryForForeground: async () => async () => {},
+    runtimeWarmPromise: Promise.resolve({ ready: true }), preparePcmWorklet: async () => {},
+    prepareCallMicrophoneStream: async () => ({ stream: { id: "mic" }, metrics: {} }),
+    releaseCallMicrophoneStream() {},
+    prepareVoicePersonaForCall: async () => false,
+    refreshChat: async () => { refreshes += 1; },
+    selectedConversation: () => chatView.dataset.currentConversation,
+    selectedConversationKind: () => chatView.dataset.conversationKind,
+    chat: () => chatView,
+    mutateConversationSelection(operation) {
+      const next = mutation.catch(() => {}).then(operation);
+      mutation = next.catch(() => {});
+      return next;
+    },
+    invoke: (command) => {
+      commands.push(command);
+      if (command === "mom_llama_conversation_draft_call_start") {
+        return new Promise((resolve) => {
+          resolveDraft = () => {
+            nativeSelection = "materialized-chat";
+            resolve({ result: { id: "materialized-chat", source_conversation_id: "contact" } });
+          };
+        });
+      }
+      assert.fail(`unexpected native command ${command}`);
+    },
+    report() {}, setPersistentVoiceCallFailure() {}, errorMessage: (error) => error.message,
+    closeVoiceCallSurface: async () => {}, reportError: (error) => { throw error; },
+    performance: { now: () => 1 },
+  };
+  vm.createContext(context);
+  vm.runInContext(`${source.slice(start, end)}\nthis.openCall = openVoiceCallSurface;`, context);
+  const opening = context.openCall();
+  for (let i = 0; i < 30 && !resolveDraft; i += 1) await Promise.resolve();
+  assert.equal(typeof resolveDraft, "function");
+  context.voiceCallActive = false;
+  context.voiceCallEpoch = null;
+  context.voiceCallPreparing = false;
+  resolveDraft();
+  await opening;
+  assert.equal(nativeSelection, "materialized-chat");
+  assert.equal(chatView.dataset.currentConversation, "materialized-chat",
+    "native selection is reflected even though hangup canceled the call");
+  assert.equal(chatView.dataset.conversationKind, "chat");
+  assert.equal(refreshes, 1, "the canceled materialization refreshes the visible projection");
+
+  // A queued redial sees the materialized native selection inside its turn
+  // and does not issue a second draft creation.
+  await context.openCall();
+  assert.equal(context.voiceCallConversation, "materialized-chat");
+  assert.deepEqual(commands, ["mom_llama_conversation_draft_call_start"]);
 });
 
 test("call persona preparation stops when its epoch changes while native preparation is pending", async () => {
@@ -525,7 +1239,7 @@ for (const switchAt of ["persistence", "dispatch"]) {
       vm.createContext(context);
       const start = source.indexOf('  document.addEventListener("submit"');
       const end = start + source.slice(start).indexOf('\n  });') + 7;
-      vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nlet activeDispatchConversation = null;\nlet pendingVoiceDispatchPrompt = null;\nlet pendingVoiceTtsOwner = null;\n${source.slice(start, end)}\nthis.cancel = ${source.match(/"chat-cancel": (async \(\) =>[^\n]+)/)[1].replace(/,$/, "")};`, context);
+      vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nconst activeDispatchStreamLeaseOwners = new Map();\nlet activeDispatchConversation = null;\nlet activeDispatchOwner = null;\nlet pendingVoiceDispatchPrompt = null;\nlet pendingVoiceTtsOwner = null;\n${source.slice(start, end)}\nthis.cancel = ${source.match(/"chat-cancel": (async \(\) =>[^\n]+)/)[1].replace(/,$/, "")};`, context);
       await submit({ preventDefault() {}, target: form });
       assert.equal(drafts.get("B"), "precious B");
       assert.equal(textarea.value, "precious B");
@@ -562,14 +1276,19 @@ for (const outcome of ["blocked", "throw"]) {
   test(`native ${outcome} without a terminal event releases only this dispatch's stream leases`, async () => {
     let submit;
     const leases = new Set();
+    const leaseOwners = new Map();
     const released = [];
     const textarea = { value: "Hello" };
     const context = {
       document: { addEventListener: (_, handler) => { submit = handler; }, getElementById: () => null, querySelectorAll: () => [] },
       recipientMutation: Promise.resolve(), activeDispatchStreamLeases: leases,
+      activeDispatchStreamLeaseOwners: leaseOwners,
+      leaseOwners,
       autocompleteAccepting: false, cancelComposerAutocomplete() {},
       formValue: () => textarea.value, draftAttachmentIds: () => [],
-      acquireChatBusy: () => "dispatch", releaseChatBusy: (lease) => released.push(lease),
+      acquireChatBusy: () => "dispatch", releaseChatBusy: (lease) => {
+        released.push(lease); leases.delete(lease); leaseOwners.delete(lease);
+      },
       suspendVoiceHistoryRecoveryForForeground: async () => () => {},
       selectedConversation: () => "A", selectedConversationKind: () => "chat",
       formField: () => textarea, closeMentions() {}, appendLiveMessage() {}, sizeComposer() {},
@@ -578,6 +1297,7 @@ for (const outcome of ["blocked", "throw"]) {
       persistDraftNow: async () => {},
       invoke: async () => {
         leases.add("mention-request:failed:contact");
+        leaseOwners.set("mention-request:failed:contact", context.getOwner());
         if (outcome === "throw") throw new Error("rejected");
         return { status: "blocked" };
       },
@@ -585,7 +1305,7 @@ for (const outcome of ["blocked", "throw"]) {
     vm.createContext(context);
     const start = source.indexOf('  document.addEventListener("submit"');
     const end = start + source.slice(start).indexOf('\n  });') + 7;
-    vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nlet activeDispatchConversation = null;\nlet voiceReplyConversation = null;\nlet callReplyConversation = null;\nlet pendingVoiceDispatchPrompt = null;\nlet pendingVoiceTtsOwner = null;\n${source.slice(start, end)}`, context);
+    vm.runInContext(`const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");\nconst activeDispatchStreamLeaseOwners = leaseOwners;\nlet activeDispatchConversation = null;\nlet activeDispatchOwner = null;\nthis.getOwner = () => activeDispatchOwner;\nlet voiceReplyConversation = null;\nlet callReplyConversation = null;\nlet pendingVoiceDispatchPrompt = null;\nlet pendingVoiceTtsOwner = null;\n${source.slice(start, end)}`, context);
     await submit({ preventDefault() {}, target: { id: "chat-form", dataset: {} } });
     assert.deepEqual(released, ["mention-request:failed:contact", "dispatch"]);
     assert.equal(leases.size, 0);
@@ -633,6 +1353,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
     },
     recipientMutation: Promise.resolve(),
     activeDispatchStreamLeases: new Set(),
+    leaseOwners: new Map(),
     autocompleteAccepting: false,
     cancelComposerAutocomplete() {},
     formValue: () => "",
@@ -667,7 +1388,15 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   vm.runInContext(`
     ${helper}
     const isInternalVoicePrompt = (message) => message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
+    const activeDispatchStreamLeaseOwners = leaseOwners;
     let activeDispatchConversation = null;
+    let activeDispatchOwner = null;
+    this.replaceDispatchOwner = (owner, conversation) => {
+      activeDispatchOwner = owner;
+      activeDispatchConversation = conversation;
+    };
+    this.getOwner = () => activeDispatchOwner;
+    this.getConversation = () => activeDispatchConversation;
     let voiceReplyConversation = null;
     let callReplyConversation = null;
     let voiceReplyMessageId = null;
@@ -682,6 +1411,11 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   // The production listener is the unit under test; capture it from the mock document.
   assert.equal(typeof submit, "function");
   const submitted = submit({ preventDefault() {}, target: { id: "chat-form", dataset: {}, querySelector: () => null } });
+  assert.ok(context.getOwner(), "generic dispatch claims cleanup ownership synchronously at admission");
+  const replacementOwner = { mode: "call" };
+  context.replaceDispatchOwner(replacementOwner, "conversation-a");
+  context.activeDispatchStreamLeases.add("newer-chat-request");
+  context.leaseOwners.set("newer-chat-request", replacementOwner);
   await finishStarted;
   assert.deepEqual(indexed, [], "voice-note ASR waits while reply TTS is still active");
   assert.deepEqual(ordering, ["finish", "persist"], "audio publication starts without waiting for the UI row");
@@ -698,6 +1432,11 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
   }], "the committed assistant identity binds the completed reply audio");
   assert.deepEqual(ordering, ["finish", "persist", "index"], "backfill waits for audio publication");
   assert.ok(stages.some(([stage]) => stage === "tts_text_admitted"));
+  assert.equal(context.getOwner(), replacementOwner,
+    "an older generic submit cannot clear a newer greeting owner in the same chat");
+  assert.equal(context.getConversation(), "conversation-a");
+  assert.equal(context.activeDispatchStreamLeases.has("newer-chat-request"), true,
+    "an older submit releases only its own stream busy leases");
 });
 
 test("voice replies do not create an incoming card or expose streamed text", () => {

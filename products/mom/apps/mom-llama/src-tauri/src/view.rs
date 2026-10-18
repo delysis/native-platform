@@ -3,7 +3,7 @@ use maud::{Markup, PreEscaped, html};
 use mom_llama_runtime::{
     AttachmentKind, AttachmentRecord, Blocker, CommandResult, Conversation, ConversationKind,
     DraftMessage, MentionToolApprovalState, MentionToolEffectOutcome, Message, MessageRole,
-    Settings, engine::EngineCheckOutput, models::ModelInfo,
+    Settings, models::ModelInfo,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1430,7 +1430,6 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
         let _ = mom_llama_runtime::conversation_resume_existing_for_empty_draft()?;
     }
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status(scope)?;
     let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let models = mom_llama_runtime::model_list(scope)?;
@@ -1445,7 +1444,6 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let recipients = mom_llama_runtime::conversation_draft_recipients()?;
     Ok(app_markup(AppProjection {
         settings: &settings,
-        engine: &engine,
         conversations: &conversations,
         personas: &personas,
         models: &models,
@@ -1456,9 +1454,8 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     .into_string())
 }
 
-pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
+pub fn render_chat_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status(scope)?;
     // The chat composer does not render the model catalog. Discovering models
     // here walked the full Hugging Face cache on every conversation switch.
     // Settings owns the model picker and refreshes independently after paint.
@@ -1483,7 +1480,6 @@ pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result
     let recipients = mom_llama_runtime::conversation_draft_recipients()?;
     Ok(chat_view_with_draft(
         &settings,
-        &engine,
         &models,
         active.as_ref(),
         Some(&draft),
@@ -1512,7 +1508,6 @@ pub fn render_settings_fragment(scope: &mom_llama_runtime::OperationScope) -> Re
 
 struct AppProjection<'a> {
     settings: &'a CommandResult<Settings>,
-    engine: &'a CommandResult<EngineCheckOutput>,
     conversations: &'a CommandResult<Vec<Conversation>>,
     personas: &'a StoreProjection<Vec<Conversation>>,
     models: &'a CommandResult<Vec<ModelInfo>>,
@@ -1524,7 +1519,6 @@ struct AppProjection<'a> {
 fn app_markup(projection: AppProjection<'_>) -> Markup {
     let AppProjection {
         settings,
-        engine,
         conversations,
         personas,
         models,
@@ -1573,7 +1567,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
                     (button("voice.call.open", Some("voice-call-open"), "icon-button voice-call-toggle", false))
                 }
             }
-            (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft), personas, recipients))
+            (chat_view_with_draft(settings, models, active.as_ref(), Some(draft), personas, recipients))
             (settings_sidebar(settings, models, personas, active.as_ref()))
             (conversation_rename_modal())
             (persona_freeze_modal())
@@ -1615,7 +1609,6 @@ fn resize_direction_class(direction: &str) -> &'static str {
 
 fn chat_view_with_draft(
     settings: &CommandResult<Settings>,
-    engine: &CommandResult<impl Serialize>,
     models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
@@ -1773,7 +1766,7 @@ fn chat_view_with_draft(
                     }
                 }
             }
-            (composer(engine, settings, models, active, draft, &attachments))
+            (composer(settings, models, active, draft, &attachments))
         }
     }
 }
@@ -2058,14 +2051,13 @@ fn sidebar(
 }
 
 fn composer(
-    engine: &CommandResult<impl Serialize>,
     settings: &CommandResult<Settings>,
     _models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
     attachments: &[AttachmentRecord],
 ) -> Markup {
-    let readiness = conversation_model_readiness(engine, active, settings);
+    let readiness = conversation_model_readiness(active, settings);
     let draft = draft.and_then(|draft| draft.result.as_ref());
     // Voice dispatch uses a transient stored draft to bind captured audio to
     // the model turn.  It is protocol state, never user-authored composer
@@ -4168,7 +4160,6 @@ struct ConversationModelReadiness {
 }
 
 fn conversation_model_readiness(
-    engine: &CommandResult<impl Serialize>,
     active: Option<&Conversation>,
     settings: &CommandResult<Settings>,
 ) -> ConversationModelReadiness {
@@ -4184,21 +4175,9 @@ fn conversation_model_readiness(
             label: blocked.blocker.message,
         };
     }
-    let global_matches = settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.model_path.as_deref())
-        == Some(path);
-    if engine.status == "host_integrated" && global_matches {
-        ConversationModelReadiness {
-            enabled: true,
-            label: "Send".to_string(),
-        }
-    } else {
-        ConversationModelReadiness {
-            enabled: true,
-            label: "Send; the selected model will load first".to_string(),
-        }
+    ConversationModelReadiness {
+        enabled: true,
+        label: "Send".to_string(),
     }
 }
 
@@ -5348,15 +5327,6 @@ mod tests {
 
     #[test]
     fn composer_renders_staged_draft_attachments_as_compact_removable_chips() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let settings = CommandResult::passed(
             "mom_llama.settings_get",
             "contracted",
@@ -5385,15 +5355,7 @@ mod tests {
             attachment_record("image", "", "garden.png", AttachmentKind::Image),
         ];
         let models = empty_models();
-        let html = composer(
-            &engine,
-            &settings,
-            &models,
-            None,
-            Some(&draft),
-            &attachments,
-        )
-        .into_string();
+        let html = composer(&settings, &models, None, Some(&draft), &attachments).into_string();
         assert!(html.contains(r#"id="composer-attachments" class="composer-attachments""#));
         assert!(html.contains(r#"data-staged-attachment-id="image""#));
         assert!(html.contains(r#"data-staged-attachment-id="notes""#));
@@ -5405,15 +5367,6 @@ mod tests {
 
     #[test]
     fn internal_voice_and_call_drafts_never_project_into_the_composer() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let settings = CommandResult::passed(
             "mom_llama.settings_get",
             "contracted",
@@ -5453,7 +5406,6 @@ mod tests {
                 false,
             );
             let html = composer(
-                &engine,
                 &settings,
                 &models,
                 None,
@@ -5497,7 +5449,6 @@ mod tests {
             false,
         );
         let stale_html = composer(
-            &engine,
             &settings,
             &models,
             None,
@@ -5523,15 +5474,7 @@ mod tests {
             false,
             false,
         );
-        let html = composer(
-            &engine,
-            &settings,
-            &models,
-            None,
-            Some(&ordinary),
-            &[attachment],
-        )
-        .into_string();
+        let html = composer(&settings, &models, None, Some(&ordinary), &[attachment]).into_string();
         assert!(!html.contains("data-internal-voice-draft"));
         assert!(html.contains("Please summarize this recording"));
         assert!(html.contains(r#"data-staged-attachment-id="voice-clip""#));
@@ -5540,15 +5483,6 @@ mod tests {
 
     #[test]
     fn composer_projects_the_conversation_model_in_runtime_precedence_order() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "configured",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let mut settings_value = Settings::defaults_for_data_dir(std::env::temp_dir());
         settings_value.model_path = Some(PathBuf::from("/models/global-default-Q8_0.gguf"));
         settings_value
@@ -5576,7 +5510,7 @@ mod tests {
         );
         let models = empty_models();
         let profile_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!profile_html.contains("Conversation model"));
         assert!(!profile_html.contains("frozen-profile-Q4_K_M"));
         assert!(!profile_html.contains("legacy-selected-Q5_K_M"));
@@ -5591,7 +5525,7 @@ mod tests {
             Some(Path::new("/models/legacy-selected-Q5_K_M.gguf"))
         );
         let selected_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!selected_html.contains("legacy-selected-Q5_K_M"));
         assert!(!selected_html.contains("global-default-Q8_0"));
 
@@ -5601,7 +5535,7 @@ mod tests {
             Some(Path::new("/models/global-default-Q8_0.gguf"))
         );
         let default_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!default_html.contains("global-default-Q8_0"));
 
         conversation.execution_profile.model_path = Some(PathBuf::from("   "));
@@ -5635,35 +5569,20 @@ mod tests {
         let mut conversation =
             test_conversation("chat", "Chat", ConversationKind::Chat, Vec::new());
         conversation.execution_profile.model_path = Some(conversation_model.clone());
-        let blocked_global: CommandResult<Value> = CommandResult::blocked(
-            "mom_llama.engine_check",
-            "blocked_missing_model",
-            Blocker::new("model_path_missing", "No global model", Vec::new()),
-        );
-
-        let configured =
-            conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        let configured = conversation_model_readiness(Some(&conversation), &settings);
         assert!(configured.enabled);
-        assert_eq!(configured.label, "Send; the selected model will load first");
+        assert_eq!(configured.label, "Send");
         let models = empty_models();
-        let html = composer(
-            &blocked_global,
-            &settings,
-            &models,
-            Some(&conversation),
-            None,
-            &[],
-        )
-        .into_string();
+        let html = composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!html.contains("runtime-dot"));
         assert!(html.contains(r#"class="send-button voice-message-button""#));
-        assert!(html.contains("Send; the selected model will load first"));
+        assert!(html.contains(r#"title="Send""#));
         assert!(html.contains(r#"data-model-ready="true""#));
         assert!(!html.contains(r#"data-model-ready="true" disabled"#));
 
         conversation.execution_profile.model_path =
             Some(directory.join("missing-conversation.gguf"));
-        let missing = conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        let missing = conversation_model_readiness(Some(&conversation), &settings);
         assert!(!missing.enabled);
         assert_eq!(missing.label, "That model file is no longer available.");
 
@@ -5679,20 +5598,32 @@ mod tests {
             false,
         );
         conversation.execution_profile.model_path = Some(conversation_model);
-        let loaded_engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
-        let loaded =
-            conversation_model_readiness(&loaded_engine, Some(&conversation), &loaded_settings);
+        let loaded = conversation_model_readiness(Some(&conversation), &loaded_settings);
         assert!(loaded.enabled);
         assert_eq!(loaded.label, "Send");
         std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_fragment_uses_configured_readiness_without_native_residency() -> Result<()> {
+        let data_dir = tempfile::tempdir()?;
+        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+            data_dir.path().to_path_buf(),
+        ));
+        let model_path = data_dir.path().join("configured.gguf");
+        std::fs::write(&model_path, b"test model placeholder")?;
+        mom_llama_runtime::settings_update(mom_llama_runtime::config::SettingsUpdate {
+            model_path: Some(Some(model_path)),
+            ..mom_llama_runtime::config::SettingsUpdate::default()
+        })?;
+        let rendered = render_chat_fragment();
+        mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+
+        let html = rendered?;
+        assert!(html.contains(r#"class="send-button voice-message-button""#));
+        assert!(html.contains(r#"data-model-ready="true""#));
+        assert!(!html.contains("runtime-dot"));
         Ok(())
     }
 

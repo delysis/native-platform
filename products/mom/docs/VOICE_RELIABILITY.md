@@ -152,6 +152,31 @@ rendered/model projections. Older session-only recordings cannot be recovered
 from their text: show an unavailable voice bubble rather than silently replacing
 the note with text or claiming a regenerated recording is the original.
 
+## Call startup, hangup and navigation
+
+Hangup releases the visible call and its startup ownership before native stop
+acknowledgements settle. A delayed microphone permission result, audio-context
+resume, greeting completion or startup failure belongs to its original call
+epoch. It cannot publish into a later call, release that call's microphone,
+clear its dispatch ownership or retarget the selected chat. Expected late
+cancellation is silent. Genuine startup failures remain dismissible and visible
+until dismissal or retry, with the failed stage recorded in latency diagnostics.
+
+Chat rendering checks model configuration without querying resident slots.
+The shared native client holds its state lock during model acquisition; a
+resident-status query in the render path therefore makes chat switching wait
+behind loading. Explicit engine diagnostics still query actual residency.
+Configured readiness does not claim that a model has loaded or passed inference.
+
+Regression checks hold startup and teardown promises open across hangup,
+navigation and redial, and verify that stale completions preserve the new owner.
+These checks do not establish pickup on another Mac. In-flight native persona
+preparation currently has no per-call cancellation handle and can continue
+after hangup; its revision-conditional imports and prefills must not overwrite
+newer generation. Keep cache preparation until an alternative proves equivalent
+resident and persisted prefix reuse, rather than exchanging a startup wait for
+uncached prompt processing.
+
 ## Sentence prosody and streaming PCM continuity
 
 Sentence-level text admission and PCM startup buffering are separate decisions.

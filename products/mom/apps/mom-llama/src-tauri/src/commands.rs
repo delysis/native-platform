@@ -153,9 +153,8 @@ pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Resp
 pub fn mom_llama_render_chat_fragment(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Response, String> {
-    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_render_chat_fragment"))?;
-    markup_response(crate::view::render_chat_fragment(&scope))
+    markup_response(crate::view::render_chat_fragment())
 }
 
 #[tauri::command]

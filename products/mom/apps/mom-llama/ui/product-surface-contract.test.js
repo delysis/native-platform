@@ -520,7 +520,7 @@ test("call starts ringing immediately while preparation remains cancellation gua
   const activityStart = call.indexOf("createVoiceCallActivityGuard(speechOperationToken())");
   const activityReady = call.indexOf("await activityGuard.ready");
   const warm = call.indexOf('runtimeWarmPromise.then');
-  const microphone = call.indexOf('prepareCallMicrophoneStream()');
+  const microphone = call.indexOf('prepareCallMicrophoneStream(epoch)');
   const visibleRinging = call.indexOf('modal.dataset.callState = "ringing"');
   const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
   const ringStart = call.indexOf("const ringingReady = startCallRinging(epoch)");
@@ -643,11 +643,11 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(open.includes("startCallRinging(epoch)"));
   assert.ok(!open.includes("await startCallRinging(epoch)"));
   assert.ok(open.includes("startStreamedCallGreeting(epoch, conversation)"));
-  assert.ok(open.includes("await prepareCallMicrophoneStream()"));
+  assert.ok(open.includes("await prepareCallMicrophoneStream(epoch)"));
   assert.ok(
     open.indexOf("const ringingReady = startCallRinging(epoch)")
       < open.indexOf("await activityGuard.ready")
-      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream()"),
+      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "ringing starts on the user gesture while microphone and model setup remain guarded",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
@@ -655,17 +655,17 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(!/if\s*\(warm\.status/.test(open), "opportunistic startup status must not decide call admission");
   assert.ok(
     open.indexOf("const warmReady = runtimeWarmPromise.then((warm) => {")
-      < open.indexOf("await prepareCallMicrophoneStream()"),
+      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "resident readiness must be observed concurrently with microphone admission",
   );
   assert.ok(
     open.indexOf("void preparePcmWorklet(24_000);")
-      < open.indexOf("await prepareCallMicrophoneStream()"),
+      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "the PCM renderer must warm under the required microphone readiness wait",
   );
   assert.ok(open.includes("await prepareVoicePersonaForCall(conversation, epoch)"));
   assert.ok(bridge.includes("!response?.result?.audio_projector_warmed"), "exact call preparation must require the selected encoder before greeting");
-  assert.ok(open.includes('markVoiceLatency("call_runtime_ready", warm)'));
+  assert.ok(open.includes('markVoiceLatencyIn(startupTrace, "call_runtime_ready", warm)'));
   assert.ok(!bridge.includes("playPreparedCallSpeech"));
   assert.ok(!bridge.includes("activeCallSpeech"));
   assert.ok(!greeting.includes('invoke("mom_llama_speech_precommit_synthesize"'));

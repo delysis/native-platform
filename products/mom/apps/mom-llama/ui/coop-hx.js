@@ -136,6 +136,10 @@
 
   const report = (value) => {
     recordCommandResult(value);
+    if (persistentVoiceCallFailure) {
+      renderPersistentVoiceCallFailure();
+      return;
+    }
     const status = document.getElementById("command-status");
     if (status) {
       window.clearTimeout(status.hideTimer);
@@ -167,6 +171,41 @@
   const errorMessage = (error) => (
     error && error.message ? error.message : String(error)
   );
+
+  let persistentVoiceCallFailure = null;
+  const renderPersistentVoiceCallFailure = () => {
+    const status = document.getElementById("command-status");
+    if (!status || !persistentVoiceCallFailure) return;
+    window.clearTimeout(status.hideTimer);
+    const message = document.createElement("span");
+    message.textContent = persistentVoiceCallFailure.message;
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "command-status-dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", () => {
+      persistentVoiceCallFailure = null;
+      report(null);
+    }, { once: true });
+    status.replaceChildren(message, dismiss);
+    status.classList.add("blocked");
+    status.classList.remove("is-hidden");
+    delete status.hideTimer;
+  };
+  const setPersistentVoiceCallFailure = (message) => {
+    persistentVoiceCallFailure = { message: String(message) };
+    renderPersistentVoiceCallFailure();
+  };
+  const clearPersistentVoiceCallFailure = () => {
+    if (!persistentVoiceCallFailure) return;
+    persistentVoiceCallFailure = null;
+    report(null);
+  };
+  const safeVoiceFailureCode = (error) => {
+    const value = typeof error?.code === "string" ? error.code : "";
+    return /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,79}$/.test(value) ? value : "startup_error";
+  };
 
   const visiblyReportedErrors = new WeakSet();
   const reportError = (error) => {
@@ -2462,6 +2501,7 @@
       onFailure: (error) => { greetingFailure = error; },
     });
     liveVoiceTts = tts;
+    activeDispatchOwner = tts;
     try {
       // The instantiated conversation already owns the selected Persona's
       // system prompt and model profile. Sending directly avoids re-routing
@@ -2519,17 +2559,27 @@
       }
       throw error;
     } finally {
-      if (activeDispatchConversation === conversation) activeDispatchConversation = null;
-      if (callReplyConversation === conversation) callReplyConversation = null;
+      // A later call can use the same conversation while this request is
+      // settling after hang-up. Conversation identity alone cannot prove that
+      // these shared dispatch slots still belong to this greeting.
+      if (activeDispatchOwner === tts) {
+        activeDispatchOwner = null;
+        if (activeDispatchConversation === conversation) activeDispatchConversation = null;
+        if (callReplyConversation === conversation) callReplyConversation = null;
+      }
     }
   };
 
-  const prepareCallMicrophoneStream = async () => {
-    if (voiceCallCaptureGraph?.context?.state !== "closed"
+  const prepareCallMicrophoneStream = async (epoch) => {
+    const isCurrentCall = () => voiceCallActive && voiceCallEpoch === epoch;
+    if (!isCurrentCall()) throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+    if (voiceCallMicrophoneEpoch === epoch
+        && voiceCallCaptureGraph?.context?.state !== "closed"
         && voiceCallMicrophoneStream?.active
         && voiceCallMicrophoneStream.getAudioTracks().some((track) => track.readyState === "live")) {
-      return { reused: true };
+      return { metrics: { reused: true }, stream: voiceCallMicrophoneStream };
     }
+    if (voiceCallMicrophoneStream) releaseCallMicrophoneStream(voiceCallMicrophoneStream);
     const startedAt = performance.now();
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -2539,32 +2589,66 @@
         autoGainControl: true,
       },
     });
+    if (!isCurrentCall()) {
+      stream.getTracks().forEach((candidate) => candidate.stop());
+      throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+    }
     const track = stream.getAudioTracks()[0];
     if (!track || track.readyState !== "live") {
       stream.getTracks().forEach((candidate) => candidate.stop());
       throw new Error("The microphone did not become ready for the call.");
     }
     voiceCallMicrophoneStream = stream;
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
-    const processor = context.createScriptProcessor(256, 1, 1);
-    const silence = context.createGain();
-    silence.gain.value = 0;
-    source.connect(processor);
-    processor.connect(silence);
-    silence.connect(context.destination);
-    await context.resume();
-    voiceCallCaptureGraph = { context, source, processor, silence, stream };
+    voiceCallMicrophoneEpoch = epoch;
+    let context = null;
+    let source = null;
+    let processor = null;
+    let silence = null;
+    try {
+      context = new AudioContext();
+      source = context.createMediaStreamSource(stream);
+      processor = context.createScriptProcessor(256, 1, 1);
+      silence = context.createGain();
+      silence.gain.value = 0;
+      // Publish the complete graph before connecting or resuming. Any failure
+      // below can then use the same identity-guarded teardown as hang-up.
+      voiceCallCaptureGraph = { context, source, processor, silence, stream };
+      source.connect(processor);
+      processor.connect(silence);
+      silence.connect(context.destination);
+      await context.resume();
+      if (!isCurrentCall() || voiceCallMicrophoneStream !== stream) {
+        throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+      }
+    } catch (error) {
+      if (voiceCallCaptureGraph?.stream === stream) {
+        releaseCallMicrophoneStream(stream);
+      } else {
+        source?.disconnect();
+        processor?.disconnect();
+        silence?.disconnect();
+        void context?.close?.().catch(() => {});
+        stream.getTracks().forEach((candidate) => candidate.stop());
+        if (voiceCallMicrophoneStream === stream) {
+          voiceCallMicrophoneStream = null;
+          voiceCallMicrophoneEpoch = null;
+        }
+      }
+      throw error;
+    }
     const settings = track.getSettings?.() || {};
     return {
-      reused: false,
-      permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
-      source_rate_hz: settings.sampleRate || null,
-      echo_cancellation: settings.echoCancellation ?? null,
-      noise_suppression: settings.noiseSuppression ?? null,
-      auto_gain_control: settings.autoGainControl ?? null,
-      graph_rate_hz: context.sampleRate,
-      graph_state: context.state,
+      stream,
+      metrics: {
+        reused: false,
+        permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
+        source_rate_hz: settings.sampleRate || null,
+        echo_cancellation: settings.echoCancellation ?? null,
+        noise_suppression: settings.noiseSuppression ?? null,
+        auto_gain_control: settings.autoGainControl ?? null,
+        graph_rate_hz: context.sampleRate,
+        graph_state: context.state,
+      },
     };
   };
 
@@ -2573,6 +2657,7 @@
     const graph = voiceCallCaptureGraph;
     voiceCallCaptureGraph = null;
     voiceCallMicrophoneStream = null;
+    voiceCallMicrophoneEpoch = null;
     if (graph) {
       graph.processor.onaudioprocess = null;
       graph.source.disconnect();
@@ -2587,6 +2672,8 @@
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
     if (!modal || !recipient || voiceCallActive || voiceCallPreparing) return;
+    clearPersistentVoiceCallFailure();
+    const startupNavigationRevision = conversationNavigationRevision;
     const recipientId = recipient.dataset.recipientId || "";
     if (!recipientId) {
       reportError(new Error("The selected contact is unavailable for voice preparation."));
@@ -2607,6 +2694,9 @@
     voiceCallConversation = null;
     let releaseHistoryRecovery = null;
     startVoiceLatency("call_greeting", "call_requested");
+    const startupTrace = voiceLatencyTrace;
+    let startupPhase = "activity_guard";
+    let startupMicrophoneStream = null;
     const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
     const sourceAvatar = recipient.querySelector(".contact-avatar");
     const targetAvatar = modal.querySelector("#voice-call-avatar");
@@ -2639,10 +2729,11 @@
       const activityGuardWaitStartedAt = performance.now();
       markVoiceLatency("call_activity_guard_wait_started");
       await activityGuard.ready;
-      markVoiceLatency("call_activity_guard_ready", {
+      markVoiceLatencyIn(startupTrace, "call_activity_guard_ready", {
         wait_ms: Math.max(0, Math.round(performance.now() - activityGuardWaitStartedAt)),
       });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      startupPhase = "ringing";
       const ringResult = await ringingReady;
       if (ringResult.error) throw ringResult.error;
       if (!ringResult.started || voiceCallEpoch !== epoch || !voiceCallActive) return;
@@ -2650,9 +2741,10 @@
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
       const recoverySuspendWaitStartedAt = performance.now();
+      startupPhase = "history_recovery";
       markVoiceLatency("call_history_recovery_suspend_wait_started");
       releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
-      markVoiceLatency("call_history_recovery_suspend_wait_finished", {
+      markVoiceLatencyIn(startupTrace, "call_history_recovery_suspend_wait_finished", {
         wait_ms: Math.max(0, Math.round(performance.now() - recoverySuspendWaitStartedAt)),
       });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
@@ -2662,73 +2754,131 @@
       // time to model startup and put Web Audio initialization back on the
       // first-PCM path.
       const warmReady = runtimeWarmPromise.then((warm) => {
-        if (voiceLatencyTrace?.mode === "call_greeting") {
-          markVoiceLatency("call_runtime_ready", warm);
+        if (voiceCallEpoch === epoch && voiceCallActive
+            && voiceLatencyTrace?.mode === "call_greeting") {
+          markVoiceLatencyIn(startupTrace, "call_runtime_ready", warm);
         }
         return warm;
       });
       void preparePcmWorklet(24_000);
+      startupPhase = "microphone";
       // Permission and a live input route are prerequisites for a call. Keep
       // this exact stream for the whole call so WebKit can continuously apply
       // acoustic echo cancellation while contact audio is playing.
-      const microphone = await prepareCallMicrophoneStream();
+      const preparedMicrophone = await prepareCallMicrophoneStream(epoch);
+      startupMicrophoneStream = preparedMicrophone.stream;
       if (voiceCallEpoch !== epoch || !voiceCallActive) {
-        releaseCallMicrophoneStream();
+        releaseCallMicrophoneStream(startupMicrophoneStream);
         return;
       }
-      markVoiceLatency("call_microphone_ready", microphone);
+      markVoiceLatency("call_microphone_ready", preparedMicrophone.metrics);
       // A cold local engine is still preparation, not a ringing contact.
       // Keep measuring the entire request-to-playback interval; do not hide
       // initialization time by redefining the latency clock at readiness.
+      startupPhase = "runtime_warm";
       await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Startup is opportunistic and can be superseded by foreground model
       // selection. The exact conversation preparation below owns call readiness
       // and warms its own audio encoder; a stale startup failure is not final.
       let conversation = selectedConversation();
+      startupPhase = "conversation";
       if (conversation === "default") {
-        const started = await invoke("mom_llama_conversation_draft_call_start");
-        report(started);
-        if (started?.status === "blocked" || !started?.result?.id) {
-          throw new Error(started?.blocker?.message || "The call could not start.");
+        const started = await mutateConversationSelection(() => {
+          if (voiceCallEpoch !== epoch || !voiceCallActive
+              || conversationNavigationRevision !== startupNavigationRevision) return null;
+          const current = selectedConversation();
+          if (current !== "default") return { existingConversation: current };
+          return invoke("mom_llama_conversation_draft_call_start").then(async (result) => {
+            // Draft creation changes native selection. Publish that selection
+            // before releasing the serialized mutation, even if hang-up won
+            // while native work was pending. A queued redial then reuses it.
+            if (conversationNavigationRevision === startupNavigationRevision
+                && result?.status !== "blocked" && result?.result?.id
+                && result.result.source_conversation_id === recipientId) {
+              chat().dataset.currentConversation = result.result.id;
+              chat().dataset.conversationKind = "chat";
+              if (!voiceCallActive && voiceCallEpoch !== epoch) await refreshChat();
+            }
+            return result;
+          });
+        });
+        if (conversationNavigationRevision !== startupNavigationRevision) return;
+        if (started?.existingConversation) {
+          conversation = started.existingConversation;
+        } else {
+          if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+          report(started);
+          if (started?.status === "blocked" || !started?.result?.id) {
+            throw new Error(started?.blocker?.message || "The call could not start.");
+          }
+          if (started.result.source_conversation_id !== recipientId) {
+            throw new Error("The selected contact changed before the call began.");
+          }
+          conversation = started.result.id;
         }
-        if (started.result.source_conversation_id !== recipientId) {
-          throw new Error("The selected contact changed before the call began.");
-        }
-        conversation = started.result.id;
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
       } else if (selectedConversationKind() === "persona_template") {
-        const instantiated = await instantiatePersona(conversation);
-        if (instantiated?.status === "blocked" || !instantiated?.result?.id) {
-          throw new Error(instantiated?.blocker?.message || "The call could not start.");
+        const instantiated = await mutateConversationSelection(() => {
+          if (voiceCallEpoch !== epoch || !voiceCallActive
+              || conversationNavigationRevision !== startupNavigationRevision) return null;
+          const current = selectedConversation();
+          if (current !== conversation || selectedConversationKind() !== "persona_template") {
+            return { existingConversation: current };
+          }
+          return invoke("mom_llama_persona_instantiate", { persona: conversation, title: null }).then(async (result) => {
+            if (conversationNavigationRevision === startupNavigationRevision
+                && result?.status !== "blocked" && result?.result?.id) {
+              chat().dataset.currentConversation = result.result.id;
+              chat().dataset.conversationKind = "chat";
+              if (!voiceCallActive && voiceCallEpoch !== epoch) await refreshChat();
+            }
+            return result;
+          });
+        });
+        if (conversationNavigationRevision !== startupNavigationRevision) return;
+        if (instantiated?.existingConversation) {
+          conversation = instantiated.existingConversation;
+        } else {
+          if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+          report(instantiated);
+          if (instantiated?.status === "blocked" || !instantiated?.result?.id) {
+            throw new Error(instantiated?.blocker?.message || "The call could not start.");
+          }
+          conversation = instantiated.result.id;
         }
-        conversation = instantiated.result.id;
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
       }
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       voiceCallConversation = conversation;
       markVoiceLatency("call_conversation_ready", { conversation });
       // Use the actual frozen call profile. It may differ from its source contact.
+      startupPhase = "persona_prepare";
       const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
       if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // The first model reply uses the same token -> TTS -> PCM buffer as every
       // later call turn. Its first PCM frame stops ringing; playback startup
       // opens continuous listening, while model attachment waits until Qwen
       // has finished producing PCM.
+      startupPhase = "greeting_generation";
       await startStreamedCallGreeting(epoch, conversation);
     } catch (error) {
       if (epoch && voiceCallEpoch === epoch) {
+        markVoiceLatency("call_start_failed", {
+          phase: startupPhase,
+          error_code: safeVoiceFailureCode(error),
+        });
+        setPersistentVoiceCallFailure(errorMessage(error));
         const closing = closeVoiceCallSurface();
         reportError(error);
         await closing;
       } else {
-        releaseCallMicrophoneStream();
+        releaseCallMicrophoneStream(startupMicrophoneStream);
+        // Rejections caused by a completed hang-up are expected cancellation.
+        // Returning here keeps the delegated click handler from displaying a
+        // second, misleading error after the call has already closed.
+        return;
       }
-      throw error;
     } finally {
-      voiceCallPreparing = false;
+      if (voiceCallEpoch === epoch) voiceCallPreparing = false;
       releaseHistoryRecovery?.();
     }
   };
@@ -2747,9 +2897,14 @@
     );
     voiceCallActive = false;
     voiceCallEpoch = null;
+    voiceCallPreparing = false;
     voiceCallConversation = null;
     retryCallPrefillAfterTranscript = null;
     voiceReplyConversation = null;
+    if (cancelGeneration && activeDispatchConversation === conversation) {
+      activeDispatchConversation = null;
+      activeDispatchOwner = null;
+    }
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
     activeCallPlayback = null;
@@ -4034,6 +4189,7 @@
   };
 
   let activeDispatchConversation = null;
+  let activeDispatchOwner = null;
   let voiceRecording = null;
   let voiceReplyConversation = null;
   let voiceReplyMessageId = null;
@@ -4048,6 +4204,7 @@
   let retryCallPrefillAfterTranscript = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
+  let voiceCallMicrophoneEpoch = null;
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
   let pendingVoiceDispatchPrompt = null;
@@ -4070,6 +4227,7 @@
   const voiceLatencyHistory = [];
   let voiceLatencyFlushTimer = null;
   const activeDispatchStreamLeases = new Set();
+  const activeDispatchStreamLeaseOwners = new Map();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
@@ -5033,7 +5191,7 @@
     "playback_packet_admitted",
   ]);
   const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
-    "call_requested", "call_ringing_started", "call_activity_guard_wait_started",
+    "call_requested", "call_start_failed", "call_ringing_started", "call_activity_guard_wait_started",
     "call_activity_guard_ready", "call_history_recovery_suspend_wait_started",
     "call_history_recovery_suspend_wait_finished", "call_conversation_ready",
     "audio_prefill_begin_requested", "audio_prefill_session_ready",
@@ -8158,9 +8316,12 @@
     if (recording.speculation === speculation) recording.speculation = null;
     if (activeVoiceSpeculation === speculation) activeVoiceSpeculation = null;
     if (liveVoiceTts === speculation.tts) liveVoiceTts = null;
-    if (activeDispatchConversation === speculation.conversation) activeDispatchConversation = null;
-    if (callReplyConversation === speculation.conversation) callReplyConversation = null;
-    if (voiceReplyConversation === speculation.conversation) voiceReplyConversation = null;
+    if (activeDispatchOwner === speculation.tts) {
+      activeDispatchOwner = null;
+      if (activeDispatchConversation === speculation.conversation) activeDispatchConversation = null;
+      if (callReplyConversation === speculation.conversation) callReplyConversation = null;
+      if (voiceReplyConversation === speculation.conversation) voiceReplyConversation = null;
+    }
     if (replacement && !recording.native && voiceRecording === recording) {
       try {
         resumeBrowserVoicePrefill(recording, replacement);
@@ -8502,6 +8663,7 @@
     if (recording.call) callReplyConversation = live.conversation;
     else voiceReplyConversation = live.conversation;
     activeDispatchConversation = live.conversation;
+    activeDispatchOwner = tts;
     markVoiceLatencyIn(recording.trace, prearm ? "speculation_prearmed" : "speculation_started", {
       speculation: speculation.id,
       producer: recording.native ? "native_ring" : "renderer_ipc",
@@ -8620,10 +8782,11 @@
       // All speculative attempts for one call share a conversation. Do not
       // let a superseded attempt clear the routing markers published by its
       // replacement after a resumed-speech handoff.
-      const stillOwnsDispatch = recording.speculation === speculation || liveVoiceTts === tts;
+      const stillOwnsDispatch = activeDispatchOwner === tts;
       if (stillOwnsDispatch && activeDispatchConversation === live.conversation) {
         activeDispatchConversation = null;
       }
+      if (stillOwnsDispatch) activeDispatchOwner = null;
       if (stillOwnsDispatch && callReplyConversation === live.conversation) {
         callReplyConversation = null;
       }
@@ -8762,7 +8925,10 @@
   const acquireStableChatBusy = (lease) => {
     if (!lease) return null;
     chatBusyLeases.add(lease);
-    if (activeDispatchConversation !== null) activeDispatchStreamLeases.add(lease);
+    if (activeDispatchConversation !== null) {
+      activeDispatchStreamLeases.add(lease);
+      activeDispatchStreamLeaseOwners.set(lease, activeDispatchOwner);
+    }
     renderChatBusyState();
     return lease;
   };
@@ -8770,6 +8936,8 @@
   const releaseChatBusy = (lease) => {
     if (!lease) return;
     chatBusyLeases.delete(lease);
+    activeDispatchStreamLeases.delete(lease);
+    activeDispatchStreamLeaseOwners.delete(lease);
     renderChatBusyState();
   };
 
@@ -10425,8 +10593,12 @@
         // this, rapid Enter presses can race persona instantiation or draft
         // persistence and dispatch the same turn more than once.
         const dispatchLease = acquireChatBusy("chat-dispatch");
+        const dispatchOwner = {};
         const sourceConversation = selectedConversation();
         let conversation = sourceConversation;
+        let dispatchVoiceOwner = null;
+        activeDispatchConversation = sourceConversation;
+        activeDispatchOwner = dispatchOwner;
         const textarea = formField(form, "message");
         let releaseHistoryRecovery = null;
         try {
@@ -10462,7 +10634,9 @@
             chat().dataset.currentConversation = conversation;
             chat().dataset.conversationKind = "chat";
           }
-          activeDispatchConversation = conversation;
+          if (activeDispatchOwner === dispatchOwner) {
+            activeDispatchConversation = conversation;
+          }
           if (!voiceDispatch) {
             await persistDraftNow(message, attachmentIds, conversation);
           }
@@ -10489,6 +10663,7 @@
             && pendingVoiceTtsOwner?.conversation === conversation
             ? pendingVoiceTtsOwner
             : (voiceDispatch && liveVoiceTts?.conversation === conversation ? liveVoiceTts : null);
+          dispatchVoiceOwner = voiceTtsOwner;
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
           let voiceTranscriptAttachment = null;
@@ -10644,28 +10819,34 @@
             // destroyed the stream controller before its first audio frame.
             await Promise.all([refreshSidebar(), refreshConversationSettingsProjection()]);
           }
-          if (callReplyConversation === conversation) {
-            callReplyConversation = null;
-          }
-          if (voiceReplyConversation === conversation && result?.status !== "blocked") {
-            voiceReplyConversation = null;
-            const row = document.getElementById("live-voice-reply-pending");
-            if (row && voiceReplyMessageId) {
-              row.id = `message-${voiceReplyMessageId}`;
-              row.dataset.messageId = voiceReplyMessageId;
+          if (activeDispatchOwner === dispatchOwner) {
+            if (callReplyConversation === conversation) {
+              callReplyConversation = null;
             }
-            voiceReplyMessageId = null;
+            if (voiceReplyConversation === conversation && result?.status !== "blocked") {
+              voiceReplyConversation = null;
+              const row = document.getElementById("live-voice-reply-pending");
+              if (row && voiceReplyMessageId) {
+                row.id = `message-${voiceReplyMessageId}`;
+                row.dataset.messageId = voiceReplyMessageId;
+              }
+              voiceReplyMessageId = null;
+            }
           }
         } finally {
           // A rejected native batch can return without a terminal stream event
           // or an invocation result. Its started events must not strand Stop.
-          activeDispatchStreamLeases.forEach(releaseChatBusy);
-          activeDispatchStreamLeases.clear();
-          activeDispatchConversation = null;
-          if (voiceReplyConversation === conversation) voiceReplyConversation = null;
-          voiceReplyMessageId = null;
-          if (callReplyConversation === conversation) callReplyConversation = null;
-          if (pendingVoiceTtsOwner?.conversation === conversation) pendingVoiceTtsOwner = null;
+          [...activeDispatchStreamLeaseOwners]
+            .filter(([, owner]) => owner === dispatchOwner)
+            .forEach(([lease]) => releaseChatBusy(lease));
+          if (activeDispatchOwner === dispatchOwner) {
+            activeDispatchOwner = null;
+            if (activeDispatchConversation === conversation) activeDispatchConversation = null;
+            if (voiceReplyConversation === conversation) voiceReplyConversation = null;
+            voiceReplyMessageId = null;
+            if (callReplyConversation === conversation) callReplyConversation = null;
+            if (dispatchVoiceOwner && pendingVoiceTtsOwner === dispatchVoiceOwner) pendingVoiceTtsOwner = null;
+          }
           releaseChatBusy(dispatchLease);
           releaseHistoryRecovery?.();
         }
