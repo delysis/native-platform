@@ -22,7 +22,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_ATTEMPTS: usize = 3;
 const PROGRESS_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const PERSONA_MANIFEST_SHA256: &str =
-    "4c7b786b36c7b3643e7119e52b506d1e81178e3294246dbdd4c108e52deb47e1";
+    "96ab575695ff226beed0c5a5d7073ba72064929d7f0fffa13db8d4883c927cb0";
 
 #[derive(Clone, Copy, Debug)]
 struct Artifact {

@@ -2013,6 +2013,31 @@ mod tests {
     }
 
     #[test]
+    fn bundled_persona_references_pass_shared_speech_admission() {
+        let reference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|root| {
+                root.join("products/mom/apps/mom-llama/src-tauri/resources/speech-voices/qwen-icl")
+            })
+            .find(|root| root.join("manifest.json").is_file())
+            .expect("bundled Mom voice references");
+        let config = QwenIclConfig {
+            helper: PathBuf::new(),
+            model_dir: PathBuf::new(),
+            reference_root,
+        };
+        let entries = manifest_entries(&config);
+        assert!(!entries.is_empty(), "bundled voice manifest must parse");
+        for entry in &entries {
+            entry_is_admitted(&config, entry)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", entry.persona_id));
+        }
+        // Exercise the actual inventory route too: valid asset hashes alone
+        // cannot establish that synthesis will offer the selected voices.
+        assert_eq!(admitted_icl_references(&config).len(), entries.len());
+    }
+
+    #[test]
     fn cancelled_background_warm_never_waits_for_worker_admission() {
         let worker = Mutex::new(0_u8);
         let waiters = AtomicUsize::new(1);
