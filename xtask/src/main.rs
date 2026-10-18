@@ -73,11 +73,12 @@ fn check_workspace(root: &Path) -> Result<()> {
                     == BTreeSet::from([
                         "crates/services/attachment/fuzz",
                         "products/loom/signal",
+                        "vendor/pocket-tts/ptts",
                         "vendor/glib",
                         "vendor/ort-sys",
                     ])
             }),
-        "only Attachment fuzzing, the Signal SQLCipher worker, and patched external GLib/ort-sys may be excluded"
+        "only Attachment fuzzing, the Signal SQLCipher worker, vendored Pocket TTS, and patched external GLib/ort-sys may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))

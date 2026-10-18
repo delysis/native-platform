@@ -167,10 +167,12 @@ iterator tests run with optimization on Linux.
 The main Cargo workspace, Attachment fuzzing, and Signal SQLCipher worker each
 have a committed lock. The Signal graph has its own license/source policy and
 does not relax the main workspace's policy. Its upstream release tags resolve
-to exact commits in the lock; mutable branches are disallowed. External GLib and
-ort-sys patches are not first-party workspace members. External llama bindings
-use an exact Git revision. Historical migration receipts and seals do not gate
-ordinary changes.
+to exact commits in the lock; mutable branches are disallowed. The vendored
+Pocket TTS package is a path dependency excluded from first-party workspace
+membership; its dependency graph resolves through the main Cargo.lock. External
+GLib and ort-sys patches are not first-party workspace members. External llama
+bindings use an exact Git revision. Historical migration receipts and seals do
+not gate ordinary changes.
 
 macOS remains the product-acceptance target. Linux and Windows checks establish
 only their executed capabilities. Unsupported private Information, Loom project, and
