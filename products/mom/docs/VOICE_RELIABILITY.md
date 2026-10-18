@@ -84,6 +84,26 @@ application directory cannot qualify a fresh profile. Existing profiles without
 their own receipt verify the acquired assets and complete runtime warming once;
 the old application-directory receipt is left untouched.
 
+## Gemma channel boundaries before speech
+
+Gemma can emit `<|channel>thought\n...<channel|>` even when a call requests a
+short answer. The shared incremental reasoning parser must route that block to
+reasoning, including an empty block, before emitting assistant-content deltas.
+The final response uses the same parser before persistence and text completion.
+Do not send model protocol markers to TTS or solve this at sentence boundaries:
+a marker may be split across any streamed token boundary.
+
+Candidate 21 recording diagnostics found a marker-bearing first sentence whose
+144 characters and 21 words matched the corresponding TTS request. At the
+approximately aligned 4:09 playback, consumed-buffer reports retained headroom
+and no underrun callback was observed; final renderer metrics were unavailable.
+This establishes malformed speech input, not that it explains every reported
+acoustic glitch. Separate underruns later in the recording remain distinct.
+Keep the accepted helper, sampling, decoder windows and buffering fixed while
+qualifying this parser repair. Regression coverage includes empty/nonempty and
+unfinished thought blocks, every UTF-8 split boundary, single-character deltas,
+and agreement between live routing and final parsing.
+
 ## Sentence prosody and streaming PCM continuity
 
 The vocoder decodes generated acoustic codes only. Speaker conditioning belongs

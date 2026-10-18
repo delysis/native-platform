@@ -504,12 +504,17 @@ struct ParsedReasoning {
 }
 
 const REASONING_START_MARKERS: &[&str] = &[
+    "<|channel>thought\n",
     "<think>",
     "<<<reasoning_content_start>>>",
     "[Start thinking]",
 ];
-const REASONING_END_MARKERS: &[&str] =
-    &["</think>", "<<<reasoning_content_end>>>", "[End thinking]"];
+const REASONING_END_MARKERS: &[&str] = &[
+    "<channel|>",
+    "</think>",
+    "<<<reasoning_content_end>>>",
+    "[End thinking]",
+];
 
 impl ReasoningStreamParser {
     fn push(&mut self, delta: &str) -> Vec<RoutedDelta> {
@@ -2480,6 +2485,108 @@ mod tests {
                 .collect::<String>(),
             "private plan"
         );
+    }
+
+    fn collect_live_reasoning_routes(chunks: &[&str]) -> Vec<(ReasoningTarget, String)> {
+        let mut parser = ReasoningStreamParser::default();
+        let mut routed = Vec::new();
+        for chunk in chunks {
+            routed.extend(parser.push(chunk));
+        }
+        routed.extend(parser.finish());
+        let mut coalesced: Vec<(ReasoningTarget, String)> = Vec::new();
+        for delta in routed {
+            if let Some((target, text)) = coalesced.last_mut()
+                && *target == delta.target
+            {
+                text.push_str(&delta.text);
+            } else {
+                coalesced.push((delta.target, delta.text));
+            }
+        }
+        coalesced
+    }
+
+    #[test]
+    fn gemma_empty_thought_channel_is_not_assistant_content() {
+        let parsed =
+            parse_reasoning_output("<|channel>thought\n<channel|>The answer is ready.", true);
+        assert_eq!(parsed.content, "The answer is ready.");
+        assert_eq!(parsed.reasoning, "");
+        assert!(!parsed.incomplete);
+    }
+
+    #[test]
+    fn gemma_thought_channel_routes_reasoning_and_preserves_final_text() {
+        let parsed = parse_reasoning_output(
+            "<|channel>thought\nConsider the evidence. 🌱<channel|>The answer is ready.",
+            true,
+        );
+        assert_eq!(parsed.reasoning, "Consider the evidence. 🌱");
+        assert_eq!(parsed.content, "The answer is ready.");
+        assert!(!parsed.incomplete);
+    }
+
+    #[test]
+    fn gemma_unfinished_thought_is_not_routed_as_assistant_content() {
+        let parsed = parse_reasoning_output("<|channel>thought\nUnfinished private plan", true);
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.reasoning, "Unfinished private plan");
+        assert!(parsed.incomplete);
+    }
+
+    #[test]
+    fn gemma_thought_channel_routes_identically_at_every_utf8_boundary() {
+        let input = "Before 🌱<|channel>thought\nConsider it. 🦀<channel|>After.";
+        let expected = vec![
+            (ReasoningTarget::Content, "Before 🌱".to_string()),
+            (ReasoningTarget::Reasoning, "Consider it. 🦀".to_string()),
+            (ReasoningTarget::Content, "After.".to_string()),
+        ];
+        let boundaries = input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(input.len()))
+            .collect::<Vec<_>>();
+
+        for boundary in boundaries.iter().copied() {
+            let chunks = [&input[..boundary], &input[boundary..]];
+            assert_eq!(
+                collect_live_reasoning_routes(&chunks),
+                expected,
+                "split at byte {boundary}"
+            );
+        }
+
+        let one_char_chunks = input
+            .char_indices()
+            .map(|(start, character)| &input[start..start + character.len_utf8()])
+            .collect::<Vec<_>>();
+        assert_eq!(collect_live_reasoning_routes(&one_char_chunks), expected);
+    }
+
+    #[test]
+    fn gemma_live_routing_matches_final_parse_and_keeps_ordinary_prose() {
+        let samples = [
+            "A plain answer mentioning thought without any control marker.",
+            "<|channel>thought\nprivate plan<channel|>Public answer.",
+            "<|channel>thought\n<channel|>Public answer.",
+        ];
+        for sample in samples {
+            let mut content = String::new();
+            let mut reasoning = String::new();
+            for (target, text) in collect_live_reasoning_routes(&[sample]) {
+                match target {
+                    ReasoningTarget::Content => content.push_str(&text),
+                    ReasoningTarget::Reasoning => reasoning.push_str(&text),
+                }
+            }
+            let final_parse = parse_reasoning_output(sample, true);
+            assert_eq!(content, final_parse.content);
+            assert_eq!(reasoning, final_parse.reasoning);
+            assert!(!final_parse.incomplete);
+        }
+        assert_eq!(parse_reasoning_output(samples[0], true).content, samples[0]);
     }
 
     #[test]
