@@ -1102,6 +1102,7 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   let now = 0;
   let timerNumber = 0;
   let playbackCallbacks = null;
+  let firstPcmObserved = false;
   let activeLeaf = "previous-leaf";
   const prefills = [];
   const capture = { retainedSamples: [1, 2, 3] };
@@ -1124,7 +1125,18 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
     playing: false,
     bufferedMs: () => 0,
     reconsiderStartup: async () => false,
-    pushSegment(frame, operation) { delivered.push({ frame, operation }); },
+    pushSegment(frame, operation) {
+      delivered.push({ frame, operation });
+      if (!firstPcmObserved && frame?.data?.byteLength > 0) {
+        firstPcmObserved = true;
+        playbackCallbacks?.onFirstChunk?.({
+          bytes: frame.data.byteLength,
+          frames: frame.data.byteLength / (2 * (frame.channels || 1)),
+          sampleRate: frame.sampleRate || 24_000,
+          channels: frame.channels || 1,
+        });
+      }
+    },
     finish() {},
     stop: async () => {},
   };
@@ -1137,7 +1149,11 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   const context = {
     window: { setTimeout: setTimer, clearTimeout: clearTimer },
     performance: { now: () => ++now },
-    document: { createElement: () => ({ className: "" }), querySelector: () => null },
+    document: {
+      createElement: () => ({ className: "" }),
+      querySelector: () => null,
+      getElementById: () => null,
+    },
     MomVoicePipelineScheduler: {
       AdaptiveVoiceLeadController,
       SemanticLeadController: class {
@@ -1176,6 +1192,14 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
     },
     errorMessage: (error) => String(error),
     reportError() {},
+    chatEvents: [],
+    acquireStableChatBusy: (lease) => context.chatEvents.push(["acquire", lease]),
+    releaseChatBusy: (lease) => context.chatEvents.push(["release", lease]),
+    finishLiveMessage: (message) => context.chatEvents.push(["terminal", message]),
+    appendLiveMessage: (...args) => context.chatEvents.push(["message", ...args]),
+    appendLiveDelta: (...args) => context.chatEvents.push(["delta", ...args]),
+    settingEnabled: () => false,
+    keepLiveTailVisible() {},
     invoke(command, args) {
       if (command === "mom_llama_speech_stop") {
         invocations.push({ command, args, reply: null });
@@ -1193,6 +1217,10 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   assert.ok(chunkStart >= 0 && chunkEnd > chunkStart);
   speechVm.runInNewContext(
     ui.slice(chunkStart, chunkEnd)
+      + "\nlet pendingCallTranscriptJobs = globalThis.pendingCallTranscriptJobs;"
+      + "\nlet activeCallTranscriptJob = globalThis.activeCallTranscriptJob;"
+      + "\nlet activeCallTranscriptTask = globalThis.activeCallTranscriptTask;"
+      + "\nlet activeCallTranscriptOperation = globalThis.activeCallTranscriptOperation;"
       + block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =")
       + "\nglobalThis.beginLiveVoiceTts = beginLiveVoiceTts;",
     context,
@@ -1219,12 +1247,185 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
     await new Promise((resolve) => setImmediate(resolve));
     return playback;
   };
+  const notifyBufferLevel = () => playbackCallbacks?.onBufferLevel?.();
+  const wireChatEvents = () => {
+    const eventStart = ui.indexOf("  const voiceStreamRequestIds = new Set();");
+    const eventEnd = ui.indexOf("\n  const mentionLiveId", eventStart);
+    assert.ok(eventStart >= 0 && eventEnd > eventStart);
+    context.chatRequestLease = ({ request_id }) => request_id
+      ? `chat-request:${request_id}` : null;
+    speechVm.runInNewContext(
+      ui.slice(eventStart, eventEnd)
+        + "\nglobalThis.dispatchChatEvent = onChatEvent;",
+      context,
+    );
+  };
   return {
     context, invocations, delivered, synthesis, pcm, fireLatestTimer,
-    startPlayback, prefills, capture,
+    startPlayback, notifyBufferLevel, prefills, capture, wireChatEvents,
     setActiveLeaf(value) { activeLeaf = value; },
   };
 };
+
+test("text EOF flushes a held call reply and history waits for confirmed commit", async () => {
+  for (const text of [
+    "This short answer is complete.",
+    "This short answer has no punctuation",
+  ]) {
+    const h = liveTtsTailHarness({ callActive: true, callEpoch: 23 });
+    const pcmConfirmed = speechDeferred();
+    const commit = speechDeferred();
+    const nativeFinish = pcmConfirmed.promise.then(() => commit.promise).then((result) => {
+      h.setActiveLeaf(result.committedLeaf);
+      return result;
+    });
+    const playback = h.context.beginLiveVoiceTts({
+      conversation: "fixture-conversation",
+      mode: "call",
+      requestId: "request-final",
+      callEpoch: 23,
+      onFirstChunk: () => pcmConfirmed.resolve(true),
+    });
+    playback.trackGeneration(nativeFinish);
+    h.context.liveVoiceTts = playback;
+    h.wireChatEvents();
+
+    const finish = playback.finish.bind(playback);
+    let finishCalls = 0;
+    const finishResults = [];
+    playback.finish = (authoritativeText) => {
+      finishCalls += 1;
+      const result = finish(authoritativeText);
+      finishResults.push(result);
+      return result;
+    };
+
+    const payload = (event, delta = "") => ({
+      event,
+      request_id: "request-final",
+      conversation_id: "fixture-conversation",
+      delta,
+    });
+    h.context.dispatchChatEvent({ payload: payload("started") });
+    h.context.dispatchChatEvent({ payload: payload("delta", text) });
+    assert.equal(h.synthesis().length, 0,
+      "the last word is held until the native text EOF arrives");
+
+    h.context.dispatchChatEvent({ payload: payload("text_completed", text) });
+    assert.equal(h.synthesis().length, 1,
+      "the nonterminal text EOF must flush the last sentence while native completion is pending");
+    assert.equal(h.synthesis()[0].args.text, text);
+    assert.equal(h.context.chatEvents.some(([kind]) => kind === "release"), false,
+      "text EOF must not release the native chat request lease");
+
+    h.context.dispatchChatEvent({ payload: payload("text_completed", text) });
+    assert.equal(finishCalls, 2, "duplicate EOF reaches the closed owner idempotently");
+    assert.equal(finishResults[0], finishResults[1],
+      "duplicate EOF returns the same production completion promise");
+    assert.equal(h.synthesis().length, 1, "duplicate EOF must not replay synthesis");
+    assert.deepEqual(h.prefills, [], "history preparation remains behind native settlement");
+
+    const segment = h.synthesis()[0];
+    segment.args.pcmStream.onmessage(h.pcm("first-pcm"));
+    assert.equal(await pcmConfirmed.promise, true,
+      "the first validated PCM packet supplies the pending native confirmation");
+    assert.deepEqual(h.prefills, [],
+      "PCM confirmation alone does not release next-turn history before the commit settles");
+
+    segment.args.pcmStream.onmessage(h.pcm("eof", true));
+    segment.reply.resolve({
+      status: "passed",
+      result: { binding: { tts_total_ms: 1, duration_ms: 1 } },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.prefills, [], "TTS completion cannot substitute for native commit settlement");
+
+    commit.resolve({ committedLeaf: "committed-after-voice-confirmation" });
+    await nativeFinish;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.prefills, [{
+      conversation: "fixture-conversation",
+      activeLeaf: "committed-after-voice-confirmation",
+    }], "the next prefill must observe the committed assistant turn");
+    assert.equal(await finishResults[0], true);
+
+    h.context.dispatchChatEvent({ payload: payload("completed") });
+    assert.equal(h.synthesis().length, 1,
+      "the terminal event after commit must not replay the already-flushed text");
+    assert.equal(h.context.chatEvents.some(([kind]) => kind === "release"), true,
+      "only the native terminal event releases the request lease");
+  }
+});
+
+test("queued transcript slot waits for EOF-triggered native settlement and rechecks caller state", async () => {
+  for (const changedState of [null, "hangup", "caller_onset"]) {
+    const h = liveTtsTailHarness({ callActive: true, callEpoch: 23 });
+    const generation = speechDeferred();
+    const resident = speechDeferred();
+    const slotStarted = [];
+    h.context.voiceCallActive = true;
+    h.context.voiceCallEpoch = 23;
+    h.context.voiceRecording = {
+      call: true,
+      prefillDeferred: true,
+      voiceActivity: { heardVoice: false },
+    };
+    h.context.pendingCallTranscriptJobs.push({ output: {} });
+    h.context.MomVoicePipelineScheduler.shouldRunCallTranscriptSlot = () => true;
+    h.context.startPendingCallTranscriptSlot = () => {
+      slotStarted.push(true);
+      return new Promise(() => {});
+    };
+    const invoke = h.context.invoke;
+    h.context.invoke = (command, args) => command === "mom_llama_speech_parakeet_resident"
+      ? resident.promise : invoke(command, args);
+
+    const playback = h.context.beginLiveVoiceTts({
+      conversation: "fixture-conversation",
+      mode: "call",
+      requestId: "request-transcript-slot",
+      callEpoch: 23,
+    });
+    playback.trackGeneration(generation.promise);
+    h.context.liveVoiceTts = playback;
+    h.wireChatEvents();
+    const payload = (event, delta = "") => ({
+      event,
+      request_id: "request-transcript-slot",
+      conversation_id: "fixture-conversation",
+      delta,
+    });
+    h.context.dispatchChatEvent({ payload: payload("started") });
+    h.context.dispatchChatEvent({ payload: payload("delta", "A final short reply") });
+    assert.equal(h.synthesis().length, 0, "the unfinished final sentence stays buffered");
+    h.context.dispatchChatEvent({ payload: payload("text_completed", "A final short reply") });
+    assert.equal(h.synthesis().length, 1, "EOF flushes the final sentence before native settlement");
+
+    const segment = h.synthesis()[0];
+    segment.args.pcmStream.onmessage(h.pcm("first-pcm"));
+    segment.args.pcmStream.onmessage(h.pcm("eof", true));
+    segment.reply.resolve({
+      status: "passed",
+      result: { binding: { tts_total_ms: 1, duration_ms: 1 } },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    h.notifyBufferLevel();
+
+    resident.resolve({ status: "passed", result: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(slotStarted, [],
+      "the transcript slot cannot start while the native assistant commit is pending");
+
+    if (changedState === "hangup") h.context.voiceCallActive = false;
+    if (changedState === "caller_onset") h.context.voiceRecording.voiceActivity.heardVoice = true;
+    generation.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(slotStarted.length, changedState === null ? 1 : 0,
+      `${changedState === null
+        ? "the queued transcript slot may start after settlement"
+        : `the settled slot rechecks ${changedState} before starting`}; stages=${JSON.stringify(h.context.voiceLatencyTrace.stages.map(({ stage }) => stage))}`);
+  }
+});
 
 test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
   const h = liveTtsTailHarness();

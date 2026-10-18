@@ -794,6 +794,50 @@ test("an exact call request keeps its TTS owner after stale conversation cleanup
   ]);
 });
 
+test("text EOF flush is routed only to the exact uncancelled voice owner", () => {
+  const events = [];
+  let cancelled = false;
+  const owner = {
+    conversation: "conversation-a",
+    mode: "call",
+    trace: null,
+    lastProgressAt: 0,
+    acceptsRequest: (request) => !cancelled && request === "current-request",
+    finish: (text) => events.push(["finish", text]),
+  };
+  const context = {
+    liveVoiceTts: owner,
+    performance: { now: () => 1 },
+    markVoiceLatencyIn() {},
+    releaseChatBusy: (lease) => events.push(["release", lease]),
+    finishLiveMessage() {},
+  };
+  vm.createContext(context);
+  const start = source.indexOf("  const voiceStreamRequestIds = new Set();");
+  const end = source.indexOf("\n  const mentionLiveId", start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(
+    `${source.slice(start, end)}\nglobalThis.testOnChatEvent = onChatEvent;`,
+    context,
+  );
+  const sendTextEof = (requestId, text) => context.testOnChatEvent({ payload: {
+    event: "text_completed",
+    request_id: requestId,
+    conversation_id: "conversation-a",
+    delta: text,
+  } });
+
+  sendTextEof("stale-request", "stale response");
+  assert.deepEqual(events, [], "a stale request cannot flush the newer live owner");
+  sendTextEof("current-request", "current response");
+  assert.deepEqual(events, [["finish", "current response"]]);
+
+  cancelled = true;
+  sendTextEof("current-request", "late cancelled response");
+  assert.deepEqual(events, [["finish", "current response"]],
+    "a late EOF after cancellation must be ignored");
+});
+
 test("late voice events cannot become text or enter the next turn's trace", () => {
   const events = [];
   const trace = { stages: [] };

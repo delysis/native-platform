@@ -176,6 +176,19 @@ then verifies the next prompt sees the committed leaf. It also covers native
 failure and hangup during the wait. These checks establish ordering only;
 physical speaker testing remains a separate acceptance step.
 
+Text completion and history completion are separate milestones. Incremental
+voice generation emits the request-owned `text_completed` event, carrying the
+final assistant text in `delta`, before waiting for recording confirmation.
+The renderer flushes its last sentence at this milestone. Otherwise a short
+reply without trailing whitespace can wait for command completion before
+starting synthesis, while that command waits for the first synthesized PCM to
+confirm the recording. The ordinary `completed` event remains post-commit;
+text EOF never releases the next-turn history barrier or the chat busy lease.
+Queued background transcription also waits for that commit before updating
+older turns, then rechecks the call epoch and caller activity.
+Late text completion from an aborted or replaced request cannot flush its
+replacement. Duplicate completion does not synthesize the reply twice.
+
 ## Pickup regression: phase-consistent history
 
 The candidate 07 warm greeting reused 13,743 of 13,973 prompt positions and

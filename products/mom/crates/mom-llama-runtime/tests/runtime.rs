@@ -2956,6 +2956,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let silence = Instant::now();
     voice.seal_input()?;
     let mut first_token_ms = None;
+    let stream_events = std::cell::RefCell::new(Vec::new());
     let finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
         voice,
         ChatSendOptions {
@@ -2963,6 +2964,10 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
             fake_fixture: false,
         },
         Some(|event: mom_llama_runtime::ChatStreamEvent| {
+            stream_events.borrow_mut().push(event.event.clone());
+            if event.event == "text_completed" {
+                assert!(event.delta.as_deref().is_some_and(|text| !text.is_empty()));
+            }
             if first_token_ms.is_none()
                 && matches!(event.event.as_str(), "delta" | "reasoning_delta")
             {
@@ -2971,6 +2976,18 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
             Ok(())
         }),
         || {
+            assert_eq!(
+                stream_events.borrow().last().map(String::as_str),
+                Some("text_completed"),
+                "speech must receive final text before waiting for recording confirmation"
+            );
+            assert!(
+                !stream_events
+                    .borrow()
+                    .iter()
+                    .any(|event| event == "completed"),
+                "text EOF must not claim the exchange is committed"
+            );
             let imported = mom_llama_runtime::attachment_import_voice_message(
                 &scope,
                 &conversation.id,
@@ -2990,6 +3007,11 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let output = finished
         .result
         .ok_or_else(|| anyhow!("prepared first voice turn failed: {:#?}", finished.blocker))?;
+    assert_eq!(
+        stream_events.borrow().last().map(String::as_str),
+        Some("completed"),
+        "the terminal stream event must follow the history commit"
+    );
     let audio = output
         .voice_audio_metrics
         .as_ref()

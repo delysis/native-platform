@@ -970,6 +970,20 @@ where
             false,
         ));
     }
+    // Speech must be able to flush a final sentence before the recording is
+    // confirmed. Confirmation may itself wait for the first synthesized PCM;
+    // withholding text EOF until after before_commit would deadlock short
+    // replies. This is not the terminal event: history is still uncommitted.
+    let mut text_completed = stream_event(
+        &session.request_id,
+        &prepared.conversation_id,
+        "text_completed",
+        Some(assistant_text.clone()),
+        None,
+        options,
+    );
+    text_completed.emitted_at_unix_us = Some(unix_now_us());
+    emit(stream.callback(), text_completed)?;
     let voice_attachment_id = before_commit()?;
     let mut conversation = prepared.conversation.clone();
     let active_messages = crate::document::checked_active_messages(&conversation)?;

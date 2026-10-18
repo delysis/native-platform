@@ -5906,6 +5906,10 @@
             if (recording?.prefillDeferred && live?.session) await recording.resumeDeferredPrefill(live);
             return;
           }
+          // Text EOF can now precede the native history commit. Compressing
+          // older turns must wait too, or that commit could overwrite the
+          // transcript slot's updated conversation snapshot.
+          await generationSettlement;
           if (!voiceCallActive || voiceCallEpoch !== callEpoch || recording?.sending
               || recording?.speculation || recording?.voiceActivity?.heardVoice) return;
           const playbackSafe = bufferedPlaybackFinished || leadController.shouldPrepareNextCall({
@@ -8670,6 +8674,16 @@
     }
     if (payload.event === "delta" && (voiceReply || callReply)) {
       liveVoiceTts?.push(payload.delta || "");
+    }
+    if (payload.event === "text_completed" && (voiceReply || callReply)) {
+      // Native text EOF precedes recording confirmation and history commit.
+      // Flush the last sentence now so its first PCM can confirm the recording;
+      // the tracked native operation still gates preparation of the next turn.
+      liveVoiceTts.lastProgressAt = performance.now();
+      markVoiceLatencyIn(eventTrace, "text_completed", {
+        observed_at_unix_us: payload.emitted_at_unix_us,
+      });
+      void liveVoiceTts.finish(payload.delta || liveVoiceTts.text);
     }
     if (payload.event === "reasoning_delta" && !voiceReply && !callReply) {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
