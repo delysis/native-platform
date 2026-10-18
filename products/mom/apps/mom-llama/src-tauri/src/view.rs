@@ -1569,7 +1569,6 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             }
             (chat_view_with_draft(settings, models, active.as_ref(), Some(draft), personas, recipients))
             (settings_sidebar(settings, models, personas, active.as_ref()))
-            (conversation_rename_modal())
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -1934,6 +1933,7 @@ fn sidebar(
 ) -> Markup {
     let chats = conversations.result.as_deref().unwrap_or(&[]);
     let conversation_list = control("conversation.list");
+    let conversation_rename = control("conversation.rename");
     let persona_list = control("persona.list");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
@@ -1961,9 +1961,15 @@ fn sidebar(
                                 .filter(|conversation| conversation.kind == ConversationKind::Chat) {
                                 @let active = active_id == Some(conversation.id.as_str());
                                 @let display_title = conversation_display_title(&conversation.title);
-                                li data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
+                                li class=(format!("conversation-sidebar-row{}", if active { " active" } else { "" }))
+                                    data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
                                     data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default())
-                                    data-conversation-title=(display_title) {
+                                    data-conversation-title=(display_title)
+                                    data-rename-affordance=(conversation_rename.affordance)
+                                    data-rename-command=(conversation_rename.command)
+                                    data-rename-tauri-command=(conversation_rename.tauri_command)
+                                    data-rename-cli=(conversation_rename.cli)
+                                    data-rename-effect=(conversation_rename.effect) {
                                     button type="button"
                                         class=(format!("conversation-item {}", if active { "active" } else { "" }))
                                         data-affordance="conversation.select"
@@ -1979,7 +1985,7 @@ fn sidebar(
                                             span class="contact-avatar" aria-hidden="true" { (icon_markup(if conversation.recipient_ids.is_empty() { "message-circle" } else { "users" })) }
                                         }
                                         div class="conversation-copy" {
-                                            span { (display_title) }
+                                            span class="conversation-title" { (display_title) }
                                             @if let Some(message) = conversation.messages.iter().rev().find(|message| {
                                                 !is_call_turn(conversation, message)
                                                     && !is_voice_note_turn(conversation, message)
@@ -2042,7 +2048,6 @@ fn sidebar(
             div class="sidebar-resizer" role="separator" aria-label="Sidebar width"
                 aria-orientation="vertical" aria-valuemin="180" aria-valuemax="480" tabindex="0" {}
             div class="sidebar-actions hidden-contract" {
-                (button("conversation.rename", Some("conversation-rename"), "small-button", active_id.is_none()))
                 (button("conversation.delete", Some("conversation-delete"), "small-button danger", active_id.is_none()))
                 (button("conversation.import", Some("conversation-import"), "small-button", false))
             }
@@ -3313,35 +3318,6 @@ fn consult_settings(personas: &StoreProjection<Vec<Conversation>>) -> Markup {
             div class="button-strip" {
                 (button("persona_group.create", Some("persona-group-save"), "primary-button persona-group-create", false))
                 (button("persona_group.update", Some("persona-group-save"), "primary-button persona-group-update is-hidden", false))
-            }
-        }
-    }
-}
-
-fn conversation_rename_modal() -> Markup {
-    let rename = control("conversation.rename");
-    html! {
-        div id="conversation-rename-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
-            form id="conversation-rename-form" class="compact-dialog" role="dialog" aria-modal="true"
-                aria-labelledby="conversation-rename-title"
-                data-affordance=(rename.affordance) data-command=(rename.command)
-                data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) {
-                header class="modal-title-row" {
-                    h2 id="conversation-rename-title" { "Rename" }
-                    button type="button" class="icon-button" aria-label="Cancel"
-                        data-affordance=(rename.affordance) data-command=(rename.command)
-                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect)
-                        data-action="conversation-rename-close" { (icon_markup("x")) }
-                }
-                label class="field" {
-                    span { "Name" }
-                    input name="conversation_title" required aria-label="Name"
-                        data-affordance=(rename.affordance) data-command=(rename.command)
-                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect);
-                }
-                button type="submit" class="primary-button"
-                    data-affordance=(rename.affordance) data-command=(rename.command)
-                    data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) { "Save" }
             }
         }
     }
@@ -5109,6 +5085,9 @@ mod tests {
 
         let html = sidebar(&conversations, &personas, Some("chat")).into_string();
 
+        assert!(html.contains(r#"class="conversation-title""#));
+        assert!(html.contains(r#"data-rename-command="mom_llama.conversation_rename""#));
+        assert!(!html.contains("conversation-rename-modal"));
         assert!(html.contains("Earlier ordinary message"));
         assert!(!html.contains("Hey Jan"));
         assert!(!html.contains("Reply naturally and briefly"));
@@ -5142,6 +5121,24 @@ mod tests {
                 let dismiss = &js[dismiss_start..dismiss_end];
                 assert!(dismiss.contains(r#"aria-label", "Dismiss""#));
                 assert!(dismiss.contains(r#"addEventListener("click", () => report(null)"#));
+                continue;
+            }
+            if unmanaged == r#"document.createElement("input")"# {
+                assert_eq!(
+                    js.matches(unmanaged).count(),
+                    1,
+                    "only inline conversation rename may create a local name editor",
+                );
+                let rename_start = js
+                    .find(r#"const input = document.createElement("input")"#)
+                    .expect("inline editor exists");
+                let rename_end = js[rename_start..]
+                    .find("input.addEventListener(\"keydown\"")
+                    .map(|offset| rename_start + offset)
+                    .expect("inline editor handlers exist");
+                let rename = &js[rename_start..rename_end];
+                assert!(rename.contains("conversation-rename-editor"));
+                assert!(rename.contains("row.dataset.renameCommand"));
                 continue;
             }
             assert!(

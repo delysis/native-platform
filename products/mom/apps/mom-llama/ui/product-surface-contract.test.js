@@ -554,7 +554,7 @@ test("call starts ringing immediately while preparation remains cancellation gua
 test("foreground chat sends suspend idle audio recovery before draft or model admission", () => {
   const submitStart = bridge.indexOf('document.addEventListener("submit", async (event) => {');
   const sendStart = bridge.indexOf('if (form.id === "chat-form")', submitStart);
-  const sendEnd = bridge.indexOf('if (form.id === "conversation-rename-form")', sendStart);
+  const sendEnd = bridge.indexOf('if (form.id === "settings-form")', sendStart);
   const send = bridge.slice(sendStart, sendEnd);
   const suspend = send.indexOf('await suspendVoiceHistoryRecoveryForForeground("chat_send")');
   const firstAwait = send.indexOf('await updateRecipients');

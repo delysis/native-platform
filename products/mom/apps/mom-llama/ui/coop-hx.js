@@ -2112,6 +2112,7 @@
   };
   const refreshSidebar = async () => {
     const replacement = await swap(".sidebar", "mom_llama_render_sidebar_fragment");
+    rebindConversationRename(replacement);
     applySidebarSectionState(replacement);
     const separator = replacement?.querySelector(".sidebar-resizer");
     separator?.setAttribute("aria-valuenow", String(Math.round(replacement.getBoundingClientRect().width)));
@@ -3204,15 +3205,139 @@
   const slugHandle = (value) => String(value || "")
     .trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 
-  const openConversationRename = (target) => {
-    const modal = document.getElementById("conversation-rename-modal");
-    if (!modal) return;
-    modal.dataset.conversation = target.dataset.conversation;
-    const field = formField(modal, "conversation_title");
-    field.value = target.dataset.conversationTitle || target.querySelector?.("span")?.textContent || "";
-    setModalVisibility("conversation-rename-modal", true);
-    field.focus();
-    field.select();
+  let activeConversationRename = null;
+  const finishConversationRename = (state, { restoreFocus = false } = {}) => {
+    if (state.done) return;
+    state.done = true;
+    if (activeConversationRename === state) activeConversationRename = null;
+    state.input.remove();
+    state.title.style.visibility = "";
+    state.input.style.cssText = "";
+    state.row.classList.remove("is-renaming");
+    if (restoreFocus && state.navigationRevision === conversationNavigationRevision) state.button.focus();
+  };
+
+  const positionConversationRenameEditor = (state) => {
+    if (state.done || !state.row.isConnected || !state.title.isConnected) return;
+    const rowRect = state.row.getBoundingClientRect();
+    const titleRect = state.title.getBoundingClientRect();
+    state.input.style.left = `${titleRect.left - rowRect.left}px`;
+    state.input.style.top = `${titleRect.top - rowRect.top}px`;
+    state.input.style.width = `${titleRect.width}px`;
+    state.input.style.height = `${titleRect.height}px`;
+  };
+
+  const rebindConversationRename = (root) => {
+    const state = activeConversationRename;
+    if (!state || state.done || !root) return;
+    const rows = [...(root.querySelectorAll?.("[data-conversation-menu-target='true']") || [])];
+    const row = rows.find((candidate) => candidate.dataset.conversation === state.conversation);
+    const button = row?.querySelector?.('[data-action="conversation-select"]');
+    const title = button?.querySelector?.(".conversation-title");
+    if (!row || !button || !title) return;
+    state.input.remove();
+    state.row = row;
+    state.button = button;
+    state.title = title;
+    title.style.visibility = "hidden";
+    row.classList.add("is-renaming");
+    row.append(state.input);
+    positionConversationRenameEditor(state);
+  };
+  window.addEventListener("resize", () => {
+    if (activeConversationRename) positionConversationRenameEditor(activeConversationRename);
+  });
+
+  const beginConversationRename = (target) => {
+    const row = target.closest?.("[data-conversation-menu-target='true']") || target;
+    const button = row.querySelector?.('[data-action="conversation-select"]');
+    const title = button?.querySelector?.(".conversation-title");
+    if (!row || !button || !title) return;
+    if (activeConversationRename?.row === row) {
+      activeConversationRename.input.focus();
+      activeConversationRename.input.select();
+      return;
+    }
+    if (activeConversationRename) {
+      activeConversationRename.input.blur();
+      if (activeConversationRename && !activeConversationRename.done) {
+        activeConversationRename.input.focus();
+        return;
+      }
+    }
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "conversation-rename-editor";
+    input.setAttribute("aria-label", "Conversation name");
+    input.dataset.affordance = row.dataset.renameAffordance || "conversation.rename";
+    input.dataset.command = row.dataset.renameCommand || "mom_llama.conversation_rename";
+    input.dataset.tauriCommand = row.dataset.renameTauriCommand || "mom_llama_conversation_rename";
+    input.dataset.cli = row.dataset.renameCli || "mom-llama conversation rename --conversation <id> --title <title> --json";
+    input.dataset.effect = row.dataset.renameEffect || "mom_llama.effects.conversation_store.v1";
+    input.value = row.dataset.conversationTitle || title.textContent || "";
+    const state = {
+      row, button, title, input, original: input.value,
+      conversation: row.dataset.conversation,
+      navigationRevision: conversationNavigationRevision,
+      saving: false,
+      done: false,
+    };
+    activeConversationRename = state;
+    title.style.visibility = "hidden";
+    row.classList.add("is-renaming");
+    row.append(input);
+    positionConversationRenameEditor(state);
+
+    const cancel = () => finishConversationRename(state, { restoreFocus: true });
+    const commit = async (restoreFocus = false) => {
+      if (state.done || state.saving) return;
+      const nextTitle = input.value.trim();
+      if (!nextTitle) {
+        if (restoreFocus) {
+          input.setCustomValidity("Enter a conversation name.");
+          input.reportValidity();
+        } else cancel();
+        return;
+      }
+      if (nextTitle === state.original.trim()) {
+        finishConversationRename(state, { restoreFocus });
+        return;
+      }
+      state.saving = true;
+      input.readOnly = true;
+      try {
+        const result = await invoke("mom_llama_conversation_rename", {
+          conversation: row.dataset.conversation,
+          title: nextTitle,
+        });
+        report(result);
+        if (result?.status !== "passed") {
+          state.saving = false;
+          input.readOnly = false;
+          return;
+        }
+        state.row.dataset.conversationTitle = nextTitle;
+        state.title.textContent = nextTitle;
+        finishConversationRename(state, { restoreFocus });
+      } catch (error) {
+        state.saving = false;
+        input.readOnly = false;
+        reportError(error);
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void commit(true);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        if (!state.saving) cancel();
+      }
+    });
+    input.addEventListener("blur", () => { void commit(false); });
+    input.addEventListener("input", () => input.setCustomValidity(""));
+    input.focus();
+    input.select();
   };
 
   let conversationNavigationRevision = 0;
@@ -9673,12 +9798,13 @@
     },
     "voice-call-open": async () => openVoiceCallSurface(),
     "voice-call-close": async () => closeVoiceCallSurface(),
-    "conversation-select": async (button) => {
+    "conversation-select": async (button, event) => {
       if (button.dataset.conversation === selectedConversation()) {
-        openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+        if (event?.target?.closest?.(".conversation-title")) {
+          beginConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+        }
       } else await selectConversation(button.dataset.conversation);
     },
-    "conversation-rename-close": async () => setModalVisibility("conversation-rename-modal", false),
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: activeDispatchConversation || selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
       const result = await invoke("mom_llama_chat_skip_reasoning", { conversation: selectedConversation() });
@@ -10459,7 +10585,7 @@
     const handler = actionHandlers[button.dataset.action];
     if (!handler) return;
     event.preventDefault();
-    try { await handler(button); } catch (error) { reportError(error); }
+    try { await handler(button, event); } catch (error) { reportError(error); }
   });
 
   const popupRowMenu = async (target, point = null) => {
@@ -10479,7 +10605,7 @@
     } else {
       const conversation = target.dataset.conversation;
       items = [
-        { id: "rename", text: "Rename…", action: safeAction(() => openConversationRename(target)) },
+        { id: "rename", text: "Rename…", action: safeAction(() => beginConversationRename(target)) },
         { id: "delete", text: "Delete", action: safeAction(async () => {
           await retainComposerDraft();
           report(await invoke("mom_llama_conversation_delete", { conversation }));
@@ -10510,10 +10636,6 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && event.target.closest("#conversation-rename-modal")) {
-      event.preventDefault();
-      setModalVisibility("conversation-rename-modal", false);
-    }
     if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
       event.preventDefault();
       setSearchMode(false);
@@ -10849,17 +10971,6 @@
           }
           releaseChatBusy(dispatchLease);
           releaseHistoryRecovery?.();
-        }
-      }
-      if (form.id === "conversation-rename-form") {
-        const modal = document.getElementById("conversation-rename-modal");
-        const title = formValue(form, "conversation_title").trim();
-        if (!title) return;
-        const result = await invoke("mom_llama_conversation_rename", { conversation: modal.dataset.conversation, title });
-        report(result);
-        if (result?.status !== "blocked") {
-          setModalVisibility("conversation-rename-modal", false);
-          await refreshConversationProjection();
         }
       }
       if (form.id === "settings-form") {

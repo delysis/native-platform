@@ -23,8 +23,8 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
   attention memory plan. This is conservative admission planning, not an OS RSS
   limit; native allocation and supported hardware still require qualification.
 - Chat titles derive from the first submitted message until renamed. Clicking
-  the selected chat opens Rename; native chat menus also expose Rename, Delete
-  and Save as Persona. Branch at a message before saving a partial chat as a
+  the selected chat's name edits it inline; native chat menus also expose Rename,
+  Delete and Save as Persona. Branch at a message before saving a partial chat as a
   Persona.
 - Persona templates remain editable. Sending from one instantiates a normal
   chat; the template never silently accumulates ordinary traffic.
