@@ -256,7 +256,13 @@ impl QwenSpeechBackend {
     /// submitting Metal work long after the model is resident and can starve
     /// a live microphone projector. Per-persona reference artifacts remain
     /// content-addressed on disk and are admitted lazily on first use.
-    pub fn warm_icl_in_background(&self) {
+    /// The owner supplies compute admission for the entire warm operation,
+    /// including model load and graph compilation. The worker owns the guard
+    /// until every success, failure or cancellation return has settled.
+    pub fn warm_icl_in_background<G: Send + 'static>(
+        &self,
+        acquire_compute: impl FnOnce() -> G + Send + 'static,
+    ) {
         let Some(config) = self.config.icl.clone() else {
             return;
         };
@@ -297,6 +303,7 @@ impl QwenSpeechBackend {
         let spawned = std::thread::Builder::new()
             .name("qwen-tts-warm".into())
             .spawn(move || {
+                let _compute_guard = acquire_compute();
                 let warm_started = Instant::now();
                 let request_id = SpeechRequestId("qwen-startup-warm".into());
                 {
@@ -2011,6 +2018,46 @@ mod tests {
         let waiters = AtomicUsize::new(1);
         let cancelled = AtomicBool::new(true);
         assert!(lock_background_worker(&worker, &waiters, &cancelled).is_none());
+    }
+
+    #[test]
+    fn failed_background_warm_start_releases_compute_guard() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary Qwen warm fixture");
+        let nonexistent = fixture.path().join("no-helper-or-model");
+        let backend = QwenSpeechBackend::discover(QwenBackendConfig {
+            helper: nonexistent.clone(),
+            model_dir: nonexistent.clone(),
+            icl: Some(QwenIclConfig {
+                helper: nonexistent.clone(),
+                model_dir: nonexistent,
+                reference_root: fixture.path().join("no-reference-manifest"),
+            }),
+        });
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let acquire_probe = Arc::clone(&acquired);
+        let drop_probe = Arc::clone(&dropped);
+
+        backend.warm_icl_in_background(move || {
+            acquire_probe.fetch_add(1, Ordering::AcqRel);
+            DropProbe(drop_probe)
+        });
+        let status = backend
+            .wait_for_icl_background_warm()
+            .expect("failed startup worker still joins cleanly");
+
+        assert_eq!(acquired.load(Ordering::Acquire), 1);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert!(!status.active);
+        assert_eq!(status.completed, 0);
     }
 
     #[test]

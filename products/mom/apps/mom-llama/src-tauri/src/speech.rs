@@ -274,6 +274,17 @@ impl ReadAloudSelection {
     fn backend_id(&self) -> &str {
         &self.descriptor().id
     }
+    /// Scheduling follows the admitted backend, never a renderer mode flag.
+    /// Every Metal-backed selection must retain Gemma coordination, including
+    /// Read Aloud and voice notes. CPU selections can return None here.
+    fn compute_arbiter(
+        &self,
+        reserved: Option<RealtimeTtsComputeArbiter>,
+    ) -> Option<RealtimeTtsComputeArbiter> {
+        match self {
+            Self::Qwen(_) => Some(reserved.unwrap_or_else(RealtimeTtsComputeArbiter::new)),
+        }
+    }
     fn model_id(&self) -> Option<String> {
         let Self::Qwen(value) = self;
         Some(value.model_id.clone())
@@ -796,6 +807,7 @@ impl MomSpeech {
                 desktop_speech::prepare_local_qwen(
                     Some(data_dir.join("speech-models")),
                     Some(installed_voice_root.to_path_buf()),
+                    mom_llama_runtime::acquire_realtime_compute,
                 )
             });
             let warm = qwen
@@ -1009,10 +1021,9 @@ impl MomSpeech {
             return Ok(blocked("mom_llama.speech_read_aloud", blocker));
         }
         let request = read_aloud_request(&target, &selection, request_id.clone());
-        let response = match stream_sink.clone() {
-            Some(sink) => self.executor.synthesize_streaming(request, sink).await,
-            None => self.executor.synthesize(request).await,
-        };
+        let (response, _compute_metrics) = self
+            .synthesize_selected(&selection, request, stream_sink.clone(), None)
+            .await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -1093,6 +1104,43 @@ impl MomSpeech {
         ))
     }
 
+    /// One scheduling boundary for all persona synthesis. The lease spans
+    /// backend admission, cold loading and generation, and is released on
+    /// success, failure or dropped futures. Only the existing bounded PCM
+    /// runway policy can yield it while a Metal request is running.
+    async fn synthesize_selected(
+        &self,
+        selection: &ReadAloudSelection,
+        request: SynthesisRequest,
+        stream_sink: Option<PcmStreamSink>,
+        reserved: Option<RealtimeTtsComputeArbiter>,
+    ) -> (Result<SynthesisResponse, String>, RealtimeTtsComputeMetrics) {
+        let compute = selection
+            .compute_arbiter(reserved)
+            .map(|arbiter| Arc::new(Mutex::new(arbiter)));
+        let sink = stream_sink.map(|downstream| {
+            let observed = compute.clone();
+            let scheduled: PcmStreamSink = Arc::new(move |chunk| {
+                if let Some(compute) = &observed
+                    && let Ok(mut arbiter) = compute.lock()
+                {
+                    arbiter.observe(chunk);
+                }
+                downstream(chunk)
+            });
+            scheduled
+        });
+        let response = match sink {
+            Some(sink) => self.executor.synthesize_streaming(request, sink).await,
+            None => self.executor.synthesize(request).await,
+        };
+        let metrics = compute
+            .as_ref()
+            .and_then(|compute| compute.lock().ok().map(|mut arbiter| arbiter.finish()))
+            .unwrap_or_default();
+        (response, metrics)
+    }
+
     /// Synthesizes a bounded reply for the exact persona represented by this
     /// conversation, before a chat message is committed. The audio is retained
     /// only in this runtime's opaque-operation registry.
@@ -1115,12 +1163,11 @@ impl MomSpeech {
                 ),
             ));
         }
-        // Claim the shared compute lane before voice lookup and routing. If
-        // Gemma starts another non-preemptible Metal decode while this command
-        // is being admitted, Qwen's first codec packet pays that entire token
-        // quantum. The lease is RAII-owned, so every blocked or failed return
-        // below still releases it without a separate cleanup branch.
-        let compute_arbiter = Arc::new(Mutex::new(RealtimeTtsComputeArbiter::new()));
+        // Qwen remains the only precommit backend in this build. Preserve its
+        // early reservation: a Gemma decode admitted during voice lookup could
+        // otherwise delay the first packet. A future CPU call route must choose
+        // its backend before this point and omit this Metal reservation.
+        let compute_reservation = RealtimeTtsComputeArbiter::new();
         let stage_started = Instant::now();
         let voice_id = match self
             .resolve_precommit_voice(conversation_id)
@@ -1162,27 +1209,17 @@ impl MomSpeech {
             return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
         }
         let tts_operation_admission_us = elapsed_us(stage_started);
-        let observed_compute = Arc::clone(&compute_arbiter);
-        let downstream_sink = Arc::clone(&stream_sink);
-        let scheduled_sink: PcmStreamSink = Arc::new(move |chunk| {
-            if let Ok(mut arbiter) = observed_compute.lock() {
-                arbiter.observe(chunk);
-            }
-            downstream_sink(chunk)
-        });
-        let response = match self
-            .executor
-            .synthesize_streaming(
+        let (response, compute_metrics) = self
+            .synthesize_selected(
+                &selection,
                 precommit_synthesis_request(text, &selection, request_id.clone()),
-                scheduled_sink,
+                Some(stream_sink),
+                Some(compute_reservation),
             )
-            .await
-        {
+            .await;
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
-                if let Ok(mut arbiter) = compute_arbiter.lock() {
-                    arbiter.release();
-                }
                 let cancelled = self.finish_operation(operation, &request_id);
                 return Ok(blocked(
                     "mom_llama.speech_precommit_synthesize",
@@ -1194,10 +1231,6 @@ impl MomSpeech {
                 ));
             }
         };
-        let compute_metrics = compute_arbiter
-            .lock()
-            .map(|mut arbiter| arbiter.finish())
-            .unwrap_or_default();
         let stage_started = Instant::now();
         let current_voice = self
             .precommit_voice(conversation_id)
@@ -3334,7 +3367,7 @@ mod tests {
         }
     }
 
-    fn qwen_descriptor() -> SpeechBackendDescriptor {
+    pub(super) fn qwen_descriptor() -> SpeechBackendDescriptor {
         SpeechBackendDescriptor {
             id: QWEN_BACKEND_ID.to_string(),
             display_name: "Qwen3 TTS".to_string(),
@@ -4430,6 +4463,272 @@ mod tests {
         -> anyhow::Result<()> {
             transcription_postflight_error(true).await
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_synthesis_scheduling_tests {
+    use super::*;
+    use speech_native_types::{SpeechResolvedRoute, SpeechUsage};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy)]
+    enum ProbeOutcome {
+        Success,
+        Failure,
+        WaitForCancellation,
+    }
+
+    struct SchedulingProbeExecutor {
+        outcome: ProbeOutcome,
+        complete_calls: AtomicUsize,
+        streaming_calls: AtomicUsize,
+        cancel_requested: AtomicBool,
+        streaming_started: Notify,
+        cancelled: Notify,
+    }
+
+    impl SchedulingProbeExecutor {
+        fn new(outcome: ProbeOutcome) -> Self {
+            Self {
+                outcome,
+                complete_calls: AtomicUsize::new(0),
+                streaming_calls: AtomicUsize::new(0),
+                cancel_requested: AtomicBool::new(false),
+                streaming_started: Notify::new(),
+                cancelled: Notify::new(),
+            }
+        }
+
+        fn response(request_id: SpeechRequestId) -> SynthesisResponse {
+            SynthesisResponse {
+                request_id,
+                route: SpeechResolvedRoute {
+                    backend_id: QWEN_BACKEND_ID.to_string(),
+                    model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
+                    voice_id: Some("mom.qwen.icl.gabor_mate".to_string()),
+                    backend_kind: speech_native_types::SpeechBackendKind::EmbeddedModel,
+                    network: NetworkBehavior::Never,
+                },
+                output: SynthesisOutput::Streamed {
+                    format: qwen_stream_output(),
+                    emitted_bytes: 4_800,
+                },
+                duration_ms: Some(100),
+                alignments: Vec::new(),
+                usage: SpeechUsage {
+                    real_local_inference: true,
+                    ..SpeechUsage::default()
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SpeechExecutor for SchedulingProbeExecutor {
+        fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+            Ok(Arc::from([super::tests::qwen_descriptor()]))
+        }
+
+        async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                ProbeOutcome::Success => Ok(Self::response(request.context.request_id)),
+                ProbeOutcome::Failure => Err("mock synthesis failure".to_string()),
+                ProbeOutcome::WaitForCancellation => {
+                    Err("unexpected non-streaming cancellation fixture".to_string())
+                }
+            }
+        }
+
+        async fn synthesize_streaming(
+            &self,
+            request: SynthesisRequest,
+            sink: PcmStreamSink,
+        ) -> Result<SynthesisResponse, String> {
+            self.streaming_calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                ProbeOutcome::Success => {
+                    sink(&speech_native_types::AudioChunk {
+                        sequence: 0,
+                        sample_offset: 0,
+                        format: PcmFormat {
+                            sample_rate_hz: 24_000,
+                            channels: 1,
+                            sample_format: PcmSampleFormat::I16Le,
+                            interleaved: true,
+                        },
+                        data: vec![0; 4_800],
+                        end_of_stream: false,
+                    })?;
+                    Ok(Self::response(request.context.request_id))
+                }
+                ProbeOutcome::Failure => Err("mock synthesis failure".to_string()),
+                ProbeOutcome::WaitForCancellation => {
+                    self.streaming_started.notify_one();
+                    loop {
+                        let cancelled = self.cancelled.notified();
+                        if self.cancel_requested.load(Ordering::Acquire) {
+                            return Err("speech_cancelled".to_string());
+                        }
+                        cancelled.await;
+                    }
+                }
+            }
+        }
+
+        async fn transcribe(
+            &self,
+            _request: TranscriptionRequest,
+        ) -> Result<TranscriptionResponse, String> {
+            Err("transcription is not part of this fixture".to_string())
+        }
+
+        fn cancel(&self, _request_id: &SpeechRequestId) -> usize {
+            self.cancel_requested.store(true, Ordering::Release);
+            self.cancelled.notify_one();
+            1
+        }
+
+        fn quiesce(&self) -> Result<(), SpeechHostError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), SpeechHostError> {
+            Ok(())
+        }
+    }
+
+    fn speech_with(executor: Arc<SchedulingProbeExecutor>) -> MomSpeech {
+        MomSpeech {
+            executor,
+            _qwen: None,
+            _qwen_startup_warm: None,
+            state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn selection() -> ReadAloudSelection {
+        select_read_aloud(
+            &[super::tests::qwen_descriptor()],
+            5,
+            Some("mom.qwen.icl.gabor_mate"),
+            true,
+        )
+        .expect("Qwen route")
+    }
+
+    fn assert_one_terminal_lease(metrics: RealtimeTtsComputeMetrics) {
+        assert_eq!(metrics.lease_acquisitions, 1);
+        assert_eq!(metrics.lease_releases, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_synthesis_settles_stream_complete_error_and_cancel_leases() {
+        let selection = selection();
+
+        let complete = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&complete));
+        let mut reservation = RealtimeTtsComputeArbiter::new();
+        reservation.metrics.low_water_ms = 777;
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-complete".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, None, Some(reservation))
+            .await;
+        assert!(response.is_ok());
+        assert_one_terminal_lease(metrics);
+        assert_eq!(metrics.low_water_ms, 777, "reuse precommit reservation");
+        assert_eq!(complete.complete_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(complete.streaming_calls.load(Ordering::Relaxed), 0);
+
+        let streamed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&streamed));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_sink = Arc::clone(&delivered);
+        let sink: PcmStreamSink = Arc::new(move |_| {
+            delivered_sink.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-stream".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, Some(sink), None)
+            .await;
+        assert!(response.is_ok());
+        assert_one_terminal_lease(metrics);
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(streamed.complete_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(streamed.streaming_calls.load(Ordering::Relaxed), 1);
+
+        let stream_failed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&stream_failed));
+        let rejecting_sink: PcmStreamSink = Arc::new(|_| Err("downstream closed".to_string()));
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-stream-sink-error".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, Some(rejecting_sink), None)
+            .await;
+        assert_eq!(
+            response.expect_err("downstream sink failure"),
+            "downstream closed"
+        );
+        assert_one_terminal_lease(metrics);
+
+        let failed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Failure));
+        let speech = speech_with(Arc::clone(&failed));
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-error".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, None, None)
+            .await;
+        assert_eq!(
+            response.expect_err("fixture failure"),
+            "mock synthesis failure"
+        );
+        assert_one_terminal_lease(metrics);
+
+        let cancelled = Arc::new(SchedulingProbeExecutor::new(
+            ProbeOutcome::WaitForCancellation,
+        ));
+        let speech = Arc::new(speech_with(Arc::clone(&cancelled)));
+        let request_id = SpeechRequestId("schedule-cancel".to_string());
+        let request = precommit_synthesis_request("hello", &selection, request_id.clone());
+        let task = tokio::spawn(async move {
+            speech
+                .synthesize_selected(&selection, request, Some(Arc::new(|_| Ok(()))), None)
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancelled.streaming_started.notified(),
+        )
+        .await
+        .expect("stream reached executor");
+        assert_eq!(cancelled.cancel(&request_id), 1);
+        let (response, metrics) = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled synthesis settled")
+            .expect("synthesis task joined");
+        assert_eq!(response.expect_err("cancelled fixture"), "speech_cancelled");
+        assert_one_terminal_lease(metrics);
     }
 }
 

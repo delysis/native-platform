@@ -41,6 +41,7 @@ impl PreparedSpeech {
         let qwen = desktop_speech::prepare_local_qwen(
             Some(app_data_dir.join("speech-models")),
             Some(app_data_dir.join("speech-voices/qwen-icl")),
+            mom_llama_runtime::acquire_realtime_compute,
         );
         Self {
             qwen: Arc::new(Mutex::new(qwen)),
@@ -58,6 +59,7 @@ impl PreparedSpeech {
         let qwen = desktop_speech::prepare_local_qwen(
             Some(app_data_dir.join("speech-models")),
             Some(voice_root.to_path_buf()),
+            mom_llama_runtime::acquire_realtime_compute,
         );
         *self.qwen.lock().expect("prepared speech lock") = qwen;
     }

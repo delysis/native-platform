@@ -32,12 +32,14 @@ pub async fn discover_local_host(
 /// Construct the local Qwen backend early enough for its resident model and
 /// reference prefixes to warm while the product unlocks unrelated state. The
 /// returned backend is the one later registered with the speech host; callers
-/// must not create a second copy for the same process.
+/// must not create a second copy for the same process. `acquire_compute` is
+/// called on the warm worker and its guard spans load and graph compilation.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn prepare_local_qwen(
+pub fn prepare_local_qwen<G: Send + 'static>(
     managed_model_root: Option<PathBuf>,
     installed_voice_root: Option<PathBuf>,
+    acquire_compute: impl FnOnce() -> G + Send + 'static,
 ) -> Arc<QwenSpeechBackend> {
     let qwen = Arc::new(QwenSpeechBackend::discover(
         QwenBackendConfig::discover_with_reference_root(
@@ -45,7 +47,7 @@ pub fn prepare_local_qwen(
             installed_voice_root.as_deref(),
         ),
     ));
-    qwen.warm_icl_in_background();
+    qwen.warm_icl_in_background(acquire_compute);
     qwen
 }
 
@@ -67,7 +69,14 @@ pub async fn discover_local_host_with_qwen(
     #[cfg(target_os = "macos")]
     {
         let qwen = prepared_qwen.unwrap_or_else(|| {
-            prepare_local_qwen(managed_model_root.clone(), installed_voice_root.clone())
+            // Discovery never schedules model work. Explicit preparation owns
+            // compute admission; otherwise the first synthesis loads lazily.
+            Arc::new(QwenSpeechBackend::discover(
+                QwenBackendConfig::discover_with_reference_root(
+                    managed_model_root.as_deref(),
+                    installed_voice_root.as_deref(),
+                ),
+            ))
         });
         host.register_backend(qwen.clone())?;
     }
