@@ -104,6 +104,41 @@ qualifying this parser repair. Regression coverage includes empty/nonempty and
 unfinished thought blocks, every UTF-8 split boundary, single-character deltas,
 and agreement between live routing and final parsing.
 
+## Production-path qualification
+
+Tests must call the production policy they claim to qualify. Do not maintain a
+benchmark-only text chunker, normalizer, scheduler, compute-arbitration policy,
+or simulated playback policy as a substitute for the application. Inject inputs
+and failures at the boundary under test, then execute its real implementation.
+For whole-path behavior, retain the real event router, sentence admission,
+adaptive scheduler, native synthesis command and PCM renderer together.
+
+The frontend voice harness executes the actual `onChatEvent`,
+`beginLiveVoiceTts`, `takeLiveSpeechChunk` and imported
+`voice-pipeline-scheduler.js` implementations. It controls native IPC and audio
+I/O to test ownership, reasoning exclusion, sentence admission, EOF ordering,
+backpressure and cancellation. Its synthetic clocks and PCM are not latency or
+physical-playback evidence. Backend integration tests must call the same `MomSpeech` synthesis
+entry points as the app; isolated model tests qualify only that model boundary.
+
+Call performance is measured by starting the exact packaged candidate through
+its normal UI in an isolated profile and reading its persisted
+`voice-latency-history` with `scripts/voice-latency-report.mjs`. This runs the
+production coordinator, native generation and renderer. Bind the trace to the
+candidate executable, source, model, voice reference and device. Record cold
+and warm pickup, content availability, speech dispatch, first PCM, first render,
+renderer underruns and cancellation settlement separately. A missing stage is
+unknown, never zero. Physical speaker quality still requires listening or a
+recording; first PCM is not first audible speech.
+
+There is currently no deterministic automated packaged-call driver. That is an
+explicit qualification gap, not a reason to invent a second call pipeline.
+The retired `real_resident_audio_to_qwen_pipeline_exercises_compute_lease`
+benchmark had private word-count chunking, buffering calculations and reasoning
+routing. Its historical receipts are preserved but cannot qualify current call
+latency or playback. The separate-process CLI pipeline benchmark was retired
+for the same reason. Component tests remain useful only at their stated boundary.
+
 ## Shared generation and speech admission
 
 Direct chat and persona/mention dispatch must use the same incremental model

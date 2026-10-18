@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-// Render an A/B from the same resident streaming route used by the app.
+// Audition the production resident TTS helper directly as a component.
+// This bypasses app routing, scheduling and playback; it cannot measure calls.
 // Usage: node voice-resident-audition.mjs PLAN.json OUTPUT_DIR
 // PLAN: { model, helper, persona_id, text, seed?: 42, references: [{ label, audio }] }
 
@@ -86,7 +87,9 @@ function levelMatchedPCM(pcm, targetRmsDb = -22, maxPeakDb = -1) {
 
 const receipt = {
   schema: 'mom-voice-resident-audition-v1',
-  route: 'Qwen3TTSHelper --resident; same bounded streaming generation as the app',
+  route: 'Qwen3TTSHelper --resident; direct helper component audition',
+  evidence_class: 'tts-helper-component',
+  app_path_exercised: false,
   reference_transcript_use: 'none; resident synthesis uses speaker embedding and decoder context',
   model: resolve(plan.model),
   helper: resolve(plan.helper),

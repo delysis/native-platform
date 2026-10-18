@@ -4,7 +4,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { AdaptiveVoiceLeadController } = require("./voice-pipeline-scheduler.js");
+const voicePipelineScheduler = require("./voice-pipeline-scheduler.js");
+const { AdaptiveVoiceLeadController } = voicePipelineScheduler;
 
 const ui = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
 const style = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
@@ -1278,6 +1279,7 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   let timerNumber = 0;
   let playbackCallbacks = null;
   let firstPcmObserved = false;
+  let bufferedMs = 0;
   const wavBytes = new Uint8Array(46);
   wavBytes.set(Buffer.from("RIFF"), 0);
   new DataView(wavBytes.buffer).setUint32(4, 38, true);
@@ -1294,25 +1296,10 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   let activeLeaf = "previous-leaf";
   const prefills = [];
   const capture = { retainedSamples: [1, 2, 3] };
-  class AdaptiveVoiceLeadController {
-    shouldDispatch() { return true; }
-    shouldBufferCompleteReply() { return false; }
-    shouldPrepareNextCall() { return false; }
-    startupRunwayMs() { return 0; }
-    startupDelayMs() { return 0; }
-    targetRunwayMs() { return 0; }
-    progressTimeoutMs() { return 60_000; }
-    notePacket() {}
-    noteSegment() {}
-    noteWait() {}
-    noteUnderrun() {}
-    calibration() { return {}; }
-    snapshot() { return {}; }
-  }
   const controller = {
     playing: false,
     ready: true,
-    bufferedMs: () => 0,
+    bufferedMs: () => bufferedMs,
     wavBytes: () => wavBytes.slice(),
     reconsiderStartup: async () => false,
     pushSegment(frame, operation) {
@@ -1344,13 +1331,7 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
       querySelector: () => null,
       getElementById: () => null,
     },
-    MomVoicePipelineScheduler: {
-      AdaptiveVoiceLeadController,
-      SemanticLeadController: class {
-        shouldPause() { return false; }
-        snapshot() { return {}; }
-      },
-    },
+    MomVoicePipelineScheduler: { ...voicePipelineScheduler },
     voiceLeadCalibration: null,
     voiceLatencyTrace: { stages: [] },
     MAX_FAILED_VOICE_REPLY_OWNERS: 1,
@@ -1465,10 +1446,67 @@ const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   return {
     context, invocations, delivered, synthesis, pcm, fireLatestTimer,
     startPlayback, notifyBufferLevel, prefills, capture, wireChatEvents,
+    setBufferedMs(value) { bufferedMs = value; },
     setActiveLeaf(value) { activeLeaf = value; },
     wavBytes: () => wavBytes.slice(),
   };
 };
+
+// Exercise the production event router, sentence admission and adaptive scheduler
+// together. Only native IPC and audio-device I/O are controlled test boundaries;
+// these assertions are behavior checks, never real-model latency measurements.
+test("production voice route excludes reasoning and dispatches whole sentences against actual runway policy", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "call", requestId: "shared-route",
+  });
+  h.context.liveVoiceTts = playback;
+  h.wireChatEvents();
+  const send = (event, delta = "") => h.context.dispatchChatEvent({ payload: {
+    event, delta, request_id: "shared-route", conversation_id: "voice-note-conversation",
+  } });
+  send("started");
+  send("reasoning_delta", "Private reasoning must never be spoken. ");
+  assert.equal(h.synthesis().length, 0, "reasoning never reaches native speech synthesis");
+  const prefix = "We can take our time and look at ";
+  send("delta", prefix);
+  assert.equal(h.synthesis().length, 0,
+    "eight complete words are not a sentence and cannot trigger the retired word-count route");
+  const firstSentence = `${prefix}what matters most to you.`;
+  send("delta", "what matters most to you. ");
+  assert.equal(h.synthesis().length, 1);
+  assert.equal(h.synthesis()[0].args.text, firstSentence);
+
+  const secondSentence = "There is no need to rush this conversation.";
+  send("delta", secondSentence);
+  send("text_completed", `${firstSentence} ${secondSentence}`);
+  const completed = playback.finish(`${firstSentence} ${secondSentence}`);
+  h.setBufferedMs(6_000);
+  await h.startPlayback(playback);
+  const settle = (segment, label) => {
+    segment.args.pcmStream.onmessage(h.pcm(label));
+    segment.args.pcmStream.onmessage(h.pcm(`${label}-eof`, true));
+    segment.reply.resolve({ status: "passed", result: { binding: {
+      tts_total_ms: 1, duration_ms: 1,
+    } } });
+  };
+  settle(h.synthesis()[0], "first");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1,
+    "the real adaptive scheduler holds the next sentence while playback has ample audio");
+  assert.ok(h.context.voiceLatencyTrace.stages.some(
+    ({ stage }) => stage === "tts_scheduler_wait_started",
+  ));
+  h.setBufferedMs(0);
+  h.notifyBufferLevel();
+  h.fireLatestTimer();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.synthesis().map(({ args }) => args.text), [firstSentence, secondSentence]);
+  settle(h.synthesis()[1], "second");
+  assert.equal(await completed, true);
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label),
+    ["first", "first-eof", "second", "second-eof"]);
+});
 
 const finishVoiceNoteAudio = async (h, playback) => {
   const completed = playback.finish("A saved spoken reply.");

@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 70,
+  "expected_test_count": 69,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1361,24 +1361,6 @@
       "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
       "prerequisite": "requires locally discoverable Qwen Base ICL model, helper, and persona reference audio",
       "required_environment": [],
-      "evidence_class": "real-model-runtime",
-      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
-      "platforms": [
-        "macos"
-      ]
-    },
-    {
-      "test_id": "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
-      "package": "mom-llama-app",
-      "target": "lib",
-      "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
-      "prerequisite": "requires Gemma audio model/projector, Qwen helper/model/voice archive, and benchmark WAV",
-      "required_environment": [
-        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
-        "MOM_LLAMA_MM_PROJ_PATH",
-        "MOM_LLAMA_TEST_VOICE_WAV",
-        "MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT"
-      ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
       "platforms": [
