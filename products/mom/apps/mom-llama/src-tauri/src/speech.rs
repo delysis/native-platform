@@ -1234,6 +1234,7 @@ impl MomSpeech {
         let tts_helper_code_generation_us = response.usage.helper_code_generation_us;
         let tts_helper_prepared_prefix_cache_hit = response.usage.helper_prepared_prefix_cache_hit;
         let tts_helper_first_decode_us = response.usage.helper_first_decode_us;
+        let tts_generation_segments = response.usage.helper_generation_segments.clone();
         let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
         let tts_total_ms = response.usage.total_ms;
         let duration_ms = match validate_read_aloud_response(response, &request_id, &selection) {
@@ -1278,7 +1279,7 @@ impl MomSpeech {
             tts_helper_code_generation_us,
             tts_helper_prepared_prefix_cache_hit,
             tts_helper_first_decode_us,
-            tts_generation_segments: response.usage.helper_generation_segments.clone(),
+            tts_generation_segments,
             tts_time_to_first_audio_ms,
             tts_total_ms,
             tts_voice_lookup_us,
