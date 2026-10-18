@@ -49,10 +49,17 @@ impl VoiceCatalog {
             Some(hub) => Source::Hub(hub),
             None => {
                 let path = PathBuf::from(source);
-                Source::Local(if path.is_dir() { path.join(CATALOG_FILE) } else { path })
+                Source::Local(if path.is_dir() {
+                    path.join(CATALOG_FILE)
+                } else {
+                    path
+                })
             }
         };
-        Ok(Self { source, voices: OnceLock::new() })
+        Ok(Self {
+            source,
+            voices: OnceLock::new(),
+        })
     }
 
     /// The catalog's voices, in file order. The first call reads or downloads the catalog.
@@ -84,7 +91,9 @@ impl VoiceCatalog {
         if file.is_empty()
             || file.contains(['\\', ':'])
             || file.starts_with('/')
-            || file.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+            || file
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == "..")
         {
             return Err(Error::invalid_data(format!(
                 "voice '{}' names the file '{file}', which is not a path inside the catalog",
@@ -105,8 +114,10 @@ impl VoiceCatalog {
     pub fn register(&self, synth: &mut Synth, query: &str) -> Result<String> {
         let known = synth.voices();
         let folded = fold(query);
-        if let Some(name) =
-            known.iter().find(|v| *v == query).or_else(|| known.iter().find(|v| fold(v) == folded))
+        if let Some(name) = known
+            .iter()
+            .find(|v| *v == query)
+            .or_else(|| known.iter().find(|v| fold(v) == folded))
         {
             return Ok(name.clone());
         }
@@ -119,7 +130,9 @@ impl VoiceCatalog {
                 known.join(", ")
             ))
         })?;
-        let Some(voice) = found else { return Ok(query.to_string()) };
+        let Some(voice) = found else {
+            return Ok(query.to_string());
+        };
         if !known.contains(&voice.name) {
             let path = self.fetch(voice)?;
             synth.add_voice_file(&voice.name, &path)?;
@@ -219,7 +232,10 @@ mod tests {
     fn a_local_voice_file_is_found_beside_the_catalog() {
         let (catalog, dir) = catalog(CATALOG);
         let zoey = catalog.find("zoey").unwrap().unwrap().clone();
-        assert_eq!(catalog.fetch(&zoey).unwrap(), dir.join("voices/a1.safetensors"));
+        assert_eq!(
+            catalog.fetch(&zoey).unwrap(),
+            dir.join("voices/a1.safetensors")
+        );
     }
 
     #[test]
