@@ -186,7 +186,10 @@ mod tests {
         // `xn::Error::msg` captures a backtrace when `RUST_BACKTRACE` is set, and prints it
         // below the message -- so compare the first line rather than the whole string. What
         // this asserts is that nothing wrapped the message, not that xn kept it bare.
-        assert_eq!(there.to_string().lines().next(), Some("device out of memory"));
+        assert_eq!(
+            there.to_string().lines().next(),
+            Some("device out of memory")
+        );
         assert!(matches!(Error::from(there), Error::Tensor(_)));
 
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
@@ -208,10 +211,16 @@ mod tests {
         let converted = Error::from(nested);
         assert!(matches!(converted, Error::Io(_)), "{converted:?}");
         // The path lives in the wrapper, so it has to survive the conversion.
-        assert!(converted.to_string().contains("voice.safetensors"), "{converted}");
+        assert!(
+            converted.to_string().contains("voice.safetensors"),
+            "{converted}"
+        );
 
         // Anything else from that layer is still a tensor failure.
-        assert!(matches!(Error::from(xn::Error::msg("shape mismatch")), Error::Tensor(_)));
+        assert!(matches!(
+            Error::from(xn::Error::msg("shape mismatch")),
+            Error::Tensor(_)
+        ));
     }
 
     #[test]
@@ -229,8 +238,13 @@ mod tests {
     fn unknown_voice_hands_back_the_names_that_would_have_worked() {
         // The reason this variant carries fields at all: a caller can correct itself, or print
         // the list, without parsing it back out of the message.
-        let e = Error::UnknownVoice { name: "nobody".into(), known: vec!["alba".into()] };
-        let Error::UnknownVoice { known, .. } = &e else { panic!("{e:?}") };
+        let e = Error::UnknownVoice {
+            name: "nobody".into(),
+            known: vec!["alba".into()],
+        };
+        let Error::UnknownVoice { known, .. } = &e else {
+            panic!("{e:?}")
+        };
         assert_eq!(known, &["alba"]);
     }
 }

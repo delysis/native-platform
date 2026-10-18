@@ -29,8 +29,9 @@ pub(super) fn urls(word: &str, lang: Lang) -> Option<String> {
 
     let (label, mut rest) = run(rest, |c| c.is_alphanumeric() || c == '-')?;
     let mut labels = vec![label];
-    while let Some((label, after)) =
-        rest.strip_prefix('.').and_then(|r| run(r, |c| c.is_alphanumeric() || c == '-'))
+    while let Some((label, after)) = rest
+        .strip_prefix('.')
+        .and_then(|r| run(r, |c| c.is_alphanumeric() || c == '-'))
     {
         labels.push(label);
         rest = after;
@@ -98,7 +99,11 @@ mod tests {
     fn addresses_are_read_out() {
         let cases = [
             (Lang::En, "www.example.com", "W-W-W dot example dot com"),
-            (Lang::En, "www.example.com/", "W-W-W dot example dot com slash"),
+            (
+                Lang::En,
+                "www.example.com/",
+                "W-W-W dot example dot com slash",
+            ),
             (
                 Lang::En,
                 "https://www.example.com/path/to-page/",
@@ -128,12 +133,20 @@ mod tests {
             (Lang::En, "abc.net.au", "abc dot net dot A-U"),
             (Lang::En, "gmail.gmail", "gmail dot gmail"),
             // A capitalized domain is an address when a scheme or `www.` says so.
-            (Lang::En, "https://kyutai.Fr", "H-T-T-P-S colon slash slash kyutai dot F-R"),
+            (
+                Lang::En,
+                "https://kyutai.Fr",
+                "H-T-T-P-S colon slash slash kyutai dot F-R",
+            ),
             (Lang::En, "www.example.Com", "W-W-W dot example dot Com"),
             (Lang::En, "EXAMPLE.COM", "EXAMPLE dot COM"),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(urls(input, lang).as_deref(), Some(expected), "{lang:?} {input:?}");
+            assert_eq!(
+                urls(input, lang).as_deref(),
+                Some(expected),
+                "{lang:?} {input:?}"
+            );
         }
         let declined = [
             "test.",

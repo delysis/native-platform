@@ -34,9 +34,22 @@ mod tests {
             ("1/5", "1-5"),
         ];
         for (input, expected) in cases {
-            assert_eq!(dates(input, Lang::En).as_deref(), Some(expected), "{input:?}");
+            assert_eq!(
+                dates(input, Lang::En).as_deref(),
+                Some(expected),
+                "{input:?}"
+            );
         }
-        for input in ["1/5/", "1/5/2", "1/5/20111", "123/5", "1/", "/5", "1-5", "1/5/2011/"] {
+        for input in [
+            "1/5/",
+            "1/5/2",
+            "1/5/20111",
+            "123/5",
+            "1/",
+            "/5",
+            "1-5",
+            "1/5/2011/",
+        ] {
             assert_eq!(dates(input, Lang::En), None, "{input:?}");
         }
     }

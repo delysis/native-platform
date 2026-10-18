@@ -87,8 +87,10 @@ impl Checkpoint {
         } else {
             // HF cache files can link to blobs outside the snapshot. Their neighbors
             // belong to the supplied path's parent rather than the blob directory.
-            let parent =
-                input.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let parent = input
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
             (std::fs::canonicalize(parent)?, path)
         };
         let config = read_config(config_path)?;
@@ -113,7 +115,13 @@ impl Checkpoint {
         let tokenizer = tokenizer.is_file().then_some(tokenizer);
         let mut voices = crate::loader::checkpoint_voices(&dir);
         voices.sort();
-        Ok(Self { config, weights, tokenizer, voices, quant: options.quant })
+        Ok(Self {
+            config,
+            weights,
+            tokenizer,
+            voices,
+            quant: options.quant,
+        })
     }
 
     pub fn builder(&self, normalize: impl Into<Normalize>) -> SynthBuilder {
@@ -154,7 +162,10 @@ pub fn legacy_source(config: &str, revision: Option<&str>) -> Result<String> {
     let local = path.exists()
         || path.has_root()
         || path.starts_with(".")
-        || path.components().next().is_some_and(|c| c.as_os_str() == "..")
+        || path
+            .components()
+            .next()
+            .is_some_and(|c| c.as_os_str() == "..")
         || path.extension().is_some_and(|ext| ext == "json");
     if config.starts_with(crate::hub::SCHEME) && revision.is_some() {
         return Err(Error::InvalidArgument(
@@ -169,7 +180,10 @@ pub fn legacy_source(config: &str, revision: Option<&str>) -> Result<String> {
         }
         return Ok(config.to_string());
     }
-    let hub = HubSource { repo: config.to_string(), revision: revision.map(str::to_string) };
+    let hub = HubSource {
+        repo: config.to_string(),
+        revision: revision.map(str::to_string),
+    };
     Ok(hub.to_string())
 }
 
@@ -190,7 +204,9 @@ pub(crate) fn validate_relative_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.contains(['\\', ':'])
         || path.starts_with('/')
-        || path.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+        || path
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
     {
         return Err(Error::InvalidData(format!(
             "weights path '{path}' must be relative to the checkpoint root"
@@ -201,7 +217,10 @@ pub(crate) fn validate_relative_path(path: &str) -> Result<()> {
 
 fn required_file(path: &Path) -> Result<PathBuf> {
     if !path.is_file() {
-        return Err(Error::NotFound(format!("checkpoint file is missing: {}", path.display())));
+        return Err(Error::NotFound(format!(
+            "checkpoint file is missing: {}",
+            path.display()
+        )));
     }
     Ok(path.to_path_buf())
 }

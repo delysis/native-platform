@@ -106,7 +106,11 @@ impl DeviceKind {
     /// the CPU whatever GPU backend is compiled in, so `auto` never picks a
     /// device that would refuse them.
     pub fn resolve_for(self, quant: Quant) -> Self {
-        if self == Self::Auto && quant != Quant::F32 { Self::Cpu } else { self.resolve() }
+        if self == Self::Auto && quant != Quant::F32 {
+            Self::Cpu
+        } else {
+            self.resolve()
+        }
     }
 }
 
@@ -165,8 +169,9 @@ impl Quant {
             (DeviceKind::Vulkan, "vulkan", cfg!(feature = "vulkan")),
             (DeviceKind::Metal, "metal", cfg!(feature = "metal")),
         ];
-        if let Some((_, name, _)) =
-            backends.iter().find(|(kind, _, compiled)| *kind == device && !compiled)
+        if let Some((_, name, _)) = backends
+            .iter()
+            .find(|(kind, _, compiled)| *kind == device && !compiled)
         {
             let available: Vec<_> = backends
                 .iter()
@@ -308,8 +313,13 @@ fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
             Some(coef) if coef != 1.0 => Some(coef),
             _ => None,
         },
-        max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
-        post_process: opts.post_process.clone().unwrap_or_else(|| defaults.post_process.clone()),
+        max_tokens_per_chunk: opts
+            .max_tokens_per_chunk
+            .unwrap_or(defaults.max_tokens_per_chunk),
+        post_process: opts
+            .post_process
+            .clone()
+            .unwrap_or_else(|| defaults.post_process.clone()),
     })
 }
 
@@ -383,18 +393,30 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// Called whenever a voice is (re)registered, so a replaced embedding is never generated
     /// from the old conditioning.
     fn forget_primed(&self, name: &str) {
-        let mut primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut primed = self
+            .primed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         primed.retain(|(voice, _), _| voice != name);
     }
 
     /// The voice a request speaks in: the one it names, else the default. `None` when there
     /// are no voices, and generation is then unconditioned.
     fn voice_for(&self, name: Option<&str>) -> Result<Option<(&str, &Voice<Q>)>> {
-        let default = if name.is_none() { self.default_voice() } else { None };
-        let Some(name) = name.or(default.as_deref()) else { return Ok(None) };
+        let default = if name.is_none() {
+            self.default_voice()
+        } else {
+            None
+        };
+        let Some(name) = name.or(default.as_deref()) else {
+            return Ok(None);
+        };
         match self.voices.get_key_value(name) {
             Some((name, voice)) => Ok(Some((name.as_str(), voice))),
-            None => Err(Error::UnknownVoice { name: name.to_string(), known: self.voices() }),
+            None => Err(Error::UnknownVoice {
+                name: name.to_string(),
+                known: self.voices(),
+            }),
         }
     }
 
@@ -429,23 +451,33 @@ impl<Q: BackendQ> SynthOf<Q> {
             // Its own variant rather than `SeqBudgetExceeded`: nothing about the text is
             // wrong here, so "split the text" would be useless advice, and the prompt
             // length alone cannot say what budget would actually work.
-            return Err(Error::VoicePromptTooLong { frames, budget: seq_budget });
+            return Err(Error::VoicePromptTooLong {
+                frames,
+                budget: seq_budget,
+            });
         }
 
         let key = (name.to_string(), cfg_coef.is_some());
         // Prime outside the lock so first callers for different voices do not serialise; a
         // same-voice race primes twice and the second insert wins, harmlessly.
         let cached = {
-            let primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            primed.get(&key).map(|p| (p.state.clone(), p.null_state.clone()))
+            let primed = self
+                .primed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            primed
+                .get(&key)
+                .map(|p| (p.state.clone(), p.null_state.clone()))
         };
         let (prefix, null_prefix) = match cached {
             Some(hit) => hit,
             None => {
                 let fresh = self.prime(voice, cfg_coef.is_some(), frames)?;
                 let out = (fresh.state.clone(), fresh.null_state.clone());
-                let mut primed =
-                    self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut primed = self
+                    .primed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if primed.len() >= MAX_PRIMED {
                     primed.clear();
                 }
@@ -559,8 +591,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
     }
 
     fn default_voice(&self) -> Option<String> {
-        let found = self.voices.get_key_value("default").or_else(|| self.voices.iter().next());
-        self.defaults.voice.clone().or_else(|| found.map(|(name, _)| name.clone()))
+        let found = self
+            .voices
+            .get_key_value("default")
+            .or_else(|| self.voices.iter().next());
+        self.defaults
+            .voice
+            .clone()
+            .or_else(|| found.map(|(name, _)| name.clone()))
     }
 
     fn supports_voice_cloning(&self) -> bool {
@@ -578,7 +616,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
         let emb = loader::load_voice_emb(path, embeddings_ext, self.model.speaker_proj(), &dev)?
             .to::<Q::T>()?;
         self.forget_primed(name);
-        self.voices.insert(name.to_string(), Voice { emb, null_emb: None, conditions: None });
+        self.voices.insert(
+            name.to_string(),
+            Voice {
+                emb,
+                null_emb: None,
+                conditions: None,
+            },
+        );
         Ok(())
     }
 
@@ -625,7 +670,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             Some(enc.encode_audio(&pcm.zeros_like()?)?)
         };
         self.forget_primed(name);
-        self.voices.insert(name.to_string(), Voice { emb, null_emb, conditions: None });
+        self.voices.insert(
+            name.to_string(),
+            Voice {
+                emb,
+                null_emb,
+                conditions: None,
+            },
+        );
         Ok(())
     }
 
@@ -660,7 +712,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             Some(null) => Some(to_tensor(null)?),
         };
         self.forget_primed(name);
-        self.voices.insert(name.to_string(), Voice { emb, null_emb, conditions: None });
+        self.voices.insert(
+            name.to_string(),
+            Voice {
+                emb,
+                null_emb,
+                conditions: None,
+            },
+        );
         Ok(())
     }
 
@@ -684,7 +743,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             loader::project_latents(&latents, "the voice latents", self.model.speaker_proj())?
                 .to::<Q::T>()?;
         self.forget_primed(name);
-        self.voices.insert(name.to_string(), Voice { emb, null_emb: None, conditions: None });
+        self.voices.insert(
+            name.to_string(),
+            Voice {
+                emb,
+                null_emb: None,
+                conditions: None,
+            },
+        );
         Ok(())
     }
 
@@ -708,7 +774,10 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             }
         }
         self.conditions = default;
-        self.primed.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.primed
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
@@ -729,7 +798,10 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
     }
 
     fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<Session> {
-        Ok(Session(Box::new(self.session_at(&resolve(&self.defaults, opts)?, max_seq_len)?)))
+        Ok(Session(Box::new(self.session_at(
+            &resolve(&self.defaults, opts)?,
+            max_seq_len,
+        )?)))
     }
 
     fn session_default(&self, opts: &SpeechOptions) -> Result<Session> {
@@ -774,9 +846,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             Some((_, voice)) => voice.emb.dim(1usize)?,
             None => 0,
         };
-        let text = chunks.iter().map(|c| c.tokens.len() + c.frame_budget).max().unwrap_or(0);
+        let text = chunks
+            .iter()
+            .map(|c| c.tokens.len() + c.frame_budget)
+            .max()
+            .unwrap_or(0);
         let seq_budget = text + prompt.max(plan::PROMPT_SEQ_HEADROOM);
-        self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
+        self.session_at(&settings, seq_budget)?
+            .stream_chunks(chunks, rng)
     }
 
     fn quant(&self) -> Quant {
@@ -786,9 +863,17 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
 
 /// A fresh, independently-owned state at `seq_budget`, seeded with `prefix`'s filled positions.
 fn grow<Q: BackendQ>(prefix: &TTSState<Q>, seq_budget: usize) -> Result<TTSState<Q>> {
-    let transformer_state = prefix.flow_lm_state.transformer_state.with_seq_budget(seq_budget)?;
+    let transformer_state = prefix
+        .flow_lm_state
+        .transformer_state
+        .with_seq_budget(seq_budget)?;
     let conditions = prefix.flow_lm_state.conditions.clone();
-    Ok(TTSState { flow_lm_state: crate::flow_lm::FlowLMState { transformer_state, conditions } })
+    Ok(TTSState {
+        flow_lm_state: crate::flow_lm::FlowLMState {
+            transformer_state,
+            conditions,
+        },
+    })
 }
 
 /// Split `text` into chunks and work out the budgets for each, cutting any chunk of more than
@@ -889,7 +974,10 @@ impl<Q: BackendQ> SessionOf<Q> {
             .max()
             .unwrap_or(0);
         if needed > self.seq_budget {
-            return Err(Error::SeqBudgetExceeded { needed, budget: self.seq_budget });
+            return Err(Error::SeqBudgetExceeded {
+                needed,
+                budget: self.seq_budget,
+            });
         }
         // Claimed before anything is cloned: the state clone shares its KV
         // storage, so a second generation would write into the same buffers.
@@ -926,8 +1014,9 @@ impl<Q: BackendQ> SessionOf<Q> {
             let model = Arc::clone(&self.model);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result =
-                    run_inline(&model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post);
+                let result = run_inline(
+                    &model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -967,7 +1056,9 @@ impl<Q: BackendQ> SessionOf<Q> {
                     let mut reset_after = false;
                     let mut batch = vec![first];
                     while batch.len() < DECODE_BATCH {
-                        let Ok(frame) = latent_rx.try_recv() else { break };
+                        let Ok(frame) = latent_rx.try_recv() else {
+                            break;
+                        };
                         match frame {
                             // Past a chunk boundary the codec state resets, so the
                             // batch has to stop here and resume on the next frame.
@@ -1024,8 +1115,9 @@ impl<Q: BackendQ> SessionOf<Q> {
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result =
-                    run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx);
+                let result = run_backbone(
+                    &model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1096,7 +1188,12 @@ impl<Q: BackendQ> SessionApi for SessionOf<Q> {
             return Err(Error::invalid_argument("nothing to synthesize: no tokens"));
         }
         let frame_budget = plan::frame_budget(tokens.len(), self.frame_rate);
-        let chunk = Chunk { text: String::new(), tokens, frames_after_eos, frame_budget };
+        let chunk = Chunk {
+            text: String::new(),
+            tokens,
+            frames_after_eos,
+            frame_budget,
+        };
         self.stream_chunks(vec![chunk], rng)
     }
 }
@@ -1667,7 +1764,9 @@ impl SynthBuilder {
     // backends before dispatch; the stubs retain errors as a backstop.
     #[cfg(not(feature = "cuda"))]
     fn build_cuda(self) -> Result<Synth> {
-        Err(Error::unsupported("this build has no CUDA support; rebuild with the `cuda` feature"))
+        Err(Error::unsupported(
+            "this build has no CUDA support; rebuild with the `cuda` feature",
+        ))
     }
 
     #[cfg(not(feature = "vulkan"))]
@@ -1679,7 +1778,9 @@ impl SynthBuilder {
 
     #[cfg(not(feature = "metal"))]
     fn build_metal(self) -> Result<Synth> {
-        Err(Error::unsupported("this build has no Metal support; rebuild with the `metal` feature"))
+        Err(Error::unsupported(
+            "this build has no Metal support; rebuild with the `metal` feature",
+        ))
     }
 
     /// Load the weights and register the voices. `inline_decode` is forwarded to
@@ -1708,7 +1809,10 @@ impl SynthBuilder {
         };
         // A dedicated speaker codec ships its encoder under its own prefix, so
         // probe there rather than assuming `mimi.encoder.*`.
-        let probe = format!("{}.encoder.model.0.conv.weight", config.speaker_mimi_prefix());
+        let probe = format!(
+            "{}.encoder.model.0.conv.weight",
+            config.speaker_mimi_prefix()
+        );
         let mimi_enc = if self.load_voice_encoder && vb.contains(&probe) {
             Some(MimiEnc::<Q>::load(&vb, &config)?)
         } else {
@@ -1741,9 +1845,14 @@ impl SynthBuilder {
         };
 
         for (name, emb) in baked_voices {
-            synth
-                .voices
-                .insert(name, Voice { emb: emb.to::<Q::T>()?, null_emb: None, conditions: None });
+            synth.voices.insert(
+                name,
+                Voice {
+                    emb: emb.to::<Q::T>()?,
+                    null_emb: None,
+                    conditions: None,
+                },
+            );
         }
         synth.set_conditions(self.conditions.clone())?;
         for (name, path) in self.voices.iter() {
@@ -1754,7 +1863,10 @@ impl SynthBuilder {
             && !synth.voices.contains_key(name)
         {
             let known = synth.voices();
-            return Err(Error::UnknownVoice { name: name.clone(), known });
+            return Err(Error::UnknownVoice {
+                name: name.clone(),
+                known,
+            });
         }
         Ok(synth)
     }
@@ -2110,7 +2222,10 @@ mod tests {
         // In a GPU build too: a GPU backend refuses quantized weights, so `auto` must not pick one.
         assert_eq!(DeviceKind::Auto.resolve_for(Quant::Q80), DeviceKind::Cpu);
         assert!(Quant::Q80.check_device(DeviceKind::Auto).is_ok());
-        assert_eq!(DeviceKind::Auto.resolve_for(Quant::F32), DeviceKind::Auto.resolve());
+        assert_eq!(
+            DeviceKind::Auto.resolve_for(Quant::F32),
+            DeviceKind::Auto.resolve()
+        );
         assert_eq!(DeviceKind::Metal.resolve_for(Quant::Q80), DeviceKind::Metal);
     }
 
@@ -2176,7 +2291,11 @@ mod tests {
     /// could stand in for a language the caller never named.
     #[test]
     fn the_builder_keeps_the_policy_it_was_given() {
-        for norm in [Normalize::for_lang(Lang::En), Normalize::for_lang(Lang::De), Normalize::OFF] {
+        for norm in [
+            Normalize::for_lang(Lang::En),
+            Normalize::for_lang(Lang::De),
+            Normalize::OFF,
+        ] {
             let b = SynthBuilder::new(crate::test_config(), "model.safetensors", norm);
             assert_eq!(b.normalize, norm);
         }
@@ -2189,7 +2308,10 @@ mod tests {
             "model.safetensors",
             Normalize::for_lang(Lang::En),
         );
-        assert!(default.load_voice_encoder, "default must preserve PCM voice support");
+        assert!(
+            default.load_voice_encoder,
+            "default must preserve PCM voice support"
+        );
 
         let precomputed = default.temperature(0.6).seed(7).precomputed_voices_only();
         assert!(!precomputed.load_voice_encoder);
@@ -2207,19 +2329,25 @@ mod tests {
 
         let flag = Arc::new(AtomicBool::new(false));
         assert!(
-            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
             "an idle session must be claimable"
         );
         assert!(
-            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err(),
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err(),
             "a claimed session must refuse a second generation"
         );
 
         let guard = InFlight(Arc::clone(&flag));
         drop(guard);
-        assert!(!flag.load(Ordering::Acquire), "the guard must release the session");
         assert!(
-            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            !flag.load(Ordering::Acquire),
+            "the guard must release the session"
+        );
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
             "and the next generation must be able to claim it"
         );
     }
@@ -2274,15 +2402,24 @@ mod tests {
             failed: false,
             workers: Some(Vec::new()),
         };
-        assert!(matches!(stream.recv_timeout(Duration::ZERO), SpeechStreamPoll::Pending));
+        assert!(matches!(
+            stream.recv_timeout(Duration::ZERO),
+            SpeechStreamPoll::Pending
+        ));
         tx.send(Ok(vec![0.25, -0.25])).unwrap();
         match stream.recv_timeout(Duration::from_secs(1)) {
             SpeechStreamPoll::Chunk(Ok(samples)) => assert_eq!(samples, [0.25, -0.25]),
             other => panic!("expected PCM chunk, got {}", poll_name(&other)),
         }
         drop(tx);
-        assert!(matches!(stream.recv_timeout(Duration::from_secs(1)), SpeechStreamPoll::Finished));
-        assert!(matches!(stream.recv_timeout(Duration::ZERO), SpeechStreamPoll::Finished));
+        assert!(matches!(
+            stream.recv_timeout(Duration::from_secs(1)),
+            SpeechStreamPoll::Finished
+        ));
+        assert!(matches!(
+            stream.recv_timeout(Duration::ZERO),
+            SpeechStreamPoll::Finished
+        ));
     }
 
     fn poll_name(poll: &SpeechStreamPoll) -> &'static str {
@@ -2316,7 +2453,10 @@ mod tests {
             }
             other => panic!("expected worker error, got {}", poll_name(&other)),
         }
-        assert!(matches!(stream.recv_timeout(Duration::ZERO), SpeechStreamPoll::Finished));
+        assert!(matches!(
+            stream.recv_timeout(Duration::ZERO),
+            SpeechStreamPoll::Finished
+        ));
     }
 
     #[test]
@@ -2343,7 +2483,10 @@ mod tests {
             SpeechStreamPoll::Chunk(Err(_))
         ));
         assert!(stopped.load(Ordering::Acquire));
-        assert!(matches!(stream.recv_timeout(Duration::ZERO), SpeechStreamPoll::Finished));
+        assert!(matches!(
+            stream.recv_timeout(Duration::ZERO),
+            SpeechStreamPoll::Finished
+        ));
     }
 
     #[test]
@@ -2374,18 +2517,34 @@ mod tests {
         let from_request = SpeechOptions::default().cfg_coef(1.0);
         assert_eq!(resolve(&defaults(), &from_request).unwrap().cfg_coef, None);
         assert_eq!(
-            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0)).unwrap().cfg_coef,
+            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0))
+                .unwrap()
+                .cfg_coef,
             Some(2.0)
         );
         // From the builder, and when a request turns the builder's off.
-        let enabled = Defaults { cfg_coef: Some(3.0), ..defaults() };
+        let enabled = Defaults {
+            cfg_coef: Some(3.0),
+            ..defaults()
+        };
         assert_eq!(
-            resolve(&Defaults { cfg_coef: Some(1.0), ..defaults() }, &SpeechOptions::default())
-                .unwrap()
-                .cfg_coef,
+            resolve(
+                &Defaults {
+                    cfg_coef: Some(1.0),
+                    ..defaults()
+                },
+                &SpeechOptions::default()
+            )
+            .unwrap()
+            .cfg_coef,
             None
         );
         assert_eq!(resolve(&enabled, &from_request).unwrap().cfg_coef, None);
-        assert_eq!(resolve(&enabled, &SpeechOptions::default()).unwrap().cfg_coef, Some(3.0));
+        assert_eq!(
+            resolve(&enabled, &SpeechOptions::default())
+                .unwrap()
+                .cfg_coef,
+            Some(3.0)
+        );
     }
 }

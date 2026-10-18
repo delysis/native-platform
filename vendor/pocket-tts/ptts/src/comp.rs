@@ -101,7 +101,11 @@ mod compressor {
                     Detector::Peak => x.abs(),
                     Detector::Rms => x * x,
                 };
-                let coef = if detect > self.envelope { self.attack_coef } else { self.decay_coef };
+                let coef = if detect > self.envelope {
+                    self.attack_coef
+                } else {
+                    self.decay_coef
+                };
                 self.envelope = detect + coef * (self.envelope - detect);
 
                 let level = match self.detector {
@@ -164,7 +168,9 @@ mod gain {
 
     impl Gain {
         pub fn new(gain_db: f32) -> Self {
-            Self { gain: 10f32.powf(gain_db * (1.0 / 20.0)) }
+            Self {
+                gain: 10f32.powf(gain_db * (1.0 / 20.0)),
+            }
         }
 
         pub fn from_config(_sample_rate: u32, cfg: &GainConfig) -> Self {
@@ -229,7 +235,12 @@ mod limiter {
         }
 
         pub fn from_config(sample_rate: u32, cfg: &LimiterConfig) -> Self {
-            Self::new(sample_rate, cfg.lookahead_ms, cfg.headroom_db, cfg.release_ms)
+            Self::new(
+                sample_rate,
+                cfg.lookahead_ms,
+                cfg.headroom_db,
+                cfg.release_ms,
+            )
         }
     }
 
@@ -265,7 +276,11 @@ mod limiter {
 
                 // Gain required so the loudest sample in the window hits exactly
                 // the ceiling (or unity if everything is already below).
-                let target = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
+                let target = if peak > self.ceiling {
+                    self.ceiling / peak
+                } else {
+                    1.0
+                };
 
                 // Snap down instantly when we see a new (lower) target — the
                 // lookahead delay is what gives us the smooth pre-attenuation
@@ -303,7 +318,11 @@ pub use gain::{Gain, GainConfig};
 pub use limiter::{Limiter, LimiterConfig};
 
 pub(crate) fn time_const_coef(time_ms: f32, sample_rate: f32) -> f32 {
-    if time_ms <= 0.0 { 0.0 } else { (-1.0 / (time_ms * 0.001 * sample_rate)).exp() }
+    if time_ms <= 0.0 {
+        0.0
+    } else {
+        (-1.0 / (time_ms * 0.001 * sample_rate)).exp()
+    }
 }
 
 /// A streaming audio processing module. Operates on `f32` mono samples
@@ -328,7 +347,10 @@ pub struct Chain {
 
 impl Chain {
     pub fn new(sample_rate: u32) -> Self {
-        Self { modules: Vec::new(), sample_rate }
+        Self {
+            modules: Vec::new(),
+            sample_rate,
+        }
     }
 
     pub fn push<M: Into<Module>>(&mut self, module: M) -> &mut Self {
@@ -357,7 +379,10 @@ impl Chain {
     }
 
     pub fn from_modules(sample_rate: u32, modules: &[ModuleConfig]) -> Self {
-        Self { modules: modules.iter().map(|m| m.build(sample_rate)).collect(), sample_rate }
+        Self {
+            modules: modules.iter().map(|m| m.build(sample_rate)).collect(),
+            sample_rate,
+        }
     }
 
     pub fn gain_compressor_limiter(gain_db: f32, sample_rate: u32) -> Self {

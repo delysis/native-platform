@@ -18,14 +18,19 @@ pub(super) fn times(word: &str, lang: Lang) -> Option<String> {
 /// needs the `AM` / `PM`: "12.30" is as likely a decimal number.
 fn en(word: &str) -> Option<String> {
     let (hour, minutes, separator, rest) = parse(word, &[':', '.'])?;
-    let meridiem =
-        ["AM", "PM", "am", "pm"].into_iter().find_map(|m| Some((m, rest.strip_prefix(m)?)));
+    let meridiem = ["AM", "PM", "am", "pm"]
+        .into_iter()
+        .find_map(|m| Some((m, rest.strip_prefix(m)?)));
     let (meridiem, rest) = meridiem.unwrap_or(("", rest));
     let suffix = suffix(rest)?;
     if separator == '.' && meridiem.is_empty() {
         return None;
     }
-    let time = if minutes == "00" { hour.to_string() } else { format!("{hour}-{minutes}") };
+    let time = if minutes == "00" {
+        hour.to_string()
+    } else {
+        format!("{hour}-{minutes}")
+    };
     match meridiem {
         "" => Some(format!("{time}{suffix}")),
         meridiem => Some(format!("{time} {}{suffix}", meridiem.to_uppercase())),
@@ -54,7 +59,11 @@ fn parse<'a>(word: &'a str, separators: &[char]) -> Option<(&'a str, &'a str, ch
     let (hour, rest) = digits(word, 1, 2)?;
     let separator = rest.chars().next().filter(|c| separators.contains(c))?;
     let (minutes, rest) = digits(&rest[separator.len_utf8()..], 2, 4)?;
-    let hour = if hour.len() == 2 { hour.strip_prefix('0').unwrap_or(hour) } else { hour };
+    let hour = if hour.len() == 2 {
+        hour.strip_prefix('0').unwrap_or(hour)
+    } else {
+        hour
+    };
     Some((hour, minutes, separator, rest))
 }
 
@@ -83,7 +92,11 @@ mod tests {
             (Lang::De, "8:00.", "8 Uhr."),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(times(input, lang).as_deref(), Some(expected), "{lang:?} {input:?}");
+            assert_eq!(
+                times(input, lang).as_deref(),
+                Some(expected),
+                "{lang:?} {input:?}"
+            );
         }
         let declined = [
             // A dot without AM / PM may be a decimal number.

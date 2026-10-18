@@ -74,7 +74,13 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, out_dim)?;
         let out_proj = Q::linear_load(vb.pp("out_proj"), embed_dim, embed_dim)?;
         let device = vb.device().clone();
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, device })
+        Ok(Self {
+            in_proj,
+            out_proj,
+            embed_dim,
+            num_heads,
+            device,
+        })
     }
 
     pub fn init_state(
@@ -87,7 +93,11 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let dev = &self.device;
         let k_cache = Tensor::zeros(shape, dev)?;
         let v_cache = Tensor::zeros(shape, dev)?;
-        Ok(StreamingMHAState { k_cache, v_cache, current_end: 0 })
+        Ok(StreamingMHAState {
+            k_cache,
+            v_cache,
+            current_end: 0,
+        })
     }
 
     #[tracing::instrument(name = "attn", skip_all)]
@@ -104,15 +114,19 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let projected = self.in_proj.forward(query)?;
         // Split into q, k, v by narrowing on the last dimension
         let ed = self.embed_dim;
-        let q = projected.narrow(2, 0..ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
+        let q = projected
+            .narrow(2, 0..ed)?
+            .contiguous()?
+            .reshape((b, t, self.num_heads, d))?;
         let k =
-            projected.narrow(2, ed..2 * ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = projected.narrow(2, 2 * ed..3 * ed)?.contiguous()?.reshape((
-            b,
-            t,
-            self.num_heads,
-            d,
-        ))?;
+            projected
+                .narrow(2, ed..2 * ed)?
+                .contiguous()?
+                .reshape((b, t, self.num_heads, d))?;
+        let v = projected
+            .narrow(2, 2 * ed..3 * ed)?
+            .contiguous()?
+            .reshape((b, t, self.num_heads, d))?;
 
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
@@ -139,7 +153,9 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             let x = attn.matmul(&v)?;
 
             // Back to [b, t, h*d]
-            x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?.contiguous()?
+            x.transpose(1, 2)?
+                .reshape((b, t, self.embed_dim))?
+                .contiguous()?
         };
         self.out_proj.forward(&x)
     }
@@ -157,7 +173,12 @@ pub struct KvCache<T: WithDTypeF, B: Backend> {
 
 impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     pub fn new(context: usize) -> Self {
-        Self { k: None, v: None, context, absolute_offset: 0 }
+        Self {
+            k: None,
+            v: None,
+            context,
+            absolute_offset: 0,
+        }
     }
 
     pub fn current_seq_len(&self) -> Result<usize> {
@@ -284,7 +305,13 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let out_dim = 3 * embed_dim;
         let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
         let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
+        Ok(Self {
+            in_proj,
+            out_proj,
+            embed_dim,
+            num_heads,
+            context,
+        })
     }
 
     pub fn init_state(&self) -> Result<KvCache<T, B>> {
@@ -303,9 +330,18 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
 
         let projected = self.in_proj.forward(query)?;
         let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
-        let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let k = packed.narrow(2, 1..2)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = packed.narrow(2, 2..3)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
+        let q = packed
+            .narrow(2, 0..1)?
+            .contiguous()?
+            .reshape((b, t, self.num_heads, d))?;
+        let k = packed
+            .narrow(2, 1..2)?
+            .contiguous()?
+            .reshape((b, t, self.num_heads, d))?;
+        let v = packed
+            .narrow(2, 2..3)?
+            .contiguous()?
+            .reshape((b, t, self.num_heads, d))?;
 
         // RoPE on [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
@@ -360,8 +396,10 @@ pub enum Gelu {
 /// The tanh GELU, `0.5 x (1 + tanh(u))` with `u = sqrt(2 / pi) (x + 0.044715 x^3)`, computed as
 /// `x sigmoid(2u)`: the same function, and faster on CPU than xn's `tanh` or its `gelu_erf`.
 fn gelu_tanh<T: WithDTypeF, B: Backend>(x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-    let u2 =
-        x.sqr()?.scale_add(T::from_f32(0.071_354_82), T::from_f32(1.595_769))?.broadcast_mul(x)?;
+    let u2 = x
+        .sqr()?
+        .scale_add(T::from_f32(0.071_354_82), T::from_f32(1.595_769))?
+        .broadcast_mul(x)?;
     u2.sigmoid()?.broadcast_mul(x)
 }
 
@@ -525,7 +563,11 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
             )?);
         }
 
-        Ok(Self { layers, head_dim, max_period })
+        Ok(Self {
+            layers,
+            head_dim,
+            max_period,
+        })
     }
 
     pub fn init_state(
@@ -655,7 +697,11 @@ impl<Q: BackendQ> ProjectedTransformer<Q> {
             }
         }
 
-        Ok(Self { transformer, input_proj, output_projs })
+        Ok(Self {
+            transformer,
+            input_proj,
+            output_projs,
+        })
     }
 
     pub fn init_state(
@@ -712,8 +758,12 @@ mod with_seq_budget_tests {
             })
             .collect();
         let k = Tensor::from_vec(data.clone(), (b, seq, h, d), &CpuDevice).unwrap();
-        let v = Tensor::from_vec(data.iter().map(|x| -x).collect(), (b, seq, h, d), &CpuDevice)
-            .unwrap();
+        let v = Tensor::from_vec(
+            data.iter().map(|x| -x).collect(),
+            (b, seq, h, d),
+            &CpuDevice,
+        )
+        .unwrap();
         StreamingTransformerState {
             layer_states: vec![LayerAttentionState::FlowLm(StreamingMHAState {
                 k_cache: k,
@@ -731,14 +781,20 @@ mod with_seq_budget_tests {
     fn copies_the_used_prefix_and_zero_fills_the_rest() {
         let small = filled_state(4, 3);
         let big = small.with_seq_budget(10).unwrap();
-        let LayerAttentionState::FlowLm(mha) = &big.layer_states[0] else { panic!() };
+        let LayerAttentionState::FlowLm(mha) = &big.layer_states[0] else {
+            panic!()
+        };
         assert_eq!(mha.current_end, 3);
         assert_eq!(mha.k_cache.dims(), &[1, 10, 2, 3]);
         let k = flat(&mha.k_cache);
         for pos in 0..3 {
             for h in 0..2 {
                 for d in 0..3 {
-                    assert_eq!(k[(pos * 2 + h) * 3 + d], (pos + 100 * h) as f32, "pos {pos} h {h}");
+                    assert_eq!(
+                        k[(pos * 2 + h) * 3 + d],
+                        (pos + 100 * h) as f32,
+                        "pos {pos} h {h}"
+                    );
                 }
             }
         }
@@ -746,7 +802,9 @@ mod with_seq_budget_tests {
         assert_eq!(
             flat(&mha.v_cache)[0..18],
             flat(&{
-                let LayerAttentionState::FlowLm(m) = &small.layer_states[0] else { panic!() };
+                let LayerAttentionState::FlowLm(m) = &small.layer_states[0] else {
+                    panic!()
+                };
                 m.v_cache.narrow(1, 0..3).unwrap().contiguous().unwrap()
             })[..]
         );
@@ -757,18 +815,29 @@ mod with_seq_budget_tests {
         // The whole reason this exists rather than `Clone`.
         let small = filled_state(4, 2);
         let big = small.with_seq_budget(8).unwrap();
-        let LayerAttentionState::FlowLm(dst) = &big.layer_states[0] else { panic!() };
-        let LayerAttentionState::FlowLm(src) = &small.layer_states[0] else { panic!() };
+        let LayerAttentionState::FlowLm(dst) = &big.layer_states[0] else {
+            panic!()
+        };
+        let LayerAttentionState::FlowLm(src) = &small.layer_states[0] else {
+            panic!()
+        };
         let poison = Tensor::from_vec(vec![9e9f32; 6], (1, 1, 2, 3), &CpuDevice).unwrap();
         dst.k_cache.slice_set(&poison, 1usize, 0).unwrap();
         // Index 3 is (pos 0, head 1) = 100.0 in the pattern, so this also fails if the source
         // were zeros all along.
-        assert_eq!(flat(&src.k_cache)[3], 100.0, "writing the copy must not reach the source");
+        assert_eq!(
+            flat(&src.k_cache)[3],
+            100.0,
+            "writing the copy must not reach the source"
+        );
     }
 
     #[test]
     fn a_budget_smaller_than_the_prefix_is_refused() {
-        let err = filled_state(4, 3).with_seq_budget(2).unwrap_err().to_string();
+        let err = filled_state(4, 3)
+            .with_seq_budget(2)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("3") && err.contains("2"), "{err}");
         assert!(filled_state(4, 3).with_seq_budget(3).is_ok());
     }
@@ -801,7 +870,9 @@ mod bad_config_tests {
     #[test]
     fn heads_that_do_not_divide_the_width_are_an_error() {
         for heads in [0, 3] {
-            let err = load(8, heads).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
+            let err = load(8, heads)
+                .err()
+                .unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
             assert!(err.to_string().contains("heads"), "{err}");
         }
     }

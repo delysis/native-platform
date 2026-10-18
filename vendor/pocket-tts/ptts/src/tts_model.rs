@@ -91,15 +91,24 @@ impl TTSConfig {
     /// `model_id`), erf otherwise.
     pub fn default_gelu(&self) -> crate::transformer::Gelu {
         use crate::transformer::Gelu;
-        if self.model_id.is_some() { Gelu::Erf } else { Gelu::Tanh }
+        if self.model_id.is_some() {
+            Gelu::Erf
+        } else {
+            Gelu::Tanh
+        }
     }
 
     fn mimi_with_gelu(&self, mimi: &MimiConfig) -> MimiConfig {
-        MimiConfig { gelu: Some(mimi.gelu.unwrap_or_else(|| self.default_gelu())), ..mimi.clone() }
+        MimiConfig {
+            gelu: Some(mimi.gelu.unwrap_or_else(|| self.default_gelu())),
+            ..mimi.clone()
+        }
     }
 
     pub fn model_ext(&self) -> Option<String> {
-        self.model_id.as_ref().map(|id| format!("{}@{}", id.sig, id.epoch))
+        self.model_id
+            .as_ref()
+            .map(|id| format!("{}@{}", id.sig, id.epoch))
     }
 
     /// Returns the `MimiConfig` used to encode the voice prompt — the
@@ -186,9 +195,10 @@ impl<Q: BackendQ> TTSModel<Q> {
         let (mut speaker_sink, mut text_sink) = (None, None);
         for (name, sink) in cfg.prefix_sinks.iter() {
             let (prefix, slot) = match name.as_str() {
-                "speaker_wavs" => {
-                    ("flow_lm.condition_provider.conditioners.speaker_wavs", &mut speaker_sink)
-                }
+                "speaker_wavs" => (
+                    "flow_lm.condition_provider.conditioners.speaker_wavs",
+                    &mut speaker_sink,
+                ),
                 "transcript_in_segment" => ("flow_lm.conditioner", &mut text_sink),
                 other => xn::bail!("unsupported prefix sink {other:?}"),
             };
@@ -237,7 +247,9 @@ impl<Q: BackendQ> TTSModel<Q> {
         batch_size: usize,
         sequence_length: usize,
     ) -> Result<TTSState<Q>> {
-        Ok(TTSState { flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)? })
+        Ok(TTSState {
+            flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)?,
+        })
     }
 
     /// Run flow LM step with text tokens. Increments state.
@@ -300,7 +312,10 @@ impl<Q: BackendQ> TTSModel<Q> {
         let text_embeddings = match &self.speaker_sink {
             Some(sink) => {
                 let present = audio_conditioning.dims3()?.1 > 0;
-                Tensor::cat(&[&self.empty_text()?, sink.token(present), audio_conditioning], 1)?
+                Tensor::cat(
+                    &[&self.empty_text()?, sink.token(present), audio_conditioning],
+                    1,
+                )?
             }
             None => Tensor::cat(&[&self.empty_text()?, audio_conditioning], 1)?,
         };
@@ -380,8 +395,9 @@ impl<Q: BackendQ> TTSModel<Q> {
         latent: &Tensor<Q::T, Q::B>,
         mimi_state: &mut MimiDecoderState<f32, Q::B>,
     ) -> Result<Tensor<f32, Q::B>> {
-        let denorm =
-            latent.broadcast_mul(&self.flow_lm.emb_std)?.broadcast_add(&self.flow_lm.emb_mean)?;
+        let denorm = latent
+            .broadcast_mul(&self.flow_lm.emb_std)?
+            .broadcast_add(&self.flow_lm.emb_mean)?;
 
         // [B, T, C] -> [B, C, T]
         let transposed = denorm.transpose(1, 2)?.contiguous()?;
@@ -410,8 +426,10 @@ impl<Q: BackendQ> TTSModel<Q> {
     ) -> Result<()> {
         let input = self.flow_lm.input_linear.forward(backbone_input_latents)?;
         let input = Tensor::cat(&[text_embeddings, &input], 1)?;
-        let _out =
-            self.flow_lm.transformer.forward(&input, &mut state.flow_lm_state.transformer_state)?;
+        let _out = self
+            .flow_lm
+            .transformer
+            .forward(&input, &mut state.flow_lm_state.transformer_state)?;
         Ok(())
     }
 
@@ -450,9 +468,17 @@ impl<Q: BackendQ> MimiEnc<Q> {
         }
         let weights = vb.tensor(
             crate::loader::SPEAKER_PROJ_WEIGHT,
-            (cfg.flow_lm.d_model, mimi_cfg.encoder_latent_dimension.unwrap_or(mimi_cfg.dimension)),
+            (
+                cfg.flow_lm.d_model,
+                mimi_cfg
+                    .encoder_latent_dimension
+                    .unwrap_or(mimi_cfg.dimension),
+            ),
         )?;
-        Ok(Self { speaker_proj: Linear::new(weights), mimi })
+        Ok(Self {
+            speaker_proj: Linear::new(weights),
+            mimi,
+        })
     }
 
     /// Encode audio for voice conditioning. Returns [1, T', dim].
@@ -485,8 +511,11 @@ pub fn split_into_best_sentences(
     // Get end-of-sentence token ids by tokenizing ".!...?" and skipping the first token
     // (the first token includes the leading space marker from sentencepiece).
     let eos_marker_tokens = tokenizer.encode(".!...?")?;
-    let eos_tokens =
-        if eos_marker_tokens.len() > 1 { &eos_marker_tokens[1..] } else { &eos_marker_tokens[..] };
+    let eos_tokens = if eos_marker_tokens.len() > 1 {
+        &eos_marker_tokens[1..]
+    } else {
+        &eos_marker_tokens[..]
+    };
 
     // Find sentence boundary indices: positions where a non-EOS token follows one or more EOS tokens.
     let mut sentence_boundaries = vec![0usize];
@@ -571,7 +600,10 @@ mod tests {
     fn short_text_is_not_padded() {
         // pocket-tts prepended 8 spaces to texts of fewer than 5 words; Phonon models
         // never see those spaces, and short texts go wrong with them.
-        assert_eq!(prepare_text_prompt("not a thing"), ("Not a thing.".to_string(), 3));
+        assert_eq!(
+            prepare_text_prompt("not a thing"),
+            ("Not a thing.".to_string(), 3)
+        );
         assert_eq!(
             prepare_text_prompt("one two three four five"),
             ("One two three four five.".to_string(), 1)
@@ -588,11 +620,19 @@ mod tests {
             ("hello world!", "Hello world!", 3),
             ("call me at 5", "Call me at 5.", 3),
             // Line breaks, CRLF included, and runs of spaces become one space.
-            ("one\r\ntwo   three\nfour five", "One two three four five.", 1),
+            (
+                "one\r\ntwo   three\nfour five",
+                "One two three four five.",
+                1,
+            ),
             ("éclair au chocolat", "Éclair au chocolat.", 3),
         ];
         for &(input, text, frames) in cases {
-            assert_eq!(prepare_text_prompt(input), (text.to_string(), frames), "{input:?}");
+            assert_eq!(
+                prepare_text_prompt(input),
+                (text.to_string(), frames),
+                "{input:?}"
+            );
         }
     }
 
@@ -628,11 +668,20 @@ mod tests {
             "conditioners",
             "fuser",
         ] {
-            assert!(fields.remove(key).is_some(), "{key} is no longer in the config");
+            assert!(
+                fields.remove(key).is_some(),
+                "{key} is no longer in the config"
+            );
         }
         let old: TTSConfig = serde_json::from_value(old).unwrap();
-        assert_eq!(old.audio_prompt_min_duration, default_audio_prompt_min_duration());
-        assert_eq!(old.audio_prompt_max_duration, default_audio_prompt_max_duration());
+        assert_eq!(
+            old.audio_prompt_min_duration,
+            default_audio_prompt_min_duration()
+        );
+        assert_eq!(
+            old.audio_prompt_max_duration,
+            default_audio_prompt_max_duration()
+        );
         assert!(!old.cfg_null_audio_empty);
         assert!(!old.cfg_null_text_empty);
         assert!(old.speaker_mimi.is_none());
@@ -662,7 +711,10 @@ mod tests {
         let named: TTSConfig = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(named.flow_lm.gelu, Some(Gelu::Tanh));
         assert_eq!(named.mimi_with_gelu(&named.mimi).gelu, Some(Gelu::Tanh));
-        assert_eq!(serde_json::to_value(&named).unwrap()["mimi"]["gelu"], "tanh");
+        assert_eq!(
+            serde_json::to_value(&named).unwrap()["mimi"]["gelu"],
+            "tanh"
+        );
         assert_eq!(Gelu::default(), Gelu::Erf);
     }
 

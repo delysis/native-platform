@@ -90,7 +90,9 @@ pub fn voice_paths(paths: impl IntoIterator<Item = String>) -> Vec<(String, Stri
             if let Some((voice_dir, name)) = voice_file_name(file)
                 && dir == voice_dir
             {
-                voices.entry(name.to_string()).or_insert_with(|| file.clone());
+                voices
+                    .entry(name.to_string())
+                    .or_insert_with(|| file.clone());
             }
         }
     }
@@ -103,7 +105,9 @@ pub const DEFAULT_VOICE_FILE: &str = "default-voice.safetensors";
 /// Every `*.safetensors` directly in `dir`, as (file stem, path), sorted by name. A missing or
 /// unreadable directory has none.
 pub fn voices_in(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
     let mut voices: Vec<_> = entries
         .flatten()
         .map(|entry| entry.path())
@@ -173,7 +177,10 @@ pub fn load_speaker_proj<B: Backend>(
         return Ok(None);
     }
     let mimi = cfg.speaker_mimi_cfg();
-    let shape = (cfg.flow_lm.d_model, mimi.encoder_latent_dimension.unwrap_or(mimi.dimension));
+    let shape = (
+        cfg.flow_lm.d_model,
+        mimi.encoder_latent_dimension.unwrap_or(mimi.dimension),
+    );
     let weight = vb.tensor(SPEAKER_PROJ_WEIGHT, shape)?;
     Ok(Some(Linear::new(weight)))
 }
@@ -290,7 +297,9 @@ pub fn load_conditions<T: WithDTypeF, B: Backend>(
     values: &HashMap<String, String>,
 ) -> Result<Option<Tensor<T, B>>> {
     let vb = vb.pp("flow_lm.condition_provider.conditioners");
-    Ok(crate::conditioners::load_summed_conditions(&vb, cfg, values)?)
+    Ok(crate::conditioners::load_summed_conditions(
+        &vb, cfg, values,
+    )?)
 }
 
 pub fn load_config_voices<B: Backend>(
@@ -319,7 +328,10 @@ pub fn load_config_voices<B: Backend>(
                 )));
             }
         };
-        voices.push((voice.name.clone(), project_latents(&tensor, &label, speaker_proj)?));
+        voices.push((
+            voice.name.clone(),
+            project_latents(&tensor, &label, speaker_proj)?,
+        ));
     }
     Ok(voices)
 }
@@ -378,11 +390,15 @@ fn check_model_ext(header: &[u8], label: &str, embeddings_ext: &[String]) -> Res
 fn safetensors_header_from_bytes<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8]> {
     let not_safetensors =
         || Error::invalid_data(format!("{label} does not look like a safetensors file"));
-    let len_bytes: [u8; 8] =
-        bytes.get(..8).and_then(|b| b.try_into().ok()).ok_or_else(not_safetensors)?;
+    let len_bytes: [u8; 8] = bytes
+        .get(..8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(not_safetensors)?;
     let header_len =
         usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| not_safetensors())?;
-    bytes.get(8..8usize.saturating_add(header_len)).ok_or_else(not_safetensors)
+    bytes
+        .get(8..8usize.saturating_add(header_len))
+        .ok_or_else(not_safetensors)
 }
 
 /// Reads a safetensors file's JSON header: the 8-byte little-endian header
@@ -444,7 +460,10 @@ mod tests {
                 ("default", "default-voice.safetensors".into()),
             ]
         );
-        assert!(checkpoint_voices(&dir).is_empty(), "a missing directory has no voices");
+        assert!(
+            checkpoint_voices(&dir).is_empty(),
+            "a missing directory has no voices"
+        );
     }
 
     #[test]
@@ -471,7 +490,10 @@ mod tests {
                 "flow_lm.backbone.layers.0.linear1.weight",
                 "flow_lm.transformer.layers.0.linear1.weight",
             ),
-            ("mimi.model.decoder.layers.0.weight", "mimi.decoder.layers.0.weight"),
+            (
+                "mimi.model.decoder.layers.0.weight",
+                "mimi.decoder.layers.0.weight",
+            ),
         ];
         for (from, to) in cases {
             assert_eq!(remap_key(from).as_deref(), Some(to), "input: {from}");
@@ -518,8 +540,16 @@ mod tests {
         assert!(check_model_ext(&header, "voice", &ext("def@2")).is_err());
 
         // A voice from before the metadata existed is accepted as-is.
-        let bare = write("ptts-loader-voice-bare.safetensors", &format!(r#"{{{tensor}}}"#));
-        check_model_ext(&read_safetensors_header(&bare).unwrap(), "voice", &ext("abc@1")).unwrap();
+        let bare = write(
+            "ptts-loader-voice-bare.safetensors",
+            &format!(r#"{{{tensor}}}"#),
+        );
+        check_model_ext(
+            &read_safetensors_header(&bare).unwrap(),
+            "voice",
+            &ext("abc@1"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -531,7 +561,9 @@ mod tests {
             bytes
         };
         let tensor = r#""emb":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}"#;
-        let bytes = file(&format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#));
+        let bytes = file(&format!(
+            r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#
+        ));
 
         let ext = |s: &str| vec![s.to_string()];
         let emb = load_voice_emb_from_bytes(&bytes, Some(&ext("abc@1")), None, &xn::CPU).unwrap();
@@ -541,11 +573,17 @@ mod tests {
 
         // Error messages name the file once.
         let empty = [&2u64.to_le_bytes()[..], b"{}"].concat();
-        let err = load_voice_emb_from_bytes(&empty, None, None, &xn::CPU).unwrap_err().to_string();
+        let err = load_voice_emb_from_bytes(&empty, None, None, &xn::CPU)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no tensors found in the voice file"), "{err}");
-        let err =
-            load_voice_emb_from_bytes(&[1, 2, 3], None, None, &xn::CPU).unwrap_err().to_string();
-        assert!(err.contains("the voice file does not look like a safetensors file"), "{err}");
+        let err = load_voice_emb_from_bytes(&[1, 2, 3], None, None, &xn::CPU)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the voice file does not look like a safetensors file"),
+            "{err}"
+        );
 
         // Too short to hold a header length, and a length past the end of the buffer.
         assert!(safetensors_header_from_bytes(&[1, 2, 3], "voice").is_err());
@@ -562,9 +600,14 @@ mod tests {
             "mimi.downsample.conv.conv.weight",
             "mimi.downsample.something_else",
         ] {
-            assert!(is_unused_by_tts_model(unused), "expected {unused} to be ignorable");
+            assert!(
+                is_unused_by_tts_model(unused),
+                "expected {unused} to be ignorable"
+            );
         }
-        assert!(!is_unused_by_tts_model("flow_lm.transformer.layers.0.linear1.weight"));
+        assert!(!is_unused_by_tts_model(
+            "flow_lm.transformer.layers.0.linear1.weight"
+        ));
         assert!(!is_unused_by_tts_model("mimi.decoder.layers.0.weight"));
         // Read by `TTSModel::load` for `load_voice_emb`, so no longer ignorable.
         assert!(!is_unused_by_tts_model(SPEAKER_PROJ_WEIGHT));
@@ -603,10 +646,16 @@ mod tests {
         let dev = xn::CpuDevice;
         // C = 2 channels, T = 3 frames, latents[c][t] = 10 * c + t.
         let latents = Tensor::from_vec(vec![0., 1., 2., 10., 11., 12.], (2, 3), &dev).unwrap();
-        let path = save_voice("speaker_wavs", "ptts-loader-voice-latents.safetensors", latents);
+        let path = save_voice(
+            "speaker_wavs",
+            "ptts-loader-voice-latents.safetensors",
+            latents,
+        );
 
         // Latents are unusable without the projection.
-        let err = load_voice_emb(&path, None, None, &dev).unwrap_err().to_string();
+        let err = load_voice_emb(&path, None, None, &dev)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no speaker projection"), "{err}");
 
         // W = [[1, 0], [0, 2]] maps [x0, x1] to [x0, 2 * x1].
@@ -617,7 +666,12 @@ mod tests {
 
         // A projection expecting three channels rejects two-channel latents.
         let w = Tensor::from_vec(vec![0.; 6], (2, 3), &dev).unwrap();
-        let err = load_voice_emb(&path, None, Some(&Linear::new(w)), &dev).unwrap_err().to_string();
-        assert!(err.contains("2 channels") && err.contains("takes 3"), "{err}");
+        let err = load_voice_emb(&path, None, Some(&Linear::new(w)), &dev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 channels") && err.contains("takes 3"),
+            "{err}"
+        );
     }
 }

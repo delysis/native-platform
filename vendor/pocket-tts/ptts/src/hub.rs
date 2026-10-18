@@ -22,7 +22,9 @@ pub struct HubSource {
 impl HubSource {
     /// `Ok(None)` for a source without the `hf://` prefix, which names a local path.
     pub fn parse(source: &str) -> Result<Option<Self>> {
-        let Some(rest) = source.strip_prefix(SCHEME) else { return Ok(None) };
+        let Some(rest) = source.strip_prefix(SCHEME) else {
+            return Ok(None);
+        };
         let (repo, revision) = match rest.split_once('@') {
             Some((repo, revision)) => (repo, Some(revision)),
             None => (rest, None),
@@ -35,7 +37,10 @@ impl HubSource {
                  {SCHEME}owner/name@revision"
             )));
         }
-        Ok(Some(Self { repo: repo.to_string(), revision: revision.map(str::to_string) }))
+        Ok(Some(Self {
+            repo: repo.to_string(),
+            revision: revision.map(str::to_string),
+        }))
     }
 
     /// The repo's page on the Hub.
@@ -96,7 +101,10 @@ pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result
     // cache does hold be found, and the first such error is reported only if no weights resolve.
     let first_err = std::cell::RefCell::new(None);
     let get_optional = |name: &str| -> Result<Option<PathBuf>> {
-        if listing.as_ref().is_some_and(|files: &Vec<String>| !files.iter().any(|f| f == name)) {
+        if listing
+            .as_ref()
+            .is_some_and(|files: &Vec<String>| !files.iter().any(|f| f == name))
+        {
             return Ok(None);
         }
         match repo.get(name) {
@@ -140,7 +148,10 @@ pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result
     // folder. A voice that will not download is skipped, as one that will not load is.
     let mut voices: Vec<(String, PathBuf)> = vec![];
     let files = crate::loader::voice_paths(listing.clone().unwrap_or_default());
-    let default = ("default".to_string(), crate::loader::DEFAULT_VOICE_FILE.to_string());
+    let default = (
+        "default".to_string(),
+        crate::loader::DEFAULT_VOICE_FILE.to_string(),
+    );
     for (name, file) in files.into_iter().chain([default]) {
         if !voices.iter().any(|(known, _)| *known == name)
             && let Ok(Some(path)) = get_optional(&file)
@@ -149,7 +160,13 @@ pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result
         }
     }
     voices.sort();
-    Ok(Checkpoint { config, weights, tokenizer: Some(tokenizer), voices, quant: options.quant })
+    Ok(Checkpoint {
+        config,
+        weights,
+        tokenizer: Some(tokenizer),
+        voices,
+        quant: options.quant,
+    })
 }
 
 #[cfg(feature = "hub")]
@@ -164,10 +181,15 @@ impl<'a> Repo<'a> {
         // Not `NotFound`: a client that will not start is an environment failure, not a name
         // that failed to resolve.
         let client = hf_hub::HFClientSync::new().map_err(|e| {
-            Error::Io(std::io::Error::other(format!("cannot reach the Hugging Face Hub: {e}")))
+            Error::Io(std::io::Error::other(format!(
+                "cannot reach the Hugging Face Hub: {e}"
+            )))
         })?;
         let (owner, name) = hf_hub::split_id(&source.repo);
-        Ok(Self { repo: client.model(owner, name), source })
+        Ok(Self {
+            repo: client.model(owner, name),
+            source,
+        })
     }
 
     /// Download `filename`, or find it in the local cache.
@@ -221,13 +243,27 @@ mod tests {
         assert_eq!(HubSource::parse("/models/phonon").unwrap(), None);
         assert_eq!(HubSource::parse("owner/name").unwrap(), None);
         let source = HubSource::parse("hf://owner/name").unwrap().unwrap();
-        assert_eq!(source, HubSource { repo: "owner/name".into(), revision: None });
+        assert_eq!(
+            source,
+            HubSource {
+                repo: "owner/name".into(),
+                revision: None
+            }
+        );
         assert_eq!(source.to_string(), "hf://owner/name");
-        let source = HubSource::parse("hf://owner/name@refs/pr/1").unwrap().unwrap();
+        let source = HubSource::parse("hf://owner/name@refs/pr/1")
+            .unwrap()
+            .unwrap();
         assert_eq!(source.revision.as_deref(), Some("refs/pr/1"));
         assert_eq!(source.to_string(), "hf://owner/name@refs/pr/1");
         assert_eq!(source.url(), "https://huggingface.co/owner/name");
-        for bad in ["hf://", "hf://name", "hf://owner/", "hf://a/b/c", "hf://owner/name@"] {
+        for bad in [
+            "hf://",
+            "hf://name",
+            "hf://owner/",
+            "hf://a/b/c",
+            "hf://owner/name@",
+        ] {
             assert!(
                 matches!(HubSource::parse(bad), Err(Error::InvalidArgument(_))),
                 "{bad} should not parse"

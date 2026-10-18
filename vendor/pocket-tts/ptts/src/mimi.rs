@@ -102,7 +102,9 @@ impl<Q: BackendQ> MimiEncoder<Q> {
             cfg.transformer_max_period,
             cfg.transformer_dim_feedforward,
         )?;
-        encoder_transformer.transformer.set_gelu(cfg.gelu.unwrap_or_default());
+        encoder_transformer
+            .transformer
+            .set_gelu(cfg.gelu.unwrap_or_default());
 
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
@@ -121,7 +123,12 @@ impl<Q: BackendQ> MimiEncoder<Q> {
             None
         };
         let frame_size = (cfg.sample_rate as f64 / cfg.frame_rate).round() as usize;
-        Ok(Self { encoder, encoder_transformer, downsample, frame_size })
+        Ok(Self {
+            encoder,
+            encoder_transformer,
+            downsample,
+            frame_size,
+        })
     }
 
     /// Encode audio to latent (non-streaming). Returns [B, C, T'].
@@ -177,7 +184,9 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             cfg.transformer_max_period,
             cfg.transformer_dim_feedforward,
         )?;
-        decoder_transformer.transformer.set_gelu(cfg.gelu.unwrap_or_default());
+        decoder_transformer
+            .transformer
+            .set_gelu(cfg.gelu.unwrap_or_default());
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
 
@@ -229,7 +238,9 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             _ => latent.clone(),
         };
 
-        let outs = self.decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
+        let outs = self
+            .decoder_transformer
+            .forward(&emb, &mut state.decoder_transformer_state)?;
         self.decoder.forward(&outs[0], &mut state.decoder_state)
     }
 }

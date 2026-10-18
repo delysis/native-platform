@@ -34,16 +34,56 @@ struct Rule {
 /// number. Numbers and times are the only rules that claim the same words, German ones like
 /// "1.234", and numbers come first so that those read as a thousand rather than a time.
 const RULES: &[Rule] = &[
-    Rule { name: "numbers", rewrite: numbers::numbers, default: true },
-    Rule { name: "currency", rewrite: currency::currency, default: true },
-    Rule { name: "dashed-digits", rewrite: dashed_digits::dashed_digits, default: true },
-    Rule { name: "emails", rewrite: emails::emails, default: true },
-    Rule { name: "urls", rewrite: urls::urls, default: true },
-    Rule { name: "abbreviations", rewrite: abbreviations::abbreviations, default: true },
-    Rule { name: "elongations", rewrite: elongations::elongations, default: true },
-    Rule { name: "phones", rewrite: phones::phones, default: false },
-    Rule { name: "times", rewrite: times::times, default: false },
-    Rule { name: "dates", rewrite: dates::dates, default: false },
+    Rule {
+        name: "numbers",
+        rewrite: numbers::numbers,
+        default: true,
+    },
+    Rule {
+        name: "currency",
+        rewrite: currency::currency,
+        default: true,
+    },
+    Rule {
+        name: "dashed-digits",
+        rewrite: dashed_digits::dashed_digits,
+        default: true,
+    },
+    Rule {
+        name: "emails",
+        rewrite: emails::emails,
+        default: true,
+    },
+    Rule {
+        name: "urls",
+        rewrite: urls::urls,
+        default: true,
+    },
+    Rule {
+        name: "abbreviations",
+        rewrite: abbreviations::abbreviations,
+        default: true,
+    },
+    Rule {
+        name: "elongations",
+        rewrite: elongations::elongations,
+        default: true,
+    },
+    Rule {
+        name: "phones",
+        rewrite: phones::phones,
+        default: false,
+    },
+    Rule {
+        name: "times",
+        rewrite: times::times,
+        default: false,
+    },
+    Rule {
+        name: "dates",
+        rewrite: dates::dates,
+        default: false,
+    },
 ];
 
 /// Which of the rewrite rules run, on top of the character normalization.
@@ -90,7 +130,11 @@ impl std::str::FromStr for Rules {
                     Some(i) => Ok(Self(set.0 | 1 << i)),
                     None => Err(crate::Error::invalid_argument(format!(
                         "unknown rewrite rule: {name}; expected default, all, none, or any of: {}",
-                        RULES.iter().map(|rule| rule.name).collect::<Vec<_>>().join(", ")
+                        RULES
+                            .iter()
+                            .map(|rule| rule.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ))),
                 }
             }),
@@ -109,7 +153,10 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
 
 impl Rules {
     fn has(self, name: &str) -> bool {
-        RULES.iter().position(|rule| rule.name == name).is_some_and(|i| self.0 & (1 << i) != 0)
+        RULES
+            .iter()
+            .position(|rule| rule.name == name)
+            .is_some_and(|i| self.0 & (1 << i) != 0)
     }
 }
 
@@ -126,13 +173,22 @@ pub(super) fn rewrite_text(
         let prev = out.last().map(String::as_str);
         let span = None
             .or_else(|| {
-                rules.has("currency").then(|| currency::scaled(&words[i..], lang)).flatten()
+                rules
+                    .has("currency")
+                    .then(|| currency::scaled(&words[i..], lang))
+                    .flatten()
             })
             .or_else(|| {
-                rules.has("numbers").then(|| numbers::digit_run(&words[i..], lang)).flatten()
+                rules
+                    .has("numbers")
+                    .then(|| numbers::digit_run(&words[i..], lang))
+                    .flatten()
             })
             .or_else(|| {
-                rules.has("numbers").then(|| numbers::ending_in(prev, &words[i..], lang)).flatten()
+                rules
+                    .has("numbers")
+                    .then(|| numbers::ending_in(prev, &words[i..], lang))
+                    .flatten()
             })
             .or_else(|| {
                 rules
@@ -157,7 +213,9 @@ const PUNCTUATION: &str = "!?.:,;…";
 /// The trailing punctuation a rule carries through, or `None` when `rest` is anything else --
 /// which means the rule did not account for the whole word and must not fire.
 fn suffix(rest: &str) -> Option<&str> {
-    rest.chars().all(|c| PUNCTUATION.contains(c)).then_some(rest)
+    rest.chars()
+        .all(|c| PUNCTUATION.contains(c))
+        .then_some(rest)
 }
 
 /// `word` without its trailing punctuation, and that punctuation.
@@ -183,9 +241,12 @@ fn all_digits(s: &str) -> bool {
 fn spell_short(word: &str) -> std::borrow::Cow<'_, str> {
     match word.as_bytes() {
         b"www" | b"WWW" => "W-W-W".into(),
-        [a, b] if a.is_ascii() && b.is_ascii() => {
-            format!("{}-{}", a.to_ascii_uppercase() as char, b.to_ascii_uppercase() as char).into()
-        }
+        [a, b] if a.is_ascii() && b.is_ascii() => format!(
+            "{}-{}",
+            a.to_ascii_uppercase() as char,
+            b.to_ascii_uppercase() as char
+        )
+        .into(),
         _ => word.into(),
     }
 }
@@ -206,14 +267,29 @@ mod tests {
         assert_eq!(Rules(default.0 | opt_in.0), Rules::ALL);
         assert_eq!("none".parse::<Rules>().unwrap(), Rules::NONE);
         assert!("colours".parse::<Rules>().is_err());
-        assert_eq!(rewrite_word("1234", Lang::En, Rules::ALL).as_deref(), Some("1 thousand 234"));
-        assert_eq!(rewrite_word("1234", Lang::Fr, Rules::ALL).as_deref(), Some("mille 234"));
+        assert_eq!(
+            rewrite_word("1234", Lang::En, Rules::ALL).as_deref(),
+            Some("1 thousand 234")
+        );
+        assert_eq!(
+            rewrite_word("1234", Lang::Fr, Rules::ALL).as_deref(),
+            Some("mille 234")
+        );
         assert_eq!(rewrite_word("1234", Lang::En, Rules::NONE), None);
-        assert_eq!(rewrite_word("1234", Lang::De, Rules::ALL).as_deref(), Some("ein Tausend 234"));
-        assert_eq!(rewrite_word("$5", Lang::En, Rules::DEFAULT).as_deref(), Some("5 dollars"));
+        assert_eq!(
+            rewrite_word("1234", Lang::De, Rules::ALL).as_deref(),
+            Some("ein Tausend 234")
+        );
+        assert_eq!(
+            rewrite_word("$5", Lang::En, Rules::DEFAULT).as_deref(),
+            Some("5 dollars")
+        );
         // The opt-in rules stay off by default.
         assert_eq!(rewrite_word("3:45PM", Lang::En, Rules::DEFAULT), None);
-        assert_eq!(rewrite_word("3:45PM", Lang::En, Rules::ALL).as_deref(), Some("3-45 PM"));
+        assert_eq!(
+            rewrite_word("3:45PM", Lang::En, Rules::ALL).as_deref(),
+            Some("3-45 PM")
+        );
     }
 
     /// Numbers are tried before times, so a German thousand is not read as a time, while a
@@ -221,8 +297,14 @@ mod tests {
     #[test]
     fn numbers_win_over_times() {
         let all = Rules::ALL;
-        assert_eq!(rewrite_word("1.234", Lang::De, all).as_deref(), Some("ein Tausend 234"));
-        assert_eq!(rewrite_word("22.45", Lang::De, all).as_deref(), Some("22 Uhr 45"));
+        assert_eq!(
+            rewrite_word("1.234", Lang::De, all).as_deref(),
+            Some("ein Tausend 234")
+        );
+        assert_eq!(
+            rewrite_word("22.45", Lang::De, all).as_deref(),
+            Some("22 Uhr 45")
+        );
     }
 
     #[test]
@@ -231,14 +313,20 @@ mod tests {
         let numbers = "numbers".parse::<Rules>().unwrap();
         assert_eq!(" Numbers ".parse::<Rules>().unwrap(), numbers);
         assert_eq!("numbers, numbers".parse::<Rules>().unwrap(), numbers);
-        assert_eq!(" Emails , URLS".parse::<Rules>().unwrap(), "emails,urls".parse().unwrap());
+        assert_eq!(
+            " Emails , URLS".parse::<Rules>().unwrap(),
+            "emails,urls".parse().unwrap()
+        );
         assert_eq!("ALL".parse::<Rules>().unwrap(), Rules::ALL);
         assert_eq!(" Default ".parse::<Rules>().unwrap(), Rules::DEFAULT);
         assert_eq!("Off".parse::<Rules>().unwrap(), Rules::NONE);
         let err = "numbers,colours".parse::<Rules>().unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
         let msg = err.to_string();
-        assert!(msg.contains("colours") && msg.contains("dashed-digits"), "{msg}");
+        assert!(
+            msg.contains("colours") && msg.contains("dashed-digits"),
+            "{msg}"
+        );
         assert!("".parse::<Rules>().is_err());
         // The whole-string values are not rule names.
         assert!("numbers,all".parse::<Rules>().is_err());

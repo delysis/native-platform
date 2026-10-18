@@ -52,33 +52,37 @@ fn range(body: &str, lang: Lang) -> Option<String> {
 
 fn spell(s: &str, lang: Lang) -> String {
     let words: [&str; 10] = match lang {
-        Lang::En => {
-            ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
-        }
-        Lang::Fr => {
-            ["zéro", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf"]
-        }
-        Lang::De => {
-            ["null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun"]
-        }
-        Lang::Es => {
-            ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve"]
-        }
-        Lang::Pt => {
-            ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
-        }
+        Lang::En => [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ],
+        Lang::Fr => [
+            "zéro", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf",
+        ],
+        Lang::De => [
+            "null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun",
+        ],
+        Lang::Es => [
+            "cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve",
+        ],
+        Lang::Pt => [
+            "zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove",
+        ],
     };
-    let spoken = s.chars().filter(|&c| c != '-').map(|c| match c.to_digit(10) {
-        Some(d) => words[d as usize].to_string(),
-        None => c.to_string(),
-    });
+    let spoken = s
+        .chars()
+        .filter(|&c| c != '-')
+        .map(|c| match c.to_digit(10) {
+            Some(d) => words[d as usize].to_string(),
+            None => c.to_string(),
+        });
     spoken.collect::<Vec<_>>().join(" ")
 }
 
 pub(super) fn digit_run(words: &[&str], lang: Lang) -> Option<(String, usize)> {
     let group = |s: &str| {
         (1..=8).contains(&s.len())
-            && s.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
             && s.bytes().any(|b| b.is_ascii_digit())
     };
     let plus = words.first()?.starts_with('+');
@@ -86,7 +90,11 @@ pub(super) fn digit_run(words: &[&str], lang: Lang) -> Option<(String, usize)> {
     let mut end = "";
     for word in words {
         let (body, suffix) = split_suffix(word);
-        let body = if bodies.is_empty() && plus { &body[1..] } else { body };
+        let body = if bodies.is_empty() && plus {
+            &body[1..]
+        } else {
+            body
+        };
         if !group(body) {
             break;
         }
@@ -96,13 +104,23 @@ pub(super) fn digit_run(words: &[&str], lang: Lang) -> Option<(String, usize)> {
             break;
         }
     }
-    let years = bodies.iter().all(|b| b.len() == 4 && matches!(&b[..2], "19" | "20"));
+    let years = bodies
+        .iter()
+        .all(|b| b.len() == 4 && matches!(&b[..2], "19" | "20"));
     let long = bodies.len() >= 3 && !years;
     if !long && !(bodies.len() == 2 && (plus || bodies.iter().any(|b| b.starts_with('0')))) {
         return None;
     }
-    let spelled = bodies.iter().map(|b| spell(b, lang)).collect::<Vec<_>>().join(", ");
-    let spelled = if plus { format!("{} {spelled}", lang.special_chars().plus) } else { spelled };
+    let spelled = bodies
+        .iter()
+        .map(|b| spell(b, lang))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spelled = if plus {
+        format!("{} {spelled}", lang.special_chars().plus)
+    } else {
+        spelled
+    };
     Some((format!("{spelled}{end}"), bodies.len()))
 }
 
@@ -137,7 +155,10 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
         _ => {
             let int = word.rsplit_once(',').map_or(word, |(before, _)| before);
             let grouped = int.contains('.')
-                && int.split('.').enumerate().all(|(i, g)| i == 0 || g.len() == 3);
+                && int
+                    .split('.')
+                    .enumerate()
+                    .all(|(i, g)| i == 0 || g.len() == 3);
             (grouped.then_some('.'), ',')
         }
     };
@@ -145,14 +166,19 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
         Some(rest) => (true, rest),
         None => (false, word),
     };
-    let end = rest.find(|c: char| !c.is_ascii_digit() && Some(c) != group).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && Some(c) != group)
+        .unwrap_or(rest.len());
     let int = rest[..end].trim_end_matches(|c: char| Some(c) == group);
     if int.is_empty() {
         return None;
     }
     let rest = &rest[int.len()..];
     let (decimal, rest) = match rest.strip_prefix(point) {
-        Some(after) => match after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len()) {
+        Some(after) => match after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len())
+        {
             0 => (None, rest),
             end => (Some(&after[..end]), &after[end..]),
         },
@@ -318,7 +344,11 @@ mod tests {
             (Lang::Pt, "1000000000", Some("1 bilhão")),
         ];
         for (lang, input, expected) in rest {
-            assert_eq!(numbers(input, lang).as_deref(), expected, "{lang:?} {input:?}");
+            assert_eq!(
+                numbers(input, lang).as_deref(),
+                expected,
+                "{lang:?} {input:?}"
+            );
         }
     }
 }

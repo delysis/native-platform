@@ -65,8 +65,14 @@ mod pocket_tests {
 
     #[test]
     fn partial_frame_and_silent_prompt_follow_reference_bounds() {
-        assert_eq!(pocket_voice_prompt(&[0.1; 100], 24_000).unwrap(), vec![0.1; 100]);
-        assert_eq!(pocket_voice_prompt(&[0.0; 1000], 24_000).unwrap(), vec![0.0; 2880]);
+        assert_eq!(
+            pocket_voice_prompt(&[0.1; 100], 24_000).unwrap(),
+            vec![0.1; 100]
+        );
+        assert_eq!(
+            pocket_voice_prompt(&[0.0; 1000], 24_000).unwrap(),
+            vec![0.0; 2880]
+        );
         assert!(pocket_voice_prompt(&[f32::NAN], 24_000).is_err());
     }
 }

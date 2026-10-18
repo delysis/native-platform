@@ -141,14 +141,26 @@ mod tests {
             (Lang::De, "01511234567", "0-1-5 1 1 2-3 4-5 6-7"),
             (Lang::De, "0301234567", "0-3-0 1-2 3-4 5-6 7"),
             // International numbers.
-            (Lang::En, "+442079460852", "plus 44 2-zero 7-9-4-6 zero-8-5-2"),
+            (
+                Lang::En,
+                "+442079460852",
+                "plus 44 2-zero 7-9-4-6 zero-8-5-2",
+            ),
             (Lang::Fr, "+330556791936", "plus 33 05 56 79 19 36"),
             (Lang::En, "+330556791936", "plus 33 zero-5 5-6 7-9 1-9 3-6"),
             (Lang::Fr, "+33556791936", "plus 33 5 56 79 19 36"),
             (Lang::En, "+33556791936", "plus 33 5 5-6 7-9 1-9 3-6"),
             (Lang::En, "+16502349653", "plus 1 6-5-zero 2-3-4 9-6-5-3"),
-            (Lang::En, "+447700900123", "plus 44 7-7-zero zero-9-zero zero-1-2-3"),
-            (Lang::En, "+442000900123", "plus 44 2-zero zero-zero-9-zero zero-1-2-3"),
+            (
+                Lang::En,
+                "+447700900123",
+                "plus 44 7-7-zero zero-9-zero zero-1-2-3",
+            ),
+            (
+                Lang::En,
+                "+442000900123",
+                "plus 44 2-zero zero-zero-9-zero zero-1-2-3",
+            ),
             (Lang::De, "+491511234567", "Plus 49 1-5 1 1 2-3 4-5 6-7"),
             (Lang::De, "+9491511234567", "Plus 94 9 1-5 1-1 2-3 4-5 6-7"),
             (Lang::De, "+33651150652", "Plus 33 6 5-1 1-5 0-6 5-2"),
@@ -157,7 +169,11 @@ mod tests {
             (Lang::Pt, "+351912345678", "mais 351 9-1-2 3-4-5 6-7-8"),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(phones(input, lang).as_deref(), Some(expected), "{lang:?} {input:?}");
+            assert_eq!(
+                phones(input, lang).as_deref(),
+                Some(expected),
+                "{lang:?} {input:?}"
+            );
         }
         let declined = [
             (Lang::Fr, "1123456789"),

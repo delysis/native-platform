@@ -62,7 +62,10 @@ pub(super) fn currency(word: &str, lang: Lang) -> Option<String> {
     // The symbol leads or trails, never both: "$5€" is not an amount.
     let (symbol, amount) = match body.strip_prefix(Currency::SYMBOLS) {
         Some(amount) => (body.chars().next()?, amount),
-        None => (body.chars().next_back()?, body.strip_suffix(Currency::SYMBOLS)?),
+        None => (
+            body.chars().next_back()?,
+            body.strip_suffix(Currency::SYMBOLS)?,
+        ),
     };
     let currency = Currency::from_symbol(symbol)?;
     if let Some((amount, scale)) = split_scale(amount, lang) {
@@ -102,7 +105,9 @@ fn split_scale(amount: &str, lang: Lang) -> Option<(&str, &'static str)> {
     };
     suffixes.iter().find_map(|&(suffix, scale)| {
         let number = amount.strip_suffix(suffix)?;
-        number.ends_with(|c: char| c.is_ascii_digit()).then_some((number, scale))
+        number
+            .ends_with(|c: char| c.is_ascii_digit())
+            .then_some((number, scale))
     })
 }
 
@@ -143,10 +148,17 @@ fn with_cents(amount: &str, currency: Currency, lang: Lang) -> Option<String> {
         Lang::En => amount.rsplit_once('.').filter(|(whole, _)| {
             all_digits(whole)
                 || whole.split(',').enumerate().all(|(i, group)| {
-                    all_digits(group) && if i == 0 { group.len() <= 3 } else { group.len() == 3 }
+                    all_digits(group)
+                        && if i == 0 {
+                            group.len() <= 3
+                        } else {
+                            group.len() == 3
+                        }
                 })
         })?,
-        Lang::Fr => amount.rsplit_once(',').filter(|(whole, _)| all_digits(whole))?,
+        Lang::Fr => amount
+            .rsplit_once(',')
+            .filter(|(whole, _)| all_digits(whole))?,
         Lang::De | Lang::Es | Lang::Pt => return None,
     };
     if cents.len() != 2 || !all_digits(cents) {
@@ -202,7 +214,11 @@ mod tests {
             // A symbol before the amount.
             (Lang::En, "$1234", "1 thousand 234 dollars"),
             (Lang::En, "$1,234.56", "1 thousand 234 dollars and 56 cents"),
-            (Lang::En, "$1,234.56...", "1 thousand 234 dollars and 56 cents..."),
+            (
+                Lang::En,
+                "$1,234.56...",
+                "1 thousand 234 dollars and 56 cents...",
+            ),
             (Lang::En, "$4.59", "4 dollars and 59 cents"),
             (Lang::En, "$0.01", "1 cents"),
             (Lang::En, "$0.10", "10 cents"),
@@ -262,9 +278,15 @@ mod tests {
             (Lang::De, "$2000000", "2 Millionen Dollar"),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(currency(input, lang).as_deref(), Some(expected), "{lang:?} {input:?}");
+            assert_eq!(
+                currency(input, lang).as_deref(),
+                Some(expected),
+                "{lang:?} {input:?}"
+            );
         }
-        for input in ["1234", "$abc", "$", "$5€", "5$5", "$007", "$1.2.3", "$ 5", "-$", "--$5"] {
+        for input in [
+            "1234", "$abc", "$", "$5€", "5$5", "$007", "$1.2.3", "$ 5", "-$", "--$5",
+        ] {
             assert_eq!(currency(input, Lang::En), None, "{input:?}");
         }
     }

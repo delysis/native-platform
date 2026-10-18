@@ -7,7 +7,11 @@ use crate::preprocess::Lang;
 /// spelled out: "a.b@gra-dium.fr" becomes "a dot b at gra dash dium dot F-R".
 pub(super) fn emails(word: &str, lang: Lang) -> Option<String> {
     let (user, rest) = word.split_once('@')?;
-    if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c)) {
+    if user.is_empty()
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
+    {
         return None;
     }
     // The domain: labels of letters, digits and dashes, separated by dots, at least two of them.
@@ -18,7 +22,9 @@ pub(super) fn emails(word: &str, lang: Lang) -> Option<String> {
         rest = after;
     }
     let suffix = suffix(rest)?;
-    let (tld, domain) = labels.split_last().filter(|(_, domain)| !domain.is_empty())?;
+    let (tld, domain) = labels
+        .split_last()
+        .filter(|(_, domain)| !domain.is_empty())?;
 
     let sc = lang.special_chars();
     let mut words = vec![];
@@ -42,7 +48,10 @@ pub(super) fn emails(word: &str, lang: Lang) -> Option<String> {
 
 /// The domain label `s` starts with, and the rest of `s`.
 fn label(s: &str) -> Option<(&str, &str)> {
-    let n = s.bytes().take_while(|&b| b.is_ascii_alphanumeric() || b == b'-').count();
+    let n = s
+        .bytes()
+        .take_while(|&b| b.is_ascii_alphanumeric() || b == b'-')
+        .count();
     (n > 0).then(|| s.split_at(n))
 }
 
@@ -73,27 +82,53 @@ mod tests {
         let cases = [
             (Lang::En, "foo@bar.com", "foo at bar dot com"),
             (Lang::En, "foo@bar.baz.com?", "foo at bar dot baz dot com?"),
-            (Lang::En, "laurent.mazare@gmail.com", "laurent dot mazare at gmail dot com"),
+            (
+                Lang::En,
+                "laurent.mazare@gmail.com",
+                "laurent dot mazare at gmail dot com",
+            ),
             (
                 Lang::En,
                 "laurent.mazare@gra-dium.fr?",
                 "laurent dot mazare at gra dash dium dot F-R?",
             ),
-            (Lang::En, "laurent+tag@gmail.com", "laurent plus tag at gmail dot com"),
-            (Lang::En, "first_last@x.co.uk.", "first underscore last at x dot co dot U-K."),
+            (
+                Lang::En,
+                "laurent+tag@gmail.com",
+                "laurent plus tag at gmail dot com",
+            ),
+            (
+                Lang::En,
+                "first_last@x.co.uk.",
+                "first underscore last at x dot co dot U-K.",
+            ),
             (Lang::En, "a..b@x.io", "a dot dot b at x dot I-O"),
             (Lang::Fr, "alex@gmail.com", "alex arobaze gmail point com"),
-            (Lang::De, "max-mustermann@web.de", "max Bindestrich mustermann ät web Punkt D-E"),
+            (
+                Lang::De,
+                "max-mustermann@web.de",
+                "max Bindestrich mustermann ät web Punkt D-E",
+            ),
             (Lang::Es, "a_b@x.es", "a guion bajo b arroba x punto E-S"),
             // The domain is not checked against the top-level domains.
             (Lang::En, "foo@bar.xyzzy", "foo at bar dot xyzzy"),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(emails(input, lang).as_deref(), Some(expected), "{lang:?} {input:?}");
+            assert_eq!(
+                emails(input, lang).as_deref(),
+                Some(expected),
+                "{lang:?} {input:?}"
+            );
         }
-        for input in
-            ["foo@com...", "user@host", "@bar.com", "foo@", "foo@.com", "fé@bar.com", "a@b.c/d"]
-        {
+        for input in [
+            "foo@com...",
+            "user@host",
+            "@bar.com",
+            "foo@",
+            "foo@.com",
+            "fé@bar.com",
+            "a@b.c/d",
+        ] {
             assert_eq!(emails(input, Lang::En), None, "{input:?}");
         }
     }

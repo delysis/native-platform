@@ -131,7 +131,10 @@ impl EosPolicy {
         if self.completed {
             Ok(())
         } else {
-            Err(Error::GenerationBudgetExceeded { frames, saw_eos: self.saw_eos() })
+            Err(Error::GenerationBudgetExceeded {
+                frames,
+                saw_eos: self.saw_eos(),
+            })
         }
     }
 }
@@ -158,7 +161,12 @@ impl Chunk {
         let (prepared, frames_after_eos) = prepare_text_prompt(&text);
         let tokens = tokenizer.encode(&prepared)?;
         let frame_budget = frame_budget(tokens.len(), frame_rate);
-        Ok(Self { text, tokens, frames_after_eos, frame_budget })
+        Ok(Self {
+            text,
+            tokens,
+            frames_after_eos,
+            frame_budget,
+        })
     }
 
     /// The KV-cache length this chunk needs, from [`seq_budget`].
@@ -186,7 +194,9 @@ pub fn chunks(
         .map(|text| Chunk::new(text, tokenizer, frame_rate))
         .collect::<Result<Vec<_>>>()?;
     if chunks.is_empty() {
-        return Err(Error::invalid_argument("nothing to synthesize: the text is empty"));
+        return Err(Error::invalid_argument(
+            "nothing to synthesize: the text is empty",
+        ));
     }
     Ok(chunks)
 }
@@ -314,7 +324,10 @@ fn cut(words: &[&str], min_side: usize, tokenizer: &dyn Tokenizer) -> Result<usi
 /// The most text tokens one chunk can have when `room` KV slots are left after the voice prompt:
 /// the largest `n` with `n + frame_budget(n, frame_rate) <= room`.
 pub fn max_tokens_for(room: usize, frame_rate: f64) -> usize {
-    (0..=room).rev().find(|&n| n + frame_budget(n, frame_rate) <= room).unwrap_or(0)
+    (0..=room)
+        .rev()
+        .find(|&n| n + frame_budget(n, frame_rate) <= room)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -388,16 +401,24 @@ mod tests {
     #[test]
     fn each_chunk_is_prepared_and_budgeted_on_its_own() {
         let tok = Words::default();
-        let chunks =
-            chunks(&tok, "short one. and now a longer second sentence", Normalize::OFF, 4, 12.5)
-                .unwrap();
+        let chunks = chunks(
+            &tok,
+            "short one. and now a longer second sentence",
+            Normalize::OFF,
+            4,
+            12.5,
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 2);
         for chunk in &chunks {
             let (prepared, frames_after_eos) = prepare_text_prompt(&chunk.text);
             assert_eq!(chunk.tokens, tok.encode(&prepared).unwrap());
             assert_eq!(chunk.frames_after_eos, frames_after_eos);
             assert_eq!(chunk.frame_budget, frame_budget(chunk.tokens.len(), 12.5));
-            assert_eq!(chunk.seq_budget(), seq_budget(chunk.tokens.len(), chunk.frame_budget));
+            assert_eq!(
+                chunk.seq_budget(),
+                seq_budget(chunk.tokens.len(), chunk.frame_budget)
+            );
         }
     }
 
@@ -423,22 +444,34 @@ mod tests {
 
     /// The pieces as the model reads them.
     fn prompts(chunks: &[Chunk]) -> Vec<String> {
-        chunks.iter().map(|c| prepare_text_prompt(&c.text).0).collect()
+        chunks
+            .iter()
+            .map(|c| prepare_text_prompt(&c.text).0)
+            .collect()
     }
 
     #[test]
     fn fit_cuts_after_the_middle_comma_without_a_full_stop() {
-        let chunks = fit_text("one two three four five, six seven eight nine ten eleven twelve", 8);
+        let chunks = fit_text(
+            "one two three four five, six seven eight nine ten eleven twelve",
+            8,
+        );
         assert_eq!(
             prompts(&chunks),
-            ["One two three four five,", "Six seven eight nine ten eleven twelve."]
+            [
+                "One two three four five,",
+                "Six seven eight nine ten eleven twelve."
+            ]
         );
     }
 
     #[test]
     fn fit_passes_over_a_comma_that_would_leave_a_tiny_piece() {
         let chunks = fit_text("one, two three four five six seven eight", 5);
-        assert_eq!(prompts(&chunks), ["One, two three four.", "Five six seven eight."]);
+        assert_eq!(
+            prompts(&chunks),
+            ["One, two three four.", "Five six seven eight."]
+        );
     }
 
     #[test]
@@ -446,7 +479,10 @@ mod tests {
         let text = "one two three four \"five,\" six seven eight nine ten eleven twelve";
         assert_eq!(
             prompts(&fit_text(text, 8)),
-            ["One two three four \"five,\"", "Six seven eight nine ten eleven twelve."]
+            [
+                "One two three four \"five,\"",
+                "Six seven eight nine ten eleven twelve."
+            ]
         );
     }
 
@@ -457,17 +493,34 @@ mod tests {
         let planned = chunks(&tok, text, Normalize::OFF, 50, 12.5).unwrap();
         assert_eq!(planned.len(), 1);
         let fitted = fit(planned, 8, &tok, 12.5).unwrap();
-        assert_eq!(prompts(&fitted), ["One two, three four five six.", "Seven eight nine ten."]);
+        assert_eq!(
+            prompts(&fitted),
+            ["One two, three four five six.", "Seven eight nine ten."]
+        );
     }
 
     #[test]
     fn fit_keeps_the_words_in_order_and_every_piece_fits() {
-        let words: Vec<String> =
-            (0..60).map(|i| if i % 7 == 6 { format!("w{i},") } else { format!("w{i}") }).collect();
+        let words: Vec<String> = (0..60)
+            .map(|i| {
+                if i % 7 == 6 {
+                    format!("w{i},")
+                } else {
+                    format!("w{i}")
+                }
+            })
+            .collect();
         let text = words.join(" ");
         let chunks = fit_text(&text, 6);
         assert!(chunks.iter().all(|c| c.tokens.len() <= 6));
-        assert_eq!(chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" "), text);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            text
+        );
     }
 
     #[test]
@@ -501,7 +554,10 @@ mod tests {
 
         let chunk = Chunk::new("é".repeat(9), &Chars, 12.5).unwrap();
         let fitted = fit(vec![chunk], 4, &Chars, 12.5).unwrap();
-        assert_eq!(fitted.iter().map(|c| c.text.as_str()).collect::<String>(), "é".repeat(9));
+        assert_eq!(
+            fitted.iter().map(|c| c.text.as_str()).collect::<String>(),
+            "é".repeat(9)
+        );
     }
 
     #[test]
@@ -530,11 +586,17 @@ mod tests {
     #[test]
     fn fit_or_error_bounds_a_long_sentence_before_cache_sizing() {
         let tok = Words::default();
-        let text = std::iter::repeat_n("word", 225).collect::<Vec<_>>().join(" ");
+        let text = std::iter::repeat_n("word", 225)
+            .collect::<Vec<_>>()
+            .join(" ");
         let planned = chunks(&tok, &text, Normalize::OFF, 50, 12.5).unwrap();
         assert!(planned[0].tokens.len() > MAX_FIT_TOKENS);
         let fitted = fit_or_error(planned, MAX_FIT_TOKENS, &tok, 12.5).unwrap();
-        assert!(fitted.iter().all(|chunk| chunk.tokens.len() <= MAX_FIT_TOKENS));
+        assert!(
+            fitted
+                .iter()
+                .all(|chunk| chunk.tokens.len() <= MAX_FIT_TOKENS)
+        );
 
         let single = chunks(&tok, "word", Normalize::OFF, 50, 12.5).unwrap();
         let err = fit_or_error(single, 1, &tok, 12.5).unwrap_err();

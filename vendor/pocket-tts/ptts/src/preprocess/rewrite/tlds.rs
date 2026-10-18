@@ -172,7 +172,10 @@ mod tests {
     fn the_table_is_sorted_and_searchable() {
         assert!(TLDS.windows(2).all(|w| w[0] < w[1]));
         for tld in TLDS {
-            assert!(tld.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'));
+            assert!(
+                tld.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+            );
         }
         assert!(is_tld("com") && is_tld("COM") && is_tld("Fr"));
         // Once written with a stray comma inside the string, so never matched.

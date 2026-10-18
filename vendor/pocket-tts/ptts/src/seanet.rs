@@ -32,7 +32,11 @@ impl<T: WithDTypeF, B: Backend> SEANetResnetBlock<T, B> {
         let mut convs = Vec::new();
         for (i, (&ks, &dil)) in kernel_sizes.iter().zip(dilations.iter()).enumerate() {
             let in_c = if i == 0 { dim } else { hidden };
-            let out_c = if i == kernel_sizes.len() - 1 { dim } else { hidden };
+            let out_c = if i == kernel_sizes.len() - 1 {
+                dim
+            } else {
+                hidden
+            };
             // block.{2*i+1} in Python (ELU at even indices, Conv at odd)
             let conv = StreamingConv1d::load(
                 &vb.pp("block").pp(2 * i + 1),
@@ -51,8 +55,11 @@ impl<T: WithDTypeF, B: Backend> SEANetResnetBlock<T, B> {
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<SEANetResnetBlockState<T, B>> {
-        let conv_states =
-            self.convs.iter().map(|c| c.init_state(batch_size)).collect::<Result<Vec<_>>>()?;
+        let conv_states = self
+            .convs
+            .iter()
+            .map(|c| c.init_state(batch_size))
+            .collect::<Result<Vec<_>>>()?;
         Ok(SEANetResnetBlockState { conv_states })
     }
 
@@ -83,7 +90,10 @@ pub struct SEANetEncoder<T: WithDTypeF, B: Backend> {
     final_conv: StreamingConv1d<T, B>,
 }
 
-type EncoderLayerState<T, B> = (Vec<SEANetResnetBlockState<T, B>>, StreamingConv1dState<T, B>);
+type EncoderLayerState<T, B> = (
+    Vec<SEANetResnetBlockState<T, B>>,
+    StreamingConv1dState<T, B>,
+);
 
 #[derive(Debug, Clone)]
 pub struct SEANetEncoderState<T: WithDTypeF, B: Backend> {
@@ -156,7 +166,10 @@ impl<T: WithDTypeF, B: Backend> SEANetEncoder<T, B> {
                 true,
             )?;
             layer_idx += 2;
-            layers.push(EncoderLayer { residuals, downsample });
+            layers.push(EncoderLayer {
+                residuals,
+                downsample,
+            });
             mult *= 2;
         }
 
@@ -173,7 +186,11 @@ impl<T: WithDTypeF, B: Backend> SEANetEncoder<T, B> {
             true,
         )?;
 
-        Ok(Self { init_conv, layers, final_conv })
+        Ok(Self {
+            init_conv,
+            layers,
+            final_conv,
+        })
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<SEANetEncoderState<T, B>> {
@@ -192,7 +209,11 @@ impl<T: WithDTypeF, B: Backend> SEANetEncoder<T, B> {
             })
             .collect::<Result<Vec<_>>>()?;
         let final_conv_state = self.final_conv.init_state(batch_size)?;
-        Ok(SEANetEncoderState { init_conv_state, layer_states, final_conv_state })
+        Ok(SEANetEncoderState {
+            init_conv_state,
+            layer_states,
+            final_conv_state,
+        })
     }
 
     pub fn forward(
@@ -228,7 +249,10 @@ pub struct SEANetDecoder<T: WithDTypeF, B: Backend> {
     final_conv: StreamingConv1d<T, B>,
 }
 
-type DecoderLayerState<T, B> = (StreamingConvTr1dState<T, B>, Vec<SEANetResnetBlockState<T, B>>);
+type DecoderLayerState<T, B> = (
+    StreamingConvTr1dState<T, B>,
+    Vec<SEANetResnetBlockState<T, B>>,
+);
 
 #[derive(Debug, Clone)]
 pub struct SEANetDecoderState<T: WithDTypeF, B: Backend> {
@@ -298,7 +322,10 @@ impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {
                 layer_idx += 1;
             }
 
-            layers.push(DecoderLayer { upsample, residuals });
+            layers.push(DecoderLayer {
+                upsample,
+                residuals,
+            });
             mult /= 2;
         }
 
@@ -315,7 +342,11 @@ impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {
             true,
         )?;
 
-        Ok(Self { init_conv, layers, final_conv })
+        Ok(Self {
+            init_conv,
+            layers,
+            final_conv,
+        })
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<SEANetDecoderState<T, B>> {
@@ -334,7 +365,11 @@ impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {
             })
             .collect::<Result<Vec<_>>>()?;
         let final_conv_state = self.final_conv.init_state(batch_size)?;
-        Ok(SEANetDecoderState { init_conv_state, layer_states, final_conv_state })
+        Ok(SEANetDecoderState {
+            init_conv_state,
+            layer_states,
+            final_conv_state,
+        })
     }
 
     pub fn forward(
@@ -376,7 +411,9 @@ mod tests {
                 PadMode::Constant,
                 compress,
             );
-            let err = block.err().unwrap_or_else(|| panic!("compress {compress} for a width of 8"));
+            let err = block
+                .err()
+                .unwrap_or_else(|| panic!("compress {compress} for a width of 8"));
             assert!(err.to_string().contains("compress"), "{err}");
         }
     }

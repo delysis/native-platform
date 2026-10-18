@@ -32,7 +32,10 @@ impl NormalRng {
     pub fn new(temperature: f32, seed: u64) -> Result<Self> {
         use rand::SeedableRng;
         let distr = rand_distr::Normal::new(0f32, temperature.sqrt()).map_err(xn::Error::wrap)?;
-        Ok(Self { inner: rand::rngs::StdRng::seed_from_u64(seed), distr })
+        Ok(Self {
+            inner: rand::rngs::StdRng::seed_from_u64(seed),
+            distr,
+        })
     }
 }
 
@@ -94,8 +97,13 @@ fn lsd_decode<T: WithDTypeF, B: Backend>(
         let t_val = (i + 1) as f32 / num_steps as f32;
 
         // Create s and t tensors matching x_0 shape but with last dim = 1
-        let shape: Vec<usize> =
-            x_0.dims().iter().copied().take(x_0.rank() - 1).chain([1]).collect();
+        let shape: Vec<usize> = x_0
+            .dims()
+            .iter()
+            .copied()
+            .take(x_0.rank() - 1)
+            .chain([1])
+            .collect();
         let s = Tensor::full(T::from_f32(s_val), shape.clone(), dev)?;
         let t = Tensor::full(T::from_f32(t_val), shape, dev)?;
 
@@ -239,7 +247,10 @@ impl<Q: BackendQ> FlowLM<Q> {
 
     pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> Result<FlowLMState<Q>> {
         let transformer_state = self.transformer.init_state(batch_size, sequence_length)?;
-        Ok(FlowLMState { transformer_state, conditions: None })
+        Ok(FlowLMState {
+            transformer_state,
+            conditions: None,
+        })
     }
 
     /// Run the backbone: concat text_embeddings + input, run transformer, strip prefix.
@@ -250,12 +261,18 @@ impl<Q: BackendQ> FlowLM<Q> {
         seq_len: usize,
         state: &mut FlowLMState<Q>,
     ) -> Result<Tensor<Q::T, Q::B>> {
-        let input = match state.conditions.as_ref().or(self.condition_providers.as_ref()) {
+        let input = match state
+            .conditions
+            .as_ref()
+            .or(self.condition_providers.as_ref())
+        {
             Some(ns) => input.broadcast_add(ns)?,
             None => input.clone(),
         };
         let input = Tensor::cat(&[text_embeddings, &input], 1)?;
-        let out = self.transformer.forward(&input, &mut state.transformer_state)?;
+        let out = self
+            .transformer
+            .forward(&input, &mut state.transformer_state)?;
         let out = out.layer_norm(&self.out_norm_weight, &self.out_norm_bias, 1e-5)?;
         // Remove prefix, keep only last seq_len positions
         let total = out.dim(1usize)?;
@@ -284,8 +301,9 @@ impl<Q: BackendQ> FlowLM<Q> {
         rng: &mut impl Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         let eos_logit = self.out_eos.forward(t_out)?;
-        let noise_data: Vec<Q::T> =
-            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
+        let noise_data: Vec<Q::T> = (0..b * self.ldim)
+            .map(|_| Q::T::from_f32(rng.sample()))
+            .collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), t_out.device())?;
         let latent = lsd_decode(&self.flow_net, t_out, &noise, lsd_decode_steps)?;
         Ok((latent.reshape((b, 1, self.ldim))?, eos_logit))
@@ -311,7 +329,10 @@ impl<Q: BackendQ> FlowLM<Q> {
         let input = self.input_linear.forward(&sequence)?;
         let t_out = self.backbone(&input, text_embeddings, s, state)?;
         let t_len = t_out.dim(1usize)?;
-        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        let t_out = t_out
+            .narrow(1, t_len - 1..t_len)?
+            .contiguous()?
+            .reshape((b, self.dim))?;
 
         self.sample_from(&t_out, b, lsd_decode_steps, rng)
     }
@@ -342,14 +363,25 @@ impl<Q: BackendQ> FlowLM<Q> {
         let x = self.input_linear.forward(&sequence)?;
         let t_out = self.backbone(&x, text_embeddings, s, state)?;
         let t_len = t_out.dim(1usize)?;
-        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        let t_out = t_out
+            .narrow(1, t_len - 1..t_len)?
+            .contiguous()?
+            .reshape((b, self.dim))?;
         let null_out = self.backbone(&x, text_embeddings, s, null_state)?;
-        let null_out =
-            null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
-        let t_out = t_out.sub(&null_out)?.scale(Q::T::from_f32(cfg_coef))?.add(&null_out)?;
+        let null_out = null_out
+            .narrow(1, t_len - 1..t_len)?
+            .contiguous()?
+            .reshape((b, self.dim))?;
+        let t_out = t_out
+            .sub(&null_out)?
+            .scale(Q::T::from_f32(cfg_coef))?
+            .add(&null_out)?;
 
         let (latent, eos_logit) = self.sample_from(&t_out, b, lsd_decode_steps, rng)?;
-        Ok((latent, Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold)))
+        Ok((
+            latent,
+            Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold),
+        ))
     }
 }
 

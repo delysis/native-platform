@@ -10,7 +10,9 @@ pub(super) fn elongations(word: &str, lang: Lang) -> Option<String> {
     let stretched = |c: char| "aeiouyhw".contains(c.to_ascii_lowercase());
     if !chars.iter().all(char::is_ascii_alphabetic)
         || chars.iter().all(char::is_ascii_uppercase)
-        || !chars.windows(3).any(|w| w[0] == w[1] && w[1] == w[2] && stretched(w[0]))
+        || !chars
+            .windows(3)
+            .any(|w| w[0] == w[1] && w[1] == w[2] && stretched(w[0]))
     {
         return None;
     }
@@ -47,7 +49,11 @@ mod tests {
             ("Mmm", None),
         ];
         for (input, expected) in cases {
-            assert_eq!(elongations(input, Lang::En).as_deref(), expected, "{input:?}");
+            assert_eq!(
+                elongations(input, Lang::En).as_deref(),
+                expected,
+                "{input:?}"
+            );
         }
     }
 }

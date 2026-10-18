@@ -39,8 +39,12 @@ pub fn decode_file(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
         .ok_or_else(|| xn::Error::msg(format!("no audio track in {}", path.display())))?;
     let track_id = track.id;
     if format.tracks().len() > 1 {
-        let others: Vec<_> =
-            format.tracks().iter().map(|t| t.id).filter(|id| *id != track_id).collect();
+        let others: Vec<_> = format
+            .tracks()
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| *id != track_id)
+            .collect();
         tracing::info!(?path, chosen = track_id, ignored = ?others, "file has several tracks");
     }
     let sample_rate = track
@@ -152,7 +156,12 @@ pub fn resample(pcm: Vec<f32>, sr_in: usize, sr_out: usize) -> Result<Vec<f32>> 
 /// ```
 pub fn load_mono_at(path: &std::path::Path, sample_rate: u32) -> Result<Vec<f32>> {
     let (pcm, file_rate) = decode_file(path)?;
-    tracing::info!(?path, samples = pcm.len(), rate = file_rate, "decoded audio");
+    tracing::info!(
+        ?path,
+        samples = pcm.len(),
+        rate = file_rate,
+        "decoded audio"
+    );
     resample(pcm, file_rate as usize, sample_rate as usize)
 }
 
@@ -162,8 +171,10 @@ mod tests {
 
     #[test]
     fn a_written_wav_decodes_to_the_same_samples() {
-        let pcm: Vec<f32> =
-            (0..2400).map(|i| (i as f32 * 0.05).sin() * 0.8).chain([1.0, -1.0, 0.0]).collect();
+        let pcm: Vec<f32> = (0..2400)
+            .map(|i| (i as f32 * 0.05).sin() * 0.8)
+            .chain([1.0, -1.0, 0.0])
+            .collect();
         let path =
             std::env::temp_dir().join(format!("ptts-wav-round-trip-{}.wav", std::process::id()));
         crate::wav::write_wav_file(&path, &pcm, 24000).unwrap();
@@ -174,7 +185,10 @@ mod tests {
         assert_eq!(back.len(), pcm.len());
         // 16-bit samples, written scaled by 32767 and read back over 32768.
         for (i, (a, b)) in pcm.iter().zip(&back).enumerate() {
-            assert!((a - b).abs() <= 2.0 / 32767.0, "sample {i}: wrote {a}, read {b}");
+            assert!(
+                (a - b).abs() <= 2.0 / 32767.0,
+                "sample {i}: wrote {a}, read {b}"
+            );
         }
     }
 
@@ -199,7 +213,9 @@ mod tests {
 
     #[test]
     fn a_missing_file_names_itself() {
-        let err = decode_file("/nope/not-audio.wav".as_ref()).unwrap_err().to_string();
+        let err = decode_file("/nope/not-audio.wav".as_ref())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("/nope/not-audio.wav"), "{err}");
     }
 }

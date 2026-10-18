@@ -47,7 +47,13 @@ impl<T: WithDTypeF, B: Backend> TimestepEmbedder<T, B> {
 
         let alpha = mlp.tensor("3.alpha", (hidden_size,))?;
         let freqs = vb.tensor("freqs", (frequency_embedding_size / 2,))?;
-        Ok(Self { linear1, linear2, alpha, norm, freqs })
+        Ok(Self {
+            linear1,
+            linear2,
+            alpha,
+            norm,
+            freqs,
+        })
     }
 
     #[tracing::instrument(name = "ts-embedder", skip_all)]
@@ -69,13 +75,20 @@ impl<T: WithDTypeF, B: Backend> TimestepEmbedder<T, B> {
         let n = x.dims()[last] as f32;
         match self.norm {
             TimeRmsNorm::Rms => {
-                let ms = x.sqr()?.sum_keepdim(vec![last])?.scale(T::from_f32(1.0 / n))?;
-                x.broadcast_mul(&ms.add_scalar(eps)?.rsqrt()?)?.broadcast_mul(&self.alpha)
+                let ms = x
+                    .sqr()?
+                    .sum_keepdim(vec![last])?
+                    .scale(T::from_f32(1.0 / n))?;
+                x.broadcast_mul(&ms.add_scalar(eps)?.rsqrt()?)?
+                    .broadcast_mul(&self.alpha)
             }
             TimeRmsNorm::RmsVar => {
                 let mean = x.sum_keepdim(vec![last])?.scale(T::from_f32(1.0 / n))?;
                 let var = x.broadcast_sub(&mean)?.sqr()?.sum_keepdim(vec![last])?;
-                let inv = var.scale(T::from_f32(1.0 / (n - 1.0)))?.add_scalar(eps)?.rsqrt()?;
+                let inv = var
+                    .scale(T::from_f32(1.0 / (n - 1.0)))?
+                    .add_scalar(eps)?
+                    .rsqrt()?;
                 x.broadcast_mul(&inv)?.broadcast_mul(&self.alpha)
             }
         }
@@ -99,7 +112,12 @@ impl<T: WithDTypeF, B: Backend> ResBlock<T, B> {
         let mlp_linear2 = Linear::load_b(mlp.pp("2"), channels, channels)?;
         let ada = vb.pp("adaLN_modulation");
         let ada_ln_silu_linear = Linear::load_b(ada.pp("1"), channels, 3 * channels)?;
-        Ok(Self { in_ln, mlp_linear1, mlp_linear2, ada_ln_silu_linear })
+        Ok(Self {
+            in_ln,
+            mlp_linear1,
+            mlp_linear2,
+            ada_ln_silu_linear,
+        })
     }
 
     #[tracing::instrument(name = "resblock", skip_all)]
@@ -107,8 +125,12 @@ impl<T: WithDTypeF, B: Backend> ResBlock<T, B> {
         let ada = self.ada_ln_silu_linear.forward(&y.silu()?)?;
         let channels = x.dim(xn::D::Minus1)?;
         let shift_mlp = ada.narrow(ada.rank() - 1, 0..channels)?.contiguous()?;
-        let scale_mlp = ada.narrow(ada.rank() - 1, channels..2 * channels)?.contiguous()?;
-        let gate_mlp = ada.narrow(ada.rank() - 1, 2 * channels..3 * channels)?.contiguous()?;
+        let scale_mlp = ada
+            .narrow(ada.rank() - 1, channels..2 * channels)?
+            .contiguous()?;
+        let gate_mlp = ada
+            .narrow(ada.rank() - 1, 2 * channels..3 * channels)?
+            .contiguous()?;
 
         // h = modulate(ln(x), shift, scale)
         let h = self.in_ln.forward(x)?;
@@ -138,14 +160,20 @@ impl<T: WithDTypeF, B: Backend> FinalLayer<T, B> {
         let linear = Linear::load_b(vb.pp("linear"), model_channels, out_channels)?;
         let ada = vb.pp("adaLN_modulation");
         let ada_ln_silu_linear = Linear::load_b(ada.pp("1"), model_channels, 2 * model_channels)?;
-        Ok(Self { norm_final, linear, ada_ln_silu_linear })
+        Ok(Self {
+            norm_final,
+            linear,
+            ada_ln_silu_linear,
+        })
     }
 
     pub fn forward(&self, x: &Tensor<T, B>, c: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let ada = self.ada_ln_silu_linear.forward(&c.silu()?)?;
         let model_channels = x.dim(D::Minus1)?;
         let shift = ada.narrow(D::Minus1, 0..model_channels)?.contiguous()?;
-        let scale = ada.narrow(D::Minus1, model_channels..2 * model_channels)?.contiguous()?;
+        let scale = ada
+            .narrow(D::Minus1, model_channels..2 * model_channels)?
+            .contiguous()?;
         let x = self.norm_final.forward(x)?;
         let x = modulate(&x, &shift, &scale)?;
         self.linear.forward(&x)
@@ -192,7 +220,14 @@ impl<T: WithDTypeF, B: Backend> SimpleMLPAdaLN<T, B> {
             res_blocks.push(ResBlock::load(&vb.pp("res_blocks").pp(i), model_channels)?);
         }
         let final_layer = FinalLayer::load(&vb.pp("final_layer"), model_channels, out_channels)?;
-        Ok(Self { time_embeds, cond_embed, input_proj, res_blocks, final_layer, num_time_conds })
+        Ok(Self {
+            time_embeds,
+            cond_embed,
+            input_proj,
+            res_blocks,
+            final_layer,
+            num_time_conds,
+        })
     }
 
     /// Forward pass.
@@ -243,7 +278,12 @@ mod tests {
                 norm,
                 freqs: Tensor::zeros(1, &CpuDevice).unwrap(),
             };
-            e.normalize(&x).unwrap().flatten_all().unwrap().to_vec1().unwrap()
+            e.normalize(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
         };
         let (n, eps) = (4.0f32, 1e-5f32);
         let mean = xs.iter().sum::<f32>() / n;
@@ -254,13 +294,22 @@ mod tests {
                 assert!((g - w).abs() < 1e-5, "{got:?} vs {want:?}");
             }
         };
-        close(run(TimeRmsNorm::Rms), xs.iter().map(|v| 2.0 * v / (ms + eps).sqrt()).collect());
-        close(run(TimeRmsNorm::RmsVar), xs.iter().map(|v| 2.0 * v / (var + eps).sqrt()).collect());
+        close(
+            run(TimeRmsNorm::Rms),
+            xs.iter().map(|v| 2.0 * v / (ms + eps).sqrt()).collect(),
+        );
+        close(
+            run(TimeRmsNorm::RmsVar),
+            xs.iter().map(|v| 2.0 * v / (var + eps).sqrt()).collect(),
+        );
     }
 
     #[test]
     fn the_config_names_the_time_norms_and_defaults_to_rms_var() {
-        assert_eq!(serde_json::from_str::<TimeRmsNorm>("\"rms\"").unwrap(), TimeRmsNorm::Rms);
+        assert_eq!(
+            serde_json::from_str::<TimeRmsNorm>("\"rms\"").unwrap(),
+            TimeRmsNorm::Rms
+        );
         assert_eq!(
             serde_json::from_str::<TimeRmsNorm>("\"rms_var\"").unwrap(),
             TimeRmsNorm::RmsVar

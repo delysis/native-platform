@@ -332,17 +332,26 @@ pub struct Normalize {
 
 impl Normalize {
     /// Hand text to the tokenizer as written.
-    pub const OFF: Self = Self { lang: None, rules: Rules::NONE };
+    pub const OFF: Self = Self {
+        lang: None,
+        rules: Rules::NONE,
+    };
 
     /// Normalize as `lang`, with the default rewrite rules, [`Rules::DEFAULT`].
     pub const fn for_lang(lang: Lang) -> Self {
-        Self { lang: Some(lang), rules: Rules::DEFAULT }
+        Self {
+            lang: Some(lang),
+            rules: Rules::DEFAULT,
+        }
     }
 
     /// This policy with `rules` instead. A no-op on [`Self::OFF`], which rewrites nothing.
     pub const fn with_rules(self, rules: Rules) -> Self {
         match self.lang {
-            Some(lang) => Self { lang: Some(lang), rules },
+            Some(lang) => Self {
+                lang: Some(lang),
+                rules,
+            },
             None => Self::OFF,
         }
     }
@@ -437,8 +446,11 @@ impl StringAppender {
     }
 
     fn ends_with_one(&self) -> bool {
-        let b = &self.buffer
-            [..self.buffer.iter().rposition(|c| !c.is_whitespace()).map_or(0, |i| i + 1)];
+        let b = &self.buffer[..self
+            .buffer
+            .iter()
+            .rposition(|c| !c.is_whitespace())
+            .map_or(0, |i| i + 1)];
         b.last() == Some(&'1')
             && !b
                 .len()
@@ -720,8 +732,9 @@ fn strip_closing_quote(text: &str) -> &str {
 /// read as a pause rather than as "slash".
 fn spell_symbols(word: &str, lang: Lang, rules: Rules) -> String {
     if let Some(text) = split_slash(word) {
-        let words =
-            text.split(' ').map(|w| rewrite_word(w, lang, rules).unwrap_or_else(|| w.into()));
+        let words = text
+            .split(' ')
+            .map(|w| rewrite_word(w, lang, rules).unwrap_or_else(|| w.into()));
         return words.collect::<Vec<_>>().join(" ");
     }
     if !word.contains(['@', '+']) {
@@ -736,7 +749,9 @@ fn spell_symbols(word: &str, lang: Lang, rules: Rules) -> String {
         }
     }
     let text = res.into_string();
-    let words = text.split(' ').map(|w| rewrite_word(w, lang, rules).unwrap_or_else(|| w.into()));
+    let words = text
+        .split(' ')
+        .map(|w| rewrite_word(w, lang, rules).unwrap_or_else(|| w.into()));
     words.collect::<Vec<_>>().join(" ")
 }
 
@@ -778,7 +793,10 @@ mod tests {
             ("user@host @home", "user at host at home"),
             ("café résumé 日本語", "café résumé 日本語"),
             ("hello 😀 flag 🇫🇷 sun ☀", "hello flag sun"),
-            ("party 🎉 cup 🏆 globe 🌍 pizza 🍕 star ⭐", "party cup globe pizza star"),
+            (
+                "party 🎉 cup 🏆 globe 🌍 pizza 🍕 star ⭐",
+                "party cup globe pizza star",
+            ),
             ("sun ☀️ dev 👩‍💻 done", "sun dev done"),
             ("Fish &, chips &.", "Fish &, chips &."),
             // ';', '(' / ')' and a ':' next to whitespace collapse to ", " (comma + single
@@ -822,10 +840,19 @@ mod tests {
     #[test]
     fn spoken_symbols_follow_the_language() {
         assert_eq!(normalize_text("a@b", Lang::En, Rules::DEFAULT), "a at b");
-        assert_eq!(normalize_text("a@b", Lang::Fr, Rules::DEFAULT), "a arobaze b");
+        assert_eq!(
+            normalize_text("a@b", Lang::Fr, Rules::DEFAULT),
+            "a arobaze b"
+        );
         assert_eq!(normalize_text("a@b", Lang::De, Rules::DEFAULT), "a ät b");
-        assert_eq!(normalize_text("1+1=2", Lang::Es, Rules::DEFAULT), "1 mas 1 igual 2");
-        assert_eq!(normalize_text("1+1=2", Lang::Pt, Rules::DEFAULT), "1 mais 1 igual 2");
+        assert_eq!(
+            normalize_text("1+1=2", Lang::Es, Rules::DEFAULT),
+            "1 mas 1 igual 2"
+        );
+        assert_eq!(
+            normalize_text("1+1=2", Lang::Pt, Rules::DEFAULT),
+            "1 mais 1 igual 2"
+        );
     }
 
     /// `@` and `+` reach the rules, which read them in emails and phone numbers, and are
@@ -833,54 +860,103 @@ mod tests {
     #[test]
     fn symbols_are_spelled_after_the_rules() {
         let cases = [
-            ("Write to laurent.mazare@gmail.com!", "Write to laurent dot mazare at gmail dot com!"),
-            ("Mail (laurent+tag@gmail.com)", "Mail, laurent plus tag at gmail dot com,"),
+            (
+                "Write to laurent.mazare@gmail.com!",
+                "Write to laurent dot mazare at gmail dot com!",
+            ),
+            (
+                "Mail (laurent+tag@gmail.com)",
+                "Mail, laurent plus tag at gmail dot com,",
+            ),
             ("user@host @home", "user at host at home"),
             ("a@.", "a at."),
             ("x @, y", "x at, y"),
             ("C++.", "C plus plus."),
             ("1500+20", "1 thousand 500 plus 20"),
-            ("+33612345678", "plus 33 billion 612 million 345 thousand 678"),
+            (
+                "+33612345678",
+                "plus 33 billion 612 million 345 thousand 678",
+            ),
         ];
         for (input, expected) in cases {
-            assert_eq!(normalize_text(input, Lang::En, Rules::DEFAULT), expected, "{input:?}");
+            assert_eq!(
+                normalize_text(input, Lang::En, Rules::DEFAULT),
+                expected,
+                "{input:?}"
+            );
         }
-        assert_eq!(normalize_text("foo@bar.com", Lang::En, Rules::NONE), "foo at bar.com");
-        assert_eq!(normalize_text("C++.", Lang::En, Rules::NONE), "C plus plus.");
+        assert_eq!(
+            normalize_text("foo@bar.com", Lang::En, Rules::NONE),
+            "foo at bar.com"
+        );
+        assert_eq!(
+            normalize_text("C++.", Lang::En, Rules::NONE),
+            "C plus plus."
+        );
         let phones = "phones".parse().unwrap();
-        assert_eq!(normalize_text("+33612345678.", Lang::Fr, phones), "plus 33 6 12 34 56 78.");
+        assert_eq!(
+            normalize_text("+33612345678.", Lang::Fr, phones),
+            "plus 33 6 12 34 56 78."
+        );
     }
 
     #[test]
     fn sentences_are_rewritten() {
         let cases = [
-            (Lang::En, "It costs $1500 today.", "It costs 1 thousand 500 dollars today."),
+            (
+                Lang::En,
+                "It costs $1500 today.",
+                "It costs 1 thousand 500 dollars today.",
+            ),
             (Lang::En, "It costs 5$.", "It costs 5 dollars."),
             (Lang::En, "It costs -$5.", "It costs minus 5 dollars."),
             // A `$` that is not part of an amount goes before a period, as other symbols do.
             (Lang::En, "In $.", "In."),
             (Lang::En, "Only £50 left.", "Only 50 pounds left."),
-            (Lang::Fr, "Ça coûte 500€ aujourd'hui.", "Ça coûte 500 euros aujourd'hui."),
-            (Lang::De, "Es kostet $2500 heute.", "Es kostet 2 Tausend 500 Dollar heute."),
+            (
+                Lang::Fr,
+                "Ça coûte 500€ aujourd'hui.",
+                "Ça coûte 500 euros aujourd'hui.",
+            ),
+            (
+                Lang::De,
+                "Es kostet $2500 heute.",
+                "Es kostet 2 Tausend 500 Dollar heute.",
+            ),
             (
                 Lang::En,
                 "Call 555-123-4567 before 2024-05-12, it costs 12345678.",
                 "Call 555 123 4 5 6 7 before 2024-05-12, it costs 12 million 345 thousand 678.",
             ),
-            (Lang::En, "Visit www.kyutai.fr today.", "Visit W-W-W dot kyutai dot F-R today."),
+            (
+                Lang::En,
+                "Visit www.kyutai.fr today.",
+                "Visit W-W-W dot kyutai dot F-R today.",
+            ),
             (
                 Lang::Fr,
                 "Voir https://www.kyutai.fr/.",
                 "Voir H-T-T-P-S deux-points slash slash W-W-W point kyutai point F-R.",
             ),
             // Times and dates are opt-in.
-            (Lang::En, "It's 1:06pm on 20/12/2015.", "It's 1:06pm on 20/12/2015."),
+            (
+                Lang::En,
+                "It's 1:06pm on 20/12/2015.",
+                "It's 1:06pm on 20/12/2015.",
+            ),
         ];
         for (lang, input, expected) in cases {
-            assert_eq!(normalize_text(input, lang, Rules::DEFAULT), expected, "{input:?}");
+            assert_eq!(
+                normalize_text(input, lang, Rules::DEFAULT),
+                expected,
+                "{input:?}"
+            );
         }
         let en = [
-            ("It sold for £3.2m.", "It sold for 3 point 2 million pounds."),
+            (
+                "It sold for £3.2m.",
+                "It sold for 3 point 2 million pounds.",
+            ),
             (
                 "We raised $2 million, then €3bn.",
                 "We raised 2 million dollars, then 3 billion euros.",
@@ -894,16 +970,31 @@ mod tests {
                 "Text zero seven seven zero zero, nine zero zero one two three now.",
             ),
             ("In 2019 2020 2021", "In 2019 2020 2021"),
-            ("The card ending in -4098.", "The card ending in four zero nine eight."),
+            (
+                "The card ending in -4098.",
+                "The card ending in four zero nine eight.",
+            ),
             ("It fell to -12.", "It fell to minus 12."),
-            ("Your order number is 48213.", "Your order number is 48 thousand 213."),
+            (
+                "Your order number is 48213.",
+                "Your order number is 48 thousand 213.",
+            ),
             (
                 "Lt Col Vann and Lt. Col. Harris.",
                 "Lieutenant Colonel Vann and Lieutenant Colonel Harris.",
             ),
-            ("Rated ★★★★☆, or ★★★½.", "Rated 4 out of 5 stars, or 3 point 5 stars."),
-            ("Wait ~10 minutes, ±2.", "Wait about 10 minutes, plus or minus 2."),
-            ("I ❤️ NY, dial *67, it's 4.5%.", "I love NY, dial star 67, it's 4.5%."),
+            (
+                "Rated ★★★★☆, or ★★★½.",
+                "Rated 4 out of 5 stars, or 3 point 5 stars.",
+            ),
+            (
+                "Wait ~10 minutes, ±2.",
+                "Wait about 10 minutes, plus or minus 2.",
+            ),
+            (
+                "I ❤️ NY, dial *67, it's 4.5%.",
+                "I love NY, dial star 67, it's 4.5%.",
+            ),
             ("Press 1, then #.", "Press 1, then #."),
             ("That was sooo good.", "That was so good."),
             ("He said, \"go home!\"", "He said, \"go home!"),
@@ -924,16 +1015,35 @@ mod tests {
                 "1920×1080, 6÷2, x≤3, y≥4, a≠b, π≈3.14",
                 "1920 times 1 thousand 80, 6 divided by 2, x less than or equal to 3, y greater than or equal to 4, a is not equal to b, pi approximately 3 point 14",
             ),
-            ("√2, ∞, 5‰ and ∑", "square root of 2, infinity, 5 per mille and sigma"),
-            ("x² + y³ = 10⁻⁶", "x squared plus y cubed equals 10 to the power of minus 6"),
+            (
+                "√2, ∞, 5‰ and ∑",
+                "square root of 2, infinity, 5 per mille and sigma",
+            ),
+            (
+                "x² + y³ = 10⁻⁶",
+                "x squared plus y cubed equals 10 to the power of minus 6",
+            ),
             ("C₈H₁₈ and ¹³C", "C8H18 and 13C"),
             ("ΔH, α and ω", "delta H, alpha and omega"),
-            ("and/or, to/from, reality/the deity.", "and or, to from, reality the deity."),
-            ("40 km/h, 5 mg/kg, c/o, 3/4, 05/04/2025", "40 km/h, 5 mg/kg, c/o, 3/4, 05/04/2025"),
-            ("bǎohù zìjǐ in İstanbul, città", "baohù ziji in Istanbul, città"),
+            (
+                "and/or, to/from, reality/the deity.",
+                "and or, to from, reality the deity.",
+            ),
+            (
+                "40 km/h, 5 mg/kg, c/o, 3/4, 05/04/2025",
+                "40 km/h, 5 mg/kg, c/o, 3/4, 05/04/2025",
+            ),
+            (
+                "bǎohù zìjǐ in İstanbul, città",
+                "baohù ziji in Istanbul, città",
+            ),
         ];
         for (input, expected) in en {
-            assert_eq!(normalize_text(input, Lang::En, Rules::DEFAULT), expected, "{input:?}");
+            assert_eq!(
+                normalize_text(input, Lang::En, Rules::DEFAULT),
+                expected,
+                "{input:?}"
+            );
         }
         assert_eq!(
             normalize_text("Il fait -5°C.", Lang::Fr, Rules::DEFAULT),
@@ -959,7 +1069,10 @@ mod tests {
             normalize_text("It's 1:06pm on 20/12/2015.", Lang::En, Rules::ALL),
             "It's 1-06 PM on 20-12 2015."
         );
-        assert_eq!(normalize_text("Um 08:20 Uhr.", Lang::De, Rules::ALL), "Um 8 Uhr 20 Uhr.");
+        assert_eq!(
+            normalize_text("Um 08:20 Uhr.", Lang::De, Rules::ALL),
+            "Um 8 Uhr 20 Uhr."
+        );
     }
 
     /// The frontends take one flag for the language and for turning
@@ -973,17 +1086,29 @@ mod tests {
             assert_eq!(lang.as_str().parse::<Normalize>().unwrap(), norm);
             assert_eq!(norm.as_str().parse::<Normalize>().unwrap(), norm);
         }
-        assert_eq!("EN".parse::<Normalize>().unwrap(), Normalize::for_lang(Lang::En));
-        assert_eq!(" en ".parse::<Normalize>().unwrap(), Normalize::for_lang(Lang::En));
+        assert_eq!(
+            "EN".parse::<Normalize>().unwrap(),
+            Normalize::for_lang(Lang::En)
+        );
+        assert_eq!(
+            " en ".parse::<Normalize>().unwrap(),
+            Normalize::for_lang(Lang::En)
+        );
         assert_eq!(" Off ".parse::<Normalize>().unwrap(), Normalize::OFF);
         assert_eq!("none".parse::<Normalize>().unwrap(), Normalize::OFF);
         assert_eq!("off".parse::<Normalize>().unwrap(), Normalize::OFF);
-        assert_eq!(Normalize::OFF.as_str().parse::<Normalize>().unwrap(), Normalize::OFF);
+        assert_eq!(
+            Normalize::OFF.as_str().parse::<Normalize>().unwrap(),
+            Normalize::OFF
+        );
         let err = "klingon".parse::<Normalize>().unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
         let msg = err.to_string();
         assert!(msg.contains("klingon"), "{msg}");
-        assert!(msg.contains("none"), "the error must name the opt-out: {msg}");
+        assert!(
+            msg.contains("none"),
+            "the error must name the opt-out: {msg}"
+        );
     }
 
     /// Opting out has to hand the text through untouched, and without
@@ -998,7 +1123,10 @@ mod tests {
         // The rules travel with the policy, so `apply` is all a caller needs.
         let en = Normalize::for_lang(Lang::En);
         assert_eq!(en.apply("I paid 1500."), "I paid 1 thousand 500.");
-        assert_eq!(en.with_rules(Rules::NONE).apply("I paid 1500."), "I paid 1500.");
+        assert_eq!(
+            en.with_rules(Rules::NONE).apply("I paid 1500."),
+            "I paid 1500."
+        );
     }
 
     #[test]

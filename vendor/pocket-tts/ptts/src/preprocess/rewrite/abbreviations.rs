@@ -72,7 +72,9 @@ pub(super) fn abbreviations(word: &str, lang: Lang) -> Option<String> {
 }
 
 pub(super) fn ranks(words: &[&str], lang: Lang) -> Option<(String, usize)> {
-    let [first, second, ..] = words else { return None };
+    let [first, second, ..] = words else {
+        return None;
+    };
     let (rank, suffix) = split_suffix(second);
     match (lang, *first, rank) {
         (Lang::En, "Lt", "Col") => Some((format!("Lieutenant Colonel{suffix}"), 2)),
@@ -100,10 +102,17 @@ mod tests {
             ("Dr.", None),
         ];
         for (input, expected) in cases {
-            assert_eq!(abbreviations(input, Lang::En).as_deref(), expected, "{input:?}");
+            assert_eq!(
+                abbreviations(input, Lang::En).as_deref(),
+                expected,
+                "{input:?}"
+            );
         }
         assert_eq!(abbreviations("Lt.", Lang::Fr), None);
-        assert_eq!(ranks(&["Lt", "Col", "Vann"], Lang::En), Some(("Lieutenant Colonel".into(), 2)));
+        assert_eq!(
+            ranks(&["Lt", "Col", "Vann"], Lang::En),
+            Some(("Lieutenant Colonel".into(), 2))
+        );
         assert_eq!(ranks(&["Lt", "Vann"], Lang::En), None);
     }
 }

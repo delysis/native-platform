@@ -11,8 +11,14 @@ fn default_max_period() -> f32 {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ConditionerConfig {
-    Lut { name: String, lut: LutConditionerConfig },
-    Continuous { name: String, continuous: ContinuousConditionerConfig },
+    Lut {
+        name: String,
+        lut: LutConditionerConfig,
+    },
+    Continuous {
+        name: String,
+        continuous: ContinuousConditionerConfig,
+    },
 }
 
 impl ConditionerConfig {
@@ -63,8 +69,14 @@ pub fn load_summed_conditions<T: WithDTypeF, B: Backend>(
 }
 
 enum Condition<T: WithDTypeF, B: Backend> {
-    Lut { possible: Vec<String>, lut: LUTConditioner<T, B> },
-    Continuous { cfg: ContinuousConditionerConfig, proj: Option<Linear<T, B>> },
+    Lut {
+        possible: Vec<String>,
+        lut: LUTConditioner<T, B>,
+    },
+    Continuous {
+        cfg: ContinuousConditionerConfig,
+        proj: Option<Linear<T, B>>,
+    },
 }
 
 pub struct Conditioners<T: WithDTypeF, B: Backend> {
@@ -94,17 +106,25 @@ impl<T: WithDTypeF, B: Backend> Conditioners<T, B> {
             };
             conditions.push((name.to_string(), condition));
         }
-        Ok(Self { conditions, device: vb.device().clone() })
+        Ok(Self {
+            conditions,
+            device: vb.device().clone(),
+        })
     }
 
     pub fn sum(&self, values: &HashMap<String, String>) -> Result<Option<Tensor<T, B>>> {
-        if let Some(name) = values.keys().find(|k| !self.conditions.iter().any(|(n, _)| n == *k)) {
+        if let Some(name) = values
+            .keys()
+            .find(|k| !self.conditions.iter().any(|(n, _)| n == *k))
+        {
             xn::bail!("no conditioner named {name:?} in this checkpoint")
         }
         let mut sum: Option<Tensor<T, B>> = None;
         for (name, condition) in self.conditions.iter() {
-            let Some(value) =
-                values.get(name).map(String::as_str).or_else(|| default_condition(name))
+            let Some(value) = values
+                .get(name)
+                .map(String::as_str)
+                .or_else(|| default_condition(name))
             else {
                 xn::bail!("conditioner {name:?} has no default, a value has to be given for it")
             };
@@ -146,7 +166,10 @@ fn load_lut_condition<T: WithDTypeF, B: Backend>(
     output_dim: usize,
 ) -> Result<Condition<T, B>> {
     if cfg.tokenizer != "noop" {
-        xn::bail!("unsupported tokenizer {:?} for a lut conditioner", cfg.tokenizer)
+        xn::bail!(
+            "unsupported tokenizer {:?} for a lut conditioner",
+            cfg.tokenizer
+        )
     }
     let Some(possible) = cfg.possible_values.clone() else {
         xn::bail!("a lut conditioner without possible_values is not supported")
@@ -168,9 +191,15 @@ fn load_continuous_condition<T: WithDTypeF, B: Backend>(
     } else if cfg.dim == output_dim {
         None
     } else {
-        xn::bail!("conditioner of dim {} has no output_proj to {output_dim}", cfg.dim)
+        xn::bail!(
+            "conditioner of dim {} has no output_proj to {output_dim}",
+            cfg.dim
+        )
     };
-    Ok(Condition::Continuous { cfg: cfg.clone(), proj })
+    Ok(Condition::Continuous {
+        cfg: cfg.clone(),
+        proj,
+    })
 }
 
 fn sin_embedding(position: f32, dim: usize, max_period: f32) -> Result<Vec<f32>> {
@@ -178,9 +207,14 @@ fn sin_embedding(position: f32, dim: usize, max_period: f32) -> Result<Vec<f32>>
         xn::bail!("a sinusoidal embedding needs an even dim of at least 4, got {dim}")
     }
     let half = dim / 2;
-    let phases: Vec<f32> =
-        (0..half).map(|i| position / max_period.powf(i as f32 / (half - 1) as f32)).collect();
-    Ok(phases.iter().map(|p| p.cos()).chain(phases.iter().map(|p| p.sin())).collect())
+    let phases: Vec<f32> = (0..half)
+        .map(|i| position / max_period.powf(i as f32 / (half - 1) as f32))
+        .collect();
+    Ok(phases
+        .iter()
+        .map(|p| p.cos())
+        .chain(phases.iter().map(|p| p.sin()))
+        .collect())
 }
 
 pub struct LUTConditioner<T: WithDTypeF, B: Backend> {
@@ -220,7 +254,14 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
             }
             None => (embed, None),
         };
-        Ok(Self { tokenizer, embed, dim, output_dim, learnt_padding, learnt_padding_id })
+        Ok(Self {
+            tokenizer,
+            embed,
+            dim,
+            output_dim,
+            learnt_padding,
+            learnt_padding_id,
+        })
     }
 
     pub fn learnt_padding_id(&self) -> Option<u32> {
@@ -244,7 +285,9 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
         // `index_select` does not bounds-check, so an id past the table panics instead of
         // erroring. The usual cause is a tokenizer from another checkpoint. The learnt padding,
         // when there is one, is the table's last row and is never looked up by id.
-        let rows = self.learnt_padding_id.map_or(self.embed.dims()[0], |id| id as usize);
+        let rows = self
+            .learnt_padding_id
+            .map_or(self.embed.dims()[0], |id| id as usize);
         if let Some(&id) = token_ids.iter().find(|&&id| id as usize >= rows) {
             xn::bail!(
                 "token id {id} is past this checkpoint's {rows}-entry embedding table: the \
@@ -315,7 +358,9 @@ mod tests {
     fn a_token_id_past_the_table_is_an_error() {
         let c = conditioner(4, 2);
         assert!(c.embed_tokens(&[0, 3]).is_ok());
-        let err = c.embed_tokens(&[1, 4]).expect_err("id 4 is past a 4-row table");
+        let err = c
+            .embed_tokens(&[1, 4])
+            .expect_err("id 4 is past a 4-row table");
         assert!(err.to_string().contains("tokenizer"), "{err}");
     }
 
@@ -325,6 +370,9 @@ mod tests {
         let mut c = conditioner(4, 2);
         c.learnt_padding_id = Some(3);
         assert!(c.embed_tokens(&[0, 2]).is_ok());
-        assert!(c.embed_tokens(&[3]).is_err(), "a tokenizer one id too long reached the padding");
+        assert!(
+            c.embed_tokens(&[3]).is_err(),
+            "a tokenizer one id too long reached the padding"
+        );
     }
 }
