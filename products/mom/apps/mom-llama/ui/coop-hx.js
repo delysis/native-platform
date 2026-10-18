@@ -6156,6 +6156,11 @@
       let segmentPreviousPacketAt = null;
       let segmentMaxPacketGapMs = 0;
       let segmentMinimumProducerLeadMs = null;
+      // Bounded cadence evidence, published once at segment completion. Each
+      // pair is milliseconds since first PCM and cumulative source frames;
+      // no microphone samples or conversation text enter this diagnostic.
+      const segmentPacketTimeline = [];
+      let segmentRequiredStartupDelayMs = 0;
       if (firstRequest) {
         firstRequest = false;
         markTtsLatency("tts_first_chunk_ready", {
@@ -6195,6 +6200,14 @@
             ttsFirstPacketAudioMs ??= Math.round(packetAudioMs * 100) / 100;
             segmentFirstPacketAt ??= packetAt;
             ttsFirstPacketAt ??= packetAt;
+            if (segmentPacketTimeline.length < 256) {
+              segmentPacketTimeline.push([
+                Math.round((packetAt - segmentFirstPacketAt) * 100) / 100,
+                segmentFrames,
+              ]);
+            }
+            segmentRequiredStartupDelayMs = Math.max(segmentRequiredStartupDelayMs,
+              packetAt - segmentFirstPacketAt - (segmentPcmAudioMs - packetAudioMs));
             const packetGapMs = segmentPreviousPacketAt === null
               ? null : packetAt - segmentPreviousPacketAt;
             const aggregatePacketGapMs = ttsPreviousPacketAt === null
@@ -6315,6 +6328,10 @@
           reference_source_hash_us: binding.tts_reference_source_hash_us ?? null,
           reference_compute_us: binding.tts_reference_compute_us ?? null,
           reference_persist_us: binding.tts_reference_persist_us ?? null,
+          generation_segments: binding.tts_generation_segments ?? null,
+          packet_timeline: segmentPacketTimeline,
+          packet_timeline_truncated: segmentPcmPackets > segmentPacketTimeline.length,
+          required_startup_delay_ms: Math.round(segmentRequiredStartupDelayMs * 100) / 100,
           helper_first_pcm_us: binding.tts_helper_first_pcm_us ?? null,
           voice_lookup_us: binding.tts_voice_lookup_us ?? null,
           descriptor_snapshot_us: binding.tts_descriptor_snapshot_us ?? null,

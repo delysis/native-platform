@@ -9,11 +9,11 @@ use speech_native_types::{
     DEFAULT_SPEECH_EVENT_CAPACITY, EvidenceKind, EvidenceOutcome, LatencyClass, NetworkBehavior,
     SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind, SpeechBackendReadiness,
     SpeechCancellation, SpeechCapability, SpeechCapabilityLimits, SpeechError, SpeechErrorClass,
-    SpeechModelDescriptor, SpeechOperationCapability, SpeechRequestId, SpeechResolvedRoute,
-    SpeechRouteSelector, SpeechUsage, SynthesisCapabilities, SynthesisEvent, SynthesisInput,
-    SynthesisOutput, SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor,
-    TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceDescriptor, VoiceGender,
-    VoiceQuality, VoiceSelector,
+    SpeechGenerationSegment, SpeechModelDescriptor, SpeechOperationCapability, SpeechRequestId,
+    SpeechResolvedRoute, SpeechRouteSelector, SpeechUsage, SynthesisCapabilities, SynthesisEvent,
+    SynthesisInput, SynthesisOutput, SynthesisRequest, SynthesisResponse, SynthesisTicket,
+    TaskSupervisor, TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceDescriptor,
+    VoiceGender, VoiceQuality, VoiceSelector,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -195,6 +195,8 @@ struct IclWorkerMessage {
     prepared_prefix_cache_hit: Option<bool>,
     #[serde(default)]
     first_decode_us: Option<u64>,
+    #[serde(default)]
+    generation_segments: Vec<SpeechGenerationSegment>,
 }
 
 struct IclSynthesisResult {
@@ -214,6 +216,7 @@ struct IclSynthesisResult {
     helper_code_generation_us: Option<u64>,
     helper_prepared_prefix_cache_hit: Option<bool>,
     helper_first_decode_us: Option<u64>,
+    helper_generation_segments: Vec<SpeechGenerationSegment>,
 }
 
 impl QwenSpeechBackend {
@@ -1259,6 +1262,7 @@ fn synthesize_streaming_icl(
             helper_code_generation_us: result.helper_code_generation_us,
             helper_prepared_prefix_cache_hit: result.helper_prepared_prefix_cache_hit,
             helper_first_decode_us: result.helper_first_decode_us,
+            helper_generation_segments: result.helper_generation_segments,
             time_to_first_result_ms: Some(result.time_to_first_audio_ms),
             total_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             provenance: UsageProvenance::Exact,
@@ -1519,6 +1523,7 @@ impl ResidentIclWorker {
                             helper_code_generation_us,
                             helper_prepared_prefix_cache_hit,
                             helper_first_decode_us,
+                            helper_generation_segments: message.generation_segments,
                         });
                     }
                     "cancelled" => return Err(clean_icl_cancelled_error(request_id)),
@@ -1912,9 +1917,46 @@ fn clean_icl_cancelled_error(id: &SpeechRequestId) -> SpeechError {
 mod tests {
     use super::*;
     use speech_native_types::{
-        AlignmentGranularity, SpeechDeadlinePolicy, SpeechPrivacyPolicy, SpeechRequestContext,
-        SpeechRouteProfile, SpeechRoutingPolicy,
+        AlignmentGranularity, SpeechDeadlinePolicy, SpeechGenerationStopReason,
+        SpeechPrivacyPolicy, SpeechRequestContext, SpeechRouteProfile, SpeechRoutingPolicy,
     };
+
+    #[test]
+    fn helper_terminal_messages_preserve_known_and_unknown_generation_diagnostics() {
+        let message: IclWorkerMessage = serde_json::from_str(
+            r#"{"event":"done","generation_segments":[{"segment":1,"stop_reason":"max_tokens","generated_codec_frames":162,"max_tokens":162}]}"#,
+        )
+        .expect("helper generation receipt");
+
+        assert_eq!(message.event, "done");
+        assert_eq!(
+            message.generation_segments,
+            vec![SpeechGenerationSegment {
+                segment: 1,
+                stop_reason: Some(SpeechGenerationStopReason::MaxTokens),
+                generated_codec_frames: Some(162),
+                max_tokens: Some(162),
+            }]
+        );
+
+        let older_message: IclWorkerMessage =
+            serde_json::from_str(r#"{"event":"done"}"#).expect("older helper message");
+        assert!(older_message.generation_segments.is_empty());
+
+        let unknown: IclWorkerMessage = serde_json::from_str(
+            r#"{"event":"done","generation_segments":[{"segment":1,"stop_reason":null,"generated_codec_frames":null,"max_tokens":null}]}"#,
+        )
+        .expect("terminal receipt with unreported counters");
+        assert_eq!(
+            unknown.generation_segments,
+            vec![SpeechGenerationSegment {
+                segment: 1,
+                stop_reason: None,
+                generated_codec_frames: None,
+                max_tokens: None,
+            }]
+        );
+    }
 
     #[test]
     fn foreground_waiter_wins_next_worker_admission() {

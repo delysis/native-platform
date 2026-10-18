@@ -2387,6 +2387,19 @@ pub async fn mom_llama_voice_audio_speculate(
             if let Err(error) = &result {
                 detail.insert("error".to_string(), Value::String(error.clone()));
             }
+            if let Ok(envelope) = &result {
+                detail.insert("status".to_string(), Value::String(envelope.status.clone()));
+                detail.insert(
+                    "has_result".to_string(),
+                    Value::Bool(envelope.result.is_some()),
+                );
+                if let Some(blocker) = &envelope.blocker {
+                    detail.insert(
+                        "blocker_code".to_string(),
+                        Value::String(blocker.code.clone()),
+                    );
+                }
+            }
             emit_voice_speculation_stage_with_detail(
                 &worker_events,
                 &worker_speculation,

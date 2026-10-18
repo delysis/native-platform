@@ -33,6 +33,29 @@ final class TextChunkerTests: XCTestCase {
         XCTAssertEqual(TextChunker.estimateTokens(for: "Hello."), 12)
     }
 
+    func testGenerationStopReportDistinguishesEOSFromBudgetExhaustion() {
+        var capped = TTSGenerationStopTracker(maxTokens: 162)
+        for _ in 0..<162 { capped.recordGeneratedFrame() }
+        XCTAssertEqual(capped.report.stopReason, .maxTokens)
+        XCTAssertEqual(capped.report.generatedCodecFrames, 162)
+        XCTAssertEqual(capped.report.maxTokens, 162)
+
+        var eos = TTSGenerationStopTracker(maxTokens: 162)
+        for _ in 0..<41 { eos.recordGeneratedFrame() }
+        eos.stop(.eos)
+        XCTAssertEqual(eos.report.stopReason, .eos)
+        XCTAssertEqual(eos.report.generatedCodecFrames, 41)
+        XCTAssertEqual(eos.report.maxTokens, 162)
+
+        for reason in [TTSGenerationStopReason.padLimit, .exactCycle, .cancelled] {
+            var stopped = TTSGenerationStopTracker(maxTokens: 162)
+            for _ in 0..<7 { stopped.recordGeneratedFrame() }
+            stopped.stop(reason)
+            XCTAssertEqual(stopped.report.stopReason, reason)
+            XCTAssertEqual(stopped.report.generatedCodecFrames, 7)
+        }
+    }
+
     func testExactCodecCycleIsStoppedWithoutRejectingOrdinaryRecurrence() {
         let a: [Int32] = [1, 10, 100]
         let b: [Int32] = [2, 20, 200]
