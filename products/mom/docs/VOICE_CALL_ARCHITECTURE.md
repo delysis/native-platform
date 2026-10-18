@@ -491,17 +491,15 @@ Its historical experiment receipts remain at
 `products/mom/artifacts/latency/2026-10-15-gemma4-mtp-depth-sweep.json`.
 Sharing the Swift helper did not make that harness the application path.
 
-The same Rust harness now runs with the packaged runtime's four native sequence
-lanes and requires token-exact reuse of Gemma's resident text prefix. A
-read-only prepared-input command had been revoking that prefix between voice
-turns; preserving the fourth lane across read-only worker commands restored 4
-tokens on the first measured turn and 47 of 86 prefix tokens on the next. With
-audio delivered at its real 16 kHz clock in 10 ms writes and projected in 40 ms
-frames, the four-second turn reached Gemma's first token 104 ms after physical
-silence, dispatched speakable text at 191 ms, produced first Qwen PCM at 377 ms,
-and had sufficient startup runway to begin playback at that point. The shorter
-500 ms turn reached first token at 113 ms and playable audio at 531 ms because
-its Qwen trace needed another 119 ms of runway. The exact receipt is
+The historical Rust harness experiment used four native sequence lanes and
+checked token-exact reuse of Gemma's resident text prefix. A read-only
+prepared-input command had revoked that prefix between voice turns; preserving
+the fourth lane restored 4 tokens on the first measured turn and 47 of 86 on
+the next. With paced 16 kHz audio, the four-second turn reached first Gemma text
+at 104 ms, its private speech boundary at 191 ms and first Qwen PCM at 377 ms.
+The 500 ms turn reached first text at 113 ms; the synthetic reservoir calculated
+a 531 ms safe-start time. These are retained component results, not observed
+playback or current application performance. The receipt remains at
 `products/mom/artifacts/latency/2026-10-16-resident-audio-prefix-e2e-v2.json`.
 
 The packaged renderer now keeps the native producer and the AudioWorklet on a
