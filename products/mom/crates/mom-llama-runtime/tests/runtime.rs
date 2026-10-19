@@ -3928,7 +3928,7 @@ fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<(
         "real dispatcher output must be committed to its host transcript"
     );
 
-    let wait_checkpoint = || -> Result<String> {
+    let wait_checkpoint = || -> Result<(String, usize, u32, usize)> {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let status = mom_llama_runtime::kv_cache_status()?
@@ -3939,7 +3939,12 @@ fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<(
                     && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
                     && entry.state_bytes > 0
             }) {
-                return Ok(entry.id.clone());
+                return Ok((
+                    entry.id.clone(),
+                    entry.token_ids.len(),
+                    entry.fingerprint.context_tokens,
+                    entry.state_bytes,
+                ));
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
@@ -3948,7 +3953,8 @@ fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<(
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    let checkpoint_id = wait_checkpoint()?;
+    let (checkpoint_id, checkpoint_tokens, checkpoint_context_tokens, checkpoint_bytes) =
+        wait_checkpoint()?;
     scope.request_cancellation();
     scope
         .join_session_checkpoints()
@@ -3963,9 +3969,37 @@ fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<(
         .results
         .first()
         .ok_or_else(|| anyhow!("restored dispatcher target result missing"))?;
+    println!(
+        "DISPATCH_SESSION_CHECKPOINT_DIAGNOSTIC {}",
+        json!({
+            "checkpoint_tokens": checkpoint_tokens,
+            "checkpoint_context_tokens": checkpoint_context_tokens,
+            "checkpoint_bytes": checkpoint_bytes,
+            "target_cache_id_present": second_target.cache_id.is_some(),
+            "target_cache_id_matches_checkpoint": second_target.cache_id.as_deref() == Some(checkpoint_id.as_str()),
+            "target_cache_reused": second_target.cache_reused,
+            "metrics": {
+                "supplied_prefix_tokens": second_target.metrics.cache.supplied_prefix_tokens,
+                "restored_prefix_tokens": second_target.metrics.cache.restored_prefix_tokens,
+                "replayed_prefix_tokens": second_target.metrics.cache.replayed_prefix_tokens,
+                "batch_shared_prefix_tokens": second_target.metrics.cache.batch_shared_prefix_tokens,
+                "resident_prefix_tokens": second_target.metrics.cache.resident_prefix_tokens,
+                "prompt_tokens": second_target.metrics.prompt_tokens,
+                "completion_tokens": second_target.metrics.completion_tokens,
+            }
+        })
+    );
     assert!(
         second_target.cache_reused,
         "restart should reuse dispatcher checkpoint"
+    );
+    assert!(
+        second_target.metrics.cache.restored_prefix_tokens > 0,
+        "restart should import native state from the dispatcher checkpoint"
+    );
+    assert_eq!(
+        second_target.metrics.cache.replayed_prefix_tokens, 0,
+        "restart must not fall back to prompt token replay"
     );
     assert_eq!(
         second_target.cache_id.as_deref(),

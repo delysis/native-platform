@@ -1160,6 +1160,11 @@ lookup uses the same exact longest-prefix selection as direct chat, including
 the host conversation checkpoint and the actual template. The real-model
 regression requires a committed dispatcher reply, idle publication under its
 host conversation, and reuse of that exact checkpoint after runtime restart.
+RAM entries can survive native worker replacement, but a live export's import
+authority cannot. Persistent lookup must discard that unusable RAM candidate
+before comparing it with the authenticated disk entry; otherwise the stale RAM
+copy can win by token length and trigger token replay despite a valid disk hit.
+Restart qualification requires positive native reuse and zero replayed tokens.
 
 The worker retains at most one immutable native snapshot. This is still a full
 native export, not delta KV serialization; the existing 8 GiB per-entry ceiling

@@ -1461,6 +1461,24 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
             None => state.cache.best_match(&fingerprint, &tokenized.token_ids),
         }
     });
+    // RAM can outlive the native worker that exported its allocation. A dead
+    // live-export receipt must not mask the authenticated durable checkpoint
+    // with the same ID and force an otherwise avoidable token replay.
+    let reusable_memory_value = memory_match
+        .as_ref()
+        .and_then(|selected| {
+            selected_memory_value(
+                memory_cache(),
+                selected,
+                lease.memory_generation,
+                owner_id,
+                &fingerprint,
+                &tokenized.token_ids,
+                now,
+            )
+        })
+        .filter(|value| handle.has_reusable_sequence(&value.sequence));
+    let memory_match = memory_match.filter(|_| reusable_memory_value.is_some());
     let db = store
         .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
         .unwrap_or_default();
@@ -1491,16 +1509,7 @@ pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
         if !lease.validate()? {
             return Ok(None);
         }
-        return Ok(selected_memory_value(
-            memory_cache(),
-            &selected,
-            lease.memory_generation,
-            owner_id,
-            &fingerprint,
-            &tokenized.token_ids,
-            now,
-        )
-        .map(|value| (value.metadata.id, value.sequence)));
+        return Ok(reusable_memory_value.map(|value| (value.metadata.id, value.sequence)));
     }
     let Some(index) = db.entries.iter().position(|entry| entry.id == selected.id) else {
         return Ok(None);
