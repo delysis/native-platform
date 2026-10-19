@@ -18,6 +18,7 @@ mod persona_library;
 pub mod personas;
 pub mod receipts;
 pub mod server;
+mod session_checkpoint_worker;
 pub mod skill_store;
 mod store;
 pub mod tool_loop;
@@ -72,11 +73,11 @@ pub use engine::{
     runtime_warm_until_cancelled,
 };
 pub use kv_cache::{
-    CommittedSessionCheckpointDrain, VoiceCachePreparationProgress, VoiceCachePreparationSummary,
-    VoicePersonaPrefixPreparation, kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
+    VoiceCachePreparationProgress, VoiceCachePreparationSummary, VoicePersonaPrefixPreparation,
+    kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
     kv_cache_prepare_voice_persona_resident, kv_cache_restore, kv_cache_save,
     kv_cache_save_voice_persona, kv_cache_set_voice_call_activity, kv_cache_status,
-    prepare_committed_session_checkpoint_drain, prepare_startup_voice_caches,
+    prepare_startup_voice_caches,
 };
 
 /// Build-time compatibility identity; no model loading or large runtime scan.

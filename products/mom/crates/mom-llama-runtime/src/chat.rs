@@ -10,7 +10,7 @@ use crate::conversation_store::{
 use crate::kv_cache::{
     compatible_cached_prefix_for_owner_with_settings,
     compatible_memory_prefix_for_owner_with_settings, invalidate_cache, invalidate_memory,
-    note_committed_session_request, schedule_committed_session_checkpoint,
+    record_committed_session_checkpoint,
 };
 use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
@@ -34,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub struct VoiceAudioSession {
+    scope: OperationScope,
     request_id: String,
     prepared: std::sync::Arc<VoiceAudioPreparedTurn>,
     operation: ChatOperationLease,
@@ -914,6 +915,7 @@ fn start_prepared_voice_audio(
     begin_metrics.generation_admission_us = generation_admission_us;
     begin_metrics.total_us = elapsed_us(total_started);
     Ok(VoiceAudioSession {
+        scope: scope.clone(),
         request_id,
         prepared,
         operation,
@@ -1082,7 +1084,11 @@ where
         &user_message_id,
         attachments.draft_snapshot.as_ref(),
     )?;
-    note_committed_session_request(&prepared.conversation_id, &session.request_id);
+    record_committed_session_checkpoint(
+        &session.scope,
+        &prepared.conversation_id,
+        &session.request_id,
+    );
     let cache_reused = prefix_cells_reused(&output.metrics.cache);
     let result = ChatSendOutput {
         request_id: session.request_id,
@@ -1774,10 +1780,7 @@ where
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
     )?;
-    note_committed_session_request(&conversation.id, &request_id);
-    if !voice_reply {
-        schedule_committed_session_checkpoint(scope, &conversation.id, &request_id);
-    }
+    record_committed_session_checkpoint(scope, &conversation.id, &request_id);
     let result = ChatSendOutput {
         request_id: request_id.clone(),
         conversation_id: conversation.id,

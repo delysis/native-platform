@@ -48,6 +48,11 @@ pub struct AppShutdownSummary {
     pub elapsed_ms: u64,
     pub native_host_joined: bool,
     pub speech_host_joined: bool,
+    pub checkpoint_worker_joined: bool,
+    pub checkpoint_join_ms: u64,
+    pub final_approval_recovery_ms: u64,
+    pub speech_join_ms: u64,
+    pub native_join_ms: u64,
     pub speech_active_operation_count: usize,
     pub speech_retained_playback_count: usize,
     /// Product-owned operation-supervisor facts at the terminal boundary.
@@ -1311,11 +1316,6 @@ impl AppRuntimeHandle {
                 // Closing app admission publishes cancellation to every long
                 // operation before application work drains. That drain
                 // precedes the sole terminal native join.
-                // Capture only export authority before cancellation revokes
-                // normal model access. This capability cannot start generation.
-                let checkpoint_drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(
-                    &self.0.operation_scope,
-                );
                 self.request_product_cancellation();
                 let voice_sessions = self
                     .0
@@ -1364,24 +1364,20 @@ impl AppRuntimeHandle {
                 eprintln!("Blessenger shutdown: app work drained {} ms", started.elapsed().as_millis());
                 let supervisor = self.0.operation_supervisor.shutdown();
                 eprintln!("Blessenger shutdown: operations joined {} ms", started.elapsed().as_millis());
-                let checkpoint_flush = tokio::task::spawn_blocking(move || checkpoint_drain.flush())
-                .await;
-                let checkpoint_flush_error = match checkpoint_flush {
-                    Ok(Ok(count)) => {
-                        if count > 0 {
-                            eprintln!(
-                                "Blessenger shutdown: persisted {count} committed voice checkpoints"
-                            );
-                        }
-                        None
-                    }
-                    Ok(Err(error)) => Some(format!(
-                        "committed voice checkpoint flush failed: {error:#}"
-                    )),
-                    Err(error) => Some(format!(
-                        "committed voice checkpoint flush worker failed: {error}"
-                    )),
+                // Cache maintenance is cancellable background work. Quit never
+                // starts a fresh native export or drains pending checkpoints.
+                let checkpoint_scope = self.0.operation_scope.clone();
+                let checkpoint_join_started = Instant::now();
+                let checkpoint_join = tokio::task::spawn_blocking(move || checkpoint_scope.join_session_checkpoints()).await;
+                let checkpoint_join_error = match checkpoint_join {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!("checkpoint worker join failed: {error}")),
+                    Err(error) => Some(format!("checkpoint worker join task failed: {error}")),
                 };
+                let checkpoint_worker_joined = checkpoint_join_error.is_none();
+                let checkpoint_join_ms = checkpoint_join_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                eprintln!("Blessenger shutdown: checkpoint worker join {checkpoint_join_ms} ms");
+                let final_recovery_started = Instant::now();
                 let final_recovery_worker = Arc::clone(&persona_approval_worker);
                 let final_persona_approval_recovery = match tokio::task::spawn_blocking(move || {
                     final_recovery_worker.reconcile_now()
@@ -1393,8 +1389,10 @@ impl AppRuntimeHandle {
                         "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} final sweep task failed: {error}"
                     )),
                 };
+                let final_approval_recovery_ms = final_recovery_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                eprintln!("Blessenger shutdown: final approval recovery {final_approval_recovery_ms} ms");
                 let mut operation_errors = Vec::new();
-                if let Some(error) = checkpoint_flush_error {
+                if let Some(error) = checkpoint_join_error {
                     operation_errors.push(error);
                 }
                 if supervisor.state_poisoned {
@@ -1419,7 +1417,10 @@ impl AppRuntimeHandle {
                         }
                         (!operation_errors.is_empty()).then(|| operation_errors.join("; "))
                     };
+                let speech_join_started = Instant::now();
                 let speech_shutdown = self.0.speech.shutdown().await;
+                let speech_join_ms = speech_join_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                eprintln!("Blessenger shutdown: speech join duration {speech_join_ms} ms");
                 eprintln!("Blessenger shutdown: speech joined {} ms", started.elapsed().as_millis());
                 let (speech_error, speech_host_joined, speech_active_operation_count, speech_retained_playback_count) =
                     match speech_shutdown {
@@ -1443,6 +1444,7 @@ impl AppRuntimeHandle {
                 // so the resident set cannot grow after
                 // this observation. Preserve its cardinality even if the
                 // finalizer fails before returning joined evidence.
+                let native_join_started = Instant::now();
                 let (native_worker_ids, native_error, joined_native_worker_count, native_host_joined) =
                     match &self.0.native_host {
                         AppNativeHost::Owned(host) => {
@@ -1462,6 +1464,7 @@ impl AppRuntimeHandle {
                         // after both product domains have drained.
                         AppNativeHost::Shared(_) => (Vec::new(), None, 0, false),
                     };
+                let native_join_ms = native_join_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 eprintln!("Blessenger shutdown: native joined {} ms", started.elapsed().as_millis());
                 let expected_native_worker_count = native_worker_ids.len();
                 let operation_supervisor_phase = supervisor.phase;
@@ -1492,6 +1495,11 @@ impl AppRuntimeHandle {
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     native_host_joined,
                     speech_host_joined,
+                    checkpoint_worker_joined,
+                    checkpoint_join_ms,
+                    final_approval_recovery_ms,
+                    speech_join_ms,
+                    native_join_ms,
                     speech_active_operation_count,
                     speech_retained_playback_count,
                     operation_supervisor_phase,

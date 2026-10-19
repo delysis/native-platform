@@ -655,8 +655,8 @@ export, encryption and disk time within those 69.317 seconds.
 
 Automatic preparation now evaluates the prefix into worker-owned RAM without
 exporting a snapshot. Explicit cache creation still persists PersonaPacks;
-committed conversation checkpoints remain scheduled after idle, hangup and
-shutdown. A saved compatible session is still restored before persona-only
+committed conversation checkpoints are scheduled during idle time and after
+hangup. Shutdown cancels and joins maintenance; it never starts an export. A saved compatible session is still restored before persona-only
 preparation. The revision fence applies to both resident-only and exported
 prefill. Qualification must measure a cold long persona and a same-build
 restart separately, before offering another candidate for manual testing.
@@ -805,17 +805,14 @@ worker-owned resident prefixes without inventing serialized cache metadata. The
 real Gemma 4 12B prefix receipt below verifies repeat preparation reused 11
 resident tokens and retained the existing restore/replay checks; a packaged
 call still needs request-scoped filesystem evidence for the no-disk-I/O
-boundary. Hangup now requests a conversation-scoped checkpoint without waiting
-on the UI path, and graceful shutdown flushes eligible committed checkpoints
-after work drain but before native teardown. Shutdown captures a restricted
-resident-checkpoint capability before cancelling its operation scope. That
-capability cannot load a model or submit generation; ordinary native access
-stays revoked while the final committed state is saved. A per-call opaque activity ID is
-registered before microphone/model setup and remains active until call-owned
-stop acknowledgements settle; a matching-ID clear precedes the hangup
-checkpoint. Active calls suppress idle persistence, and graceful shutdown
-clears remaining IDs only after work drain. These paths are source-level
-implementation until the focused tests and a package receipt verify them.
+boundary. Hangup requests a conversation-scoped idle checkpoint without waiting on the UI
+path. The earlier shutdown-only export capability has been removed: quit never
+starts a fresh native export or flushes a checkpoint backlog. A per-call opaque
+activity ID is registered before microphone/model setup and remains active
+until call-owned stop acknowledgements settle. Active calls suppress native
+snapshotting and persistence; a matching-ID clear schedules later idle work.
+See the opportunistic maintenance section below for the current worker and
+publication contract.
 
 The optional staged Parakeet transcription tap remains bounded to 40,960
 samples (2.56 s at 16 kHz), including in-flight audio; it is not a live ASR
@@ -1128,9 +1125,10 @@ trigger model discovery during navigation. Refresh conversation settings when
 they become visible.
 
 Opportunistic session checkpoints yield at the next encrypted chunk boundary
-when an ordinary store writer is waiting. Roll back the interrupted transaction
-and preserve the previous durable checkpoint; retain the pending checkpoint for
-the existing later retry. Do not weaken encrypted-store authentication or cache
+when an ordinary store writer is waiting. A partially written part rolls back;
+already committed parts remain staged and the previous complete checkpoint
+remains authoritative. Resume the retained snapshot at the next unwritten part
+when idle. Do not weaken encrypted-store authentication or cache
 compatibility to improve navigation latency.
 
 Packaged-app qualification records selection queue time, selection command time,
@@ -1139,3 +1137,84 @@ and storage writer waits. These diagnostics contain numbers and stage names,
 never conversation identifiers or content. Measure populated chat switches both
 while idle and after hangup, when a background checkpoint can be active;
 component preemption tests alone do not establish visible navigation latency.
+
+
+## Opportunistic maintenance and prompt quit (19 October 2026)
+
+Each runtime owns one joinable session-checkpoint worker shared by its dispatch
+children. Committed direct text/voice turns and completed single-recipient
+dispatches coalesce that conversation's pending request. Multi-recipient batches
+and tool-approval continuations do not currently expose an unambiguous committed
+native sequence for this checkpoint path. After a three-second idle window, the worker exports only an
+exact still-resident committed request. It never reloads an evicted model to
+rebuild a cache. A foreground operation, active call, waiting store writer, or
+cancellation preempts maintenance. Deferred work retries with bounded delay;
+errors back off. Requests and cancellation authority are runtime-local.
+
+Native qualification must exercise the actual `mom_llama_chat_dispatch` path,
+including a saved Persona recipient, not just `chat_send`. Candidate 33's native
+quit measurements passed, but its text-dispatch trial exposed missing cache
+registration: recipient dispatch bypassed the direct-chat completion hook.
+Both completions now use one registration-and-scheduling helper. Dispatcher
+lookup uses the same exact longest-prefix selection as direct chat, including
+the host conversation checkpoint and the actual template. The real-model
+regression requires a committed dispatcher reply, idle publication under its
+host conversation, and reuse of that exact checkpoint after runtime restart.
+RAM entries can survive native worker replacement, but a live export's import
+authority cannot. Persistent lookup must discard that unusable RAM candidate
+before comparing it with the authenticated disk entry; otherwise the stale RAM
+copy can win by token length and trigger token replay despite a valid disk hit.
+Restart qualification requires positive native reuse and zero replayed tokens.
+
+The worker retains at most one immutable native snapshot. This is still a full
+native export, not delta KV serialization; the existing 8 GiB per-entry ceiling
+remains an upper bound, not an observed memory requirement or M2 qualification.
+Persistence commits 16 MiB encrypted parts in separate storage transactions.
+A staged part is never a cache hit. Only a complete, source-authorized manifest
+is atomically published, preserving the previous complete version on
+preemption, cancellation, failure or crash. In-process retry resumes the same
+snapshot at its unwritten part. A later writer fences out and reclaims an
+abandoned staging slot; old versions are reclaimed in bounded idle transactions.
+Authentication and model/layout compatibility checks are unchanged.
+
+Paused work holds no Persona/publication lock. Publication uses a nonblocking
+short-lived owner lease and rechecks conversation authority inside the metadata
+transaction. Cache clear invalidates older leases and retires the staging slot
+under the same authority guard, preventing a delayed save from reviving cleared
+state. No fresh export, transcription, orphan cleanup or cache write is launched
+by quit. Cancellation signals native export preemption before waiting for locks,
+wakes the idle worker, discards queued cache work and joins the active unit.
+Saved messages and original recordings were committed independently of this
+reusable cache. If quit interrupts a save, restart can use the previous complete
+checkpoint and evaluate the newer suffix; it must never import partial state.
+
+Historical transcription uses the existing production recovery/commit path.
+One coalesced timer runs after foreground ownership is released and scans
+pending recordings on active branches across conversations without selecting
+those chats. Foreground work cancels the timer and preempts active ASR. Already
+started transcript commits settle normally. Failed/empty transcription backs
+off; a complete scan prunes stale retry identities. Original voice media and
+user-visible message type stay intact. No transcription backlog is drained at
+quit or chat selection.
+
+Record native snapshot, reconstruction, part-write maximum, publication, and
+total persistence time separately. The terminal shutdown summary records
+checkpoint-worker join, final approval sweep, speech join and native join
+independently, alongside their completion evidence. Qualify with production
+idle publication plus authenticated restart, quit with queued and active cache
+work, and packaged call/navigation measurements. Fixture tests prove race and
+ownership rules; they do not establish physical audio quality, M2 performance,
+or a wall-clock upper bound for native/OS calls.
+
+Before the consolidated gate, run the complete product frontend suite, the
+affected Rust package tests in their default parallel mode, and package clippy
+with all targets and warnings denied. Register new hardware-dependent ignored
+tests in the repository's ignored-test registry and run its drift check before
+starting the consolidated gate. A serialized diagnostic run does not
+replace parallel qualification. Whole-page UI harnesses must load the same
+production prerequisite scripts in the same order as `index.html`; inject only
+DOM, clock and native-I/O boundaries, not an alternate scheduler. Tests that
+mutate global cache state must coordinate with every test that clears that state.
+After a failure, preserve the receipt, repair the specific cause, and verify its
+focused gate before repeating the broader gate. A passing component result
+still does not replace the packaged quit/restart measurements above.

@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 71,
+  "expected_test_count": 72,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1513,6 +1513,17 @@
       "target": "test:runtime",
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF; verifies committed session checkpoint save after operation-scope cancellation and authenticated native restore after worker restart",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "real_chat_dispatch_checkpoint_persists_and_reuses_after_restart",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF; dispatches to a saved persona recipient, persists the committed host-chat checkpoint, then verifies the exact encrypted checkpoint is restored after runtime restart without prompt replay",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",

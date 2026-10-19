@@ -1,3 +1,4 @@
+use crate::session_checkpoint_worker::SessionCheckpointScheduler;
 use llama_native_host::{NativeClient, NativeHost};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -169,6 +170,17 @@ struct OperationScopeInner {
     registries: Mutex<OperationRegistries>,
     voice_call_sessions: Arc<Mutex<HashSet<String>>>,
     voice_call_waiters: Arc<AtomicUsize>,
+    cancellation_checkpoint_signal: AtomicBool,
+    session_checkpoints: Arc<SessionCheckpointScheduler>,
+    committed_session_requests: Arc<Mutex<HashMap<String, String>>>,
+}
+
+pub(crate) struct WeakOperationScope(Weak<OperationScopeInner>);
+
+impl WeakOperationScope {
+    pub(crate) fn upgrade(&self) -> Option<OperationScope> {
+        self.0.upgrade().map(OperationScope)
+    }
 }
 
 struct VoiceCallWaiter<'a>(&'a AtomicUsize);
@@ -259,7 +271,11 @@ impl OperationScope {
         shared_client: Option<NativeClient>,
         native_key: Option<crate::native_runtime::ProductHostKey>,
     ) -> Self {
-        Self(Arc::new(OperationScopeInner {
+        let checkpoint_data_dir = native_key
+            .as_ref()
+            .map(|key| key.data_dir().to_path_buf())
+            .unwrap_or_else(crate::config::resolve_data_dir);
+        Self(Arc::new_cyclic(|weak| OperationScopeInner {
             native_host,
             parent: None,
             shared_client,
@@ -275,7 +291,105 @@ impl OperationScope {
             }),
             voice_call_sessions: Arc::new(Mutex::new(HashSet::new())),
             voice_call_waiters: Arc::new(AtomicUsize::new(0)),
+            cancellation_checkpoint_signal: AtomicBool::new(false),
+            session_checkpoints: Arc::new(SessionCheckpointScheduler::new(
+                WeakOperationScope(weak.clone()),
+                checkpoint_data_dir,
+            )),
+            committed_session_requests: Arc::new(Mutex::new(HashMap::new())),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn downgrade(&self) -> WeakOperationScope {
+        WeakOperationScope(Arc::downgrade(&self.0))
+    }
+
+    pub fn schedule_session_checkpoint(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<()> {
+        if self.cancellation_requested() {
+            anyhow::bail!("operation scope is shutting down");
+        }
+        self.0
+            .session_checkpoints
+            .schedule(conversation_id, request_id)
+    }
+
+    pub fn stop_session_checkpoints(&self) -> anyhow::Result<()> {
+        if self.0.parent.is_some() {
+            anyhow::bail!("only the root operation scope may stop session checkpoints");
+        }
+        self.0.session_checkpoints.stop();
+        Ok(())
+    }
+
+    pub fn join_session_checkpoints(&self) -> anyhow::Result<()> {
+        if self.0.parent.is_some() {
+            anyhow::bail!("only the root operation scope may join session checkpoints");
+        }
+        self.0.session_checkpoints.join()
+    }
+
+    pub(crate) fn note_committed_session_request(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<()> {
+        self.0
+            .committed_session_requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("committed session request registry is unavailable"))?
+            .insert(conversation_id.to_owned(), request_id.to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn committed_session_request(
+        &self,
+        conversation_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .committed_session_requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("committed session request registry is unavailable"))?
+            .get(conversation_id)
+            .cloned())
+    }
+
+    pub(crate) fn committed_session_requests(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut requests = self
+            .0
+            .committed_session_requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("committed session request registry is unavailable"))?
+            .iter()
+            .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
+            .collect::<Vec<_>>();
+        requests.sort_unstable();
+        Ok(requests)
+    }
+
+    pub(crate) fn retire_committed_session_request(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+    ) -> anyhow::Result<bool> {
+        let mut requests =
+            self.0.committed_session_requests.lock().map_err(|_| {
+                anyhow::anyhow!("committed session request registry is unavailable")
+            })?;
+        if requests
+            .get(conversation_id)
+            .is_some_and(|current| current == request_id)
+        {
+            requests.remove(conversation_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     #[must_use]
@@ -304,20 +418,26 @@ impl OperationScope {
         if registries.children.len() >= 128 {
             anyhow::bail!("operation scope has too many active dispatches");
         }
-        let mut child = Self::with_client(
-            self.0.native_host.clone(),
-            self.0.shared_client.clone(),
-            self.0.native_key.clone(),
-        );
-        Arc::get_mut(&mut child.0)
-            .expect("new operation scope has one owner")
-            .parent = Some(Arc::downgrade(&self.0));
-        Arc::get_mut(&mut child.0)
-            .expect("new operation scope has one owner")
-            .voice_call_sessions = Arc::clone(&self.0.voice_call_sessions);
-        Arc::get_mut(&mut child.0)
-            .expect("new operation scope has one owner")
-            .voice_call_waiters = Arc::clone(&self.0.voice_call_waiters);
+        let child = Self(Arc::new(OperationScopeInner {
+            native_host: self.0.native_host.clone(),
+            parent: Some(Arc::downgrade(&self.0)),
+            shared_client: self.0.shared_client.clone(),
+            quiescing: AtomicBool::new(false),
+            native_key: self.0.native_key.clone(),
+            registries: Mutex::new(OperationRegistries {
+                next_mcp_id: 0,
+                chats: Vec::new(),
+                mentions: BTreeMap::new(),
+                mcp: BTreeMap::new(),
+                tool_loops: HashMap::new(),
+                children: Vec::new(),
+            }),
+            voice_call_sessions: Arc::clone(&self.0.voice_call_sessions),
+            voice_call_waiters: Arc::clone(&self.0.voice_call_waiters),
+            cancellation_checkpoint_signal: AtomicBool::new(false),
+            session_checkpoints: Arc::clone(&self.0.session_checkpoints),
+            committed_session_requests: Arc::clone(&self.0.committed_session_requests),
+        }));
         registries.children.push(Arc::downgrade(&child.0));
         Ok(child)
     }
@@ -408,12 +528,18 @@ impl OperationScope {
         &self,
         operation: impl FnOnce(Arc<AtomicUsize>) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
         let sessions = self
             .0
             .voice_call_sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?;
-        if !sessions.is_empty() || self.0.voice_call_waiters.load(Ordering::Acquire) != 0 {
+        if self.cancellation_requested()
+            || !sessions.is_empty()
+            || self.0.voice_call_waiters.load(Ordering::Acquire) != 0
+        {
             return Ok(None);
         }
         // Keep admission until native copying settles. The independent counter
@@ -426,15 +552,6 @@ impl OperationScope {
             .voice_call_sessions
             .lock()
             .map_or(true, |sessions| !sessions.is_empty())
-    }
-
-    pub(crate) fn clear_voice_call_activity(&self) -> anyhow::Result<()> {
-        self.0
-            .voice_call_sessions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("voice call activity registry is unavailable"))?
-            .clear();
-        Ok(())
     }
 
     pub(crate) fn request_chat_cancellation(&self, request_id: &str) -> bool {
@@ -559,6 +676,18 @@ impl OperationScope {
     /// Closes this scope to new uncancelled operations and requests
     /// cancellation from every operation currently owned by this runtime.
     pub fn request_cancellation(&self) -> usize {
+        if self.0.parent.is_none() {
+            let was_quiescing = self.0.quiescing.swap(true, Ordering::AcqRel);
+            if !was_quiescing
+                && !self
+                    .0
+                    .cancellation_checkpoint_signal
+                    .swap(true, Ordering::AcqRel)
+            {
+                self.0.voice_call_waiters.fetch_add(1, Ordering::AcqRel);
+            }
+            self.0.session_checkpoints.stop();
+        }
         let (chat_requests, mention_requests, mcp_cancellations, tool_controls, children) = {
             let Ok(registries) = self.0.registries.lock() else {
                 return 0;
@@ -636,6 +765,15 @@ impl OperationScope {
                         .sum::<usize>(),
                 )
         })
+    }
+}
+
+impl Drop for OperationScopeInner {
+    fn drop(&mut self) {
+        if self.parent.is_none() {
+            self.session_checkpoints.stop();
+            let _joined = self.session_checkpoints.join();
+        }
     }
 }
 
@@ -750,7 +888,7 @@ impl Drop for ToolLoopOperationLease {
 #[cfg(test)]
 mod tests {
     use super::{MentionCancelControl, OperationScope};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, atomic::Ordering};
 
     #[test]
     fn voice_call_checkpoint_guard_tracks_exact_sessions() {
@@ -898,6 +1036,100 @@ mod tests {
             .expect("clear");
         drop((stopped_chat, active_chat, late_chat));
         assert_eq!(parent.active_operation_count(), 0);
+    }
+
+    #[test]
+    fn root_cancellation_signals_checkpoint_preemption_once_and_children_share_scheduler() {
+        let scope = OperationScope::detached();
+        let child = scope.child().expect("child");
+        assert!(Arc::ptr_eq(
+            &scope.0.session_checkpoints,
+            &child.0.session_checkpoints
+        ));
+        child
+            .schedule_session_checkpoint("conversation", "request")
+            .expect("child uses the root scheduler");
+        assert_eq!(
+            scope.0.session_checkpoints.pending_count(),
+            1,
+            "root and children share one coalescing queue"
+        );
+        child.request_cancellation();
+        assert_eq!(scope.0.voice_call_waiters.load(Ordering::Acquire), 0);
+        scope.request_cancellation();
+        scope.join_session_checkpoints().expect("root joins worker");
+        assert_eq!(scope.0.voice_call_waiters.load(Ordering::Acquire), 1);
+        scope.request_cancellation();
+        assert_eq!(scope.0.voice_call_waiters.load(Ordering::Acquire), 1);
+        assert!(
+            scope
+                .with_idle_voice_checkpoint(|_| Ok(()))
+                .expect("cancelled checkpoint admission")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn committed_session_requests_are_shared_within_one_runtime_only() {
+        let first = OperationScope::detached();
+        let first_child = first.child().expect("first runtime child");
+        let second = OperationScope::detached();
+
+        first
+            .note_committed_session_request("conversation-a", "request-old")
+            .expect("record first request");
+        first_child
+            .note_committed_session_request("conversation-a", "request-new")
+            .expect("replace request through child");
+        first_child
+            .note_committed_session_request("conversation-b", "request-b")
+            .expect("record second conversation");
+
+        assert_eq!(
+            first
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
+            Some("request-new".to_owned())
+        );
+        assert_eq!(
+            first
+                .committed_session_requests()
+                .expect("runtime request registry should be available"),
+            vec![
+                ("conversation-a".to_owned(), "request-new".to_owned()),
+                ("conversation-b".to_owned(), "request-b".to_owned()),
+            ]
+        );
+        assert_eq!(
+            second
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
+            None,
+            "a separate runtime must not inherit another runtime's authority"
+        );
+        assert!(
+            !first
+                .retire_committed_session_request("conversation-a", "request-old")
+                .expect("runtime request registry should be available"),
+            "a stale worker must not retire the newer request"
+        );
+        assert!(
+            first_child
+                .retire_committed_session_request("conversation-a", "request-new")
+                .expect("runtime request registry should be available")
+        );
+        assert_eq!(
+            first
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
+            None
+        );
+        assert_eq!(
+            second
+                .committed_session_requests()
+                .expect("runtime request registry should be available"),
+            Vec::<(String, String)>::new()
+        );
     }
 
     #[test]

@@ -36,6 +36,12 @@ pub(crate) struct ProductHostKey {
     cache_policy: KvCachePolicy,
 }
 
+impl ProductHostKey {
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+}
+
 /// Inject Mom's encrypted cache and immutable host policy into the shared owner.
 pub fn application_host() -> Result<ApplicationHost, NativeError> {
     let settings = crate::config::resolve_settings().map_err(prefix_store_error)?;
@@ -72,66 +78,6 @@ fn host_binding(key: &ProductHostKey) -> Result<String, NativeError> {
 pub(crate) enum NativeHostAccess {
     Owned(Arc<NativeHost>),
     Shared(NativeClient),
-}
-
-/// A shutdown-only capability: it can export an exact committed request from
-/// an already resident worker, but cannot load a model or submit generation.
-/// Capture before cancelling the scope; consume only after its work drains.
-pub(crate) struct ResidentCheckpointAccess {
-    host: NativeHostAccess,
-    scope: OperationScope,
-}
-
-impl ResidentCheckpointAccess {
-    pub(crate) fn capture(scope: &OperationScope) -> Option<Self> {
-        Some(Self {
-            host: scope.native_access()?,
-            scope: scope.clone(),
-        })
-    }
-
-    pub(crate) fn snapshot(
-        &self,
-        settings: &Settings,
-        model_path: &Path,
-        mmproj_path: Option<&Path>,
-        request_id: &str,
-        max_bytes: usize,
-    ) -> anyhow::Result<
-        Option<(
-            llama_native_types::SequenceStateBlob,
-            llama_native_types::ModelFingerprint,
-        )>,
-    > {
-        anyhow::ensure!(
-            self.scope.cancellation_requested(),
-            "checkpoint drain requires a cancelled scope"
-        );
-        anyhow::ensure!(
-            self.scope.matches_native_key(&host_key(settings)),
-            "checkpoint host identity changed during shutdown"
-        );
-        let config = unchecked_model_configuration_for_profile(settings, model_path, mmproj_path)
-            .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
-        let Some(handle) = self
-            .host
-            .resident(&config)
-            .map_err(|error| anyhow::anyhow!(error))?
-        else {
-            return Ok(None);
-        };
-        let Some(state) = handle
-            .snapshot_conversation_for_request_if_fits(request_id, max_bytes)
-            .map_err(|error| anyhow::anyhow!(error))?
-        else {
-            return Ok(None);
-        };
-        let fingerprint = handle
-            .status()
-            .fingerprint
-            .ok_or_else(|| anyhow::anyhow!("resident model has no native fingerprint"))?;
-        Ok(Some((state, fingerprint)))
-    }
 }
 
 impl NativeHostAccess {
@@ -231,6 +177,7 @@ impl ProductRuntimeOwner {
 impl Drop for ProductRuntimeOwner {
     fn drop(&mut self) {
         let _ = self.scope.request_cancellation();
+        let _checkpoints = self.scope.join_session_checkpoints();
         let _joined = self.host.shutdown_for_process_exit();
     }
 }
@@ -882,45 +829,6 @@ mod tests {
         ValidatedPrefixCacheValue,
     };
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
-
-    #[test]
-    fn shutdown_checkpoint_access_cannot_load_or_reopen_generation() {
-        let directory = tempfile::tempdir().expect("isolated shutdown fixture");
-        let settings =
-            crate::config::Settings::defaults_for_data_dir(directory.path().to_path_buf());
-        let key = super::host_key(&settings);
-        let host = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let scope = crate::OperationScope::for_product_host(&host, key);
-        let checkpoint = super::ResidentCheckpointAccess::capture(&scope).expect("running scope");
-        let missing = directory.path().join("never-load.gguf");
-        assert!(
-            checkpoint
-                .snapshot(&settings, &missing, None, "committed", 1024)
-                .is_err()
-        );
-        scope.request_cancellation();
-        assert!(scope.native_access().is_none());
-        assert!(super::ResidentCheckpointAccess::capture(&scope).is_none());
-        let late = scope
-            .register_chat("late", "conversation")
-            .expect("cancelled late lease");
-        assert!(late.cancellation_requested());
-        assert!(
-            checkpoint
-                .snapshot(&settings, &missing, None, "committed", 1024)
-                .expect("resident lookup only")
-                .is_none()
-        );
-        assert!(host.slots().is_empty());
-        assert!(!missing.exists());
-        let mut changed = settings;
-        changed.data_dir = directory.path().join("different-host");
-        assert!(
-            checkpoint
-                .snapshot(&changed, &missing, None, "committed", 1024)
-                .is_err()
-        );
-    }
 
     #[test]
     fn invalid_execution_limits_are_refused_before_model_path_access() {

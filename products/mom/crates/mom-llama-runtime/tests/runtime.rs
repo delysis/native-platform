@@ -3606,7 +3606,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MM_PROJ_PATH for real Gemma audio"]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MMPROJ_PATH for real Gemma audio"]
 fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     let _session = configured_real_session("real-shutdown-session-checkpoint")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -3616,9 +3616,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         batch_tokens: Some(128),
         max_parallel_sequences: Some(4),
         max_tokens: Some(8),
-        mmproj_path: Some(Some(PathBuf::from(std::env::var(
-            "MOM_LLAMA_MM_PROJ_PATH",
-        )?))),
+        mmproj_path: Some(Some(PathBuf::from(std::env::var("MOM_LLAMA_MMPROJ_PATH")?))),
         resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         ..SettingsUpdate::default()
@@ -3641,6 +3639,24 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         "Remember this phrase: copper heron.",
     )?;
     mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation.id)?;
+    let wait_checkpoint = |previous: Option<&str>| -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = mom_llama_runtime::kv_cache_status()?
+                .result
+                .ok_or_else(|| anyhow!("missing cache status"))?;
+            if status.entries.iter().any(|entry| {
+                entry.owner_id.as_deref() == Some(&conversation.id)
+                    && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                    && Some(entry.id.as_str()) != previous
+            }) {
+                return Ok(());
+            }
+            anyhow::ensure!(Instant::now() < deadline, "idle checkpoint did not publish");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_checkpoint(None)?;
     let before = mom_llama_runtime::kv_cache_status()?
         .result
         .ok_or_else(|| anyhow!("missing cache status"))?;
@@ -3677,7 +3693,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     let handle = mom_llama_runtime::native_runtime::resident_model(&scope, &settings)?;
     let before_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
     let before_startup_state = handle
-        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 8 * 1024 * 1024 * 1024)?
         .ok_or_else(|| anyhow!("latest committed request was not snapshot eligible"))?;
     let startup_warm = mom_llama_runtime::runtime_warm(&scope)?
         .result
@@ -3707,7 +3723,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         warm.resident_prefix_tokens
     );
     let after_startup_state = handle
-        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 8 * 1024 * 1024 * 1024)?
         .ok_or_else(|| anyhow!("startup warm lost the latest committed request"))?;
     assert_eq!(
         after_startup_state.cells, before_startup_state.cells,
@@ -3726,14 +3742,22 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         "PENDING_SESSION_RAM_HIT {}",
         json!({"resident_prefix_tokens": warm.resident_prefix_tokens, "prefill_us": warm.prefill_us, "older_checkpoint": older.id})
     );
-    let drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(&scope);
+    // Release foreground ownership and let the production idle worker publish.
+    // Quit must stop/join it without creating a new export.
+    let idle_started = Instant::now();
+    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, "shutdown-witness", false)?;
+    wait_checkpoint(Some(&older.id))?;
+    let idle_ms = idle_started.elapsed().as_millis();
     scope.request_cancellation();
     assert!(scope.cancellation_requested());
     let started = Instant::now();
-    let saved = drain.flush()?;
-    assert_eq!(
-        saved, 1,
-        "shutdown must persist the resident committed request"
+    scope
+        .join_session_checkpoints()
+        .map_err(|error| anyhow!(error))?;
+    let join_ms = started.elapsed().as_millis();
+    assert!(
+        join_ms < 1000,
+        "idle worker join unexpectedly waited {join_ms} ms"
     );
     let after = mom_llama_runtime::kv_cache_status()?
         .result
@@ -3750,8 +3774,8 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     assert!(checkpoint.state_bytes > 0);
     let cache_id = checkpoint.id.clone();
     println!(
-        "SHUTDOWN_CHECKPOINT_SAVED {}",
-        json!({"saved": saved, "bytes": checkpoint.state_bytes, "elapsed_ms": started.elapsed().as_millis()})
+        "IDLE_CHECKPOINT_SAVED {}",
+        json!({"bytes": checkpoint.state_bytes, "idle_ms": idle_ms, "quit_join_ms": join_ms})
     );
     drop(scope);
     drop(owner);
@@ -3798,6 +3822,196 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
             "resident_prefix_tokens": prepared.resident_prefix_tokens,
             "prefill_us": prepared.prefill_us,
             "path": "conversation-scoped authenticated native restore"
+        })
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<()> {
+    let _session = configured_real_session("real-dispatch-session-checkpoint")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(4),
+        max_tokens: Some(48),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        ..SettingsUpdate::default()
+    })?;
+
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+    let source = mom_llama_runtime::conversation_new(Some("Dispatcher source".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher source conversation missing"))?;
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: source.id.clone(),
+            message: "A short source for a dispatcher persona.".to_string(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    let source = mom_llama_runtime::conversation_select(&source.id)?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher source reload missing"))?;
+    let persona = mom_llama_runtime::persona_freeze(PersonaFreezeInput {
+        conversation_id: source.id.clone(),
+        message_id: source
+            .active_leaf_message_id
+            .clone()
+            .ok_or_else(|| anyhow!("dispatcher source leaf missing"))?,
+        name: "Checkpoint witness".to_string(),
+        mention_handle: "checkpoint-witness".to_string(),
+        history_mode: PersonaHistoryMode::Full,
+    })?
+    .result
+    .ok_or_else(|| anyhow!("dispatcher persona missing"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
+    let first_message = "Remember the invented phrase copper heron.";
+    mom_llama_runtime::draft_update(None, first_message.to_string(), Vec::new())?;
+    let host = mom_llama_runtime::conversation_draft_submit()?
+        .result
+        .ok_or_else(|| anyhow!("recipient chat draft did not materialize"))?;
+    assert_eq!(host.recipient_ids, vec![persona.id.clone()]);
+
+    let dispatch = |scope: &mom_llama_runtime::OperationScope,
+                    message: &str|
+     -> Result<mom_llama_runtime::MentionInvocation> {
+        mom_llama_runtime::draft_update(Some(&host.id), message.to_string(), Vec::new())?;
+        let result = mom_llama_runtime::chat_dispatch_in_scope(
+            scope,
+            MentionDispatchInput {
+                conversation_id: host.id.clone(),
+                message: message.to_string(),
+            },
+            ChatSendOptions::default(),
+        )?;
+        assert_eq!(result.readiness, "real_prompt_smoke_passed");
+        assert!(result.receipt.real_engine_invoked);
+        assert!(!result.receipt.fake_fixture);
+        let ChatDispatchOutput::Mention { invocation, .. } = result
+            .result
+            .ok_or_else(|| anyhow!("dispatcher mention output missing"))?
+        else {
+            return Err(anyhow!("expected a single-persona mention dispatch"));
+        };
+        assert_eq!(invocation.targets.len(), 1);
+        assert_eq!(invocation.targets[0].target_id, persona.id);
+        let target = invocation
+            .results
+            .first()
+            .ok_or_else(|| anyhow!("dispatcher target result missing"))?;
+        assert_eq!(target.state, GenerationState::Completed);
+        assert!(target.real_engine_invoked);
+        assert!(!target.fake_fixture);
+        Ok(invocation)
+    };
+
+    let first = dispatch(&scope, first_message)?;
+    let committed = mom_llama_runtime::conversation_select(&host.id)?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher host transcript missing"))?;
+    assert!(
+        committed.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.attribution.as_ref().is_some_and(|attribution| {
+                    attribution.source_id == persona.id && attribution.invocation_id == first.id
+                })
+        }),
+        "real dispatcher output must be committed to its host transcript"
+    );
+
+    let wait_checkpoint = || -> Result<(String, usize, u32, usize)> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = mom_llama_runtime::kv_cache_status()?
+                .result
+                .ok_or_else(|| anyhow!("missing cache status"))?;
+            if let Some(entry) = status.entries.iter().find(|entry| {
+                entry.owner_id.as_deref() == Some(host.id.as_str())
+                    && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                    && entry.state_bytes > 0
+            }) {
+                return Ok((
+                    entry.id.clone(),
+                    entry.token_ids.len(),
+                    entry.fingerprint.context_tokens,
+                    entry.state_bytes,
+                ));
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "dispatcher idle checkpoint did not publish"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let (checkpoint_id, checkpoint_tokens, checkpoint_context_tokens, checkpoint_bytes) =
+        wait_checkpoint()?;
+    scope.request_cancellation();
+    scope
+        .join_session_checkpoints()
+        .map_err(|error| anyhow!(error))?;
+    drop(scope);
+    drop(owner);
+
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    let second = dispatch(&restored_scope, "Now use the phrase from the prior turn.")?;
+    let second_target = second
+        .results
+        .first()
+        .ok_or_else(|| anyhow!("restored dispatcher target result missing"))?;
+    println!(
+        "DISPATCH_SESSION_CHECKPOINT_DIAGNOSTIC {}",
+        json!({
+            "checkpoint_tokens": checkpoint_tokens,
+            "checkpoint_context_tokens": checkpoint_context_tokens,
+            "checkpoint_bytes": checkpoint_bytes,
+            "target_cache_id_present": second_target.cache_id.is_some(),
+            "target_cache_id_matches_checkpoint": second_target.cache_id.as_deref() == Some(checkpoint_id.as_str()),
+            "target_cache_reused": second_target.cache_reused,
+            "metrics": {
+                "supplied_prefix_tokens": second_target.metrics.cache.supplied_prefix_tokens,
+                "restored_prefix_tokens": second_target.metrics.cache.restored_prefix_tokens,
+                "replayed_prefix_tokens": second_target.metrics.cache.replayed_prefix_tokens,
+                "batch_shared_prefix_tokens": second_target.metrics.cache.batch_shared_prefix_tokens,
+                "resident_prefix_tokens": second_target.metrics.cache.resident_prefix_tokens,
+                "prompt_tokens": second_target.metrics.prompt_tokens,
+                "completion_tokens": second_target.metrics.completion_tokens,
+            }
+        })
+    );
+    assert!(
+        second_target.cache_reused,
+        "restart should reuse dispatcher checkpoint"
+    );
+    assert!(
+        second_target.metrics.cache.restored_prefix_tokens > 0,
+        "restart should import native state from the dispatcher checkpoint"
+    );
+    assert_eq!(
+        second_target.metrics.cache.replayed_prefix_tokens, 0,
+        "restart must not fall back to prompt token replay"
+    );
+    assert_eq!(
+        second_target.cache_id.as_deref(),
+        Some(checkpoint_id.as_str()),
+        "restart should restore the exact committed dispatcher checkpoint"
+    );
+    println!(
+        "DISPATCH_SESSION_CHECKPOINT_RESTORED {}",
+        json!({
+            "cache_id": checkpoint_id,
+            "restored_cache_reused": second_target.cache_reused,
+            "restored_prefix_tokens": second_target.metrics.cache.restored_prefix_tokens,
         })
     );
     Ok(())

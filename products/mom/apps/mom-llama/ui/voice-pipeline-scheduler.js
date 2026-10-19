@@ -30,6 +30,40 @@
     recording = false,
   } = {}) => !suspended && !foregroundDispatch && !callActive && !callPreparing && !recording;
 
+  const createIdleVoiceHistoryScheduler = ({
+    run,
+    onError = () => {},
+    delayMs = 2_000,
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
+    now = Date.now,
+  } = {}) => {
+    let timer = null;
+    let scheduledAt = null;
+    return {
+      schedule(delay = delayMs) {
+        const dueAt = now() + Math.max(0, delay);
+        if (timer !== null && scheduledAt <= dueAt) return false;
+        if (timer !== null) clearTimer(timer);
+        scheduledAt = dueAt;
+        timer = setTimer(() => {
+          timer = null;
+          scheduledAt = null;
+          Promise.resolve().then(run).catch(onError);
+        }, Math.max(0, dueAt - now()));
+        return true;
+      },
+      cancel() {
+        if (timer === null) return false;
+        clearTimer(timer);
+        timer = null;
+        scheduledAt = null;
+        return true;
+      },
+      get scheduled() { return timer !== null; },
+    };
+  };
+
   const shouldWaitForVoiceHistoryRecovery = ({ operation = null, stage = "idle" } = {}) =>
     Boolean(operation) || stage === "recording_commit";
 
@@ -419,6 +453,7 @@
     shouldRunCallTranscriptSlot,
     shouldDisableCallTranscriptSlotsAfterStop,
     canContinueVoiceHistoryRecovery,
+    createIdleVoiceHistoryScheduler,
     shouldWaitForVoiceHistoryRecovery,
     createCallTranscriptIntent,
     enqueueCallTranscriptIntent,

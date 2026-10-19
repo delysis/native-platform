@@ -850,6 +850,7 @@ test("hangup dismisses and releases startup ownership before slow stops, without
     stopCallBed: () => Promise.resolve(),
     releaseCallMicrophoneStream(stream) { released = stream; },
     recoverPendingVoiceHistory: () => Promise.resolve(),
+    scheduleVoiceHistoryRecovery() {},
     invoke: () => Promise.resolve(),
     console: { warn() {} },
   };
@@ -905,6 +906,7 @@ test("hangup clears its held greeting dispatch before waiting and preserves a ne
     stopCallBed: async () => {},
     releaseCallMicrophoneStream() {},
     recoverPendingVoiceHistory: async () => {},
+    scheduleVoiceHistoryRecovery() {},
     invoke: async () => ({}),
   };
   vm.createContext(context);
