@@ -727,16 +727,16 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   gap: 10px;
   background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
 }
-.message-row.voice-reply-row.voice-reply-has-audio {
-  grid-template-columns: 38px minmax(180px, 360px);
+.message-row.assistant.voice-reply-row {
+  grid-template-columns: 38px minmax(0, 360px);
   align-items: center;
 }
-.message-row.voice-reply-row.voice-reply-has-audio > .message-speaker-avatar {
+.message-row.voice-reply-row > .message-speaker-avatar {
   grid-column: 1;
   grid-row: 1;
   align-self: center;
 }
-.message-row.voice-reply-row.voice-reply-has-audio > .message-card {
+.message-row.voice-reply-row > .message-card {
   grid-column: 2;
   grid-row: 1;
   width: min(360px, 100%);
@@ -747,13 +747,6 @@ html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-
   color: var(--text);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 10%, transparent);
 }
-.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio) {
-  grid-template-columns: minmax(0, 1fr);
-}
-.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio)
-  > .message-speaker-avatar { display: none; }
-.message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio)
-  > .message-card { grid-column: 1; }
 .message-row.voice-reply-row.voice-reply-pending .typing-indicator > span {
   background: currentColor;
 }
@@ -2010,6 +2003,10 @@ body .message-row.voice-reply-row .message-card { width: min(360px, 78%); paddin
 body .message-row.voice-message-row .message-card { background: var(--message-blue); }
 body .message-row.voice-reply-row .message-card {
   background: color-mix(in srgb, var(--surface) 92%, var(--surface-raised));
+}
+body .message-row.voice-reply-row.voice-reply-pending:not(.voice-reply-has-audio) > .message-card {
+  width: fit-content;
+  max-width: 100%;
 }
 /* The retained player is the durable identity of an incoming voice note.
    Paint that element as the bubble instead of relying on transient live-row

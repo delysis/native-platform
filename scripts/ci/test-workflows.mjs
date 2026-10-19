@@ -563,6 +563,14 @@ test("Loom's required macOS lane runs the headless WebKit editor interactions", 
   assert.match(required, /^\s{6}- platform-macos$/m);
 });
 
+test("Mom's macOS full lane runs the pending voice-reply layout in WebKit", () => {
+  const workflow = read(fullRootPath);
+  assert.match(workflow, /pnpm --filter @delysis\/loom exec playwright install webkit[\s\S]*pnpm --filter @delysis\/mom-llama run test:browser/);
+  const momPackage = JSON.parse(read(momPackagePath));
+  assert.equal(momPackage.devDependencies.playwright, "1.62.1");
+  assert.match(momPackage.scripts["test:browser"], /voice-reply-layout\.browser\.mjs/);
+});
+
 test("native macOS lane runs all native tests, separate doctests, and strict Clippy", () => {
   const workflow = read(".github/workflows/ci-pr.yml");
   const macos = workflow.match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
@@ -925,7 +933,7 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
   assert.equal(
     scripts["check:frontend"],
-    "node --check ui/composer-key-policy.js && node --check ui/voice-capture-policy.js && node --check ui/voice-pipeline-scheduler.js && node --check ui/pcm-playback-worklet.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
+    "node --check ui/composer-key-policy.js && node --check ui/voice-capture-policy.js && node --check ui/voice-pipeline-scheduler.js && node --check ui/pcm-playback-worklet.js && node --check ui/coop-hx.js && node --check ui/voice-reply-layout.browser.mjs && node --check ui/product-surface-contract.test.js",
   );
   assert.match(scripts["test:frontend"], /(?:^|\s)ui\/persona-sidebar-wiring\.test\.js(?:\s|$)/);
 });

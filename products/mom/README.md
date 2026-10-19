@@ -57,6 +57,13 @@ products/mom/scripts/check-contracts.sh
 products/mom/scripts/check-persona-product-ux.sh
 ```
 
+After WebKit has been installed by the local qualification runner, the rendered
+voice-reply check can be run directly with:
+
+```sh
+pnpm --filter @delysis/mom-llama run test:browser
+```
+
 ## Run the app
 
 Fresh setup acquires and verifies the pinned Gemma 4 12B QAT Q4_0 model, its

@@ -797,6 +797,10 @@ fn component_steps(log: &Recorder, tools: &Tools) -> Result<Vec<(&'static str, C
             "webkit",
             pnpm(&["--filter", "@delysis/loom", "run", "test:browser"]),
         ),
+        (
+            "mom-webkit",
+            pnpm(&["--filter", "@delysis/mom-llama", "run", "test:browser"]),
+        ),
     ])
 }
 
@@ -1148,6 +1152,7 @@ mod tests {
             );
         }
         assert!(position("playwright-install") < position("webkit"));
+        assert!(position("playwright-install") < position("mom-webkit"));
         assert_eq!(
             args("signal-fmt"),
             [
@@ -1218,6 +1223,19 @@ mod tests {
         assert!(args("macos-smoke-helpers").contains(&"macos-smoke-support".to_owned()));
         assert!(args("webkit").contains(&"--fail-if-no-match".to_owned()));
         assert!(args("webkit").contains(&"--yes=false".to_owned()));
+        assert_eq!(
+            args("mom-webkit"),
+            [
+                "--offline",
+                "--yes=false",
+                "pnpm@11.16.0",
+                "--fail-if-no-match",
+                "--filter",
+                "@delysis/mom-llama",
+                "run",
+                "test:browser"
+            ]
+        );
         let node = args("ci-node-tests");
         assert_eq!(&node[..2], ["--test", "--test-concurrency=1"]);
         assert_eq!(node.len(), 4);

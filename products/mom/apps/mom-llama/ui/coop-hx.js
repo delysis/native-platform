@@ -4360,10 +4360,8 @@
     const row = card?.closest(".message-row");
     if (!card || !row) return null;
     row.classList.add("voice-reply-row", "voice-reply-pending");
-    // A bare portrait reads as a broken message. Publish the speaker only
-    // when PCM exists; until then the compact typing bubble is the complete
-    // pending state.
-    row.querySelector?.(".message-speaker-avatar")?.remove();
+    // Speaker identity is visible throughout generation; only the bubble
+    // changes from typing to playable audio once the recording is complete.
     card.replaceChildren(pendingVoiceReply());
     row.hidden = false;
     return row;
