@@ -1726,6 +1726,7 @@ fn session_checkpoint_admitted(scope: &crate::OperationScope) -> bool {
 
 pub(crate) fn run_scheduled_session_checkpoint(
     scope: &crate::OperationScope,
+    data_dir: &std::path::Path,
     conversation_id: &str,
     request_id: &str,
     progress: &mut Option<SessionCheckpointProgress>,
@@ -1745,7 +1746,7 @@ pub(crate) fn run_scheduled_session_checkpoint(
         *progress = None;
     }
     if progress.is_none() {
-        match capture_session_checkpoint(scope, conversation_id, request_id)? {
+        match capture_session_checkpoint(scope, data_dir, conversation_id, request_id)? {
             SessionCheckpointCapture::Deferred => return Ok(false),
             SessionCheckpointCapture::Obsolete => {
                 scope.retire_committed_session_request(conversation_id, request_id)?;
@@ -1786,6 +1787,7 @@ pub(crate) fn run_scheduled_session_checkpoint(
 
 fn capture_session_checkpoint(
     scope: &crate::OperationScope,
+    data_dir: &std::path::Path,
     conversation_id: &str,
     request_id: &str,
 ) -> Result<SessionCheckpointCapture> {
@@ -1793,7 +1795,7 @@ fn capture_session_checkpoint(
     if !session_checkpoint_admitted(scope) {
         return Ok(SessionCheckpointCapture::Deferred);
     }
-    let mut settings = resolve_settings()?;
+    let (mut settings, _) = crate::config::resolve_settings_in_directory(data_dir.to_path_buf())?;
     if !settings.kv_cache_policy.persists_conversation_checkpoints() {
         return Ok(SessionCheckpointCapture::Obsolete);
     }

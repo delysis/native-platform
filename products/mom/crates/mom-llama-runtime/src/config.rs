@@ -499,7 +499,10 @@ pub fn resolve_settings() -> Result<Settings> {
 }
 
 pub(crate) fn resolve_settings_with_cache_status() -> Result<(Settings, bool)> {
-    let data_dir = resolve_data_dir();
+    resolve_settings_in_directory(resolve_data_dir())
+}
+
+pub(crate) fn resolve_settings_in_directory(data_dir: PathBuf) -> Result<(Settings, bool)> {
     if let Some(settings) = resolved_settings_cache()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

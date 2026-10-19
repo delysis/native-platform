@@ -45,12 +45,13 @@ pub(crate) struct SessionCheckpointScheduler {
 }
 
 impl SessionCheckpointScheduler {
-    pub(crate) fn new(weak_scope: WeakOperationScope) -> Self {
+    pub(crate) fn new(weak_scope: WeakOperationScope, data_dir: std::path::PathBuf) -> Self {
         Self::with_runner(
             weak_scope,
-            |scope, conversation_id, request_id, progress| {
+            move |scope, conversation_id, request_id, progress| {
                 crate::kv_cache::run_scheduled_session_checkpoint(
                     scope,
+                    &data_dir,
                     conversation_id,
                     request_id,
                     progress,

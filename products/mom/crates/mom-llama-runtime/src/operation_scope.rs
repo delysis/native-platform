@@ -271,6 +271,10 @@ impl OperationScope {
         shared_client: Option<NativeClient>,
         native_key: Option<crate::native_runtime::ProductHostKey>,
     ) -> Self {
+        let checkpoint_data_dir = native_key
+            .as_ref()
+            .map(|key| key.data_dir().to_path_buf())
+            .unwrap_or_else(crate::config::resolve_data_dir);
         Self(Arc::new_cyclic(|weak| OperationScopeInner {
             native_host,
             parent: None,
@@ -288,9 +292,10 @@ impl OperationScope {
             voice_call_sessions: Arc::new(Mutex::new(HashSet::new())),
             voice_call_waiters: Arc::new(AtomicUsize::new(0)),
             cancellation_checkpoint_signal: AtomicBool::new(false),
-            session_checkpoints: Arc::new(SessionCheckpointScheduler::new(WeakOperationScope(
-                weak.clone(),
-            ))),
+            session_checkpoints: Arc::new(SessionCheckpointScheduler::new(
+                WeakOperationScope(weak.clone()),
+                checkpoint_data_dir,
+            )),
             committed_session_requests: Arc::new(Mutex::new(HashMap::new())),
         }))
     }

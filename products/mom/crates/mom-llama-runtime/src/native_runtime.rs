@@ -36,6 +36,12 @@ pub(crate) struct ProductHostKey {
     cache_policy: KvCachePolicy,
 }
 
+impl ProductHostKey {
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+}
+
 /// Inject Mom's encrypted cache and immutable host policy into the shared owner.
 pub fn application_host() -> Result<ApplicationHost, NativeError> {
     let settings = crate::config::resolve_settings().map_err(prefix_store_error)?;
