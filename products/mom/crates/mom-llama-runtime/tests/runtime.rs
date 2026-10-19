@@ -3829,6 +3829,162 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+fn real_chat_dispatch_checkpoint_persists_and_reuses_after_restart() -> Result<()> {
+    let _session = configured_real_session("real-dispatch-session-checkpoint")?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(4),
+        max_tokens: Some(48),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        ..SettingsUpdate::default()
+    })?;
+
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+    let source = mom_llama_runtime::conversation_new(Some("Dispatcher source".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher source conversation missing"))?;
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: source.id.clone(),
+            message: "A short source for a dispatcher persona.".to_string(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    let source = mom_llama_runtime::conversation_select(&source.id)?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher source reload missing"))?;
+    let persona = mom_llama_runtime::persona_freeze(PersonaFreezeInput {
+        conversation_id: source.id.clone(),
+        message_id: source
+            .active_leaf_message_id
+            .clone()
+            .ok_or_else(|| anyhow!("dispatcher source leaf missing"))?,
+        name: "Checkpoint witness".to_string(),
+        mention_handle: "checkpoint-witness".to_string(),
+        history_mode: PersonaHistoryMode::Full,
+    })?
+    .result
+    .ok_or_else(|| anyhow!("dispatcher persona missing"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
+    let first_message = "Remember the invented phrase copper heron.";
+    mom_llama_runtime::draft_update(None, first_message.to_string(), Vec::new())?;
+    let host = mom_llama_runtime::conversation_draft_submit()?
+        .result
+        .ok_or_else(|| anyhow!("recipient chat draft did not materialize"))?;
+    assert_eq!(host.recipient_ids, vec![persona.id.clone()]);
+
+    let dispatch = |scope: &mom_llama_runtime::OperationScope,
+                    message: &str|
+     -> Result<mom_llama_runtime::MentionInvocation> {
+        mom_llama_runtime::draft_update(Some(&host.id), message.to_string(), Vec::new())?;
+        let result = mom_llama_runtime::chat_dispatch_in_scope(
+            scope,
+            MentionDispatchInput {
+                conversation_id: host.id.clone(),
+                message: message.to_string(),
+            },
+            ChatSendOptions::default(),
+        )?;
+        assert_eq!(result.readiness, "real_prompt_smoke_passed");
+        assert!(result.receipt.real_engine_invoked);
+        assert!(!result.receipt.fake_fixture);
+        let ChatDispatchOutput::Mention { invocation, .. } = result
+            .result
+            .ok_or_else(|| anyhow!("dispatcher mention output missing"))?
+        else {
+            return Err(anyhow!("expected a single-persona mention dispatch"));
+        };
+        assert_eq!(invocation.targets.len(), 1);
+        assert_eq!(invocation.targets[0].target_id, persona.id);
+        let target = invocation
+            .results
+            .first()
+            .ok_or_else(|| anyhow!("dispatcher target result missing"))?;
+        assert_eq!(target.state, GenerationState::Completed);
+        assert!(target.real_engine_invoked);
+        assert!(!target.fake_fixture);
+        Ok(invocation)
+    };
+
+    let first = dispatch(&scope, first_message)?;
+    let committed = mom_llama_runtime::conversation_select(&host.id)?
+        .result
+        .ok_or_else(|| anyhow!("dispatcher host transcript missing"))?;
+    assert!(
+        committed.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.attribution.as_ref().is_some_and(|attribution| {
+                    attribution.source_id == persona.id && attribution.invocation_id == first.id
+                })
+        }),
+        "real dispatcher output must be committed to its host transcript"
+    );
+
+    let wait_checkpoint = || -> Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = mom_llama_runtime::kv_cache_status()?
+                .result
+                .ok_or_else(|| anyhow!("missing cache status"))?;
+            if let Some(entry) = status.entries.iter().find(|entry| {
+                entry.owner_id.as_deref() == Some(host.id.as_str())
+                    && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                    && entry.state_bytes > 0
+            }) {
+                return Ok(entry.id.clone());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "dispatcher idle checkpoint did not publish"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let checkpoint_id = wait_checkpoint()?;
+    scope.request_cancellation();
+    scope
+        .join_session_checkpoints()
+        .map_err(|error| anyhow!(error))?;
+    drop(scope);
+    drop(owner);
+
+    let restored_owner = initialize_product_runtime()?;
+    let restored_scope = restored_owner.operation_scope();
+    let second = dispatch(&restored_scope, "Now use the phrase from the prior turn.")?;
+    let second_target = second
+        .results
+        .first()
+        .ok_or_else(|| anyhow!("restored dispatcher target result missing"))?;
+    assert!(
+        second_target.cache_reused,
+        "restart should reuse dispatcher checkpoint"
+    );
+    assert_eq!(
+        second_target.cache_id.as_deref(),
+        Some(checkpoint_id.as_str()),
+        "restart should restore the exact committed dispatcher checkpoint"
+    );
+    println!(
+        "DISPATCH_SESSION_CHECKPOINT_RESTORED {}",
+        json!({
+            "cache_id": checkpoint_id,
+            "restored_cache_reused": second_target.cache_reused,
+            "restored_prefix_tokens": second_target.metrics.cache.restored_prefix_tokens,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {

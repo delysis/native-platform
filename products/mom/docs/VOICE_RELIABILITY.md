@@ -1142,12 +1142,24 @@ component preemption tests alone do not establish visible navigation latency.
 ## Opportunistic maintenance and prompt quit (19 October 2026)
 
 Each runtime owns one joinable session-checkpoint worker shared by its dispatch
-children. Every committed text or voice turn coalesces that conversation's
-pending request. After a three-second idle window, the worker exports only an
+children. Committed direct text/voice turns and completed single-recipient
+dispatches coalesce that conversation's pending request. Multi-recipient batches
+and tool-approval continuations do not currently expose an unambiguous committed
+native sequence for this checkpoint path. After a three-second idle window, the worker exports only an
 exact still-resident committed request. It never reloads an evicted model to
 rebuild a cache. A foreground operation, active call, waiting store writer, or
 cancellation preempts maintenance. Deferred work retries with bounded delay;
 errors back off. Requests and cancellation authority are runtime-local.
+
+Native qualification must exercise the actual `mom_llama_chat_dispatch` path,
+including a saved Persona recipient, not just `chat_send`. Candidate 33's native
+quit measurements passed, but its text-dispatch trial exposed missing cache
+registration: recipient dispatch bypassed the direct-chat completion hook.
+Both completions now use one registration-and-scheduling helper. Dispatcher
+lookup uses the same exact longest-prefix selection as direct chat, including
+the host conversation checkpoint and the actual template. The real-model
+regression requires a committed dispatcher reply, idle publication under its
+host conversation, and reuse of that exact checkpoint after runtime restart.
 
 The worker retains at most one immutable native snapshot. This is still a full
 native export, not delta KV serialization; the existing 8 GiB per-entry ceiling

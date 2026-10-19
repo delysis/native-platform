@@ -6,8 +6,9 @@ pub use sources::{ConsultSourcePreview, consult_source_open, consult_sources};
 mod target_resolution;
 use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{
-    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, ReasoningStreamParser,
-    ReasoningTarget, native_context_messages, parse_reasoning_output,
+    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, PrefixLookupMode,
+    ReasoningStreamParser, ReasoningTarget, longest_cached_prefix_for_owners,
+    native_context_messages, parse_reasoning_output,
 };
 use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
@@ -15,7 +16,7 @@ use crate::conversation_store::{
     ConversationKind, Message, MessageAttribution, MessageRole, MessageSpeakerKind, active_leaf_id,
     load_db, strip_reserved_attribution_prefix, upsert_conversation,
 };
-use crate::kv_cache::ensure_persona_prefix;
+use crate::kv_cache::record_committed_session_checkpoint;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::mcp::mcp_platform_blocker;
 use crate::mcp::{
@@ -3327,16 +3328,21 @@ where
                 continue;
             }
         };
-        let cache_use = if handoff.media.is_empty() {
-            match snapshot.profile.chat_template {
-                crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
-                    ensure_persona_prefix(&handle, &cache_owner(snapshot), &handoff.messages)?
-                }
-                crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
-            }
-        } else {
-            None
-        };
+        let target_cache_owner = cache_owner(snapshot);
+        let cache_use = longest_cached_prefix_for_owners(
+            &handle,
+            &handoff.messages,
+            &[
+                &input.conversation_id,
+                &snapshot.target_id,
+                &target_cache_owner,
+            ],
+            &settings,
+            !handoff.media.is_empty(),
+            PrefixLookupMode::Persistent,
+            profile_chat_template(&snapshot.profile),
+        )?
+        .0;
         handoff::retain_input_receipt(
             &settings.data_dir,
             &invocation_id,
@@ -3350,11 +3356,11 @@ where
             model_config,
             handle,
             messages: handoff.messages,
-            cache_id: cache_use.as_ref().map(|cache| cache.cache_id.clone()),
+            cache_id: cache_use.as_ref().map(|(id, _)| id.clone()),
             media: handoff.media,
             model_fingerprint: handoff.receipt.model_fingerprint,
             text_prompt_tokens: handoff.text_prompt_tokens,
-            cached_prefix: cache_use.map(|cache| cache.sequence),
+            cached_prefix: cache_use.map(|(_, sequence)| sequence),
         });
     }
 
@@ -3503,6 +3509,19 @@ where
         }
         Err(error) => return Err(error),
     };
+    // A single completed recipient uses the same resident sequence as a direct
+    // reply. Persist only after the host exchange and its journal commit; the
+    // idle worker validates the exact native request before exporting it.
+    if snapshots.len() == 1
+        && invocation.results.len() == 1
+        && invocation.results[0].state == GenerationState::Completed
+        && invocation.results[0].message_id.is_some()
+        && !invocation.results[0].text.trim().is_empty()
+        && invocation.results[0].real_engine_invoked
+        && !invocation.results[0].fake_fixture
+    {
+        record_committed_session_checkpoint(scope, &input.conversation_id, &invocation_id);
+    }
     Ok(CommandResult::passed(
         "mom_llama.chat_dispatch",
         "real_prompt_smoke_passed",

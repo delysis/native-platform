@@ -449,14 +449,16 @@ impl MemoryCacheState {
 }
 
 static MEMORY_CACHE: OnceLock<Mutex<MemoryCacheState>> = OnceLock::new();
-pub(crate) fn note_committed_session_request(
+pub(crate) fn record_committed_session_checkpoint(
     scope: &crate::OperationScope,
     conversation_id: &str,
     request_id: &str,
 ) {
     if let Err(error) = scope.note_committed_session_request(conversation_id, request_id) {
         eprintln!("Unable to register committed cache request: {error:#}");
+        return;
     }
+    schedule_committed_session_checkpoint(scope, conversation_id, request_id);
 }
 
 /// Enqueue maintenance; callers never export or write native state inline.
@@ -1423,22 +1425,6 @@ fn latest_session_checkpoint<'a>(
         .max_by_key(|entry| (entry.last_used_at_ms, entry.created_at_ms))
 }
 
-fn compatible_cached_prefix_for_owner(
-    handle: &NativeModelHandle,
-    messages: &[ChatMessage],
-    owner_id: Option<&str>,
-) -> Result<Option<(String, SequenceStateBlob)>> {
-    let settings = resolve_settings()?;
-    compatible_cached_prefix_for_owner_with_settings(
-        handle,
-        messages,
-        owner_id,
-        &settings,
-        ChatTemplateChoice::ModelDefault,
-        0,
-    )
-}
-
 pub(crate) fn compatible_cached_prefix_for_owner_with_settings(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
@@ -1613,38 +1599,6 @@ fn resident_prefix_covers_snapshot(
     !snapshot_token_ids.is_empty()
         && resident_text_prefix_tokens.max(resident_media_prefix_tokens) >= snapshot_token_ids.len()
         && prompt_token_ids.starts_with(snapshot_token_ids)
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PersonaPrefixUse {
-    pub cache_id: String,
-    pub sequence: SequenceStateBlob,
-}
-
-pub(crate) fn ensure_persona_prefix(
-    handle: &NativeModelHandle,
-    owner_id: &str,
-    target_messages: &[ChatMessage],
-) -> Result<Option<PersonaPrefixUse>> {
-    let settings = resolve_settings()?;
-    if !settings.kv_cache_policy.allows_prefix_reuse() {
-        return Ok(None);
-    }
-    if let Some(value) =
-        compatible_cached_prefix_for_owner(handle, target_messages, Some(owner_id))?
-    {
-        return Ok(Some(PersonaPrefixUse {
-            cache_id: value.0,
-            sequence: value.1,
-        }));
-    }
-    // A cache miss must remain cheaper than ordinary generation. Gemma 4's
-    // hybrid recurrent state exports hundreds of megabytes even for a short
-    // system prompt, so eagerly constructing and snapshotting a persona cache
-    // delayed every cold reply by several seconds. Explicit cache preparation
-    // may still populate a reusable entry; the automatic reply path falls
-    // through to direct prompt prefill.
-    Ok(None)
 }
 
 pub fn kv_cache_checkpoint_committed_voice_session(

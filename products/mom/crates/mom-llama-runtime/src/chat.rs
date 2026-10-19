@@ -10,7 +10,7 @@ use crate::conversation_store::{
 use crate::kv_cache::{
     compatible_cached_prefix_for_owner_with_settings,
     compatible_memory_prefix_for_owner_with_settings, invalidate_cache, invalidate_memory,
-    note_committed_session_request, schedule_committed_session_checkpoint,
+    record_committed_session_checkpoint,
 };
 use crate::native_runtime::{resident_model_for_profile, resident_model_for_profile_with_status};
 use crate::now_ms;
@@ -1084,12 +1084,7 @@ where
         &user_message_id,
         attachments.draft_snapshot.as_ref(),
     )?;
-    note_committed_session_request(
-        &session.scope,
-        &prepared.conversation_id,
-        &session.request_id,
-    );
-    schedule_committed_session_checkpoint(
+    record_committed_session_checkpoint(
         &session.scope,
         &prepared.conversation_id,
         &session.request_id,
@@ -1785,8 +1780,7 @@ where
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
     )?;
-    note_committed_session_request(scope, &conversation.id, &request_id);
-    schedule_committed_session_checkpoint(scope, &conversation.id, &request_id);
+    record_committed_session_checkpoint(scope, &conversation.id, &request_id);
     let result = ChatSendOutput {
         request_id: request_id.clone(),
         conversation_id: conversation.id,
