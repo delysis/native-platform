@@ -11517,7 +11517,6 @@
     const card = document.getElementById("startup-card");
     const greeting = document.getElementById("startup-greeting");
     const setupProgress = document.getElementById("startup-progress");
-    const persona = document.getElementById("startup-persona");
     const friends = document.getElementById("startup-friends");
     const friendPortraits = [
       ["bessel_van_der_kolk", "Bessel van der Kolk"],
@@ -11595,10 +11594,6 @@
       const stopVoiceProgress = await events?.listen?.("mom_llama_voice_initialization_progress", ({ payload }) => {
         if (!firstRunSetup || !payload) return;
         if (status) status.textContent = `Checking ${payload.voice}`;
-        if (persona) {
-          persona.hidden = false;
-          persona.textContent = payload.persona;
-        }
         for (const portrait of friends?.children || []) {
           portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
         }
@@ -11607,10 +11602,6 @@
       const stopCachePreparationProgress = await events?.listen?.("mom_llama_cache_preparation_progress", ({ payload }) => {
         if (!firstRunSetup || !payload) return;
         if (status) status.textContent = `Preparing ${payload.persona}`;
-        if (persona) {
-          persona.hidden = false;
-          persona.textContent = payload.persona;
-        }
         for (const portrait of friends?.children || []) {
           portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
         }
