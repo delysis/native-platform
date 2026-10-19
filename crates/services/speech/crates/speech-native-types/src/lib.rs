@@ -828,12 +828,35 @@ pub struct SpeechUsage {
     /// Time spent decoding the first emitted codec window into PCM.
     #[serde(default)]
     pub helper_first_decode_us: Option<u64>,
+    /// Per text segment generator termination diagnostics from the local Qwen helper.
+    #[serde(default)]
+    pub helper_generation_segments: Vec<SpeechGenerationSegment>,
     pub time_to_first_result_ms: Option<u64>,
     pub total_ms: Option<u64>,
     #[serde(default)]
     pub provenance: UsageProvenance,
     #[serde(default)]
     pub real_local_inference: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechGenerationStopReason {
+    Eos,
+    PadLimit,
+    ExactCycle,
+    Cancelled,
+    MaxTokens,
+    InputTooShort,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeechGenerationSegment {
+    pub segment: u32,
+    pub stop_reason: Option<SpeechGenerationStopReason>,
+    pub generated_codec_frames: Option<u64>,
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

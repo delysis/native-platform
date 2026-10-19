@@ -115,6 +115,31 @@ private struct WireEvent: Encodable {
     var first_decode_us: Int? = nil
     var first_pcm_us: Int? = nil
     var embedding: [Float]? = nil
+    var generation_segments: [GenerationSegmentReceipt]? = nil
+}
+
+private struct GenerationSegmentReceipt: Encodable {
+    let segment: Int
+    let stop_reason: String?
+    let generated_codec_frames: Int?
+    let max_tokens: Int?
+}
+
+private final class GenerationReportBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var report: TTSGenerationReport?
+
+    func store(_ report: TTSGenerationReport) {
+        lock.lock()
+        self.report = report
+        lock.unlock()
+    }
+
+    func load() -> TTSGenerationReport? {
+        lock.lock()
+        defer { lock.unlock() }
+        return report
+    }
 }
 
 private let residentProtocol = "mom-qwen3-tts-resident-v2"
@@ -263,6 +288,8 @@ private enum Qwen3TTSHelperMain {
                 writeJSON(WireEvent(event: "fatal", detail: "Invalid request JSON"))
                 continue
             }
+            var generationSegments: [GenerationSegmentReceipt] = []
+            var activeGeneration: (segment: Int, reports: GenerationReportBox)?
             do {
                 let requestStarted = DispatchTime.now().uptimeNanoseconds
                 let lookup = try referenceVoiceCache.voice(
@@ -333,15 +360,12 @@ private enum Qwen3TTSHelperMain {
                     continue
                 }
                 let textChunkStarted = DispatchTime.now().uptimeNanoseconds
-                // The app scheduler is the sole segmentation authority for
-                // live speech. Splitting the same phrase again here reset the
-                // talker and codec at helper-private boundaries, producing
-                // the conspicuous short prosody blocks heard in voice notes.
-                // Retain formatting cleanup, then synthesize this request as
-                // one continuous utterance.
-                let speechText = TextChunker.spokenChunks(request.text, maxWords: .max)
-                    .joined(separator: " ")
-                let speechChunks = speechText.isEmpty ? [] : [speechText]
+                // Live call/voice-note requests already arrive bounded by the
+                // app scheduler and remain one acoustic segment. Read Aloud
+                // can contain an entire long message, so split only above the
+                // same 64-word ceiling while keeping one helper job and one
+                // final terminal event for the streamed PCM.
+                let speechChunks = TextChunker.boundedSpokenChunks(request.text, maxWords: 64)
                 let textChunkMicros = elapsedMicros(since: textChunkStarted)
                 guard !speechChunks.isEmpty else {
                     throw NSError(domain: "MomQwen3TTSHelper", code: 9,
@@ -352,7 +376,7 @@ private enum Qwen3TTSHelperMain {
                 // Explicitly seeded audition requests make reference A/B
                 // comparisons repeatable. App requests omit this field.
                 if let seed = request.audition_seed { MLX.seed(seed) }
-                for textChunk in speechChunks {
+                for (segmentIndex, textChunk) in speechChunks.enumerated() {
                     // Reset generation at natural boundaries before acoustic
                     // drift can propagate. The cached speaker embedding keeps
                     // identity stable, and playback consumes earlier PCM while
@@ -363,6 +387,8 @@ private enum Qwen3TTSHelperMain {
                     // Allow the app's bounded 64-word sentences to finish instead
                     // of exhausting the old short-phrase ceiling mid-word.
                     let maxTokens = min(384, max(24, TextChunker.estimateTokens(for: textChunk) + 12))
+                    let generationReports = GenerationReportBox()
+                    activeGeneration = (segmentIndex + 1, generationReports)
                     let stream = pipeline.generateStream(
                         text: textChunk,
                         speakerEmbedding: voice.speakerEmbedding,
@@ -378,7 +404,8 @@ private enum Qwen3TTSHelperMain {
                         maxTokens: maxTokens,
                         chunkSize: chunkSize,
                         preparedPrefixKey: preparedPrefixKey,
-                        isCancelled: { cancellations.contains(request.id) }
+                        isCancelled: { cancellations.contains(request.id) },
+                        onGenerationComplete: { generationReports.store($0) }
                     )
                     for try await chunk in stream {
                         if cancellations.contains(request.id) { break }
@@ -410,17 +437,37 @@ private enum Qwen3TTSHelperMain {
                         ))
                         firstPCM = false
                     }
+                    let report = generationReports.load()
+                    let missingReportReason = cancellations.contains(request.id) ? "cancelled" : nil
+                    generationSegments.append(GenerationSegmentReceipt(
+                        segment: segmentIndex + 1,
+                        stop_reason: report?.stopReason.rawValue ?? missingReportReason,
+                        generated_codec_frames: report?.generatedCodecFrames,
+                        max_tokens: report?.maxTokens
+                    ))
+                    activeGeneration = nil
                     if cancellations.contains(request.id) { break }
                 }
                 writeJSON(WireEvent(
                     event: cancellations.contains(request.id) ? "cancelled" : "done",
-                    id: request.id
+                    id: request.id,
+                    generation_segments: generationSegments
                 ))
             } catch {
+                if let activeGeneration {
+                    let report = activeGeneration.reports.load()
+                    generationSegments.append(GenerationSegmentReceipt(
+                        segment: activeGeneration.segment,
+                        stop_reason: report?.stopReason.rawValue ?? (cancellations.contains(request.id) ? "cancelled" : "error"),
+                        generated_codec_frames: report?.generatedCodecFrames,
+                        max_tokens: report?.maxTokens
+                    ))
+                }
                 writeJSON(WireEvent(
                     event: cancellations.contains(request.id) ? "cancelled" : "error",
                     id: request.id,
-                    detail: cancellations.contains(request.id) ? nil : String(describing: error)
+                    detail: cancellations.contains(request.id) ? nil : String(describing: error),
+                    generation_segments: generationSegments.isEmpty ? nil : generationSegments
                 ))
             }
             cancellations.finish(request.id)

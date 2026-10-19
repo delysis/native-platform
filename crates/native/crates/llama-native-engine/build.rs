@@ -4,8 +4,9 @@
 mod build_identity;
 
 use build_identity::{
-    PrivateBuildIdentity, reviewed_binding_profile, rustc_digest_directive,
-    validate_binding_build_evidence, validate_reviewed_cmake_cache,
+    PrivateBuildIdentity, cargo_dependency_closure, cargo_workspace_build_inputs,
+    reviewed_binding_profile, rustc_digest_directive, validate_binding_build_evidence,
+    validate_reviewed_cmake_cache,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -125,11 +126,12 @@ fn emit_build_identity() -> Result<(), String> {
     let engine_root = PathBuf::from(required_os("CARGO_MANIFEST_DIR")?);
     let workspace_root = engine_root.join("../../../..");
     let types_root = engine_root.join("../llama-native-types");
+    let cpp_wrapper_root = engine_root.join("../llama-cpp-2");
     let target = required_safe_identifier("TARGET")?;
     let host = required_safe_identifier("HOST")?;
 
     let mut identity = PrivateBuildIdentity::new();
-    identity.add_bytes("protocol", b"llama-native-engine-private-build-v3")?;
+    identity.add_bytes("protocol", b"llama-native-engine-private-build-v4")?;
     identity.add_bytes("binding.version", LLAMA_CPP_BINDING_VERSION.as_bytes())?;
     identity.add_bytes("binding.wrapper_revision", LLAMA_CPP_BINDING_REV.as_bytes())?;
     identity.add_bytes("binding.llama_cpp_revision", LLAMA_CPP_REV.as_bytes())?;
@@ -141,14 +143,33 @@ fn emit_build_identity() -> Result<(), String> {
         "source.types",
         &source_tree_digest(&types_root, &["Cargo.toml", "src"])?,
     )?;
+    let workspace_manifest =
+        private_read(&workspace_root.join("Cargo.toml"), "workspace manifest")?;
+    let workspace_manifest = std::str::from_utf8(&workspace_manifest)
+        .map_err(|_| "workspace manifest is not valid UTF-8".to_string())?;
+    let engine_manifest = private_read(&engine_root.join("Cargo.toml"), "engine manifest")?;
+    let engine_manifest = std::str::from_utf8(&engine_manifest)
+        .map_err(|_| "engine manifest is not valid UTF-8".to_string())?;
+    let types_manifest = private_read(&types_root.join("Cargo.toml"), "types manifest")?;
+    let types_manifest = std::str::from_utf8(&types_manifest)
+        .map_err(|_| "types manifest is not valid UTF-8".to_string())?;
+    let workspace_inputs =
+        cargo_workspace_build_inputs(workspace_manifest, engine_manifest, types_manifest)?;
+    identity.add_bytes("source.workspace_build_inputs", &workspace_inputs)?;
     identity.add_bytes(
-        "source.workspace_manifest",
-        &private_file_digest(&workspace_root.join("Cargo.toml"), "workspace manifest")?,
+        "source.cpp_wrapper",
+        &source_tree_digest(&cpp_wrapper_root, &["Cargo.toml", "build.rs", "src"])?,
     )?;
-    identity.add_bytes(
-        "source.cargo_lock",
-        &private_file_digest(&workspace_root.join("Cargo.lock"), "Cargo lock")?,
+    let cargo_lock_path = workspace_root.join("Cargo.lock");
+    let cargo_lock = private_read(&cargo_lock_path, "Cargo lock")?;
+    let cargo_lock_text = std::str::from_utf8(&cargo_lock)
+        .map_err(|_| "Cargo lock is not valid UTF-8".to_string())?;
+    let dependency_closure = cargo_dependency_closure(
+        cargo_lock_text,
+        "llama-native-engine",
+        &required_safe_identifier("CARGO_PKG_VERSION")?,
     )?;
+    identity.add_bytes("source.dependency_closure", &dependency_closure)?;
     identity.add_bytes(
         "source.cargo_config",
         &private_file_digest(
@@ -197,6 +218,9 @@ fn emit_build_identity() -> Result<(), String> {
         "src",
         "../llama-native-types/Cargo.toml",
         "../llama-native-types/src",
+        "../llama-cpp-2/Cargo.toml",
+        "../llama-cpp-2/build.rs",
+        "../llama-cpp-2/src",
         "../../../../Cargo.toml",
         "../../../../Cargo.lock",
         "../../../../.cargo/config.toml",

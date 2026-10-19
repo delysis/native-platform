@@ -58,7 +58,8 @@ test("Persona menu actions move focus out of the hidden menu", () => {
   assert.ok(actions.includes("await openPersonaConversation(persona);"));
   const draft = between(client, "const openNewDraft =", "const actionHandlers =");
   assert.ok(draft.indexOf("await refreshConversationProjection();") < draft.indexOf("focusComposer();"));
-  assert.ok(draft.includes("void retainComposerDraft().catch(reportError);"));
+  assert.ok(draft.includes("const retainedDraft = retainComposerDraft();"));
+  assert.ok(draft.includes("await retainedDraft;"));
   assert.ok(draft.includes('invoke("mom_llama_conversation_draft_open", { persona })'));
   assert.ok(!draft.includes("instantiatePersona"));
   assert.ok(actions.includes('formField(document.getElementById("persona-editor"), "persona_name")?.focus();'));
@@ -102,6 +103,8 @@ const settingsFocusHarness = (withToggle) => {
     document: { activeElement: outside, getElementById: () => sidebar,
       querySelector(selector) { return selector === '[data-action="settings-open"]' ? toggle : composer; } },
     shell: () => ({ classList }), sizeComposer() {}, switchSettingsSection() {},
+    refreshConversationSettingsProjection: async () => { calls.push("refresh-current-chat"); },
+    reportError(error) { throw error; },
     invoke: async (command) => { calls.push(command); return { status: "passed" }; },
   };
   settingsFocusVm.runInNewContext(
@@ -118,7 +121,7 @@ test("Settings native-menu open then actual Close returns focus to current compo
   assert.equal(h.sidebar.hidden, false);
   await h.close();
   assert.equal(h.sidebar.hidden, true);
-  assert.deepEqual(h.calls, ["mom_llama_settings_get"]);
+  assert.deepEqual(h.calls, ["refresh-current-chat", "mom_llama_settings_get"]);
   assert.deepEqual(h.focusEvents, ["composer"]);
   assert.deepEqual([h.composer.selectionStart, h.composer.selectionEnd], [2, 5]);
 });

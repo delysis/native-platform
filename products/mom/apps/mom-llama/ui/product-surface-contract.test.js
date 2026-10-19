@@ -39,6 +39,7 @@ const backendOnlyCommandIds = [
   "mom_llama.skill_create",
   "mom_llama.skill_list",
   "mom_llama.skill_update",
+  "mom_llama.voice_reply_store",
 ];
 
 const controlPattern =
@@ -267,6 +268,11 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.ok(voiceCapture.includes("pendingVoiceAudioSession"));
   assert.ok(voiceCapture.includes('invoke("mom_llama_voice_message_import"'), "attachment import remains only as the explicit failed-prefill fallback");
   assert.match(
+    bridge,
+    /tts\.trackGeneration\(invoke\("mom_llama_chat_send"/,
+    "the call greeting must register its exact native generation promise",
+  );
+  assert.match(
     voiceCapture,
     /if \(live\?\.session && !expectedRecording\.prefillFailed\)[\s\S]*pendingVoiceAudioSession = \{[\s\S]*bytes: Array\.from\(wav\)/,
     "the normal path must hand persistence bytes to the exact incremental session",
@@ -277,7 +283,16 @@ test("the composer uses a glass microphone affordance and keeps recording contro
     submitStart,
     bridge.indexOf('  document.addEventListener("input"', submitStart),
   );
-  assert.match(submitHandler, /result = await invoke\("mom_llama_chat_dispatch"/);
+  assert.match(
+    submitHandler,
+    /const operation = invoke\("mom_llama_chat_dispatch"[\s\S]*?result = await \(voiceTtsOwner\s*\? voiceTtsOwner\.trackGeneration\(operation\) : operation\)/,
+    "fallback voice dispatch must register the native operation with the active TTS owner",
+  );
+  assert.match(
+    submitHandler,
+    /const finished = await \(voiceTtsOwner\s*\? voiceTtsOwner\.trackGeneration\(operation\) : operation\)/,
+    "incremental audio completion must register its exact native generation promise",
+  );
   assert.ok(!submitHandler.includes("waitForVoiceTranscript"), "voice dispatch cannot wait for transcription");
   assert.match(submitHandler, /finishVoiceReplyAndIndexTurn\([\s\S]*callReplyConversation === conversation[\s\S]*result\?\.result\?\.kind === "direct"[\s\S]*indexVoiceTurn\(conversation, output, voiceTranscriptAttachment,[\s\S]*sourceCapture/);
   const voiceTranscript = bridge.slice(
@@ -290,15 +305,16 @@ test("the composer uses a glass microphone affordance and keeps recording contro
   assert.ok(!voiceTranscript.includes("waitForVoiceTranscript"), "new microphone turns cannot wait for transcription");
   assert.ok(!voiceTranscript.includes("await previous"), "one failed transcript cannot strand later backfills");
   const speculate = bridge.slice(
-    bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"'),
-    bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = invoke("mom_llama_voice_audio_speculate"')),
+    bridge.indexOf('const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate"'),
+    bridge.indexOf("    } catch (error) {", bridge.indexOf('const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate"')),
   );
   assert.match(speculate, /finishVoiceReplyAndIndexTurn\(recording\.call,[\s\S]*indexVoiceTurn\(live\.conversation, response\.result, null,[\s\S]*speculation\.captureReady, recording\.trace\)[\s\S]*tts\.finish/);
+  assert.match(speculate, /tts\.trackGeneration\(invoke\("mom_llama_voice_audio_speculate"/);
   assert.ok(!bridge.includes("const composerHasSendableDraft"));
   assert.ok(!bridge.includes('send.dataset.modelReady !== "true"'));
   const glassControls = styles.slice(
     styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)"),
-    styles.indexOf("/* Messages-style toolbar items", styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)")),
+    styles.indexOf("/* Toolbar controls share", styles.indexOf(".composer .round-button,\n.composer .send-button {\n  color: var(--glass-glyph)")),
   );
   assert.ok(glassControls.includes("border: 1px solid var(--glass-edge)"));
   assert.ok(glassControls.includes("linear-gradient(180deg"));
@@ -315,7 +331,7 @@ test("the composer uses a glass microphone affordance and keeps recording contro
 });
 
 test("window chrome is centered and every native resize edge is discoverable", () => {
-  assert.ok(styles.includes("--toolbar-height: 64px"));
+  assert.ok(styles.includes("--toolbar-height: 56px"));
   assert.ok(!styles.includes(".chrome { padding-bottom:"));
   assert.ok(styles.includes(".window-resize-north-east"));
   assert.ok(styles.includes("cursor: ns-resize"));
@@ -337,14 +353,12 @@ test("window chrome is centered and every native resize edge is discoverable", (
   assert.ok(sharedChrome.includes("var(--chat-pane) var(--sidebar-width) 100%"));
   assert.ok(sharedChrome.includes("border-bottom: 0"));
   assert.ok(styles.includes(".llama-ui-shell .chat-main { background: var(--chat-pane); }"));
-  const flatToolbar = styles.slice(
-    styles.indexOf("/* Messages-style toolbar items"),
-    styles.indexOf(".composer .send-button:disabled"),
-  );
-  assert.ok(flatToolbar.includes("border: 0"));
-  assert.ok(flatToolbar.includes("background: transparent"));
-  assert.ok(flatToolbar.includes("box-shadow: none"));
-  assert.ok(!flatToolbar.includes("linear-gradient"));
+  const windowConfig = JSON.parse(read("apps/mom-llama/src-tauri/tauri.conf.json")).app.windows[0];
+  assert.equal(windowConfig.titleBarStyle, "Overlay");
+  assert.equal(windowConfig.decorations, true);
+  assert.deepEqual(windowConfig.trafficLightPosition, { x: 20, y: 30 });
+  assert.ok(styles.includes(".chrome .icon-button,\n.composer .round-button,"));
+
 });
 
 test("titlebar gives search to the sidebar and voice identity to the chat", () => {
@@ -387,7 +401,7 @@ test("titlebar gives search to the sidebar and voice identity to the chat", () =
   assert.doesNotMatch(callStart, /throw new Error\("The call was not answered\."\)/);
   assert.ok(bridge.includes('.sidebar-titlebar-zone")?.classList.toggle("searching", enabled)'));
   assert.ok(styles.includes(".chrome .icon { width: 18px; height: 18px; flex-basis: 18px; }"));
-  assert.ok(styles.includes("left: calc(var(--sidebar-width) + 50px)"));
+  assert.ok(styles.includes("left: calc(var(--sidebar-width) + 48px)"));
   assert.ok(styles.includes("flex-wrap: nowrap"));
   assert.ok(styles.includes("max-width: calc(100% - 34px)"));
   assert.ok(styles.includes("height: min(520px, calc(100dvh - 24px))"));
@@ -506,7 +520,7 @@ test("call starts ringing immediately while preparation remains cancellation gua
   const activityStart = call.indexOf("createVoiceCallActivityGuard(speechOperationToken())");
   const activityReady = call.indexOf("await activityGuard.ready");
   const warm = call.indexOf('runtimeWarmPromise.then');
-  const microphone = call.indexOf('prepareCallMicrophoneStream()');
+  const microphone = call.indexOf('prepareCallMicrophoneStream(epoch)');
   const visibleRinging = call.indexOf('modal.dataset.callState = "ringing"');
   const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
   const ringStart = call.indexOf("const ringingReady = startCallRinging(epoch)");
@@ -540,7 +554,7 @@ test("call starts ringing immediately while preparation remains cancellation gua
 test("foreground chat sends suspend idle audio recovery before draft or model admission", () => {
   const submitStart = bridge.indexOf('document.addEventListener("submit", async (event) => {');
   const sendStart = bridge.indexOf('if (form.id === "chat-form")', submitStart);
-  const sendEnd = bridge.indexOf('if (form.id === "conversation-rename-form")', sendStart);
+  const sendEnd = bridge.indexOf('if (form.id === "settings-form")', sendStart);
   const send = bridge.slice(sendStart, sendEnd);
   const suspend = send.indexOf('await suspendVoiceHistoryRecoveryForForeground("chat_send")');
   const firstAwait = send.indexOf('await updateRecipients');
@@ -569,8 +583,8 @@ test("call capture remains live during playback through the shared echo-cancelle
   assert.ok(live.includes("prefillSession: deferPrefill ? null : (nextCallPrefill || nextCallPrefillGate)"));
   assert.ok(live.includes("deferPrefill,"));
   assert.ok(live.includes("startNextCallPrefill();\n          controller.finish();"));
-  assert.ok(live.includes("const continueCall = !onFailure && mode === \"call\""));
-  assert.ok(live.includes("startCallCapture();\n          startNextCallPrefill();"));
+  assert.ok(live.includes("const continueCall = playbackAuthorized && !onFailure && mode === \"call\""));
+  assert.ok(live.includes("startCallCapture();\n          if (callCaptureStarted) startNextCallPrefill();"));
   assert.ok(!live.includes("void beginVoiceCapture({ call: true }).catch(reportError);"));
   assert.ok(playbackStarted.includes("activeCallPlayback = playback;"));
   assert.ok(interrupt.includes("recording?.call ? activeCallPlayback : null"));
@@ -629,11 +643,11 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(open.includes("startCallRinging(epoch)"));
   assert.ok(!open.includes("await startCallRinging(epoch)"));
   assert.ok(open.includes("startStreamedCallGreeting(epoch, conversation)"));
-  assert.ok(open.includes("await prepareCallMicrophoneStream()"));
+  assert.ok(open.includes("await prepareCallMicrophoneStream(epoch)"));
   assert.ok(
     open.indexOf("const ringingReady = startCallRinging(epoch)")
       < open.indexOf("await activityGuard.ready")
-      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream()"),
+      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "ringing starts on the user gesture while microphone and model setup remain guarded",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
@@ -641,17 +655,17 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(!/if\s*\(warm\.status/.test(open), "opportunistic startup status must not decide call admission");
   assert.ok(
     open.indexOf("const warmReady = runtimeWarmPromise.then((warm) => {")
-      < open.indexOf("await prepareCallMicrophoneStream()"),
+      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "resident readiness must be observed concurrently with microphone admission",
   );
   assert.ok(
     open.indexOf("void preparePcmWorklet(24_000);")
-      < open.indexOf("await prepareCallMicrophoneStream()"),
+      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
     "the PCM renderer must warm under the required microphone readiness wait",
   );
   assert.ok(open.includes("await prepareVoicePersonaForCall(conversation, epoch)"));
   assert.ok(bridge.includes("!response?.result?.audio_projector_warmed"), "exact call preparation must require the selected encoder before greeting");
-  assert.ok(open.includes('markVoiceLatency("call_runtime_ready", warm)'));
+  assert.ok(open.includes('markVoiceLatencyIn(startupTrace, "call_runtime_ready", warm)'));
   assert.ok(!bridge.includes("playPreparedCallSpeech"));
   assert.ok(!bridge.includes("activeCallSpeech"));
   assert.ok(!greeting.includes('invoke("mom_llama_speech_precommit_synthesize"'));
@@ -997,6 +1011,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
     { stage: "playback_started", elapsed_ms: 860, observed_at_unix_us: 1_750_000 },
     { stage: "tts_segment_finished", elapsed_ms: 1_000, total_ms: 400,
       output_audio_ms: 800, production_rtf: 0.5,
+      backend_id: "qwen", model_id: "qwen-model", voice_id: "qwen-gabor",
       compute_lease_acquisitions: 1, compute_lease_releases: 1,
       compute_lease_held_us: 410000, compute_lease_released_us: 90000,
       generation_yields: 1, generation_yield_us: 135_250,
@@ -1004,6 +1019,7 @@ test("voice latency summary uses native and absolute clocks across event deliver
       compute_low_water_ms: 180, compute_high_water_ms: 350 },
     { stage: "tts_segment_finished", elapsed_ms: 1_800, total_ms: 800,
       output_audio_ms: 1_000, production_rtf: 0.8,
+      backend_id: "qwen", model_id: "qwen-model", voice_id: "qwen-gabor",
       compute_lease_acquisitions: 1, compute_lease_releases: 1,
       compute_lease_held_us: 320000, compute_lease_released_us: 80000,
       generation_yields: 0, generation_yield_us: 0,
@@ -1070,6 +1086,9 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.tts_worst_segment_rtf, 0.8);
   assert.equal(summary.tts_compute_lease_acquisitions, 2);
   assert.equal(summary.tts_compute_lease_releases, 2);
+  assert.deepEqual(summary.tts_backend_ids, ["qwen"]);
+  assert.deepEqual(summary.tts_model_ids, ["qwen-model"]);
+  assert.deepEqual(summary.tts_voice_ids, ["qwen-gabor"]);
   assert.equal(summary.tts_generation_yields, 1);
   assert.equal(summary.tts_generation_yield_ms, 135.25);
   assert.equal(summary.tts_compute_lease_held_ms, 730);
@@ -1098,6 +1117,58 @@ test("voice latency summary uses native and absolute clocks across event deliver
   assert.equal(summary.playback_underrun_occurrences, 2);
   assert.equal(summary.playback_underrun_total_gap_ms, 21.5);
   assert.equal(summary.playback_underrun_max_gap_ms, 14);
+});
+
+test("TTS summary preserves measured zero, unknown counters, identities, and Qwen totals", () => {
+  const start = bridge.indexOf("  const voiceLatencySummary =");
+  const end = bridge.indexOf("\n  const persistVoiceLatency =", start);
+  const summarize = Function(`${bridge.slice(start, end)}\nreturn voiceLatencySummary;`)();
+  const stage = (metrics) => ({ stage: "tts_segment_finished", ...metrics });
+
+  const zero = summarize({ stages: [stage({ backend_id: "pocket-cpu", model_id: "pocket",
+    voice_id: "dolores", compute_lease_acquisitions: 0, compute_lease_releases: 0,
+    compute_lease_held_us: 0, compute_lease_released_us: 0 })] });
+  assert.equal(zero.tts_compute_lease_acquisitions, 0);
+  assert.equal(zero.tts_compute_lease_releases, 0);
+  assert.equal(zero.tts_compute_lease_held_ms, 0);
+  assert.equal(zero.tts_compute_lease_released_ms, 0);
+  assert.deepEqual(zero.tts_backend_ids, ["pocket-cpu"]);
+  assert.deepEqual(zero.tts_model_ids, ["pocket"]);
+  assert.deepEqual(zero.tts_voice_ids, ["dolores"]);
+
+  const nullCounters = summarize({ stages: [stage({ compute_lease_acquisitions: null,
+    compute_lease_releases: null, compute_lease_held_us: null, compute_lease_released_us: null })] });
+  assert.equal(nullCounters.tts_compute_lease_acquisitions, null);
+  assert.equal(nullCounters.tts_compute_lease_releases, null);
+  assert.equal(nullCounters.tts_compute_lease_held_ms, null);
+  assert.equal(nullCounters.tts_compute_lease_released_ms, null);
+
+  const missingCounters = summarize({ stages: [stage({ compute_lease_acquisitions: 0 })] });
+  assert.equal(missingCounters.tts_compute_lease_acquisitions, 0,
+    "an observed zero remains evidence even when unrelated fields are absent");
+  assert.equal(missingCounters.tts_compute_lease_releases, null);
+  assert.equal(missingCounters.tts_compute_lease_held_ms, null);
+
+  const partialAcrossSegments = summarize({ stages: [
+    stage({ compute_lease_acquisitions: 1 }),
+    stage({}),
+  ] });
+  assert.equal(partialAcrossSegments.tts_compute_lease_acquisitions, null,
+    "a missing segment count keeps the aggregate unknown");
+
+  const qwen = summarize({ stages: [
+    stage({ backend_id: "qwen", model_id: "qwen-model", voice_id: "gabor",
+      compute_lease_acquisitions: 1, compute_lease_releases: 1,
+      compute_lease_held_us: 120_000, compute_lease_released_us: 30_000 }),
+    stage({ backend_id: "qwen", model_id: "qwen-model", voice_id: "gabor",
+      compute_lease_acquisitions: 1, compute_lease_releases: 1,
+      compute_lease_held_us: 80_000, compute_lease_released_us: 20_000 }),
+  ] });
+  assert.equal(qwen.tts_compute_lease_acquisitions, 2);
+  assert.equal(qwen.tts_compute_lease_releases, 2);
+  assert.equal(qwen.tts_compute_lease_held_ms, 200);
+  assert.equal(qwen.tts_compute_lease_released_ms, 50);
+  assert.deepEqual(qwen.tts_backend_ids, ["qwen"]);
 });
 
 test("voice latency recorder coalesces only high-volume deltas and packet events by owner", () => {
@@ -1682,9 +1753,8 @@ test("the startup TTS compile probe primes one bounded exact-persona emission", 
 });
 
 test("live speech has one segmentation authority before Qwen synthesis", () => {
-  assert.ok(qwenHelper.includes("The app scheduler is the sole segmentation authority"));
-  assert.ok(qwenHelper.includes("TextChunker.spokenChunks(request.text, maxWords: .max)"));
-  assert.ok(qwenHelper.includes('let speechChunks = speechText.isEmpty ? [] : [speechText]'));
+  assert.ok(qwenHelper.includes("TextChunker.boundedSpokenChunks(request.text, maxWords: 64)"));
+  assert.ok(qwenHelper.includes("for (segmentIndex, textChunk) in speechChunks.enumerated()"));
   assert.ok(!qwenHelper.includes("let speechChunks = TextChunker.spokenChunks(request.text)"));
 });
 

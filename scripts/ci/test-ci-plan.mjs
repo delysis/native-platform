@@ -18,6 +18,7 @@ const metadataPackages = [
   ["information-native-types", "crates/services/information/crates/information-native-types", []],
   ["information-native-store", "crates/services/information/crates/information-native-store", ["information-native-types"]],
   ["speech-native-types", "crates/services/speech/crates/speech-native-types", []],
+  ["speech-native-backend-pocket", "crates/services/speech/crates/speech-native-backend-pocket", ["speech-native-types"]],
   ["speech-native-host", "crates/services/speech/crates/speech-native-host", ["speech-native-types"]],
   ["speech-native-platform", "crates/services/speech/crates/speech-native-platform", ["speech-native-types"]],
   ["fte-types", "products/fte/crates/fte-types", []],
@@ -25,7 +26,7 @@ const metadataPackages = [
   ["free-token-energy", "products/fte/src-tauri", ["fte-backend-llama"]],
   ["mom-llama-runtime", "products/mom/crates/mom-llama-runtime", ["attachment-native-types", "fte-types", "llama-native-host"]],
   ["mom-llama-cli", "products/mom/crates/mom-llama-cli", ["mom-llama-runtime"]],
-  ["mom-llama-app", "products/mom/apps/mom-llama/src-tauri", ["mom-llama-runtime", "speech-native-host", "speech-native-platform"]],
+  ["mom-llama-app", "products/mom/apps/mom-llama/src-tauri", ["mom-llama-runtime", "speech-native-backend-pocket", "speech-native-host", "speech-native-platform"]],
   ["loom-types", "products/loom/crates/loom-types", []],
   ["loom-backend-llama", "products/loom/crates/loom-backend-llama", ["llama-native-host", "loom-types"]],
   ["loom-app", "products/loom/apps/loom/src-tauri", ["loom-backend-llama"]],
@@ -264,6 +265,22 @@ test("Speech Apple changes select Speech and platform coverage", (t) => {
   assert.equal(result.flags.platform_macos, true);
   assert.ok(!result.jobs.includes("platform-windows"));
   assert.deepEqual(result.macos_matrix, ["release", "speech"]);
+});
+
+test("Pocket speech backend changes select Speech and its Mom app consumer", (t) => {
+  const { result } = fixture(t,
+    "crates/services/speech/crates/speech-native-backend-pocket/src/lib.rs",
+    { present: ["products/mom/Cargo.toml"] },
+  );
+  assert.equal(result.flags.speech, true);
+  assert.equal(result.flags.mom, true);
+  assert.equal(result.flags.platform_macos, true);
+  assert.equal(result.flags.full, false);
+  assert.ok(result.dependency_selection.reverse_dependency_closure.includes("mom-llama-app"));
+  assert.ok(result.jobs.includes("speech-linux"));
+  assert.ok(result.jobs.includes("mom-linux"));
+  assert.ok(result.jobs.includes("mom-windows"));
+  assert.deepEqual(result.macos_matrix, ["release", "mom", "speech"]);
 });
 
 test("contract-family changes select their actual metadata consumers", (t) => {

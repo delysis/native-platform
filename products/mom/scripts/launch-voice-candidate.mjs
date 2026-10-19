@@ -11,7 +11,12 @@ import {
   readPrivateStoreKeyFile,
   resolveCandidateDataDirectory,
   runtimeReadyLogConfirmsPath,
+  startupCacheProgressCompleted,
+  startupProgressDeadline,
 } from './voice-candidate-launch-policy.mjs';
+
+const STARTUP_PROGRESS_TIMEOUT_MS = 180_000;
+const STARTUP_HARD_TIMEOUT_MS = 30 * 60_000;
 
 const [operation, ...args] = process.argv.slice(2);
 const fail = message => { throw new Error(message); };
@@ -106,8 +111,12 @@ async function start(candidatePath, receiptPath) {
     evidence.status = 'failed'; evidence.error = 'Operating system did not return a child PID'; writeJson(receipt, evidence); fail(evidence.error);
   }
 
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
+  const startupStartedAt = Date.now();
+  const hardDeadline = startupStartedAt + STARTUP_HARD_TIMEOUT_MS;
+  let progressDeadline = startupProgressDeadline(startupStartedAt, hardDeadline, STARTUP_PROGRESS_TIMEOUT_MS);
+  let observedCacheProgress = 0;
+  let startupWaitFailure = null;
+  while (Date.now() < progressDeadline) {
     const identity = processIdentity(child.pid, executable);
     if (identity && runtimeReady(logPath, expectedDataDir)) {
       evidence.status = 'ready';
@@ -117,7 +126,15 @@ async function start(candidatePath, receiptPath) {
       console.log(JSON.stringify({ status: evidence.status, pid: evidence.pid, executable, effective_data_directory: expectedDataDir, receipt }, null, 2));
       return;
     }
-    if (!identity) break;
+    if (!identity) {
+      startupWaitFailure = 'Candidate process exited before reporting the expected runtime data directory';
+      break;
+    }
+    const cacheProgress = startupCacheProgressCompleted(readFileSync(logPath, 'utf8'));
+    if (cacheProgress > observedCacheProgress) {
+      observedCacheProgress = cacheProgress;
+      progressDeadline = startupProgressDeadline(Date.now(), hardDeadline, STARTUP_PROGRESS_TIMEOUT_MS);
+    }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 250));
   }
   // Only stop the exact candidate process we launched. A vanished/reused PID
@@ -126,7 +143,10 @@ async function start(candidatePath, receiptPath) {
     try { process.kill(child.pid, 'SIGTERM'); } catch {}
   }
   evidence.status = 'failed';
-  evidence.error = 'Candidate did not remain alive and report the expected runtime data directory within 120 seconds';
+  evidence.error = startupWaitFailure ?? (Date.now() >= hardDeadline
+    ? 'Candidate did not report the expected runtime data directory within the 30-minute startup limit'
+    : `Candidate made no startup readiness or persona-cache progress for ${STARTUP_PROGRESS_TIMEOUT_MS / 1000} seconds`);
+  evidence.startup_cache_contexts_completed = observedCacheProgress;
   writeJson(receipt, evidence);
   fail(`${evidence.error}; preserve ${receipt} and ${logPath}`);
 }

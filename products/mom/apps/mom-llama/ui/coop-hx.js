@@ -134,8 +134,24 @@
     if (output) output.value = JSON.stringify(value);
   };
 
+  const renderStatusContent = (status, label, onDismiss) => {
+    const message = document.createElement("span");
+    message.textContent = String(label);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "command-status-dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", onDismiss, { once: true });
+    status.replaceChildren(message, dismiss);
+  };
+
   const report = (value) => {
     recordCommandResult(value);
+    if (persistentVoiceCallFailure) {
+      renderPersistentVoiceCallFailure();
+      return;
+    }
     const status = document.getElementById("command-status");
     if (status) {
       window.clearTimeout(status.hideTimer);
@@ -148,15 +164,7 @@
         status.replaceChildren();
         return;
       }
-      const message = document.createElement("span");
-      message.textContent = String(label).replaceAll("_", " ");
-      const dismiss = document.createElement("button");
-      dismiss.type = "button";
-      dismiss.className = "command-status-dismiss";
-      dismiss.setAttribute("aria-label", "Dismiss");
-      dismiss.textContent = "×";
-      dismiss.addEventListener("click", () => report(null), { once: true });
-      status.replaceChildren(message, dismiss);
+      renderStatusContent(status, String(label).replaceAll("_", " "), () => report(null));
       const blocked = Boolean(blocker) || value?.status === "blocked";
       status.classList.toggle("blocked", blocked);
       status.classList.remove("is-hidden");
@@ -167,6 +175,33 @@
   const errorMessage = (error) => (
     error && error.message ? error.message : String(error)
   );
+
+  let persistentVoiceCallFailure = null;
+  const renderPersistentVoiceCallFailure = () => {
+    const status = document.getElementById("command-status");
+    if (!status || !persistentVoiceCallFailure) return;
+    window.clearTimeout(status.hideTimer);
+    renderStatusContent(status, persistentVoiceCallFailure.message, () => {
+      persistentVoiceCallFailure = null;
+      report(null);
+    });
+    status.classList.add("blocked");
+    status.classList.remove("is-hidden");
+    delete status.hideTimer;
+  };
+  const setPersistentVoiceCallFailure = (message) => {
+    persistentVoiceCallFailure = { message: String(message) };
+    renderPersistentVoiceCallFailure();
+  };
+  const clearPersistentVoiceCallFailure = () => {
+    if (!persistentVoiceCallFailure) return;
+    persistentVoiceCallFailure = null;
+    report(null);
+  };
+  const safeVoiceFailureCode = (error) => {
+    const value = typeof error?.code === "string" ? error.code : "";
+    return /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,79}$/.test(value) ? value : "startup_error";
+  };
 
   const visiblyReportedErrors = new WeakSet();
   const reportError = (error) => {
@@ -625,6 +660,10 @@
 
   let voiceReplyPlayRequested = false;
   const voiceReplyPlayback = new WeakMap();
+  const failedVoiceReplyOwners = new Map();
+  const MAX_FAILED_VOICE_REPLY_OWNERS = 1;
+  const activeVoiceNotePublications = new Set();
+  const voiceReplyPersistenceKey = (conversation, message) => `${conversation}\u0000${message}`;
   const pendingVoiceReply = () => {
     return createTypingIndicator();
   };
@@ -663,19 +702,16 @@
     row.classList.remove("voice-reply-pending");
   };
 
-  const settleDurableVoiceReply = (button, controller) => {
+  const settleInMemoryVoiceReply = (button, controller, trace = voiceLatencyTrace) => {
     const row = button?.closest?.(".message-row");
     const card = row?.querySelector?.(".message-card");
     const player = button?.closest?.(".voice-message-player");
     const bytes = controller?.wavBytes?.();
-    const traceId = voiceLatencyTrace?.id || null;
-    const markThisTrace = (stage, detail = {}) => {
-      if (traceId && voiceLatencyTrace?.id === traceId) markVoiceLatency(stage, detail);
-    };
+    const markThisTrace = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
     if (!row?.classList.contains("voice-reply-row") || !card || !player
         || !controller?.ready || !isCanonicalPcmWav(bytes)) {
       settleUnavailableVoiceReply(button);
-      markThisTrace("durable_voice_audio_failed", {
+      markThisTrace("in_memory_voice_audio_failed", {
         reason: bytes?.byteLength ? "invalid_wav" : "missing_wav",
         wav_bytes: bytes?.byteLength || 0,
       });
@@ -697,7 +733,7 @@
     button.removeAttribute("aria-pressed");
     player.classList.remove("voice-message-pending", "voice-message-unavailable");
     player.classList.toggle("is-playing", controller.playing);
-    markThisTrace("durable_voice_audio_ready", { wav_bytes: bytes.byteLength });
+    markThisTrace("in_memory_voice_audio_ready", { wav_bytes: bytes.byteLength });
     row.hidden = false;
     row.classList.remove("voice-reply-pending");
     return true;
@@ -1087,6 +1123,28 @@
       onPlayable?.();
     };
 
+    // Keep the shared output clock running once playback has started. WebKit
+    // may retain device-bound PCM across suspend/resume, so suspending at a
+    // turn boundary can cut off a tail and replay it under the next speaker.
+    // Only this renderer's graph and ring are retired; the idle graph is silent.
+    const disconnectWorklet = () => {
+      const shared = workletOwner !== null;
+      if (workletNode) {
+        workletNode.port.postMessage({ type: "reset" });
+        workletNode.port.onmessage = null;
+        workletNode.disconnect();
+        workletNode = null;
+      }
+      echoReference?.disconnect();
+      echoReference = null;
+      echoReferenceSamples = null;
+      if (workletOwner && pcmWorkletEngine.owner === workletOwner) {
+        pcmWorkletEngine.owner = null;
+      }
+      workletOwner = null;
+      return shared;
+    };
+
     const resumeContext = async (candidate) => {
       let timeout = null;
       try {
@@ -1143,8 +1201,11 @@
           },
         });
         rendererMetrics.worklet = true;
+        const ownedNode = workletNode;
+        const ownedEngine = workletOwner;
         workletNode.port.onmessage = ({ data }) => {
-          if (stopped) return;
+          if (stopped || workletNode !== ownedNode
+              || pcmWorkletEngine.owner !== ownedEngine) return;
           const audioContextMs = Number(data?.audioContextFrame || 0) * 1_000 / format.sampleRate;
           if (data?.type === "packet_admitted") {
             const packetIndex = Number(data.packetIndex || 0);
@@ -1202,7 +1263,7 @@
             onBufferLevel?.(bufferedPlaybackSeconds() * 1000);
           } else if (data?.type === "error") {
             onPlaybackError?.(new Error(`speech_stream_worklet_failed: ${data.message || "PCM output failed."}`));
-          } else if (data?.type === "drained" && playing && !stopped) {
+          } else if (data?.type === "drained" && !stopped) {
             rendererMetrics.worklet_final_metrics_received = true;
             rendererMetrics.worklet_pcm_signal_frames = Number.isFinite(data.pcmSignalFrames)
               ? Number(data.pcmSignalFrames) : null;
@@ -1239,13 +1300,7 @@
             rendererMetrics.worklet_first_render_context_frame = Number.isFinite(data.firstRenderContextFrame)
               ? Number(data.firstRenderContextFrame) : rendererMetrics.worklet_first_render_context_frame;
             playing = false;
-            workletNode.disconnect();
-            workletNode = null;
-            if (pcmWorkletEngine.owner === workletOwner) {
-              pcmWorkletEngine.owner = null;
-              void context.suspend().catch(() => {});
-            }
-            workletOwner = null;
+            disconnectWorklet();
             context = null;
             reportRendererMetrics("ended");
             onEnded?.();
@@ -1272,31 +1327,21 @@
           startCancellation.then(() => "cancelled"),
         ]);
         if (resumeResult === "cancelled" || !isStartCurrent()) {
-          // stop() has already torn down this renderer. A resume that settles
-          // afterward can wake its AudioContext again, so put it back to sleep
-          // only while the shared worklet context is still ours (or unowned).
-          void resume.then(async () => {
-            if (startOwner && pcmWorkletEngine.owner && pcmWorkletEngine.owner !== startOwner) return;
-            if (startOwner) await startContext.suspend().catch(() => {});
-            else await startContext.close().catch(() => {});
-          }).catch(() => {});
+          // A retired renderer has no authority to pause the shared clock.
+          // Its graph is disconnected by stop(), including for a late resume.
+          if (!startOwner) {
+            void resume.then(() => startContext.close()).catch(() => {});
+          }
           return false;
         }
       } catch (error) {
         playing = false;
         sources.forEach((source) => { try { source.stop(); } catch (_) {} });
         sources.clear();
-        if (workletNode) {
-          workletNode.port.postMessage({ type: "reset" });
-          workletNode.disconnect();
-          workletNode = null;
-          if (pcmWorkletEngine.owner === workletOwner) pcmWorkletEngine.owner = null;
-          await context.suspend().catch(() => {});
-          workletOwner = null;
-        } else {
-          await context.close().catch(() => {});
-        }
+        const failedContext = context;
+        const shared = disconnectWorklet();
         context = null;
+        if (!shared && failedContext) await failedContext.close().catch(() => {});
         throw error;
       }
       onPlaybackStarted?.({
@@ -1336,11 +1381,25 @@
 
     const play = async () => {
       if (stopped || playing) return false;
+      if (workletNode && context) {
+        playing = true;
+        playWhenReady = true;
+        workletNode.port.postMessage({ type: "resume" });
+        schedulePending();
+        onPlaybackStarted?.({
+          renderer: "audio_worklet_ring",
+          buffered_ms: Math.round(bufferedSeconds() * 100_000) / 100,
+          resume_ms: 0,
+          total_start_ms: 0,
+          resumed: true,
+        });
+        armEnd();
+        return true;
+      }
       if (context?.state === "suspended") {
         playing = true;
         playWhenReady = true;
         const resumedContext = context;
-        const resumedOwner = workletOwner;
         try {
           const resume = resumeContext(resumedContext);
           const resumeResult = await Promise.race([
@@ -1350,10 +1409,7 @@
           if (!resumeResult || stopped || !playing || context !== resumedContext) {
             playing = false;
             void resume.then(async () => {
-              if (resumedOwner && pcmWorkletEngine.owner
-                  && pcmWorkletEngine.owner !== resumedOwner) return;
-              if (resumedOwner) await resumedContext.suspend().catch(() => {});
-              else await resumedContext.close().catch(() => {});
+              await resumedContext.close().catch(() => {});
             }).catch(() => {});
             return false;
           }
@@ -1393,7 +1449,8 @@
       playing = false;
       playWhenReady = false;
       endGeneration += 1;
-      await context.suspend();
+      if (workletNode) workletNode.port.postMessage({ type: "pause" });
+      else await context.suspend();
       onPlaybackPaused?.();
       return true;
     };
@@ -1474,19 +1531,10 @@
       endGeneration += 1;
       sources.forEach((source) => { try { source.stop(); } catch (_) {} });
       sources.clear();
-      if (workletNode) {
-        workletNode.port.postMessage({ type: "reset" });
-        workletNode.disconnect();
-        workletNode = null;
-      }
-      if (workletOwner && pcmWorkletEngine.owner === workletOwner) {
-        pcmWorkletEngine.owner = null;
-        if (context) await context.suspend().catch(() => {});
-      } else if (context) {
-        await context.close().catch(() => {});
-      }
-      workletOwner = null;
+      const stoppedContext = context;
+      const shared = disconnectWorklet();
       context = null;
+      if (!shared && stoppedContext) await stoppedContext.close().catch(() => {});
       rendererPacketOwners.clear();
       reportRendererMetrics("stopped");
     };
@@ -1921,29 +1969,6 @@
     }, { rootMargin: "320px 0px" });
   }
 
-  const prepareVoiceReplyRow = (messageId, root = document) => {
-    if (!messageId) return null;
-    const row = root?.querySelector?.(
-      `.message-row.assistant[data-message-id='${CSS.escape(messageId)}']`,
-    );
-    const button = row?.querySelector?.("[data-action='message-read-aloud']");
-    if (!row || !button) return null;
-    button.dataset.personaVoice = "true";
-    button.dataset.prepareOnly = "true";
-    if (voiceReplyPlayRequested) {
-      button.dataset.autoplayWhenReady = "true";
-      button.classList.add("is-loading");
-    }
-    row.classList.add("voice-reply-pending");
-    row.classList.add("voice-reply-row");
-    button.classList.add("voice-reply-play");
-    const card = row.querySelector(".message-card");
-    card?.replaceChildren(button, waveform());
-    row.querySelector(".message-actions")?.remove();
-    row.hidden = false;
-    return button;
-  };
-
   const hydrateAttachmentPreviews = async (root = document) => {
     const previews = attachmentPreviewsWithin(root);
     previews.forEach((preview) => {
@@ -1971,30 +1996,52 @@
       const next = row.nextElementSibling;
       if (row.classList.contains("call-turn")) next?.classList.add("call-turn");
       if (!row.querySelector(".voice-message-bubble") || !next?.classList.contains("assistant")) return;
-      const button = next.querySelector("[data-action='message-read-aloud']");
-      if (!button) return;
+      const hasSavedVoiceAttachment = Boolean(
+        next.querySelector(".message-attachments [data-attachment-preview]"),
+      );
+      // Saved audio and native unavailable markers are authoritative; only
+      // the exact live result may remain hidden while its owner publishes.
+      if (hasSavedVoiceAttachment) return;
       const preparingLiveReply = voiceReplyConversation === selectedConversation()
         && voiceReplyMessageId
         && next.dataset.messageId === voiceReplyMessageId;
       if (preparingLiveReply) {
-        button.dataset.personaVoice = "true";
-        button.dataset.prepareOnly = "true";
         next.classList.add("voice-reply-pending");
         next.hidden = true;
+        return;
       } else {
+        if (next.classList.contains("voice-message-row")) return;
+        const button = next.querySelector("[data-action='message-read-aloud']");
+        if (!button) return;
         // A preceding user voice attachment proves how the user spoke; it does
         // not prove that the assistant reply has retained audio. Historical
         // text therefore keeps its ordinary read-aloud action. A voice-message
         // play control is published only by the live PCM controller or by an
         // actual assistant audio attachment.
-        delete button.dataset.personaVoice;
-        delete button.dataset.prepareOnly;
         next.classList.remove("voice-reply-pending", "voice-reply-row");
         button.classList.remove("voice-reply-play", "is-loading", "is-awaiting-audio");
         button.removeAttribute("aria-pressed");
         next.hidden = false;
       }
     });
+    const conversation = selectedConversation();
+    for (const row of root?.querySelectorAll?.(".message-row.assistant") || []) {
+      const message = row.dataset.messageId;
+      if (!message) continue;
+      const playback = failedVoiceReplyOwners.get(voiceReplyPersistenceKey(conversation, message));
+      if (!playback || row.querySelector(".message-attachments [data-attachment-preview]")) continue;
+      const card = row.querySelector(".message-card");
+      if (!card) continue;
+      row.classList.add("voice-message-row", "voice-reply-row", "voice-reply-has-audio");
+      row.hidden = false;
+      const player = pendingVoiceReplyPlayer();
+      card.replaceChildren(player);
+      const button = player.querySelector(".voice-reply-play");
+      if (!button || !playback.bindButton(button)) continue;
+      button.dataset.audioPersistence = "failed";
+      button.title = "Audio is available in this session; retry saving";
+      settleInMemoryVoiceReply(button, playback.controller, playback.trace);
+    }
   };
 
   window.addEventListener("beforeunload", () => {
@@ -2073,6 +2120,7 @@
   };
   const refreshSidebar = async () => {
     const replacement = await swap(".sidebar", "mom_llama_render_sidebar_fragment");
+    rebindConversationRename(replacement);
     applySidebarSectionState(replacement);
     const separator = replacement?.querySelector(".sidebar-resizer");
     separator?.setAttribute("aria-valuenow", String(Math.round(replacement.getBoundingClientRect().width)));
@@ -2093,7 +2141,9 @@
 
   const refreshConversationSettingsProjection = async () => {
     const settings = document.getElementById("settings-sidebar");
-    if (settings && settings.dataset.currentConversation !== selectedConversation()) {
+    if (settings && !settings.hidden && settings.dataset.currentConversation !== selectedConversation()) {
+      const previousInstructions = settings.querySelector(".current-chat-settings");
+      if (previousInstructions) previousInstructions.hidden = true;
       const projection = parseFragment(await invokeMarkup("mom_llama_render_settings_fragment"));
       const instructions = projection?.querySelector(".current-chat-settings");
       if (instructions && settings === document.getElementById("settings-sidebar")
@@ -2110,8 +2160,18 @@
   };
 
   let conversationSwitchTimingId = 0;
-  const recordConversationSwitchPaint = (startedAt, paintedAt, timing = performance) => {
-    const id = ++conversationSwitchTimingId;
+  const recordConversationSwitchTiming = (phase, id, startedAt, finishedAt, timing = performance) => {
+    timing.measure(`mom.conversation.switch.${phase}.${id}`, {
+      start: startedAt,
+      end: finishedAt,
+    });
+  };
+  const recordConversationSwitchPaint = (
+    startedAt,
+    paintedAt,
+    timing = performance,
+    id = ++conversationSwitchTimingId,
+  ) => {
     timing.measure(`mom.conversation.switch-to-paint.${id}`, {
       start: startedAt,
       end: paintedAt,
@@ -2281,6 +2341,7 @@
     switchSettingsSection(section);
     sizeComposer();
     modal.querySelector(".section-tab.active")?.focus();
+    void refreshConversationSettingsProjection().catch(reportError);
   };
 
   const closeSettings = () => {
@@ -2462,6 +2523,7 @@
       onFailure: (error) => { greetingFailure = error; },
     });
     liveVoiceTts = tts;
+    activeDispatchOwner = tts;
     try {
       // The instantiated conversation already owns the selected Persona's
       // system prompt and model profile. Sending directly avoids re-routing
@@ -2469,11 +2531,11 @@
       // whose differently shaped stream/result previously stranded pickup.
       markVoiceLatencyIn(greetingTrace, "generation_dispatched", { purpose: "call_greeting" });
       const response = await withProgressDeadline(
-        invoke("mom_llama_chat_send", {
+        tts.trackGeneration(invoke("mom_llama_chat_send", {
           conversation,
           clientRequest: tts.clientRequest,
           message: "[Phone call] [Greeting] You have just picked up a call from Jan. Greet Jan naturally in one short sentence, using wording unlike earlier pickups in this conversation. No headings, lists, or preamble.",
-        }),
+        })),
         30_000,
         () => tts.lastProgressAt,
         "call_reply_timeout: The contact did not finish answering the call.",
@@ -2519,17 +2581,27 @@
       }
       throw error;
     } finally {
-      if (activeDispatchConversation === conversation) activeDispatchConversation = null;
-      if (callReplyConversation === conversation) callReplyConversation = null;
+      // A later call can use the same conversation while this request is
+      // settling after hang-up. Conversation identity alone cannot prove that
+      // these shared dispatch slots still belong to this greeting.
+      if (activeDispatchOwner === tts) {
+        activeDispatchOwner = null;
+        if (activeDispatchConversation === conversation) activeDispatchConversation = null;
+        if (callReplyConversation === conversation) callReplyConversation = null;
+      }
     }
   };
 
-  const prepareCallMicrophoneStream = async () => {
-    if (voiceCallCaptureGraph?.context?.state !== "closed"
+  const prepareCallMicrophoneStream = async (epoch) => {
+    const isCurrentCall = () => voiceCallActive && voiceCallEpoch === epoch;
+    if (!isCurrentCall()) throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+    if (voiceCallMicrophoneEpoch === epoch
+        && voiceCallCaptureGraph?.context?.state !== "closed"
         && voiceCallMicrophoneStream?.active
         && voiceCallMicrophoneStream.getAudioTracks().some((track) => track.readyState === "live")) {
-      return { reused: true };
+      return { metrics: { reused: true }, stream: voiceCallMicrophoneStream };
     }
+    if (voiceCallMicrophoneStream) releaseCallMicrophoneStream(voiceCallMicrophoneStream);
     const startedAt = performance.now();
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -2539,32 +2611,66 @@
         autoGainControl: true,
       },
     });
+    if (!isCurrentCall()) {
+      stream.getTracks().forEach((candidate) => candidate.stop());
+      throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+    }
     const track = stream.getAudioTracks()[0];
     if (!track || track.readyState !== "live") {
       stream.getTracks().forEach((candidate) => candidate.stop());
       throw new Error("The microphone did not become ready for the call.");
     }
     voiceCallMicrophoneStream = stream;
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
-    const processor = context.createScriptProcessor(256, 1, 1);
-    const silence = context.createGain();
-    silence.gain.value = 0;
-    source.connect(processor);
-    processor.connect(silence);
-    silence.connect(context.destination);
-    await context.resume();
-    voiceCallCaptureGraph = { context, source, processor, silence, stream };
+    voiceCallMicrophoneEpoch = epoch;
+    let context = null;
+    let source = null;
+    let processor = null;
+    let silence = null;
+    try {
+      context = new AudioContext();
+      source = context.createMediaStreamSource(stream);
+      processor = context.createScriptProcessor(256, 1, 1);
+      silence = context.createGain();
+      silence.gain.value = 0;
+      // Publish the complete graph before connecting or resuming. Any failure
+      // below can then use the same identity-guarded teardown as hang-up.
+      voiceCallCaptureGraph = { context, source, processor, silence, stream };
+      source.connect(processor);
+      processor.connect(silence);
+      silence.connect(context.destination);
+      await context.resume();
+      if (!isCurrentCall() || voiceCallMicrophoneStream !== stream) {
+        throw Object.assign(new Error("The call was closed during microphone setup."), { code: "call_closed" });
+      }
+    } catch (error) {
+      if (voiceCallCaptureGraph?.stream === stream) {
+        releaseCallMicrophoneStream(stream);
+      } else {
+        source?.disconnect();
+        processor?.disconnect();
+        silence?.disconnect();
+        void context?.close?.().catch(() => {});
+        stream.getTracks().forEach((candidate) => candidate.stop());
+        if (voiceCallMicrophoneStream === stream) {
+          voiceCallMicrophoneStream = null;
+          voiceCallMicrophoneEpoch = null;
+        }
+      }
+      throw error;
+    }
     const settings = track.getSettings?.() || {};
     return {
-      reused: false,
-      permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
-      source_rate_hz: settings.sampleRate || null,
-      echo_cancellation: settings.echoCancellation ?? null,
-      noise_suppression: settings.noiseSuppression ?? null,
-      auto_gain_control: settings.autoGainControl ?? null,
-      graph_rate_hz: context.sampleRate,
-      graph_state: context.state,
+      stream,
+      metrics: {
+        reused: false,
+        permission_ready_ms: Math.round((performance.now() - startedAt) * 100) / 100,
+        source_rate_hz: settings.sampleRate || null,
+        echo_cancellation: settings.echoCancellation ?? null,
+        noise_suppression: settings.noiseSuppression ?? null,
+        auto_gain_control: settings.autoGainControl ?? null,
+        graph_rate_hz: context.sampleRate,
+        graph_state: context.state,
+      },
     };
   };
 
@@ -2573,6 +2679,7 @@
     const graph = voiceCallCaptureGraph;
     voiceCallCaptureGraph = null;
     voiceCallMicrophoneStream = null;
+    voiceCallMicrophoneEpoch = null;
     if (graph) {
       graph.processor.onaudioprocess = null;
       graph.source.disconnect();
@@ -2587,6 +2694,8 @@
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
     if (!modal || !recipient || voiceCallActive || voiceCallPreparing) return;
+    clearPersistentVoiceCallFailure();
+    const startupNavigationRevision = conversationNavigationRevision;
     const recipientId = recipient.dataset.recipientId || "";
     if (!recipientId) {
       reportError(new Error("The selected contact is unavailable for voice preparation."));
@@ -2607,6 +2716,9 @@
     voiceCallConversation = null;
     let releaseHistoryRecovery = null;
     startVoiceLatency("call_greeting", "call_requested");
+    const startupTrace = voiceLatencyTrace;
+    let startupPhase = "activity_guard";
+    let startupMicrophoneStream = null;
     const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
     const sourceAvatar = recipient.querySelector(".contact-avatar");
     const targetAvatar = modal.querySelector("#voice-call-avatar");
@@ -2639,10 +2751,11 @@
       const activityGuardWaitStartedAt = performance.now();
       markVoiceLatency("call_activity_guard_wait_started");
       await activityGuard.ready;
-      markVoiceLatency("call_activity_guard_ready", {
+      markVoiceLatencyIn(startupTrace, "call_activity_guard_ready", {
         wait_ms: Math.max(0, Math.round(performance.now() - activityGuardWaitStartedAt)),
       });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+      startupPhase = "ringing";
       const ringResult = await ringingReady;
       if (ringResult.error) throw ringResult.error;
       if (!ringResult.started || voiceCallEpoch !== epoch || !voiceCallActive) return;
@@ -2650,9 +2763,10 @@
       // ticket is still processing. The stop result is only a request; this
       // wait must observe the matching backend operation leave the registry.
       const recoverySuspendWaitStartedAt = performance.now();
+      startupPhase = "history_recovery";
       markVoiceLatency("call_history_recovery_suspend_wait_started");
       releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
-      markVoiceLatency("call_history_recovery_suspend_wait_finished", {
+      markVoiceLatencyIn(startupTrace, "call_history_recovery_suspend_wait_finished", {
         wait_ms: Math.max(0, Math.round(performance.now() - recoverySuspendWaitStartedAt)),
       });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
@@ -2662,73 +2776,131 @@
       // time to model startup and put Web Audio initialization back on the
       // first-PCM path.
       const warmReady = runtimeWarmPromise.then((warm) => {
-        if (voiceLatencyTrace?.mode === "call_greeting") {
-          markVoiceLatency("call_runtime_ready", warm);
+        if (voiceCallEpoch === epoch && voiceCallActive
+            && voiceLatencyTrace?.mode === "call_greeting") {
+          markVoiceLatencyIn(startupTrace, "call_runtime_ready", warm);
         }
         return warm;
       });
       void preparePcmWorklet(24_000);
+      startupPhase = "microphone";
       // Permission and a live input route are prerequisites for a call. Keep
       // this exact stream for the whole call so WebKit can continuously apply
       // acoustic echo cancellation while contact audio is playing.
-      const microphone = await prepareCallMicrophoneStream();
+      const preparedMicrophone = await prepareCallMicrophoneStream(epoch);
+      startupMicrophoneStream = preparedMicrophone.stream;
       if (voiceCallEpoch !== epoch || !voiceCallActive) {
-        releaseCallMicrophoneStream();
+        releaseCallMicrophoneStream(startupMicrophoneStream);
         return;
       }
-      markVoiceLatency("call_microphone_ready", microphone);
+      markVoiceLatency("call_microphone_ready", preparedMicrophone.metrics);
       // A cold local engine is still preparation, not a ringing contact.
       // Keep measuring the entire request-to-playback interval; do not hide
       // initialization time by redefining the latency clock at readiness.
+      startupPhase = "runtime_warm";
       await warmReady;
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Startup is opportunistic and can be superseded by foreground model
       // selection. The exact conversation preparation below owns call readiness
       // and warms its own audio encoder; a stale startup failure is not final.
       let conversation = selectedConversation();
+      startupPhase = "conversation";
       if (conversation === "default") {
-        const started = await invoke("mom_llama_conversation_draft_call_start");
-        report(started);
-        if (started?.status === "blocked" || !started?.result?.id) {
-          throw new Error(started?.blocker?.message || "The call could not start.");
+        const started = await mutateConversationSelection(() => {
+          if (voiceCallEpoch !== epoch || !voiceCallActive
+              || conversationNavigationRevision !== startupNavigationRevision) return null;
+          const current = selectedConversation();
+          if (current !== "default") return { existingConversation: current };
+          return invoke("mom_llama_conversation_draft_call_start").then(async (result) => {
+            // Draft creation changes native selection. Publish that selection
+            // before releasing the serialized mutation, even if hang-up won
+            // while native work was pending. A queued redial then reuses it.
+            if (conversationNavigationRevision === startupNavigationRevision
+                && result?.status !== "blocked" && result?.result?.id
+                && result.result.source_conversation_id === recipientId) {
+              chat().dataset.currentConversation = result.result.id;
+              chat().dataset.conversationKind = "chat";
+              if (!voiceCallActive && voiceCallEpoch !== epoch) await refreshChat();
+            }
+            return result;
+          });
+        });
+        if (conversationNavigationRevision !== startupNavigationRevision) return;
+        if (started?.existingConversation) {
+          conversation = started.existingConversation;
+        } else {
+          if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+          report(started);
+          if (started?.status === "blocked" || !started?.result?.id) {
+            throw new Error(started?.blocker?.message || "The call could not start.");
+          }
+          if (started.result.source_conversation_id !== recipientId) {
+            throw new Error("The selected contact changed before the call began.");
+          }
+          conversation = started.result.id;
         }
-        if (started.result.source_conversation_id !== recipientId) {
-          throw new Error("The selected contact changed before the call began.");
-        }
-        conversation = started.result.id;
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
       } else if (selectedConversationKind() === "persona_template") {
-        const instantiated = await instantiatePersona(conversation);
-        if (instantiated?.status === "blocked" || !instantiated?.result?.id) {
-          throw new Error(instantiated?.blocker?.message || "The call could not start.");
+        const instantiated = await mutateConversationSelection(() => {
+          if (voiceCallEpoch !== epoch || !voiceCallActive
+              || conversationNavigationRevision !== startupNavigationRevision) return null;
+          const current = selectedConversation();
+          if (current !== conversation || selectedConversationKind() !== "persona_template") {
+            return { existingConversation: current };
+          }
+          return invoke("mom_llama_persona_instantiate", { persona: conversation, title: null }).then(async (result) => {
+            if (conversationNavigationRevision === startupNavigationRevision
+                && result?.status !== "blocked" && result?.result?.id) {
+              chat().dataset.currentConversation = result.result.id;
+              chat().dataset.conversationKind = "chat";
+              if (!voiceCallActive && voiceCallEpoch !== epoch) await refreshChat();
+            }
+            return result;
+          });
+        });
+        if (conversationNavigationRevision !== startupNavigationRevision) return;
+        if (instantiated?.existingConversation) {
+          conversation = instantiated.existingConversation;
+        } else {
+          if (voiceCallEpoch !== epoch || !voiceCallActive) return;
+          report(instantiated);
+          if (instantiated?.status === "blocked" || !instantiated?.result?.id) {
+            throw new Error(instantiated?.blocker?.message || "The call could not start.");
+          }
+          conversation = instantiated.result.id;
         }
-        conversation = instantiated.result.id;
-        chat().dataset.currentConversation = conversation;
-        chat().dataset.conversationKind = "chat";
       }
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       voiceCallConversation = conversation;
       markVoiceLatency("call_conversation_ready", { conversation });
       // Use the actual frozen call profile. It may differ from its source contact.
+      startupPhase = "persona_prepare";
       const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
       if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // The first model reply uses the same token -> TTS -> PCM buffer as every
       // later call turn. Its first PCM frame stops ringing; playback startup
       // opens continuous listening, while model attachment waits until Qwen
       // has finished producing PCM.
+      startupPhase = "greeting_generation";
       await startStreamedCallGreeting(epoch, conversation);
     } catch (error) {
       if (epoch && voiceCallEpoch === epoch) {
+        markVoiceLatency("call_start_failed", {
+          phase: startupPhase,
+          error_code: safeVoiceFailureCode(error),
+        });
+        setPersistentVoiceCallFailure(errorMessage(error));
         const closing = closeVoiceCallSurface();
         reportError(error);
         await closing;
       } else {
-        releaseCallMicrophoneStream();
+        releaseCallMicrophoneStream(startupMicrophoneStream);
+        // Rejections caused by a completed hang-up are expected cancellation.
+        // Returning here keeps the delegated click handler from displaying a
+        // second, misleading error after the call has already closed.
+        return;
       }
-      throw error;
     } finally {
-      voiceCallPreparing = false;
+      if (voiceCallEpoch === epoch) voiceCallPreparing = false;
       releaseHistoryRecovery?.();
     }
   };
@@ -2747,9 +2919,14 @@
     );
     voiceCallActive = false;
     voiceCallEpoch = null;
+    voiceCallPreparing = false;
     voiceCallConversation = null;
     retryCallPrefillAfterTranscript = null;
     voiceReplyConversation = null;
+    if (cancelGeneration && activeDispatchConversation === conversation) {
+      activeDispatchConversation = null;
+      activeDispatchOwner = null;
+    }
     callReplyConversation = null;
     if (callTts && liveVoiceTts === callTts) liveVoiceTts = null;
     activeCallPlayback = null;
@@ -3049,15 +3226,139 @@
   const slugHandle = (value) => String(value || "")
     .trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 
-  const openConversationRename = (target) => {
-    const modal = document.getElementById("conversation-rename-modal");
-    if (!modal) return;
-    modal.dataset.conversation = target.dataset.conversation;
-    const field = formField(modal, "conversation_title");
-    field.value = target.dataset.conversationTitle || target.querySelector?.("span")?.textContent || "";
-    setModalVisibility("conversation-rename-modal", true);
-    field.focus();
-    field.select();
+  let activeConversationRename = null;
+  const finishConversationRename = (state, { restoreFocus = false } = {}) => {
+    if (state.done) return;
+    state.done = true;
+    if (activeConversationRename === state) activeConversationRename = null;
+    state.input.remove();
+    state.title.style.visibility = "";
+    state.input.style.cssText = "";
+    state.row.classList.remove("is-renaming");
+    if (restoreFocus && state.navigationRevision === conversationNavigationRevision) state.button.focus();
+  };
+
+  const positionConversationRenameEditor = (state) => {
+    if (state.done || !state.row.isConnected || !state.title.isConnected) return;
+    const rowRect = state.row.getBoundingClientRect();
+    const titleRect = state.title.getBoundingClientRect();
+    state.input.style.left = `${titleRect.left - rowRect.left}px`;
+    state.input.style.top = `${titleRect.top - rowRect.top}px`;
+    state.input.style.width = `${titleRect.width}px`;
+    state.input.style.height = `${titleRect.height}px`;
+  };
+
+  const rebindConversationRename = (root) => {
+    const state = activeConversationRename;
+    if (!state || state.done || !root) return;
+    const rows = [...(root.querySelectorAll?.("[data-conversation-menu-target='true']") || [])];
+    const row = rows.find((candidate) => candidate.dataset.conversation === state.conversation);
+    const button = row?.querySelector?.('[data-action="conversation-select"]');
+    const title = button?.querySelector?.(".conversation-title");
+    if (!row || !button || !title) return;
+    state.input.remove();
+    state.row = row;
+    state.button = button;
+    state.title = title;
+    title.style.visibility = "hidden";
+    row.classList.add("is-renaming");
+    row.append(state.input);
+    positionConversationRenameEditor(state);
+  };
+  window.addEventListener("resize", () => {
+    if (activeConversationRename) positionConversationRenameEditor(activeConversationRename);
+  });
+
+  const beginConversationRename = (target) => {
+    const row = target.closest?.("[data-conversation-menu-target='true']") || target;
+    const button = row.querySelector?.('[data-action="conversation-select"]');
+    const title = button?.querySelector?.(".conversation-title");
+    if (!row || !button || !title) return;
+    if (activeConversationRename?.row === row) {
+      activeConversationRename.input.focus();
+      activeConversationRename.input.select();
+      return;
+    }
+    if (activeConversationRename) {
+      activeConversationRename.input.blur();
+      if (activeConversationRename && !activeConversationRename.done) {
+        activeConversationRename.input.focus();
+        return;
+      }
+    }
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "conversation-rename-editor";
+    input.setAttribute("aria-label", "Conversation name");
+    input.dataset.affordance = row.dataset.renameAffordance || "conversation.rename";
+    input.dataset.command = row.dataset.renameCommand || "mom_llama.conversation_rename";
+    input.dataset.tauriCommand = row.dataset.renameTauriCommand || "mom_llama_conversation_rename";
+    input.dataset.cli = row.dataset.renameCli || "mom-llama conversation rename --conversation <id> --title <title> --json";
+    input.dataset.effect = row.dataset.renameEffect || "mom_llama.effects.conversation_store.v1";
+    input.value = row.dataset.conversationTitle || title.textContent || "";
+    const state = {
+      row, button, title, input, original: input.value,
+      conversation: row.dataset.conversation,
+      navigationRevision: conversationNavigationRevision,
+      saving: false,
+      done: false,
+    };
+    activeConversationRename = state;
+    title.style.visibility = "hidden";
+    row.classList.add("is-renaming");
+    row.append(input);
+    positionConversationRenameEditor(state);
+
+    const cancel = () => finishConversationRename(state, { restoreFocus: true });
+    const commit = async (restoreFocus = false) => {
+      if (state.done || state.saving) return;
+      const nextTitle = input.value.trim();
+      if (!nextTitle) {
+        if (restoreFocus) {
+          input.setCustomValidity("Enter a conversation name.");
+          input.reportValidity();
+        } else cancel();
+        return;
+      }
+      if (nextTitle === state.original.trim()) {
+        finishConversationRename(state, { restoreFocus });
+        return;
+      }
+      state.saving = true;
+      input.readOnly = true;
+      try {
+        const result = await invoke("mom_llama_conversation_rename", {
+          conversation: row.dataset.conversation,
+          title: nextTitle,
+        });
+        report(result);
+        if (result?.status !== "passed") {
+          state.saving = false;
+          input.readOnly = false;
+          return;
+        }
+        state.row.dataset.conversationTitle = nextTitle;
+        state.title.textContent = nextTitle;
+        finishConversationRename(state, { restoreFocus });
+      } catch (error) {
+        state.saving = false;
+        input.readOnly = false;
+        reportError(error);
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void commit(true);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        if (!state.saving) cancel();
+      }
+    });
+    input.addEventListener("blur", () => { void commit(false); });
+    input.addEventListener("input", () => input.setCustomValidity(""));
+    input.focus();
+    input.select();
   };
 
   let conversationNavigationRevision = 0;
@@ -3071,17 +3372,50 @@
   const selectConversation = async (conversation) => {
     const revision = ++conversationNavigationRevision;
     const startedAt = performance.now();
-    void retainComposerDraft().catch(reportError);
-    const result = await mutateConversationSelection(
-      () => invoke("mom_llama_conversation_select", { conversation }),
-    );
+    const timingId = ++conversationSwitchTimingId;
+    const retainedDraft = retainComposerDraft();
+    const selectionQueuedAt = performance.now();
+    let selectionQueueMs = 0;
+    let selectionCommandMs = 0;
+    let chatRenderMs = 0;
+    const result = await mutateConversationSelection(async () => {
+      const commandStartedAt = performance.now();
+      selectionQueueMs = commandStartedAt - selectionQueuedAt;
+      recordConversationSwitchTiming("select-queue", timingId, selectionQueuedAt, commandStartedAt);
+      try {
+        await retainedDraft;
+        return await invoke("mom_llama_conversation_select", { conversation });
+      } finally {
+        const commandFinishedAt = performance.now();
+        selectionCommandMs = commandFinishedAt - commandStartedAt;
+        recordConversationSwitchTiming("select-command", timingId, commandStartedAt, commandFinishedAt);
+      }
+    });
     if (revision !== conversationNavigationRevision) return result;
     report(result);
-    const replacement = await refreshChat();
+    const renderStartedAt = performance.now();
+    let replacement;
+    try {
+      replacement = await refreshChat();
+    } finally {
+      const renderFinishedAt = performance.now();
+      chatRenderMs = renderFinishedAt - renderStartedAt;
+      recordConversationSwitchTiming("chat-render", timingId, renderStartedAt, renderFinishedAt);
+    }
     if (revision === conversationNavigationRevision
       && replacement?.dataset.currentConversation === conversation) {
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        recordConversationSwitchPaint(startedAt, performance.now());
+        const paintedAt = performance.now();
+        recordConversationSwitchPaint(startedAt, paintedAt, performance, timingId);
+        void invoke("mom_llama_navigation_timing_record", {
+          timing: {
+            switchId: timingId,
+            selectionQueueMs,
+            selectionCommandMs,
+            chatRenderMs,
+            switchToPaintMs: paintedAt - startedAt,
+          },
+        }).catch(() => {});
         void recoverPendingVoiceHistory().catch(() => {});
       }));
     }
@@ -3657,6 +3991,15 @@
   const isInternalVoicePrompt = (message) =>
     message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
 
+  const updateComposerDraft = (input) => {
+    const payload = {
+      conversation: input.conversation,
+      message: input.message,
+      attachmentIds: [...(input.attachmentIds || [])],
+    };
+    return mutateConversationSelection(() => invoke("mom_llama_draft_update", payload));
+  };
+
   const persistDraftNow = async (
     message,
     attachmentIds = draftAttachmentIds(),
@@ -3664,7 +4007,7 @@
   ) => {
     window.clearTimeout(draftTimer);
     draftTimer = null;
-    return invoke("mom_llama_draft_update", {
+    return updateComposerDraft({
       conversation,
       message,
       attachmentIds: [...attachmentIds],
@@ -3677,7 +4020,7 @@
     const attachmentIds = draftAttachmentIds();
     draftTimer = window.setTimeout(() => {
       draftTimer = null;
-      invoke("mom_llama_draft_update", {
+      updateComposerDraft({
         conversation,
         message,
         attachmentIds,
@@ -4034,6 +4377,7 @@
   };
 
   let activeDispatchConversation = null;
+  let activeDispatchOwner = null;
   let voiceRecording = null;
   let voiceReplyConversation = null;
   let voiceReplyMessageId = null;
@@ -4048,6 +4392,7 @@
   let retryCallPrefillAfterTranscript = null;
   let voiceCallMicrophoneStream = null;
   let voiceCallCaptureGraph = null;
+  let voiceCallMicrophoneEpoch = null;
   let pendingVoiceAudioSession = null;
   let pendingVoiceFallbackAttachment = null;
   let pendingVoiceDispatchPrompt = null;
@@ -4070,6 +4415,7 @@
   const voiceLatencyHistory = [];
   let voiceLatencyFlushTimer = null;
   const activeDispatchStreamLeases = new Set();
+  const activeDispatchStreamLeaseOwners = new Map();
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
@@ -4246,6 +4592,17 @@
     const ttsMetricValues = (name) => ttsSegments
       .map((stage) => Number(stage[name]))
       .filter(Number.isFinite);
+    const measuredTtsSum = (name, divisor = 1) => {
+      if (ttsSegments.length === 0 || !ttsSegments.every((stage) =>
+        typeof stage[name] === "number" && Number.isFinite(stage[name]))) return null;
+      return Math.round(ttsSegments.reduce((total, stage) => total + stage[name], 0) / divisor * 100) / 100;
+    };
+    const ttsIdentitySet = (name) => {
+      const values = [...new Set(ttsSegments
+        .map((stage) => stage[name])
+        .filter((value) => typeof value === "string" && value.length > 0))];
+      return values.length ? values : null;
+    };
     const ttsComplete = latestSinceAttempt("tts_all_segments_finished");
     const semanticBackpressure = latestSinceAttempt("semantic_backpressure_finished")
       || ttsComplete?.semantic_backpressure || null;
@@ -4756,6 +5113,9 @@
         ? Number(tts.time_to_first_audio_ms)
         : null,
       tts_segment_count: ttsSegments.length,
+      tts_backend_ids: ttsIdentitySet("backend_id"),
+      tts_model_ids: ttsIdentitySet("model_id"),
+      tts_voice_ids: ttsIdentitySet("voice_id"),
       tts_total_synthesis_ms: Number.isFinite(Number(ttsComplete?.synthesis_ms))
         ? Number(ttsComplete.synthesis_ms)
         : null,
@@ -4825,14 +5185,8 @@
         const candidate = Number(segment.production_rtf);
         return Number.isFinite(candidate) ? Math.max(worst, candidate) : worst;
       }, 0) || null,
-      tts_compute_lease_acquisitions: ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_acquisitions))
-          ? Number(segment.compute_lease_acquisitions) : 0)
-      ), 0) || null,
-      tts_compute_lease_releases: ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_releases))
-          ? Number(segment.compute_lease_releases) : 0)
-      ), 0) || null,
+      tts_compute_lease_acquisitions: measuredTtsSum("compute_lease_acquisitions"),
+      tts_compute_lease_releases: measuredTtsSum("compute_lease_releases"),
       tts_generation_yields: ttsSegments.reduce((total, segment) => (
         total + (Number.isFinite(Number(segment.generation_yields))
           ? Number(segment.generation_yields) : 0)
@@ -4845,14 +5199,8 @@
         total + (Number.isFinite(Number(segment.generation_fair_passes))
           ? Number(segment.generation_fair_passes) : 0)
       ), 0) || null,
-      tts_compute_lease_held_ms: Math.round(ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_held_us))
-          ? Number(segment.compute_lease_held_us) : 0)
-      ), 0) / 10) / 100 || null,
-      tts_compute_lease_released_ms: Math.round(ttsSegments.reduce((total, segment) => (
-        total + (Number.isFinite(Number(segment.compute_lease_released_us))
-          ? Number(segment.compute_lease_released_us) : 0)
-      ), 0) / 10) / 100 || null,
+      tts_compute_lease_held_ms: measuredTtsSum("compute_lease_held_us", 1_000),
+      tts_compute_lease_released_ms: measuredTtsSum("compute_lease_released_us", 1_000),
       tts_compute_minimum_lead_ms: ttsMetricValues("compute_minimum_lead_ms").length
         ? Math.min(...ttsMetricValues("compute_minimum_lead_ms")) : null,
       tts_compute_maximum_lead_ms: ttsMetricValues("compute_maximum_lead_ms").length
@@ -5033,7 +5381,7 @@
     "playback_packet_admitted",
   ]);
   const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
-    "call_requested", "call_ringing_started", "call_activity_guard_wait_started",
+    "call_requested", "call_start_failed", "call_ringing_started", "call_activity_guard_wait_started",
     "call_activity_guard_ready", "call_history_recovery_suspend_wait_started",
     "call_history_recovery_suspend_wait_finished", "call_conversation_ready",
     "audio_prefill_begin_requested", "audio_prefill_session_ready",
@@ -5049,7 +5397,7 @@
     "first_content_delta_received", "tts_first_chunk_ready", "tts_native_dispatched",
     "tts_first_pcm", "tts_segment_finished", "tts_all_segments_finished",
     "tts_segment_dispatched", "tts_segment_first_pcm", "tts_segment_pcm_complete",
-    "tts_segment_receipt_received",
+    "tts_segment_receipt_received", "tts_backend_complete", "tts_pcm_complete",
     "next_turn_prefill_started", "next_turn_prefill_ready", "next_turn_prefill_failed",
     "barge_in_detected", "barge_in_playback_stopped", "barge_in_playback_stop_failed",
     "playable", "playback_started", "playback_render_started",
@@ -5495,6 +5843,15 @@
     onPlaybackStarted = null,
     onFailure = null,
   }) => {
+    const voiceNotePublicationReservation = mode === "voice_note" ? {} : null;
+    if (voiceNotePublicationReservation) {
+      activeVoiceNotePublications.add(voiceNotePublicationReservation);
+    }
+    const releaseVoiceNotePublicationReservation = () => {
+      if (voiceNotePublicationReservation && !durableVoiceStorePromise) {
+        activeVoiceNotePublications.delete(voiceNotePublicationReservation);
+      }
+    };
     if (requestId) rememberVoiceStreamRequest(requestId);
     let pendingText = "";
     let streamedText = "";
@@ -5507,11 +5864,13 @@
     let activeSynthesis = null;
     let cancelPcmDelivery = null;
     let nextCallPrefill = null;
+    let generationSettlement = Promise.resolve();
     let callTranscriptResidentCheck = null;
     let nextCallPrefillRetryPending = false;
     let retryHook = null;
     let nextCallPrefillHandedOff = false;
     let callCaptureStarted = false;
+    let playbackAuthorized = !deferPlayback;
     let settleNextCallPrefillGate = null;
     const nextCallPrefillGate = mode === "call" ? new Promise((resolve) => {
       settleNextCallPrefillGate = resolve;
@@ -5544,14 +5903,134 @@
     let firstPcmSeen = false;
     let voiceNoteComplete = false;
     let durablePending = false;
+    let voiceAudioReadySettled = false;
+    let resolveVoiceAudioReady;
+    const voiceAudioReady = new Promise((resolve) => { resolveVoiceAudioReady = resolve; });
+    const settleVoiceAudioReady = (ready) => {
+      if (voiceAudioReadySettled) return;
+      voiceAudioReadySettled = true;
+      resolveVoiceAudioReady(ready);
+    };
+    let durableVoiceTarget = null;
+    let durableVoiceStorePromise = null;
+    let durableVoiceAttachmentId = null;
+    let durableVoiceStoreError = null;
     let resolveFinished;
     const finished = new Promise((resolve) => { resolveFinished = resolve; });
     const ttsLatencyTrace = voiceLatencyTrace;
     const markTtsLatency = (stage, detail = {}) => {
       markVoiceLatencyIn(ttsLatencyTrace, stage, detail);
     };
+    const bindDurableVoiceReply = (target) => {
+      if (mode !== "voice_note") return Promise.resolve(null);
+      const exactTarget = {
+        conversation: typeof target?.conversation === "string" ? target.conversation : "",
+        message: typeof target?.message === "string" ? target.message : "",
+        text: typeof target?.text === "string" ? target.text : "",
+      };
+      if (!exactTarget.conversation || !exactTarget.message || !exactTarget.text.trim()) {
+        return Promise.reject(new Error("voice_reply_attachment_target_missing"));
+      }
+      if (durableVoiceTarget && (durableVoiceTarget.conversation !== exactTarget.conversation
+        || durableVoiceTarget.message !== exactTarget.message
+        || durableVoiceTarget.text !== exactTarget.text)) {
+        return Promise.reject(new Error("voice_reply_attachment_target_conflict"));
+      }
+      durableVoiceTarget ||= exactTarget;
+      if (durableVoiceAttachmentId) return Promise.resolve(durableVoiceAttachmentId);
+      if (durableVoiceStorePromise) return durableVoiceStorePromise;
+      if (voiceNotePublicationReservation) {
+        activeVoiceNotePublications.add(voiceNotePublicationReservation);
+      }
+      let storeAttempted = false;
+      durableVoiceStorePromise = (async () => {
+        if (!await voiceAudioReady) {
+          throw new Error("voice_reply_audio_incomplete: The reply audio did not finish.");
+        }
+        const bytes = controller.wavBytes();
+        if (!isCanonicalPcmWav(bytes)) {
+          throw new Error("voice_reply_audio_invalid: The completed reply audio is unavailable.");
+        }
+        storeAttempted = true;
+        const response = await invoke("mom_llama_voice_reply_store", {
+          conversation: exactTarget.conversation,
+          message: exactTarget.message,
+          text: exactTarget.text,
+          bytes: Array.from(bytes),
+        });
+        const attachmentId = response?.result?.attachment?.id;
+        if (response?.status !== "contracted" || !attachmentId) {
+          const blocker = response?.blocker;
+          throw new Error(blocker
+            ? `${blocker.code}: ${blocker.message}`
+            : "voice_reply_attachment_uncommitted: The reply audio was not saved.");
+        }
+        durableVoiceAttachmentId = attachmentId;
+        durableVoiceStoreError = null;
+        if (voiceNotePublicationReservation) {
+          activeVoiceNotePublications.delete(voiceNotePublicationReservation);
+        }
+        failedVoiceReplyOwners.delete(voiceReplyPersistenceKey(
+          exactTarget.conversation, exactTarget.message,
+        ));
+        if (button) {
+          button.dataset.committedAttachment = attachmentId;
+          delete button.dataset.audioPersistence;
+          button.title = "Play voice message";
+        }
+        markTtsLatency("durable_voice_audio_ready", {
+          attachment_id: attachmentId,
+          wav_bytes: bytes.byteLength,
+        });
+        refreshVoiceReplyProjectionIfNeeded(exactTarget);
+        return attachmentId;
+      })().catch((error) => {
+        durableVoiceStorePromise = null;
+        durableVoiceStoreError = storeAttempted ? error : null;
+        const key = voiceReplyPersistenceKey(exactTarget.conversation, exactTarget.message);
+        if (storeAttempted) {
+          failedVoiceReplyOwners.set(key, playback);
+          if (button) {
+            button.dataset.audioPersistence = "failed";
+            button.title = "Audio is available in this session; retry saving";
+          }
+          markTtsLatency("durable_voice_audio_failed", { message: errorMessage(error) });
+          reportError(error);
+          refreshVoiceReplyProjectionIfNeeded(exactTarget);
+        } else {
+          markTtsLatency("durable_voice_audio_not_stored", { message: errorMessage(error) });
+        }
+        releaseVoiceNotePublicationReservation();
+        return null;
+      });
+      return durableVoiceStorePromise;
+    };
+    const refreshVoiceReplyProjectionIfNeeded = (target) => {
+      if (selectedConversation() !== target.conversation || button?.isConnected) return;
+      let attempts = 0;
+      const refreshWhenIdle = () => {
+        if (selectedConversation() !== target.conversation) return;
+        if (activeDispatchConversation === target.conversation && attempts++ < 40) {
+          window.setTimeout(refreshWhenIdle, 50);
+          return;
+        }
+        if (activeDispatchConversation === target.conversation) return;
+        void retainComposerDraft().then(() => {
+          if (selectedConversation() === target.conversation
+              && activeDispatchConversation !== target.conversation) {
+            return refreshChat();
+          }
+          return null;
+        }).catch(reportError);
+      };
+      window.setTimeout(refreshWhenIdle, 0);
+    };
+    const synthesisPurpose = mode === "call" ? "call" : "voice_note";
+    const calibrationCache = voiceLeadCalibration || (voiceLeadCalibration =
+      new globalThis.MomVoicePipelineScheduler.VoiceLeadCalibrationCache());
     const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController(
-      voiceLeadCalibration || { initialBufferComplete: true, initialProbePending: true },
+      calibrationCache.get(synthesisPurpose)
+        || { initialBufferComplete: true, initialProbePending: true },
     );
     const semanticLeadController = new globalThis.MomVoicePipelineScheduler.SemanticLeadController();
     const mountVoiceReplyPlayer = () => {
@@ -5654,12 +6133,25 @@
       if (nextCallPrefill || mode !== "call" || !voiceCallActive || voiceCallEpoch !== callEpoch) {
         return nextCallPrefill;
       }
-      markTtsLatency("next_turn_prefill_started", {
-        overlap: trigger,
-        buffered_runway_ms: controller.bufferedMs(),
-      });
-      const startedAt = performance.now();
-      nextCallPrefill = startVoicePrefill(conversation, true, ttsLatencyTrace).then(async (live) => {
+      const requestedAt = performance.now();
+      let startedAt = requestedAt;
+      // Barge-in can stop speech before the confirmed reply is saved. Keep
+      // capture running, but do not snapshot the next prompt until that exact
+      // native operation has settled. Otherwise the new turn becomes a sibling
+      // of the interrupted reply and subsequent turns follow the wrong branch.
+      nextCallPrefill = generationSettlement.then(() => {
+        if ((stopped && !nextCallPrefillHandedOff)
+            || !voiceCallActive || voiceCallEpoch !== callEpoch) return null;
+        startedAt = performance.now();
+        markTtsLatency("next_turn_history_settled", {
+          wait_ms: Math.round((startedAt - requestedAt) * 100) / 100,
+        });
+        markTtsLatency("next_turn_prefill_started", {
+          overlap: trigger,
+          buffered_runway_ms: controller.bufferedMs(),
+        });
+        return startVoicePrefill(conversation, true, ttsLatencyTrace);
+      }).then(async (live) => {
         if (trigger === "transcript_committed") nextCallPrefillRetryPending = false;
         if ((stopped && !nextCallPrefillHandedOff)
             || !voiceCallActive || voiceCallEpoch !== callEpoch) {
@@ -5730,8 +6222,15 @@
       return nextCallPrefill;
     };
     const startCallCapture = () => {
-      if (callCaptureStarted || mode !== "call" || !voiceCallActive
+      if (!playbackAuthorized || callCaptureStarted || mode !== "call" || !voiceCallActive
           || voiceCallEpoch !== callEpoch) return;
+      if (voiceRecording) {
+        markTtsLatency("call_capture_start_skipped", {
+          reason: "capture_owned",
+          capture_trace_id: voiceRecording.trace?.id || null,
+        });
+        return;
+      }
       callCaptureStarted = true;
       nextCallPrefillHandedOff = true;
       const deferPrefill = pendingCallTranscriptJobs.length > 0 || Boolean(activeCallTranscriptJob);
@@ -5821,7 +6320,7 @@
       onPlaybackError: (error) => fail(error),
       onUnderrun: (gapMs) => {
         leadController.noteUnderrun(gapMs);
-        voiceLeadCalibration = leadController.calibration();
+        calibrationCache.set(synthesisPurpose, leadController.calibration());
         markTtsLatency("playback_underrun", {
           gap_ms: Math.round(gapMs),
           scheduler: leadController.snapshot(),
@@ -5843,7 +6342,7 @@
         }
         if (mode === "voice_note" && durablePending && button) {
           durablePending = false;
-          settleDurableVoiceReply(button, controller);
+          settleInMemoryVoiceReply(button, controller, ttsLatencyTrace);
         }
         if (mode === "call" && voiceCallActive && voiceCallEpoch === callEpoch) {
           // Playback may end before the start callback on an exceptionally
@@ -5892,6 +6391,10 @@
             if (recording?.prefillDeferred && live?.session) await recording.resumeDeferredPrefill(live);
             return;
           }
+          // Text EOF can now precede the native history commit. Compressing
+          // older turns must wait too, or that commit could overwrite the
+          // transcript slot's updated conversation snapshot.
+          await generationSettlement;
           if (!voiceCallActive || voiceCallEpoch !== callEpoch || recording?.sending
               || recording?.speculation || recording?.voiceActivity?.heardVoice) return;
           const playbackSafe = bufferedPlaybackFinished || leadController.shouldPrepareNextCall({
@@ -5971,7 +6474,7 @@
       const operation = activeOperation;
       const synthesis = activeSynthesis;
       activeOperation = null;
-      const continueCall = !onFailure && mode === "call"
+      const continueCall = playbackAuthorized && !onFailure && mode === "call"
         && voiceCallActive && voiceCallEpoch === callEpoch;
       if (!continueCall) abortUnclaimedCallPrefill();
       const releaseProducer = Promise.allSettled([
@@ -5985,6 +6488,8 @@
           ".message-row.voice-reply-row.voice-reply-pending",
         )?.remove();
       }
+      if (mode === "voice_note") settleVoiceAudioReady(false);
+      releaseVoiceNotePublicationReservation();
       if (onFailure) {
         onFailure(error);
       } else if (continueCall) {
@@ -5994,10 +6499,11 @@
         void releaseProducer.then(() => {
           if (!voiceCallActive || voiceCallEpoch !== callEpoch) return;
           startCallCapture();
-          startNextCallPrefill();
+          if (callCaptureStarted) startNextCallPrefill();
         });
       }
       markTtsLatency("failed", { component: "tts", message: errorMessage(error) });
+      if (mode === "voice_note") settleVoiceAudioReady(false);
       if (!onFailure) reportError(error);
       resolveFinished(false);
     };
@@ -6051,10 +6557,11 @@
           controller.finish();
           if (mode === "voice_note") {
             voiceNoteComplete = true;
+            settleVoiceAudioReady(true);
             const voiceButton = mountVoiceReplyPlayer();
             if (voiceButton) {
               if (controller.playing) durablePending = true;
-              else settleDurableVoiceReply(voiceButton, controller);
+              else settleInMemoryVoiceReply(voiceButton, controller, ttsLatencyTrace);
             }
           }
           resolveFinished(true);
@@ -6130,6 +6637,11 @@
       let segmentPreviousPacketAt = null;
       let segmentMaxPacketGapMs = 0;
       let segmentMinimumProducerLeadMs = null;
+      // Bounded cadence evidence, published once at segment completion. Each
+      // pair is milliseconds since first PCM and cumulative source frames;
+      // no microphone samples or conversation text enter this diagnostic.
+      const segmentPacketTimeline = [];
+      let segmentRequiredStartupDelayMs = 0;
       if (firstRequest) {
         firstRequest = false;
         markTtsLatency("tts_first_chunk_ready", {
@@ -6169,6 +6681,14 @@
             ttsFirstPacketAudioMs ??= Math.round(packetAudioMs * 100) / 100;
             segmentFirstPacketAt ??= packetAt;
             ttsFirstPacketAt ??= packetAt;
+            if (segmentPacketTimeline.length < 256) {
+              segmentPacketTimeline.push([
+                Math.round((packetAt - segmentFirstPacketAt) * 100) / 100,
+                segmentFrames,
+              ]);
+            }
+            segmentRequiredStartupDelayMs = Math.max(segmentRequiredStartupDelayMs,
+              packetAt - segmentFirstPacketAt - (segmentPcmAudioMs - packetAudioMs));
             const packetGapMs = segmentPreviousPacketAt === null
               ? null : packetAt - segmentPreviousPacketAt;
             const aggregatePacketGapMs = ttsPreviousPacketAt === null
@@ -6198,7 +6718,7 @@
               boundary: segmentBoundary,
               startupDeficitMs,
             });
-            voiceLeadCalibration = leadController.calibration();
+            calibrationCache.set(synthesisPurpose, leadController.calibration());
             const segmentLead = segmentPcmAudioMs - (packetAt - segmentFirstPacketAt);
             const aggregateLead = ttsPcmAudioMs - (packetAt - ttsFirstPacketAt);
             segmentMinimumProducerLeadMs = segmentMinimumProducerLeadMs === null
@@ -6229,6 +6749,7 @@
         conversation,
         operation,
         text: next.chunk,
+        purpose: synthesisPurpose,
         pcmStream: stream,
       });
       activeSynthesis = synthesis;
@@ -6257,7 +6778,7 @@
           firstAudioMs: Number(binding.tts_time_to_first_audio_ms),
           words: wordCount,
         });
-        voiceLeadCalibration = leadController.calibration();
+        calibrationCache.set(synthesisPurpose, leadController.calibration());
         // Completion of the cold probe can release playback without waiting
         // for another PCM packet (or the entire reply) to wake the player.
         if (mode === "call") void controller.reconsiderStartup();
@@ -6265,6 +6786,9 @@
           segment,
           operation_id: operation,
           request_id: requestId,
+          backend_id: binding.backend_id ?? null,
+          model_id: binding.model_id ?? null,
+          voice_id: binding.voice_id ?? null,
           transport_drain_ms: Math.round(performance.now() - receiptAt),
           characters: next.chunk.length,
           words: wordCount,
@@ -6289,6 +6813,10 @@
           reference_source_hash_us: binding.tts_reference_source_hash_us ?? null,
           reference_compute_us: binding.tts_reference_compute_us ?? null,
           reference_persist_us: binding.tts_reference_persist_us ?? null,
+          generation_segments: binding.tts_generation_segments ?? null,
+          packet_timeline: segmentPacketTimeline,
+          packet_timeline_truncated: segmentPcmPackets > segmentPacketTimeline.length,
+          required_startup_delay_ms: Math.round(segmentRequiredStartupDelayMs * 100) / 100,
           helper_first_pcm_us: binding.tts_helper_first_pcm_us ?? null,
           voice_lookup_us: binding.tts_voice_lookup_us ?? null,
           descriptor_snapshot_us: binding.tts_descriptor_snapshot_us ?? null,
@@ -6353,6 +6881,13 @@
         void reconcileSemanticBackpressure();
         return true;
       },
+      trackGeneration(operation) {
+        // Observe the native operation itself, never a renderer timeout or
+        // cancellation request: only settlement establishes that its history
+        // commit can no longer race preparation of the next turn.
+        generationSettlement = operation.then(() => {}, () => {});
+        return operation;
+      },
       get button() { return button; },
       get audible() { return controller.playing; },
       get interruptedForSpeech() { return interruptedForSpeech; },
@@ -6364,10 +6899,19 @@
         if (!voiceNoteComplete) return button;
         const voiceButton = mountVoiceReplyPlayer();
         if (voiceButton && !controller.playing) {
-          settleDurableVoiceReply(voiceButton, controller);
+          settleInMemoryVoiceReply(voiceButton, controller, ttsLatencyTrace);
         }
         return voiceButton;
       },
+      bindDurableVoiceReply(target) { return bindDurableVoiceReply(target); },
+      retryDurableVoiceReply() {
+        if (!durableVoiceTarget || !durableVoiceStoreError) {
+          return Promise.resolve(durableVoiceAttachmentId);
+        }
+        return bindDurableVoiceReply(durableVoiceTarget);
+      },
+      get durableVoiceAttachmentId() { return durableVoiceAttachmentId; },
+      get durableVoiceStoreError() { return durableVoiceStoreError; },
       bindButton(nextButton) {
         if (!nextButton || stopped) return false;
         if (button && button !== nextButton) voiceReplyPlayback.delete(button);
@@ -6412,6 +6956,7 @@
         return finished;
       },
       async play() {
+        playbackAuthorized = true;
         markTtsLatency("playback_requested", { pcm_ready: controller.ready });
         button?.classList.add("is-loading");
         let started = false;
@@ -6442,6 +6987,8 @@
       async cancel() {
         if (stopped) return;
         stopped = true;
+        if (mode === "voice_note") settleVoiceAudioReady(false);
+        releaseVoiceNotePublicationReservation();
         cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
@@ -6472,6 +7019,8 @@
       async stop() {
         if (stopped) return;
         stopped = true;
+        if (mode === "voice_note") settleVoiceAudioReady(false);
+        releaseVoiceNotePublicationReservation();
         cancelPcmDelivery?.();
         if (activeCallPlayback === playback) activeCallPlayback = null;
         updateSemanticBackpressure({ terminal: true });
@@ -6962,9 +7511,16 @@
     return task;
   };
 
-  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish) => {
+  const finishVoiceReplyAndIndexTurn = async (callTurn, index, finish, persist = null) => {
     if (callTurn) index();
+    const persistence = persist
+      ? Promise.resolve().then(persist).catch((error) => {
+        reportError(error);
+        return null;
+      })
+      : null;
     const synthesized = await finish();
+    if (persistence) await persistence;
     if (synthesized && !callTurn) index();
     return synthesized;
   };
@@ -7802,6 +8358,10 @@
   };
 
   const beginVoiceCapture = async (options = {}) => {
+    if (!options.call && (failedVoiceReplyOwners.size >= MAX_FAILED_VOICE_REPLY_OWNERS
+        || activeVoiceNotePublications.size >= MAX_FAILED_VOICE_REPLY_OWNERS)) {
+      throw new Error("voice_reply_save_retry_required: Save the previous voice reply before recording another.");
+    }
     // This runs from the user's microphone/call gesture. Compile and suspend
     // the audio-thread renderer while capture and model prefill are already
     // in flight, so first PCM never waits for AudioWorklet setup.
@@ -7954,9 +8514,12 @@
     if (recording.speculation === speculation) recording.speculation = null;
     if (activeVoiceSpeculation === speculation) activeVoiceSpeculation = null;
     if (liveVoiceTts === speculation.tts) liveVoiceTts = null;
-    if (activeDispatchConversation === speculation.conversation) activeDispatchConversation = null;
-    if (callReplyConversation === speculation.conversation) callReplyConversation = null;
-    if (voiceReplyConversation === speculation.conversation) voiceReplyConversation = null;
+    if (activeDispatchOwner === speculation.tts) {
+      activeDispatchOwner = null;
+      if (activeDispatchConversation === speculation.conversation) activeDispatchConversation = null;
+      if (callReplyConversation === speculation.conversation) callReplyConversation = null;
+      if (voiceReplyConversation === speculation.conversation) voiceReplyConversation = null;
+    }
     if (replacement && !recording.native && voiceRecording === recording) {
       try {
         resumeBrowserVoicePrefill(recording, replacement);
@@ -8298,6 +8861,7 @@
     if (recording.call) callReplyConversation = live.conversation;
     else voiceReplyConversation = live.conversation;
     activeDispatchConversation = live.conversation;
+    activeDispatchOwner = tts;
     markVoiceLatencyIn(recording.trace, prearm ? "speculation_prearmed" : "speculation_started", {
       speculation: speculation.id,
       producer: recording.native ? "native_ring" : "renderer_ipc",
@@ -8331,13 +8895,13 @@
       const generationTimeoutMs = 30_000;
       const rendererFailsafeMs = generationTimeoutMs + 2_000;
       const waitForNativeSilence = Boolean(prearm && recording.native);
-      const generation = invoke("mom_llama_voice_audio_speculate", {
+      const generation = tts.trackGeneration(invoke("mom_llama_voice_audio_speculate", {
         session: live.session,
         speculation: speculation.id,
         capture: recording.native ? recording.capture : null,
         waitForSilence: waitForNativeSilence,
         generationTimeoutMs,
-      });
+      }));
       // A prearmed request may wait while the caller speaks for any length of
       // time. Start its deadline only when native VAD releases the silence
       // gate. The unguarded branch still propagates an admission error that
@@ -8373,9 +8937,14 @@
       const synthesized = await finishVoiceReplyAndIndexTurn(recording.call,
         () => indexVoiceTurn(live.conversation, response.result, null,
           speculation.captureReady, recording.trace),
-        () => tts.finish(response.result.assistant_text || tts.text));
+        () => tts.finish(response.result.assistant_text || tts.text),
+        recording.call ? null : () => tts.bindDurableVoiceReply({
+          conversation: live.conversation,
+          message: response.result.assistant_message_id,
+          text: response.result.assistant_text || tts.text,
+        }));
       if (!synthesized) {
-        throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
+        throw new Error("voice_reply_incomplete: The completed reply did not produce complete audio.");
       }
       if (!recording.call) {
         void Promise.all([refreshSidebar(), refreshConversationSettingsProjection()]).catch(reportError);
@@ -8411,10 +8980,11 @@
       // All speculative attempts for one call share a conversation. Do not
       // let a superseded attempt clear the routing markers published by its
       // replacement after a resumed-speech handoff.
-      const stillOwnsDispatch = recording.speculation === speculation || liveVoiceTts === tts;
+      const stillOwnsDispatch = activeDispatchOwner === tts;
       if (stillOwnsDispatch && activeDispatchConversation === live.conversation) {
         activeDispatchConversation = null;
       }
+      if (stillOwnsDispatch) activeDispatchOwner = null;
       if (stillOwnsDispatch && callReplyConversation === live.conversation) {
         callReplyConversation = null;
       }
@@ -8553,7 +9123,10 @@
   const acquireStableChatBusy = (lease) => {
     if (!lease) return null;
     chatBusyLeases.add(lease);
-    if (activeDispatchConversation !== null) activeDispatchStreamLeases.add(lease);
+    if (activeDispatchConversation !== null) {
+      activeDispatchStreamLeases.add(lease);
+      activeDispatchStreamLeaseOwners.set(lease, activeDispatchOwner);
+    }
     renderChatBusyState();
     return lease;
   };
@@ -8561,6 +9134,8 @@
   const releaseChatBusy = (lease) => {
     if (!lease) return;
     chatBusyLeases.delete(lease);
+    activeDispatchStreamLeases.delete(lease);
+    activeDispatchStreamLeaseOwners.delete(lease);
     renderChatBusyState();
   };
 
@@ -8649,6 +9224,16 @@
     }
     if (payload.event === "delta" && (voiceReply || callReply)) {
       liveVoiceTts?.push(payload.delta || "");
+    }
+    if (payload.event === "text_completed" && (voiceReply || callReply)) {
+      // Native text EOF precedes recording confirmation and history commit.
+      // Flush the last sentence now so its first PCM can confirm the recording;
+      // the tracked native operation still gates preparation of the next turn.
+      liveVoiceTts.lastProgressAt = performance.now();
+      markVoiceLatencyIn(eventTrace, "text_completed", {
+        observed_at_unix_us: payload.emitted_at_unix_us,
+      });
+      void liveVoiceTts.finish(payload.delta || liveVoiceTts.text);
     }
     if (payload.event === "reasoning_delta" && !voiceReply && !callReply) {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
@@ -9015,15 +9600,24 @@
 
   const retainComposerDraft = async () => {
     const form = document.getElementById("chat-form");
-    if (form && form.dataset.busy !== "true") await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+    if (form && form.dataset.busy !== "true") {
+      const result = await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+      if (result?.status === "blocked") {
+        report(result);
+        throw new Error(result.blocker?.message || "Could not preserve the current draft.");
+      }
+      return result;
+    }
+    return null;
   };
 
   const openNewDraft = async (persona = null) => {
     const revision = ++conversationNavigationRevision;
-    void retainComposerDraft().catch(reportError);
-    const result = await mutateConversationSelection(
-      () => invoke("mom_llama_conversation_draft_open", { persona }),
-    );
+    const retainedDraft = retainComposerDraft();
+    const result = await mutateConversationSelection(async () => {
+      await retainedDraft;
+      return invoke("mom_llama_conversation_draft_open", { persona });
+    });
     if (revision !== conversationNavigationRevision) return result;
     report(result);
     if (result?.status !== "blocked") {
@@ -9192,8 +9786,9 @@
     },
     "settings-open": async () => {
       await invoke("mom_llama_settings_get");
-      if (document.getElementById("settings-sidebar")?.hidden) openSettings();
-      else closeSettings();
+      if (document.getElementById("settings-sidebar")?.hidden) {
+        openSettings();
+      } else closeSettings();
     },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
     "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
@@ -9273,6 +9868,9 @@
         settleUnavailableVoiceReply(button);
         return;
       }
+      if (playback.durableVoiceStoreError) {
+        void playback.retryDurableVoiceReply();
+      }
       voiceReplyPlayRequested = true;
       if (playback.controller.playing) {
         await playback.pause();
@@ -9283,12 +9881,13 @@
     },
     "voice-call-open": async () => openVoiceCallSurface(),
     "voice-call-close": async () => closeVoiceCallSurface(),
-    "conversation-select": async (button) => {
+    "conversation-select": async (button, event) => {
       if (button.dataset.conversation === selectedConversation()) {
-        openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+        if (event?.target?.closest?.(".conversation-title")) {
+          beginConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+        }
       } else await selectConversation(button.dataset.conversation);
     },
-    "conversation-rename-close": async () => setModalVisibility("conversation-rename-modal", false),
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: activeDispatchConversation || selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
       const result = await invoke("mom_llama_chat_skip_reasoning", { conversation: selectedConversation() });
@@ -9308,7 +9907,6 @@
       report(result);
     },
     "message-read-aloud": async (button) => {
-      const personaVoice = button.dataset.personaVoice === "true";
       if (activeSpeechPlayback?.button === button) {
         if (activeSpeechPlayback.controller?.ready
             && !activeSpeechPlayback.controller.playing
@@ -9343,54 +9941,51 @@
       const message = button.dataset.message;
       const operation = speechOperationToken();
       button.dataset.operation = operation;
-      const prepareOnly = button.dataset.prepareOnly === "true";
       const panel = document.createElement("section");
       panel.className = "speech-playback";
       let retainedPlayback = null;
       let controller = null;
       let endedBeforeCommit = false;
+      // Explicit reading shares the call renderer and measured packet runway,
+      // but keeps its own calibration: reading a long document must not change
+      // the next live call's startup policy.
+      const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController();
+      const trace = { id: crypto.randomUUID(), mode: "read_aloud", began_at: Date.now(),
+        started: performance.now(), stages: [] };
+      const markReadLatency = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
+      let firstPacketAt = null;
+      let previousPacketAt = null;
+      let audioMs = 0;
+      let packetCount = 0;
       try {
-        if (personaVoice) markVoiceLatency("tts_started");
+        markReadLatency("tts_started");
         controller = createPcmPlaybackBuffer({
-          autoplay: !prepareOnly,
+          autoplay: true,
+          startupBufferMs: () => leadController.startupRunwayMs(),
+          startupDelayMs: () => leadController.startupDelayMs(),
+          onUnderrun: (gapMs) => {
+            leadController.noteUnderrun(gapMs);
+            markReadLatency("playback_underrun", { gap_ms: gapMs, scheduler: leadController.snapshot() });
+          },
           onFirstChunk: () => {
             if (activeSpeechPlayback?.controller !== controller || !button.isConnected) return;
-            if (personaVoice) markVoiceLatency("tts_first_pcm");
+            markReadLatency("tts_first_pcm");
             const row = button.closest(".message-row");
             const card = row?.querySelector(".message-card");
-            // Preparing a reply to a voice note changes that exact reply into
-            // a voice-note row. Explicit Read Aloud is only transport for the
-            // existing text row: it must never destroy or replace its text.
-            if (prepareOnly && personaVoice && row && card) {
-              row.classList.add("voice-reply-row");
-              button.classList.add("voice-reply-play");
-              card.replaceChildren(button, waveform(), panel);
-              row.querySelector(".message-actions")?.remove();
-              row.hidden = false;
-              row.classList.remove("voice-reply-pending");
-              markVoiceLatency("playable");
-            } else {
-              card?.append(panel);
-            }
-            if (prepareOnly) {
-              restoreReadAloudButton(button);
-              button.dataset.operation = operation;
-            } else {
-              commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
-              button.title = "Stop reading";
-              button.setAttribute("aria-pressed", "true");
-              button.querySelector(".sr-only")?.replaceChildren("Stop reading");
-            }
-            delete button.dataset.prepareOnly;
+            card?.append(panel);
+            commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
+            button.title = "Stop reading";
+            button.setAttribute("aria-pressed", "true");
+            button.querySelector(".sr-only")?.replaceChildren("Stop reading");
           },
-          onPlaybackStarted: () => {
-            if (personaVoice) markVoiceLatency("playback_started");
+          onPlaybackStarted: (metrics) => {
+            markReadLatency("playback_started", metrics);
           },
           onRendererEvent: (event) => {
-            if (personaVoice) markVoiceLatency(`playback_${event.type}`, event);
+            markReadLatency(`playback_${event.type}`, event);
           },
           onRendererMetrics: (metrics) => {
-            if (personaVoice) markVoiceLatency("playback_renderer", metrics);
+            markReadLatency("playback_renderer", metrics);
           },
           onEnded: () => {
             if (activeSpeechPlayback?.controller !== controller) return;
@@ -9404,14 +9999,32 @@
           },
         });
         const stream = pcmChannel((frame) => {
-          try { controller.push(frame); } catch (error) { reportError(error); }
+          if (activeSpeechPlayback?.controller !== controller || epoch !== speechPlaybackEpoch) return;
+          try {
+            const decoded = decodePcmFrame(frame);
+            if (decoded.data.byteLength > 0) {
+              const now = performance.now();
+              const packetMs = decoded.data.byteLength * 1000 / (2 * decoded.channels * decoded.sampleRate);
+              firstPacketAt ??= now;
+              audioMs += packetMs;
+              packetCount += 1;
+              leadController.notePacket({ audioMs: packetMs,
+                gapMs: previousPacketAt === null ? null : now - previousPacketAt,
+                startupDeficitMs: Math.max(0, now - firstPacketAt - (audioMs - packetMs)) });
+              previousPacketAt = now;
+            }
+            controller.push(frame);
+            if (decoded.end) markReadLatency("tts_pcm_complete", {
+              pcm_packets: packetCount, output_audio_ms: audioMs, scheduler: leadController.snapshot(),
+            });
+          } catch (error) { reportError(error); }
         });
         activeSpeechPlayback = { id: null, operation, controller, panel, button };
         const response = await invoke("mom_llama_speech_read_aloud", {
           conversation,
           message,
           operation,
-          requirePersonaVoice: personaVoice,
+          requirePersonaVoice: false,
           pcmStream: stream,
         });
         // A cancelled request may still finish natively and return a retained
@@ -9419,12 +10032,16 @@
         // do not publish the cancellation response or mutate the row.
         retainedPlayback = response?.result?.playback_id || null;
         if (activeSpeechPlayback?.controller !== controller || epoch !== speechPlaybackEpoch) return;
-        if (personaVoice && response?.result?.binding) {
-          markVoiceLatency("tts_backend_complete", {
+        if (response?.result?.binding) {
+          markReadLatency("tts_backend_complete", {
+            backend_id: response.result.binding.backend_id ?? null,
+            model_id: response.result.binding.model_id ?? null,
+            voice_id: response.result.binding.voice_id ?? null,
             backend_ms: response.result.binding.tts_time_to_first_audio_ms,
+            generation_segments: response.result.binding.tts_generation_segments ?? null,
           });
         }
-        if (personaVoice) markVoiceLatency("tts_finished");
+        markReadLatency("tts_finished");
         report(response);
         if (response?.status === "blocked" || !response?.result) return;
         const result = response.result;
@@ -9456,11 +10073,6 @@
           && (button.dataset.operation === operation
             || (retainedPlayback && button.dataset.playback === retainedPlayback))) {
           restoreReadAloudButton(button);
-        }
-        const voiceRow = personaVoice ? button.closest(".message-row") : null;
-        if (voiceRow?.classList.contains("voice-reply-pending")) {
-          if (activeSpeechPlayback?.button === button) await stopSpeechPlayback();
-          settleUnavailableVoiceReply(button);
         }
       }
     },
@@ -9651,7 +10263,6 @@
       await refreshChat();
     },
     "message-edit-cancel": async () => {
-      report(await invoke("mom_llama_conversation_select", { conversation: selectedConversation() }));
       await refreshChat();
     },
     "message-delete": async (button) => {
@@ -9709,7 +10320,7 @@
         conversation = instantiated.result.id;
         chat().dataset.currentConversation = conversation;
         chat().dataset.conversationKind = "chat";
-        await invoke("mom_llama_draft_update", {
+        await updateComposerDraft({
           conversation: sourceConversation,
           message: "",
           attachmentIds: [],
@@ -10059,7 +10670,7 @@
     const handler = actionHandlers[button.dataset.action];
     if (!handler) return;
     event.preventDefault();
-    try { await handler(button); } catch (error) { reportError(error); }
+    try { await handler(button, event); } catch (error) { reportError(error); }
   });
 
   const popupRowMenu = async (target, point = null) => {
@@ -10079,7 +10690,7 @@
     } else {
       const conversation = target.dataset.conversation;
       items = [
-        { id: "rename", text: "Rename…", action: safeAction(() => openConversationRename(target)) },
+        { id: "rename", text: "Rename…", action: safeAction(() => beginConversationRename(target)) },
         { id: "delete", text: "Delete", action: safeAction(async () => {
           await retainComposerDraft();
           report(await invoke("mom_llama_conversation_delete", { conversation }));
@@ -10110,10 +10721,6 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && event.target.closest("#conversation-rename-modal")) {
-      event.preventDefault();
-      setModalVisibility("conversation-rename-modal", false);
-    }
     if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
       event.preventDefault();
       setSearchMode(false);
@@ -10193,8 +10800,12 @@
         // this, rapid Enter presses can race persona instantiation or draft
         // persistence and dispatch the same turn more than once.
         const dispatchLease = acquireChatBusy("chat-dispatch");
+        const dispatchOwner = {};
         const sourceConversation = selectedConversation();
         let conversation = sourceConversation;
+        let dispatchVoiceOwner = null;
+        activeDispatchConversation = sourceConversation;
+        activeDispatchOwner = dispatchOwner;
         const textarea = formField(form, "message");
         let releaseHistoryRecovery = null;
         try {
@@ -10230,12 +10841,14 @@
             chat().dataset.currentConversation = conversation;
             chat().dataset.conversationKind = "chat";
           }
-          activeDispatchConversation = conversation;
+          if (activeDispatchOwner === dispatchOwner) {
+            activeDispatchConversation = conversation;
+          }
           if (!voiceDispatch) {
             await persistDraftNow(message, attachmentIds, conversation);
           }
           if (conversation !== sourceConversation && sourceConversation !== "default") {
-            await invoke("mom_llama_draft_update", {
+            await updateComposerDraft({
               conversation: sourceConversation,
               message: "",
               attachmentIds: [],
@@ -10257,6 +10870,7 @@
             && pendingVoiceTtsOwner?.conversation === conversation
             ? pendingVoiceTtsOwner
             : (voiceDispatch && liveVoiceTts?.conversation === conversation ? liveVoiceTts : null);
+          dispatchVoiceOwner = voiceTtsOwner;
           if (voiceDispatch && pendingVoiceTtsOwner === voiceTtsOwner) pendingVoiceTtsOwner = null;
           let result;
           let voiceTranscriptAttachment = null;
@@ -10280,7 +10894,7 @@
             if (fallbackVoice) pendingVoiceFallbackAttachment = null;
             voiceTranscriptAttachment = fallbackVoice?.attachment || null;
             if (liveVoice) {
-              const finished = await invoke("mom_llama_voice_audio_finish", {
+              const operation = invoke("mom_llama_voice_audio_finish", {
                 session: liveVoice.session,
                 recording: liveVoice.recording,
                 ...(liveVoice.modelInput ? {
@@ -10292,6 +10906,8 @@
                     : { sourceStartSample: liveVoice.modelInput.sourceStartSample }),
                 } : {}),
               });
+              const finished = await (voiceTtsOwner
+                ? voiceTtsOwner.trackGeneration(operation) : operation);
               result = finished?.result ? {
                 ...finished,
                 result: { kind: "direct", conversation_id: conversation, output: finished.result },
@@ -10304,10 +10920,12 @@
               if (fallbackVoice) {
                 await persistDraftNow(message, [fallbackVoice.attachment], conversation);
               }
-              result = await invoke("mom_llama_chat_dispatch", {
+              const operation = invoke("mom_llama_chat_dispatch", {
                 conversation, message,
                 ...(voiceTtsOwner?.clientRequest ? { clientRequest: voiceTtsOwner.clientRequest } : {}),
               });
+              result = await (voiceTtsOwner
+                ? voiceTtsOwner.trackGeneration(operation) : operation);
             }
             if (voiceDispatch) {
               const output = result?.result?.output;
@@ -10323,7 +10941,7 @@
             // write through the renderer's possibly changed selection.
             if (!voiceDispatch && selectedConversation() === conversation && textarea && !textarea.value) textarea.value = message;
             if (voiceDispatch) {
-              await invoke("mom_llama_draft_update", {
+              await updateComposerDraft({
                 conversation,
                 message: "",
                 attachmentIds: [],
@@ -10344,7 +10962,7 @@
             textarea.value = message;
           }
           if (voiceDispatch) {
-            await invoke("mom_llama_draft_update", {
+            await updateComposerDraft({
               conversation,
               message: "",
               attachmentIds: [],
@@ -10380,9 +10998,14 @@
                   }
                 },
                 () => voiceTtsOwner.finish(output.assistant_text),
+                callReplyConversation === conversation ? null : () => voiceTtsOwner.bindDurableVoiceReply({
+                  conversation,
+                  message: output.assistant_message_id,
+                  text: output.assistant_text,
+                }),
               );
               if (!synthesized) {
-                throw new Error("voice_reply_incomplete: The completed reply did not produce durable audio.");
+                throw new Error("voice_reply_incomplete: The completed reply did not produce complete audio.");
               }
             } else {
               await voiceTtsOwner?.stop().catch(() => {});
@@ -10403,41 +11026,36 @@
             // destroyed the stream controller before its first audio frame.
             await Promise.all([refreshSidebar(), refreshConversationSettingsProjection()]);
           }
-          if (callReplyConversation === conversation) {
-            callReplyConversation = null;
-          }
-          if (voiceReplyConversation === conversation && result?.status !== "blocked") {
-            voiceReplyConversation = null;
-            const row = document.getElementById("live-voice-reply-pending");
-            if (row && voiceReplyMessageId) {
-              row.id = `message-${voiceReplyMessageId}`;
-              row.dataset.messageId = voiceReplyMessageId;
+          if (activeDispatchOwner === dispatchOwner) {
+            if (callReplyConversation === conversation) {
+              callReplyConversation = null;
             }
-            voiceReplyMessageId = null;
+            if (voiceReplyConversation === conversation && result?.status !== "blocked") {
+              voiceReplyConversation = null;
+              const row = document.getElementById("live-voice-reply-pending");
+              if (row && voiceReplyMessageId) {
+                row.id = `message-${voiceReplyMessageId}`;
+                row.dataset.messageId = voiceReplyMessageId;
+              }
+              voiceReplyMessageId = null;
+            }
           }
         } finally {
           // A rejected native batch can return without a terminal stream event
           // or an invocation result. Its started events must not strand Stop.
-          activeDispatchStreamLeases.forEach(releaseChatBusy);
-          activeDispatchStreamLeases.clear();
-          activeDispatchConversation = null;
-          if (voiceReplyConversation === conversation) voiceReplyConversation = null;
-          voiceReplyMessageId = null;
-          if (callReplyConversation === conversation) callReplyConversation = null;
-          if (pendingVoiceTtsOwner?.conversation === conversation) pendingVoiceTtsOwner = null;
+          [...activeDispatchStreamLeaseOwners]
+            .filter(([, owner]) => owner === dispatchOwner)
+            .forEach(([lease]) => releaseChatBusy(lease));
+          if (activeDispatchOwner === dispatchOwner) {
+            activeDispatchOwner = null;
+            if (activeDispatchConversation === conversation) activeDispatchConversation = null;
+            if (voiceReplyConversation === conversation) voiceReplyConversation = null;
+            voiceReplyMessageId = null;
+            if (callReplyConversation === conversation) callReplyConversation = null;
+            if (dispatchVoiceOwner && pendingVoiceTtsOwner === dispatchVoiceOwner) pendingVoiceTtsOwner = null;
+          }
           releaseChatBusy(dispatchLease);
           releaseHistoryRecovery?.();
-        }
-      }
-      if (form.id === "conversation-rename-form") {
-        const modal = document.getElementById("conversation-rename-modal");
-        const title = formValue(form, "conversation_title").trim();
-        if (!title) return;
-        const result = await invoke("mom_llama_conversation_rename", { conversation: modal.dataset.conversation, title });
-        report(result);
-        if (result?.status !== "blocked") {
-          setModalVisibility("conversation-rename-modal", false);
-          await refreshConversationProjection();
         }
       }
       if (form.id === "settings-form") {
@@ -10963,7 +11581,6 @@
     const card = document.getElementById("startup-card");
     const greeting = document.getElementById("startup-greeting");
     const setupProgress = document.getElementById("startup-progress");
-    const persona = document.getElementById("startup-persona");
     const friends = document.getElementById("startup-friends");
     const friendPortraits = [
       ["bessel_van_der_kolk", "Bessel van der Kolk"],
@@ -11020,6 +11637,7 @@
         projector: "listening model",
         mtp: "response accelerator",
         "qwen-weights": "voice model",
+        "pocket-weights": "call voice",
         "qwen-codec-weights": "speech decoder",
       })[artifact] || "voice support";
       const stopSetupState = await events?.listen?.("mom_llama_setup_state", ({ payload }) => {
@@ -11040,14 +11658,22 @@
       const stopVoiceProgress = await events?.listen?.("mom_llama_voice_initialization_progress", ({ payload }) => {
         if (!firstRunSetup || !payload) return;
         if (status) status.textContent = `Checking ${payload.voice}`;
-        if (persona) {
-          persona.hidden = false;
-          persona.textContent = payload.persona;
-        }
         for (const portrait of friends?.children || []) {
           portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
         }
         if (setupProgress) setupProgress.value = Math.floor((Number(payload.completed || 0) / Number(payload.total || 1)) * 100);
+      });
+      const stopCachePreparationProgress = await events?.listen?.("mom_llama_cache_preparation_progress", ({ payload }) => {
+        if (!firstRunSetup || !payload) return;
+        if (status) status.textContent = `Preparing ${payload.persona}`;
+        for (const portrait of friends?.children || []) {
+          portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
+        }
+        if (setupProgress) {
+          const total = Math.max(1, Number(payload.total) || 1);
+          const completed = Math.max(0, Math.min(total, Number(payload.completed) || 0));
+          setupProgress.value = Math.floor((completed / total) * 100);
+        }
       });
       try {
         await invoke("mom_llama_runtime_initialize");
@@ -11058,7 +11684,7 @@
           || isInternalVoicePrompt(formField(bootComposer, "message")?.value || "");
         if (interruptedVoiceDispatch) {
           document.getElementById("chat-form")?.setAttribute("hidden", "");
-          const cleared = await invoke("mom_llama_draft_update", {
+          const cleared = await updateComposerDraft({
             conversation: selectedConversation(),
             message: "",
             attachmentIds: [],
@@ -11128,6 +11754,7 @@
       } finally {
         if (typeof stopModelProgress === "function") stopModelProgress();
         if (typeof stopVoiceProgress === "function") stopVoiceProgress();
+        if (typeof stopCachePreparationProgress === "function") stopCachePreparationProgress();
         if (typeof stopSetupState === "function") stopSetupState();
       }
     };

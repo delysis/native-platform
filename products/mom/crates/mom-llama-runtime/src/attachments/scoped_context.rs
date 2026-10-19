@@ -116,7 +116,24 @@ pub(crate) fn prepare_scoped_chat_attachments(
         current_policy_fingerprint: &current_policy_fingerprint,
     };
     for message in active_messages {
-        if message.attachment_ids.is_empty() {
+        let context_ids = if message.role == crate::conversation_store::MessageRole::Assistant {
+            message
+                .attachment_ids
+                .iter()
+                .filter(|id| {
+                    records.get(id.as_str()).is_none_or(|record| {
+                        !(is_generated_voice_reply(record)
+                            && message.conversation_id == conversation_id
+                            && record.conversation_id == conversation_id
+                            && record.message_id == message.id)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            message.attachment_ids.clone()
+        };
+        if context_ids.is_empty() {
             continue;
         }
         // The final transcript is the model representation of this recorded
@@ -124,8 +141,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
         // never send both that WAV and its replacement text to the model.
         // Unknown records still pass through normal validation and fail closed.
         let context_ids = if crate::conversation_store::has_final_voice_transcript(message) {
-            message
-                .attachment_ids
+            context_ids
                 .iter()
                 .filter(|id| {
                     records
@@ -135,7 +151,7 @@ pub(crate) fn prepare_scoped_chat_attachments(
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            message.attachment_ids.clone()
+            context_ids
         };
         if context_ids.is_empty() {
             continue;

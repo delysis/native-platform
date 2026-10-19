@@ -3,6 +3,49 @@ import MLX
 import MLXNN
 import MLXRandom
 
+public enum TTSGenerationStopReason: String, Codable, Equatable, Sendable {
+    case eos
+    case padLimit = "pad_limit"
+    case exactCycle = "exact_cycle"
+    case cancelled
+    case maxTokens = "max_tokens"
+    case inputTooShort = "input_too_short"
+}
+
+public struct TTSGenerationReport: Codable, Sendable {
+    public let stopReason: TTSGenerationStopReason
+    public let generatedCodecFrames: Int
+    public let maxTokens: Int
+
+    public init(stopReason: TTSGenerationStopReason, generatedCodecFrames: Int, maxTokens: Int) {
+        self.stopReason = stopReason
+        self.generatedCodecFrames = generatedCodecFrames
+        self.maxTokens = maxTokens
+    }
+}
+
+struct TTSGenerationStopTracker {
+    private(set) var stopReason = TTSGenerationStopReason.maxTokens
+    private(set) var generatedCodecFrames = 0
+    let maxTokens: Int
+
+    mutating func recordGeneratedFrame() {
+        generatedCodecFrames += 1
+    }
+
+    mutating func stop(_ reason: TTSGenerationStopReason) {
+        stopReason = reason
+    }
+
+    var report: TTSGenerationReport {
+        TTSGenerationReport(
+            stopReason: stopReason,
+            generatedCodecFrames: generatedCodecFrames,
+            maxTokens: maxTokens
+        )
+    }
+}
+
 // MARK: - Qwen3 Talker Model
 
 nonisolated public class Qwen3Talker: Module {
@@ -696,7 +739,8 @@ nonisolated public class Qwen3Talker: Module {
         adaptiveChunking: Bool = false,
         preparedPrefixKey: String? = nil,
         isCancelled: (@Sendable () -> Bool)? = nil,
-        afterYield: (@Sendable () async -> Void)? = nil
+        afterYield: (@Sendable () async -> Void)? = nil,
+        onGenerationComplete: (@Sendable (TTSGenerationReport) -> Void)? = nil
     ) -> AsyncThrowingStream<[[Int32]], Error> {
         let model = self
         let config = self.config
@@ -711,6 +755,11 @@ nonisolated public class Qwen3Talker: Module {
 
                 let minTokens = 9
                 guard inputIds.shape[1] >= minTokens else {
+                    onGenerationComplete?(TTSGenerationReport(
+                        stopReason: .inputTooShort,
+                        generatedCodecFrames: 0,
+                        maxTokens: maxTokens
+                    ))
                     continuation.finish()
                     return
                 }
@@ -833,6 +882,7 @@ nonisolated public class Qwen3Talker: Module {
 
                 var chunkCodes: [[Int32]] = []
                 var yieldedCodeFrames = 0
+                var generationStop = TTSGenerationStopTracker(maxTokens: maxTokens)
                 var recentCodeFrames: [[Int32]] = []
                 let eosTokenId: Int32 = Int32(config.codec_eos_token_id)
                 let stopTokenIds = Set([eosTokenId, Int32(config.codec_think_eos_id)])
@@ -847,6 +897,7 @@ nonisolated public class Qwen3Talker: Module {
 
                 generationLoop: for step in 0..<maxTokens {
                     if Task.isCancelled || isCancelled?() == true {
+                        generationStop.stop(.cancelled)
                         break
                     }
 
@@ -882,10 +933,12 @@ nonisolated public class Qwen3Talker: Module {
                     let code0Value = nextToken[0].item(Int32.self)
 
                     if stopTokenIds.contains(code0Value) {
+                        generationStop.stop(.eos)
                         break
                     } else if code0Value == padTokenId {
                         consecutivePad += 1
                         if consecutivePad > 6 {
+                            generationStop.stop(.padLimit)
                             break
                         }
                     } else {
@@ -899,6 +952,7 @@ nonisolated public class Qwen3Talker: Module {
 
                     for codeIdx in 0..<(numCodeGroups - 1) {
                         if Task.isCancelled || isCancelled?() == true {
+                            generationStop.stop(.cancelled)
                             break generationLoop
                         }
                         let codeInput: MLXArray
@@ -934,6 +988,7 @@ nonisolated public class Qwen3Talker: Module {
                         history: recentCodeFrames,
                         candidate: codeTokens
                     ) {
+                        generationStop.stop(.exactCycle)
                         break generationLoop
                     }
                     recentCodeFrames.append(codeTokens)
@@ -941,12 +996,14 @@ nonisolated public class Qwen3Talker: Module {
                         recentCodeFrames.removeFirst(recentCodeFrames.count - 36)
                     }
                     chunkCodes.append(codeTokens)
+                    generationStop.recordGeneratedFrame()
                     codePredictorCache = nil
                     let nextChunkSize = adaptiveChunking
                         ? streamingFramesToNextEmission(emittedFrames: yieldedCodeFrames)
                         : chunkSize
                     if chunkCodes.count >= nextChunkSize {
                         if Task.isCancelled || isCancelled?() == true {
+                            generationStop.stop(.cancelled)
                             break generationLoop
                         }
                         // MLX queues work lazily. Commit the producer's graph
@@ -1019,6 +1076,8 @@ nonisolated public class Qwen3Talker: Module {
                 Stream.defaultStream(.gpu).synchronize()
                 inputEmbeds = MLXArray([])
                 Memory.clearCache()
+
+                onGenerationComplete?(generationStop.report)
 
                 continuation.finish()
             }

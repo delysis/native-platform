@@ -32,16 +32,16 @@ pub use attachments::{
     INFERENCE_AUDIO_CANONICALIZER_VERSION, InferenceAudioProvenance, InferenceAudioSampleRange,
     attachment_import, attachment_import_pasted_text, attachment_import_voice_message,
     attachment_library_input, attachment_list, attachment_preview, attachment_preview_content,
-    attachment_preview_media, attachment_transcription_input, prepare_document_chat_in_scope,
-    store_inference_audio_derivative,
+    attachment_preview_media, attachment_store_voice_reply, attachment_transcription_input,
+    is_generated_voice_reply, prepare_document_chat_in_scope, store_inference_audio_derivative,
 };
 pub use chat::{
     ChatCancelOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ChatSkipReasoningOutput,
-    ChatStreamEvent, VoiceAudioPreparedTurn, VoiceAudioSession, chat_cancel_in_scope,
-    chat_continue_in_scope, chat_regenerate_in_scope, chat_send_in_scope,
-    chat_send_stream_in_scope, chat_skip_reasoning_in_scope, voice_audio_begin_in_scope,
-    voice_audio_finish_in_scope, voice_audio_finish_with_precommit_in_scope,
-    voice_audio_restart_prepared_in_scope,
+    ChatStreamEvent, VoiceAudioPreparedTurn, VoiceAudioSession, assistant_display_projection,
+    assistant_visible_content, chat_cancel_in_scope, chat_continue_in_scope,
+    chat_regenerate_in_scope, chat_send_in_scope, chat_send_stream_in_scope,
+    chat_skip_reasoning_in_scope, voice_audio_begin_in_scope, voice_audio_finish_in_scope,
+    voice_audio_finish_with_precommit_in_scope, voice_audio_restart_prepared_in_scope,
 };
 pub use composer::{
     ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
@@ -72,12 +72,17 @@ pub use engine::{
     runtime_warm_until_cancelled,
 };
 pub use kv_cache::{
-    CommittedSessionCheckpointDrain, VoicePersonaPrefixPreparation,
-    kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
+    CommittedSessionCheckpointDrain, VoiceCachePreparationProgress, VoiceCachePreparationSummary,
+    VoicePersonaPrefixPreparation, kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
     kv_cache_prepare_voice_persona_resident, kv_cache_restore, kv_cache_save,
     kv_cache_save_voice_persona, kv_cache_set_voice_call_activity, kv_cache_status,
-    prepare_committed_session_checkpoint_drain,
+    prepare_committed_session_checkpoint_drain, prepare_startup_voice_caches,
 };
+
+/// Build-time compatibility identity; no model loading or large runtime scan.
+pub fn native_cache_build_identity() -> &'static str {
+    llama_native_engine::LLAMA_NATIVE_BUILD_MANIFEST_SHA256
+}
 pub use llama_native_engine::{
     GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,
     RealtimeComputeMetrics, acquire_generation_backpressure, acquire_realtime_compute,

@@ -15,6 +15,7 @@ use llama_native_engine::NativeModelHandle;
 use llama_native_types::{ChatMessage, ChatTemplateChoice, GenerationInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
 pub(crate) enum VoiceHistoryMode {
@@ -74,7 +75,20 @@ pub(crate) fn fit_voice_context(
         &fingerprint,
         upstream_setting_bool(prompt.settings, "excludeReasoningFromContext"),
     ))?;
-    let start = valid_window_start(active, conversation.inference_window.as_ref(), &profile)?;
+    let store = RuntimeStore::open(&prompt.settings.data_dir)?;
+    let generated_voice_reply_ids = store.read_documents(|snapshot| {
+        crate::attachments::generated_voice_reply_ids_from_snapshot(
+            snapshot,
+            &conversation.id,
+            active,
+        )
+    })?;
+    let start = valid_window_start(
+        active,
+        conversation.inference_window.as_ref(),
+        &profile,
+        &generated_voice_reply_ids,
+    )?;
     let (start, mut projection) = fit_window(active, start, limit, |selected| {
         let attachments = if !matches!(prompt.mode, VoiceHistoryMode::Recorded)
             && selected
@@ -141,7 +155,7 @@ pub(crate) fn fit_voice_context(
     } else {
         Some(ConversationInferenceWindow {
             covered_through_message_id: active[start - 1].id.clone(),
-            covered_source_sha256: source_digest(&active[..start])?,
+            covered_source_sha256: source_digest(&active[..start], &generated_voice_reply_ids)?,
             profile_sha256: profile,
         })
     };
@@ -150,8 +164,13 @@ pub(crate) fn fit_voice_context(
         // worker's resident prefix. A prearmed capture may be cancelled without
         // committing a message; redial must still use this same history. This
         // small metadata transaction neither exports nor persists native KV.
-        let store = RuntimeStore::open(&prompt.settings.data_dir)?;
-        if !persist_window_if_unchanged(&store, conversation, active, window.as_ref())? {
+        if !persist_window_if_unchanged(
+            &store,
+            conversation,
+            active,
+            &generated_voice_reply_ids,
+            window.as_ref(),
+        )? {
             return Err(anyhow!(
                 "voice_context_changed: Conversation history changed during voice preparation"
             ));
@@ -165,9 +184,10 @@ fn persist_window_if_unchanged(
     store: &RuntimeStore,
     expected: &Conversation,
     expected_active: &[Message],
+    expected_generated_voice_reply_ids: &BTreeSet<(String, String)>,
     window: Option<&ConversationInferenceWindow>,
 ) -> Result<bool> {
-    let expected_source = source_projection(expected_active);
+    let expected_source = source_projection(expected_active, expected_generated_voice_reply_ids);
     store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         ConversationDb::default,
@@ -185,6 +205,12 @@ fn persist_window_if_unchanged(
                 return Ok(false);
             };
             let current_active = crate::document::checked_active_messages(current)?;
+            let current_generated_voice_reply_ids =
+                crate::attachments::generated_voice_reply_ids_from_mutations(
+                    documents,
+                    &current.id,
+                    &current_active,
+                )?;
             if current.active_leaf_message_id != expected.active_leaf_message_id
                 || current.branch_root_message_id != expected.branch_root_message_id
                 || current.execution_profile != expected.execution_profile
@@ -193,7 +219,8 @@ fn persist_window_if_unchanged(
                 || current.source_conversation_id != expected.source_conversation_id
                 || (current.inference_window != expected.inference_window
                     && current.inference_window.as_ref() != window)
-                || source_projection(&current_active) != expected_source
+                || source_projection(&current_active, &current_generated_voice_reply_ids)
+                    != expected_source
             {
                 return Ok(false);
             }
@@ -221,8 +248,11 @@ fn digest(value: &(impl Serialize + ?Sized)) -> Result<String> {
 /// indices and counts are presentation metadata and may be normalized when a
 /// generated exchange is committed, so they must not invalidate a saved
 /// inference boundary.
-fn source_digest(messages: &[Message]) -> Result<String> {
-    digest(&source_projection(messages))
+fn source_digest(
+    messages: &[Message],
+    generated_voice_reply_ids: &BTreeSet<(String, String)>,
+) -> Result<String> {
+    digest(&source_projection(messages, generated_voice_reply_ids))
 }
 
 type InferenceSourceProjection<'a> = (
@@ -231,13 +261,16 @@ type InferenceSourceProjection<'a> = (
     MessageRole,
     &'a String,
     &'a Option<String>,
-    &'a Vec<String>,
+    Vec<&'a String>,
     &'a Option<String>,
     bool,
     &'a Option<MessageAttribution>,
 );
 
-fn source_projection(messages: &[Message]) -> Vec<InferenceSourceProjection<'_>> {
+fn source_projection<'a>(
+    messages: &'a [Message],
+    generated_voice_reply_ids: &BTreeSet<(String, String)>,
+) -> Vec<InferenceSourceProjection<'a>> {
     messages
         .iter()
         .map(|message| {
@@ -247,7 +280,18 @@ fn source_projection(messages: &[Message]) -> Vec<InferenceSourceProjection<'_>>
                 message.role.clone(),
                 &message.content,
                 &message.parent_id,
-                &message.attachment_ids,
+                message
+                    .attachment_ids
+                    .iter()
+                    .filter(|id| {
+                        message.role != MessageRole::Assistant
+                            || !generated_voice_reply_ids.iter().any(
+                                |(message_id, attachment_id)| {
+                                    message_id == &message.id && attachment_id == *id
+                                },
+                            )
+                    })
+                    .collect(),
                 &message.reasoning_content,
                 message.reasoning_incomplete,
                 &message.attribution,
@@ -260,6 +304,7 @@ fn valid_window_start(
     active: &[Message],
     window: Option<&ConversationInferenceWindow>,
     profile: &str,
+    generated_voice_reply_ids: &BTreeSet<(String, String)>,
 ) -> Result<usize> {
     let Some(window) = window.filter(|window| window.profile_sha256 == profile) else {
         return Ok(0);
@@ -271,7 +316,9 @@ fn valid_window_start(
         return Ok(0);
     };
     Ok(
-        if source_digest(&active[..=index])? == window.covered_source_sha256 {
+        if source_digest(&active[..=index], generated_voice_reply_ids)?
+            == window.covered_source_sha256
+        {
             index + 1
         } else {
             0
@@ -449,9 +496,38 @@ mod tests {
     fn window_at(active: &[Message], start: usize) -> Result<ConversationInferenceWindow> {
         Ok(ConversationInferenceWindow {
             covered_through_message_id: active[start - 1].id.clone(),
-            covered_source_sha256: source_digest(&active[..start])?,
+            covered_source_sha256: source_digest(&active[..start], &BTreeSet::new())?,
             profile_sha256: "profile".into(),
         })
+    }
+
+    fn generated_voice_reply_record(
+        conversation_id: &str,
+        message_id: &str,
+        id: &str,
+    ) -> crate::attachments::AttachmentRecord {
+        crate::attachments::AttachmentRecord {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            kind: crate::attachments::AttachmentKind::Audio,
+            file_name: "voice-message-reply-fixture.wav".to_string(),
+            source_path: "generated://assistant-voice".to_string(),
+            stored_path: "private://fixture".to_string(),
+            mime: "audio/wav".to_string(),
+            bytes: 48,
+            sha256: "0".repeat(64),
+            created_at: "2".to_string(),
+            state: crate::attachments::AttachmentState::Committed,
+            root_object_id: Some("object-fixture".to_string()),
+            detected_format: Some(attachment_native_types::DetectedFormat::Wav),
+            coverage: Some(attachment_native_types::Coverage::Complete),
+            manifest_namespace: Some("attachment-manifest-fixture".to_string()),
+            policy_fingerprint: Some("policy-fixture".to_string()),
+            artifact_count: 1,
+            canonical_text_bytes: 0,
+            media_objects: 1,
+        }
     }
 
     #[test]
@@ -484,6 +560,7 @@ mod tests {
             &store,
             &original,
             &active,
+            &BTreeSet::new(),
             Some(&window)
         )?);
         // A duplicate preparation of the same boundary is harmless.
@@ -491,6 +568,7 @@ mod tests {
             &store,
             &original,
             &active,
+            &BTreeSet::new(),
             Some(&window)
         )?);
         drop(store); // Hangup/cancellation: no generated exchange is committed.
@@ -506,6 +584,7 @@ mod tests {
             &active,
             saved.conversations[0].inference_window.as_ref(),
             "profile",
+            &BTreeSet::new(),
         )?;
         let (redial_start, redial) = fit_window(&active, resumed_start, limit, |messages| {
             Ok(Some((11_000 + messages.len() * 300, messages.to_vec())))
@@ -514,6 +593,161 @@ mod tests {
         assert_eq!(
             redial, selected,
             "redial must reuse the prepared historical prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_voice_publication_keeps_rolled_boundary_but_ordinary_changes_reject() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(root.path(), [81; 32])?;
+        let original = saved_history();
+        let active = crate::document::checked_active_messages(&original)?;
+        let start = 8;
+        let window = window_at(&active, start)?;
+        store.put(
+            CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![original.clone()],
+                selected_conversation_id: Some(original.id.clone()),
+            },
+        )?;
+
+        let mut published = original.clone();
+        let assistant = published
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "a1")
+            .expect("covered assistant message");
+        let generated_id = "generated-voice-a1";
+        assistant.attachment_ids.push(generated_id.to_string());
+        published.updated_at = "2".to_string();
+        store.put(
+            CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![published.clone()],
+                selected_conversation_id: Some(original.id.clone()),
+            },
+        )?;
+        let mut attachment_db = crate::attachments::AttachmentDb::default();
+        attachment_db.attachments.push(generated_voice_reply_record(
+            &original.id,
+            "a1",
+            generated_id,
+        ));
+        store.put(crate::attachments::ATTACHMENTS_NAMESPACE, &attachment_db)?;
+
+        let no_generated_ids = BTreeSet::new();
+        assert!(persist_window_if_unchanged(
+            &store,
+            &original,
+            &active,
+            &no_generated_ids,
+            Some(&window),
+        )?);
+        let published_active = crate::document::checked_active_messages(&published)?;
+        let published_generated_ids = store.read_documents(|snapshot| {
+            crate::attachments::generated_voice_reply_ids_from_snapshot(
+                snapshot,
+                &original.id,
+                &published_active,
+            )
+        })?;
+        assert_eq!(
+            published_generated_ids,
+            BTreeSet::from([("a1".to_string(), generated_id.to_string())])
+        );
+        assert_eq!(
+            valid_window_start(
+                &published_active,
+                Some(&window),
+                "profile",
+                &published_generated_ids,
+            )?,
+            start,
+            "generated audio does not change the saved inference source"
+        );
+
+        // A registry row owned by a1 must not erase the same ID when a
+        // malformed/moved reference appears on another assistant message.
+        let mut moved_reference = published.clone();
+        moved_reference
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "a2")
+            .expect("second assistant message")
+            .attachment_ids
+            .push(generated_id.to_string());
+        let moved_active = crate::document::checked_active_messages(&moved_reference)?;
+        let moved_projection = source_projection(&moved_active, &published_generated_ids);
+        let moved_index = moved_active
+            .iter()
+            .position(|message| message.id == "a2")
+            .expect("second assistant index");
+        assert!(
+            moved_projection[moved_index]
+                .5
+                .iter()
+                .any(|id| id.as_str() == generated_id),
+            "an ID owned by a1 remains authoritative when referenced by a2"
+        );
+
+        let mut ordinary_change = published.clone();
+        ordinary_change
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "a1")
+            .expect("covered assistant message")
+            .attachment_ids
+            .push("ordinary-attachment".to_string());
+        let ordinary_active = crate::document::checked_active_messages(&ordinary_change)?;
+        store.put(
+            CONVERSATIONS_NAMESPACE,
+            &ConversationDb {
+                conversations: vec![ordinary_change],
+                selected_conversation_id: Some(original.id.clone()),
+            },
+        )?;
+        assert!(
+            !persist_window_if_unchanged(
+                &store,
+                &original,
+                &active,
+                &no_generated_ids,
+                Some(&window),
+            )?,
+            "ordinary attachment IDs remain inference-authoritative"
+        );
+        assert_eq!(
+            valid_window_start(
+                &ordinary_active,
+                Some(&window),
+                "profile",
+                &published_generated_ids,
+            )?,
+            0,
+            "ordinary attachment changes invalidate a prior inference window"
+        );
+
+        let mut edited = published;
+        edited
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "a1")
+            .expect("covered assistant message")
+            .content
+            .push_str(" changed");
+        let edited_active = crate::document::checked_active_messages(&edited)?;
+        assert_eq!(
+            valid_window_start(
+                &edited_active,
+                Some(&window),
+                "profile",
+                &published_generated_ids,
+            )?,
+            0,
+            "generated audio does not mask a source text edit"
         );
         Ok(())
     }
@@ -543,7 +777,13 @@ mod tests {
             };
             store.put(CONVERSATIONS_NAMESPACE, &db)?;
             assert!(
-                !persist_window_if_unchanged(&store, &original, &active, Some(&window))?,
+                !persist_window_if_unchanged(
+                    &store,
+                    &original,
+                    &active,
+                    &BTreeSet::new(),
+                    Some(&window),
+                )?,
                 "stale authority case {change}"
             );
             assert_eq!(
@@ -727,10 +967,13 @@ mod tests {
         let profile = "profile-a";
         let window = ConversationInferenceWindow {
             covered_through_message_id: "assistant-1".to_string(),
-            covered_source_sha256: source_digest(&active[..=2])?,
+            covered_source_sha256: source_digest(&active[..=2], &BTreeSet::new())?,
             profile_sha256: profile.to_string(),
         };
-        assert_eq!(valid_window_start(&active, Some(&window), profile)?, 3);
+        assert_eq!(
+            valid_window_start(&active, Some(&window), profile, &BTreeSet::new())?,
+            3
+        );
 
         // Generated exchange commits can normalize branch presentation while
         // leaving the inference source unchanged. That must retain the stable
@@ -741,17 +984,20 @@ mod tests {
         normalized_branch[2].branch_index = Some(0);
         normalized_branch[2].branch_count = Some(2);
         assert_eq!(
-            valid_window_start(&normalized_branch, Some(&window), profile)?,
+            valid_window_start(&normalized_branch, Some(&window), profile, &BTreeSet::new())?,
             3
         );
 
         let mut changed_source = active.clone();
         changed_source[1].content.push_str(" edited");
         assert_eq!(
-            valid_window_start(&changed_source, Some(&window), profile)?,
+            valid_window_start(&changed_source, Some(&window), profile, &BTreeSet::new())?,
             0
         );
-        assert_eq!(valid_window_start(&active, Some(&window), "profile-b")?, 0);
+        assert_eq!(
+            valid_window_start(&active, Some(&window), "profile-b", &BTreeSet::new())?,
+            0
+        );
 
         let changed_branch = vec![
             active[0].clone(),
@@ -760,7 +1006,7 @@ mod tests {
             active[3].clone(),
         ];
         assert_eq!(
-            valid_window_start(&changed_branch, Some(&window), profile)?,
+            valid_window_start(&changed_branch, Some(&window), profile, &BTreeSet::new())?,
             0
         );
         Ok(())

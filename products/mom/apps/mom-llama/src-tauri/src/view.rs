@@ -3,7 +3,7 @@ use maud::{Markup, PreEscaped, html};
 use mom_llama_runtime::{
     AttachmentKind, AttachmentRecord, Blocker, CommandResult, Conversation, ConversationKind,
     DraftMessage, MentionToolApprovalState, MentionToolEffectOutcome, Message, MessageRole,
-    Settings, engine::EngineCheckOutput, models::ModelInfo,
+    Settings, models::ModelInfo,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1302,14 +1302,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
     },
     SettingsFieldSpec {
         section: "developer",
-        key: "disableReasoningParsing",
-        label: "Disable reasoning parsing",
-        kind: "checkbox",
-        help: "Keep model reasoning markers in the raw assistant output.",
-        options: EMPTY_OPTIONS,
-    },
-    SettingsFieldSpec {
-        section: "developer",
         key: "excludeReasoningFromContext",
         label: "Exclude reasoning from context",
         kind: "checkbox",
@@ -1438,7 +1430,6 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
         let _ = mom_llama_runtime::conversation_resume_existing_for_empty_draft()?;
     }
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status(scope)?;
     let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let models = mom_llama_runtime::model_list(scope)?;
@@ -1453,7 +1444,6 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let recipients = mom_llama_runtime::conversation_draft_recipients()?;
     Ok(app_markup(AppProjection {
         settings: &settings,
-        engine: &engine,
         conversations: &conversations,
         personas: &personas,
         models: &models,
@@ -1464,9 +1454,8 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     .into_string())
 }
 
-pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
+pub fn render_chat_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status(scope)?;
     // The chat composer does not render the model catalog. Discovering models
     // here walked the full Hugging Face cache on every conversation switch.
     // Settings owns the model picker and refreshes independently after paint.
@@ -1491,7 +1480,6 @@ pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result
     let recipients = mom_llama_runtime::conversation_draft_recipients()?;
     Ok(chat_view_with_draft(
         &settings,
-        &engine,
         &models,
         active.as_ref(),
         Some(&draft),
@@ -1520,7 +1508,6 @@ pub fn render_settings_fragment(scope: &mom_llama_runtime::OperationScope) -> Re
 
 struct AppProjection<'a> {
     settings: &'a CommandResult<Settings>,
-    engine: &'a CommandResult<EngineCheckOutput>,
     conversations: &'a CommandResult<Vec<Conversation>>,
     personas: &'a StoreProjection<Vec<Conversation>>,
     models: &'a CommandResult<Vec<ModelInfo>>,
@@ -1532,7 +1519,6 @@ struct AppProjection<'a> {
 fn app_markup(projection: AppProjection<'_>) -> Markup {
     let AppProjection {
         settings,
-        engine,
         conversations,
         personas,
         models,
@@ -1581,9 +1567,8 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
                     (button("voice.call.open", Some("voice-call-open"), "icon-button voice-call-toggle", false))
                 }
             }
-            (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft), personas, recipients))
+            (chat_view_with_draft(settings, models, active.as_ref(), Some(draft), personas, recipients))
             (settings_sidebar(settings, models, personas, active.as_ref()))
-            (conversation_rename_modal())
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -1623,7 +1608,6 @@ fn resize_direction_class(direction: &str) -> &'static str {
 
 fn chat_view_with_draft(
     settings: &CommandResult<Settings>,
-    engine: &CommandResult<impl Serialize>,
     models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
@@ -1763,6 +1747,7 @@ fn chat_view_with_draft(
                                         && message.attribution.is_none()
                                 }),
                                 assistant_contact_id,
+                                active.is_some_and(|conversation| is_voice_note_turn(conversation, message)),
                             ))
                         }
                     }
@@ -1780,7 +1765,7 @@ fn chat_view_with_draft(
                     }
                 }
             }
-            (composer(engine, settings, models, active, draft, &attachments))
+            (composer(settings, models, active, draft, &attachments))
         }
     }
 }
@@ -1948,6 +1933,7 @@ fn sidebar(
 ) -> Markup {
     let chats = conversations.result.as_deref().unwrap_or(&[]);
     let conversation_list = control("conversation.list");
+    let conversation_rename = control("conversation.rename");
     let persona_list = control("persona.list");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
@@ -1975,9 +1961,15 @@ fn sidebar(
                                 .filter(|conversation| conversation.kind == ConversationKind::Chat) {
                                 @let active = active_id == Some(conversation.id.as_str());
                                 @let display_title = conversation_display_title(&conversation.title);
-                                li data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
+                                li class=(format!("conversation-sidebar-row{}", if active { " active" } else { "" }))
+                                    data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
                                     data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default())
-                                    data-conversation-title=(display_title) {
+                                    data-conversation-title=(display_title)
+                                    data-rename-affordance=(conversation_rename.affordance)
+                                    data-rename-command=(conversation_rename.command)
+                                    data-rename-tauri-command=(conversation_rename.tauri_command)
+                                    data-rename-cli=(conversation_rename.cli)
+                                    data-rename-effect=(conversation_rename.effect) {
                                     button type="button"
                                         class=(format!("conversation-item {}", if active { "active" } else { "" }))
                                         data-affordance="conversation.select"
@@ -1993,12 +1985,14 @@ fn sidebar(
                                             span class="contact-avatar" aria-hidden="true" { (icon_markup(if conversation.recipient_ids.is_empty() { "message-circle" } else { "users" })) }
                                         }
                                         div class="conversation-copy" {
-                                            span { (display_title) }
+                                            span class="conversation-title" { (display_title) }
                                             @if let Some(message) = conversation.messages.iter().rev().find(|message| {
                                                 !is_call_turn(conversation, message)
                                                     && !is_voice_note_turn(conversation, message)
                                             }) {
-                                                small { (message.content.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
+                                                @let preview = mom_llama_runtime::assistant_visible_content(message)
+                                                    .unwrap_or_else(|| message.content.clone());
+                                                small { (preview.split_whitespace().take(20).collect::<Vec<_>>().join(" ")) }
                                             }
                                         }
                                     }
@@ -2054,7 +2048,6 @@ fn sidebar(
             div class="sidebar-resizer" role="separator" aria-label="Sidebar width"
                 aria-orientation="vertical" aria-valuemin="180" aria-valuemax="480" tabindex="0" {}
             div class="sidebar-actions hidden-contract" {
-                (button("conversation.rename", Some("conversation-rename"), "small-button", active_id.is_none()))
                 (button("conversation.delete", Some("conversation-delete"), "small-button danger", active_id.is_none()))
                 (button("conversation.import", Some("conversation-import"), "small-button", false))
             }
@@ -2063,14 +2056,13 @@ fn sidebar(
 }
 
 fn composer(
-    engine: &CommandResult<impl Serialize>,
     settings: &CommandResult<Settings>,
     _models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
     attachments: &[AttachmentRecord],
 ) -> Markup {
-    let readiness = conversation_model_readiness(engine, active, settings);
+    let readiness = conversation_model_readiness(active, settings);
     let draft = draft.and_then(|draft| draft.result.as_ref());
     // Voice dispatch uses a transient stored draft to bind captured audio to
     // the model turn.  It is protocol state, never user-authored composer
@@ -2289,14 +2281,32 @@ fn message_row(
     allow_freeze: bool,
     allow_generation_actions: bool,
     assistant_contact_id: Option<&str>,
+    voice_note_turn: bool,
 ) -> Markup {
+    // Generated speech belongs to one immutable message occurrence. An edit
+    // creates a new ID and cannot inherit the prior wording's recording.
+    let attachments = attachments
+        .iter()
+        .copied()
+        .filter(|attachment| {
+            !mom_llama_runtime::is_generated_voice_reply(attachment)
+                || attachment.message_id == message.id
+        })
+        .collect::<Vec<_>>();
+    let raw_message = message;
+    let display_message = mom_llama_runtime::assistant_display_projection(message);
+    let message = &display_message;
     let role = role_label(&message.role);
     let call_turn = message.content.starts_with("[Phone call]");
-    let voice_message = message.role == MessageRole::User
-        && attachments.iter().any(|attachment| {
-            attachment.kind == AttachmentKind::Audio
-                && attachment.file_name.starts_with("voice-message-")
-        });
+    let voice_message = attachments.iter().any(|attachment| {
+        (message.role == MessageRole::User
+            && attachment.kind == AttachmentKind::Audio
+            && attachment.file_name.starts_with("voice-message-"))
+            || (message.role == MessageRole::Assistant
+                && mom_llama_runtime::is_generated_voice_reply(attachment))
+    });
+    let missing_voice_reply =
+        voice_note_turn && message.role == MessageRole::Assistant && !voice_message;
     let show_stats = upstream_settings_bool(settings, "showMessageStats");
     let enable_continue = upstream_settings_bool(settings, "enableContinueGeneration");
     let user_markdown = upstream_settings_bool(settings, "renderUserContentAsMarkdown");
@@ -2315,7 +2325,7 @@ fn message_row(
             class=(format!(
                 "message-row {role}{}{}",
                 if call_turn { " call-turn" } else { "" },
-                if voice_message { " voice-message-row" } else { "" },
+                if voice_message || missing_voice_reply { " voice-message-row" } else { "" },
             ))
             data-message-id=(message.id.clone())
             aria-label=(format!("{role} message")) {
@@ -2350,9 +2360,16 @@ fn message_row(
                         }
                     }
                 }
-                @if message.role == MessageRole::Tool {
+                @if missing_voice_reply {
+                    div class="voice-message-player voice-message-unavailable" {
+                        button type="button" class="voice-message-play" disabled
+                            data-audio-state="failed" aria-label="Voice recording unavailable"
+                            title="This earlier reply has no saved recording" { (icon_markup("volume-x")) }
+                        (waveform_bars())
+                    }
+                } @else if message.role == MessageRole::Tool {
                     (tool_message_content(message, expand_tool_content, show_agentic_stats))
-                } @else if message.role == MessageRole::User && voice_message {
+                } @else if voice_message {
                     span class="sr-only" { "Voice message" }
                 } @else if message.role == MessageRole::User && !user_markdown {
                     p class="plain-message-content" { (message.content) }
@@ -2383,7 +2400,7 @@ fn message_row(
                     }
                     (markdown_content(&message.content))
                     @if message.role == MessageRole::Assistant && show_raw_output_switch {
-                        pre class="raw-message-content is-hidden" { (message.content.clone()) }
+                        pre class="raw-message-content is-hidden" { (raw_message.content.clone()) }
                     }
                 }
                 @if message.role == MessageRole::Assistant && show_stats {
@@ -2396,7 +2413,7 @@ fn message_row(
                 }
             }
             (message_actions(
-                message,
+                raw_message,
                 allow_freeze,
                 allow_generation_actions,
                 enable_continue,
@@ -3306,35 +3323,6 @@ fn consult_settings(personas: &StoreProjection<Vec<Conversation>>) -> Markup {
     }
 }
 
-fn conversation_rename_modal() -> Markup {
-    let rename = control("conversation.rename");
-    html! {
-        div id="conversation-rename-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
-            form id="conversation-rename-form" class="compact-dialog" role="dialog" aria-modal="true"
-                aria-labelledby="conversation-rename-title"
-                data-affordance=(rename.affordance) data-command=(rename.command)
-                data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) {
-                header class="modal-title-row" {
-                    h2 id="conversation-rename-title" { "Rename" }
-                    button type="button" class="icon-button" aria-label="Cancel"
-                        data-affordance=(rename.affordance) data-command=(rename.command)
-                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect)
-                        data-action="conversation-rename-close" { (icon_markup("x")) }
-                }
-                label class="field" {
-                    span { "Name" }
-                    input name="conversation_title" required aria-label="Name"
-                        data-affordance=(rename.affordance) data-command=(rename.command)
-                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect);
-                }
-                button type="submit" class="primary-button"
-                    data-affordance=(rename.affordance) data-command=(rename.command)
-                    data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) { "Save" }
-            }
-        }
-    }
-}
-
 fn voice_call_modal() -> Markup {
     let call = control("voice.call.open");
     html! {
@@ -4148,7 +4136,6 @@ struct ConversationModelReadiness {
 }
 
 fn conversation_model_readiness(
-    engine: &CommandResult<impl Serialize>,
     active: Option<&Conversation>,
     settings: &CommandResult<Settings>,
 ) -> ConversationModelReadiness {
@@ -4164,21 +4151,9 @@ fn conversation_model_readiness(
             label: blocked.blocker.message,
         };
     }
-    let global_matches = settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.model_path.as_deref())
-        == Some(path);
-    if engine.status == "host_integrated" && global_matches {
-        ConversationModelReadiness {
-            enabled: true,
-            label: "Send".to_string(),
-        }
-    } else {
-        ConversationModelReadiness {
-            enabled: true,
-            label: "Send; the selected model will load first".to_string(),
-        }
+    ConversationModelReadiness {
+        enabled: true,
+        label: "Send".to_string(),
     }
 }
 
@@ -4562,7 +4537,7 @@ mod tests {
             .find(r#"if (textarea) textarea.value = "";"#)
             .expect("composer must clear optimistically when a send is accepted");
         let dispatch = js
-            .find(r#"result = await invoke("mom_llama_chat_dispatch"#)
+            .find(r#"invoke("mom_llama_chat_dispatch"#)
             .expect("composer must dispatch through the canonical Rust command");
         assert!(
             composer_clear < dispatch,
@@ -4965,6 +4940,7 @@ mod tests {
             true,
             true,
             Some("persona-ad_de_jongh"),
+            false,
         )
         .into_string();
         assert!(html.contains(r#"class="message-speaker-avatar""#));
@@ -4977,6 +4953,49 @@ mod tests {
         assert!(html.contains("Private reasoning"));
         assert!(html.contains("Visible answer"));
         assert!(!html.contains("&lt;think&gt;"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_assistant_channel_markers_are_hidden_in_the_message_projection() -> Result<()> {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let message = Message {
+            id: "assistant-legacy".to_string(),
+            conversation_id: "conversation".to_string(),
+            role: MessageRole::Assistant,
+            content: "<|channel>thought\nprivate reasoning<channel|>Visible answer.".to_string(),
+            created_at: "1".to_string(),
+            parent_id: None,
+            model: Some("model.gguf".to_string()),
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+            attachment_ids: Vec::new(),
+        };
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
+        assert!(html.contains("Visible answer."));
+        assert!(html.contains("private reasoning"));
+        let visible_body = html.split("data-message-content=").next().unwrap_or(&html);
+        assert!(!visible_body.contains("&lt;|channel&gt;thought"));
+        assert!(!visible_body.contains("&lt;channel|&gt;"));
+        assert!(html.contains("data-message-content=\"&lt;|channel&gt;thought"));
+        assert_eq!(
+            message.content, "<|channel>thought\nprivate reasoning<channel|>Visible answer.",
+            "rendering must not mutate the persisted message"
+        );
         Ok(())
     }
 
@@ -4994,12 +5013,40 @@ mod tests {
         let mut message = test_message("assistant", MessageRole::Assistant, "Stored reply");
         message.parent_id = Some("voice-note".to_string());
 
-        let html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
 
         assert!(html.contains("Stored reply"));
         assert!(!html.contains("voice-reply-row"));
         assert!(!html.contains("voice-message-player"));
         assert!(html.contains(r#"data-action="message-read-aloud""#));
+    }
+
+    #[test]
+    fn historical_voice_reply_without_recording_does_not_become_a_text_note() {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let message = test_message(
+            "reply",
+            MessageRole::Assistant,
+            "Model transcript stays available.",
+        );
+        let html = message_row(&message, &settings, &[], true, true, None, true).into_string();
+        assert!(html.contains("voice-message-unavailable"));
+        assert!(
+            !html
+                .split("data-message-content=")
+                .next()
+                .unwrap_or(&html)
+                .contains("Model transcript stays available.")
+        );
+        assert_eq!(message.content, "Model transcript stays available.");
     }
 
     #[test]
@@ -5038,6 +5085,9 @@ mod tests {
 
         let html = sidebar(&conversations, &personas, Some("chat")).into_string();
 
+        assert!(html.contains(r#"class="conversation-title""#));
+        assert!(html.contains(r#"data-rename-command="mom_llama.conversation_rename""#));
+        assert!(!html.contains("conversation-rename-modal"));
         assert!(html.contains("Earlier ordinary message"));
         assert!(!html.contains("Hey Jan"));
         assert!(!html.contains("Reply naturally and briefly"));
@@ -5059,18 +5109,62 @@ mod tests {
                 assert_eq!(
                     js.matches(unmanaged).count(),
                     1,
-                    "only the command-status dismissal may create a local button",
+                    "command-status dismissals must share one button construction site",
                 );
-                let dismiss_start = js
-                    .find(r#"const dismiss = document.createElement("button")"#)
-                    .expect("status dismissal button exists");
-                let dismiss_end = js[dismiss_start..]
-                    .find("status.replaceChildren(message, dismiss)")
-                    .map(|offset| dismiss_start + offset)
-                    .expect("status dismissal is mounted");
-                let dismiss = &js[dismiss_start..dismiss_end];
-                assert!(dismiss.contains(r#"aria-label", "Dismiss""#));
-                assert!(dismiss.contains(r#"addEventListener("click", () => report(null)"#));
+                let helper_start = js
+                    .find("const renderStatusContent = (status, label, onDismiss) => {")
+                    .expect("shared status content helper exists");
+                let helper_end = js[helper_start..]
+                    .find("\n  const report = (value) => {")
+                    .map(|offset| helper_start + offset)
+                    .expect("shared status helper is bounded before report");
+                let helper = &js[helper_start..helper_end];
+                assert!(helper.contains(r#"dismiss.setAttribute("aria-label", "Dismiss")"#));
+                assert!(
+                    helper.contains(
+                        r#"dismiss.addEventListener("click", onDismiss, { once: true })"#
+                    )
+                );
+                assert!(helper.contains("status.replaceChildren(message, dismiss)"));
+
+                let report_start = js
+                    .find("const report = (value) => {")
+                    .expect("command status report exists");
+                let persistent_start = js
+                    .find("const renderPersistentVoiceCallFailure = () => {")
+                    .expect("persistent call failure projection exists");
+                let report = &js[report_start..persistent_start];
+                assert!(report.contains("renderStatusContent(status, String(label).replaceAll(\"_\", \" \"), () => report(null))"));
+
+                let persistent_end = js[persistent_start..]
+                    .find("\n  const setPersistentVoiceCallFailure =")
+                    .map(|offset| persistent_start + offset)
+                    .expect("persistent status projection is bounded");
+                let persistent = &js[persistent_start..persistent_end];
+                assert!(persistent.contains(
+                    "renderStatusContent(status, persistentVoiceCallFailure.message, () => {"
+                ));
+                assert!(
+                    persistent.contains("persistentVoiceCallFailure = null;\n      report(null);")
+                );
+                continue;
+            }
+            if unmanaged == r#"document.createElement("input")"# {
+                assert_eq!(
+                    js.matches(unmanaged).count(),
+                    1,
+                    "only inline conversation rename may create a local name editor",
+                );
+                let rename_start = js
+                    .find(r#"const input = document.createElement("input")"#)
+                    .expect("inline editor exists");
+                let rename_end = js[rename_start..]
+                    .find("input.addEventListener(\"keydown\"")
+                    .map(|offset| rename_start + offset)
+                    .expect("inline editor handlers exist");
+                let rename = &js[rename_start..rename_end];
+                assert!(rename.contains("conversation-rename-editor"));
+                assert!(rename.contains("row.dataset.renameCommand"));
                 continue;
             }
             assert!(
@@ -5244,7 +5338,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["second", "first"]
         );
-        let html = message_row(&message, &settings, &records, true, false, None).into_string();
+        let html =
+            message_row(&message, &settings, &records, true, false, None, false).into_string();
         let second_position = html.find("photo.png").expect("second attachment");
         let first_position = html.find("notes.md").expect("first attachment");
         assert!(second_position < first_position);
@@ -5255,15 +5350,6 @@ mod tests {
 
     #[test]
     fn composer_renders_staged_draft_attachments_as_compact_removable_chips() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let settings = CommandResult::passed(
             "mom_llama.settings_get",
             "contracted",
@@ -5292,15 +5378,7 @@ mod tests {
             attachment_record("image", "", "garden.png", AttachmentKind::Image),
         ];
         let models = empty_models();
-        let html = composer(
-            &engine,
-            &settings,
-            &models,
-            None,
-            Some(&draft),
-            &attachments,
-        )
-        .into_string();
+        let html = composer(&settings, &models, None, Some(&draft), &attachments).into_string();
         assert!(html.contains(r#"id="composer-attachments" class="composer-attachments""#));
         assert!(html.contains(r#"data-staged-attachment-id="image""#));
         assert!(html.contains(r#"data-staged-attachment-id="notes""#));
@@ -5312,15 +5390,6 @@ mod tests {
 
     #[test]
     fn internal_voice_and_call_drafts_never_project_into_the_composer() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let settings = CommandResult::passed(
             "mom_llama.settings_get",
             "contracted",
@@ -5360,7 +5429,6 @@ mod tests {
                 false,
             );
             let html = composer(
-                &engine,
                 &settings,
                 &models,
                 None,
@@ -5404,7 +5472,6 @@ mod tests {
             false,
         );
         let stale_html = composer(
-            &engine,
             &settings,
             &models,
             None,
@@ -5430,15 +5497,7 @@ mod tests {
             false,
             false,
         );
-        let html = composer(
-            &engine,
-            &settings,
-            &models,
-            None,
-            Some(&ordinary),
-            &[attachment],
-        )
-        .into_string();
+        let html = composer(&settings, &models, None, Some(&ordinary), &[attachment]).into_string();
         assert!(!html.contains("data-internal-voice-draft"));
         assert!(html.contains("Please summarize this recording"));
         assert!(html.contains(r#"data-staged-attachment-id="voice-clip""#));
@@ -5447,15 +5506,6 @@ mod tests {
 
     #[test]
     fn composer_projects_the_conversation_model_in_runtime_precedence_order() {
-        let engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "configured",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
         let mut settings_value = Settings::defaults_for_data_dir(std::env::temp_dir());
         settings_value.model_path = Some(PathBuf::from("/models/global-default-Q8_0.gguf"));
         settings_value
@@ -5483,7 +5533,7 @@ mod tests {
         );
         let models = empty_models();
         let profile_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!profile_html.contains("Conversation model"));
         assert!(!profile_html.contains("frozen-profile-Q4_K_M"));
         assert!(!profile_html.contains("legacy-selected-Q5_K_M"));
@@ -5498,7 +5548,7 @@ mod tests {
             Some(Path::new("/models/legacy-selected-Q5_K_M.gguf"))
         );
         let selected_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!selected_html.contains("legacy-selected-Q5_K_M"));
         assert!(!selected_html.contains("global-default-Q8_0"));
 
@@ -5508,7 +5558,7 @@ mod tests {
             Some(Path::new("/models/global-default-Q8_0.gguf"))
         );
         let default_html =
-            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+            composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!default_html.contains("global-default-Q8_0"));
 
         conversation.execution_profile.model_path = Some(PathBuf::from("   "));
@@ -5542,35 +5592,20 @@ mod tests {
         let mut conversation =
             test_conversation("chat", "Chat", ConversationKind::Chat, Vec::new());
         conversation.execution_profile.model_path = Some(conversation_model.clone());
-        let blocked_global: CommandResult<Value> = CommandResult::blocked(
-            "mom_llama.engine_check",
-            "blocked_missing_model",
-            Blocker::new("model_path_missing", "No global model", Vec::new()),
-        );
-
-        let configured =
-            conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        let configured = conversation_model_readiness(Some(&conversation), &settings);
         assert!(configured.enabled);
-        assert_eq!(configured.label, "Send; the selected model will load first");
+        assert_eq!(configured.label, "Send");
         let models = empty_models();
-        let html = composer(
-            &blocked_global,
-            &settings,
-            &models,
-            Some(&conversation),
-            None,
-            &[],
-        )
-        .into_string();
+        let html = composer(&settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(!html.contains("runtime-dot"));
         assert!(html.contains(r#"class="send-button voice-message-button""#));
-        assert!(html.contains("Send; the selected model will load first"));
+        assert!(html.contains(r#"title="Send""#));
         assert!(html.contains(r#"data-model-ready="true""#));
         assert!(!html.contains(r#"data-model-ready="true" disabled"#));
 
         conversation.execution_profile.model_path =
             Some(directory.join("missing-conversation.gguf"));
-        let missing = conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        let missing = conversation_model_readiness(Some(&conversation), &settings);
         assert!(!missing.enabled);
         assert_eq!(missing.label, "That model file is no longer available.");
 
@@ -5586,20 +5621,32 @@ mod tests {
             false,
         );
         conversation.execution_profile.model_path = Some(conversation_model);
-        let loaded_engine = CommandResult::passed(
-            "mom_llama.engine_check",
-            "host_integrated",
-            serde_json::json!({"ready": true}),
-            Vec::new(),
-            Vec::new(),
-            true,
-            false,
-        );
-        let loaded =
-            conversation_model_readiness(&loaded_engine, Some(&conversation), &loaded_settings);
+        let loaded = conversation_model_readiness(Some(&conversation), &loaded_settings);
         assert!(loaded.enabled);
         assert_eq!(loaded.label, "Send");
         std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_fragment_uses_configured_readiness_without_native_residency() -> Result<()> {
+        let data_dir = tempfile::tempdir()?;
+        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+            data_dir.path().to_path_buf(),
+        ));
+        let model_path = data_dir.path().join("configured.gguf");
+        std::fs::write(&model_path, b"test model placeholder")?;
+        mom_llama_runtime::settings_update(mom_llama_runtime::config::SettingsUpdate {
+            model_path: Some(Some(model_path)),
+            ..mom_llama_runtime::config::SettingsUpdate::default()
+        })?;
+        let rendered = render_chat_fragment();
+        mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+
+        let html = rendered?;
+        assert!(html.contains(r#"class="send-button voice-message-button""#));
+        assert!(html.contains(r#"data-model-ready="true""#));
+        assert!(!html.contains("runtime-dot"));
         Ok(())
     }
 
@@ -5627,18 +5674,20 @@ mod tests {
         message.prompt_tokens = Some(7);
         message.completion_tokens = Some(11);
 
-        let html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let html = message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!html.contains("frozen-conversation-Q4_K_M"));
         assert!(!html.contains("global-default-Q8_0"));
         assert!(html.contains("7 prompt · 11 generated"));
 
         message.model = None;
-        let legacy_html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let legacy_html =
+            message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!legacy_html.contains("Unknown model"));
         assert!(!legacy_html.contains("global-default-Q8_0"));
 
         message.model = Some("  ".to_string());
-        let blank_html = message_row(&message, &settings, &[], true, true, None).into_string();
+        let blank_html =
+            message_row(&message, &settings, &[], true, true, None, false).into_string();
         assert!(!blank_html.contains("Unknown model"));
     }
 
@@ -5654,6 +5703,50 @@ mod tests {
         assert!(!js.contains("persona_mmproj_path"));
         assert!(!js.contains("persona_model_path"));
         assert!(js.contains("persona_model_choice"));
+    }
+
+    #[test]
+    fn saved_persona_voice_reply_restores_audio_without_exposing_model_transcript() {
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(std::env::temp_dir()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut message =
+            test_message("reply", MessageRole::Assistant, "Transcript for the model.");
+        message.attachment_ids.push("speech".into());
+        let mut attachment = attachment_record(
+            "speech",
+            "reply",
+            "voice-message-reply-fixture.wav",
+            AttachmentKind::Audio,
+        );
+        attachment.source_path = "generated://assistant-voice".into();
+        attachment.mime = "audio/wav".into();
+        attachment.detected_format =
+            Some(serde_json::from_value(serde_json::json!("wav")).expect("WAV format"));
+        attachment.state = mom_llama_runtime::AttachmentState::Committed;
+        let html =
+            message_row(&message, &settings, &[&attachment], true, true, None, false).into_string();
+        assert!(html.contains("voice-message-player"));
+        assert!(html.contains("data-attachment-preview=\"speech\""));
+        assert!(
+            !html
+                .split("data-message-content=")
+                .next()
+                .unwrap_or(&html)
+                .contains("Transcript for the model.")
+        );
+        assert_eq!(message.content, "Transcript for the model.");
+        message.id = "edited-reply".into();
+        let edited =
+            message_row(&message, &settings, &[&attachment], true, true, None, false).into_string();
+        assert!(!edited.contains("voice-message-player"));
+        assert!(edited.contains("Transcript for the model."));
     }
 
     #[test]

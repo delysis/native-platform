@@ -258,6 +258,70 @@ fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
 }
 
 #[test]
+fn legacy_disable_reasoning_parsing_cannot_leak_direct_chat_fixture_output() -> Result<()> {
+    let _session = TestSession::new("retired-reasoning-parser-setting")?;
+    let mut stored_settings = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("settings missing"))?;
+    // Simulate an older encrypted settings document. This key is no longer a
+    // writable control, but old documents remain readable without migration.
+    stored_settings
+        .upstream_settings
+        .insert("disableReasoningParsing".into(), json!(true));
+    mom_llama_runtime::config::save_settings(&stored_settings)?;
+    assert_eq!(
+        mom_llama_runtime::settings_get()?
+            .result
+            .ok_or_else(|| anyhow!("settings missing"))?
+            .upstream_settings["disableReasoningParsing"],
+        json!(true)
+    );
+
+    let conversation = mom_llama_runtime::conversation_new(Some("Parser fixture".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("conversation missing"))?;
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &mom_llama_runtime::OperationScope::detached(),
+        ChatSendInput {
+            conversation_id: conversation.id.clone(),
+            message: "[[fixture:reasoning-marker-regression]]".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    assert_eq!(result.readiness, "fake_fixture_exercised");
+    assert!(!result.receipt.real_engine_invoked);
+    assert!(result.receipt.fake_fixture);
+    let output = result
+        .result
+        .ok_or_else(|| anyhow!("fixture output missing"))?;
+    assert_eq!(output.assistant_text, "Fixture assistant response.");
+    assert_eq!(
+        output.reasoning_content.as_deref(),
+        Some("fixture private reasoning")
+    );
+
+    let stored = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("conversation missing after fixture"))?;
+    let assistant = stored
+        .messages
+        .iter()
+        .find(|message| message.id == output.assistant_message_id)
+        .ok_or_else(|| anyhow!("assistant fixture message missing"))?;
+    assert_eq!(assistant.content, "Fixture assistant response.");
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some("fixture private reasoning")
+    );
+    assert!(!assistant.content.contains("<think>"));
+    assert!(!assistant.content.contains("</think>"));
+    Ok(())
+}
+
+#[test]
 fn cache_mode_is_coherent_and_off_blocks_manual_cache_access() -> Result<()> {
     let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("cache-policy-surface")?;
@@ -2830,6 +2894,248 @@ fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires a real local Gemma GGUF and matching multimodal projector"]
+fn real_startup_preparation_persists_personas_and_history_without_editing_messages() -> Result<()> {
+    let _session = configured_real_session("real-startup-voice-cache-preparation")?;
+    let projector = std::env::var_os("MOM_LLAMA_MMPROJ_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MMPROJ_PATH must point to the matching projector"))?;
+    let configured = mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(2),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        max_tokens: Some(8),
+        mmproj_path: Some(Some(projector)),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("startup cache settings were not accepted"))?;
+    assert!(configured.context_tokens >= 512);
+    assert_eq!(configured.batch_tokens, 512);
+    assert_eq!(configured.max_parallel_sequences, 2);
+    assert_eq!(
+        configured.resident_memory_budget_bytes,
+        21_845 * 1024 * 1024
+    );
+    assert_eq!(configured.sampling_config()?.max_tokens, 8);
+    assert_eq!(configured.kv_cache_policy, KvCachePolicy::KvCacheCandidate);
+
+    let personas = mom_llama_runtime::persona_list()?
+        .result
+        .unwrap_or_default();
+    anyhow::ensure!(!personas.is_empty(), "the persona catalog is empty");
+    let persona_ids = personas
+        .iter()
+        .map(|persona| persona.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+
+    // Build one materialized persona conversation with deterministic fixture
+    // history. The fixture only creates input data; all cache preparation below
+    // uses the real configured native model.
+    let persona = personas
+        .first()
+        .ok_or_else(|| anyhow!("the persona catalog is empty"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona conversation was not materialized"))?;
+    let fixture = mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: conversation.id.clone(),
+            message: "Synthetic startup-cache history: the caller prefers concise replies.".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    anyhow::ensure!(
+        fixture.receipt.fake_fixture,
+        "history setup did not use the fixture path"
+    );
+    let saved_before = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("materialized conversation could not be reloaded"))?
+        .messages;
+    anyhow::ensure!(saved_before.len() >= 2, "fixture history was not persisted");
+
+    let mut progress = Vec::new();
+    let summary = mom_llama_runtime::prepare_startup_voice_caches(&scope, |item| {
+        println!(
+            "STARTUP_VOICE_CACHE_PROGRESS completed={} total={} elapsed_ms={} positions={} bytes={}",
+            item.completed, item.total, item.elapsed_ms, item.cache_positions, item.state_bytes
+        );
+        progress.push(item);
+    })?;
+    assert_eq!(summary.prepared, personas.len() + 1);
+    assert_eq!(summary.total, personas.len() + 1);
+    assert_eq!(progress.len(), summary.total * 2);
+    anyhow::ensure!(
+        progress.iter().any(|item| item.completed == 0)
+            && progress.iter().any(|item| item.completed == summary.total),
+        "startup preparation did not report its boundaries"
+    );
+
+    let status = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("cache status was unavailable after preparation"))?;
+    let ready_personas = status
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+        })
+        .filter_map(|entry| entry.owner_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        persona_ids
+            .iter()
+            .all(|persona_id| ready_personas.contains(persona_id.as_str())),
+        "not every catalog persona has a ready native checkpoint"
+    );
+    let persona_prefix = status
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                && entry.owner_id.as_deref() == Some(persona.id.as_str())
+        })
+        .ok_or_else(|| anyhow!("selected persona prefix checkpoint is missing"))?;
+    let session_checkpoint = status
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(conversation.id.as_str())
+        })
+        .ok_or_else(|| anyhow!("materialized conversation checkpoint is missing"))?;
+    let latest_persona_checkpoint_ms = status
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                && persona_ids.contains(entry.owner_id.as_deref().unwrap_or_default())
+        })
+        .map(|entry| entry.created_at_ms)
+        .max()
+        .ok_or_else(|| anyhow!("no ready persona checkpoint timestamps were recorded"))?;
+    anyhow::ensure!(
+        latest_persona_checkpoint_ms <= session_checkpoint.created_at_ms,
+        "persona checkpoints were not prepared before the materialized chat"
+    );
+    anyhow::ensure!(session_checkpoint.state_bytes > 0);
+    anyhow::ensure!(
+        status
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                    && (entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                        || (entry.tier
+                            == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                            && entry.owner_id.as_deref() == Some(conversation.id.as_str())))
+            })
+            .all(|entry| entry.fingerprint == session_checkpoint.fingerprint),
+        "startup checkpoints do not share the configured native build identity"
+    );
+    assert_eq!(
+        session_checkpoint.fingerprint.context_tokens, configured.context_tokens,
+        "startup checkpoint must use the effective production context plan"
+    );
+    anyhow::ensure!(
+        session_checkpoint.token_ids.len() > persona_prefix.token_ids.len(),
+        "conversation checkpoint contains only the system/persona prefix"
+    );
+    anyhow::ensure!(
+        session_checkpoint
+            .cells
+            .len()
+            .max(session_checkpoint.token_ids.len())
+            > persona_prefix
+                .cells
+                .len()
+                .max(persona_prefix.token_ids.len()),
+        "conversation checkpoint did not retain history KV positions"
+    );
+    let saved_after = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("materialized conversation disappeared after preparation"))?
+        .messages;
+    assert_eq!(saved_after, saved_before, "setup changed saved messages");
+
+    let chat_id = conversation.id.clone();
+    let checkpoint_id = session_checkpoint.id.clone();
+    let checkpoint_cells = session_checkpoint.cells.len();
+    let checkpoint_tokens = session_checkpoint.token_ids.len();
+    let persona_count = persona_ids.len();
+    drop(scope);
+    drop(owner);
+
+    let restarted_owner = initialize_product_runtime()?;
+    let restarted_scope = restarted_owner.operation_scope();
+    let restore_started = Instant::now();
+    let restored =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&restarted_scope, &chat_id)?;
+    anyhow::ensure!(
+        restored.readiness == "resident_prefix_prepared",
+        "worker restart did not restore the prepared conversation: {:?}",
+        restored.blocker
+    );
+    let restored = restored
+        .result
+        .ok_or_else(|| anyhow!("conversation checkpoint restore returned no result"))?;
+    anyhow::ensure!(
+        restored.persisted,
+        "restart did not restore durable native state"
+    );
+    let restored_metadata = restored
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("restart did not use the persisted checkpoint"))?;
+    assert_eq!(restored_metadata.id, checkpoint_id);
+    assert_eq!(restored.prefill_us, 0, "restart replayed the saved prompt");
+    assert_eq!(
+        restored.resident_prefix_tokens,
+        checkpoint_tokens.max(checkpoint_cells)
+    );
+
+    println!(
+        "STARTUP_VOICE_CACHE_ACCEPTANCE {}",
+        json!({
+            "personas": persona_count,
+            "effective_context_tokens": configured.context_tokens,
+            "effective_batch_tokens": configured.batch_tokens,
+            "effective_max_parallel_sequences": configured.max_parallel_sequences,
+            "resident_memory_budget_bytes": configured.resident_memory_budget_bytes,
+            "prepared": summary.prepared,
+            "reused": summary.reused,
+            "targets": summary.total,
+            "progress_events": progress.len(),
+            "checkpoint_tokens": checkpoint_tokens,
+            "checkpoint_cells": checkpoint_cells,
+            "checkpoint_bytes": session_checkpoint.state_bytes,
+            "restored_tokens": restored.resident_prefix_tokens,
+            "restore_prefill_us": restored.prefill_us,
+            "prepare_elapsed_ms": summary.elapsed_ms,
+            "restore_elapsed_ms": restore_started.elapsed().as_millis(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires real Gemma GGUF, matching projector, and 16 kHz voice WAV"]
 fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let _session = configured_real_session("real-voice-persona-prefix")?;
@@ -2956,6 +3262,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let silence = Instant::now();
     voice.seal_input()?;
     let mut first_token_ms = None;
+    let stream_events = std::cell::RefCell::new(Vec::new());
     let finished = mom_llama_runtime::voice_audio_finish_with_precommit_in_scope(
         voice,
         ChatSendOptions {
@@ -2963,6 +3270,10 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
             fake_fixture: false,
         },
         Some(|event: mom_llama_runtime::ChatStreamEvent| {
+            stream_events.borrow_mut().push(event.event.clone());
+            if event.event == "text_completed" {
+                assert!(event.delta.as_deref().is_some_and(|text| !text.is_empty()));
+            }
             if first_token_ms.is_none()
                 && matches!(event.event.as_str(), "delta" | "reasoning_delta")
             {
@@ -2971,6 +3282,18 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
             Ok(())
         }),
         || {
+            assert_eq!(
+                stream_events.borrow().last().map(String::as_str),
+                Some("text_completed"),
+                "speech must receive final text before waiting for recording confirmation"
+            );
+            assert!(
+                !stream_events
+                    .borrow()
+                    .iter()
+                    .any(|event| event == "completed"),
+                "text EOF must not claim the exchange is committed"
+            );
             let imported = mom_llama_runtime::attachment_import_voice_message(
                 &scope,
                 &conversation.id,
@@ -2990,6 +3313,11 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let output = finished
         .result
         .ok_or_else(|| anyhow!("prepared first voice turn failed: {:#?}", finished.blocker))?;
+    assert_eq!(
+        stream_events.borrow().last().map(String::as_str),
+        Some("completed"),
+        "the terminal stream event must follow the history commit"
+    );
     let audio = output
         .voice_audio_metrics
         .as_ref()
@@ -3293,10 +3621,6 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         )?))),
         resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let owner = initialize_product_runtime()?;
@@ -3493,10 +3817,6 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
         // Match the application profile so cancelled turns exercise the
         // alternate-sequence resident audio checkpoint used for fast resume.
         max_parallel_sequences: Some(4),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         ..SettingsUpdate::default()
     })?;
@@ -3973,10 +4293,6 @@ fn real_incremental_voice_prefill_reports_silence_to_first_token() -> Result<()>
         // the token-exact text prefix while the first two lanes ping-pong
         // incremental audio checkpoints.
         max_parallel_sequences: Some(4),
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -4284,10 +4600,10 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
         model_path: Some(Some(model_path)),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
         max_tokens: Some(192),
-        upstream_settings: Some(BTreeMap::from([
-            ("disableReasoningParsing".to_string(), json!(false)),
-            ("excludeReasoningFromContext".to_string(), json!(false)),
-        ])),
+        upstream_settings: Some(BTreeMap::from([(
+            "excludeReasoningFromContext".to_string(),
+            json!(false),
+        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -4494,10 +4810,6 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         max_parallel_sequences: Some(4),
         // This scenario verifies independent execution, cancellation, and
         // source ownership; reasoning extraction has its own model scenarios.
-        upstream_settings: Some(BTreeMap::from([(
-            "disableReasoningParsing".to_string(),
-            json!(true),
-        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;

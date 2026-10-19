@@ -78,13 +78,201 @@ Two actual native builds with distinct Cargo output directories produced
 the same Mac/compiler/features. No artifact digest was normalized or weakened.
 This does not establish cross-compiler or cross-machine reproducibility.
 
+The engine build identity includes its resolved Cargo dependency closure,
+not the entire workspace manifest and lockfile. Adding an unrelated speech
+backend must not invalidate saved Gemma state. Package versions, sources,
+checksums and resolved dependency edges remain included, alongside engine/type
+sources, compiler, target, features and native artifact evidence. A change to
+this identity recipe itself invalidates earlier checkpoints once; it does not
+authorize importing incompatible state. A warm callback alone cannot qualify
+this boundary: verify persisted restoration after an application restart.
+
 First-run readiness is scoped to the runtime data directory, including an
 explicit `LLAMA_NATIVE_KIT_DATA_DIR` override. A setup receipt in Tauri's shared
 application directory cannot qualify a fresh profile. Existing profiles without
 their own receipt verify the acquired assets and complete runtime warming once;
 the old application-directory receipt is left untouched.
 
+Setup also binds the native cache build identity and the cache-preparation
+schema. When those change, the setup screen prepares and persists every persona
+system prefix and each nonempty saved conversation's bounded voice-history
+projection before publishing readiness. It uses the same history projection,
+native generation, authenticated storage and pickup preparation as calls.
+Multimodal history preparation generates one discarded warm token because the
+normal native generation entry point requires a positive token budget; it never
+commits a message or changes user-visible audio/text. Future generation still
+checks and trims to the exact shared prefix. This is measured setup work,
+not a second speech pipeline or a hidden call greeting.
+
+Preparation is sequential and observes the existing per-entry, total-byte and
+entry-count cache budgets. Failures cannot publish a ready receipt. A final
+metadata check requires every newly prepared checkpoint to remain present;
+the selected context is then restored to worker-owned RAM. Other prepared
+contexts reside in encrypted storage until selected. The preparation summary
+counts newly published checkpoints, not cache tokens reused during their
+construction. This explicit setup phase must not be moved into background work
+that competes with an admitted call, nor repeated on every unchanged launch.
+
+## Gemma channel boundaries before speech
+
+Gemma can emit `<|channel>thought\n...<channel|>` even when a call requests a
+short answer. The shared incremental reasoning parser must route that block to
+reasoning, including an empty block, before emitting assistant-content deltas.
+The final response uses the same parser before persistence and text completion.
+Do not send model protocol markers to TTS or solve this at sentence boundaries:
+a marker may be split across any streamed token boundary.
+
+Candidate 21 recording diagnostics found a marker-bearing first sentence whose
+144 characters and 21 words matched the corresponding TTS request. At the
+approximately aligned 4:09 playback, consumed-buffer reports retained headroom
+and no underrun callback was observed; final renderer metrics were unavailable.
+This establishes malformed speech input, not that it explains every reported
+acoustic glitch. Separate underruns later in the recording remain distinct.
+Keep the accepted helper, sampling, decoder windows and buffering fixed while
+qualifying this parser repair. Regression coverage includes empty/nonempty and
+unfinished thought blocks, every UTF-8 split boundary, single-character deltas,
+and agreement between live routing and final parsing.
+
+## Production-path qualification
+
+Tests must call the production policy they claim to qualify. Do not maintain a
+benchmark-only text chunker, normalizer, scheduler, compute-arbitration policy,
+or simulated playback policy as a substitute for the application. Inject inputs
+and failures at the boundary under test, then execute its real implementation.
+For whole-path behavior, retain the real event router, sentence admission,
+adaptive scheduler, native synthesis command and PCM renderer together.
+
+The frontend voice harness executes the actual `onChatEvent`,
+`beginLiveVoiceTts`, `takeLiveSpeechChunk` and imported
+`voice-pipeline-scheduler.js` implementations. It controls native IPC and audio
+I/O to test ownership, reasoning exclusion, sentence admission, EOF ordering,
+backpressure and cancellation. Its synthetic clocks and PCM are not latency or
+physical-playback evidence. Backend integration tests must call the same `MomSpeech` synthesis
+entry points as the app; isolated model tests qualify only that model boundary.
+
+The shared PCM worklet context keeps its output clock running between turns.
+Natural completion and cancellation retire only the owning node, analyser and
+ring; they never suspend a shared context that could retain device-bound audio
+for a later speaker. Explicit pause holds the processor's ring position while
+rendering silence. Late callbacks have authority only over their exact node
+and owner. Tests cover drain/pause races, cancellation during startup, and
+cross-owner teardown. These lifecycle checks do not establish audible speaker
+isolation; a packaged cross-persona stop-and-call test remains necessary.
+
+Call performance is measured by starting the exact packaged candidate through
+its normal UI in an isolated profile and reading its persisted
+`voice-latency-history` with `scripts/voice-latency-report.mjs`. This runs the
+production coordinator, native generation and renderer. Bind the trace to the
+candidate executable, source, model, voice reference and device. Record cold
+and warm pickup, content availability, speech dispatch, first PCM, first render,
+renderer underruns and cancellation settlement separately. A missing stage is
+unknown, never zero. Physical speaker quality still requires listening or a
+recording; first PCM is not first audible speech.
+
+There is currently no deterministic automated packaged-call driver. That is an
+explicit qualification gap, not a reason to invent a second call pipeline.
+The retired `real_resident_audio_to_qwen_pipeline_exercises_compute_lease`
+benchmark had private word-count chunking, buffering calculations and reasoning
+routing. Its historical receipts are preserved but cannot qualify current call
+latency or playback. The separate-process CLI pipeline benchmark was retired
+for the same reason. Component tests remain useful only at their stated boundary.
+
+## Shared generation and speech admission
+
+Direct chat and persona/mention dispatch must use the same incremental model
+output parser, including tool continuations and final persisted results. A
+successful direct-chat test does not qualify persona streaming. Protocol markers
+and reasoning must be separated before visible content reaches any speech
+consumer. Stored assistant messages are projected through the same parser for
+display, copy and Read Aloud; the original storage and explicit raw exports are
+preserved. User and tool text are never rewritten by that assistant projection.
+
+Read Aloud and precommit speech share one synthesis-request constructor and the
+same Qwen helper, voice reference cache, sampling, PCM framing and renderer.
+The helper owns the final bounded-text admission for every request: already
+bounded inputs remain one unchanged normalized utterance; long inputs split at
+complete sentences, then clauses or a 64-word limit. Live text availability can
+cause earlier dispatch, but must not bypass this admission or invent a second
+normalizer. Explicit reading uses the shared adaptive PCM runway with local
+calibration so a long reading does not retune a later call.
+
+Regression evidence must cross both entry points: persona output routing and
+persistence, exact Read Aloud target selection, shared request parity, long-input
+word conservation, and short-input audio parity. Renderer tests do not establish
+pleasant audio; keep real helper stop reasons, packet timing and audition audio
+separate from physical playback acceptance.
+
+## Voice-note storage and visibility
+
+A persona voice note has two projections: saved audio for the user and the
+assistant transcript for model context. Publish its WAV through encrypted
+attachment storage, atomically binding it to the exact committed assistant
+message and visible text. In-memory playback is not durable publication.
+Navigation must not cancel a completed recording's pending publication; failed
+publication retains the session recording and offers retry. Restored recordings
+render as audio bubbles. Generated assistant audio is excluded before model
+media budgeting, without excluding ordinary user audio. An edit creates a new
+message occurrence and cannot inherit the previous wording's recording.
+Publishing this presentation-only recording must preserve the rolled inference
+window and checkpoint eligibility. Exclusions use authenticated attachment
+metadata with exact conversation/message ownership, never a filename. Ordinary
+media, transcript edits, branch changes and profile changes still invalidate the
+relevant inference authority.
+
+Regression checks cover both PCM/message-ID completion orders, failed-save retry,
+encrypted-store reopen, exact audio bytes, stale-message rejection, and separate
+rendered/model projections. Older session-only recordings cannot be recovered
+from their text: show an unavailable voice bubble rather than silently replacing
+the note with text or claiming a regenerated recording is the original.
+
+## Call startup, hangup and navigation
+
+Hangup releases the visible call and its startup ownership before native stop
+acknowledgements settle. A delayed microphone permission result, audio-context
+resume, greeting completion or startup failure belongs to its original call
+epoch. It cannot publish into a later call, release that call's microphone,
+clear its dispatch ownership or retarget the selected chat. Expected late
+cancellation is silent. Genuine startup failures remain dismissible and visible
+until dismissal or retry, with the failed stage recorded in latency diagnostics.
+
+Chat rendering checks model configuration without querying resident slots.
+The shared native client holds its state lock during model acquisition; a
+resident-status query in the render path therefore makes chat switching wait
+behind loading. Explicit engine diagnostics still query actual residency.
+Configured readiness does not claim that a model has loaded or passed inference.
+
+Regression checks hold startup and teardown promises open across hangup,
+navigation and redial, and verify that stale completions preserve the new owner.
+These checks do not establish pickup on another Mac. In-flight native persona
+preparation currently has no per-call cancellation handle and can continue
+after hangup; its revision-conditional imports and prefills must not overwrite
+newer generation. Keep cache preparation until an alternative proves equivalent
+resident and persisted prefix reuse, rather than exchanging a startup wait for
+uncached prompt processing.
+
 ## Sentence prosody and streaming PCM continuity
+
+Sentence-level text admission and PCM startup buffering are separate decisions.
+Give Qwen complete sentences for prosody, but do not require all of a healthy
+sentence's PCM before playback. A cold producer may release the startup probe
+after five measured packets, at least 1.2 seconds of PCM, and sustained production
+faster than playback. Both recent and cumulative cadence must qualify, with
+headroom for the observed startup deficit and packet gap. Missing measurements,
+slow production, and prior underrun evidence retain the conservative fallback.
+This is a bounded startup decision, not a guarantee against a later producer
+stall. Retain sentence boundaries, cancellation, and adaptive underrun recovery.
+
+TTS completion receipts distinguish EOS from token-budget exhaustion, pad/cycle
+guards, and cancellation. Unreported counts remain unknown. A bounded packet
+timeline records arrival offsets and cumulative frame counts, without speech
+text or microphone PCM, so startup policies can be replayed against actual
+production. A replay verifies the observed schedule, not physical speaker
+quality or behavior on another Mac.
+
+Speculative failures cannot acquire the next microphone turn before playback is
+authorized, or replace an existing capture. Native blocked/no-result envelopes
+must release an unconfirmed recording-import waiter before joining its worker,
+just as transport errors do. An already confirmed recording remains confirmed.
 
 The vocoder decodes generated acoustic codes only. Speaker conditioning belongs
 to the talker; unrelated reference-waveform codes must not fill an initial or
@@ -151,6 +339,43 @@ overlap as well as the new frames preserves duration and boundary alignment.
 Regression checks compare a continuous synthetic waveform across varying batch
 sizes, including both empty and nonempty final remainders. This repairs sample
 loss; it does not establish the cause of multi-second physical-output pauses.
+
+## Interrupted replies and next-turn history
+
+Stopping speech is not evidence that the reply has finished saving. A call can
+already be capturing the next utterance while the previous confirmed reply is
+still completing its native operation. Preparing the next prompt during that
+interval reads the previous leaf and creates sibling exchanges; the store
+correctly preserves the existing active branch, but subsequent replies can then
+follow a different branch from the one the caller just heard.
+
+Each live speech controller tracks its exact native generation promise. The
+next prompt is prepared only after that promise settles, including failure or
+cancellation, and after rechecking the call epoch. Microphone capture continues
+and playback interruption remains immediate. A renderer timeout, speech-backend stop,
+or cancellation request is not a substitute for native operation settlement.
+This applies to call greetings, speculative audio, and complete-recording
+fallback dispatches. `next_turn_history_settled.wait_ms` separates this ordering
+wait from the subsequent prompt-preparation measurement.
+
+The behavioral regression interrupts playback before the prior operation
+commits, verifies capture remains available and preparation has not started,
+then verifies the next prompt sees the committed leaf. It also covers native
+failure and hangup during the wait. These checks establish ordering only;
+physical speaker testing remains a separate acceptance step.
+
+Text completion and history completion are separate milestones. Incremental
+voice generation emits the request-owned `text_completed` event, carrying the
+final assistant text in `delta`, before waiting for recording confirmation.
+The renderer flushes its last sentence at this milestone. Otherwise a short
+reply without trailing whitespace can wait for command completion before
+starting synthesis, while that command waits for the first synthesized PCM to
+confirm the recording. The ordinary `completed` event remains post-commit;
+text EOF never releases the next-turn history barrier or the chat busy lease.
+Queued background transcription also waits for that commit before updating
+older turns, then rechecks the call epoch and caller activity.
+Late text completion from an aborted or replaced request cannot flush its
+replacement. Duplicate completion does not synthesize the reply twice.
 
 ## Pickup regression: phase-consistent history
 
@@ -868,3 +1093,49 @@ The snapshot includes whole-buffer authentication, but its queue, native copy,
 and authentication phases were not separately timed in that trace. Faster
 hashing must not be presented as proof that this entire delay or the reported
 mid-word audio dropouts have been fixed.
+
+
+## Speech backend selection and evidence
+
+Calls select the in-process PocketTTS CPU backend. Voice notes and Read Aloud
+select Qwen. Both enter the same persona speech operation registry, sentence
+buffering, contiguous PCM validation, cancellation settlement, and renderer.
+A missing requested backend is an actionable failure; it must not silently
+fall back to the other model. Only an admitted Qwen request owns a Metal lease.
+Pocket never reserves Metal, and call startup does not warm Qwen in the
+background. Notes and Read Aloud retain cooperative Metal arbitration with Gemma.
+
+Pocket voice conditioning is prepared offline from the full official encoder
+checkpoint and the same reviewed reference clips used by Qwen. The package
+contains the projected embeddings, tokenizer, configuration and provenance;
+first-run acquisition installs the pinned public generation checkpoint. Runtime
+calls do not require Python, network access, a voice encoder, or fresh reference
+encoding. Each embedding is bound to its source clip and model revision.
+
+Qualification must use the packaged UI and preserve selected backend/model IDs,
+first PCM and first render timestamps, renderer underruns, completion status,
+request cancellation settlement, and Metal lease counts. A measured zero is
+not missing data. Standalone engine benchmarks may explain a component but
+cannot establish call pickup or continuity. Keep the previous candidate and
+its traces intact until the replacement has passed its actual app checks.
+
+## Navigation during checkpoint persistence
+
+Chat selection and draft retention must not perform storage waits on the native
+UI thread. Their blocking workers retain the application work lease; frontend
+selection and draft writes preserve invocation order. Hidden settings must not
+trigger model discovery during navigation. Refresh conversation settings when
+they become visible.
+
+Opportunistic session checkpoints yield at the next encrypted chunk boundary
+when an ordinary store writer is waiting. Roll back the interrupted transaction
+and preserve the previous durable checkpoint; retain the pending checkpoint for
+the existing later retry. Do not weaken encrypted-store authentication or cache
+compatibility to improve navigation latency.
+
+Packaged-app qualification records selection queue time, selection command time,
+chat rendering and switch-to-paint time, plus native worker queue/work duration
+and storage writer waits. These diagnostics contain numbers and stage names,
+never conversation identifiers or content. Measure populated chat switches both
+while idle and after hangup, when a background checkpoint can be active;
+component preemption tests alone do not establish visible navigation latency.

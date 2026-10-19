@@ -4,6 +4,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const voicePipelineScheduler = require("./voice-pipeline-scheduler.js");
+const { AdaptiveVoiceLeadController } = voicePipelineScheduler;
 
 const ui = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
 const style = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
@@ -48,7 +50,7 @@ test("preview failures use the shared total error formatter", () => {
   assert.match(load, /preview\.title = errorMessage\(error\)/);
 });
 
-test("a failed persona synthesis republishes its pending voice row", () => {
+test("failed live voice synthesis republishes its unavailable reply row", () => {
   const settle = block(
     ui,
     "const settleUnavailableVoiceReply =",
@@ -57,15 +59,8 @@ test("a failed persona synthesis republishes its pending voice row", () => {
   assert.match(settle, /card\.replaceChildren\(unavailableVoiceMessage\(\)\)/);
   assert.match(settle, /row\.hidden = false/);
   assert.match(settle, /row\.classList\.remove\("voice-reply-pending"\)/);
-  const action = block(
-    ui,
-    '"message-read-aloud": async',
-    '"attachment-transcribe": async',
-  );
-  assert.match(action, /finally \{/);
-  assert.match(action, /voiceRow\?\.classList\.contains\("voice-reply-pending"\)/);
-  assert.match(action, /activeSpeechPlayback\?\.button === button\) await stopSpeechPlayback\(\)/);
-  assert.match(action, /settleUnavailableVoiceReply\(button\)/);
+  const live = block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =");
+  assert.match(live, /if \(!continueCall\) abortUnclaimedCallPrefill\(\);[\s\S]*?settleUnavailableVoiceReply\(button\)/);
 });
 
 test("explicit Read Aloud preserves the text card", () => {
@@ -74,11 +69,11 @@ test("explicit Read Aloud preserves the text card", () => {
     '"message-read-aloud": async',
     '"attachment-transcribe": async',
   );
-  assert.match(action, /if \(prepareOnly && personaVoice && row && card\)/);
-  assert.doesNotMatch(
-    action,
-    /if \(personaVoice && row && card\) \{\s*row\.classList\.add\("voice-reply-row"\)/,
-  );
+  assert.doesNotMatch(action, /personaVoice|prepareOnly|voice-reply-row/);
+  assert.match(action, /card\?\.append\(panel\)/);
+  assert.match(action, /requirePersonaVoice: false/);
+  assert.doesNotMatch(action, /mom_llama_speech_precommit_synthesize|purpose:\s*["']call/,
+    "Read Aloud remains on its separate native request");
   const playbackStyle = style.match(/\.speech-playback\s*\{([^}]*)\}/)?.[1] || "";
   assert.match(playbackStyle, /display:\s*none/);
   assert.doesNotMatch(playbackStyle, /border|margin|padding/);
@@ -286,7 +281,7 @@ test("voice players expose play only after structural and media validation", () 
   assert.doesNotMatch(activeStyle, /inset/);
 });
 
-test("only the exact generated voice reply is hidden while preparing", async () => {
+test("hydration preserves saved or unavailable voice rows and hides only the exact live reply", async () => {
   const classList = (initial = []) => {
     const values = new Set(initial);
     return {
@@ -297,15 +292,19 @@ test("only the exact generated voice reply is hidden while preparing", async () 
       has: (name) => values.has(name),
     };
   };
-  const pairs = ["old", "newest"].map((id) => {
+  const pairs = ["old", "missing", "saved", "newest"].map((id) => {
     const assistant = {
       hidden: false,
       dataset: { messageId: id },
-      classList: classList(["assistant"]),
+      classList: classList(id === "missing" || id === "saved"
+        ? ["assistant", "voice-message-row"] : ["assistant"]),
       querySelector(selector) {
         if (selector === "[data-action='message-read-aloud']") return this.button;
         if (selector === ".message-card") return this.card;
         if (selector === ".message-actions") return null;
+        if (selector === ".message-attachments [data-attachment-preview]") {
+          return id === "saved" ? {} : null;
+        }
         return null;
       },
     };
@@ -338,7 +337,9 @@ test("only the exact generated voice reply is hidden while preparing", async () 
   const root = {
     matches: () => false,
     querySelectorAll(selector) {
-      return selector === ".message-row.user" ? pairs.map(({ user }) => user) : [];
+      if (selector === ".message-row.user") return pairs.map(({ user }) => user);
+      if (selector === ".message-row.assistant") return pairs.map(({ assistant }) => assistant);
+      return [];
     },
   };
   const hydrate = block(ui, "  const hydrateAttachmentPreviews = async", "  window.addEventListener(\"beforeunload\"");
@@ -350,6 +351,8 @@ test("only the exact generated voice reply is hidden while preparing", async () 
     waveform: () => ({ kind: "waveform" }),
     voiceReplyConversation: "fixture-conversation",
     voiceReplyMessageId: "newest",
+    failedVoiceReplyOwners: new Map(),
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
     voiceCallActive: false,
     pendingVoiceMessage: () => { shellCount += 1; return {}; },
     registerPreview(preview) {
@@ -369,11 +372,104 @@ test("only the exact generated voice reply is hidden while preparing", async () 
   assert.equal(pairs[0].assistant.classList.has("voice-reply-pending"), false);
   assert.equal(pairs[0].assistant.classList.has("voice-reply-row"), false);
   assert.equal(pairs[0].assistant.button.classList.has("voice-reply-play"), false);
-  assert.equal(pairs[1].assistant.hidden, true, "only the exact generated voice reply may hide during preparation");
-  assert.equal(pairs[1].assistant.classList.has("voice-reply-pending"), true);
-  assert.equal(pairs[0].assistant.button.dataset.prepareOnly, undefined);
-  assert.equal(pairs[1].assistant.button.dataset.prepareOnly, "true");
+  assert.equal(pairs[1].assistant.hidden, false, "a missing historical recording stays an unavailable voice row");
+  assert.equal(pairs[1].assistant.classList.has("voice-message-row"), true);
+  assert.equal(pairs[2].assistant.hidden, false, "a saved voice attachment remains visible");
+  assert.equal(pairs[2].assistant.classList.has("voice-message-row"), true);
+  assert.equal(pairs[3].assistant.hidden, true, "only the exact live reply stays hidden until publication");
+  assert.equal(pairs[3].assistant.classList.has("voice-reply-pending"), true);
+  assert.equal(pairs[3].assistant.button.dataset.prepareOnly, undefined);
   assert.deepEqual(observedPreviews, ["newest", "old"], "lazy attachment hydration must begin nearest the composer");
+});
+
+test("navigation rebinds a retained failed-save owner to its exact voice reply", async () => {
+  const classes = new Set(["assistant", "voice-message-row"]);
+  const buttonClasses = new Set();
+  const button = {
+    dataset: { action: "voice-reply-pending-play" },
+    classList: { add: (...values) => values.forEach((value) => buttonClasses.add(value)) },
+    setAttribute(name, value) { this[name] = value; },
+    removeAttribute(name) { delete this[name]; },
+  };
+  const player = { querySelector: (selector) => selector === ".voice-reply-play" ? button : null };
+  const card = { replaceChildren(...children) { this.children = children; } };
+  const row = {
+    hidden: true,
+    dataset: { messageId: "assistant-20" },
+    classList: { add: (...values) => values.forEach((value) => classes.add(value)) },
+    querySelector(selector) {
+      if (selector === ".message-card") return card;
+      if (selector === ".message-attachments [data-attachment-preview]") return null;
+      return null;
+    },
+  };
+  const playback = {
+    controller: { ready: true },
+    trace: { id: "trace-20" },
+    bindButton(next) { this.button = next; return true; },
+  };
+  const retained = new Map([["chat-20\u0000assistant-20", playback]]);
+  const root = {
+    matches: () => false,
+    querySelectorAll: (selector) => selector === ".message-row.assistant" ? [row] : [],
+  };
+  const hydrate = block(ui, "  const hydrateAttachmentPreviews = async", "  window.addEventListener(\"beforeunload\"");
+  const context = {
+    document: root,
+    attachmentPreviewsWithin: () => [],
+    selectedConversation: () => "chat-20",
+    voiceReplyConversation: null,
+    voiceReplyMessageId: null,
+    failedVoiceReplyOwners: retained,
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
+    pendingVoiceReplyPlayer: () => player,
+    settleInMemoryVoiceReply(nextButton, controller, trace) {
+      assert.equal(nextButton, button);
+      assert.equal(controller, playback.controller);
+      assert.equal(trace, playback.trace);
+      nextButton.dataset.audioState = "ready";
+    },
+  };
+  speechVm.createContext(context);
+  speechVm.runInContext(hydrate + "\nthis.hydrate = hydrateAttachmentPreviews;", context);
+  await context.hydrate(root);
+
+  assert.equal(row.hidden, false);
+  assert.ok(classes.has("voice-reply-row"));
+  assert.equal(playback.button, button);
+  assert.equal(button.dataset.action, "voice-reply-pending-play");
+  assert.equal(button.dataset.audioPersistence, "failed");
+  assert.equal(button.dataset.audioState, "ready");
+});
+
+test("a retained failed voice-note save blocks another capture but leaves calls available", async () => {
+  const begin = block(ui, "  const beginVoiceCapture = async", "  const resumeBrowserVoicePrefill =");
+  const prepared = [];
+  const context = {
+    failedVoiceReplyOwners: new Map([["chat\u0000message", {}]]),
+    MAX_FAILED_VOICE_REPLY_OWNERS: 1,
+    activeVoiceNotePublications: new Set(),
+    preparePcmWorklet: () => prepared.push("worklet"),
+    beginBrowserVoiceCapture: async (options) => ({ call: options.call }),
+    beginNativeVoiceCapture: async () => ({ native: true }),
+    markVoiceLatency() {},
+    errorMessage: String,
+  };
+  speechVm.createContext(context);
+  speechVm.runInContext(`${begin}\nthis.beginVoiceCapture = beginVoiceCapture;`, context);
+
+  await assert.rejects(
+    context.beginVoiceCapture(),
+    /voice_reply_save_retry_required/,
+  );
+  assert.deepEqual(prepared, [], "blocked note capture must not start microphone preparation");
+  context.failedVoiceReplyOwners.clear();
+  context.activeVoiceNotePublications.add({});
+  await assert.rejects(context.beginVoiceCapture(), /voice_reply_save_retry_required/);
+  assert.deepEqual(prepared, [], "a pending publication also reserves the single note slot");
+  context.activeVoiceNotePublications.clear();
+  assert.deepEqual(await context.beginVoiceCapture({ call: true }), { call: true });
+  assert.deepEqual(prepared, ["worklet"], "call capture remains available and starts its normal setup");
 });
 
 test("voice dispatch keeps its live PCM row mounted through completion", () => {
@@ -391,15 +487,8 @@ test("voice dispatch keeps its live PCM row mounted through completion", () => {
   assert.match(ui, /const replayBytes = capture\.wavBytes \|\| encodePcmWav\(capture\.samples\(\)\)/);
   assert.match(ui, /appendOptimisticVoiceMessage\(replayBytes\)/);
 
-  const binding = block(
-    ui,
-    "  const prepareVoiceReplyRow =",
-    "  const hydrateAttachmentPreviews = async",
-  );
-  assert.match(binding, /button\.dataset\.personaVoice = "true"/);
-  assert.match(binding, /card\?\.replaceChildren\(button, waveform\(\)\)/);
-  assert.match(binding, /row\.classList\.add\("voice-reply-pending"\)/);
-  assert.doesNotMatch(binding, /row\.hidden = true/);
+  assert.doesNotMatch(ui, /prepareVoiceReplyRow/);
+  assert.doesNotMatch(ui, /dataset\.personaVoice\s*=|dataset\.prepareOnly\s*=/);
 
   const liveVoice = block(
     ui,
@@ -427,9 +516,12 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const media = [];
   const urls = [];
   const audioContexts = [];
+  const analysers = [];
   const workletNodes = [];
   const timers = [];
   let selected = "fixture-conversation";
+  let now = 1;
+  const traces = [];
   let serial = 0;
   let automaticReplies = false;
   let automaticReadResult = null;
@@ -468,7 +560,10 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   transcribe.closest = () => preview;
   const context = {
     Blob, Uint8Array, ArrayBuffer, DataView, JSON,
-    performance: { now: () => 1 },
+    performance: { now: () => now },
+    crypto: { randomUUID: () => `fixture-trace-${++serial}` },
+    MomVoicePipelineScheduler: { AdaptiveVoiceLeadController },
+    markVoiceLatencyIn: (trace, stage, detail = {}) => traces.push({ id: trace.id, stage, ...detail }),
     HTMLMediaElement: { HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3 },
     document: {
       createElement: element,
@@ -521,7 +616,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     constructor(options) {
       this.options = options; this.sampleRate = options?.sampleRate || 24_000;
       this.currentTime = 0; this.destination = {}; this.sources = [];
-      this.closed = false; this.state = "running";
+      this.closed = false; this.state = "running"; this.suspendCount = 0;
       if (worklet) this.audioWorklet = { addModule: () => workletPreparationGate?.promise || Promise.resolve() };
       audioContexts.push(this);
     }
@@ -532,13 +627,21 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
       this.state = "running";
     }
     async suspend() {
+      this.suspendCount += 1;
       this.suspendCalled = true;
       if (suspendGate && suspendGateEnabled) await suspendGate.promise;
       this.state = "suspended";
     }
     async close() { this.closed = true; this.state = "closed"; }
     createAnalyser() {
-      return { fftSize: 0, connect() {}, getFloatTimeDomainData(samples) { samples.fill(0); } };
+      const analyser = {
+        fftSize: 0, connected: false, disconnected: false,
+        connect() { this.connected = true; },
+        disconnect() { this.connected = false; this.disconnected = true; },
+        getFloatTimeDomainData(samples) { samples.fill(0); },
+      };
+      analysers.push(analyser);
+      return analyser;
     }
     createBuffer(channels, length, sampleRate) {
       return { channels, length, sampleRate, duration: length / sampleRate, copyToChannel() {} };
@@ -636,13 +739,46 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
-  return { ...context.api, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
+  return { ...context.api, traces, advance(ms) { now += ms; }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, analysers, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
     holdSuspend() { suspendGateEnabled = true; },
     hangPlaybackResume() { playbackResumePending = true; },
     navigate() { selected = "fixture-other-conversation"; } };
 };
+
+test("Read Aloud buffers packet jitter through the shared adaptive renderer", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const { task, read } = await h.start();
+  const firstFrames = 3328; // The real helper's short initial codec packet (~139 ms).
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(firstFrames * 2), 0, false));
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  assert.equal(h.workletNodes.length, 0, "one short packet must not start Read Aloud");
+  h.advance(220);
+  const nextFrames = 11520;
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(nextFrames * 2), 1, false, firstFrames));
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  assert.equal(h.workletNodes.length, 1, "bounded headroom permits playback before message EOF");
+  const started = h.traces.find((entry) => entry.stage === "playback_started");
+  assert.ok(started.buffered_ms >= 600);
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(), 2, true, firstFrames + nextFrames));
+  const response = h.result();
+  response.result.binding.backend_id = "fixture-qwen";
+  response.result.binding.model_id = "fixture-read-aloud-model";
+  response.result.binding.voice_id = "fixture-persona-voice";
+  response.result.binding.tts_generation_segments = [{ stop_reason: "eos", generated_codec_frames: 7 }];
+  read.reply.resolve(response);
+  await task;
+  assert.equal(h.traces.find((entry) => entry.stage === "tts_backend_complete")
+    .generation_segments[0].stop_reason, "eos");
+  const route = h.traces.find((entry) => entry.stage === "tts_backend_complete");
+  assert.deepEqual(
+    { backend_id: route.backend_id, model_id: route.model_id, voice_id: route.voice_id },
+    { backend_id: "fixture-qwen", model_id: "fixture-read-aloud-model", voice_id: "fixture-persona-voice" },
+  );
+  assert.equal(h.traces.find((entry) => entry.stage === "tts_pcm_complete").pcm_packets, 2);
+  h.settle();
+});
 
 test("a completed streamed voice reply retains PCM for a real replay", async () => {
   const h = speechLifetimeHarness();
@@ -711,6 +847,65 @@ test("a cold reply's pending segment stays gated until its measured completion r
   await controller.stop();
 });
 
+test("the packet-level cold probe starts the playback controller before EOF and cannot wake a stopped player", async () => {
+  const timeline = [
+    [3_328, 0], [5_760, 123.7], [9_600, 319.3], [9_600, 517.6], [9_600, 720.5],
+  ];
+  const make = () => {
+    const h = speechLifetimeHarness();
+    const lead = new AdaptiveVoiceLeadController({
+      initialBufferComplete: true,
+      initialProbePending: true,
+    });
+    const playback = h.createPcmPlaybackBuffer({
+      autoplay: true,
+      retainHistory: false,
+      waitForCompletion: () => lead.shouldBufferCompleteReply(),
+    });
+    let previousArrival = 0;
+    let previousPcmMs = 0;
+    let sampleOffset = 0;
+    const push = async (index) => {
+      const [samples, arrivalMs] = timeline[index];
+      const audioMs = samples / 24;
+      lead.notePacket({
+        audioMs,
+        gapMs: index === 0 ? null : arrivalMs - previousArrival,
+        startupDeficitMs: Math.max(0, arrivalMs - previousPcmMs),
+      });
+      playback.push(h.pcmFrame(new Uint8Array(samples * 2), index, false, sampleOffset));
+      previousArrival = arrivalMs;
+      previousPcmMs += audioMs;
+      sampleOffset += samples;
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    return { h, lead, playback, push };
+  };
+
+  const active = make();
+  for (let index = 0; index < 4; index += 1) {
+    await active.push(index);
+    assert.equal(active.h.audioContexts.length, 0, `packet ${index + 1} stays behind the cold gate`);
+  }
+  assert.equal(active.lead.shouldBufferCompleteReply(), true);
+  await active.push(4);
+  assert.equal(active.lead.shouldBufferCompleteReply(), false);
+  assert.equal(active.playback.ready, true);
+  assert.equal(active.h.audioContexts.length, 1, "packet five creates the test renderer before EOF");
+  assert.equal(active.playback.playing, true);
+  await active.playback.stop();
+
+  const stopped = make();
+  for (let index = 0; index < 4; index += 1) await stopped.push(index);
+  assert.equal(stopped.h.audioContexts.length, 0);
+  await stopped.playback.stop();
+  await stopped.push(4);
+  await stopped.playback.reconsiderStartup();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped.lead.shouldBufferCompleteReply(), false, "the evidence can settle after stop");
+  assert.equal(stopped.h.audioContexts.length, 0, "late packet evidence cannot wake the stopped renderer");
+});
+
 test("a stopped player cannot be woken by clearing its cold startup gate", async () => {
   const h = speechLifetimeHarness();
   let probePending = true;
@@ -757,7 +952,7 @@ test("stop during delayed worklet preparation settles queued playback without cr
   assert.deepEqual(ended, [], "stopped queued completion is not reported as natural playback end");
 });
 
-test("stop during delayed context resume prevents playback-start callbacks and re-suspends late resume", async () => {
+test("cancelled delayed resume cannot suspend a successor on the shared context", async () => {
   const resume = speechDeferred();
   const h = speechLifetimeHarness({ worklet: true, playbackResumeGate: resume });
   const started = [];
@@ -770,13 +965,36 @@ test("stop during delayed context resume prevents playback-start callbacks and r
   const playback = controller.play();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.workletNodes.length, 1);
+  const context = h.audioContexts[0];
+  const oldNode = h.workletNodes[0];
+  const oldMessageHandler = oldNode.port.onmessage;
+  const suspendsBeforeStop = context.suspendCount;
 
   await controller.stop();
   assert.equal(await playback, false, "stop settles even while browser resume is pending");
+  assert.equal(context.suspendCount, suspendsBeforeStop, "stopping a cancelled owner does not suspend the shared clock");
+
+  const successorStarted = [];
+  const successor = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onPlaybackStarted: () => successorStarted.push(true),
+  });
+  successor.push(h.pcmFrame(new Uint8Array(6_000)));
+  const successorPlayback = successor.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.workletNodes.length, 2);
+  const successorNode = h.workletNodes[1];
   resume.resolve();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(started, [], "stale resume cannot announce playback or open capture");
-  assert.equal(h.audioContexts[0].state, "suspended", "a late resume is returned to the stopped state");
+  assert.equal(await successorPlayback, true);
+  assert.deepEqual(successorStarted, [true]);
+  assert.equal(context.state, "running", "late completion from the cancelled owner cannot suspend its successor");
+  assert.equal(successorNode.connected, true);
+  assert.doesNotThrow(() => oldMessageHandler({ data: { type: "drained", renderedFrames: 0 } }));
+  assert.equal(context.state, "running");
+  await successor.stop();
 });
 
 test("stop during a paused-context resume cannot schedule queued PCM or announce playback", async () => {
@@ -848,8 +1066,97 @@ test("call playback transfers PCM to the preallocated audio-thread ring", async 
   assert.equal(h.workletNodes[0].port.messages.at(-1).type, "finish");
   h.workletNodes[0].port.onmessage({ data: { type: "drained", renderedFrames: 3_000 } });
   assert.equal(ended.length, 1);
-  assert.equal(h.audioContexts[0].state, "suspended");
+  assert.equal(h.audioContexts[0].state, "running", "drain leaves the shared output clock running");
+  assert.equal(h.analysers[0].disconnected, true);
   await controller.stop();
+});
+
+test("shared worklet context survives drain and stop; stale old drain cannot pause its successor", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const firstEnded = [];
+  const first = h.createPcmPlaybackBuffer({
+    autoplay: true, retainHistory: false,
+    onEnded: () => firstEnded.push(true),
+  });
+  first.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const context = h.audioContexts[0];
+  const oldNode = h.workletNodes[0];
+  const alreadyQueuedDrainHandler = oldNode.port.onmessage;
+  const suspendsAfterStart = context.suspendCount;
+  first.finish();
+  alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000 } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(context.state, "running", "natural drain keeps the prepared shared audio clock alive");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.deepEqual(firstEnded, [true]);
+  assert.equal(h.analysers[0].disconnected, true, "natural EOF releases the old analyser graph");
+
+  const second = h.createPcmPlaybackBuffer({ autoplay: true, retainHistory: false });
+  second.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const newNode = h.workletNodes[1];
+  assert.equal(h.audioContexts.length, 1, "the successor reuses the prepared context");
+  assert.equal(context.state, "running");
+  assert.doesNotThrow(() => alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000 } }));
+  assert.equal(context.state, "running", "a late old-owner event cannot suspend successor playback");
+  assert.equal(newNode.connected, true, "late old-owner events leave the successor renderer connected");
+  assert.deepEqual(firstEnded, [true], "a stale duplicate drain is ignored after the old renderer ended");
+  assert.equal(h.analysers[1].connected, true, "the successor retains its own connected analyser graph");
+
+  await second.stop();
+  assert.equal(context.state, "running", "stopping one owner does not suspend the shared context");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+});
+
+test("explicit worklet pause and resume preserve the running shared audio clock", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const controller = h.createPcmPlaybackBuffer({ autoplay: true, retainHistory: false });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const context = h.audioContexts[0];
+  const node = h.workletNodes[0];
+  const suspendsAfterStart = context.suspendCount;
+
+  assert.equal(await controller.pause(), true);
+  assert.equal(context.state, "running", "pause is implemented in the worklet, not by suspending the shared context");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.equal(node.port.messages.at(-1).type, "pause");
+  assert.equal(await controller.play(), true);
+  assert.equal(context.state, "running");
+  assert.equal(context.suspendCount, suspendsAfterStart);
+  assert.equal(node.port.messages.at(-1).type, "resume");
+  await controller.stop();
+  assert.equal(h.analysers[0].disconnected, true, "stop disconnects the paused owner graph");
+});
+
+test("a drain already queued before pause still settles natural playback", async () => {
+  const h = speechLifetimeHarness({ worklet: true });
+  const ended = [];
+  const metrics = [];
+  const controller = h.createPcmPlaybackBuffer({
+    autoplay: true,
+    retainHistory: false,
+    onEnded: () => ended.push(true),
+    onRendererMetrics: (value) => metrics.push(value),
+  });
+  controller.push(h.pcmFrame(new Uint8Array(6_000)));
+  await new Promise((resolve) => setImmediate(resolve));
+  const node = h.workletNodes[0];
+  const alreadyQueuedDrainHandler = node.port.onmessage;
+  controller.finish();
+  assert.equal(node.port.messages.at(-1).type, "finish");
+  assert.equal(await controller.pause(), true);
+  assert.equal(controller.playing, false);
+  assert.equal(node.port.messages.at(-1).type, "pause");
+
+  alreadyQueuedDrainHandler({ data: { type: "drained", renderedFrames: 3_000, underruns: 0 } });
+  assert.deepEqual(ended, [true], "a valid terminal drain is honored even after pause changed UI playback state");
+  assert.equal(metrics.at(-1).reason, "ended");
+  assert.equal(metrics.at(-1).underruns, 0);
+  assert.equal(node.connected, false);
+  assert.equal(h.analysers[0].disconnected, true);
+  assert.equal(h.audioContexts[0].state, "running");
 });
 
 test("worklet playback joins producer, admission, render, and consumption on the audio clock", async () => {
@@ -1094,33 +1401,50 @@ test("live voice synthesis has an idle-progress deadline after first PCM", () =>
   assert.match(live, /invoke\("mom_llama_speech_stop", \{ operation \}\)/);
 });
 
-const liveTtsTailHarness = () => {
+const liveTtsTailHarness = ({ callActive = false, callEpoch = 0 } = {}) => {
   const invocations = [];
   const delivered = [];
   const timers = new Map();
   let operationNumber = 0;
   let now = 0;
   let timerNumber = 0;
-  class AdaptiveVoiceLeadController {
-    shouldDispatch() { return true; }
-    shouldBufferCompleteReply() { return false; }
-    shouldPrepareNextCall() { return false; }
-    startupRunwayMs() { return 0; }
-    startupDelayMs() { return 0; }
-    targetRunwayMs() { return 0; }
-    progressTimeoutMs() { return 60_000; }
-    notePacket() {}
-    noteSegment() {}
-    noteWait() {}
-    noteUnderrun() {}
-    calibration() { return {}; }
-    snapshot() { return {}; }
-  }
+  let playbackCallbacks = null;
+  let firstPcmObserved = false;
+  let bufferedMs = 0;
+  const wavBytes = new Uint8Array(46);
+  wavBytes.set(Buffer.from("RIFF"), 0);
+  new DataView(wavBytes.buffer).setUint32(4, 38, true);
+  wavBytes.set(Buffer.from("WAVEfmt "), 8);
+  new DataView(wavBytes.buffer).setUint32(16, 16, true);
+  new DataView(wavBytes.buffer).setUint16(20, 1, true);
+  new DataView(wavBytes.buffer).setUint16(22, 1, true);
+  new DataView(wavBytes.buffer).setUint32(24, 24_000, true);
+  new DataView(wavBytes.buffer).setUint32(28, 48_000, true);
+  new DataView(wavBytes.buffer).setUint16(32, 2, true);
+  new DataView(wavBytes.buffer).setUint16(34, 16, true);
+  wavBytes.set(Buffer.from("data"), 36);
+  new DataView(wavBytes.buffer).setUint32(40, 2, true);
+  let activeLeaf = "previous-leaf";
+  const prefills = [];
+  const capture = { retainedSamples: [1, 2, 3] };
   const controller = {
     playing: false,
-    bufferedMs: () => 0,
+    ready: true,
+    bufferedMs: () => bufferedMs,
+    wavBytes: () => wavBytes.slice(),
     reconsiderStartup: async () => false,
-    pushSegment(frame, operation) { delivered.push({ frame, operation }); },
+    pushSegment(frame, operation) {
+      delivered.push({ frame, operation });
+      if (!firstPcmObserved && frame?.data?.byteLength > 0) {
+        firstPcmObserved = true;
+        playbackCallbacks?.onFirstChunk?.({
+          bytes: frame.data.byteLength,
+          frames: frame.data.byteLength / (2 * (frame.channels || 1)),
+          sampleRate: frame.sampleRate || 24_000,
+          channels: frame.channels || 1,
+        });
+      }
+    },
     finish() {},
     stop: async () => {},
   };
@@ -1133,26 +1457,39 @@ const liveTtsTailHarness = () => {
   const context = {
     window: { setTimeout: setTimer, clearTimeout: clearTimer },
     performance: { now: () => ++now },
-    document: { createElement: () => ({ className: "" }), querySelector: () => null },
-    MomVoicePipelineScheduler: {
-      AdaptiveVoiceLeadController,
-      SemanticLeadController: class {
-        shouldPause() { return false; }
-        snapshot() { return {}; }
-      },
+    document: {
+      createElement: () => ({ className: "" }),
+      querySelector: () => null,
+      getElementById: () => null,
     },
+    MomVoicePipelineScheduler: { ...voicePipelineScheduler },
     voiceLeadCalibration: null,
     voiceLatencyTrace: { stages: [] },
+    MAX_FAILED_VOICE_REPLY_OWNERS: 1,
+    failedVoiceReplyOwners: new Map(),
+    activeVoiceNotePublications: new Set(),
+    selectedConversation: () => "voice-note-conversation",
+    activeDispatchConversation: null,
+    retainComposerDraft: async () => {},
+    refreshChat: async () => {},
+    voiceReplyPersistenceKey: (conversation, message) => `${conversation}\u0000${message}`,
     markVoiceLatencyIn(trace, stage, detail) { trace.stages.push({ stage, ...detail }); },
     decodePcmFrame: (frame) => frame,
+    isCanonicalPcmWav: (bytes) => bytes instanceof Uint8Array
+      && bytes.byteLength === 46
+      && Buffer.from(bytes.subarray(0, 4)).toString() === "RIFF"
+      && Buffer.from(bytes.subarray(8, 12)).toString() === "WAVE",
     pcmChannel: (onmessage) => ({ onmessage }),
-    createPcmPlaybackBuffer: () => controller,
+    createPcmPlaybackBuffer: (callbacks) => {
+      playbackCallbacks = callbacks;
+      return controller;
+    },
     speechOperationToken: () => `tts-op-${++operationNumber}`,
     rememberVoiceStreamRequest() {},
     voiceStreamRequestIds: new Set(),
     voiceReplyPlayback: new WeakMap(),
-    voiceCallActive: false,
-    voiceCallEpoch: 0,
+    voiceCallActive: callActive,
+    voiceCallEpoch: callEpoch,
     activeCallPlayback: null,
     liveVoiceTts: null,
     voiceReplyPlayRequested: false,
@@ -1162,8 +1499,21 @@ const liveTtsTailHarness = () => {
     activeCallTranscriptTask: null,
     voiceCallTranscriptSlotsDisabled: false,
     voiceRecording: null,
+    beginVoiceCapture: async () => { context.voiceRecording = capture; },
+    startVoicePrefill: async (conversation) => {
+      prefills.push({ conversation, activeLeaf });
+      return { session: `prefill-${prefills.length}`, leaf: activeLeaf };
+    },
     errorMessage: (error) => String(error),
     reportError() {},
+    chatEvents: [],
+    acquireStableChatBusy: (lease) => context.chatEvents.push(["acquire", lease]),
+    releaseChatBusy: (lease) => context.chatEvents.push(["release", lease]),
+    finishLiveMessage: (message) => context.chatEvents.push(["terminal", message]),
+    appendLiveMessage: (...args) => context.chatEvents.push(["message", ...args]),
+    appendLiveDelta: (...args) => context.chatEvents.push(["delta", ...args]),
+    settingEnabled: () => false,
+    keepLiveTailVisible() {},
     invoke(command, args) {
       if (command === "mom_llama_speech_stop") {
         invocations.push({ command, args, reply: null });
@@ -1181,6 +1531,10 @@ const liveTtsTailHarness = () => {
   assert.ok(chunkStart >= 0 && chunkEnd > chunkStart);
   speechVm.runInNewContext(
     ui.slice(chunkStart, chunkEnd)
+      + "\nlet pendingCallTranscriptJobs = globalThis.pendingCallTranscriptJobs;"
+      + "\nlet activeCallTranscriptJob = globalThis.activeCallTranscriptJob;"
+      + "\nlet activeCallTranscriptTask = globalThis.activeCallTranscriptTask;"
+      + "\nlet activeCallTranscriptOperation = globalThis.activeCallTranscriptOperation;"
       + block(ui, "  const beginLiveVoiceTts =", "  const chatRequestIsCancellable =")
       + "\nglobalThis.beginLiveVoiceTts = beginLiveVoiceTts;",
     context,
@@ -1201,8 +1555,423 @@ const liveTtsTailHarness = () => {
     timers.delete(entry[0]);
     entry[1]();
   };
-  return { context, invocations, delivered, synthesis, pcm, fireLatestTimer };
+  const startPlayback = async (playback) => {
+    controller.playing = true;
+    playbackCallbacks?.onPlaybackStarted?.({});
+    await new Promise((resolve) => setImmediate(resolve));
+    return playback;
+  };
+  const notifyBufferLevel = () => playbackCallbacks?.onBufferLevel?.();
+  const wireChatEvents = () => {
+    const eventStart = ui.indexOf("  const voiceStreamRequestIds = new Set();");
+    const eventEnd = ui.indexOf("\n  const mentionLiveId", eventStart);
+    assert.ok(eventStart >= 0 && eventEnd > eventStart);
+    context.chatRequestLease = ({ request_id }) => request_id
+      ? `chat-request:${request_id}` : null;
+    speechVm.runInNewContext(
+      ui.slice(eventStart, eventEnd)
+        + "\nglobalThis.dispatchChatEvent = onChatEvent;",
+      context,
+    );
+  };
+  return {
+    context, invocations, delivered, synthesis, pcm, fireLatestTimer,
+    startPlayback, notifyBufferLevel, prefills, capture, wireChatEvents,
+    setBufferedMs(value) { bufferedMs = value; },
+    setActiveLeaf(value) { activeLeaf = value; },
+    wavBytes: () => wavBytes.slice(),
+  };
 };
+
+// Exercise the production event router, sentence admission and adaptive scheduler
+// together. Only native IPC and audio-device I/O are controlled test boundaries;
+// these assertions are behavior checks, never real-model latency measurements.
+test("production voice route excludes reasoning and dispatches whole sentences against actual runway policy", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "call", requestId: "shared-route",
+  });
+  h.context.liveVoiceTts = playback;
+  h.wireChatEvents();
+  const send = (event, delta = "") => h.context.dispatchChatEvent({ payload: {
+    event, delta, request_id: "shared-route", conversation_id: "voice-note-conversation",
+  } });
+  send("started");
+  send("reasoning_delta", "Private reasoning must never be spoken. ");
+  assert.equal(h.synthesis().length, 0, "reasoning never reaches native speech synthesis");
+  const prefix = "We can take our time and look at ";
+  send("delta", prefix);
+  assert.equal(h.synthesis().length, 0,
+    "eight complete words are not a sentence and cannot trigger the retired word-count route");
+  const firstSentence = `${prefix}what matters most to you.`;
+  send("delta", "what matters most to you. ");
+  assert.equal(h.synthesis().length, 1);
+  assert.equal(h.synthesis()[0].args.text, firstSentence);
+  assert.equal(h.synthesis()[0].args.purpose, "call");
+
+  const secondSentence = "There is no need to rush this conversation.";
+  send("delta", secondSentence);
+  send("text_completed", `${firstSentence} ${secondSentence}`);
+  const completed = playback.finish(`${firstSentence} ${secondSentence}`);
+  h.setBufferedMs(6_000);
+  await h.startPlayback(playback);
+  const settle = (segment, label) => {
+    segment.args.pcmStream.onmessage(h.pcm(label));
+    segment.args.pcmStream.onmessage(h.pcm(`${label}-eof`, true));
+    segment.reply.resolve({ status: "passed", result: { binding: {
+      backend_id: "fixture-pocket-cpu", model_id: "fixture-model", voice_id: "fixture-voice",
+      tts_total_ms: 1, duration_ms: 1,
+    } } });
+  };
+  settle(h.synthesis()[0], "first");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.synthesis().length, 1,
+    "the real adaptive scheduler holds the next sentence while playback has ample audio");
+  assert.ok(h.context.voiceLatencyTrace.stages.some(
+    ({ stage }) => stage === "tts_scheduler_wait_started",
+  ));
+  h.setBufferedMs(0);
+  h.notifyBufferLevel();
+  h.fireLatestTimer();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.synthesis().map(({ args }) => args.text), [firstSentence, secondSentence]);
+  settle(h.synthesis()[1], "second");
+  assert.equal(await completed, true);
+  assert.deepEqual(h.delivered.map(({ frame }) => frame.label),
+    ["first", "first-eof", "second", "second-eof"]);
+  const finished = h.context.voiceLatencyTrace.stages.filter(
+    ({ stage }) => stage === "tts_segment_finished",
+  );
+  assert.equal(finished[0].backend_id, "fixture-pocket-cpu");
+  assert.equal(finished[0].model_id, "fixture-model");
+  assert.equal(finished[0].voice_id, "fixture-voice");
+});
+
+const finishVoiceNoteAudio = async (h, playback) => {
+  const completed = playback.finish("A saved spoken reply.");
+  assert.equal(h.synthesis().length, 1, "one bounded sentence starts one TTS request");
+  const segment = h.synthesis()[0];
+  segment.args.pcmStream.onmessage(h.pcm("audio"));
+  segment.args.pcmStream.onmessage(h.pcm("eof", true));
+  segment.reply.resolve({
+    status: "passed",
+    result: { binding: { tts_total_ms: 2, duration_ms: 1 } },
+  });
+  assert.equal(await completed, true);
+};
+
+test("voice-note audio publication waits for both committed message identity and completed PCM", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  const target = {
+    conversation: "voice-note-conversation",
+    message: "assistant-message-17",
+    text: "A saved spoken reply.",
+  };
+  const saved = playback.bindDurableVoiceReply(target);
+  assert.equal(h.invocations.some(({ command }) => command === "mom_llama_voice_reply_store"), false,
+    "native persistence must wait for the complete WAV");
+  await finishVoiceNoteAudio(h, playback);
+  assert.equal(h.synthesis()[0].args.purpose, "voice_note");
+  const store = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.ok(store, "publication runs even with no mounted message row");
+  assert.deepEqual({ ...store.args, bytes: undefined }, {
+    ...target, bytes: undefined,
+  });
+  assert.equal(store.args.bytes.length, 46);
+  store.reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-17" } },
+  });
+  assert.equal(await saved, "voice-attachment-17");
+  assert.equal(playback.durableVoiceAttachmentId, "voice-attachment-17");
+  assert.ok(playback.trace.stages.some(({ stage }) => stage === "durable_voice_audio_ready"));
+});
+
+test("voice-note audio completed before the native message ID is still published", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  await finishVoiceNoteAudio(h, playback);
+  const saved = playback.bindDurableVoiceReply({
+    conversation: "voice-note-conversation",
+    message: "assistant-message-18",
+    text: "A saved spoken reply.",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const store = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.ok(store, `completed audio remains owned after TTS EOF and view navigation: ${String(playback.durableVoiceStoreError)}`);
+  store.reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-18" } },
+  });
+  assert.equal(await saved, "voice-attachment-18");
+});
+
+test("failed voice-note audio save stays in-memory and can be retried", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  await finishVoiceNoteAudio(h, playback);
+  const target = {
+    conversation: "voice-note-conversation",
+    message: "assistant-message-19",
+    text: "A saved spoken reply.",
+  };
+  const failedSave = playback.bindDurableVoiceReply(target);
+  await new Promise((resolve) => setImmediate(resolve));
+  const failedStore = h.invocations.find(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "pending native persistence keeps the note slot reserved");
+  failedStore.reply.resolve({ status: "blocked", blocker: { code: "offline", message: "Offline" } });
+  assert.equal(await failedSave, null);
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "save failure transfers ownership to the retryable PCM map");
+  assert.equal(h.context.failedVoiceReplyOwners.size, 1);
+  assert.equal(playback.durableVoiceAttachmentId, null);
+  assert.ok(playback.durableVoiceStoreError);
+  assert.equal(h.wavBytes().byteLength, 46, "the completed PCM remains available in this session");
+  const retried = playback.retryDurableVoiceReply();
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "retry reserves the capture slot while native save is pending");
+  await new Promise((resolve) => setImmediate(resolve));
+  const stores = h.invocations.filter(({ command }) => command === "mom_llama_voice_reply_store");
+  assert.equal(stores.length, 2);
+  stores[1].reply.resolve({
+    status: "contracted",
+    result: { attachment: { id: "voice-attachment-19" } },
+  });
+  assert.equal(await retried, "voice-attachment-19");
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "successful retry releases the capture slot");
+});
+
+test("failed synthesis does not occupy the retryable save-owner slot", async () => {
+  const h = liveTtsTailHarness();
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "voice-note-conversation", mode: "voice_note",
+  });
+  assert.equal(h.context.activeVoiceNotePublications.size, 1, "the note slot is reserved during synthesis");
+  await playback.unavailable(new Error("synthetic generation failure"));
+  assert.equal(h.context.activeVoiceNotePublications.size, 0, "a synthesis failure releases the reservation");
+  const save = playback.bindDurableVoiceReply({
+    conversation: "voice-note-conversation",
+    message: "assistant-message-failed-synthesis",
+    text: "A reply that has no completed audio.",
+  });
+  assert.equal(await save, null);
+  assert.equal(h.context.failedVoiceReplyOwners.size, 0, "no unplayable PCM is retained as a retryable save");
+  assert.equal(h.invocations.some(({ command }) => command === "mom_llama_voice_reply_store"), false);
+  assert.equal(h.context.activeVoiceNotePublications.size, 0);
+});
+
+test("failed unconfirmed speculation leaves the caller's capture and prefill alone", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const caller = { trace: { id: "caller" }, retainedSamples: [1, 2, 3] };
+  h.context.voiceRecording = caller;
+  let admissions = 0;
+  h.context.beginVoiceCapture = async () => {
+    admissions += 1;
+    throw new Error("Voice capture is already active.");
+  };
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+    deferPlayback: true,
+  });
+  assert.equal(await playback.unavailable(new Error("empty model response")), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admissions, 0, "unconfirmed failure must not reopen an owned microphone");
+  assert.equal(h.context.voiceRecording, caller);
+  assert.deepEqual(h.prefills, [], "the speculative owner must not create a competing prompt");
+});
+
+test("late reply failure cannot replace a newer capture in the same call", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  const newer = { trace: { id: "newer-capture" } };
+  h.context.voiceRecording = newer;
+  let admissions = 0;
+  h.context.beginVoiceCapture = async () => { admissions += 1; };
+  await playback.unavailable(new Error("late producer failure"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admissions, 0);
+  assert.equal(h.context.voiceRecording, newer);
+  assert.deepEqual(h.prefills, []);
+});
+
+test("failed audible reply preserves its capture and prepares its next turn", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  await h.startPlayback(playback);
+  await playback.unavailable(new Error("producer failed after playback"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.context.voiceRecording, h.capture);
+  assert.equal(h.prefills.length, 1);
+});
+
+test("text EOF flushes a held call reply and history waits for confirmed commit", async () => {
+  for (const text of [
+    "This short answer is complete.",
+    "This short answer has no punctuation",
+  ]) {
+    const h = liveTtsTailHarness({ callActive: true, callEpoch: 23 });
+    const pcmConfirmed = speechDeferred();
+    const commit = speechDeferred();
+    const nativeFinish = pcmConfirmed.promise.then(() => commit.promise).then((result) => {
+      h.setActiveLeaf(result.committedLeaf);
+      return result;
+    });
+    const playback = h.context.beginLiveVoiceTts({
+      conversation: "fixture-conversation",
+      mode: "call",
+      requestId: "request-final",
+      callEpoch: 23,
+      onFirstChunk: () => pcmConfirmed.resolve(true),
+    });
+    playback.trackGeneration(nativeFinish);
+    h.context.liveVoiceTts = playback;
+    h.wireChatEvents();
+
+    const finish = playback.finish.bind(playback);
+    let finishCalls = 0;
+    const finishResults = [];
+    playback.finish = (authoritativeText) => {
+      finishCalls += 1;
+      const result = finish(authoritativeText);
+      finishResults.push(result);
+      return result;
+    };
+
+    const payload = (event, delta = "") => ({
+      event,
+      request_id: "request-final",
+      conversation_id: "fixture-conversation",
+      delta,
+    });
+    h.context.dispatchChatEvent({ payload: payload("started") });
+    h.context.dispatchChatEvent({ payload: payload("delta", text) });
+    assert.equal(h.synthesis().length, 0,
+      "the last word is held until the native text EOF arrives");
+
+    h.context.dispatchChatEvent({ payload: payload("text_completed", text) });
+    assert.equal(h.synthesis().length, 1,
+      "the nonterminal text EOF must flush the last sentence while native completion is pending");
+    assert.equal(h.synthesis()[0].args.text, text);
+    assert.equal(h.context.chatEvents.some(([kind]) => kind === "release"), false,
+      "text EOF must not release the native chat request lease");
+
+    h.context.dispatchChatEvent({ payload: payload("text_completed", text) });
+    assert.equal(finishCalls, 2, "duplicate EOF reaches the closed owner idempotently");
+    assert.equal(finishResults[0], finishResults[1],
+      "duplicate EOF returns the same production completion promise");
+    assert.equal(h.synthesis().length, 1, "duplicate EOF must not replay synthesis");
+    assert.deepEqual(h.prefills, [], "history preparation remains behind native settlement");
+
+    const segment = h.synthesis()[0];
+    segment.args.pcmStream.onmessage(h.pcm("first-pcm"));
+    assert.equal(await pcmConfirmed.promise, true,
+      "the first validated PCM packet supplies the pending native confirmation");
+    assert.deepEqual(h.prefills, [],
+      "PCM confirmation alone does not release next-turn history before the commit settles");
+
+    segment.args.pcmStream.onmessage(h.pcm("eof", true));
+    segment.reply.resolve({
+      status: "passed",
+      result: { binding: { tts_total_ms: 1, duration_ms: 1 } },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.prefills, [], "TTS completion cannot substitute for native commit settlement");
+
+    commit.resolve({ committedLeaf: "committed-after-voice-confirmation" });
+    await nativeFinish;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.prefills, [{
+      conversation: "fixture-conversation",
+      activeLeaf: "committed-after-voice-confirmation",
+    }], "the next prefill must observe the committed assistant turn");
+    assert.equal(await finishResults[0], true);
+
+    h.context.dispatchChatEvent({ payload: payload("completed") });
+    assert.equal(h.synthesis().length, 1,
+      "the terminal event after commit must not replay the already-flushed text");
+    assert.equal(h.context.chatEvents.some(([kind]) => kind === "release"), true,
+      "only the native terminal event releases the request lease");
+  }
+});
+
+test("queued transcript slot waits for EOF-triggered native settlement and rechecks caller state", async () => {
+  for (const changedState of [null, "hangup", "caller_onset"]) {
+    const h = liveTtsTailHarness({ callActive: true, callEpoch: 23 });
+    const generation = speechDeferred();
+    const resident = speechDeferred();
+    const slotStarted = [];
+    h.context.voiceCallActive = true;
+    h.context.voiceCallEpoch = 23;
+    h.context.voiceRecording = {
+      call: true,
+      prefillDeferred: true,
+      voiceActivity: { heardVoice: false },
+    };
+    h.context.pendingCallTranscriptJobs.push({ output: {} });
+    h.context.MomVoicePipelineScheduler.shouldRunCallTranscriptSlot = () => true;
+    h.context.startPendingCallTranscriptSlot = () => {
+      slotStarted.push(true);
+      return new Promise(() => {});
+    };
+    const invoke = h.context.invoke;
+    h.context.invoke = (command, args) => command === "mom_llama_speech_parakeet_resident"
+      ? resident.promise : invoke(command, args);
+
+    const playback = h.context.beginLiveVoiceTts({
+      conversation: "fixture-conversation",
+      mode: "call",
+      requestId: "request-transcript-slot",
+      callEpoch: 23,
+    });
+    playback.trackGeneration(generation.promise);
+    h.context.liveVoiceTts = playback;
+    h.wireChatEvents();
+    const payload = (event, delta = "") => ({
+      event,
+      request_id: "request-transcript-slot",
+      conversation_id: "fixture-conversation",
+      delta,
+    });
+    h.context.dispatchChatEvent({ payload: payload("started") });
+    h.context.dispatchChatEvent({ payload: payload("delta", "A final short reply") });
+    assert.equal(h.synthesis().length, 0, "the unfinished final sentence stays buffered");
+    h.context.dispatchChatEvent({ payload: payload("text_completed", "A final short reply") });
+    assert.equal(h.synthesis().length, 1, "EOF flushes the final sentence before native settlement");
+
+    const segment = h.synthesis()[0];
+    segment.args.pcmStream.onmessage(h.pcm("first-pcm"));
+    segment.args.pcmStream.onmessage(h.pcm("eof", true));
+    segment.reply.resolve({
+      status: "passed",
+      result: { binding: { tts_total_ms: 1, duration_ms: 1 } },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    h.notifyBufferLevel();
+
+    resident.resolve({ status: "passed", result: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(slotStarted, [],
+      "the transcript slot cannot start while the native assistant commit is pending");
+
+    if (changedState === "hangup") h.context.voiceCallActive = false;
+    if (changedState === "caller_onset") h.context.voiceRecording.voiceActivity.heardVoice = true;
+    generation.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(slotStarted.length, changedState === null ? 1 : 0,
+      `${changedState === null
+        ? "the queued transcript slot may start after settlement"
+        : `the settled slot rechecks ${changedState} before starting`}; stages=${JSON.stringify(h.context.voiceLatencyTrace.stages.map(({ stage }) => stage))}`);
+  }
+});
 
 test("live TTS keeps the next segment behind the old channel's terminal PCM tail", async () => {
   const h = liveTtsTailHarness();
@@ -1260,6 +2029,93 @@ test("stopping live TTS releases promptly while it waits for channel EOF", async
   assert.equal(stopSettled, true, "stop must not await the missing PCM EOF");
   assert.equal(h.synthesis().length, 1, "stop must not dispatch queued text before old channel EOF");
   assert.equal(await completed, false, "stop settles without waiting for channel EOF");
+});
+
+test("interrupted call keeps capture live but waits for native commit before next prefill", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 7 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 7,
+  });
+  const native = speechDeferred();
+  const committedGeneration = native.promise.then((result) => {
+    h.setActiveLeaf(result.committedLeaf);
+    return result;
+  });
+  assert.equal(playback.trackGeneration(committedGeneration), committedGeneration,
+    "tracking must return the exact native operation to its existing caller");
+  await h.startPlayback(playback);
+  assert.equal(h.context.voiceRecording, h.capture,
+    "playback hands off to a capture that retains the caller's samples");
+
+  const stopping = playback.interruptForSpeech();
+  const stoppedBeforeCommit = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeCommit) native.resolve({ committedLeaf: "assistant-committed" });
+  assert.equal(stoppedBeforeCommit, true,
+    "stopping audible speech must not wait for Gemma's history commit");
+  assert.equal(h.context.voiceRecording, h.capture,
+    "interrupting playback must preserve the active microphone capture");
+  assert.deepEqual(h.prefills, [],
+    "next-turn prompt preparation must wait while the previous native request is pending");
+
+  native.resolve({ committedLeaf: "assistant-committed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.prefills, [{ conversation: "fixture-conversation", activeLeaf: "assistant-committed" }],
+    "the next prefill must observe the leaf after the native operation settles");
+});
+
+test("a rejected native generation still releases next-turn prefill safely", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 3 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 3,
+  });
+  const native = speechDeferred();
+  const tracked = playback.trackGeneration(native.promise);
+  tracked.catch(() => {});
+  await h.startPlayback(playback);
+  const stopping = playback.stop();
+  const stoppedBeforeSettlement = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeSettlement) native.reject(new Error("native request failed"));
+  assert.equal(stoppedBeforeSettlement, true,
+    "playback stop must remain prompt while native generation is pending");
+  assert.deepEqual(h.prefills, []);
+
+  native.reject(new Error("native request failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.prefills.length, 1,
+    "a failed native request has settled and must not strand the next capture");
+  assert.equal(h.prefills[0].activeLeaf, "previous-leaf");
+});
+
+test("hangup while waiting for native settlement suppresses next-turn prefill", async () => {
+  const h = liveTtsTailHarness({ callActive: true, callEpoch: 11 });
+  const playback = h.context.beginLiveVoiceTts({
+    conversation: "fixture-conversation", mode: "call", callEpoch: 11,
+  });
+  const native = speechDeferred();
+  playback.trackGeneration(native.promise);
+  await h.startPlayback(playback);
+  const stopping = playback.stop();
+  const stoppedBeforeSettlement = await Promise.race([
+    stopping.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  if (!stoppedBeforeSettlement) native.resolve({});
+  assert.equal(stoppedBeforeSettlement, true,
+    "playback teardown must not wait for the native request");
+  assert.deepEqual(h.prefills, []);
+
+  h.context.voiceCallActive = false;
+  h.context.voiceCallEpoch += 1;
+  native.resolve({ committedLeaf: "late-commit" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.prefills, [],
+    "the delayed settlement must recheck call ownership before opening a prefill");
 });
 
 test("live TTS also waits for native success when channel EOF arrives first", async () => {
@@ -1564,29 +2420,24 @@ test("late worklet callbacks after stop neither schedule stale PCM nor update ow
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(await playing, true);
   const node = h.workletNodes[0];
+  const alreadyQueuedHandler = node.port.onmessage;
   assert.equal(node.port.messages.filter((message) => message.type === "pcm").length, 8);
 
   // Fill the 8-second ring and leave one packet queued in the main-thread
   // buffer. A consumed callback arriving after stop must not schedule it.
   controller.push(h.pcmFrame(oneSecond, 8, false, 8 * 24_000));
   assert.equal(h.audioContexts[0].sources.length, 0);
-  h.holdSuspend();
-  let stopped = false;
-  const stopping = controller.stop().then(() => { stopped = true; });
-  for (let attempt = 0; attempt < 100 && !h.audioContexts[0].suspendCalled; attempt += 1) {
-    await Promise.resolve();
-  }
-  assert.equal(h.audioContexts[0].suspendCalled, true);
-  assert.equal(stopped, false, "the simulated context suspension is still pending");
-
-  node.port.onmessage({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
-  node.port.onmessage({ data: { type: "underrun", missingFrames: 240 } });
+  await controller.stop();
+  assert.equal(h.audioContexts[0].state, "running", "stop retires only the old graph on the shared context");
+  assert.equal(node.connected, false);
+  assert.equal(node.port.onmessage, null, "teardown detaches future event delivery");
+  // This saved callback models an event already queued in the renderer before
+  // teardown detached the port handler.
+  alreadyQueuedHandler({ data: { type: "consumed", frames: 24_000, renderedFrames: 24_000 } });
+  alreadyQueuedHandler({ data: { type: "underrun", missingFrames: 240 } });
   const observed = {
     staleBufferSources: h.audioContexts[0].sources.length,
     lateUnderrunFeedback: lateUnderruns.length,
   };
-  suspendGate.resolve();
-  await stopping;
-  assert.equal(stopped, true);
   assert.deepEqual(observed, { staleBufferSources: 0, lateUnderrunFeedback: 0 });
 });

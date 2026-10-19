@@ -1636,7 +1636,8 @@ pub fn message_copy(conversation_id: &str, message_id: &str) -> Result<CommandRe
         MessageCopy {
             conversation_id: conversation_id.to_string(),
             message_id: message_id.to_string(),
-            content: message.content.clone(),
+            content: crate::chat::assistant_visible_content(message)
+                .unwrap_or_else(|| message.content.clone()),
         },
         Vec::new(),
         Vec::new(),
@@ -1899,12 +1900,46 @@ pub fn draft_update(
     attachment_ids: Vec<String>,
 ) -> Result<CommandResult<DraftMessage>> {
     let mut db = load_drafts()?;
-    let expected_drafts = db.clone();
     let key = draft_key(conversation_id);
-    let previous_attachment_ids = db
+    let existing = db
         .drafts
         .iter()
         .find(|draft| draft_key(draft.conversation_id.as_deref()) == key)
+        .cloned();
+    if let Some(existing) = existing.as_ref()
+        && existing.message == message
+        && existing.attachment_ids == attachment_ids
+    {
+        return Ok(CommandResult::passed(
+            "mom_llama.draft_update",
+            "contracted",
+            existing.clone(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        ));
+    }
+    let draft = DraftMessage {
+        conversation_id: conversation_id.map(str::to_string),
+        message,
+        attachment_ids,
+        updated_at: now_ms().to_string(),
+    };
+    if existing.is_none() && draft.message.trim().is_empty() && draft.attachment_ids.is_empty() {
+        return Ok(CommandResult::passed(
+            "mom_llama.draft_update",
+            "contracted",
+            draft,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        ));
+    }
+    let expected_drafts = db.clone();
+    let previous_attachment_ids = existing
+        .as_ref()
         .map(|draft| {
             draft
                 .attachment_ids
@@ -1913,12 +1948,6 @@ pub fn draft_update(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let draft = DraftMessage {
-        conversation_id: conversation_id.map(str::to_string),
-        message,
-        attachment_ids,
-        updated_at: now_ms().to_string(),
-    };
     if draft.message.trim().is_empty() && draft.attachment_ids.is_empty() {
         db.drafts
             .retain(|existing| draft_key(existing.conversation_id.as_deref()) != key);
@@ -2748,6 +2777,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn message_copy_projects_legacy_assistant_markers_without_rewriting_storage() {
+        with_rename_store(|store| {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    crate::config::set_data_dir_override_for_tests(None);
+                }
+            }
+            crate::config::set_data_dir_override_for_tests(Some(
+                store
+                    .path()
+                    .parent()
+                    .expect("store directory")
+                    .to_path_buf(),
+            ));
+            let _reset = Reset;
+            let raw = "<|channel>thought\nprivate reasoning<channel|>Visible answer.";
+            let mut conversation = document_fixture();
+            conversation.messages[1].content = raw.to_string();
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![conversation],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+
+            let copied = super::message_copy("host", "a")?
+                .result
+                .expect("assistant copy");
+            assert_eq!(copied.content, "Visible answer.");
+            let stored = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("stored source");
+            assert_eq!(stored.conversations[0].messages[1].content, raw);
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn malformed_history_cannot_replace_or_silently_repair_durable_source() {
         with_rename_store(|store| {
             let db = super::ConversationDb {
@@ -2804,6 +2874,103 @@ mod tests {
         let store =
             crate::store::RuntimeStore::open(&directory).expect("open encrypted test store");
         test(&store).expect("rename store regression");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_update_skips_identical_and_missing_empty_writes_but_persists_changes_and_removal() {
+        with_rename_store(|store| {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    crate::config::set_data_dir_override_for_tests(None);
+                }
+            }
+            crate::config::set_data_dir_override_for_tests(Some(
+                store
+                    .path()
+                    .parent()
+                    .expect("store directory")
+                    .to_path_buf(),
+            ));
+            let _reset = Reset;
+
+            let original = super::DraftMessage {
+                conversation_id: Some("host".into()),
+                message: "retained draft".into(),
+                attachment_ids: vec!["staged-attachment".into()],
+                updated_at: "123".into(),
+            };
+            store.put(
+                super::DRAFTS_NAMESPACE,
+                &super::DraftDb {
+                    drafts: vec![original.clone()],
+                },
+            )?;
+            let original_bytes = store
+                .get_bytes(super::DRAFTS_NAMESPACE)?
+                .expect("persisted draft bytes");
+            let attachments_before = store.get_bytes(crate::attachments::ATTACHMENTS_NAMESPACE)?;
+
+            let unchanged = super::draft_update(
+                Some("host"),
+                original.message.clone(),
+                original.attachment_ids.clone(),
+            )?;
+            assert_eq!(unchanged.result, Some(original.clone()));
+            assert_eq!(
+                store.get_bytes(super::DRAFTS_NAMESPACE)?,
+                Some(original_bytes.clone())
+            );
+            assert_eq!(
+                store.get_bytes(crate::attachments::ATTACHMENTS_NAMESPACE)?,
+                attachments_before,
+                "an identical draft must not invoke attachment garbage collection"
+            );
+
+            let empty = super::draft_update(Some("new-chat"), " \n ".into(), Vec::new())?;
+            assert_eq!(empty.result.expect("empty draft result").message, " \n ");
+            assert_eq!(
+                store.get_bytes(super::DRAFTS_NAMESPACE)?,
+                Some(original_bytes.clone())
+            );
+            assert_eq!(
+                store.get_bytes(crate::attachments::ATTACHMENTS_NAMESPACE)?,
+                attachments_before,
+                "an absent empty draft must remain a non-persisting no-op"
+            );
+
+            let changed = super::draft_update(
+                Some("host"),
+                "changed draft".into(),
+                vec!["staged-attachment".into()],
+            )?;
+            assert_eq!(
+                changed.result.expect("changed draft result").message,
+                "changed draft"
+            );
+            let changed_bytes = store
+                .get_bytes(super::DRAFTS_NAMESPACE)?
+                .expect("changed draft bytes");
+            assert_ne!(changed_bytes, original_bytes);
+
+            let removed = super::draft_update(Some("host"), String::new(), Vec::new())?;
+            assert_eq!(removed.result.expect("removed draft result").message, "");
+            assert!(
+                store
+                    .get::<super::DraftDb>(super::DRAFTS_NAMESPACE)?
+                    .expect("draft database")
+                    .drafts
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .get_bytes(crate::attachments::ATTACHMENTS_NAMESPACE)?
+                    .is_some(),
+                "removing staged attachment IDs must still run the atomic GC path"
+            );
+            Ok(())
+        });
     }
 
     #[cfg(unix)]

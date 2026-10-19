@@ -390,7 +390,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         maxTokens: Int? = nil,
         chunkSize: Int? = nil,
         preparedPrefixKey: String? = nil,
-        isCancelled: (@Sendable () -> Bool)? = nil
+        isCancelled: (@Sendable () -> Bool)? = nil,
+        onGenerationComplete: (@Sendable (TTSGenerationReport) -> Void)? = nil
     ) -> AsyncThrowingStream<AudioChunk, Error> {
         _generateStreamImpl(
             text: text,
@@ -403,7 +404,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             maxTokens: maxTokens,
             chunkSize: chunkSize,
             preparedPrefixKey: preparedPrefixKey,
-            isCancelled: isCancelled
+            isCancelled: isCancelled,
+            onGenerationComplete: onGenerationComplete
         )
     }
 
@@ -566,7 +568,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         maxTokens: Int?,
         chunkSize: Int?,
         preparedPrefixKey: String?,
-        isCancelled: (@Sendable () -> Bool)? = nil
+        isCancelled: (@Sendable () -> Bool)? = nil,
+        onGenerationComplete: (@Sendable (TTSGenerationReport) -> Void)? = nil
     ) -> AsyncThrowingStream<AudioChunk, Error> {
         let temp = temperature ?? pipelineConfig.defaultTemperature
         let tokens = maxTokens ?? pipelineConfig.defaultMaxTokens
@@ -602,7 +605,8 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             adaptiveChunking: true,
                             preparedPrefixKey: preparedPrefixKey,
                             isCancelled: isCancelled,
-                            afterYield: { await batchGate.wait() }
+                            afterYield: { await batchGate.wait() },
+                            onGenerationComplete: onGenerationComplete
                         )
                     }
 

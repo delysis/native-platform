@@ -87,6 +87,14 @@
       this.healthySegmentCount = initialHealthySegmentCount;
       this.bufferComplete = initialBufferComplete;
       this.probePending = initialProbePending;
+      this.probePackets = 0;
+      this.probeAudioMs = 0;
+      this.probeFirstPacketMs = 0;
+      this.probeElapsedMs = 0;
+      this.probeMaximumGapMs = 0;
+      this.probePeakDeficitMs = 0;
+      this.probeRecentIntervals = [];
+      this.probeReleasedEarly = false;
       this.replySegmentCount = 0;
       this.waits = 0;
       this.waitMs = 0;
@@ -115,6 +123,47 @@
           startupDeficitMs,
           this.requiredStartupDelayMs * 0.92,
         );
+      }
+      if (this.probePending && this.bufferComplete && this.replySegmentCount === 0
+          && !boundary && Number.isFinite(audioMs) && audioMs > 0) {
+        if (!Number.isFinite(startupDeficitMs) || startupDeficitMs < 0) {
+          this.probePending = false;
+          return;
+        }
+        this.probePackets += 1;
+        this.probeAudioMs += audioMs;
+        if (this.probePackets === 1) this.probeFirstPacketMs = audioMs;
+        else if (Number.isFinite(gapMs) && gapMs >= 0) {
+          this.probeElapsedMs += gapMs;
+          this.probeMaximumGapMs = Math.max(this.probeMaximumGapMs, gapMs);
+          this.probeRecentIntervals.push({ gapMs, audioMs });
+          if (this.probeRecentIntervals.length > 2) this.probeRecentIntervals.shift();
+        } else {
+          // Missing cadence cannot qualify an early start. Segment completion
+          // remains the fallback, using its independently measured duration.
+          this.probePending = false;
+          return;
+        }
+        this.probePeakDeficitMs = Math.max(this.probePeakDeficitMs, startupDeficitMs);
+        const recentGap = this.probeRecentIntervals.reduce((sum, item) => sum + item.gapMs, 0);
+        const recentAudio = this.probeRecentIntervals.reduce((sum, item) => sum + item.audioMs, 0);
+        const leadMs = this.probeAudioMs - this.probeElapsedMs;
+        const requiredLeadMs = Math.max(600, this.startupRunwayMs(),
+          this.probePeakDeficitMs + this.probeMaximumGapMs + 80);
+        // Complete sentences still enter TTS together. The cold PCM probe can
+        // release before EOF only after several packets demonstrate sustained
+        // faster-than-playback production and retain a measured jitter margin.
+        // Two initial fast packets do not qualify a progressively slower
+        // decoder. Unknown/slow production keeps complete-reply buffering.
+        if (this.probePackets >= 5 && this.probeAudioMs >= 1_200
+            && this.probeElapsedMs >= 250 && this.underrunPenaltyMs === 0
+            && this.probeElapsedMs <= (this.probeAudioMs - this.probeFirstPacketMs) * 0.9
+            && this.probeRecentIntervals.length === 2 && recentGap <= recentAudio * 0.9
+            && leadMs >= requiredLeadMs) {
+          this.bufferComplete = false;
+          this.probePending = false;
+          this.probeReleasedEarly = true;
+        }
       }
     }
 
@@ -278,6 +327,8 @@
         observed_production_rtf: Math.round(this.productionRtf * 10_000) / 10_000,
         buffer_complete_reply: this.bufferComplete,
         startup_probe_pending: this.probePending,
+        startup_probe_released_early: this.probeReleasedEarly,
+        startup_probe_packets: this.probePackets,
         slow_segment_count: this.slowSegmentCount,
         healthy_segment_count: this.healthySegmentCount,
         observed_speech_ms_per_word: Math.round(this.speechMsPerWord * 100) / 100,
@@ -305,6 +356,29 @@
         minimumTargetMs: this.minimumTargetMs,
         maximumTargetMs: this.maximumTargetMs,
       };
+    }
+  }
+
+  // Synthesis purpose is also the enforced backend route: calls use Pocket
+  // CPU, while voice notes use Qwen. Keep their learned cadence separate so
+  // one backend cannot set the other's playback runway.
+  class VoiceLeadCalibrationCache {
+    constructor() {
+      this.values = new Map();
+    }
+
+    key(purpose) {
+      if (purpose === "call") return "call:pocket";
+      if (purpose === "voice_note") return "voice_note:qwen";
+      throw new RangeError(`unsupported voice synthesis purpose: ${purpose}`);
+    }
+
+    get(purpose) {
+      return this.values.get(this.key(purpose)) || null;
+    }
+
+    set(purpose, calibration) {
+      this.values.set(this.key(purpose), calibration);
     }
   }
 
@@ -340,6 +414,7 @@
 
   return {
     AdaptiveVoiceLeadController,
+    VoiceLeadCalibrationCache,
     SemanticLeadController,
     shouldRunCallTranscriptSlot,
     shouldDisableCallTranscriptSlotsAfterStop,

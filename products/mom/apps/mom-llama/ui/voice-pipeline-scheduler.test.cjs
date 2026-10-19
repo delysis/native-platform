@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
   AdaptiveVoiceLeadController,
+  VoiceLeadCalibrationCache,
   SemanticLeadController,
   shouldRunCallTranscriptSlot,
   shouldDisableCallTranscriptSlotsAfterStop,
@@ -202,6 +203,38 @@ test("a following turn starts from measured machine cadence without inheriting q
   assert.equal(second.snapshot().maximum_runway_ms, 0);
 });
 
+test("call/Pocket and voice-note/Qwen retain independent adaptive lead measurements", () => {
+  const cache = new VoiceLeadCalibrationCache();
+  const coldCalibration = { initialBufferComplete: true, initialProbePending: true };
+
+  const call = new AdaptiveVoiceLeadController(cache.get("call") || coldCalibration);
+  call.noteUnderrun(220);
+  cache.set("call", call.calibration());
+
+  const voiceNote = new AdaptiveVoiceLeadController(cache.get("voice_note") || coldCalibration);
+  voiceNote.noteSegment({ synthesisMs: 500, audioMs: 1_000, firstAudioMs: 150, words: 3 });
+  cache.set("voice_note", voiceNote.calibration());
+
+  const nextCall = new AdaptiveVoiceLeadController(cache.get("call"));
+  const nextVoiceNote = new AdaptiveVoiceLeadController(cache.get("voice_note"));
+  assert.ok(nextCall.startupDelayMs() > nextVoiceNote.startupDelayMs(),
+    "Pocket call underrun protection must not be replaced by faster Qwen cadence");
+  assert.ok(nextVoiceNote.snapshot().observed_production_rtf < 0.7,
+    "Qwen note keeps its own measured production rate");
+  assert.throws(() => cache.get("read_aloud"), /unsupported voice synthesis purpose/);
+
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
+  const start = source.indexOf("  const beginLiveVoiceTts =");
+  const end = source.indexOf("\n  const chatRequestIsCancellable =", start);
+  const liveTts = source.slice(start, end);
+  assert.match(liveTts, /const synthesisPurpose = mode === "call" \? "call" : "voice_note"/);
+  assert.match(liveTts, /calibrationCache\.get\(synthesisPurpose\)/);
+  assert.equal((liveTts.match(/calibrationCache\.set\(synthesisPurpose/g) || []).length, 3);
+  assert.match(liveTts, /purpose: synthesisPurpose/);
+});
+
 test("semantic lead uses hysteresis and never pauses on an unusable partial chunk", () => {
   const lead = new SemanticLeadController();
   assert.equal(lead.shouldPause({ queuedWords: 24, readyChunk: false }), false);
@@ -253,7 +286,7 @@ test("a cold-call probe releases only for a complete, clearly healthy segment", 
   const fs = require("node:fs");
   const path = require("node:path");
   const source = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
-  assert.match(source, /voiceLeadCalibration\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
+  assert.match(source, /calibrationCache\.get\(synthesisPurpose\)\s*\|\|\s*\{\s*initialBufferComplete:\s*true,\s*initialProbePending:\s*true\s*\}/);
 
   const cold = new AdaptiveVoiceLeadController({ initialBufferComplete: true, initialProbePending: true });
   assert.equal(cold.shouldBufferCompleteReply(), true);
@@ -294,6 +327,165 @@ test("cold-call buffering remains for short, slow, unknown, jittered, or previou
   noFirstAudioMeasurement.noteSegment({ synthesisMs: 500, audioMs: 1_000 });
   assert.equal(noFirstAudioMeasurement.shouldBufferCompleteReply(), true);
   assert.equal(noFirstAudioMeasurement.snapshot().startup_probe_pending, false);
+});
+
+test("cold PCM probe opens on a sustained healthy prefix from the recorded packet schedule", () => {
+  const coldTimeline = [
+    [3328, 0], [5760, 123.7], [9600, 319.3], [9600, 517.6], [9600, 720.5],
+    [9600, 931.9], [9600, 1149.1], [9600, 1366.9], [9600, 1573.9],
+    [9600, 1780.2], [5760, 1919.5], [4352, 2109.4],
+  ];
+  const controller = new AdaptiveVoiceLeadController({
+    initialBufferComplete: true,
+    initialProbePending: true,
+  });
+  let elapsed = 0;
+  let pcmMs = 0;
+  for (let index = 0; index < coldTimeline.length; index += 1) {
+    const [samples, relativeArrivalMs] = coldTimeline[index];
+    const audioMs = samples / 24;
+    const gapMs = index === 0 ? null : relativeArrivalMs - elapsed;
+    const startupDeficitMs = Math.max(0, relativeArrivalMs - pcmMs);
+    controller.notePacket({ audioMs, gapMs, startupDeficitMs });
+    elapsed = relativeArrivalMs;
+    pcmMs += audioMs;
+
+    if (index < 4) {
+      assert.equal(controller.shouldBufferCompleteReply(), true, `packet ${index + 1} is insufficient evidence`);
+    }
+    if (index === 4) {
+      assert.equal(controller.shouldBufferCompleteReply(), false, "packet five releases before sentence EOF");
+      assert.equal(controller.snapshot().startup_probe_released_early, true);
+      assert.equal(controller.snapshot().startup_probe_packets, 5);
+      assert.ok(pcmMs - elapsed >= 600, "the released prefix retains the measured lead margin");
+    }
+  }
+});
+
+test("warm recorded packet schedule satisfies the cold probe at packet five too", () => {
+  const warmTimeline = [
+    [3328, 0], [5760, 112.7], [9600, 300.7], [9600, 487.3], [9600, 673.2],
+    [9600, 866.4], [9600, 1063.0], [9600, 1280.1], [9600, 1495.7],
+    [9600, 1711.4], [5760, 1857.3], [4352, 2040.9],
+  ];
+  const controller = new AdaptiveVoiceLeadController({
+    initialBufferComplete: true,
+    initialProbePending: true,
+  });
+  let elapsed = 0;
+  let pcmMs = 0;
+  for (let index = 0; index < warmTimeline.length; index += 1) {
+    const [samples, relativeArrivalMs] = warmTimeline[index];
+    const audioMs = samples / 24;
+    controller.notePacket({
+      audioMs,
+      gapMs: index === 0 ? null : relativeArrivalMs - elapsed,
+      startupDeficitMs: Math.max(0, relativeArrivalMs - pcmMs),
+    });
+    elapsed = relativeArrivalMs;
+    pcmMs += audioMs;
+    if (index < 4) assert.equal(controller.shouldBufferCompleteReply(), true);
+    if (index === 4) {
+      assert.equal(controller.shouldBufferCompleteReply(), false);
+      assert.equal(controller.snapshot().startup_probe_released_early, true);
+      assert.equal(controller.snapshot().startup_probe_packets, 5);
+      assert.ok(pcmMs - elapsed >= 600);
+    }
+  }
+});
+
+test("cold PCM probe falls back for slow, deceptive, stalled, or previously-underrun schedules", () => {
+  const coldTimeline = [
+    [3328, 0], [5760, 123.7], [9600, 319.3], [9600, 517.6], [9600, 720.5],
+    [9600, 931.9], [9600, 1149.1], [9600, 1366.9], [9600, 1573.9],
+    [9600, 1780.2], [5760, 1919.5], [4352, 2109.4],
+  ];
+  const makeCold = (extra = {}) => new AdaptiveVoiceLeadController({
+    initialBufferComplete: true,
+    initialProbePending: true,
+    ...extra,
+  });
+  const replay = (gapScale = () => 1, stall = null, extra = {}) => {
+    const lead = makeCold(extra);
+    let previousArrival = 0;
+    let previousRawArrival = 0;
+    let cumulativeAudioMs = 0;
+    for (let index = 0; index < coldTimeline.length; index += 1) {
+      const [samples, rawArrival] = coldTimeline[index];
+      const arrival = index === 0 ? rawArrival : previousArrival
+        + (rawArrival - previousRawArrival) * gapScale(index)
+        + (stall && index === stall.index ? stall.ms : 0);
+      const audioMs = samples / 24;
+      const gapMs = index === 0 ? null : arrival - previousArrival;
+      const startupDeficitMs = Math.max(0, arrival - cumulativeAudioMs);
+      lead.notePacket({ audioMs, gapMs, startupDeficitMs });
+      previousArrival = arrival;
+      previousRawArrival = rawArrival;
+      cumulativeAudioMs += audioMs;
+    }
+    return lead;
+  };
+
+  for (const scale of [2, 3]) {
+    const slow = replay(() => scale);
+    assert.equal(slow.shouldBufferCompleteReply(), true, `${scale}x slower cadence must use full buffering`);
+    assert.equal(slow.snapshot().startup_probe_released_early, false);
+  }
+
+  const deceptive = replay((index) => (index <= 2 ? 0.5 : 2));
+  assert.equal(deceptive.shouldBufferCompleteReply(), true, "two early fast intervals cannot mask later 2x cadence");
+  assert.equal(deceptive.snapshot().startup_probe_released_early, false);
+
+  const stalledBeforeRelease = replay(() => 1, { index: 3, ms: 1_100 });
+  assert.equal(stalledBeforeRelease.shouldBufferCompleteReply(), true, "a 1.1 s stall before packet four keeps the cold probe closed");
+  assert.equal(stalledBeforeRelease.snapshot().startup_probe_released_early, false);
+
+  const hadUnderrun = replay(() => 1, null, { initialUnderrunPenaltyMs: 120 });
+  assert.equal(hadUnderrun.shouldBufferCompleteReply(), true);
+  assert.equal(hadUnderrun.snapshot().startup_probe_released_early, false);
+});
+
+test("warm controllers keep their existing buffer policy and do not enter the cold probe", () => {
+  const warm = new AdaptiveVoiceLeadController();
+  warm.notePacket({ audioMs: 138.667, gapMs: null, startupDeficitMs: 0 });
+  warm.notePacket({ audioMs: 240, gapMs: 123.7, startupDeficitMs: 0 });
+  assert.equal(warm.shouldBufferCompleteReply(), false);
+  assert.equal(warm.snapshot().startup_probe_pending, false);
+  assert.equal(warm.snapshot().startup_probe_released_early, false);
+  assert.equal(warm.snapshot().startup_probe_packets, 0);
+});
+
+test("a post-open 1.1 s stall fits measured runway; a real queue deficit uses existing recovery", () => {
+  const lead = new AdaptiveVoiceLeadController({ initialBufferComplete: true, initialProbePending: true });
+  const prefix = [
+    { audioMs: 138.667, gapMs: null, startupDeficitMs: 0 },
+    { audioMs: 240, gapMs: 123.7, startupDeficitMs: 0 },
+    { audioMs: 400, gapMs: 195.6, startupDeficitMs: 0 },
+    { audioMs: 400, gapMs: 198.3, startupDeficitMs: 0 },
+    { audioMs: 400, gapMs: 202.9, startupDeficitMs: 0 },
+  ];
+  for (const packet of prefix) lead.notePacket(packet);
+  assert.equal(lead.shouldBufferCompleteReply(), false);
+  assert.equal(lead.snapshot().startup_probe_released_early, true);
+
+  let queuedMs = prefix.reduce((sum, packet) => sum + packet.audioMs, 0);
+  const postOpenGapMs = 1_311.4;
+  const postOpenDeficitMs = Math.max(0, postOpenGapMs - queuedMs);
+  assert.equal(postOpenDeficitMs, 0, "the released prefix covers one 1.1 s late packet");
+  queuedMs -= postOpenGapMs;
+  lead.notePacket({ audioMs: 400, gapMs: postOpenGapMs, startupDeficitMs: 0 });
+  queuedMs += 400;
+  assert.equal(lead.snapshot().underrun_penalty_ms, 0, "a covered late packet does not invent an underrun");
+
+  const before = lead.startupRunwayMs();
+  const laterGapMs = 1_800;
+  const laterDeficitMs = Math.max(0, laterGapMs - queuedMs);
+  assert.ok(laterDeficitMs > 0, "a later gap exceeds queued PCM");
+  lead.notePacket({ audioMs: 400, gapMs: laterGapMs, startupDeficitMs: 0 });
+  lead.noteUnderrun(laterDeficitMs);
+  assert.equal(lead.startupRunwayMs(), before, "the existing bounded startup runway stays capped");
+  assert.ok(lead.snapshot().underrun_penalty_ms > 0, "an observed queue deficit activates existing underrun recovery");
+  assert.equal(lead.snapshot().startup_probe_released_early, true, "the one-shot cold probe is not rerun");
 });
 
 test("progress timeout grows with measured slow-machine cadence and stays bounded", () => {

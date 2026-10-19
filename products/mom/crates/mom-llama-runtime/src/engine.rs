@@ -211,7 +211,7 @@ pub fn runtime_warm_until_cancelled(
     ))
 }
 
-fn selected_voice_context_to_warm(settings: &mut Settings) -> Result<Option<String>> {
+pub(crate) fn selected_voice_context_to_warm(settings: &mut Settings) -> Result<Option<String>> {
     let store = RuntimeStore::current()?;
     let db: ConversationDb = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
     let draft = if db.selected_conversation_id.as_deref() == Some("default") {

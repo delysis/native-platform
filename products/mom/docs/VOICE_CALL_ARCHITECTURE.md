@@ -1,5 +1,14 @@
 # Voice call architecture
 
+Current qualification policy is in [VOICE_RELIABILITY.md](VOICE_RELIABILITY.md#production-path-qualification).
+The dated experimental timings below are historical component evidence. The
+former Rust resident-pipeline benchmark was removed because its private
+chunking, buffering and reasoning routing diverged from the application.
+Neither its computed safe-start times nor its synthetic reservoir measure
+current packaged-call playback. Current call admission buffers complete
+sentences (with a bounded long-sentence fallback); performance qualification
+must execute the packaged production path and use its actual renderer trace.
+
 Status: native capture, adaptive acoustic detection, incremental model prefill,
 silence-edge speculation, streaming synthesis, and AudioWorklet playback are
 implemented. Packaged conversational latency and barge-in remain qualification
@@ -131,20 +140,16 @@ Four words reached first PCM at 127.8 ms median / 136.4 ms p95, synthesized at
 no worse than 0.69 real-time factor, and retained at least 395.4 ms more audio
 than synthesis wall time. That experiment established the minimum viable
 runway, but independent four-word TTS requests produced conspicuous prosody
-resets in the packaged app. The live chunker now releases a naturally
-punctuated clause as soon as it is usable, with an unpunctuated fallback at six
-complete words for a call and ten for a voice note. Later fallbacks are eight
-and twelve words respectively. Qwen's first two codec frames yield about
-138.7 ms of PCM, so the renderer starts from that first complete packet rather
-than waiting for the next packet and inflating its runway to about 357 ms. The
-audio-thread ring still recovers coherently behind a 100 ms rebuffer boundary.
-Every trace records packet count, first-packet duration, maximum packet-arrival
-gap, and minimum producer lead so this lower bound remains continuously audited.
+resets in the packaged app. Calls now admit complete sentences, with a
+64-completed-word fallback for exceptionally long or unpunctuated output.
+Voice notes retain their separate production phrase policy. PCM startup uses
+the production adaptive scheduler; it is measured separately from text
+admission and is not inferred from the historical first-packet duration.
 
 The combined resident-model benchmark in
 `products/mom/artifacts/latency/2026-10-15-voice-pipeline-contention.json`
-feeds every real Gemma content delta through the same semantic chunk boundary as
-the product, then starts Qwen while both models share Metal. This deliberately
+used a separate semantic chunker and started Qwen while both models shared
+Metal. It did not execute the production UI scheduler or renderer. This deliberately
 includes the time from first token to a natural speakable fragment instead of
 pretending TTS can begin on one token. The latest 500 ms and four-second turns
 reached first token at 215 ms and 149 ms, speakable text at 272 ms and 237 ms,
@@ -363,11 +368,12 @@ visible. That run is
 
 The external paired harness cannot validate the product compute lease: Gemma
 and Qwen are child processes there, while the lease is deliberately
-process-local. The app now has an ignored same-process acceptance,
-`real_resident_audio_to_qwen_pipeline_exercises_compute_lease`, which feeds PCM
-at real-time cadence through the resident incremental-audio path and dispatches
-the exact app Qwen route at the first speakable phrase. A fixed
-temperature-one seed now makes the text side of that acceptance repeatable.
+process-local. The retired same-process component benchmark,
+`real_resident_audio_to_qwen_pipeline_exercises_compute_lease`, fed PCM at
+real-time cadence through resident incremental audio and called the app Qwen
+route, but surrounded it with private chunking and buffering policy. A fixed
+temperature-one seed made that historical experiment repeatable, not equivalent
+to the application.
 It exposed why naive time slicing was wrong: allowing Gemma one decode every
 60 ms while Qwen held the lease produced 19 fair passes but made the first
 packet schedule require 75-83 ms of extra runway. Safe playback regressed to
@@ -418,11 +424,9 @@ remaining onset work was the 116-121 ms needed to admit four complete words and
 Qwen's 145-160 ms time to first PCM.
 The deterministic A/B receipt is
 `products/mom/artifacts/latency/2026-10-16-resident-voice-pipeline.json`.
-The same-process acceptance now mirrors the packaged call's current clause
-policy: natural punctuation can release earlier, otherwise the first segment
-waits for six complete words and continuations wait for eight. The earlier
-four-word onset figures remain useful component evidence but are not current
-packaged-call latency claims; the next real-model run must replace them.
+The later six/eight-word benchmark also diverged from the production sentence
+policy and has been removed. These retained figures are historical component
+evidence; new call measurements must come from the packaged production path.
 MTP remains a qualified candidate in the direct engine harness; it is not yet
 wired into this resident production path, so current product diagrams and
 receipts must not label the Gemma lane as MTP.
@@ -480,28 +484,22 @@ codec stage still took 94.5 ms while Gemma shared Metal, showing that startup
 contention can consume the intrinsic cache gain. The measurement is
 `products/mom/artifacts/latency/2026-10-16-qwen-resident-prefix-cache.json`.
 
-The Rust-owned paired harness is
-`products/mom/crates/mom-llama-cli/src/bin/voice-pipeline-benchmark.rs`. The
-paired end-to-end receipt is
-`products/mom/artifacts/latency/2026-10-15-voice-pipeline-mtp-ab.json`; the
-acceptance/depth sweep is
+The separate-process CLI pipeline benchmark was also retired: it maintained a
+second four-word chunker and inferred playback from a synthetic reservoir.
+Its historical experiment receipts remain at
+`products/mom/artifacts/latency/2026-10-15-voice-pipeline-mtp-ab.json` and
 `products/mom/artifacts/latency/2026-10-15-gemma4-mtp-depth-sweep.json`.
-The authoritative latency path has no Python runtime or benchmark dependency:
-Rust owns capture, Gemma execution, scheduling, measurement, and receipt
-generation, while the resident Qwen process is the same Swift helper used by
-the packaged macOS app.
+Sharing the Swift helper did not make that harness the application path.
 
-The same Rust harness now runs with the packaged runtime's four native sequence
-lanes and requires token-exact reuse of Gemma's resident text prefix. A
-read-only prepared-input command had been revoking that prefix between voice
-turns; preserving the fourth lane across read-only worker commands restored 4
-tokens on the first measured turn and 47 of 86 prefix tokens on the next. With
-audio delivered at its real 16 kHz clock in 10 ms writes and projected in 40 ms
-frames, the four-second turn reached Gemma's first token 104 ms after physical
-silence, dispatched speakable text at 191 ms, produced first Qwen PCM at 377 ms,
-and had sufficient startup runway to begin playback at that point. The shorter
-500 ms turn reached first token at 113 ms and playable audio at 531 ms because
-its Qwen trace needed another 119 ms of runway. The exact receipt is
+The historical Rust harness experiment used four native sequence lanes and
+checked token-exact reuse of Gemma's resident text prefix. A read-only
+prepared-input command had revoked that prefix between voice turns; preserving
+the fourth lane restored 4 tokens on the first measured turn and 47 of 86 on
+the next. With paced 16 kHz audio, the four-second turn reached first Gemma text
+at 104 ms, its private speech boundary at 191 ms and first Qwen PCM at 377 ms.
+The 500 ms turn reached first text at 113 ms; the synthetic reservoir calculated
+a 531 ms safe-start time. These are retained component results, not observed
+playback or current application performance. The receipt remains at
 `products/mom/artifacts/latency/2026-10-16-resident-audio-prefix-e2e-v2.json`.
 
 The packaged renderer now keeps the native producer and the AudioWorklet on a

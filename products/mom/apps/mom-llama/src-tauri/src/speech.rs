@@ -6,7 +6,7 @@ use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult,
     ConversationPersonaIdentity, MessageRole, conversation_persona_identity,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
@@ -20,11 +20,11 @@ use speech_native_types::{
     AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
     DiarizationPolicy, EncodedAudioFormat, NetworkBehavior, PcmFormat, PcmSampleFormat,
     SpeechBackendDescriptor, SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechError,
-    SpeechErrorClass, SpeechOperationCapability, SpeechPrivacyPolicy, SpeechRequestContext,
-    SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisEvent,
-    SynthesisInput, SynthesisOutput, SynthesisRequest, SynthesisResponse, TimestampGranularity,
-    TranscriptionInput, TranscriptionRequest, TranscriptionResponse, TranscriptionTask,
-    VoiceSelector,
+    SpeechErrorClass, SpeechGenerationSegment, SpeechOperationCapability, SpeechPrivacyPolicy,
+    SpeechRequestContext, SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector,
+    SpeechRoutingPolicy, SynthesisEvent, SynthesisInput, SynthesisOutput, SynthesisRequest,
+    SynthesisResponse, TimestampGranularity, TranscriptionInput, TranscriptionRequest,
+    TranscriptionResponse, TranscriptionTask, VoiceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -242,8 +242,13 @@ struct AssistantMessageTarget {
     persona_voice_id: Option<String>,
 }
 
+struct AssistantMessageSpeechText {
+    text: String,
+    raw_content_sha256: String,
+}
+
 #[derive(Debug, Clone)]
-struct QwenSelection {
+struct EmbeddedVoiceSelection {
     descriptor_sha256: String,
     descriptor: SpeechBackendDescriptor,
     model_id: String,
@@ -252,29 +257,49 @@ struct QwenSelection {
 
 #[derive(Debug, Clone)]
 enum ReadAloudSelection {
-    Qwen(QwenSelection),
+    Qwen(EmbeddedVoiceSelection),
+    Pocket(EmbeddedVoiceSelection),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrecommitPurpose {
+    Call,
+    VoiceNote,
 }
 
 impl ReadAloudSelection {
     fn descriptor(&self) -> &SpeechBackendDescriptor {
         match self {
-            Self::Qwen(value) => &value.descriptor,
+            Self::Qwen(value) | Self::Pocket(value) => &value.descriptor,
         }
     }
     fn descriptor_sha256(&self) -> &str {
         match self {
-            Self::Qwen(value) => &value.descriptor_sha256,
+            Self::Qwen(value) | Self::Pocket(value) => &value.descriptor_sha256,
         }
     }
     fn backend_id(&self) -> &str {
         &self.descriptor().id
     }
+    /// Scheduling follows the admitted backend, never a renderer mode flag.
+    /// Every Metal-backed selection must retain Gemma coordination, including
+    /// Read Aloud and voice notes. CPU selections can return None here.
+    fn compute_arbiter(
+        &self,
+        reserved: Option<RealtimeTtsComputeArbiter>,
+    ) -> Option<RealtimeTtsComputeArbiter> {
+        match self {
+            Self::Qwen(_) => Some(reserved.unwrap_or_else(RealtimeTtsComputeArbiter::new)),
+            Self::Pocket(_) => None,
+        }
+    }
     fn model_id(&self) -> Option<String> {
-        let Self::Qwen(value) = self;
+        let (Self::Qwen(value) | Self::Pocket(value)) = self;
         Some(value.model_id.clone())
     }
     fn voice_id(&self) -> String {
-        let Self::Qwen(value) = self;
+        let (Self::Qwen(value) | Self::Pocket(value)) = self;
         value.voice_id.clone()
     }
 }
@@ -298,6 +323,7 @@ pub struct ReadAloudBinding {
     pub duration_ms: Option<u64>,
     pub tts_time_to_first_audio_ms: Option<u64>,
     pub tts_total_ms: Option<u64>,
+    pub tts_generation_segments: Vec<SpeechGenerationSegment>,
     pub network: NetworkBehavior,
 }
 
@@ -346,6 +372,7 @@ pub struct PrecommitSpeechBinding {
     pub tts_helper_code_generation_us: Option<u64>,
     pub tts_helper_prepared_prefix_cache_hit: Option<bool>,
     pub tts_helper_first_decode_us: Option<u64>,
+    pub tts_generation_segments: Vec<SpeechGenerationSegment>,
     pub tts_time_to_first_audio_ms: Option<u64>,
     pub tts_total_ms: Option<u64>,
     pub tts_voice_lookup_us: u64,
@@ -603,14 +630,14 @@ impl HostSpeechExecutor {
             if let SynthesisEvent::Audio { chunk, .. } = event {
                 if chunk.sequence != expected_sequence {
                     return Err(
-                        "speech_stream_sequence_invalid: Qwen PCM chunks were not contiguous"
+                        "speech_stream_sequence_invalid: Speech PCM chunks were not contiguous"
                             .to_string(),
                     );
                 }
                 expected_sequence = expected_sequence.saturating_add(1);
                 if chunk.sample_offset != expected_sample_offset {
                     return Err(
-                        "speech_stream_offset_invalid: Qwen PCM chunks overlapped or skipped samples"
+                        "speech_stream_offset_invalid: Speech PCM chunks overlapped or skipped samples"
                             .to_string(),
                     );
                 }
@@ -618,13 +645,13 @@ impl HostSpeechExecutor {
                 let frames = u64::try_from(chunk.data.len() / frame_bytes).unwrap_or(u64::MAX);
                 expected_sample_offset =
                     expected_sample_offset.checked_add(frames).ok_or_else(|| {
-                        "speech_stream_offset_invalid: Qwen PCM sample offset overflowed"
+                        "speech_stream_offset_invalid: Speech PCM sample offset overflowed"
                             .to_string()
                     })?;
                 if let Some(expected) = &format {
                     if expected != &chunk.format {
                         return Err(
-                            "speech_stream_format_changed: Qwen PCM format changed mid-stream"
+                            "speech_stream_format_changed: Speech PCM format changed mid-stream"
                                 .to_string(),
                         );
                     }
@@ -638,7 +665,8 @@ impl HostSpeechExecutor {
                     })?;
                 if emitted_bytes > u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) {
                     return Err(
-                        "speech_stream_too_large: Qwen PCM exceeded the playback bound".to_string(),
+                        "speech_stream_too_large: Speech PCM exceeded the playback bound"
+                            .to_string(),
                     );
                 }
                 if let Some(sink) = &sink {
@@ -651,16 +679,18 @@ impl HostSpeechExecutor {
             .final_response()
             .await
             .map_err(|error| speech_error_message(&error))?;
-        let format =
-            format.ok_or_else(|| "speech_stream_empty: Qwen returned no PCM".to_string())?;
+        let format = format
+            .ok_or_else(|| "speech_stream_empty: Speech backend returned no PCM".to_string())?;
         if !saw_end {
-            return Err("speech_stream_incomplete: Qwen closed without an end marker".to_string());
+            return Err(
+                "speech_stream_incomplete: Speech backend closed without an end marker".to_string(),
+            );
         }
         match &response.output {
             SynthesisOutput::Streamed { format: output, emitted_bytes: output_bytes }
                 if output == &AudioOutputFormat::Pcm { format }
                     && *output_bytes == emitted_bytes => {}
-            _ => return Err("speech_stream_receipt_invalid: Qwen's final streamed receipt did not match the emitted PCM".to_string()),
+            _ => return Err("speech_stream_receipt_invalid: Speech backend's final streamed receipt did not match the emitted PCM".to_string()),
         }
         Ok(response)
     }
@@ -786,10 +816,12 @@ impl MomSpeech {
         #[cfg(target_os = "macos")]
         let (prepared_qwen, qwen_startup_warm) = {
             let qwen = prepared_qwen.unwrap_or_else(|| {
-                desktop_speech::prepare_local_qwen(
-                    Some(data_dir.join("speech-models")),
-                    Some(installed_voice_root.to_path_buf()),
-                )
+                Arc::new(QwenSpeechBackend::discover(
+                    speech_native_backend_qwen::QwenBackendConfig::discover_with_reference_root(
+                        Some(&data_dir.join("speech-models")),
+                        Some(installed_voice_root),
+                    ),
+                ))
             });
             let warm = qwen
                 .wait_for_icl_background_warm()
@@ -1002,10 +1034,9 @@ impl MomSpeech {
             return Ok(blocked("mom_llama.speech_read_aloud", blocker));
         }
         let request = read_aloud_request(&target, &selection, request_id.clone());
-        let response = match stream_sink.clone() {
-            Some(sink) => self.executor.synthesize_streaming(request, sink).await,
-            None => self.executor.synthesize(request).await,
-        };
+        let (response, _compute_metrics) = self
+            .synthesize_selected(&selection, request, stream_sink.clone(), None)
+            .await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -1039,6 +1070,7 @@ impl MomSpeech {
         }
         let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
         let tts_total_ms = response.usage.total_ms;
+        let tts_generation_segments = response.usage.helper_generation_segments.clone();
         let validated = validate_read_aloud_response(response, &request_id, &selection);
         let duration_ms = match validated {
             Ok(output) => output,
@@ -1059,6 +1091,7 @@ impl MomSpeech {
             duration_ms,
             tts_time_to_first_audio_ms,
             tts_total_ms,
+            tts_generation_segments,
             network: NetworkBehavior::Never,
         };
         let playback_id = match self.publish_playback(operation, &request_id, binding.clone()) {
@@ -1084,6 +1117,43 @@ impl MomSpeech {
         ))
     }
 
+    /// One scheduling boundary for all persona synthesis. Metal backends hold
+    /// a lease across admission, cold loading and generation; CPU speech has
+    /// no Metal lease. Both use identical output validation and cancellation.
+    /// The PCM runway policy can yield the lease while Qwen is running.
+    async fn synthesize_selected(
+        &self,
+        selection: &ReadAloudSelection,
+        request: SynthesisRequest,
+        stream_sink: Option<PcmStreamSink>,
+        reserved: Option<RealtimeTtsComputeArbiter>,
+    ) -> (Result<SynthesisResponse, String>, RealtimeTtsComputeMetrics) {
+        let compute = selection
+            .compute_arbiter(reserved)
+            .map(|arbiter| Arc::new(Mutex::new(arbiter)));
+        let sink = stream_sink.map(|downstream| {
+            let observed = compute.clone();
+            let scheduled: PcmStreamSink = Arc::new(move |chunk| {
+                if let Some(compute) = &observed
+                    && let Ok(mut arbiter) = compute.lock()
+                {
+                    arbiter.observe(chunk);
+                }
+                downstream(chunk)
+            });
+            scheduled
+        });
+        let response = match sink {
+            Some(sink) => self.executor.synthesize_streaming(request, sink).await,
+            None => self.executor.synthesize(request).await,
+        };
+        let metrics = compute
+            .as_ref()
+            .and_then(|compute| compute.lock().ok().map(|mut arbiter| arbiter.finish()))
+            .unwrap_or_default();
+        (response, metrics)
+    }
+
     /// Synthesizes a bounded reply for the exact persona represented by this
     /// conversation, before a chat message is committed. The audio is retained
     /// only in this runtime's opaque-operation registry.
@@ -1092,6 +1162,7 @@ impl MomSpeech {
         conversation_id: &str,
         operation: &str,
         text: &str,
+        purpose: PrecommitPurpose,
         stream_sink: PcmStreamSink,
     ) -> anyhow::Result<CommandResult<PrecommitSpeechOutput>> {
         validate_operation_token(operation)?;
@@ -1106,12 +1177,10 @@ impl MomSpeech {
                 ),
             ));
         }
-        // Claim the shared compute lane before voice lookup and routing. If
-        // Gemma starts another non-preemptible Metal decode while this command
-        // is being admitted, Qwen's first codec packet pays that entire token
-        // quantum. The lease is RAII-owned, so every blocked or failed return
-        // below still releases it without a separate cleanup branch.
-        let compute_arbiter = Arc::new(Mutex::new(RealtimeTtsComputeArbiter::new()));
+        // Reserve Metal early only for the Qwen voice-note route. Calls select
+        // the CPU backend explicitly; they must never fall back to Qwen.
+        let compute_reservation =
+            (purpose == PrecommitPurpose::VoiceNote).then(RealtimeTtsComputeArbiter::new);
         let stage_started = Instant::now();
         let voice_id = match self
             .resolve_precommit_voice(conversation_id)
@@ -1134,15 +1203,13 @@ impl MomSpeech {
         let descriptors = self.executor.descriptors()?;
         let tts_descriptor_snapshot_us = elapsed_us(stage_started);
         let stage_started = Instant::now();
-        let selection =
-            match select_read_aloud(&descriptors, character_count, Some(&voice_id), true) {
-                Ok(selection) => selection,
-                Err(blocker) => {
-                    return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
-                }
-            };
+        let selection = match select_precommit(&descriptors, character_count, &voice_id, purpose) {
+            Ok(selection) => selection,
+            Err(blocker) => {
+                return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
+            }
+        };
         let tts_route_selection_us = elapsed_us(stage_started);
-        let ReadAloudSelection::Qwen(qwen) = &selection;
         let request_id = SpeechRequestId(format!("mom-precommit-{operation}"));
         let stage_started = Instant::now();
         if let Err(blocker) = self.begin_operation(
@@ -1153,27 +1220,17 @@ impl MomSpeech {
             return Ok(blocked("mom_llama.speech_precommit_synthesize", blocker));
         }
         let tts_operation_admission_us = elapsed_us(stage_started);
-        let observed_compute = Arc::clone(&compute_arbiter);
-        let downstream_sink = Arc::clone(&stream_sink);
-        let scheduled_sink: PcmStreamSink = Arc::new(move |chunk| {
-            if let Ok(mut arbiter) = observed_compute.lock() {
-                arbiter.observe(chunk);
-            }
-            downstream_sink(chunk)
-        });
-        let response = match self
-            .executor
-            .synthesize_streaming(
+        let (response, compute_metrics) = self
+            .synthesize_selected(
+                &selection,
                 precommit_synthesis_request(text, &selection, request_id.clone()),
-                scheduled_sink,
+                Some(stream_sink),
+                compute_reservation,
             )
-            .await
-        {
+            .await;
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
-                if let Ok(mut arbiter) = compute_arbiter.lock() {
-                    arbiter.release();
-                }
                 let cancelled = self.finish_operation(operation, &request_id);
                 return Ok(blocked(
                     "mom_llama.speech_precommit_synthesize",
@@ -1185,10 +1242,6 @@ impl MomSpeech {
                 ));
             }
         };
-        let compute_metrics = compute_arbiter
-            .lock()
-            .map(|mut arbiter| arbiter.finish())
-            .unwrap_or_default();
         let stage_started = Instant::now();
         let current_voice = self
             .precommit_voice(conversation_id)
@@ -1197,7 +1250,7 @@ impl MomSpeech {
             })
             .map_err(anyhow::Error::msg)?;
         let tts_postflight_voice_lookup_us = elapsed_us(stage_started);
-        if current_voice.as_ref() != Some(&qwen.voice_id) {
+        if current_voice.as_ref() != Some(&voice_id) {
             self.finish_operation(operation, &request_id);
             return Ok(blocked(
                 "mom_llama.speech_precommit_synthesize",
@@ -1233,6 +1286,7 @@ impl MomSpeech {
         let tts_helper_code_generation_us = response.usage.helper_code_generation_us;
         let tts_helper_prepared_prefix_cache_hit = response.usage.helper_prepared_prefix_cache_hit;
         let tts_helper_first_decode_us = response.usage.helper_first_decode_us;
+        let tts_generation_segments = response.usage.helper_generation_segments.clone();
         let tts_time_to_first_audio_ms = response.usage.time_to_first_result_ms;
         let tts_total_ms = response.usage.total_ms;
         let duration_ms = match validate_read_aloud_response(response, &request_id, &selection) {
@@ -1246,10 +1300,10 @@ impl MomSpeech {
             operation: operation.to_string(),
             conversation_id: conversation_id.to_string(),
             text_sha256: sha256_hex(text.as_bytes()),
-            backend_id: qwen.descriptor.id.clone(),
-            backend_descriptor_sha256: qwen.descriptor_sha256.clone(),
-            model_id: qwen.model_id.clone(),
-            voice_id: qwen.voice_id.clone(),
+            backend_id: selection.backend_id().to_string(),
+            backend_descriptor_sha256: selection.descriptor_sha256().to_string(),
+            model_id: selection.model_id().expect("embedded speech model"),
+            voice_id: selection.voice_id(),
             request_id: request_id.0.clone(),
             duration_ms,
             tts_queue_ms,
@@ -1277,6 +1331,7 @@ impl MomSpeech {
             tts_helper_code_generation_us,
             tts_helper_prepared_prefix_cache_hit,
             tts_helper_first_decode_us,
+            tts_generation_segments,
             tts_time_to_first_audio_ms,
             tts_total_ms,
             tts_voice_lookup_us,
@@ -1837,7 +1892,7 @@ impl MomSpeech {
         if binding.request_id != request_id.0 {
             self.finish_operation(operation, request_id);
             return Err(speech_provenance_mismatch(
-                "Qwen playback binding did not match the admitted request and streamed audio.",
+                "Speech playback binding did not match the admitted request and streamed audio.",
             ));
         }
         let mut state = self.state.lock().map_err(|_| {
@@ -1909,18 +1964,18 @@ fn assistant_message_target(
             Vec::new(),
         )));
     }
-    if message.content.trim().is_empty() {
+    let Some(speech_text) = assistant_message_speech_text(message) else {
         return Ok(Err(Blocker::new(
             "speech_read_aloud_empty",
             "The assistant message has no text to read aloud.",
             Vec::new(),
         )));
-    }
+    };
     Ok(Ok(AssistantMessageTarget {
         conversation_id: conversation_id.to_string(),
         message_id: message_id.to_string(),
-        text_sha256: sha256_hex(message.content.as_bytes()),
-        text: message.content.clone(),
+        text_sha256: speech_text.raw_content_sha256,
+        text: speech_text.text,
         persona_voice_id: persona_voice_key_for_conversation(
             &conversation.recipient_ids,
             conversation.source_conversation_id.as_deref(),
@@ -1929,6 +1984,19 @@ fn assistant_message_target(
         // Qwen Base ICL route; generic speech keeps the VoiceDesign route.
         .map(|key| format!("mom.qwen.icl.{key}")),
     }))
+}
+
+fn assistant_message_speech_text(
+    message: &mom_llama_runtime::conversation_store::Message,
+) -> Option<AssistantMessageSpeechText> {
+    let text = mom_llama_runtime::assistant_visible_content(message)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(AssistantMessageSpeechText {
+        text,
+        raw_content_sha256: sha256_hex(message.content.as_bytes()),
+    })
 }
 
 fn elapsed_us(started: Instant) -> u64 {
@@ -1972,18 +2040,59 @@ fn select_read_aloud(
     persona_voice_id: Option<&str>,
     _require_persona_voice: bool,
 ) -> Result<ReadAloudSelection, Blocker> {
-    let Some(voice_id) = persona_voice_id.filter(|voice_id| voice_id.starts_with("mom.qwen.icl."))
-    else {
-        return Err(speech_unavailable(
-            "The selected consultant's streaming Qwen voice is unavailable.",
-        ));
-    };
+    let voice_id = persona_voice_id
+        .filter(|id| id.starts_with("mom.qwen.icl."))
+        .ok_or_else(|| speech_unavailable("The consultant voice is unavailable."))?;
+    select_embedded_voice(
+        descriptors,
+        input_characters,
+        voice_id,
+        QWEN_BACKEND_ID,
+        QWEN_ICL_MODEL_ID,
+    )
+    .map(ReadAloudSelection::Qwen)
+}
+
+fn select_precommit(
+    descriptors: &[SpeechBackendDescriptor],
+    input_characters: usize,
+    persona_voice_id: &str,
+    purpose: PrecommitPurpose,
+) -> Result<ReadAloudSelection, Blocker> {
+    match purpose {
+        PrecommitPurpose::VoiceNote => {
+            select_read_aloud(descriptors, input_characters, Some(persona_voice_id), true)
+        }
+        PrecommitPurpose::Call => {
+            let persona = persona_voice_id
+                .strip_prefix("mom.qwen.icl.")
+                .ok_or_else(|| speech_unavailable("The consultant voice is unavailable."))?;
+            let voice = format!("mom.pocket.{persona}");
+            select_embedded_voice(
+                descriptors,
+                input_characters,
+                &voice,
+                speech_native_backend_pocket::POCKET_BACKEND_ID,
+                speech_native_backend_pocket::POCKET_MODEL_ID,
+            )
+            .map(ReadAloudSelection::Pocket)
+        }
+    }
+}
+
+fn select_embedded_voice(
+    descriptors: &[SpeechBackendDescriptor],
+    input_characters: usize,
+    voice_id: &str,
+    backend_id: &str,
+    model_id: &str,
+) -> Result<EmbeddedVoiceSelection, Blocker> {
     if let Some(descriptor) = descriptors.iter().find(|descriptor| {
-        descriptor.id == QWEN_BACKEND_ID
+        descriptor.id == backend_id
             && descriptor.readiness.is_ready()
             && descriptor.capabilities.iter().any(|capability| {
                 (capability.eligible_for_local_only() || capability.deferred_load_admissible())
-                    && capability.model_id.as_deref() == Some(QWEN_ICL_MODEL_ID)
+                    && capability.model_id.as_deref() == Some(model_id)
                     && capability.limits.max_input_characters.is_none_or(|limit| {
                         u64::try_from(input_characters).unwrap_or(u64::MAX) <= limit
                     })
@@ -2000,19 +2109,19 @@ fn select_read_aloud(
         .iter()
         .any(|voice| voice.installed && voice.id == voice_id)
     {
-        return Ok(ReadAloudSelection::Qwen(QwenSelection {
+        return Ok(EmbeddedVoiceSelection {
             descriptor_sha256: descriptor_sha256(descriptor)?,
             descriptor: descriptor.clone(),
-            model_id: QWEN_ICL_MODEL_ID.to_string(),
+            model_id: model_id.to_string(),
             voice_id: voice_id.to_string(),
-        }));
+        });
     }
     Err(speech_unavailable(
-        "The selected consultant's streaming Qwen voice is unavailable.",
+        "The selected consultant's requested speech backend is unavailable.",
     ))
 }
 
-fn qwen_stream_output() -> AudioOutputFormat {
+fn persona_stream_output() -> AudioOutputFormat {
     AudioOutputFormat::Pcm {
         format: PcmFormat {
             sample_rate_hz: 24_000,
@@ -2028,32 +2137,18 @@ fn read_aloud_request(
     selection: &ReadAloudSelection,
     request_id: SpeechRequestId,
 ) -> SynthesisRequest {
-    let voice_id = selection.voice_id();
-    SynthesisRequest {
-        context: request_context(
-            request_id,
-            SpeechRouteSelector::ExactBackend {
-                backend_id: selection.backend_id().to_string(),
-                model_id: selection.model_id(),
-                voice_id: Some(voice_id.clone()),
-            },
-            240_000,
-        ),
-        input: SynthesisInput::Text {
-            text: target.text.clone(),
-        },
-        voice: VoiceSelector::Exact { voice_id },
-        language: Some(READ_ALOUD_LANGUAGE.to_string()),
-        rate: 1.0,
-        pitch: 1.0,
-        volume: 1.0,
-        output: qwen_stream_output(),
-        alignment: AlignmentGranularity::None,
-        stream: true,
-    }
+    persona_synthesis_request(&target.text, selection, request_id)
 }
 
 fn precommit_synthesis_request(
+    text: &str,
+    selection: &ReadAloudSelection,
+    request_id: SpeechRequestId,
+) -> SynthesisRequest {
+    persona_synthesis_request(text, selection, request_id)
+}
+
+fn persona_synthesis_request(
     text: &str,
     selection: &ReadAloudSelection,
     request_id: SpeechRequestId,
@@ -2077,7 +2172,7 @@ fn precommit_synthesis_request(
         rate: 1.0,
         pitch: 1.0,
         volume: 1.0,
-        output: qwen_stream_output(),
+        output: persona_stream_output(),
         alignment: AlignmentGranularity::None,
         stream: true,
     }
@@ -2186,23 +2281,23 @@ fn validate_read_aloud_response(
     request_id: &SpeechRequestId,
     selection: &ReadAloudSelection,
 ) -> Result<Option<u64>, Blocker> {
-    let ReadAloudSelection::Qwen(qwen) = selection;
     if response.request_id != *request_id
-        || response.route.backend_id != QWEN_BACKEND_ID
-        || response.route.model_id.as_deref() != Some(&qwen.model_id)
-        || response.route.voice_id.as_deref() != Some(&qwen.voice_id)
+        || response.route.backend_id != selection.backend_id()
+        || response.route.model_id != selection.model_id()
+        || response.route.voice_id.as_deref() != Some(selection.voice_id().as_str())
         || response.route.network != NetworkBehavior::Never
+        || response.route.backend_kind != speech_native_types::SpeechBackendKind::EmbeddedModel
         || !response.usage.real_local_inference
     {
         return Err(speech_provenance_mismatch(
-            "Qwen3 TTS response route did not match the admitted local model and voice.",
+            "Speech response route did not match the admitted local model and voice.",
         ));
     }
     match response.output {
         SynthesisOutput::Streamed {
             format,
             emitted_bytes,
-        } if format == qwen_stream_output()
+        } if format == persona_stream_output()
             && emitted_bytes > 0
             && emitted_bytes <= u64::try_from(MAX_COMPLETE_WAV_BYTES).unwrap_or(u64::MAX) =>
         {
@@ -2210,7 +2305,7 @@ fn validate_read_aloud_response(
         }
         _ => Err(Blocker::new(
             "speech_stream_invalid",
-            "Qwen3 TTS did not complete the admitted PCM stream.",
+            "Speech did not complete the admitted PCM stream.",
             Vec::new(),
         )),
     }
@@ -2350,668 +2445,6 @@ fn speech_error_message(error: &SpeechError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "macos")]
-    fn benchmark_pcm16_mono_16khz_wav(path: &Path) -> anyhow::Result<Vec<f32>> {
-        use anyhow::{Context, ensure};
-
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read benchmark WAV {}", path.display()))?;
-        ensure!(
-            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-            "benchmark audio must be a RIFF/WAVE file"
-        );
-        let mut cursor = 12usize;
-        let mut format = None;
-        let mut data = None;
-        while cursor.checked_add(8).is_some_and(|end| end <= bytes.len()) {
-            let chunk_id = &bytes[cursor..cursor + 4];
-            let chunk_len = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into()?) as usize;
-            let chunk_start = cursor + 8;
-            let chunk_end = chunk_start
-                .checked_add(chunk_len)
-                .context("benchmark WAV chunk length overflow")?;
-            ensure!(chunk_end <= bytes.len(), "truncated benchmark WAV chunk");
-            match chunk_id {
-                b"fmt " if chunk_len >= 16 => {
-                    format = Some((
-                        u16::from_le_bytes(bytes[chunk_start..chunk_start + 2].try_into()?),
-                        u16::from_le_bytes(bytes[chunk_start + 2..chunk_start + 4].try_into()?),
-                        u32::from_le_bytes(bytes[chunk_start + 4..chunk_start + 8].try_into()?),
-                        u16::from_le_bytes(bytes[chunk_start + 14..chunk_start + 16].try_into()?),
-                    ));
-                }
-                b"data" => data = Some(&bytes[chunk_start..chunk_end]),
-                _ => {}
-            }
-            cursor = chunk_end + (chunk_len & 1);
-        }
-        let (encoding, channels, sample_rate, bits) =
-            format.context("benchmark WAV has no fmt chunk")?;
-        ensure!(
-            (encoding, channels, sample_rate, bits) == (1, 1, 16_000, 16),
-            "benchmark WAV must be PCM16 mono 16 kHz"
-        );
-        let data = data.context("benchmark WAV has no data chunk")?;
-        ensure!(data.len() % 2 == 0, "benchmark WAV has a partial sample");
-        Ok(data
-            .chunks_exact(2)
-            .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32_768.0)
-            .collect())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn benchmark_speech_chunk(
-        text: &str,
-        flush: bool,
-        first: bool,
-        word_limit: usize,
-    ) -> Option<(String, String)> {
-        let trimmed = text.trim_start();
-        let mut words = Vec::new();
-        let mut word_start = None;
-        for (index, character) in trimmed.char_indices() {
-            if character.is_whitespace() {
-                if let Some(start) = word_start.take() {
-                    words.push((start, index, true));
-                }
-            } else if word_start.is_none() {
-                word_start = Some(index);
-            }
-        }
-        if let Some(start) = word_start {
-            words.push((start, trimmed.len(), false));
-        }
-        if words.is_empty() {
-            return None;
-        }
-        let minimum = if first { 6 } else { 8 };
-        let maximum = word_limit.clamp(minimum, if first { 16 } else { 24 });
-        let sentence_boundary_minimum = if first { 2 } else { 3 };
-        let weak_boundary_minimum = if first { 3 } else { minimum.min(6) };
-        for (index, &(start, end, _)) in words.iter().enumerate().take(maximum) {
-            let word = &trimmed[start..end];
-            let strong = word
-                .trim_end_matches(['"', '\'', ')', ']'])
-                .ends_with(['.', '!', '?']);
-            let weak = word
-                .trim_end_matches(['"', '\'', ')', ']'])
-                .ends_with([';', ':', ',']);
-            let complete_sentence = strong && (flush || index + 1 >= sentence_boundary_minimum);
-            let weak_boundary = weak && index + 1 >= weak_boundary_minimum;
-            if complete_sentence || weak_boundary {
-                return Some((
-                    trimmed[..end].trim().to_string(),
-                    trimmed[end..].trim_start().to_string(),
-                ));
-            }
-        }
-        if !flush && words.len() < minimum {
-            return None;
-        }
-        let split_at = if flush {
-            words.get(words.len().min(maximum) - 1)?.1
-        } else {
-            let &(_, end, complete) = words.get(minimum - 1)?;
-            if !complete && words.len() == minimum {
-                return None;
-            }
-            end
-        };
-        Some((
-            trimmed[..split_at].trim().to_string(),
-            trimmed[split_at..].trim_start().to_string(),
-        ))
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resident_benchmark_uses_the_product_first_speech_boundary() {
-        assert_eq!(
-            benchmark_speech_chunk("One two three four five six", false, true, 6),
-            None
-        );
-        assert_eq!(
-            benchmark_speech_chunk("One two three four five six ", false, true, 6),
-            Some(("One two three four five six".into(), String::new()))
-        );
-        assert_eq!(
-            benchmark_speech_chunk("One two three four five six s", false, true, 6),
-            Some(("One two three four five six".into(), "s".into()))
-        );
-        assert_eq!(
-            benchmark_speech_chunk("One two three,", false, true, 6),
-            Some(("One two three,".into(), String::new()))
-        );
-        assert_eq!(
-            benchmark_speech_chunk("five six", true, false, 8),
-            Some(("five six".into(), String::new()))
-        );
-        assert_eq!(
-            benchmark_speech_chunk(
-                "one two three four five six seven eight nine ten",
-                true,
-                false,
-                8
-            ),
-            Some((
-                "one two three four five six seven eight".into(),
-                "nine ten".into()
-            ))
-        );
-    }
-
-    /// Runs Gemma audio prefill/decode and the app's Qwen precommit route in
-    /// one process. Unlike the external comparison harness, this exercises
-    /// the real process-local compute lease and proves whether Gemma actually
-    /// yields Metal while Qwen is filling the playback buffer.
-    #[test]
-    #[ignore = "requires the exact Gemma audio model/projector, Qwen helper/model/voice archive, and benchmark WAV"]
-    fn real_resident_audio_to_qwen_pipeline_exercises_compute_lease() -> anyhow::Result<()> {
-        use anyhow::{Context, ensure};
-        use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
-        use serde_json::json;
-        use std::collections::BTreeMap;
-        use std::path::PathBuf;
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let model_path = PathBuf::from(
-            std::env::var_os("MOM_LLAMA_MULTIMODAL_MODEL_PATH")
-                .context("MOM_LLAMA_MULTIMODAL_MODEL_PATH")?,
-        );
-        let projector_path = PathBuf::from(
-            std::env::var_os("MOM_LLAMA_MM_PROJ_PATH").context("MOM_LLAMA_MM_PROJ_PATH")?,
-        );
-        let wav_path = PathBuf::from(
-            std::env::var_os("MOM_LLAMA_TEST_VOICE_WAV").context("MOM_LLAMA_TEST_VOICE_WAV")?,
-        );
-        let reference_root = PathBuf::from(
-            std::env::var_os("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")
-                .context("MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT")?,
-        );
-        ensure!(model_path.is_file(), "Gemma model is missing");
-        ensure!(projector_path.is_file(), "audio projector is missing");
-        let samples = benchmark_pcm16_mono_16khz_wav(&wav_path)?;
-        ensure!(samples.len() >= 15_840, "benchmark WAV is too short");
-
-        let store = tempfile::tempdir()?;
-        set_data_dir_override_for_tests(Some(store.path().to_path_buf()));
-        struct ResetDataDir;
-        impl Drop for ResetDataDir {
-            fn drop(&mut self) {
-                mom_llama_runtime::config::set_data_dir_override_for_tests(None);
-            }
-        }
-        let _reset = ResetDataDir;
-        mom_llama_runtime::settings_update(SettingsUpdate {
-            model_path: Some(Some(model_path)),
-            mmproj_path: Some(Some(projector_path)),
-            temperature: Some(1.0),
-            max_tokens: Some(64),
-            batch_tokens: Some(128),
-            max_parallel_sequences: Some(1),
-            native_device: Some(llama_native_types::NativeDevice::Metal),
-            upstream_settings: Some(BTreeMap::from([(
-                "customJson".into(),
-                json!(r#"{"seed":17}"#),
-            )])),
-            ..SettingsUpdate::default()
-        })?;
-        let settings = mom_llama_runtime::config::resolve_settings()?;
-        let native = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)?;
-        let scope = native.operation_scope();
-        let warm = mom_llama_runtime::runtime_warm(&scope)?;
-        let warm = warm.result.context("Gemma runtime warm was blocked")?;
-        ensure!(
-            warm.model_loaded && warm.audio_projector_warmed,
-            "Gemma did not warm"
-        );
-
-        let async_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let speech = async_runtime
-            .block_on(MomSpeech::discover(store.path(), &reference_root))
-            .map_err(anyhow::Error::msg)?;
-        let conversation =
-            mom_llama_runtime::conversation_new(Some("Voice pipeline benchmark".into()))?
-                .result
-                .context("benchmark conversation")?;
-        speech
-            .bind_precommit_voice(
-                &conversation.id,
-                &ConversationPersonaIdentity {
-                    recipient_ids: vec!["persona-christine_courtois".into()],
-                    source_conversation_id: Some("persona-christine_courtois".into()),
-                },
-            )
-            .map_err(anyhow::Error::msg)?;
-
-        let voice = mom_llama_runtime::voice_audio_begin_in_scope(
-            &scope,
-            &conversation.id,
-            "[Phone call] Reply naturally in exactly three short sentences to what you hear.",
-        )?;
-        voice.wait_for_resume()?;
-        let audio_started = Instant::now();
-        for (index, chunk) in samples[..samples.len().min(4 * 16_000)]
-            .chunks(160)
-            .enumerate()
-        {
-            voice.push_pcm(chunk)?;
-            // Pace from one monotonic audio clock. Repeated relative sleeps
-            // accumulate scheduler slop and falsely give prefill extra time;
-            // a microphone does not slow down when the consumer is busy.
-            let audio_deadline =
-                audio_started + Duration::from_millis(u64::try_from(index.saturating_add(1))? * 10);
-            std::thread::sleep(audio_deadline.saturating_duration_since(Instant::now()));
-        }
-        let silence = Instant::now();
-        voice.seal_input()?;
-
-        let (speech_tx, speech_rx) = mpsc::channel::<Option<String>>();
-        let (tts_tx, tts_rx) = mpsc::sync_channel(1);
-        let speech_worker = Arc::clone(&speech);
-        let conversation_id = conversation.id.clone();
-        let tts_worker = std::thread::Builder::new()
-            .name("resident-voice-pipeline-qwen".into())
-            .spawn(move || {
-                let result = (|| -> anyhow::Result<_> {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    let first_pcm_ms = Arc::new(Mutex::new(None));
-                    // (segment index, wall-clock arrival from silence, PCM duration).
-                    // Keeping the segment identity prevents the deliberate reservoir
-                    // wait between requests from being misreported as a producer
-                    // packet stall.
-                    let packets = Arc::new(Mutex::new(Vec::<(usize, f64, f64)>::new()));
-                    let mut pending = String::new();
-                    let mut closed = false;
-                    let mut first = true;
-                    let mut first_dispatch_ms = None;
-                    let mut bindings = Vec::new();
-                    let mut segments = Vec::new();
-                    let mut scheduler_wait_ms = 0.0_f64;
-                    let mut target_runway_ms = 180.0_f64;
-                    loop {
-                        while let Ok(event) = speech_rx.try_recv() {
-                            match event {
-                                Some(delta) => pending.push_str(&delta),
-                                None => closed = true,
-                            }
-                        }
-                        let word_limit = if first { 6 } else { 8 };
-                        let Some((phrase, rest)) =
-                            benchmark_speech_chunk(&pending, closed, first, word_limit)
-                        else {
-                            if closed {
-                                break;
-                            }
-                            match speech_rx.recv()? {
-                                Some(delta) => pending.push_str(&delta),
-                                None => closed = true,
-                            }
-                            continue;
-                        };
-                        pending = rest;
-                        if !first {
-                            let wait_ms = packets
-                                .lock()
-                                .ok()
-                                .and_then(|packets| {
-                                    let first_arrival = packets.first()?.1;
-                                    let audio_ms =
-                                        packets.iter().map(|packet| packet.2).sum::<f64>();
-                                    let now_ms = silence.elapsed().as_secs_f64() * 1_000.0;
-                                    let consumed_ms = (now_ms - first_arrival - 16.0).max(0.0);
-                                    Some((audio_ms - consumed_ms - target_runway_ms).max(0.0))
-                                })
-                                .unwrap_or(0.0);
-                            if wait_ms > 0.0 {
-                                std::thread::sleep(Duration::from_secs_f64(wait_ms / 1_000.0));
-                                scheduler_wait_ms += wait_ms;
-                            }
-                        }
-                        let dispatch_ms = silence.elapsed().as_secs_f64() * 1_000.0;
-                        first_dispatch_ms.get_or_insert(dispatch_ms);
-                        let segment_index = segments.len();
-                        let observed_first_pcm = Arc::clone(&first_pcm_ms);
-                        let observed_packets = Arc::clone(&packets);
-                        let sink: PcmStreamSink = Arc::new(move |chunk| {
-                            let arrival_ms = silence.elapsed().as_secs_f64() * 1_000.0;
-                            if let Ok(mut first) = observed_first_pcm.lock() {
-                                first.get_or_insert(arrival_ms);
-                            }
-                            if !chunk.data.is_empty()
-                                && let Ok(mut packets) = observed_packets.lock()
-                            {
-                                let frames = chunk.data.len() / chunk.format.bytes_per_frame();
-                                let audio_ms = frames as f64 * 1_000.0
-                                    / f64::from(chunk.format.sample_rate_hz);
-                                packets.push((segment_index, arrival_ms, audio_ms));
-                            }
-                            Ok(())
-                        });
-                        let operation =
-                            format!("resident-pipeline-benchmark-{}", segments.len() + 1);
-                        let packet_start = packets.lock().map(|packets| packets.len()).unwrap_or(0);
-                        let result = runtime.block_on(speech_worker.synthesize_precommit(
-                            &conversation_id,
-                            &operation,
-                            &phrase,
-                            sink,
-                        ))?;
-                        let binding = result
-                            .result
-                            .with_context(|| {
-                                format!(
-                                    "Qwen segment was blocked: readiness={}, blocker={:?}",
-                                    result.readiness, result.blocker
-                                )
-                            })?
-                            .binding;
-                        let (
-                            segment_first_pcm_ms,
-                            first_packet_audio_ms,
-                            maximum_packet_gap_ms,
-                            boundary_gap_ms,
-                        ) = packets
-                            .lock()
-                            .map(|packets| {
-                                let segment_packets = &packets[packet_start.min(packets.len())..];
-                                let segment_first_pcm_ms =
-                                    segment_packets.first().map(|packet| packet.1);
-                                let first_audio =
-                                    segment_packets.first().map_or(139.0, |packet| packet.2);
-                                let maximum_gap = segment_packets
-                                    .windows(2)
-                                    .map(|pair| pair[1].1 - pair[0].1)
-                                    .fold(0.0_f64, f64::max);
-                                let boundary_gap = packet_start
-                                    .checked_sub(1)
-                                    .and_then(|previous| packets.get(previous))
-                                    .zip(segment_packets.first())
-                                    .map(|(previous, first)| first.1 - previous.1);
-                                (segment_first_pcm_ms, first_audio, maximum_gap, boundary_gap)
-                            })
-                            .unwrap_or((None, 139.0, 139.0, None));
-                        let first_audio_ms = binding
-                            .tts_time_to_first_audio_ms
-                            .map_or(140.0, |value| value as f64);
-                        let production_rtf = match (binding.tts_total_ms, binding.duration_ms) {
-                            (Some(synthesis), Some(audio)) if audio > 0 => {
-                                synthesis as f64 / audio as f64
-                            }
-                            _ => 0.7,
-                        };
-                        let uncovered_packet_gap_ms =
-                            (maximum_packet_gap_ms - first_packet_audio_ms).max(0.0);
-                        let refill_runway_ms = (first_audio_ms + uncovered_packet_gap_ms + 16.0)
-                            .max(first_packet_audio_ms * 1.25)
-                            .max(120.0);
-                        target_runway_ms = (refill_runway_ms
-                            + (production_rtf - 0.8).max(0.0) * 800.0)
-                            .clamp(180.0, 1_200.0);
-                        segments.push(serde_json::json!({
-                            "text": phrase,
-                            "dispatch_ms": dispatch_ms,
-                            "first_pcm_ms": segment_first_pcm_ms,
-                            "first_packet_audio_ms": first_packet_audio_ms,
-                            "maximum_internal_packet_gap_ms": maximum_packet_gap_ms,
-                            "preceding_segment_boundary_gap_ms": boundary_gap_ms,
-                            "tts_total_ms": binding.tts_total_ms,
-                            "duration_ms": binding.duration_ms,
-                            "generation_yield_us": binding.tts_generation_yield_us,
-                            "compute_lease_held_us": binding.tts_compute_lease_held_us,
-                            "next_target_runway_ms": target_runway_ms,
-                        }));
-                        bindings.push(binding);
-                        first = false;
-                    }
-                    let first_pcm_ms = first_pcm_ms.lock().ok().and_then(|value| *value);
-                    let packets = packets
-                        .lock()
-                        .map(|value| value.clone())
-                        .unwrap_or_default();
-                    anyhow::Ok((
-                        first_dispatch_ms,
-                        first_pcm_ms,
-                        packets,
-                        bindings,
-                        segments,
-                        scheduler_wait_ms,
-                    ))
-                })();
-                // Preserve the worker's original error for the accepting test
-                // thread. A dropped text receiver must not replace a Qwen
-                // failure with an unrelated channel-send error.
-                let _ = tts_tx.send(result);
-            })?;
-
-        let mut first_delta_ms = None;
-        let completed = mom_llama_runtime::voice_audio_finish_in_scope(
-            voice,
-            mom_llama_runtime::ChatSendOptions {
-                timeout_s: 600.0,
-                fake_fixture: false,
-            },
-            Some(|event: mom_llama_runtime::ChatStreamEvent| {
-                if matches!(event.event.as_str(), "delta" | "reasoning_delta")
-                    && let Some(delta) = event.delta
-                {
-                    first_delta_ms.get_or_insert_with(|| silence.elapsed().as_secs_f64() * 1_000.0);
-                    let _ = speech_tx.send(Some(delta));
-                }
-                Ok(())
-            }),
-        )?;
-        let output = completed.result.context("Gemma voice output")?;
-        let gemma_complete_ms = silence.elapsed().as_secs_f64() * 1_000.0;
-        println!(
-            "VOICE_RESIDENT_GEMMA_STREAMING_BENCHMARK {}",
-            serde_json::to_string(&serde_json::json!({
-                "silence_to_first_token_ms": first_delta_ms,
-                "engine_start_to_first_token_ms": output.first_token_ms,
-                "silence_to_gemma_complete_ms": gemma_complete_ms,
-                "gemma_completion_tokens": output.completion_tokens,
-                "audio": output.voice_audio_metrics,
-            }))?
-        );
-        // The Qwen worker can fail and close its text receiver before Gemma
-        // finishes. Preserve that original worker error instead of replacing
-        // it with an unrelated channel-send failure here.
-        let _ = speech_tx.send(None);
-        drop(speech_tx);
-        let (dispatch_ms, first_pcm_ms, packets, bindings, segments, scheduler_wait_ms) =
-            tts_rx.recv_timeout(Duration::from_secs(120))??;
-        let tts_pipeline_complete_ms = silence.elapsed().as_secs_f64() * 1_000.0;
-        tts_worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("Qwen worker panicked"))?;
-        ensure!(!bindings.is_empty(), "Gemma emitted no speakable phrase");
-        ensure!(
-            bindings
-                .first()
-                .and_then(|binding| binding.tts_helper_prepared_prefix_cache_hit)
-                .is_some(),
-            "foreground Qwen synthesis omitted its persona-prefix cache telemetry"
-        );
-        let generation_yields = bindings
-            .iter()
-            .map(|binding| binding.tts_generation_yields)
-            .sum::<u64>();
-        let generation_yield_us = bindings
-            .iter()
-            .map(|binding| binding.tts_generation_yield_us)
-            .sum::<u64>();
-        let generation_fair_passes = bindings
-            .iter()
-            .map(|binding| binding.tts_generation_fair_passes)
-            .sum::<u64>();
-        let compute_lease_held_us = bindings
-            .iter()
-            .map(|binding| binding.tts_compute_lease_held_us)
-            .sum::<u64>();
-        let compute_lease_released_us = bindings
-            .iter()
-            .map(|binding| binding.tts_compute_lease_released_us)
-            .sum::<u64>();
-        let tts_total_ms = bindings
-            .iter()
-            .filter_map(|binding| binding.tts_total_ms)
-            .sum::<u64>();
-        let tts_output_audio_ms = bindings
-            .iter()
-            .filter_map(|binding| binding.duration_ms)
-            .sum::<u64>();
-        let minimum_lead_ms = bindings
-            .iter()
-            .filter_map(|binding| binding.tts_compute_minimum_lead_ms)
-            .min();
-        let maximum_lead_ms = bindings
-            .iter()
-            .filter_map(|binding| binding.tts_compute_maximum_lead_ms)
-            .max();
-        let maximum_internal_packet_gap_ms = packets
-            .windows(2)
-            .filter(|pair| pair[0].0 == pair[1].0)
-            .map(|pair| pair[1].1 - pair[0].1)
-            .fold(0.0_f64, f64::max);
-        let maximum_segment_boundary_gap_ms = packets
-            .windows(2)
-            .filter(|pair| pair[0].0 != pair[1].0)
-            .map(|pair| pair[1].1 - pair[0].1)
-            .fold(0.0_f64, f64::max);
-        let mut preceding_audio_ms = 0.0_f64;
-        let required_startup_delay_ms = packets.first().map_or(0.0, |first| {
-            let first_arrival_ms = first.1;
-            packets.iter().fold(0.0_f64, |required, packet| {
-                let deficit = packet.1 - first_arrival_ms - preceding_audio_ms;
-                preceding_audio_ms += packet.2;
-                required.max(deficit)
-            })
-        });
-        let audio = output.voice_audio_metrics.as_ref();
-        let audio_finish_to_last_projector_finish_us = audio.and_then(|metrics| {
-            metrics
-                .finish_us
-                .zip(metrics.last_projector_finish_us)
-                .map(|(finish, projector_finish)| projector_finish.saturating_sub(finish))
-        });
-        let audio_finish_to_decode_start_us = audio.and_then(|metrics| {
-            metrics
-                .finish_us
-                .zip(metrics.decode_start_us)
-                .map(|(finish, decode_start)| decode_start.saturating_sub(finish))
-        });
-        let audio_decode_start_to_first_token_ms = first_delta_ms
-            .zip(audio_finish_to_decode_start_us.map(|elapsed| elapsed as f64 / 1_000.0))
-            .map(|(first_token, finish_to_decode)| (first_token - finish_to_decode).max(0.0));
-        let audio_receipt = serde_json::json!({
-            "streamed_audio_ms": audio.map(|metrics| metrics.accepted_samples as f64 / 16.0),
-            "projected_blocks": audio.map(|metrics| metrics.projected_blocks),
-            "projected_samples": audio.map(|metrics| metrics.projected_samples),
-            "tail_samples": audio.map(|metrics| metrics.tail_samples),
-            "projector_us": audio.map(|metrics| metrics.projector_us),
-            "tail_projector_us": audio.map(|metrics| metrics.tail_projector_us),
-            "finish_us": audio.and_then(|metrics| metrics.finish_us),
-            "last_projector_finish_us": audio.and_then(|metrics| metrics.last_projector_finish_us),
-            "decode_start_us": audio.and_then(|metrics| metrics.decode_start_us),
-            "finish_to_last_projector_finish_us": audio_finish_to_last_projector_finish_us,
-            "finish_to_decode_start_us": audio_finish_to_decode_start_us,
-            "decode_start_to_first_token_ms": audio_decode_start_to_first_token_ms,
-        });
-        let qwen_startup_warm = speech._qwen_startup_warm.map(|warm| {
-            serde_json::json!({
-                "completed": warm.completed,
-                "total": warm.total,
-                "resident_us": warm.resident_us,
-                "probe_us": warm.probe_us,
-                "total_us": warm.total_us,
-            })
-        });
-        let receipt = serde_json::json!({
-            "runtime_warm": {
-                "audio_projector_warmed": warm.audio_projector_warmed,
-                "audio_projector_warm_us": warm.audio_projector_warm_us,
-                "model_acquire_us": warm.model_acquire_us,
-            },
-            "silence_to_first_token_ms": first_delta_ms,
-            "engine_start_to_first_token_ms": output.first_token_ms,
-            "audio": audio_receipt,
-            "silence_to_tts_dispatch_ms": dispatch_ms,
-            "silence_to_first_pcm_ms": first_pcm_ms,
-            "silence_to_gemma_complete_ms": gemma_complete_ms,
-            "gemma_completion_tokens": output.completion_tokens,
-            "tts_generation_yields": generation_yields,
-            "tts_generation_yield_us": generation_yield_us,
-            "tts_generation_fair_passes": generation_fair_passes,
-            "tts_compute_lease_held_us": compute_lease_held_us,
-            "tts_compute_lease_released_us": compute_lease_released_us,
-            "tts_reference_admission_us": bindings.first().and_then(|binding| binding.tts_reference_admission_us),
-            "tts_reference_cache": bindings.first().and_then(|binding| binding.tts_reference_cache.clone()),
-            "tts_reference_us": bindings.first().and_then(|binding| binding.tts_reference_us),
-            "tts_first_pcm_us": bindings.first().and_then(|binding| binding.tts_helper_first_pcm_us),
-            "tts_text_chunk_us": bindings.first().and_then(|binding| binding.tts_helper_text_chunk_us),
-            "tts_code_generation_us": bindings.first().and_then(|binding| binding.tts_helper_code_generation_us),
-            "tts_prepared_prefix_cache_hit": bindings.first().and_then(|binding| binding.tts_helper_prepared_prefix_cache_hit),
-            "qwen_startup_warm": qwen_startup_warm,
-            "tts_first_decode_us": bindings.first().and_then(|binding| binding.tts_helper_first_decode_us),
-            "tts_total_ms": tts_total_ms,
-            "tts_output_audio_ms": tts_output_audio_ms,
-            "tts_pipeline_complete_ms": tts_pipeline_complete_ms,
-            "tts_scheduler_wait_ms": scheduler_wait_ms,
-            "tts_segment_count": bindings.len(),
-            "tts_segments": segments,
-            "tts_minimum_lead_ms": minimum_lead_ms,
-            "tts_maximum_lead_ms": maximum_lead_ms,
-            "tts_packet_count": packets.len(),
-            "tts_first_packet_audio_ms": packets.first().map(|packet| packet.2),
-            "tts_maximum_internal_packet_gap_ms": maximum_internal_packet_gap_ms,
-            "tts_maximum_segment_boundary_gap_ms": maximum_segment_boundary_gap_ms,
-            "tts_required_startup_delay_ms": required_startup_delay_ms,
-            "silence_to_safe_playback_ms": first_pcm_ms.map(|first| first + required_startup_delay_ms),
-            "assistant_text": output.assistant_text,
-        });
-        println!("VOICE_RESIDENT_PIPELINE_BENCHMARK {receipt}");
-        let audio = audio.context("Gemma omitted incremental-audio metrics")?;
-        let projector_backlog_us = audio
-            .finish_us
-            .zip(audio.last_projector_finish_us)
-            .map_or(u64::MAX, |(finish, projector_finish)| {
-                projector_finish.saturating_sub(finish)
-            });
-        ensure!(
-            projector_backlog_us <= 80_000,
-            "streaming audio projector retained {:.1} ms after physical silence",
-            projector_backlog_us as f64 / 1_000.0
-        );
-        ensure!(
-            audio.high_water_samples <= 3_200,
-            "streaming audio ring accumulated {:.1} ms instead of consuming near real time",
-            audio.high_water_samples as f64 / 16.0
-        );
-        ensure!(
-            first_delta_ms.is_some_and(|elapsed| elapsed <= 500.0),
-            "Gemma first token missed the 500 ms conversational ceiling: {first_delta_ms:?}"
-        );
-        ensure!(
-            first_pcm_ms.is_some_and(|elapsed| elapsed <= 750.0),
-            "Qwen first PCM missed the 750 ms end-to-end ceiling: {first_pcm_ms:?}"
-        );
-        ensure!(
-            generation_yields > 0,
-            "Qwen acquired the compute lease but resident Gemma never yielded"
-        );
-        ensure!(first_pcm_ms.is_some(), "Qwen emitted no PCM");
-        async_runtime
-            .block_on(speech.shutdown())
-            .map_err(anyhow::Error::msg)?;
-        drop(native);
-        Ok(())
-    }
 
     #[test]
     fn generation_backpressure_is_exact_idempotent_and_bounded() {
@@ -3323,7 +2756,7 @@ mod tests {
         }
     }
 
-    fn qwen_descriptor() -> SpeechBackendDescriptor {
+    pub(super) fn qwen_descriptor() -> SpeechBackendDescriptor {
         SpeechBackendDescriptor {
             id: QWEN_BACKEND_ID.to_string(),
             display_name: "Qwen3 TTS".to_string(),
@@ -3371,6 +2804,21 @@ mod tests {
         }
     }
 
+    fn pocket_descriptor() -> SpeechBackendDescriptor {
+        let mut descriptor = qwen_descriptor();
+        descriptor.id = speech_native_backend_pocket::POCKET_BACKEND_ID.to_string();
+        descriptor.display_name = "Pocket TTS CPU".to_string();
+        descriptor.capabilities[0].backend_id = descriptor.id.clone();
+        descriptor.capabilities[0].id = "pocket-tts.native-cpu.synthesis".to_string();
+        descriptor.capabilities[0].model_id =
+            Some(speech_native_backend_pocket::POCKET_MODEL_ID.to_string());
+        descriptor.models[0].id = speech_native_backend_pocket::POCKET_MODEL_ID.to_string();
+        descriptor.models[0].display_name = "Pocket TTS".to_string();
+        descriptor.models[0].family = "pocket-tts".to_string();
+        descriptor.voices[0].id = "mom.pocket.gabor_mate".to_string();
+        descriptor
+    }
+
     fn deferred_parakeet_descriptor() -> SpeechBackendDescriptor {
         let mut descriptor = parakeet_descriptor();
         descriptor.models[0].resident = false;
@@ -3403,8 +2851,13 @@ mod tests {
             &qwen,
             SpeechRequestId("request".to_string()),
         );
+        assert_eq!(
+            request,
+            precommit_synthesis_request("hello", &qwen, SpeechRequestId("request".to_string())),
+            "Read Aloud and precommit must share one persona synthesis contract"
+        );
         assert!(request.stream);
-        assert_eq!(request.output, qwen_stream_output());
+        assert_eq!(request.output, persona_stream_output());
         assert!(qwen.descriptor().capabilities.iter().all(|capability| {
             capability.network == NetworkBehavior::Never
                 && matches!(
@@ -3474,6 +2927,73 @@ mod tests {
     }
 
     #[test]
+    fn precommit_purpose_routes_notes_to_qwen_and_calls_to_pocket_without_fallback() {
+        let descriptors = [qwen_descriptor(), pocket_descriptor()];
+        let persona_voice = "mom.qwen.icl.gabor_mate";
+        let note = select_precommit(&descriptors, 62, persona_voice, PrecommitPurpose::VoiceNote)
+            .expect("voice note retains Qwen");
+        assert!(matches!(note, ReadAloudSelection::Qwen(_)));
+        assert_eq!(note.backend_id(), QWEN_BACKEND_ID);
+        assert!(
+            note.compute_arbiter(None).is_some(),
+            "Qwen stays compute-coordinated"
+        );
+
+        let call = select_precommit(&descriptors, 62, persona_voice, PrecommitPurpose::Call)
+            .expect("call selects Pocket CPU");
+        assert!(matches!(call, ReadAloudSelection::Pocket(_)));
+        assert_eq!(
+            call.backend_id(),
+            speech_native_backend_pocket::POCKET_BACKEND_ID
+        );
+        assert_eq!(
+            call.model_id().as_deref(),
+            Some(speech_native_backend_pocket::POCKET_MODEL_ID)
+        );
+        assert_eq!(call.voice_id(), "mom.pocket.gabor_mate");
+        assert!(
+            call.compute_arbiter(None).is_none(),
+            "Pocket does not reserve Metal"
+        );
+
+        assert!(
+            select_precommit(
+                &[qwen_descriptor()],
+                62,
+                persona_voice,
+                PrecommitPurpose::Call,
+            )
+            .is_err(),
+            "missing Pocket blocks instead of falling back to Qwen"
+        );
+        assert!(
+            select_precommit(
+                &[pocket_descriptor()],
+                62,
+                persona_voice,
+                PrecommitPurpose::VoiceNote,
+            )
+            .is_err(),
+            "missing Qwen blocks voice notes instead of falling back to Pocket"
+        );
+    }
+
+    #[test]
+    fn precommit_purpose_accepts_only_explicit_snake_case_values() {
+        assert_eq!(
+            serde_json::from_str::<PrecommitPurpose>("\"call\"")
+                .expect("call purpose is a valid wire value"),
+            PrecommitPurpose::Call
+        );
+        assert_eq!(
+            serde_json::from_str::<PrecommitPurpose>("\"voice_note\"")
+                .expect("voice note purpose is a valid wire value"),
+            PrecommitPurpose::VoiceNote
+        );
+        assert!(serde_json::from_str::<PrecommitPurpose>("\"read_aloud\"").is_err());
+    }
+
+    #[test]
     fn prepared_turn_voice_binding_is_resident_and_immutable() {
         let speech = MomSpeech::empty_for_tests();
         let conversation = "conversation-resident-voice";
@@ -3515,7 +3035,7 @@ mod tests {
     fn qwen_icl_response_validates_against_the_selected_model() {
         let request_id = SpeechRequestId("qwen-icl-validation".to_string());
         let voice_id = "mom.qwen.icl.gabor_mate";
-        let selection = ReadAloudSelection::Qwen(QwenSelection {
+        let selection = ReadAloudSelection::Qwen(EmbeddedVoiceSelection {
             descriptor_sha256: "descriptor".to_string(),
             descriptor: qwen_descriptor(),
             model_id: QWEN_ICL_MODEL_ID.to_string(),
@@ -3531,7 +3051,7 @@ mod tests {
                 network: NetworkBehavior::Never,
             },
             output: SynthesisOutput::Streamed {
-                format: qwen_stream_output(),
+                format: persona_stream_output(),
                 emitted_bytes: 3,
             },
             duration_ms: Some(800),
@@ -3545,6 +3065,50 @@ mod tests {
         assert_eq!(
             validate_read_aloud_response(response, &request_id, &selection),
             Ok(Some(800))
+        );
+    }
+
+    #[test]
+    fn pocket_call_response_must_match_the_selected_cpu_route() {
+        let request_id = SpeechRequestId("pocket-call-validation".to_string());
+        let selection = ReadAloudSelection::Pocket(EmbeddedVoiceSelection {
+            descriptor_sha256: "descriptor".to_string(),
+            descriptor: pocket_descriptor(),
+            model_id: speech_native_backend_pocket::POCKET_MODEL_ID.to_string(),
+            voice_id: "mom.pocket.gabor_mate".to_string(),
+        });
+        let response = SynthesisResponse {
+            request_id: request_id.clone(),
+            route: speech_native_types::SpeechResolvedRoute {
+                backend_id: speech_native_backend_pocket::POCKET_BACKEND_ID.to_string(),
+                model_id: Some(speech_native_backend_pocket::POCKET_MODEL_ID.to_string()),
+                voice_id: Some("mom.pocket.gabor_mate".to_string()),
+                backend_kind: SpeechBackendKind::EmbeddedModel,
+                network: NetworkBehavior::Never,
+            },
+            output: SynthesisOutput::Streamed {
+                format: persona_stream_output(),
+                emitted_bytes: 3,
+            },
+            duration_ms: Some(800),
+            alignments: Vec::new(),
+            usage: speech_native_types::SpeechUsage {
+                real_local_inference: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            validate_read_aloud_response(response.clone(), &request_id, &selection),
+            Ok(Some(800))
+        );
+
+        let mut wrong_route = response;
+        wrong_route.route.backend_id = QWEN_BACKEND_ID.to_string();
+        assert_eq!(
+            validate_read_aloud_response(wrong_route, &request_id, &selection)
+                .expect_err("a Qwen response cannot satisfy a Pocket call")
+                .code,
+            "speech_provenance_mismatch"
         );
     }
 
@@ -3615,6 +3179,7 @@ mod tests {
                         duration_ms: None,
                         tts_time_to_first_audio_ms: None,
                         tts_total_ms: None,
+                        tts_generation_segments: Vec::new(),
                         network: NetworkBehavior::Never,
                     },
                 )
@@ -3735,6 +3300,41 @@ mod tests {
         const ATTACHMENT_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
             fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
             data\x02\x00\x00\x00\x00\x00";
+
+        #[test]
+        fn read_aloud_speaks_visible_text_but_binds_raw_stored_content() {
+            let raw = "<|channel>thought\nprivate reasoning<channel|>Visible answer.";
+            let message = Message {
+                id: "message".to_string(),
+                conversation_id: "conversation".to_string(),
+                role: MessageRole::Assistant,
+                content: raw.to_string(),
+                created_at: "1".to_string(),
+                parent_id: None,
+                model: None,
+                receipt_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_content: None,
+                reasoning_incomplete: false,
+                branch_index: None,
+                branch_count: None,
+                attribution: None,
+                attachment_ids: Vec::new(),
+            };
+
+            let speech_text = assistant_message_speech_text(&message).expect("visible answer");
+            assert_eq!(speech_text.text, "Visible answer.");
+            assert_eq!(speech_text.raw_content_sha256, sha256_hex(raw.as_bytes()));
+            assert_eq!(
+                message.content, raw,
+                "speech projection must not mutate storage"
+            );
+
+            let mut thought_only = message;
+            thought_only.content = "<|channel>thought\nprivate reasoning<channel|>".to_string();
+            assert!(assistant_message_speech_text(&thought_only).is_none());
+        }
 
         struct OwnedSpeechStore {
             _directory: tempfile::TempDir,
@@ -3918,7 +3518,7 @@ mod tests {
                     },
                     // Envelope bytes only; no synthesis, decoding or playback.
                     output: SynthesisOutput::Streamed {
-                        format: qwen_stream_output(),
+                        format: persona_stream_output(),
                         emitted_bytes: u64::try_from(MOCK_WAV.len()).expect("mock WAV length"),
                     },
                     duration_ms: Some(1),
@@ -4378,6 +3978,272 @@ mod tests {
         -> anyhow::Result<()> {
             transcription_postflight_error(true).await
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_synthesis_scheduling_tests {
+    use super::*;
+    use speech_native_types::{SpeechResolvedRoute, SpeechUsage};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy)]
+    enum ProbeOutcome {
+        Success,
+        Failure,
+        WaitForCancellation,
+    }
+
+    struct SchedulingProbeExecutor {
+        outcome: ProbeOutcome,
+        complete_calls: AtomicUsize,
+        streaming_calls: AtomicUsize,
+        cancel_requested: AtomicBool,
+        streaming_started: Notify,
+        cancelled: Notify,
+    }
+
+    impl SchedulingProbeExecutor {
+        fn new(outcome: ProbeOutcome) -> Self {
+            Self {
+                outcome,
+                complete_calls: AtomicUsize::new(0),
+                streaming_calls: AtomicUsize::new(0),
+                cancel_requested: AtomicBool::new(false),
+                streaming_started: Notify::new(),
+                cancelled: Notify::new(),
+            }
+        }
+
+        fn response(request_id: SpeechRequestId) -> SynthesisResponse {
+            SynthesisResponse {
+                request_id,
+                route: SpeechResolvedRoute {
+                    backend_id: QWEN_BACKEND_ID.to_string(),
+                    model_id: Some(QWEN_ICL_MODEL_ID.to_string()),
+                    voice_id: Some("mom.qwen.icl.gabor_mate".to_string()),
+                    backend_kind: speech_native_types::SpeechBackendKind::EmbeddedModel,
+                    network: NetworkBehavior::Never,
+                },
+                output: SynthesisOutput::Streamed {
+                    format: persona_stream_output(),
+                    emitted_bytes: 4_800,
+                },
+                duration_ms: Some(100),
+                alignments: Vec::new(),
+                usage: SpeechUsage {
+                    real_local_inference: true,
+                    ..SpeechUsage::default()
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SpeechExecutor for SchedulingProbeExecutor {
+        fn descriptors(&self) -> Result<Arc<[SpeechBackendDescriptor]>, SpeechHostError> {
+            Ok(Arc::from([super::tests::qwen_descriptor()]))
+        }
+
+        async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisResponse, String> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                ProbeOutcome::Success => Ok(Self::response(request.context.request_id)),
+                ProbeOutcome::Failure => Err("mock synthesis failure".to_string()),
+                ProbeOutcome::WaitForCancellation => {
+                    Err("unexpected non-streaming cancellation fixture".to_string())
+                }
+            }
+        }
+
+        async fn synthesize_streaming(
+            &self,
+            request: SynthesisRequest,
+            sink: PcmStreamSink,
+        ) -> Result<SynthesisResponse, String> {
+            self.streaming_calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                ProbeOutcome::Success => {
+                    sink(&speech_native_types::AudioChunk {
+                        sequence: 0,
+                        sample_offset: 0,
+                        format: PcmFormat {
+                            sample_rate_hz: 24_000,
+                            channels: 1,
+                            sample_format: PcmSampleFormat::I16Le,
+                            interleaved: true,
+                        },
+                        data: vec![0; 4_800],
+                        end_of_stream: false,
+                    })?;
+                    Ok(Self::response(request.context.request_id))
+                }
+                ProbeOutcome::Failure => Err("mock synthesis failure".to_string()),
+                ProbeOutcome::WaitForCancellation => {
+                    self.streaming_started.notify_one();
+                    loop {
+                        let cancelled = self.cancelled.notified();
+                        if self.cancel_requested.load(Ordering::Acquire) {
+                            return Err("speech_cancelled".to_string());
+                        }
+                        cancelled.await;
+                    }
+                }
+            }
+        }
+
+        async fn transcribe(
+            &self,
+            _request: TranscriptionRequest,
+        ) -> Result<TranscriptionResponse, String> {
+            Err("transcription is not part of this fixture".to_string())
+        }
+
+        fn cancel(&self, _request_id: &SpeechRequestId) -> usize {
+            self.cancel_requested.store(true, Ordering::Release);
+            self.cancelled.notify_one();
+            1
+        }
+
+        fn quiesce(&self) -> Result<(), SpeechHostError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), SpeechHostError> {
+            Ok(())
+        }
+    }
+
+    fn speech_with(executor: Arc<SchedulingProbeExecutor>) -> MomSpeech {
+        MomSpeech {
+            executor,
+            _qwen: None,
+            _qwen_startup_warm: None,
+            state: Mutex::new(SpeechState::default()),
+            operation_revision: watch::channel(0).0,
+            precommit_voices: RwLock::new(BTreeMap::new()),
+            generation_backpressure: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn selection() -> ReadAloudSelection {
+        select_read_aloud(
+            &[super::tests::qwen_descriptor()],
+            5,
+            Some("mom.qwen.icl.gabor_mate"),
+            true,
+        )
+        .expect("Qwen route")
+    }
+
+    fn assert_one_terminal_lease(metrics: RealtimeTtsComputeMetrics) {
+        assert_eq!(metrics.lease_acquisitions, 1);
+        assert_eq!(metrics.lease_releases, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_synthesis_settles_stream_complete_error_and_cancel_leases() {
+        let selection = selection();
+
+        let complete = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&complete));
+        let mut reservation = RealtimeTtsComputeArbiter::new();
+        reservation.metrics.low_water_ms = 777;
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-complete".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, None, Some(reservation))
+            .await;
+        assert!(response.is_ok());
+        assert_one_terminal_lease(metrics);
+        assert_eq!(metrics.low_water_ms, 777, "reuse precommit reservation");
+        assert_eq!(complete.complete_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(complete.streaming_calls.load(Ordering::Relaxed), 0);
+
+        let streamed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&streamed));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_sink = Arc::clone(&delivered);
+        let sink: PcmStreamSink = Arc::new(move |_| {
+            delivered_sink.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-stream".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, Some(sink), None)
+            .await;
+        assert!(response.is_ok());
+        assert_one_terminal_lease(metrics);
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(streamed.complete_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(streamed.streaming_calls.load(Ordering::Relaxed), 1);
+
+        let stream_failed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Success));
+        let speech = speech_with(Arc::clone(&stream_failed));
+        let rejecting_sink: PcmStreamSink = Arc::new(|_| Err("downstream closed".to_string()));
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-stream-sink-error".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, Some(rejecting_sink), None)
+            .await;
+        assert_eq!(
+            response.expect_err("downstream sink failure"),
+            "downstream closed"
+        );
+        assert_one_terminal_lease(metrics);
+
+        let failed = Arc::new(SchedulingProbeExecutor::new(ProbeOutcome::Failure));
+        let speech = speech_with(Arc::clone(&failed));
+        let request = precommit_synthesis_request(
+            "hello",
+            &selection,
+            SpeechRequestId("schedule-error".to_string()),
+        );
+        let (response, metrics) = speech
+            .synthesize_selected(&selection, request, None, None)
+            .await;
+        assert_eq!(
+            response.expect_err("fixture failure"),
+            "mock synthesis failure"
+        );
+        assert_one_terminal_lease(metrics);
+
+        let cancelled = Arc::new(SchedulingProbeExecutor::new(
+            ProbeOutcome::WaitForCancellation,
+        ));
+        let speech = Arc::new(speech_with(Arc::clone(&cancelled)));
+        let request_id = SpeechRequestId("schedule-cancel".to_string());
+        let request = precommit_synthesis_request("hello", &selection, request_id.clone());
+        let task = tokio::spawn(async move {
+            speech
+                .synthesize_selected(&selection, request, Some(Arc::new(|_| Ok(()))), None)
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancelled.streaming_started.notified(),
+        )
+        .await
+        .expect("stream reached executor");
+        assert_eq!(cancelled.cancel(&request_id), 1);
+        let (response, metrics) = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled synthesis settled")
+            .expect("synthesis task joined");
+        assert_eq!(response.expect_err("cancelled fixture"), "speech_cancelled");
+        assert_one_terminal_lease(metrics);
     }
 }
 

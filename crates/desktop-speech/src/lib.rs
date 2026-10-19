@@ -10,6 +10,7 @@ use std::sync::Arc;
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
 };
+use speech_native_backend_pocket::{PocketBackendConfig, PocketSpeechBackend};
 use speech_native_backend_qwen::{QwenBackendConfig, QwenSpeechBackend};
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
@@ -32,12 +33,14 @@ pub async fn discover_local_host(
 /// Construct the local Qwen backend early enough for its resident model and
 /// reference prefixes to warm while the product unlocks unrelated state. The
 /// returned backend is the one later registered with the speech host; callers
-/// must not create a second copy for the same process.
+/// must not create a second copy for the same process. `acquire_compute` is
+/// called on the warm worker and its guard spans load and graph compilation.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn prepare_local_qwen(
+pub fn prepare_local_qwen<G: Send + 'static>(
     managed_model_root: Option<PathBuf>,
     installed_voice_root: Option<PathBuf>,
+    acquire_compute: impl FnOnce() -> G + Send + 'static,
 ) -> Arc<QwenSpeechBackend> {
     let qwen = Arc::new(QwenSpeechBackend::discover(
         QwenBackendConfig::discover_with_reference_root(
@@ -45,7 +48,7 @@ pub fn prepare_local_qwen(
             installed_voice_root.as_deref(),
         ),
     ));
-    qwen.warm_icl_in_background();
+    qwen.warm_icl_in_background(acquire_compute);
     qwen
 }
 
@@ -58,6 +61,12 @@ pub async fn discover_local_host_with_qwen(
     #[cfg(not(target_os = "macos"))] _prepared_qwen: Option<Arc<QwenSpeechBackend>>,
 ) -> Result<Arc<SpeechHost>, SpeechHostError> {
     let host = Arc::new(SpeechHost::default());
+    let pocket_root = installed_voice_root
+        .as_ref()
+        .map(|root| root.with_file_name("pocket"));
+    host.register_backend(Arc::new(PocketSpeechBackend::discover(
+        PocketBackendConfig::discover_with_reference_root(pocket_root.as_deref()),
+    )))?;
     let parakeet = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
         model_dir: None,
         managed_model_root: managed_model_root.clone(),
@@ -67,7 +76,14 @@ pub async fn discover_local_host_with_qwen(
     #[cfg(target_os = "macos")]
     {
         let qwen = prepared_qwen.unwrap_or_else(|| {
-            prepare_local_qwen(managed_model_root.clone(), installed_voice_root.clone())
+            // Discovery never schedules model work. Explicit preparation owns
+            // compute admission; otherwise the first synthesis loads lazily.
+            Arc::new(QwenSpeechBackend::discover(
+                QwenBackendConfig::discover_with_reference_root(
+                    managed_model_root.as_deref(),
+                    installed_voice_root.as_deref(),
+                ),
+            ))
         });
         host.register_backend(qwen.clone())?;
     }

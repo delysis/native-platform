@@ -40,7 +40,7 @@
         "reasoning_delta events are distinct from visible assistant deltas",
         "reasoning content and incomplete state persist in encrypted conversation records",
         "the Maud view renders reasoning in an expandable section",
-        "disableReasoningParsing and excludeReasoningFromContext are active settings",
+        "excludeReasoningFromContext controls future model context; the serialized disableReasoningParsing compatibility key cannot bypass the native protocol parser",
         "mom_llama.chat_skip_reasoning drives a branch-scoped native force flag and the upstream SkipForward affordance",
         "deterministic tests prove force scoping and model-specific closing-marker selection",
         "receipts/007-real-structured-reasoning-skip.json"

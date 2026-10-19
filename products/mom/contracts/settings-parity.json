@@ -64,7 +64,7 @@
     {"key":"agenticMaxTurns","status":"implemented","evidence":"Bounds the native model/tool loop to the stricter one-to-eight range."},
     {"key":"alwaysShowToolCallContent","status":"implemented","evidence":"Controls expansion of tool arguments and technical details."},
     {"key":"preEncodeConversation","status":"implemented","ui_projection":"backend_only","runtime_policy":"kv_cache_policy","evidence":"The Rust-owned cache policy implements the upstream behavior without exposing cache internals or a cache-policy control in the ordinary product UI."},
-    {"key":"disableReasoningParsing","status":"implemented","evidence":"Preserves raw reasoning markers when enabled."},
+    {"key":"disableReasoningParsing","status":"superseded_by_native_rust","reason":"Existing persisted values remain readable without migration, but the key is no longer a default or writable setting; reserved model-protocol markers are always separated from user-visible content."},
     {"key":"excludeReasoningFromContext","status":"implemented","evidence":"Strips persisted reasoning from later native context when enabled."},
     {"key":"showRawOutputSwitch","status":"implemented","evidence":"Shows a command-backed formatted/raw assistant output toggle."},
     {"key":"jsSandboxEnabled","status":"rejected_for_constraint_violation","reason":"The native-local webview does not execute model-authored JavaScript."},

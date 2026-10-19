@@ -446,6 +446,30 @@
       "destructive": "none"
     },
     {
+      "effect_id": "mom_llama.effects.voice_reply_store.v1",
+      "reads": [
+        "exact_assistant_message",
+        "completed_voice_reply_wav"
+      ],
+      "writes": [
+        "encrypted_attachment",
+        "attachment_metadata",
+        "assistant_message_attachment_binding"
+      ],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": [
+        "encrypted_sqlite"
+      ],
+      "memory": [
+        "bounded_pcm_wav"
+      ],
+      "external_apps": [],
+      "destructive": "none"
+    },
+    {
       "effect_id": "mom_llama.effects.attachment_import.v1",
       "reads": ["user_selected_attachment"],
       "writes": ["encrypted_attachment", "attachment_metadata", "command_receipt"],

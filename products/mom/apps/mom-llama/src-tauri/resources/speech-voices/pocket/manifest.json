@@ -1,0 +1,333 @@
+{
+  "schema_version": 1,
+  "model_revision": "575d14372df89a4534bcb989870a34e77544b09f",
+  "encoder_revision": "7f364c05d1be3faf2b234cdbe4cbb68a026d4218",
+  "config_sha256": "26caf8dd69c4a0d1486bd284ad54a7de5854bd48b9e888135b9f7dd2e886cb25",
+  "tokenizer_sha256": "f498428e1eafee50492f7be13dc9bfafcfc12e508cd0eb1b01c92ecd5d8c6687",
+  "official_source_commit": "1df6b3da17cb43eff8c4c4e077f785520492adff",
+  "source_persona_manifest_sha256": "96ab575695ff226beed0c5a5d7073ba72064929d7f0fffa13db8d4883c927cb0",
+  "encoder_weights_sha256": "7767ce79b1b8db523d867e70855a00627aacfe44aaa5c1fd7ebe135fba71fff9",
+  "reference_preprocessing": {
+    "implementation": "Kyutai official audio_read + convert_audio + end_on_pause + Mimi encoder + flow_lm speaker projection",
+    "sample_rate_hz": 24000,
+    "channels": 1,
+    "end_on_pause": {
+      "frame_ms": 20,
+      "floor_db": 35,
+      "fade_ms": 20,
+      "appended_silence_ms": 80
+    },
+    "normalization": "none",
+    "conditioning_shape": "[frames, 1024] little-endian f32"
+  },
+  "entries": [
+    {
+      "persona_id": "ad_de_jongh",
+      "speaker": "Ad de Jongh",
+      "source_clip_path": "qwen-icl/clips/ad_de_jongh.wav",
+      "source_clip_sha256": "1dbcb72426c500d12d26d4253e06a14e4da856881c2919739cde4ef50da54b7a",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "kbwm0QHNTvA",
+      "source_timestamp_start_seconds": 180,
+      "source_timestamp_end_seconds": 194,
+      "embedding_path": "voices/ad_de_jongh.f32le",
+      "embedding_sha256": "5059d33e11711209c58f10e1e63a51f328c10b840afc8499895914014cb2934b",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 561.806
+    },
+    {
+      "persona_id": "arnold_popky",
+      "speaker": "Arnold Popky",
+      "source_clip_path": "qwen-icl/clips/arnold_popky.wav",
+      "source_clip_sha256": "7fd966995a9f60a04c8f78e3a431d5e66e8b274060f9febcd469135be571e46e",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 384000
+      },
+      "source_video_id": "3EcW-qsfvpU",
+      "source_timestamp_start_seconds": 149.0,
+      "source_timestamp_end_seconds": 165.0,
+      "embedding_path": "voices/arnold_popky.f32le",
+      "embedding_sha256": "a8569d28c1f61e49b1e0b9a169e180d65bf087ea2268ea85d88063d8d145af35",
+      "embedding_bytes": 823296,
+      "frames": 201,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 385920,
+      "encode_elapsed_ms": 595.051
+    },
+    {
+      "persona_id": "bessel_van_der_kolk",
+      "speaker": "Bessel van der Kolk",
+      "source_clip_path": "qwen-icl/clips/bessel_van_der_kolk.wav",
+      "source_clip_sha256": "9208c2cf7bafc31896151111707b1bc638ef6728eaf7fb03ea0d9bcdb1b67562",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 360002
+      },
+      "source_video_id": "-MI6Z_NlE8A",
+      "source_timestamp_start_seconds": 604,
+      "source_timestamp_end_seconds": 618,
+      "embedding_path": "voices/bessel_van_der_kolk.f32le",
+      "embedding_sha256": "f3df40d56f2648c720232866fef33dd80ff99a1bcda2aea78d91f22797c8e578",
+      "embedding_bytes": 774144,
+      "frames": 189,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 361920,
+      "encode_elapsed_ms": 532.222
+    },
+    {
+      "persona_id": "christine_courtois",
+      "speaker": "Christine Courtois",
+      "source_clip_path": "qwen-icl/clips/christine_courtois.wav",
+      "source_clip_sha256": "8876c34ab380c3e02e7cf37f136321c128d8d0ce252e57bc09550d0c47fda766",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 380400
+      },
+      "source_video_id": "JJz7g6gRaHo",
+      "source_timestamp_start_seconds": 75.99,
+      "source_timestamp_end_seconds": 91.84,
+      "embedding_path": "voices/christine_courtois.f32le",
+      "embedding_sha256": "58a145b103a71b8d24c95ee5c3a3d62a7c434599f64c22eca8891f3e50aa5269",
+      "embedding_bytes": 815104,
+      "frames": 199,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 382080,
+      "encode_elapsed_ms": 574.225
+    },
+    {
+      "persona_id": "dolores_mosquera",
+      "speaker": "Dolores Mosquera",
+      "source_clip_path": "qwen-icl/clips/dolores_mosquera.wav",
+      "source_clip_sha256": "3d68672463425bb77c4d756fefd4b047679ce7d84668b817421e9297d7d26d63",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 176880
+      },
+      "source_video_id": "AxEERWF8-A4",
+      "source_timestamp_start_seconds": 94.32,
+      "source_timestamp_end_seconds": 101.69,
+      "embedding_path": "voices/dolores_mosquera.f32le",
+      "embedding_sha256": "de30c640537906c4ea80b790d84938ca7a3628c2c314221396c65c39b91a2174",
+      "embedding_bytes": 380928,
+      "frames": 93,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 178560,
+      "encode_elapsed_ms": 229.81
+    },
+    {
+      "persona_id": "francine_shapiro",
+      "speaker": "Francine Shapiro",
+      "source_clip_path": "qwen-icl/clips/francine_shapiro.wav",
+      "source_clip_sha256": "6391a4be7e73d0ad7a5fce7e142fb0de84e7275439958d0350093ac579af9295",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "8GUd5hhnkVE",
+      "source_timestamp_start_seconds": 331,
+      "source_timestamp_end_seconds": 345,
+      "embedding_path": "voices/francine_shapiro.f32le",
+      "embedding_sha256": "ad4aadb79a70763302b6b7f6eeafe714f2ee454a23e4b0f2312eac71051a0cbd",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 503.815
+    },
+    {
+      "persona_id": "gabor_mate",
+      "speaker": "Gabor Mat\u00e9",
+      "source_clip_path": "qwen-icl/clips/gabor_mate.wav",
+      "source_clip_sha256": "26a87331e54fd088d1072e2459769bf9014487c641305fd229e7c4c03be21a69",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336000
+      },
+      "source_video_id": "krZmYALUqhM",
+      "source_timestamp_start_seconds": 543,
+      "source_timestamp_end_seconds": 557,
+      "embedding_path": "voices/gabor_mate.f32le",
+      "embedding_sha256": "a156307e9cd83f7d9b678cc5635080a5e95239b983db181ba088bae79d0dec6b",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 492.687
+    },
+    {
+      "persona_id": "janina_fisher",
+      "speaker": "Janina Fisher",
+      "source_clip_path": "qwen-icl/clips/janina_fisher.wav",
+      "source_clip_sha256": "643b441cec1a7c50c8be49a7bbb9ba1d95d1c4278cf23ba290c594dccce38357",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "sqHQgPviOTY",
+      "source_timestamp_start_seconds": 510,
+      "source_timestamp_end_seconds": 524,
+      "embedding_path": "voices/janina_fisher.f32le",
+      "embedding_sha256": "3029efb52a1e0eb6440f1a920320d97e2374723bab1abe2e28ff9a236985d218",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 487.188
+    },
+    {
+      "persona_id": "jim_knipe",
+      "speaker": "Jim Knipe",
+      "source_clip_path": "qwen-icl/clips/jim_knipe.wav",
+      "source_clip_sha256": "64eada7bc353c0f482ff9cc7d78106dd9ed030f7e42a1670666554ac599d5491",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336000
+      },
+      "source_video_id": "RUd25vrgV5I",
+      "source_timestamp_start_seconds": 240,
+      "source_timestamp_end_seconds": 254,
+      "embedding_path": "voices/jim_knipe.f32le",
+      "embedding_sha256": "2f621bf0b5417c28b356beffc312e3f4f5e195a51603a63508f805ef2b056f33",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 481.646
+    },
+    {
+      "persona_id": "judith_herman",
+      "speaker": "Judith Herman",
+      "source_clip_path": "qwen-icl/clips/judith_herman.wav",
+      "source_clip_sha256": "c5fe07ea4e497fc9f53cbb39a6e65e6d2775dd67ce5917b8b3bd54ceb522cfcb",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "USTKmffoQms",
+      "source_timestamp_start_seconds": 1501,
+      "source_timestamp_end_seconds": 1515,
+      "embedding_path": "voices/judith_herman.f32le",
+      "embedding_sha256": "51d6570997d2e3c1a3d6b8804715ea35c242fb626aa946c0283455c78719ea5c",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 502.918
+    },
+    {
+      "persona_id": "peter_levine",
+      "speaker": "Peter Levine",
+      "source_clip_path": "qwen-icl/clips/peter_levine.wav",
+      "source_clip_sha256": "3fb7ec47ac6332ae4da0affc38c6451baeb95325c7dd4c5442ac0d5fd2864f27",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "s1RnTipiU_Q",
+      "source_timestamp_start_seconds": 240,
+      "source_timestamp_end_seconds": 254,
+      "embedding_path": "voices/peter_levine.f32le",
+      "embedding_sha256": "2154deeedd2d72203d6d1a6ce2b96ce778e434978cb3e6700cd059e025ed323b",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 503.965
+    },
+    {
+      "persona_id": "richard_schwartz",
+      "speaker": "Richard Schwartz",
+      "source_clip_path": "qwen-icl/clips/richard_schwartz.wav",
+      "source_clip_sha256": "ada3ac0bb14c2fef41082eff2f25b08e16dc6afe431ee3785254108fe7454188",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 384216
+      },
+      "source_video_id": "f80xs3MN9mY",
+      "source_timestamp_start_seconds": 212.28,
+      "source_timestamp_end_seconds": 228.289,
+      "embedding_path": "voices/richard_schwartz.f32le",
+      "embedding_sha256": "2f6bbab39392d732770c2240e5de528a6c1578cdd93f866f001d45f80ed3ec42",
+      "embedding_bytes": 823296,
+      "frames": 201,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 385920,
+      "encode_elapsed_ms": 599.957
+    },
+    {
+      "persona_id": "robert_miller",
+      "speaker": "Robert Miller (Feeling-State Addiction Protocol)",
+      "source_clip_path": "qwen-icl/clips/robert_miller.wav",
+      "source_clip_sha256": "971cdc4191c80954cd70e8d4d4a790e34bb1772793f4abc85f28d4875c0715dd",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "Kp5ipBv08hU",
+      "source_timestamp_start_seconds": 331,
+      "source_timestamp_end_seconds": 345,
+      "embedding_path": "voices/robert_miller.f32le",
+      "embedding_sha256": "045311f998c9c9e7d8f2bbc8ab3c0b6ec29a2cfca70bd8c3ca02fdd1e9d73b46",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 497.953
+    },
+    {
+      "persona_id": "shirley_jean_schmidt",
+      "speaker": "Shirley Jean Schmidt (DNMS)",
+      "source_clip_path": "qwen-icl/clips/shirley_jean_schmidt.wav",
+      "source_clip_sha256": "9d0c9b7c04c83007840954dc3c3e85a78dd0ed883dcec93746c61c0cb528a6a5",
+      "source_clip_format": {
+        "channels": 1,
+        "sample_rate_hz": 24000,
+        "sample_width_bytes": 2,
+        "frames": 336039
+      },
+      "source_video_id": "ike-VzVAfjw",
+      "source_timestamp_start_seconds": 300,
+      "source_timestamp_end_seconds": 314,
+      "embedding_path": "voices/shirley_jean_schmidt.f32le",
+      "embedding_sha256": "a8ce277943455165443913f7ad23ea97f7699cec17585d132b066e51878df53c",
+      "embedding_bytes": 720896,
+      "frames": 176,
+      "dimension": 1024,
+      "preprocessed_pcm_frames": 337920,
+      "encode_elapsed_ms": 499.182
+    }
+  ]
+}

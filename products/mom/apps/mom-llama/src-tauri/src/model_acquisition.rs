@@ -22,7 +22,12 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_ATTEMPTS: usize = 3;
 const PROGRESS_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const PERSONA_MANIFEST_SHA256: &str =
-    "4c7b786b36c7b3643e7119e52b506d1e81178e3294246dbdd4c108e52deb47e1";
+    "96ab575695ff226beed0c5a5d7073ba72064929d7f0fffa13db8d4883c927cb0";
+
+const POCKET_MANIFEST_SHA256: &str =
+    "28618598ea7cd43505e0b1bf592354180b8f97c2c92d45a2843a49d3c1bca458";
+
+const VOICE_CACHE_PREPARATION_SCHEMA: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct Artifact {
@@ -166,6 +171,14 @@ const REQUIRED_ARTIFACTS: &[Artifact] = &[
         relative: "vocab.json",
         sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
         bytes: 2_776_833,
+    },
+    Artifact {
+        id: "pocket-weights",
+        repository: speech_native_backend_pocket::POCKET_MODEL_REPOSITORY,
+        revision: speech_native_backend_pocket::POCKET_MODEL_REVISION,
+        relative: speech_native_backend_pocket::POCKET_MODEL_RELATIVE_PATH,
+        sha256: speech_native_backend_pocket::POCKET_MODEL_SHA256,
+        bytes: speech_native_backend_pocket::POCKET_MODEL_BYTES,
     },
 ];
 
@@ -355,6 +368,22 @@ pub(crate) fn validate_persona_voices(
     Ok(())
 }
 
+pub(crate) fn validate_pocket_voices(root: &Path) -> Result<(), AcquisitionError> {
+    let path = root.join("manifest.json");
+    let bytes = fs::read(&path).map_err(|source| AcquisitionError::Io {
+        operation: "read call voice manifest",
+        path,
+        source,
+    })?;
+    if format!("{:x}", Sha256::digest(&bytes)) != POCKET_MANIFEST_SHA256 {
+        return Err(AcquisitionError::VoiceArchive(
+            "the packaged call voice manifest failed verification".into(),
+        ));
+    }
+    speech_native_backend_pocket::validate_voice_resources(root)
+        .map_err(|error| AcquisitionError::VoiceArchive(error.to_string()))
+}
+
 pub(crate) fn installation_receipt_is_current(app_data_dir: &Path) -> bool {
     fs::read_to_string(app_data_dir.join("setup-v1.receipt"))
         .is_ok_and(|contents| contents == installation_receipt_contents())
@@ -379,6 +408,12 @@ pub(crate) fn write_installation_receipt(app_data_dir: &Path) -> Result<(), Acqu
 }
 
 fn installation_receipt_contents() -> String {
+    installation_receipt_contents_with_native_cache_build(
+        mom_llama_runtime::native_cache_build_identity(),
+    )
+}
+
+fn installation_receipt_contents_with_native_cache_build(native_cache_build: &str) -> String {
     let mut receipt = String::from("blessenger-voice-setup-v1\n");
     for artifact in REQUIRED_ARTIFACTS {
         receipt.push_str(artifact.id);
@@ -388,6 +423,15 @@ fn installation_receipt_contents() -> String {
     }
     receipt.push_str("persona-archive ");
     receipt.push_str(PERSONA_MANIFEST_SHA256);
+    receipt.push('\n');
+    receipt.push_str("pocket-archive ");
+    receipt.push_str(POCKET_MANIFEST_SHA256);
+    receipt.push('\n');
+    receipt.push_str("voice-cache-preparation-schema ");
+    receipt.push_str(&VOICE_CACHE_PREPARATION_SCHEMA.to_string());
+    receipt.push('\n');
+    receipt.push_str("native-cache-build ");
+    receipt.push_str(native_cache_build);
     receipt.push('\n');
     receipt
 }
@@ -1142,11 +1186,110 @@ mod tests {
     }
 
     #[test]
+    fn pocket_checkpoint_and_packaged_embeddings_are_exactly_pinned() {
+        let artifact = REQUIRED_ARTIFACTS
+            .iter()
+            .find(|artifact| artifact.id == "pocket-weights")
+            .expect("Pocket checkpoint is required");
+        assert_eq!(
+            artifact.repository,
+            "kyutai/pocket-tts-without-voice-cloning"
+        );
+        assert_eq!(
+            artifact.revision,
+            "575d14372df89a4534bcb989870a34e77544b09f"
+        );
+        assert_eq!(artifact.relative, "languages/english/model.safetensors");
+        assert_eq!(
+            artifact.sha256,
+            "e106c451108e066119f070eb7cf6c9ff4a2ad93f3bf04c9914cc94c66b7a4eeb"
+        );
+        assert_eq!(artifact.bytes, 219_029_196);
+        assert!(
+            artifact
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/speech-voices/pocket");
+        let manifest_bytes =
+            fs::read(root.join("manifest.json")).expect("packaged Pocket manifest");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&manifest_bytes)),
+            POCKET_MANIFEST_SHA256
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
+        assert_eq!(manifest["model_revision"], artifact.revision);
+        assert_eq!(
+            manifest["config_sha256"],
+            "26caf8dd69c4a0d1486bd284ad54a7de5854bd48b9e888135b9f7dd2e886cb25"
+        );
+        assert_eq!(
+            manifest["tokenizer_sha256"],
+            "f498428e1eafee50492f7be13dc9bfafcfc12e508cd0eb1b01c92ecd5d8c6687"
+        );
+
+        let entries = manifest["entries"].as_array().expect("voice entries");
+        let expected: std::collections::BTreeSet<_> = EXPECTED_PERSONAS.iter().copied().collect();
+        let actual: std::collections::BTreeSet<_> = entries
+            .iter()
+            .map(|entry| entry["persona_id"].as_str().expect("persona id"))
+            .collect();
+        assert_eq!(entries.len(), EXPECTED_PERSONAS.len());
+        assert_eq!(actual, expected);
+        for entry in entries {
+            let dimension = entry["dimension"].as_u64().expect("dimension");
+            let frames = entry["frames"].as_u64().expect("frames");
+            assert_eq!(dimension, 1024);
+            assert_eq!(
+                entry["embedding_bytes"].as_u64(),
+                Some(frames * dimension * 4)
+            );
+        }
+        validate_pocket_voices(&root).expect("all packaged Pocket voice resources verify");
+    }
+
+    #[test]
     fn installation_receipt_is_exact_and_durable() {
         let root = tempfile::tempdir().expect("receipt directory");
         assert!(!installation_receipt_is_current(root.path()));
+
+        let previous_receipt = installation_receipt_contents()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("pocket-weights ") && !line.starts_with("pocket-archive ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(root.path().join("setup-v1.receipt"), previous_receipt)
+            .expect("pre-Pocket receipt");
+        assert!(
+            !installation_receipt_is_current(root.path()),
+            "receipts issued before the Pocket resources were pinned must be stale"
+        );
+
         write_installation_receipt(root.path()).expect("receipt");
         assert!(installation_receipt_is_current(root.path()));
+        assert!(installation_receipt_contents().contains(&format!(
+            "native-cache-build {}\n",
+            mom_llama_runtime::native_cache_build_identity()
+        )));
+        let changed_native_cache =
+            installation_receipt_contents_with_native_cache_build("different-native-cache-build");
+        fs::write(root.path().join("setup-v1.receipt"), changed_native_cache)
+            .expect("changed native cache build");
+        assert!(
+            !installation_receipt_is_current(root.path()),
+            "a native cache build identity change must invalidate startup preparation"
+        );
+        write_installation_receipt(root.path())
+            .expect("current receipt after native identity check");
+        let changed = installation_receipt_contents().replace(POCKET_MANIFEST_SHA256, "0");
+        fs::write(root.path().join("setup-v1.receipt"), changed).expect("changed Pocket pin");
+        assert!(!installation_receipt_is_current(root.path()));
         fs::write(root.path().join("setup-v1.receipt"), "stale").expect("stale receipt");
         assert!(!installation_receipt_is_current(root.path()));
     }

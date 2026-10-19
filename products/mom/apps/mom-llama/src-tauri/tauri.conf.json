@@ -21,7 +21,11 @@
         "minWidth": 640,
         "minHeight": 480,
         "resizable": true,
-        "useHttpsScheme": true
+        "useHttpsScheme": true,
+        "trafficLightPosition": {
+          "x": 20,
+          "y": 30
+        }
       }
     ],
     "security": {
@@ -33,7 +37,8 @@
     "targets": ["app"],
     "externalBin": ["binaries/qwen3-tts-helper", "binaries/mlx.metallib"],
     "resources": {
-      "resources/speech-voices/qwen-icl/": "speech-voices/qwen-icl/"
+      "resources/speech-voices/qwen-icl/": "speech-voices/qwen-icl/",
+      "resources/speech-voices/pocket/": "speech-voices/pocket/"
     },
     "icon": ["icons/icon.png"],
     "macOS": {

@@ -580,7 +580,7 @@ test("all ignored tests carry exact target, platform, evidence, and non-promotio
   const metadata = workspaceMetadata();
   const report = validateRegistry({ registry, metadata, repoRoot: root });
   assert.equal(report.registry_count, report.source_ignored_count);
-  assert.equal(report.cargo_target_count, 21);
+  assert.equal(report.cargo_target_count, 22);
   assert.equal(report.reviewed_build_script_count, 8);
 
   assert.equal(report.workspace_proc_macro_count, 0);
@@ -644,10 +644,6 @@ test("the only platform-limited tests match their source cfg gates", () => {
     ],
     [
       "speech::tests::real_local_app_persona_qwen_route_selects_synthesizes_and_validates",
-      ["macos"],
-    ],
-    [
-      "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
       ["macos"],
     ],
     [

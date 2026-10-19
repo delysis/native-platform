@@ -58,6 +58,32 @@ public struct TextChunker {
         return mergedBlocks.flatMap { chunk($0, maxWords: maxWords) }
     }
 
+    /// Preserve short normalized requests as one utterance. For long requests,
+    /// give each complete sentence its own generation, falling back to a
+    /// sufficiently long clause or the word limit for oversized sentences.
+    /// Canonicalizing whitespace keeps the split boundaries lossless.
+    public static func boundedSpokenChunks(_ text: String, maxWords: Int = 64) -> [String] {
+        precondition(maxWords > 0)
+        let normalized = spokenChunks(text, maxWords: .max).joined(separator: " ")
+        guard !normalized.isEmpty else { return [] }
+        let words = normalized.split(whereSeparator: { $0.isWhitespace })
+        guard words.count > maxWords else { return [normalized] }
+        var remaining = words.joined(separator: " ")
+        var chunks: [String] = []
+
+        while !remaining.isEmpty {
+            let next = boundedLongInputBreak(remaining, maxWords: maxWords)
+            let piece = String(remaining.prefix(next)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !piece.isEmpty {
+                chunks.append(piece)
+            }
+            remaining = String(remaining.dropFirst(next))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return chunks
+    }
+
     private static func normalizeSpokenLine(_ input: String) -> String {
         var line = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !line.isEmpty else { return "" }
@@ -204,11 +230,15 @@ public struct TextChunker {
     private static func findSentenceEnd(in text: String) -> Int? {
         var lastEnd: Int? = nil
         let minChunkLength = minWords * 4  // Rough character estimate
+        let characters = Array(text)
 
-        for (index, char) in text.enumerated() {
+        for (index, char) in characters.enumerated() {
             if char == "." || char == "!" || char == "?" {
                 let nextIndex = text.index(text.startIndex, offsetBy: index + 1, limitedBy: text.endIndex)
                 if nextIndex == text.endIndex || (nextIndex != nil && text[nextIndex!].isWhitespace) {
+                    if char == ".", isAbbreviationPeriod(in: characters, at: index) {
+                        continue
+                    }
                     if index >= minChunkLength {
                         lastEnd = index + 1
                     }
@@ -217,6 +247,82 @@ public struct TextChunker {
         }
 
         return lastEnd
+    }
+
+    /// Find the first complete sentence, or the latest usable clause boundary
+    /// in the word-limited window. This path is only used for originally-long
+    /// requests, so short remaining tails may still be emitted separately.
+    private static func boundedLongInputBreak(_ text: String, maxWords: Int) -> Int {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        let window = words.prefix(maxWords).joined(separator: " ")
+        if let sentenceEnd = findFirstSentenceEnd(in: window) {
+            return sentenceEnd
+        }
+        guard words.count > maxWords else {
+            return text.count
+        }
+
+        let characters = Array(window)
+        var clauseEnd: Int?
+        for (index, character) in characters.enumerated() {
+            let candidate: Int?
+            if character == ";" || character == ":" || character == "," {
+                candidate = index + 1
+            } else {
+                candidate = nil
+            }
+            if let candidate,
+               String(characters[..<candidate]).split(whereSeparator: { $0.isWhitespace }).count >= 16 {
+                clauseEnd = candidate
+            }
+        }
+
+        for conjunction in conjunctions {
+            guard let range = window.range(of: conjunction, options: [.backwards, .caseInsensitive]) else {
+                continue
+            }
+            let prefix = String(window[..<range.lowerBound])
+            guard prefix.split(whereSeparator: { $0.isWhitespace }).count >= 16 else { continue }
+            let offset = window.distance(from: window.startIndex, to: range.lowerBound)
+            if clauseEnd == nil || offset > clauseEnd! {
+                clauseEnd = offset
+            }
+        }
+
+        return clauseEnd ?? window.count
+    }
+
+    private static func findFirstSentenceEnd(in text: String) -> Int? {
+        let characters = Array(text)
+        for (index, character) in characters.enumerated() where character == "." || character == "!" || character == "?" {
+            if character == ".", isAbbreviationPeriod(in: characters, at: index) {
+                continue
+            }
+            var end = index + 1
+            while end < characters.count && "\"'’”)]}»".contains(characters[end]) {
+                end += 1
+            }
+            if end == characters.count || characters[end].isWhitespace {
+                return end
+            }
+        }
+        return nil
+    }
+
+    private static func isAbbreviationPeriod(in characters: [Character], at characterOffset: Int) -> Bool {
+        guard characterOffset < characters.count, characters[characterOffset] == "." else {
+            return false
+        }
+        let start = (0..<characterOffset).reversed()
+            .first(where: { characters[$0].isWhitespace })
+            .map { $0 + 1 } ?? 0
+        let token = String(characters[start...characterOffset]).lowercased()
+        if ["mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "vs.", "etc."]
+            .contains(token) {
+            return true
+        }
+        let initials = token.split(separator: ".", omittingEmptySubsequences: true)
+        return initials.count > 1 && initials.allSatisfy { $0.count == 1 && $0.first?.isLetter == true }
     }
 
     /// Estimate the number of audio tokens needed for text.

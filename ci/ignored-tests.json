@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 70,
+  "expected_test_count": 71,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -123,6 +123,22 @@
       ],
       "src_path": "crates/services/speech/crates/speech-native-backend-parakeet/tests/real_parakeet.rs",
       "manifest_path": "crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "harness": "libtest"
+    },
+    {
+      "package": "speech-native-backend-pocket",
+      "selector": "test:real_pocket",
+      "name": "real_pocket",
+      "kinds": [
+        "test"
+      ],
+      "src_path": "crates/services/speech/crates/speech-native-backend-pocket/tests/real_pocket.rs",
+      "manifest_path": "crates/services/speech/crates/speech-native-backend-pocket/Cargo.toml",
       "platforms": [
         "linux",
         "macos",
@@ -348,7 +364,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "21cc7b19606788b87ff78d7626e9a29f3ca85f1df65fe1af1af783a80066af74"
+      "sha256": "58904945423028db538e48b2aa336bfc4c663d2eb705673e3da5bea10414c96f"
     },
     {
       "package": "speech-native-platform",
@@ -787,6 +803,23 @@
       ],
       "evidence_class": "real-model-audio-runtime",
       "promotion_prohibition": "Passing this test cannot promote transcription accuracy, microphone capture, product integration, or cross-platform readiness.",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ]
+    },
+    {
+      "test_id": "real_pocket_host_stream_cancel_recovery_and_join",
+      "package": "speech-native-backend-pocket",
+      "target": "test:real_pocket",
+      "source": "crates/services/speech/crates/speech-native-backend-pocket/tests/real_pocket.rs",
+      "prerequisite": "requires the pinned local Pocket model in the Hugging Face cache and packaged voice resources",
+      "required_environment": [
+        "SPEECH_NATIVE_POCKET_VOICES"
+      ],
+      "evidence_class": "real-model-audio-runtime",
+      "promotion_prohibition": "Passing this local model exercise cannot promote voice quality, consultant likeness, product playback, packaging, or cross-platform readiness.",
       "platforms": [
         "linux",
         "macos",
@@ -1368,24 +1401,6 @@
       ]
     },
     {
-      "test_id": "speech::tests::real_resident_audio_to_qwen_pipeline_exercises_compute_lease",
-      "package": "mom-llama-app",
-      "target": "lib",
-      "source": "products/mom/apps/mom-llama/src-tauri/src/speech.rs",
-      "prerequisite": "requires Gemma audio model/projector, Qwen helper/model/voice archive, and benchmark WAV",
-      "required_environment": [
-        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
-        "MOM_LLAMA_MM_PROJ_PATH",
-        "MOM_LLAMA_TEST_VOICE_WAV",
-        "MOM_QWEN3_TTS_VOICE_REFERENCE_ROOT"
-      ],
-      "evidence_class": "real-model-runtime",
-      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
-      "platforms": [
-        "macos"
-      ]
-    },
-    {
       "test_id": "tests::real_incremental_audio_accepts_earlier_recording",
       "package": "llama-native-engine",
       "target": "lib",
@@ -1447,6 +1462,17 @@
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "real_startup_preparation_persists_personas_and_history_without_editing_messages",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires a real local Gemma GGUF and matching multimodal projector; prepares the built-in persona catalog and a materialized conversation, then verifies encrypted native checkpoints survive worker restart without changing messages",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MMPROJ_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
       "platforms": ["linux", "macos", "windows"]
