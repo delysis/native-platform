@@ -1208,7 +1208,9 @@ or a wall-clock upper bound for native/OS calls.
 
 Before the consolidated gate, run the complete product frontend suite, the
 affected Rust package tests in their default parallel mode, and package clippy
-with all targets and warnings denied. A serialized diagnostic run does not
+with all targets and warnings denied. Register new hardware-dependent ignored
+tests in the repository's ignored-test registry and run its drift check before
+starting the consolidated gate. A serialized diagnostic run does not
 replace parallel qualification. Whole-page UI harnesses must load the same
 production prerequisite scripts in the same order as `index.html`; inject only
 DOM, clock and native-I/O boundaries, not an alternate scheduler. Tests that
