@@ -2285,12 +2285,12 @@ fn configure_voice_sampling(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrefixLookupMode {
+pub(crate) enum PrefixLookupMode {
     Persistent,
     LiveVoice,
 }
 
-fn longest_cached_prefix_for_owners(
+pub(crate) fn longest_cached_prefix_for_owners(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
     owner_ids: &[&str],
@@ -2358,7 +2358,7 @@ fn prefer_longer_prefix(
     }
 }
 
-fn reusable_prefix_owner_ids<'a>(
+pub(crate) fn reusable_prefix_owner_ids<'a>(
     conversation_id: &'a str,
     source_persona_id: Option<&'a str>,
     skill_ids: &[String],

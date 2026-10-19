@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 70,
+  "expected_test_count": 71,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1462,6 +1462,17 @@
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "real_startup_preparation_persists_personas_and_history_without_editing_messages",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires a real local Gemma GGUF and matching multimodal projector; prepares the built-in persona catalog and a materialized conversation, then verifies encrypted native checkpoints survive worker restart without changing messages",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MMPROJ_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local real-model test cannot promote packaged-app, cross-platform, or release readiness.",
       "platforms": ["linux", "macos", "windows"]

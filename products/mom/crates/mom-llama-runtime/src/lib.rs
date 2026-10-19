@@ -72,12 +72,17 @@ pub use engine::{
     runtime_warm_until_cancelled,
 };
 pub use kv_cache::{
-    CommittedSessionCheckpointDrain, VoicePersonaPrefixPreparation,
-    kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
+    CommittedSessionCheckpointDrain, VoiceCachePreparationProgress, VoiceCachePreparationSummary,
+    VoicePersonaPrefixPreparation, kv_cache_checkpoint_committed_voice_session, kv_cache_clear,
     kv_cache_prepare_voice_persona_resident, kv_cache_restore, kv_cache_save,
     kv_cache_save_voice_persona, kv_cache_set_voice_call_activity, kv_cache_status,
-    prepare_committed_session_checkpoint_drain,
+    prepare_committed_session_checkpoint_drain, prepare_startup_voice_caches,
 };
+
+/// Build-time compatibility identity; no model loading or large runtime scan.
+pub fn native_cache_build_identity() -> &'static str {
+    llama_native_engine::LLAMA_NATIVE_BUILD_MANIFEST_SHA256
+}
 pub use llama_native_engine::{
     GenerationBackpressureLease, GenerationBackpressureMetrics, RealtimeComputeLease,
     RealtimeComputeMetrics, acquire_generation_backpressure, acquire_realtime_compute,

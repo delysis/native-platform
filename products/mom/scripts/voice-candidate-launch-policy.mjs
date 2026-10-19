@@ -93,3 +93,23 @@ export function runtimeReadyLogConfirmsPath(logText, expectedPath) {
   const marker = 'mom-llama runtime ready: ';
   return logText.split(/\r?\n/).some(line => line.startsWith(marker) && line.slice(marker.length) === expectedPath);
 }
+
+export function startupCacheProgressCompleted(logText) {
+  const marker = 'mom-llama startup voice-cache progress: ';
+  let completed = 0;
+  for (const line of logText.split(/\r?\n/)) {
+    if (!line.startsWith(marker)) continue;
+    const match = /^contexts=(\d+)\/(\d+) checkpoint_reused=(?:true|false) elapsed_ms=(\d+) cache_positions=(\d+) state_bytes=(\d+)$/.exec(line.slice(marker.length));
+    if (!match) continue;
+    const current = Number(match[1]);
+    const total = Number(match[2]);
+    if (total > 0 && total <= 64 && current > 0 && current <= total) {
+      completed = Math.max(completed, current);
+    }
+  }
+  return completed;
+}
+
+export function startupProgressDeadline(now, hardDeadline, idleTimeoutMs) {
+  return Math.min(hardDeadline, now + idleTimeoutMs);
+}

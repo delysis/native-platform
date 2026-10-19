@@ -8,6 +8,8 @@ import {
   readPrivateStoreKeyFile,
   resolveCandidateDataDirectory,
   runtimeReadyLogConfirmsPath,
+  startupCacheProgressCompleted,
+  startupProgressDeadline,
 } from './voice-candidate-launch-policy.mjs';
 
 const home = '/Users/tester';
@@ -71,6 +73,23 @@ test('startup identity matches the exact data path, not a path prefix', () => {
   assert.equal(runtimeReadyLogConfirmsPath(`mom-llama runtime ready: ${expected}\n`, expected), true);
   assert.equal(runtimeReadyLogConfirmsPath(`mom-llama runtime ready: ${expected}-other\n`, expected), false);
   assert.equal(runtimeReadyLogConfirmsPath(`prefix mom-llama runtime ready: ${expected}\n`, expected), false);
+});
+
+test('startup cache progress accepts only bounded numeric context completions', () => {
+  const prefix = 'mom-llama startup voice-cache progress: ';
+  const record = (completed, total = 14) =>
+    `${prefix}contexts=${completed}/${total} checkpoint_reused=false elapsed_ms=1200 cache_positions=64 state_bytes=512`;
+  assert.equal(startupCacheProgressCompleted(`${record(2)}\n${record(5)}\n`), 5);
+  assert.equal(startupCacheProgressCompleted(`${record(5)}\n${record(3)}\n`), 5);
+  assert.equal(startupCacheProgressCompleted(`${record(15)}\n`), 0);
+  assert.equal(startupCacheProgressCompleted(`${record(1, 0)}\n`), 0);
+  assert.equal(startupCacheProgressCompleted(`${prefix}contexts=1/14\n`), 0);
+  assert.equal(startupCacheProgressCompleted(`prefix ${record(1)}\n`), 0);
+});
+
+test('startup progress extends only the idle deadline and never the hard cap', () => {
+  assert.equal(startupProgressDeadline(10_000, 1_000_000, 180_000), 190_000);
+  assert.equal(startupProgressDeadline(900_000, 1_000_000, 180_000), 1_000_000);
 });
 
 test('start options accept data and key files in either order', () => {

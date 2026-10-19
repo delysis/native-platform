@@ -760,7 +760,7 @@ fn append_toml_value(output: &mut Vec<u8>, value: &toml::Value) {
             output.push(7);
             append_closure_field(output, &(values.len() as u64).to_le_bytes());
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(key, _)| *key);
             for (key, value) in entries {
                 append_closure_field(output, key.as_bytes());
                 append_toml_value(output, value);

@@ -54,6 +54,295 @@ pub struct VoicePersonaPrefixPreparation {
     pub persisted: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VoiceCachePreparationProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub persona_id: String,
+    pub persona: String,
+    pub reused: bool,
+    pub elapsed_ms: u64,
+    pub cache_positions: usize,
+    pub state_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VoiceCachePreparationSummary {
+    pub prepared: usize,
+    pub reused: usize,
+    pub total: usize,
+    pub elapsed_ms: u64,
+}
+
+fn is_startup_voice_cache_target(conversation: &crate::conversation_store::Conversation) -> bool {
+    use crate::conversation_store::ConversationKind;
+    conversation.kind == ConversationKind::PersonaTemplate
+        || (conversation.kind == ConversationKind::Chat && !conversation.messages.is_empty())
+}
+
+/// Explicit setup work, before admitting foreground generation. Persist every
+/// persona prefix and the same bounded history projection used by calls. This
+/// is deliberately separate from cheap per-launch resident warming.
+pub fn prepare_startup_voice_caches(
+    scope: &crate::OperationScope,
+    mut on_progress: impl FnMut(VoiceCachePreparationProgress),
+) -> Result<VoiceCachePreparationSummary> {
+    use crate::conversation_store::ConversationKind;
+    let started = Instant::now();
+    anyhow::ensure!(!scope.cancellation_requested(), "Voice setup was cancelled");
+    let settings = resolve_settings()?;
+    if !settings.kv_cache_policy.persists_conversation_checkpoints() {
+        anyhow::bail!("Voice setup requires persistent conversation caching");
+    }
+    // Materialize the same catalog that the UI uses, before taking the plan.
+    crate::personas::persona_list()?;
+    let db = crate::conversation_store::load_db_with_settings(&settings)?;
+    let persona_names = db
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
+        .map(|conversation| (conversation.id.clone(), conversation.title.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut targets = db
+        .conversations
+        .into_iter()
+        .filter(is_startup_voice_cache_target)
+        .collect::<Vec<_>>();
+    // Prepare shared persona prefixes before any history that can reuse them.
+    targets.sort_by_key(|conversation| conversation.kind != ConversationKind::PersonaTemplate);
+    if targets.len() > DEFAULT_PERSISTENT_CACHE_ENTRIES {
+        anyhow::bail!("Voice setup exceeds the persistent cache entry budget");
+    }
+    let total = targets.len();
+    let mut prepared_ids = Vec::new();
+    let mut prepared_bytes = 0_usize;
+    for (index, mut conversation) in targets.into_iter().enumerate() {
+        if scope.has_active_voice_call() || scope.active_operation_count() != 0 {
+            anyhow::bail!("Voice cache preparation yielded to foreground work");
+        }
+        let item_started = Instant::now();
+        let persona_id = conversation
+            .source_conversation_id
+            .clone()
+            .unwrap_or_else(|| conversation.id.clone());
+        let persona_name = persona_names
+            .get(&persona_id)
+            .cloned()
+            .unwrap_or_else(|| "Conversation".to_string());
+        let progress = |completed, positions, bytes| VoiceCachePreparationProgress {
+            completed,
+            total,
+            persona_id: persona_id.clone(),
+            persona: persona_name.clone(),
+            reused: false,
+            elapsed_ms: item_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cache_positions: positions,
+            state_bytes: bytes,
+        };
+        on_progress(progress(index, 0, 0));
+        anyhow::ensure!(!scope.cancellation_requested(), "Voice setup was cancelled");
+        let mut profile = settings.clone();
+        crate::chat::apply_conversation_model_pair(
+            &mut profile,
+            conversation.execution_profile.model_path.clone(),
+            conversation.selected_model_path.clone(),
+            conversation.execution_profile.mmproj_path.clone(),
+        );
+        let handle = match profile.model_path.as_deref() {
+            Some(path) => crate::native_runtime::resident_model_for_profile(
+                scope,
+                &profile,
+                path,
+                profile.mmproj_path.as_deref(),
+            ),
+            None => resident_model(scope, &profile),
+        }
+        .map_err(|blocked| anyhow!(blocked.blocker.message))?;
+        let (value, authority) = if conversation.kind == ConversationKind::PersonaTemplate {
+            let messages = stable_persona_prompt_messages(&profile, &conversation)?;
+            (
+                create_prefix_value(
+                    &handle,
+                    CacheTier::PersonaPack,
+                    Some(conversation.id.clone()),
+                    format!("Voice persona: {}", conversation.title),
+                    &messages,
+                    ChatTemplateChoice::PreferNonThinking,
+                )?,
+                None,
+            )
+        } else {
+            let active = crate::document::checked_active_messages(&conversation)?;
+            let system = conversation
+                .execution_profile
+                .system_message
+                .clone()
+                .unwrap_or_else(|| {
+                    upstream_setting_string(&profile, "systemMessage").unwrap_or_default()
+                });
+            let skill = crate::skill_store::applied_skill_prompt(&conversation.current_skill_ids)?;
+            let projection = crate::voice_context::fit_voice_context(
+                &handle,
+                &mut conversation,
+                &active,
+                crate::voice_context::VoicePrompt {
+                    settings: &profile,
+                    system: &system,
+                    skill: &skill.prompt,
+                    current: "",
+                    template: ChatTemplateChoice::PreferNonThinking,
+                    completion_tokens: 96,
+                    mode: crate::voice_context::VoiceHistoryMode::Greeting,
+                },
+            )?;
+            let authority = SessionConversationAuthority::from_conversation(&conversation)?;
+            let revision = handle
+                .inspect_resident_conversation(None)
+                .map_err(|e| anyhow!(e))?
+                .revision;
+            // A same-build retry can retain already prepared historical audio.
+            // The ordinary engine still checks the exact cells against the
+            // projected request; an owner match alone cannot authorize reuse.
+            restore_latest_session_checkpoint_if_needed(
+                &profile,
+                &handle,
+                &cache_fingerprint(&handle)?,
+                &conversation.id,
+                revision,
+            )?;
+            // Use the same owner ordering and longest-prefix selection as a
+            // foreground request, including the newly prepared persona fallback.
+            let owner_ids = crate::chat::reusable_prefix_owner_ids(
+                &conversation.id,
+                conversation.source_conversation_id.as_deref(),
+                &conversation.current_skill_ids,
+                skill.cache_owner_id.is_some(),
+                skill.cache_owner_id.as_deref(),
+            );
+            let (cached_prefix, _) = crate::chat::longest_cached_prefix_for_owners(
+                &handle,
+                &projection.messages,
+                &owner_ids,
+                &profile,
+                !projection.attachments.media.is_empty(),
+                crate::chat::PrefixLookupMode::Persistent,
+                ChatTemplateChoice::PreferNonThinking,
+            )?;
+            let request_id = format!("voice-setup-{}", Uuid::new_v4());
+            // Use normal multimodal generation and its cache/cancellation path.
+            // One bounded warm token is discarded; no message, transcript or
+            // assistant reply is committed. A future call trims to its exact
+            // common prefix, including across the trailing assistant marker.
+            let output = handle
+                .generate(GenerationRequest {
+                    request_id: request_id.clone(),
+                    model_id: handle.status().model_id,
+                    input: GenerationInput::Chat {
+                        messages: projection.messages,
+                        template: ChatTemplateChoice::PreferNonThinking,
+                    },
+                    sampling: SamplingConfig {
+                        max_tokens: 1,
+                        temperature: 0.0,
+                        seed: 1,
+                        ..SamplingConfig::default()
+                    },
+                    media: projection.attachments.media,
+                    cached_prefix: cached_prefix.map(|(_, sequence)| sequence),
+                })
+                .map_err(|e| anyhow!(e))?
+                .wait()
+                .map_err(|e| anyhow!(e))?;
+            if output.is_empty()
+                || output
+                    .iter()
+                    .any(|item| item.state != GenerationState::Completed)
+            {
+                anyhow::bail!("Voice history preparation did not complete");
+            }
+            let state = handle
+                .snapshot_conversation_for_request_if_fits(&request_id, MAX_PERSISTENT_ENTRY_BYTES)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| {
+                    anyhow!("Voice history exceeds the persistent cache entry budget")
+                })?;
+            let mut metadata = PrefixCacheMetadata::new(
+                Uuid::new_v4().to_string(),
+                CacheTier::SessionPersistent,
+                cache_fingerprint(&handle)?,
+                state.token_ids.clone(),
+                state.bytes.len(),
+                now_ms(),
+            )
+            .with_owner(&conversation.id)
+            .with_label(format!("Conversation {}", conversation.id));
+            metadata.cells.clone_from(&state.cells);
+            (
+                PrefixCacheValue {
+                    metadata,
+                    sequence: state,
+                },
+                Some(authority),
+            )
+        };
+        if !value.is_valid() || !persistent_entry_fits(value.sequence.bytes.len()) {
+            anyhow::bail!("Voice preparation produced an invalid or oversized checkpoint");
+        }
+        prepared_bytes = prepared_bytes
+            .checked_add(value.sequence.bytes.len())
+            .filter(|bytes| *bytes <= DEFAULT_PERSISTENT_CACHE_BYTES)
+            .ok_or_else(|| anyhow!("Voice setup exceeds the persistent cache byte budget"))?;
+        let persisted = match &authority {
+            Some(authority) => {
+                persist_session_checkpoint_value(scope, &profile, &value, authority)?
+            }
+            None => persist_value(&profile, &value)?,
+        };
+        if !persisted {
+            anyhow::bail!("Voice context changed during cache preparation");
+        }
+        prepared_ids.push(value.metadata.id.clone());
+        on_progress(VoiceCachePreparationProgress {
+            completed: index + 1,
+            total,
+            persona_id,
+            persona: persona_name,
+            reused: false,
+            elapsed_ms: item_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cache_positions: value.sequence.cells.len().max(value.sequence.token_count),
+            state_bytes: value.sequence.bytes.len(),
+        });
+    }
+    anyhow::ensure!(!scope.cancellation_requested(), "Voice setup was cancelled");
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let caches = store
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    if prepared_ids.iter().any(|id| {
+        !caches
+            .entries
+            .iter()
+            .any(|entry| &entry.id == id && entry.state == CacheEntryState::Ready)
+    }) {
+        anyhow::bail!("A prepared voice checkpoint was evicted before setup completed");
+    }
+    // Leave the selected conversation in worker-owned RAM, using the same
+    // preparation function as pickup. Other contexts remain on encrypted disk.
+    let mut selected_settings = settings;
+    if let Some(selected) = crate::engine::selected_voice_context_to_warm(&mut selected_settings)? {
+        let prepared = kv_cache_prepare_voice_persona_resident(scope, &selected)?;
+        if prepared.result.is_none() {
+            anyhow::bail!("The selected conversation could not become resident after setup");
+        }
+    }
+    Ok(VoiceCachePreparationSummary {
+        prepared: total,
+        reused: 0,
+        total,
+        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KvCacheState {
@@ -2795,6 +3084,17 @@ mod tests {
     use llama_native_cache::ValidatedPrefixCacheValue;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn cancelled_startup_does_not_open_storage_or_admit_a_model() {
+        let scope = crate::OperationScope::detached();
+        scope.request_cancellation();
+        let error = prepare_startup_voice_caches(&scope, |_| {
+            panic!("cancelled startup must not begin a preparation target");
+        })
+        .expect_err("cancelled scope must reject preparation");
+        assert_eq!(error.to_string(), "Voice setup was cancelled");
+    }
 
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {

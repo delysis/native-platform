@@ -938,6 +938,10 @@ enum KvCacheCommand {
         #[arg(long)]
         json: bool,
     },
+    PrepareStartup {
+        #[arg(long)]
+        json: bool,
+    },
     Restore {
         #[arg(long)]
         cache: Option<String>,
@@ -1810,6 +1814,10 @@ fn run() -> Result<()> {
                     &operation_scope,
                     &persona,
                 )?,
+                json,
+            ),
+            KvCacheCommand::PrepareStartup { json } => print_result(
+                mom_llama_runtime::prepare_startup_voice_caches(&operation_scope, |_| {})?,
                 json,
             ),
             KvCacheCommand::Restore { cache, json } => print_result(

@@ -2894,6 +2894,248 @@ fn real_voice_greeting_reports_its_actual_prefix_reuse() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires a real local Gemma GGUF and matching multimodal projector"]
+fn real_startup_preparation_persists_personas_and_history_without_editing_messages() -> Result<()> {
+    let _session = configured_real_session("real-startup-voice-cache-preparation")?;
+    let projector = std::env::var_os("MOM_LLAMA_MMPROJ_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MMPROJ_PATH must point to the matching projector"))?;
+    let configured = mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        context_tokens: Some(8192),
+        batch_tokens: Some(512),
+        max_parallel_sequences: Some(2),
+        resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
+        max_tokens: Some(8),
+        mmproj_path: Some(Some(projector)),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("startup cache settings were not accepted"))?;
+    assert!(configured.context_tokens >= 512);
+    assert_eq!(configured.batch_tokens, 512);
+    assert_eq!(configured.max_parallel_sequences, 2);
+    assert_eq!(
+        configured.resident_memory_budget_bytes,
+        21_845 * 1024 * 1024
+    );
+    assert_eq!(configured.sampling_config()?.max_tokens, 8);
+    assert_eq!(configured.kv_cache_policy, KvCachePolicy::KvCacheCandidate);
+
+    let personas = mom_llama_runtime::persona_list()?
+        .result
+        .unwrap_or_default();
+    anyhow::ensure!(!personas.is_empty(), "the persona catalog is empty");
+    let persona_ids = personas
+        .iter()
+        .map(|persona| persona.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
+
+    // Build one materialized persona conversation with deterministic fixture
+    // history. The fixture only creates input data; all cache preparation below
+    // uses the real configured native model.
+    let persona = personas
+        .first()
+        .ok_or_else(|| anyhow!("the persona catalog is empty"))?;
+    mom_llama_runtime::conversation_draft_open(Some(persona.id.clone()))?;
+    let conversation = mom_llama_runtime::conversation_draft_call_start()?
+        .result
+        .ok_or_else(|| anyhow!("persona conversation was not materialized"))?;
+    let fixture = mom_llama_runtime::chat_send_in_scope(
+        &scope,
+        ChatSendInput {
+            conversation_id: conversation.id.clone(),
+            message: "Synthetic startup-cache history: the caller prefers concise replies.".into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    anyhow::ensure!(
+        fixture.receipt.fake_fixture,
+        "history setup did not use the fixture path"
+    );
+    let saved_before = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("materialized conversation could not be reloaded"))?
+        .messages;
+    anyhow::ensure!(saved_before.len() >= 2, "fixture history was not persisted");
+
+    let mut progress = Vec::new();
+    let summary = mom_llama_runtime::prepare_startup_voice_caches(&scope, |item| {
+        println!(
+            "STARTUP_VOICE_CACHE_PROGRESS completed={} total={} elapsed_ms={} positions={} bytes={}",
+            item.completed, item.total, item.elapsed_ms, item.cache_positions, item.state_bytes
+        );
+        progress.push(item);
+    })?;
+    assert_eq!(summary.prepared, personas.len() + 1);
+    assert_eq!(summary.total, personas.len() + 1);
+    assert_eq!(progress.len(), summary.total * 2);
+    anyhow::ensure!(
+        progress.iter().any(|item| item.completed == 0)
+            && progress.iter().any(|item| item.completed == summary.total),
+        "startup preparation did not report its boundaries"
+    );
+
+    let status = mom_llama_runtime::kv_cache_status()?
+        .result
+        .ok_or_else(|| anyhow!("cache status was unavailable after preparation"))?;
+    let ready_personas = status
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+        })
+        .filter_map(|entry| entry.owner_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        persona_ids
+            .iter()
+            .all(|persona_id| ready_personas.contains(persona_id.as_str())),
+        "not every catalog persona has a ready native checkpoint"
+    );
+    let persona_prefix = status
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                && entry.owner_id.as_deref() == Some(persona.id.as_str())
+        })
+        .ok_or_else(|| anyhow!("selected persona prefix checkpoint is missing"))?;
+    let session_checkpoint = status
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                && entry.owner_id.as_deref() == Some(conversation.id.as_str())
+        })
+        .ok_or_else(|| anyhow!("materialized conversation checkpoint is missing"))?;
+    let latest_persona_checkpoint_ms = status
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                && entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                && persona_ids.contains(entry.owner_id.as_deref().unwrap_or_default())
+        })
+        .map(|entry| entry.created_at_ms)
+        .max()
+        .ok_or_else(|| anyhow!("no ready persona checkpoint timestamps were recorded"))?;
+    anyhow::ensure!(
+        latest_persona_checkpoint_ms <= session_checkpoint.created_at_ms,
+        "persona checkpoints were not prepared before the materialized chat"
+    );
+    anyhow::ensure!(session_checkpoint.state_bytes > 0);
+    anyhow::ensure!(
+        status
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.state == mom_llama_runtime::kv_cache::CacheEntryState::Ready
+                    && (entry.tier == mom_llama_runtime::kv_cache::CacheTier::PersonaPack
+                        || (entry.tier
+                            == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                            && entry.owner_id.as_deref() == Some(conversation.id.as_str())))
+            })
+            .all(|entry| entry.fingerprint == session_checkpoint.fingerprint),
+        "startup checkpoints do not share the configured native build identity"
+    );
+    assert_eq!(
+        session_checkpoint.fingerprint.context_tokens, configured.context_tokens,
+        "startup checkpoint must use the effective production context plan"
+    );
+    anyhow::ensure!(
+        session_checkpoint.token_ids.len() > persona_prefix.token_ids.len(),
+        "conversation checkpoint contains only the system/persona prefix"
+    );
+    anyhow::ensure!(
+        session_checkpoint
+            .cells
+            .len()
+            .max(session_checkpoint.token_ids.len())
+            > persona_prefix
+                .cells
+                .len()
+                .max(persona_prefix.token_ids.len()),
+        "conversation checkpoint did not retain history KV positions"
+    );
+    let saved_after = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("materialized conversation disappeared after preparation"))?
+        .messages;
+    assert_eq!(saved_after, saved_before, "setup changed saved messages");
+
+    let chat_id = conversation.id.clone();
+    let checkpoint_id = session_checkpoint.id.clone();
+    let checkpoint_cells = session_checkpoint.cells.len();
+    let checkpoint_tokens = session_checkpoint.token_ids.len();
+    let persona_count = persona_ids.len();
+    drop(scope);
+    drop(owner);
+
+    let restarted_owner = initialize_product_runtime()?;
+    let restarted_scope = restarted_owner.operation_scope();
+    let restore_started = Instant::now();
+    let restored =
+        mom_llama_runtime::kv_cache_prepare_voice_persona_resident(&restarted_scope, &chat_id)?;
+    anyhow::ensure!(
+        restored.readiness == "resident_prefix_prepared",
+        "worker restart did not restore the prepared conversation: {:?}",
+        restored.blocker
+    );
+    let restored = restored
+        .result
+        .ok_or_else(|| anyhow!("conversation checkpoint restore returned no result"))?;
+    anyhow::ensure!(
+        restored.persisted,
+        "restart did not restore durable native state"
+    );
+    let restored_metadata = restored
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("restart did not use the persisted checkpoint"))?;
+    assert_eq!(restored_metadata.id, checkpoint_id);
+    assert_eq!(restored.prefill_us, 0, "restart replayed the saved prompt");
+    assert_eq!(
+        restored.resident_prefix_tokens,
+        checkpoint_tokens.max(checkpoint_cells)
+    );
+
+    println!(
+        "STARTUP_VOICE_CACHE_ACCEPTANCE {}",
+        json!({
+            "personas": persona_count,
+            "effective_context_tokens": configured.context_tokens,
+            "effective_batch_tokens": configured.batch_tokens,
+            "effective_max_parallel_sequences": configured.max_parallel_sequences,
+            "resident_memory_budget_bytes": configured.resident_memory_budget_bytes,
+            "prepared": summary.prepared,
+            "reused": summary.reused,
+            "targets": summary.total,
+            "progress_events": progress.len(),
+            "checkpoint_tokens": checkpoint_tokens,
+            "checkpoint_cells": checkpoint_cells,
+            "checkpoint_bytes": session_checkpoint.state_bytes,
+            "restored_tokens": restored.resident_prefix_tokens,
+            "restore_prefill_us": restored.prefill_us,
+            "prepare_elapsed_ms": summary.elapsed_ms,
+            "restore_elapsed_ms": restore_started.elapsed().as_millis(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires real Gemma GGUF, matching projector, and 16 kHz voice WAV"]
 fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
     let _session = configured_real_session("real-voice-persona-prefix")?;

@@ -93,6 +93,26 @@ application directory cannot qualify a fresh profile. Existing profiles without
 their own receipt verify the acquired assets and complete runtime warming once;
 the old application-directory receipt is left untouched.
 
+Setup also binds the native cache build identity and the cache-preparation
+schema. When those change, the setup screen prepares and persists every persona
+system prefix and each nonempty saved conversation's bounded voice-history
+projection before publishing readiness. It uses the same history projection,
+native generation, authenticated storage and pickup preparation as calls.
+Multimodal history preparation generates one discarded warm token because the
+normal native generation entry point requires a positive token budget; it never
+commits a message or changes user-visible audio/text. Future generation still
+checks and trims to the exact shared prefix. This is measured setup work,
+not a second speech pipeline or a hidden call greeting.
+
+Preparation is sequential and observes the existing per-entry, total-byte and
+entry-count cache budgets. Failures cannot publish a ready receipt. A final
+metadata check requires every newly prepared checkpoint to remain present;
+the selected context is then restored to worker-owned RAM. Other prepared
+contexts reside in encrypted storage until selected. The preparation summary
+counts newly published checkpoints, not cache tokens reused during their
+construction. This explicit setup phase must not be moved into background work
+that competes with an admitted call, nor repeated on every unchanged launch.
+
 ## Gemma channel boundaries before speech
 
 Gemma can emit `<|channel>thought\n...<channel|>` even when a call requests a

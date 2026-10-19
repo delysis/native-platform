@@ -27,6 +27,8 @@ const PERSONA_MANIFEST_SHA256: &str =
 const POCKET_MANIFEST_SHA256: &str =
     "28618598ea7cd43505e0b1bf592354180b8f97c2c92d45a2843a49d3c1bca458";
 
+const VOICE_CACHE_PREPARATION_SCHEMA: u32 = 1;
+
 #[derive(Clone, Copy, Debug)]
 struct Artifact {
     id: &'static str,
@@ -406,6 +408,12 @@ pub(crate) fn write_installation_receipt(app_data_dir: &Path) -> Result<(), Acqu
 }
 
 fn installation_receipt_contents() -> String {
+    installation_receipt_contents_with_native_cache_build(
+        mom_llama_runtime::native_cache_build_identity(),
+    )
+}
+
+fn installation_receipt_contents_with_native_cache_build(native_cache_build: &str) -> String {
     let mut receipt = String::from("blessenger-voice-setup-v1\n");
     for artifact in REQUIRED_ARTIFACTS {
         receipt.push_str(artifact.id);
@@ -418,6 +426,12 @@ fn installation_receipt_contents() -> String {
     receipt.push('\n');
     receipt.push_str("pocket-archive ");
     receipt.push_str(POCKET_MANIFEST_SHA256);
+    receipt.push('\n');
+    receipt.push_str("voice-cache-preparation-schema ");
+    receipt.push_str(&VOICE_CACHE_PREPARATION_SCHEMA.to_string());
+    receipt.push('\n');
+    receipt.push_str("native-cache-build ");
+    receipt.push_str(native_cache_build);
     receipt.push('\n');
     receipt
 }
@@ -1259,6 +1273,20 @@ mod tests {
 
         write_installation_receipt(root.path()).expect("receipt");
         assert!(installation_receipt_is_current(root.path()));
+        assert!(installation_receipt_contents().contains(&format!(
+            "native-cache-build {}\n",
+            mom_llama_runtime::native_cache_build_identity()
+        )));
+        let changed_native_cache =
+            installation_receipt_contents_with_native_cache_build("different-native-cache-build");
+        fs::write(root.path().join("setup-v1.receipt"), changed_native_cache)
+            .expect("changed native cache build");
+        assert!(
+            !installation_receipt_is_current(root.path()),
+            "a native cache build identity change must invalidate startup preparation"
+        );
+        write_installation_receipt(root.path())
+            .expect("current receipt after native identity check");
         let changed = installation_receipt_contents().replace(POCKET_MANIFEST_SHA256, "0");
         fs::write(root.path().join("setup-v1.receipt"), changed).expect("changed Pocket pin");
         assert!(!installation_receipt_is_current(root.path()));

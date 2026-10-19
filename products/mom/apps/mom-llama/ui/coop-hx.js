@@ -11604,6 +11604,22 @@
         }
         if (setupProgress) setupProgress.value = Math.floor((Number(payload.completed || 0) / Number(payload.total || 1)) * 100);
       });
+      const stopCachePreparationProgress = await events?.listen?.("mom_llama_cache_preparation_progress", ({ payload }) => {
+        if (!firstRunSetup || !payload) return;
+        if (status) status.textContent = `Preparing ${payload.persona}`;
+        if (persona) {
+          persona.hidden = false;
+          persona.textContent = payload.persona;
+        }
+        for (const portrait of friends?.children || []) {
+          portrait.classList.toggle("active", portrait.dataset.personaId === payload.persona_id);
+        }
+        if (setupProgress) {
+          const total = Math.max(1, Number(payload.total) || 1);
+          const completed = Math.max(0, Math.min(total, Number(payload.completed) || 0));
+          setupProgress.value = Math.floor((completed / total) * 100);
+        }
+      });
       try {
         await invoke("mom_llama_runtime_initialize");
         const root = document.getElementById("app");
@@ -11683,6 +11699,7 @@
       } finally {
         if (typeof stopModelProgress === "function") stopModelProgress();
         if (typeof stopVoiceProgress === "function") stopVoiceProgress();
+        if (typeof stopCachePreparationProgress === "function") stopCachePreparationProgress();
         if (typeof stopSetupState === "function") stopSetupState();
       }
     };

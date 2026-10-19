@@ -201,6 +201,12 @@ impl StartupController {
         }
     }
 
+    fn can_continue_preparation(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| matches!(&*state, StartupState::Building))
+    }
+
     fn install<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -280,6 +286,20 @@ impl StartupController {
                 _ => return,
             };
         }
+    }
+
+    fn finish_failed_preparation(&self, runtime: AppRuntimeHandle, safe_to_exit: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            if !safe_to_exit {
+                std::mem::forget(runtime);
+            }
+            return;
+        };
+        *state = match (&*state, safe_to_exit) {
+            (StartupState::QuiescingDuringBuild, true) => StartupState::QuiescingSafe(None),
+            (_, true) => StartupState::Failed,
+            (_, false) => StartupState::QuiescingBlocked(runtime),
+        };
     }
 
     async fn wait_for_build(&self) -> bool {
@@ -486,11 +506,23 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                 let warm = tauri::async_runtime::spawn_blocking(move || {
                     mom_llama_runtime::runtime_warm(&scope)
                 })
-                .await
-                .map_err(|error| format!("Blessenger model warm worker failed: {error}"))?
-                .map_err(|error| {
-                    format!("Blessenger could not warm its listening model: {error:#}")
-                })?;
+                .await;
+                let warm = match warm {
+                    Ok(warm) => warm,
+                    Err(error) => {
+                        fail_startup_runtime(startup, runtime, embedded).await;
+                        return Err(format!("Blessenger model warm worker failed: {error}"));
+                    }
+                };
+                let warm = match warm {
+                    Ok(warm) => warm,
+                    Err(error) => {
+                        fail_startup_runtime(startup, runtime, embedded).await;
+                        return Err(format!(
+                            "Blessenger could not warm its listening model: {error:#}"
+                        ));
+                    }
+                };
                 let ready = first_run_warm_ready(&warm);
                 if !ready {
                     let reason = if let Some(blocker) = warm.blocker.as_ref() {
@@ -503,17 +535,59 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                     } else {
                         format!("runtime warm returned {}", warm.status)
                     };
-                    runtime.begin_quiesce();
-                    let _ = if embedded {
-                        runtime.drain_shared_services().await
-                    } else {
-                        runtime.shutdown().await
-                    };
-                    startup.record_failure();
+                    fail_startup_runtime(startup, runtime, embedded).await;
                     return Err(format!(
                         "Blessenger could not make its listening model ready: {reason}"
                     ));
                 }
+
+                let progress_app = app.clone();
+                let scope = runtime.operation_scope();
+                if !startup.can_continue_preparation() {
+                    scope.request_cancellation();
+                }
+                let progress_startup = startup.clone();
+                let prepared = tauri::async_runtime::spawn_blocking(move || {
+                    mom_llama_runtime::prepare_startup_voice_caches(&scope, |progress| {
+                        if !progress_startup.can_continue_preparation() {
+                            scope.request_cancellation();
+                        }
+                        eprintln!(
+                            "mom-llama startup voice-cache progress: contexts={}/{} checkpoint_reused={} elapsed_ms={} cache_positions={} state_bytes={}",
+                            progress.completed,
+                            progress.total,
+                            progress.reused,
+                            progress.elapsed_ms,
+                            progress.cache_positions,
+                            progress.state_bytes
+                        );
+                        let _ = progress_app.emit("mom_llama_cache_preparation_progress", progress);
+                    })
+                })
+                .await;
+                let prepared = match prepared {
+                    Ok(Ok(summary)) => summary,
+                    Ok(Err(error)) => {
+                        fail_startup_runtime(startup, runtime, embedded).await;
+                        return Err(format!(
+                            "Blessenger could not prepare its persona voice caches: {error:#}"
+                        ));
+                    }
+                    Err(error) => {
+                        fail_startup_runtime(startup, runtime, embedded).await;
+                        return Err(format!(
+                            "Blessenger voice-cache preparation worker failed: {error}"
+                        ));
+                    }
+                };
+                if !startup.can_continue_preparation() {
+                    fail_startup_runtime(startup, runtime, embedded).await;
+                    return Err("Blessenger setup was canceled during persona preparation".into());
+                }
+                eprintln!(
+                    "mom-llama startup voice caches prepared: checkpoints_prepared={}, checkpoints_reused={}, contexts_total={}, elapsed_ms={}",
+                    prepared.prepared, prepared.reused, prepared.total, prepared.elapsed_ms
+                );
             }
             if let Some(prepared) = &prepared_speech {
                 prepared.claim();
@@ -522,8 +596,10 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
                     prepared.started.elapsed().as_millis()
                 );
             }
-            model_acquisition::write_installation_receipt(&app_data_dir)
-                .map_err(|error| format!("Blessenger could not finish setup: {error}"))?;
+            if let Err(error) = model_acquisition::write_installation_receipt(&app_data_dir) {
+                fail_startup_runtime(startup, runtime, embedded).await;
+                return Err(format!("Blessenger could not finish setup: {error}"));
+            }
             match startup.install(&app, runtime) {
                 Ok(()) => {
                     let _ = app.emit(
@@ -560,6 +636,26 @@ async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Resu
             Err(message)
         }
     }
+}
+
+async fn fail_startup_runtime(
+    startup: &StartupController,
+    runtime: AppRuntimeHandle,
+    embedded: bool,
+) {
+    runtime.begin_quiesce();
+    let shutdown = if embedded {
+        runtime.drain_shared_services().await
+    } else {
+        runtime.shutdown().await
+    };
+    let safe_to_exit = if embedded {
+        shutdown.is_ok()
+    } else {
+        safe_to_exit_after_shutdown(&shutdown)
+    };
+    log_shutdown_result(&shutdown);
+    startup.finish_failed_preparation(runtime, safe_to_exit);
 }
 
 fn resolve_installed_voice_root(
@@ -1434,6 +1530,23 @@ mod tests {
             StartupShutdownAction::AlreadyQuiescing
         ));
         assert!(startup.begin_initialization().is_err());
+    }
+
+    #[test]
+    fn startup_preparation_stops_when_shutdown_begins() {
+        let startup = startup_controller();
+        assert!(!startup.can_continue_preparation());
+        assert!(startup.begin_initialization().is_ok());
+        assert!(!startup.can_continue_preparation());
+        assert!(startup.begin_runtime_build().is_ok());
+        assert!(startup.can_continue_preparation());
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::WaitForBuild
+        ));
+        assert!(!startup.can_continue_preparation());
+        startup.finish_failed_build();
+        assert!(!startup.can_continue_preparation());
     }
 
     #[tokio::test]
