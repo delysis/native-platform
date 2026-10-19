@@ -1188,3 +1188,14 @@ idle publication plus authenticated restart, quit with queued and active cache
 work, and packaged call/navigation measurements. Fixture tests prove race and
 ownership rules; they do not establish physical audio quality, M2 performance,
 or a wall-clock upper bound for native/OS calls.
+
+Before the consolidated gate, run the complete product frontend suite, the
+affected Rust package tests in their default parallel mode, and package clippy
+with all targets and warnings denied. A serialized diagnostic run does not
+replace parallel qualification. Whole-page UI harnesses must load the same
+production prerequisite scripts in the same order as `index.html`; inject only
+DOM, clock and native-I/O boundaries, not an alternate scheduler. Tests that
+mutate global cache state must coordinate with every test that clears that state.
+After a failure, preserve the receipt, repair the specific cause, and verify its
+focused gate before repeating the broader gate. A passing component result
+still does not replace the packaged quit/restart measurements above.

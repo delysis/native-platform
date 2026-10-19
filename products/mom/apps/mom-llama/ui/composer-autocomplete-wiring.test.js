@@ -157,12 +157,19 @@ const autocompleteBridge = async (generation, acceptance, selectionOffset = 0) =
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout: (id) => timers.delete(id), addEventListener() {},
   };
-  vm.runInNewContext(ui, {
-    document, window, localStorage: { getItem: () => null, setItem() {} },
+  const context = {
+    document, window, setTimeout: window.setTimeout, clearTimeout: window.clearTimeout,
+    localStorage: { getItem: () => null, setItem() {} },
     TextEncoder, TextDecoder, MomLlamaComposerKeyPolicy: composer,
     MomVoiceCapturePolicy: voiceCapturePolicy,
     Event: class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } },
-  }, { filename: "coop-hx.js", timeout: 1000 });
+  };
+  vm.runInNewContext(
+    fs.readFileSync(path.join(__dirname, "voice-pipeline-scheduler.js"), "utf8"),
+    context,
+    { filename: "voice-pipeline-scheduler.js", timeout: 1000 },
+  );
+  vm.runInNewContext(ui, context, { filename: "coop-hx.js", timeout: 1000 });
   // The existing boot refusal settles before the fixture enables IPC. None of
   // the app startup/native capabilities are supplied by this component control.
   await new Promise(setImmediate);

@@ -37,9 +37,12 @@ const bridgeKey = async (key, fields, initialState = presentedState) => {
       listeners.set(name, entries);
     },
   };
+  const window = { setTimeout: () => 1, clearTimeout: () => {}, addEventListener: () => {} };
   const context = {
     document,
-    window: { setTimeout: () => 1, clearTimeout: () => {}, addEventListener: () => {} },
+    window,
+    setTimeout: window.setTimeout,
+    clearTimeout: window.clearTimeout,
     localStorage: { getItem: () => null, setItem: () => {} },
     TextEncoder,
     TextDecoder,
@@ -55,6 +58,9 @@ const bridgeKey = async (key, fields, initialState = presentedState) => {
       },
     },
   };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "voice-pipeline-scheduler.js"), "utf8"), context, {
+    filename: "voice-pipeline-scheduler.js", timeout: 1000,
+  });
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8"), context, {
     filename: "coop-hx.js", timeout: 1000,
   });
