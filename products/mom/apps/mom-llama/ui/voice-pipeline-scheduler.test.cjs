@@ -8,6 +8,7 @@ const {
   shouldRunCallTranscriptSlot,
   shouldDisableCallTranscriptSlotsAfterStop,
   canContinueVoiceHistoryRecovery,
+  createIdleVoiceHistoryScheduler,
   shouldWaitForVoiceHistoryRecovery,
   createCallTranscriptIntent,
   enqueueCallTranscriptIntent,
@@ -81,6 +82,42 @@ test("foreground work gates recovery without awaiting metadata, but waits an act
   assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "metadata" }), false);
   assert.equal(shouldWaitForVoiceHistoryRecovery({ operation: "exact-operation", stage: "transcription" }), true);
   assert.equal(shouldWaitForVoiceHistoryRecovery({ stage: "recording_commit" }), true);
+});
+
+test("idle recovery wakeups coalesce and foreground can cancel the pending run", async () => {
+  const timers = new Map();
+  const runs = [];
+  let now = 10_000;
+  let nextId = 0;
+  const scheduler = createIdleVoiceHistoryScheduler({
+    run: async () => { runs.push("run"); },
+    delayMs: 2_000,
+    setTimer: (callback, delay) => {
+      const id = ++nextId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+    now: () => now,
+  });
+
+  assert.equal(scheduler.schedule(30 * 60_000), true);
+  assert.equal(scheduler.schedule(2_000), true, "fresh work replaces a much later retry deadline");
+  assert.equal(scheduler.schedule(3_000), false, "later wakeups join the earlier pending deadline");
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].delay, 2_000);
+  assert.equal(scheduler.cancel(), true);
+  assert.equal(scheduler.scheduled, false);
+  assert.equal(timers.size, 0, "foreground admission removes the pending idle timer");
+  assert.deepEqual(runs, []);
+
+  scheduler.schedule(0);
+  const timer = [...timers.values()][0];
+  timers.clear();
+  timer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(runs, ["run"]);
+  assert.equal(scheduler.scheduled, false);
 });
 
 test("queued call transcript intents retain only durable identities and have a hard bound", () => {

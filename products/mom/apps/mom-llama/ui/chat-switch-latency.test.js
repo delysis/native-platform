@@ -58,7 +58,7 @@ test("conversation selection measures completed paint and does not await seconda
     refreshChat: async () => ({ dataset: { currentConversation: "next" } }),
     refreshSidebar: () => pending,
     refreshConversationSettingsProjection: () => pending,
-    recoverPendingVoiceHistory: async () => {},
+    scheduleVoiceHistoryRecovery() {},
     reportError() {},
   };
   vm.createContext(context);

@@ -3606,7 +3606,7 @@ fn real_prepared_persona_prefix_is_reused_by_first_voice_turn() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MM_PROJ_PATH for real Gemma audio"]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH and MOM_LLAMA_MMPROJ_PATH for real Gemma audio"]
 fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     let _session = configured_real_session("real-shutdown-session-checkpoint")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -3616,9 +3616,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         batch_tokens: Some(128),
         max_parallel_sequences: Some(4),
         max_tokens: Some(8),
-        mmproj_path: Some(Some(PathBuf::from(std::env::var(
-            "MOM_LLAMA_MM_PROJ_PATH",
-        )?))),
+        mmproj_path: Some(Some(PathBuf::from(std::env::var("MOM_LLAMA_MMPROJ_PATH")?))),
         resident_memory_budget_bytes: Some(21_845 * 1024 * 1024),
         kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         ..SettingsUpdate::default()
@@ -3641,6 +3639,24 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         "Remember this phrase: copper heron.",
     )?;
     mom_llama_runtime::kv_cache_checkpoint_committed_voice_session(&scope, &conversation.id)?;
+    let wait_checkpoint = |previous: Option<&str>| -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = mom_llama_runtime::kv_cache_status()?
+                .result
+                .ok_or_else(|| anyhow!("missing cache status"))?;
+            if status.entries.iter().any(|entry| {
+                entry.owner_id.as_deref() == Some(&conversation.id)
+                    && entry.tier == mom_llama_runtime::kv_cache::CacheTier::SessionPersistent
+                    && Some(entry.id.as_str()) != previous
+            }) {
+                return Ok(());
+            }
+            anyhow::ensure!(Instant::now() < deadline, "idle checkpoint did not publish");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_checkpoint(None)?;
     let before = mom_llama_runtime::kv_cache_status()?
         .result
         .ok_or_else(|| anyhow!("missing cache status"))?;
@@ -3677,7 +3693,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     let handle = mom_llama_runtime::native_runtime::resident_model(&scope, &settings)?;
     let before_startup_warm = handle.inspect_resident_conversation(Some(&latest.request_id))?;
     let before_startup_state = handle
-        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 8 * 1024 * 1024 * 1024)?
         .ok_or_else(|| anyhow!("latest committed request was not snapshot eligible"))?;
     let startup_warm = mom_llama_runtime::runtime_warm(&scope)?
         .result
@@ -3707,7 +3723,7 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         warm.resident_prefix_tokens
     );
     let after_startup_state = handle
-        .snapshot_conversation_for_request_if_fits(&latest.request_id, 128 * 1024 * 1024)?
+        .snapshot_conversation_for_request_if_fits(&latest.request_id, 8 * 1024 * 1024 * 1024)?
         .ok_or_else(|| anyhow!("startup warm lost the latest committed request"))?;
     assert_eq!(
         after_startup_state.cells, before_startup_state.cells,
@@ -3726,14 +3742,22 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
         "PENDING_SESSION_RAM_HIT {}",
         json!({"resident_prefix_tokens": warm.resident_prefix_tokens, "prefill_us": warm.prefill_us, "older_checkpoint": older.id})
     );
-    let drain = mom_llama_runtime::prepare_committed_session_checkpoint_drain(&scope);
+    // Release foreground ownership and let the production idle worker publish.
+    // Quit must stop/join it without creating a new export.
+    let idle_started = Instant::now();
+    mom_llama_runtime::kv_cache_set_voice_call_activity(&scope, "shutdown-witness", false)?;
+    wait_checkpoint(Some(&older.id))?;
+    let idle_ms = idle_started.elapsed().as_millis();
     scope.request_cancellation();
     assert!(scope.cancellation_requested());
     let started = Instant::now();
-    let saved = drain.flush()?;
-    assert_eq!(
-        saved, 1,
-        "shutdown must persist the resident committed request"
+    scope
+        .join_session_checkpoints()
+        .map_err(|error| anyhow!(error))?;
+    let join_ms = started.elapsed().as_millis();
+    assert!(
+        join_ms < 1000,
+        "idle worker join unexpectedly waited {join_ms} ms"
     );
     let after = mom_llama_runtime::kv_cache_status()?
         .result
@@ -3750,8 +3774,8 @@ fn real_committed_session_checkpoint_survives_scope_shutdown() -> Result<()> {
     assert!(checkpoint.state_bytes > 0);
     let cache_id = checkpoint.id.clone();
     println!(
-        "SHUTDOWN_CHECKPOINT_SAVED {}",
-        json!({"saved": saved, "bytes": checkpoint.state_bytes, "elapsed_ms": started.elapsed().as_millis()})
+        "IDLE_CHECKPOINT_SAVED {}",
+        json!({"bytes": checkpoint.state_bytes, "idle_ms": idle_ms, "quit_join_ms": join_ms})
     );
     drop(scope);
     drop(owner);

@@ -17,6 +17,7 @@ use llama_native_types::{ChatMessage, ChatRole, ChatTemplateChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -1129,14 +1130,7 @@ pub(crate) fn acquire_persona_cache_authority_guard(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| anyhow::anyhow!("Persona cache authority lock is unavailable"))?;
-    let lock_path = store
-        .path()
-        .with_file_name(PERSONA_CACHE_AUTHORITY_LOCK_FILE);
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(lock_path)?;
+    let file = open_persona_cache_authority_file(store)?;
     FileExt::lock_exclusive(&file)?;
     Ok(PersonaCacheAuthorityGuard {
         _process_guard: process_guard,
@@ -1144,11 +1138,68 @@ pub(crate) fn acquire_persona_cache_authority_guard(
     })
 }
 
+pub(crate) fn try_acquire_persona_cache_authority_guard(
+    store: &RuntimeStore,
+) -> Result<Option<PersonaCacheAuthorityGuard>> {
+    let process_guard = match PERSONA_CACHE_AUTHORITY
+        .get_or_init(|| Mutex::new(()))
+        .try_lock()
+    {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(anyhow::anyhow!(
+                "Persona cache authority lock is unavailable"
+            ));
+        }
+    };
+    let file = open_persona_cache_authority_file(store)?;
+    if let Err(error) = FileExt::try_lock_exclusive(&file) {
+        if error.kind() == ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    Ok(Some(PersonaCacheAuthorityGuard {
+        _process_guard: process_guard,
+        file,
+    }))
+}
+
+fn open_persona_cache_authority_file(store: &RuntimeStore) -> Result<File> {
+    let lock_path = store
+        .path()
+        .with_file_name(PERSONA_CACHE_AUTHORITY_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    Ok(options.open(lock_path)?)
+}
+
 pub(crate) fn acquire_persona_cache_owner_lease(
     store: &RuntimeStore,
     owner_id: &str,
 ) -> Result<Option<PersonaCacheOwnerLease>> {
     let authority = acquire_persona_cache_authority_guard(store)?;
+    cache_owner_lease_with_authority(store, owner_id, authority)
+}
+
+pub(crate) fn try_acquire_persona_cache_owner_lease(
+    store: &RuntimeStore,
+    owner_id: &str,
+) -> Result<Option<PersonaCacheOwnerLease>> {
+    let Some(authority) = try_acquire_persona_cache_authority_guard(store)? else {
+        return Ok(None);
+    };
+    cache_owner_lease_with_authority(store, owner_id, authority)
+}
+
+fn cache_owner_lease_with_authority(
+    store: &RuntimeStore,
+    owner_id: &str,
+    authority: PersonaCacheAuthorityGuard,
+) -> Result<Option<PersonaCacheOwnerLease>> {
     let removal_generation = persona_cache_owner_removal_generation(store, owner_id)?;
     if removal_generation != 0 {
         return Ok(None);
@@ -2623,6 +2674,50 @@ mod tests {
                 .get::<Option<String>>(crate::conversation_store::NEW_CHAT_CONTEXT_NAMESPACE)
                 .expect("pending selection"),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn try_persona_cache_owner_lease_does_not_wait_and_respects_removals() {
+        let _session = TestDataDir::new("try-cache-owner-lease");
+        let store = RuntimeStore::current().expect("open test runtime store");
+
+        let first = super::try_acquire_persona_cache_owner_lease(&store, "active-persona")
+            .expect("try active Persona lease")
+            .expect("acquire available Persona lease");
+        assert!(
+            super::try_acquire_persona_cache_owner_lease(&store, "active-persona")
+                .expect("try while held")
+                .is_none(),
+            "busy authority must return immediately without a lease"
+        );
+        drop(first);
+
+        let available = super::try_acquire_persona_cache_owner_lease(&store, "active-persona")
+            .expect("retry available Persona lease")
+            .expect("acquire after previous lease is released");
+        drop(available);
+
+        store
+            .put(
+                PERSONA_REMOVALS_NAMESPACE,
+                &PersonaRemovalLedger {
+                    removals: vec![super::PersonaRemovalRecord {
+                        persona_id: "removed-persona".to_string(),
+                        persona_version: None,
+                        impact_sha256: "test-tombstone".to_string(),
+                        impact: None,
+                        removed_at: "1".to_string(),
+                        persona_snapshot: None,
+                    }],
+                },
+            )
+            .expect("write Persona removal tombstone");
+        assert!(
+            super::try_acquire_persona_cache_owner_lease(&store, "removed-persona")
+                .expect("try removed Persona lease")
+                .is_none(),
+            "removed Persona owners must not receive a lease"
         );
     }
 

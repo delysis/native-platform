@@ -1250,6 +1250,7 @@ fn safe_to_exit_after_shutdown(
         Err(error) => {
             error.summary.native_host_joined
                 && error.summary.speech_host_joined
+                && error.summary.checkpoint_worker_joined
                 && error.summary.persona_approval_recovery_complete
                 && error.approval_recovery_error.is_none()
                 && error.speech_error.is_none()
@@ -1610,6 +1611,11 @@ mod tests {
             elapsed_ms: 1,
             native_host_joined: false,
             speech_host_joined: true,
+            checkpoint_worker_joined: true,
+            checkpoint_join_ms: 0,
+            final_approval_recovery_ms: 0,
+            speech_join_ms: 0,
+            native_join_ms: 0,
             speech_active_operation_count: 0,
             speech_retained_playback_count: 0,
             operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
@@ -1646,6 +1652,18 @@ mod tests {
             speech_error: None,
         });
         assert!(!safe_to_exit_after_shutdown(&recovery_failure));
+        let checkpoint_failure = Err(AppShutdownError {
+            summary: AppShutdownSummary {
+                native_host_joined: true,
+                checkpoint_worker_joined: false,
+                ..summary.clone()
+            },
+            operation_error: Some("checkpoint worker join failed".to_string()),
+            approval_recovery_error: None,
+            native_error: None,
+            speech_error: None,
+        });
+        assert!(!safe_to_exit_after_shutdown(&checkpoint_failure));
         let speech_failure = Err(AppShutdownError {
             summary: AppShutdownSummary {
                 native_host_joined: true,

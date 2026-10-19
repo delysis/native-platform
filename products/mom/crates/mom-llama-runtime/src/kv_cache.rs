@@ -1,7 +1,6 @@
 use crate::config::{KvCachePolicy, Settings, resolve_settings, upstream_setting_string};
 use crate::native_runtime::{
-    ResidentCheckpointAccess, clear_native_prefix_cache, resident_model,
-    resident_model_for_profile_if_loaded,
+    clear_native_prefix_cache, resident_model, resident_model_for_profile_if_loaded,
 };
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
@@ -22,8 +21,8 @@ use llama_native_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use uuid::Uuid;
 
 const KV_CACHE_NAMESPACE: &str = "kv-cache.v3";
@@ -450,107 +449,26 @@ impl MemoryCacheState {
 }
 
 static MEMORY_CACHE: OnceLock<Mutex<MemoryCacheState>> = OnceLock::new();
-static COMMITTED_SESSION_REQUESTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-static SESSION_CHECKPOINT_SCHEDULER: OnceLock<Arc<SessionCheckpointScheduler>> = OnceLock::new();
-
-struct ScheduledSessionCheckpoint {
-    scope: crate::OperationScope,
-    request_id: String,
-    deadline: Instant,
-}
-
-struct SessionCheckpointScheduler {
-    pending: Mutex<HashMap<String, ScheduledSessionCheckpoint>>,
-    wake: Condvar,
-}
-
-pub(crate) fn note_committed_session_request(conversation_id: &str, request_id: &str) {
-    let requests = COMMITTED_SESSION_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut requests) = requests.lock() {
-        requests.insert(conversation_id.to_owned(), request_id.to_owned());
+pub(crate) fn note_committed_session_request(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    request_id: &str,
+) {
+    if let Err(error) = scope.note_committed_session_request(conversation_id, request_id) {
+        eprintln!("Unable to register committed cache request: {error:#}");
     }
 }
 
-/// Debounce text-session persistence until there has been a short idle window.
-/// The registry retains the committed request even when this bounded queue is
-/// full or foreground work preempts the snapshot, so hangup/shutdown can retry.
+/// Enqueue maintenance; callers never export or write native state inline.
 pub(crate) fn schedule_committed_session_checkpoint(
     scope: &crate::OperationScope,
     conversation_id: &str,
     request_id: &str,
 ) {
-    const MAX_PENDING_CHECKPOINTS: usize = 64;
-    let scheduler = SESSION_CHECKPOINT_SCHEDULER.get_or_init(|| {
-        let scheduler = Arc::new(SessionCheckpointScheduler {
-            pending: Mutex::new(HashMap::new()),
-            wake: Condvar::new(),
-        });
-        let worker = Arc::clone(&scheduler);
-        let _ = std::thread::Builder::new()
-            .name("mom-session-checkpoint-idle".to_owned())
-            .spawn(move || session_checkpoint_worker(worker));
-        scheduler
-    });
-    if let Ok(mut pending) = scheduler.pending.lock() {
-        if !pending.contains_key(conversation_id) && pending.len() >= MAX_PENDING_CHECKPOINTS {
-            return;
+    if let Err(error) = scope.schedule_session_checkpoint(conversation_id, request_id) {
+        if !scope.cancellation_requested() {
+            eprintln!("Unable to schedule idle checkpoint: {error:#}");
         }
-        pending.insert(
-            conversation_id.to_owned(),
-            ScheduledSessionCheckpoint {
-                scope: scope.clone(),
-                request_id: request_id.to_owned(),
-                deadline: Instant::now() + Duration::from_secs(3),
-            },
-        );
-        scheduler.wake.notify_one();
-    }
-}
-
-fn session_checkpoint_worker(scheduler: Arc<SessionCheckpointScheduler>) {
-    loop {
-        let due = {
-            let Ok(mut pending) = scheduler.pending.lock() else {
-                return;
-            };
-            loop {
-                if pending.is_empty() {
-                    let Ok(next) = scheduler.wake.wait(pending) else {
-                        return;
-                    };
-                    pending = next;
-                    continue;
-                }
-                let next_deadline = pending
-                    .values()
-                    .map(|entry| entry.deadline)
-                    .min()
-                    .unwrap_or_else(Instant::now);
-                let now = Instant::now();
-                if next_deadline > now {
-                    let Ok((next, _)) = scheduler.wake.wait_timeout(pending, next_deadline - now)
-                    else {
-                        return;
-                    };
-                    pending = next;
-                    continue;
-                }
-                let key = pending
-                    .iter()
-                    .filter(|(_, value)| value.deadline <= now)
-                    .min_by_key(|(_, value)| value.deadline)
-                    .map(|(key, _)| key.clone());
-                break key.and_then(|key| pending.remove(&key).map(|entry| (key, entry)));
-            }
-        };
-        let Some((conversation_id, scheduled)) = due else {
-            continue;
-        };
-        let _ = checkpoint_committed_session_request(
-            &scheduled.scope,
-            &conversation_id,
-            Some(&scheduled.request_id),
-        );
     }
 }
 
@@ -920,12 +838,7 @@ fn prepare_voice_context_resident(
     // A previous hangup may still be encrypting its snapshot. If the worker
     // owns this conversation's newer committed request, do not replace it with
     // an older disk checkpoint (or touch the disk cache at all).
-    let pending_request = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
-        .get(&session_owner_id)
-        .cloned();
+    let pending_request = scope.committed_session_request(&session_owner_id)?;
     let resident = handle
         .inspect_resident_conversation(pending_request.as_deref())
         .map_err(|error| anyhow!(error))?;
@@ -1365,10 +1278,14 @@ pub fn kv_cache_restore(
     ))
 }
 
-pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvCacheStatus>> {
-    let settings = resolve_settings()?;
-    clear_native_prefix_cache(scope, &settings)?;
-    let store = RuntimeStore::open(&settings.data_dir)?;
+fn clear_checkpoint_store(store: &RuntimeStore) -> Result<()> {
+    // Publication and removal use this same authority guard. Invalidate leases
+    // before deleting manifests so a delayed writer cannot revive cleared state.
+    let _authority = crate::personas::acquire_persona_cache_authority_guard(store)?;
+    memory_cache()
+        .lock()
+        .map_err(|_| anyhow!("cache memory state unavailable"))?
+        .clear();
     store.mutate_documents(
         KV_CACHE_NAMESPACE,
         KvCacheDb::default,
@@ -1377,12 +1294,24 @@ pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvC
                 delete_cache_bytes(documents, entry);
             }
             db.entries.clear();
+            let mut journal = documents
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)?
+                .unwrap_or_default();
+            if let Some(active) = journal.active.take() {
+                journal.garbage.push(active);
+            }
+            documents.put_bytes(KV_CACHE_STAGING_NAMESPACE, &serde_json::to_vec(&journal)?)?;
             Ok(())
         },
     )?;
-    if let Ok(mut cache) = memory_cache().lock() {
-        cache.clear();
-    }
+    Ok(())
+}
+
+pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvCacheStatus>> {
+    let settings = resolve_settings()?;
+    clear_native_prefix_cache(scope, &settings)?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    clear_checkpoint_store(&store)?;
     Ok(CommandResult::passed(
         "mom_llama.kv_cache_clear",
         "contracted",
@@ -1722,51 +1651,27 @@ pub fn kv_cache_checkpoint_committed_voice_session(
     scope: &crate::OperationScope,
     conversation_id: &str,
 ) -> Result<Option<String>> {
-    checkpoint_committed_session_request(scope, conversation_id, None)
+    if let Some(request) = scope.committed_session_request(conversation_id)? {
+        schedule_committed_session_checkpoint(scope, conversation_id, &request);
+    }
+    // This command acknowledges scheduling, never claims a durable cache hit.
+    Ok(None)
 }
 
-/// Best-effort checkpoint of other committed conversations before an
-/// ordinary chat request can replace their resident request authority.
+/// Foreground operations only notify the idle worker. They must not serialize
+/// another conversation's native state before serving the current request.
 pub(crate) fn checkpoint_pending_sessions_before_chat(
     scope: &crate::OperationScope,
-    incoming_conversation_id: &str,
+    _incoming_conversation_id: &str,
 ) {
-    if scope.has_active_voice_call() {
-        return;
-    }
-    let requests = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map(|requests| {
-            pending_session_checkpoint_candidates(&requests, Some(incoming_conversation_id))
-        })
-        .unwrap_or_default();
-    for (conversation_id, request_id) in requests {
-        if let Err(error) =
-            checkpoint_committed_session_request(scope, &conversation_id, Some(&request_id))
-        {
-            eprintln!(
-                "Unable to checkpoint committed conversation {conversation_id} before chat: {error:#}"
-            );
-        }
-    }
+    reschedule_committed_session_checkpoints(scope);
 }
 
-/// Capture a conversation using its current frozen profile before that profile
-/// is changed. Cache failures are diagnostic only; model selection remains
-/// available and the pending checkpoint is still eligible for later retry.
 pub(crate) fn checkpoint_session_before_profile_change(
     scope: &crate::OperationScope,
     conversation_id: &str,
 ) {
-    if scope.has_active_voice_call() {
-        return;
-    }
-    if let Err(error) = checkpoint_committed_session_request(scope, conversation_id, None) {
-        eprintln!(
-            "Unable to checkpoint committed conversation {conversation_id} before profile change: {error:#}"
-        );
-    }
+    let _ = kv_cache_checkpoint_committed_voice_session(scope, conversation_id);
 }
 
 pub fn kv_cache_set_voice_call_activity(
@@ -1784,137 +1689,119 @@ pub fn kv_cache_set_voice_call_activity(
 }
 
 fn reschedule_committed_session_checkpoints(scope: &crate::OperationScope) {
-    let requests = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map(|requests| {
-            requests
-                .iter()
-                .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let requests = scope.committed_session_requests().unwrap_or_default();
     for (conversation_id, request_id) in requests {
         schedule_committed_session_checkpoint(scope, &conversation_id, &request_id);
     }
 }
 
-fn pending_session_checkpoint_candidates(
-    requests: &HashMap<String, String>,
-    excluded_conversation_id: Option<&str>,
-) -> Vec<(String, String)> {
-    requests
-        .iter()
-        .filter(|(conversation_id, _)| Some(conversation_id.as_str()) != excluded_conversation_id)
-        .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
-        .collect()
+/// One immutable snapshot retained by the owned worker across yielded writes.
+/// At most one full snapshot per runtime is retained, never one per queued chat.
+pub(crate) struct SessionCheckpointProgress {
+    conversation_id: String,
+    request_id: String,
+    store: RuntimeStore,
+    value: PrefixCacheValue,
+    authority: SessionConversationAuthority,
+    memory_generation: MemoryCacheGeneration,
+    next_chunk: usize,
+    registered: bool,
+    max_part_ms: u128,
+    snapshot_ms: u128,
+    write_started: Instant,
 }
 
-/// Restricted checkpoint access captured before scope cancellation. It never
-/// reopens generation admission and is consumed after application work drains.
-pub struct CommittedSessionCheckpointDrain {
-    scope: crate::OperationScope,
-    access: Option<ResidentCheckpointAccess>,
+enum SessionCheckpointCapture {
+    Deferred,
+    Obsolete,
+    Captured(Box<SessionCheckpointProgress>),
 }
 
-pub fn prepare_committed_session_checkpoint_drain(
+fn session_checkpoint_admitted(scope: &crate::OperationScope) -> bool {
+    !scope.cancellation_requested()
+        && !scope.has_active_voice_call()
+        && scope.active_operation_count() == 0
+        && !crate::store::store_write_pending()
+}
+
+pub(crate) fn run_scheduled_session_checkpoint(
     scope: &crate::OperationScope,
-) -> CommittedSessionCheckpointDrain {
-    CommittedSessionCheckpointDrain {
-        scope: scope.clone(),
-        access: ResidentCheckpointAccess::capture(scope),
+    conversation_id: &str,
+    request_id: &str,
+    progress: &mut Option<SessionCheckpointProgress>,
+) -> Result<bool> {
+    if scope.cancellation_requested() {
+        return Ok(true);
     }
-}
-
-impl CommittedSessionCheckpointDrain {
-    /// Call after cancellation and application work drain, before native teardown.
-    pub fn flush(self) -> Result<usize> {
-        anyhow::ensure!(
-            self.scope.cancellation_requested(),
-            "checkpoint drain requires a cancelled scope"
-        );
-        let scope = &self.scope;
-        scope.clear_voice_call_activity().map_err(|error| {
-            anyhow!("Unable to clear voice call activity at shutdown: {error:#}")
-        })?;
-        if self.access.is_none() {
-            return Ok(0);
-        }
-        let requests = COMMITTED_SESSION_REQUESTS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|_| anyhow!("Committed session checkpoint registry is unavailable"))?
-            .iter()
-            .map(|(conversation_id, request_id)| (conversation_id.clone(), request_id.clone()))
-            .collect::<Vec<_>>();
-        let mut persisted = 0;
-        let mut first_error = None;
-        for (conversation_id, request_id) in requests {
-            match checkpoint_committed_session_request_with_drain(
-                scope,
-                &conversation_id,
-                Some(&request_id),
-                self.access.as_ref(),
-            ) {
-                Ok(Some(_)) => persisted += 1,
-                Ok(None) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
+    if scope.committed_session_request(conversation_id)?.as_deref() != Some(request_id) {
+        return Ok(true);
+    }
+    if !session_checkpoint_admitted(scope) {
+        return Ok(false);
+    }
+    if progress.as_ref().is_some_and(|saved| {
+        saved.conversation_id != conversation_id || saved.request_id != request_id
+    }) {
+        *progress = None;
+    }
+    if progress.is_none() {
+        match capture_session_checkpoint(scope, conversation_id, request_id)? {
+            SessionCheckpointCapture::Deferred => return Ok(false),
+            SessionCheckpointCapture::Obsolete => {
+                scope.retire_committed_session_request(conversation_id, request_id)?;
+                return Ok(true);
             }
+            SessionCheckpointCapture::Captured(saved) => *progress = Some(*saved),
         }
-        if let Some(error) = first_error {
-            return Err(anyhow!(
-                "one or more committed session checkpoints failed after {persisted} saves: {error:#}"
-            ));
-        }
-        Ok(persisted)
     }
+    let Some(saved) = progress.as_mut() else {
+        return Ok(false);
+    };
+    let admitted = || session_checkpoint_admitted(scope);
+    if memory_generation(saved.value.metadata.owner_id.as_deref())? != saved.memory_generation {
+        scope.retire_committed_session_request(conversation_id, request_id)?;
+        *progress = None;
+        return Ok(true);
+    }
+    match advance_session_checkpoint(saved, &admitted)? {
+        CheckpointAdvance::Deferred => return Ok(false),
+        CheckpointAdvance::Obsolete => {
+            scope.retire_committed_session_request(conversation_id, request_id)?;
+            *progress = None;
+            return Ok(true);
+        }
+        CheckpointAdvance::Published => {}
+    }
+    let saved = progress.take().expect("completed checkpoint");
+    scope.retire_committed_session_request(conversation_id, request_id)?;
+    eprintln!(
+        "Blessenger checkpoint: snapshot {} ms, persistence {} ms, bytes {}, parts {}",
+        saved.snapshot_ms,
+        saved.write_started.elapsed().as_millis(),
+        saved.value.metadata.state_bytes,
+        saved.next_chunk
+    );
+    Ok(true)
 }
 
-fn checkpoint_committed_session_request(
+fn capture_session_checkpoint(
     scope: &crate::OperationScope,
     conversation_id: &str,
-    expected_request_id: Option<&str>,
-) -> Result<Option<String>> {
-    checkpoint_committed_session_request_with_drain(
-        scope,
-        conversation_id,
-        expected_request_id,
-        None,
-    )
-}
-
-fn checkpoint_committed_session_request_with_drain(
-    scope: &crate::OperationScope,
-    conversation_id: &str,
-    expected_request_id: Option<&str>,
-    drain: Option<&ResidentCheckpointAccess>,
-) -> Result<Option<String>> {
-    if scope.has_active_voice_call() {
-        return Ok(None);
+    request_id: &str,
+) -> Result<SessionCheckpointCapture> {
+    let started = Instant::now();
+    if !session_checkpoint_admitted(scope) {
+        return Ok(SessionCheckpointCapture::Deferred);
     }
     let mut settings = resolve_settings()?;
     if !settings.kv_cache_policy.persists_conversation_checkpoints() {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Obsolete);
     }
     if scope
-        .current_chat_request_id(conversation_id, drain.is_none())
+        .current_chat_request_id(conversation_id, true)
         .is_some()
     {
-        return Ok(None);
-    }
-    let request_id = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow!("Committed voice-session checkpoint registry is unavailable"))?
-        .get(conversation_id)
-        .cloned();
-    let Some(request_id) = request_id else {
-        return Ok(None);
-    };
-    if expected_request_id.is_some_and(|expected| expected != request_id) {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Deferred);
     }
     let conversations = crate::conversation_store::load_db_with_settings(&settings)?;
     let Some(conversation) = conversations
@@ -1922,7 +1809,7 @@ fn checkpoint_committed_session_request_with_drain(
         .iter()
         .find(|conversation| conversation.id == conversation_id)
     else {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Obsolete);
     };
     // Fence this snapshot against a newer committed source conversation. The
     // matching check is repeated inside the SQLite mutation that writes the
@@ -1936,18 +1823,12 @@ fn checkpoint_committed_session_request_with_drain(
         conversation.execution_profile.mmproj_path.clone(),
     );
     let Some(model_path) = settings.model_path.clone() else {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Obsolete);
     };
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let captured_memory_generation = memory_generation(Some(conversation_id))?;
+    let mut source_obsolete = false;
     let snapshot = scope.with_idle_voice_checkpoint(|foreground_waiters| {
-        if let Some(drain) = drain {
-            return drain.snapshot(
-                &settings,
-                &model_path,
-                settings.mmproj_path.as_deref(),
-                &request_id,
-                MAX_PERSISTENT_ENTRY_BYTES,
-            );
-        }
         let Some(handle) = resident_model_for_profile_if_loaded(
             scope,
             &settings,
@@ -1956,8 +1837,20 @@ fn checkpoint_committed_session_request_with_drain(
         )
         .map_err(|blocked| anyhow!(blocked.blocker.message))?
         else {
+            source_obsolete = true;
             return Ok(None);
         };
+        // An evicted/replaced resident request cannot become snapshot-eligible
+        // by polling. Retire it; the last durable prefix remains available.
+        if handle
+            .inspect_resident_conversation(Some(request_id))
+            .map_err(|error| anyhow!(error))?
+            .committed_prefix_tokens
+            .is_none()
+        {
+            source_obsolete = true;
+            return Ok(None);
+        }
         let Some(state) = handle
             .snapshot_conversation_for_request_if_idle(
                 &request_id,
@@ -1975,10 +1868,14 @@ fn checkpoint_committed_session_request_with_drain(
         Ok(Some((state, fingerprint)))
     })?;
     let Some((state, fingerprint)) = snapshot.flatten() else {
-        return Ok(None);
+        return Ok(if source_obsolete {
+            SessionCheckpointCapture::Obsolete
+        } else {
+            SessionCheckpointCapture::Deferred
+        });
     };
     if (state.token_ids.is_empty() && state.cells.is_empty()) || state.bytes.is_empty() {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Obsolete);
     }
     let fingerprint = cache_fingerprint_from_native(fingerprint)?;
     let mut metadata = PrefixCacheMetadata::new(
@@ -1997,21 +1894,23 @@ fn checkpoint_committed_session_request_with_drain(
         sequence: state,
     };
     if !value.is_valid() {
-        return Ok(None);
+        return Ok(SessionCheckpointCapture::Obsolete);
     }
-    let promoted =
-        persist_session_checkpoint_value(scope, &settings, &value, &conversation_authority)?;
-    if !promoted {
-        return Ok(None);
-    }
-    if let Ok(mut requests) = COMMITTED_SESSION_REQUESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        && requests.get(conversation_id) == Some(&request_id)
-    {
-        requests.remove(conversation_id);
-    }
-    Ok(Some(value.metadata.id))
+    Ok(SessionCheckpointCapture::Captured(Box::new(
+        SessionCheckpointProgress {
+            conversation_id: conversation_id.to_owned(),
+            request_id: request_id.to_owned(),
+            store,
+            value,
+            authority: conversation_authority,
+            memory_generation: captured_memory_generation,
+            next_chunk: 0,
+            registered: false,
+            max_part_ms: 0,
+            snapshot_ms: started.elapsed().as_millis(),
+            write_started: Instant::now(),
+        },
+    )))
 }
 
 pub fn invalidate_cache(cache_id: &str) -> Result<()> {
@@ -2322,6 +2221,17 @@ impl MomCachePromotionLease {
         }))
     }
 
+    fn try_acquire(store: &RuntimeStore, owner_id: &str) -> Result<Option<Self>> {
+        let Some(owner) = crate::personas::try_acquire_persona_cache_owner_lease(store, owner_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            owner: Some(owner),
+            memory_generation: memory_generation(Some(owner_id))?,
+        }))
+    }
+
     fn validate(&self) -> Result<bool> {
         match &self.owner {
             Some(owner) => owner.validate(),
@@ -2436,12 +2346,275 @@ fn persist_session_checkpoint_value(
         value,
         Some(authority),
         &|| {
-            !scope.has_active_voice_call()
+            !scope.cancellation_requested()
+                && !scope.has_active_voice_call()
                 && scope.active_operation_count() == 0
                 && !crate::store::store_write_pending()
         },
         || {},
     )
+}
+
+// Staged parts are encrypted storage documents, but never advertised as a
+// usable checkpoint until their manifest is published atomically. One staging
+// slot per store bounds abandoned writes. A new writer fences out an older
+// one and reclaims its parts in bounded transactions before writing new parts.
+const KV_CACHE_STAGING_NAMESPACE: &str = "kv-cache.v3.staging";
+
+#[derive(Default, Serialize, Deserialize)]
+struct CacheStagingJournal {
+    active: Option<StagedCacheParts>,
+    garbage: Vec<StagedCacheParts>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StagedCacheParts {
+    id: String,
+    written: usize,
+    deleted: usize,
+}
+
+impl StagedCacheParts {
+    fn published(metadata: &PrefixCacheMetadata) -> Self {
+        Self {
+            id: metadata.id.clone(),
+            written: metadata
+                .state_bytes
+                .min(MAX_PERSISTENT_ENTRY_BYTES)
+                .div_ceil(CACHE_BLOB_CHUNK_BYTES)
+                .max(1),
+            deleted: 0,
+        }
+    }
+}
+
+enum CheckpointAdvance {
+    Published,
+    Deferred,
+    Obsolete,
+}
+
+fn advance_session_checkpoint(
+    saved: &mut SessionCheckpointProgress,
+    admitted: &dyn Fn() -> bool,
+) -> Result<CheckpointAdvance> {
+    let result = advance_session_checkpoint_inner(saved, admitted);
+    match result {
+        Err(error) if error.is::<CachePersistencePreempted>() => Ok(CheckpointAdvance::Deferred),
+        other => other,
+    }
+}
+
+fn advance_session_checkpoint_inner(
+    saved: &mut SessionCheckpointProgress,
+    admitted: &dyn Fn() -> bool,
+) -> Result<CheckpointAdvance> {
+    require_cache_persistence_admission(admitted)?;
+    if saved.value.metadata.reconstruction.is_none() {
+        let started = Instant::now();
+        let Some(reconstruction) = saved.value.sequence.reconstruction_while(admitted) else {
+            return Ok(CheckpointAdvance::Deferred);
+        };
+        saved.value.metadata.reconstruction = Some(reconstruction);
+        eprintln!(
+            "Blessenger checkpoint: reconstruction {} ms",
+            started.elapsed().as_millis()
+        );
+    }
+    if !saved.value.is_valid() || !persistent_entry_fits(saved.value.metadata.state_bytes) {
+        anyhow::bail!("refusing invalid or oversized staged native checkpoint");
+    }
+    if !saved.registered {
+        saved.store.mutate_documents_with_admission(
+            KV_CACHE_STAGING_NAMESPACE,
+            CacheStagingJournal::default,
+            || require_cache_persistence_admission(admitted),
+            |journal, _| {
+                if let Some(previous) = journal.active.take() {
+                    journal.garbage.push(previous);
+                }
+                journal.active = Some(StagedCacheParts {
+                    id: saved.value.metadata.id.clone(),
+                    written: 0,
+                    deleted: 0,
+                });
+                Ok(())
+            },
+        )?;
+        saved.registered = true;
+    }
+    // Old versions and interrupted writes are reclaimed by idle work, never
+    // by quit or foreground navigation. Each commit holds only one part.
+    reclaim_staged_cache_garbage(&saved.store, admitted)?;
+    for (index, chunk) in saved
+        .value
+        .sequence
+        .bytes
+        .chunks(CACHE_BLOB_CHUNK_BYTES)
+        .enumerate()
+        .skip(saved.next_chunk)
+    {
+        let started = Instant::now();
+        let written = saved.store.mutate_documents_with_admission(
+            KV_CACHE_STAGING_NAMESPACE,
+            CacheStagingJournal::default,
+            || require_cache_persistence_admission(admitted),
+            |journal, documents| {
+                let Some(active) = journal.active.as_mut().filter(|active| {
+                    active.id == saved.value.metadata.id && active.written == index
+                }) else {
+                    return Ok(false);
+                };
+                documents.put_bytes_streamed(&blob_chunk_namespace(&active.id, index), chunk)?;
+                active.written += 1;
+                Ok(true)
+            },
+        )?;
+        if !written {
+            return Ok(CheckpointAdvance::Obsolete);
+        }
+        saved.next_chunk = index + 1;
+        saved.max_part_ms = saved.max_part_ms.max(started.elapsed().as_millis());
+    }
+    require_cache_persistence_admission(admitted)?;
+    if memory_generation(saved.value.metadata.owner_id.as_deref())? != saved.memory_generation {
+        return Ok(CheckpointAdvance::Obsolete);
+    }
+    let Some(lease) = MomCachePromotionLease::try_acquire(&saved.store, &saved.conversation_id)?
+    else {
+        return Ok(CheckpointAdvance::Deferred);
+    };
+    if lease.memory_generation != saved.memory_generation {
+        return Ok(CheckpointAdvance::Obsolete);
+    }
+    let started = Instant::now();
+    let published = saved.store.mutate_documents_with_admission(
+        KV_CACHE_NAMESPACE,
+        KvCacheDb::default,
+        || require_cache_persistence_admission(admitted),
+        |db, documents| {
+            let mut journal = documents
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)?
+                .unwrap_or_default();
+            let complete = journal.active.as_ref().is_some_and(|active| {
+                active.id == saved.value.metadata.id && active.written == saved.next_chunk
+            });
+            if !complete
+                || !saved
+                    .authority
+                    .still_authoritative_in_documents(documents)?
+            {
+                return Ok(false);
+            }
+            if let Some(owner_id) = saved.value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(
+                    documents, owner_id,
+                )?
+            {
+                return Ok(false);
+            }
+            let value = &saved.value;
+            db.entries.retain(|entry| {
+                let replaced = entry.id == value.metadata.id
+                    || (entry.tier == value.metadata.tier
+                        && entry.owner_id == value.metadata.owner_id
+                        && entry.fingerprint == value.metadata.fingerprint);
+                if replaced {
+                    journal.garbage.push(StagedCacheParts::published(entry));
+                }
+                !replaced
+            });
+            db.entries.insert(0, value.metadata.clone());
+            let evicted = persistent_eviction_ids(
+                &db.entries,
+                &value.metadata.id,
+                DEFAULT_PERSISTENT_CACHE_ENTRIES,
+                DEFAULT_PERSISTENT_CACHE_BYTES,
+            );
+            db.entries.retain(|entry| {
+                if evicted.contains(&entry.id) {
+                    journal.garbage.push(StagedCacheParts::published(entry));
+                    false
+                } else {
+                    true
+                }
+            });
+            journal.active = None;
+            documents.put_bytes(KV_CACHE_STAGING_NAMESPACE, &serde_json::to_vec(&journal)?)?;
+            Ok(true)
+        },
+    )?;
+    if !published {
+        return Ok(CheckpointAdvance::Obsolete);
+    }
+    eprintln!(
+        "Blessenger checkpoint: publication {} ms, largest part {} ms",
+        started.elapsed().as_millis(),
+        saved.max_part_ms
+    );
+    if !lease.promote(saved.value.clone())?
+        && !lease.current_for(saved.value.metadata.owner_id.as_deref())?
+    {
+        // Fence cache-clear/removal races without synchronously deleting GiB
+        // of parts. Reclamation belongs to the next admitted idle writer.
+        saved
+            .store
+            .mutate_documents(KV_CACHE_NAMESPACE, KvCacheDb::default, |db, documents| {
+                let mut journal = documents
+                    .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)?
+                    .unwrap_or_default();
+                db.entries.retain(|entry| {
+                    if entry.id == saved.value.metadata.id {
+                        journal.garbage.push(StagedCacheParts::published(entry));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                documents.put_bytes(KV_CACHE_STAGING_NAMESPACE, &serde_json::to_vec(&journal)?)?;
+                Ok(())
+            })?;
+        return Ok(CheckpointAdvance::Obsolete);
+    }
+    drop(lease);
+    // Reclaim the previous version while still idle, releasing storage between
+    // parts. Foreground preemption may leave it for the next idle save; quit
+    // never waits to drain this garbage.
+    if let Err(error) = reclaim_staged_cache_garbage(&saved.store, admitted)
+        && !error.is::<CachePersistencePreempted>()
+    {
+        eprintln!("Idle cache reclamation deferred after publication: {error:#}");
+    }
+    Ok(CheckpointAdvance::Published)
+}
+
+fn reclaim_staged_cache_garbage(store: &RuntimeStore, admitted: &dyn Fn() -> bool) -> Result<()> {
+    loop {
+        require_cache_persistence_admission(admitted)?;
+        let remains = store.mutate_documents_with_admission(
+            KV_CACHE_STAGING_NAMESPACE,
+            CacheStagingJournal::default,
+            || require_cache_persistence_admission(admitted),
+            |journal, documents| {
+                journal
+                    .garbage
+                    .retain(|parts| parts.deleted < parts.written);
+                let Some(parts) = journal.garbage.first_mut() else {
+                    return Ok(false);
+                };
+                anyhow::ensure!(
+                    parts.written <= MAX_PERSISTENT_ENTRY_BYTES.div_ceil(CACHE_BLOB_CHUNK_BYTES),
+                    "invalid staged cache part count"
+                );
+                documents.delete(&blob_chunk_namespace(&parts.id, parts.deleted));
+                parts.deleted += 1;
+                Ok(true)
+            },
+        )?;
+        if !remains {
+            return Ok(());
+        }
+    }
 }
 
 fn persistent_entry_fits(bytes: usize) -> bool {
@@ -3088,6 +3261,7 @@ mod tests {
     use llama_native_cache::ValidatedPrefixCacheValue;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn cancelled_startup_does_not_open_storage_or_admit_a_model() {
@@ -3160,6 +3334,246 @@ mod tests {
         value
     }
 
+    fn staged_checkpoint_fixture(
+        store: &RuntimeStore,
+        id: &str,
+        bytes: usize,
+    ) -> Result<SessionCheckpointProgress> {
+        use crate::conversation_store::{
+            Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind,
+        };
+        let conversation = Conversation {
+            id: "staged-conversation".into(),
+            title: "fixture".into(),
+            created_at: "fixture".into(),
+            updated_at: "fixture".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            recipient_ids: Vec::new(),
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
+            inference_window: None,
+        };
+        let mut db = ConversationDb::default();
+        db.conversations.push(conversation.clone());
+        store.put(crate::conversation_store::CONVERSATIONS_NAMESPACE, &db)?;
+        let mut value = authenticated_session_value(id);
+        value.metadata.owner_id = Some(conversation.id.clone());
+        let mut payload = value.sequence.bytes.as_ref().clone();
+        payload.resize(bytes.max(payload.len()), 7);
+        value.sequence.bytes = payload.into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        let captured_memory_generation = memory_generation(Some(&conversation.id))?;
+        Ok(SessionCheckpointProgress {
+            conversation_id: conversation.id.clone(),
+            request_id: id.into(),
+            store: store.clone(),
+            value,
+            authority: SessionConversationAuthority::from_conversation(&conversation)?,
+            memory_generation: captured_memory_generation,
+            next_chunk: 0,
+            registered: false,
+            max_part_ms: 0,
+            snapshot_ms: 0,
+            write_started: Instant::now(),
+        })
+    }
+
+    #[test]
+    fn staged_checkpoint_resumes_parts_and_atomically_publishes_after_preemption() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(directory.path(), [81; 32])?;
+        let previous = staged_checkpoint_fixture(&store, "old-complete", 128)?;
+        assert!(persist_value_to_store(
+            &store,
+            &previous.value,
+            8,
+            64 * 1024 * 1024
+        )?);
+        let mut next =
+            staged_checkpoint_fixture(&store, "new-staged", CACHE_BLOB_CHUNK_BYTES + 128)?;
+        let until_first_commit = || {
+            store
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
+                .unwrap()
+                .and_then(|journal| journal.active)
+                .is_none_or(|stage| stage.written == 0)
+        };
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &until_first_commit)?,
+            CheckpointAdvance::Deferred
+        ));
+        assert_eq!(
+            next.next_chunk, 1,
+            "first committed encrypted part must survive yielding"
+        );
+        let reopened = RuntimeStore::open_with_key(directory.path(), [81; 32])?;
+        let db = reopened.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        assert_eq!(db.entries.len(), 1);
+        assert_eq!(
+            db.entries[0].id, previous.value.metadata.id,
+            "partial state must never be advertised"
+        );
+        assert_eq!(
+            read_cache_bytes(&reopened, &previous.value.metadata)?,
+            Some(previous.value.sequence.bytes.as_ref().clone())
+        );
+        assert_eq!(
+            reopened
+                .get_bytes(&blob_chunk_namespace("new-staged", 0))?
+                .unwrap()
+                .len(),
+            CACHE_BLOB_CHUNK_BYTES
+        );
+        next.store = reopened.clone();
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &|| true)?,
+            CheckpointAdvance::Published
+        ));
+        assert_eq!(next.next_chunk, 2);
+        let db = reopened.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        assert_eq!(db.entries.len(), 1);
+        assert_eq!(db.entries[0].id, "new-staged");
+        assert_eq!(
+            read_cache_bytes(&reopened, &db.entries[0])?,
+            Some(next.value.sequence.bytes.as_ref().clone())
+        );
+        reclaim_staged_cache_garbage(&reopened, &|| true)?;
+        assert!(
+            reopened
+                .get_bytes(&blob_namespace("old-complete"))?
+                .is_none()
+        );
+        assert!(read_cache_bytes(&reopened, &db.entries[0])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn yielded_checkpoint_holds_no_publication_lock_and_clear_fences_it() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(directory.path(), [84; 32])?;
+        let mut next =
+            staged_checkpoint_fixture(&store, "clear-staged", CACHE_BLOB_CHUNK_BYTES + 128)?;
+        let until_first_commit = || {
+            store
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
+                .unwrap()
+                .and_then(|journal| journal.active)
+                .is_none_or(|stage| stage.written == 0)
+        };
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &until_first_commit)?,
+            CheckpointAdvance::Deferred
+        ));
+        let foreground =
+            crate::personas::try_acquire_persona_cache_owner_lease(&store, &next.conversation_id)?;
+        assert!(
+            foreground.is_some(),
+            "yielded cache must not hold a lock needed by foreground work"
+        );
+        drop(foreground);
+        clear_checkpoint_store(&store)?;
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &|| true)?,
+            CheckpointAdvance::Obsolete
+        ));
+        assert!(
+            store
+                .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        reclaim_staged_cache_garbage(&store, &|| true)?;
+        assert!(store.get_bytes(&blob_namespace("clear-staged"))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_staging_is_fenced_and_reclaimed_without_replacing_a_complete_cache() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(directory.path(), [82; 32])?;
+        let previous = staged_checkpoint_fixture(&store, "durable", 128)?;
+        assert!(persist_value_to_store(
+            &store,
+            &previous.value,
+            8,
+            64 * 1024 * 1024
+        )?);
+        let mut interrupted =
+            staged_checkpoint_fixture(&store, "abandoned", CACHE_BLOB_CHUNK_BYTES + 128)?;
+        let until_first_commit = || {
+            store
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
+                .unwrap()
+                .and_then(|journal| journal.active)
+                .is_none_or(|stage| stage.written == 0)
+        };
+        assert!(matches!(
+            advance_session_checkpoint(&mut interrupted, &until_first_commit)?,
+            CheckpointAdvance::Deferred
+        ));
+        let mut replacement = staged_checkpoint_fixture(&store, "replacement", 128)?;
+        assert!(matches!(
+            advance_session_checkpoint(&mut replacement, &|| true)?,
+            CheckpointAdvance::Published
+        ));
+        assert!(store.get_bytes(&blob_namespace("abandoned"))?.is_none());
+        assert!(matches!(
+            advance_session_checkpoint(&mut interrupted, &|| true)?,
+            CheckpointAdvance::Obsolete
+        ));
+        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        assert_eq!(db.entries[0].id, "replacement");
+        assert!(read_cache_bytes(&store, &db.entries[0])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_checkpoint_rechecks_conversation_authority_at_publication() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(directory.path(), [83; 32])?;
+        let previous = staged_checkpoint_fixture(&store, "durable-authority", 128)?;
+        assert!(persist_value_to_store(
+            &store,
+            &previous.value,
+            8,
+            64 * 1024 * 1024
+        )?);
+        let mut next =
+            staged_checkpoint_fixture(&store, "stale-source", CACHE_BLOB_CHUNK_BYTES + 128)?;
+        let until_first_commit = || {
+            store
+                .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
+                .unwrap()
+                .and_then(|journal| journal.active)
+                .is_none_or(|stage| stage.written == 0)
+        };
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &until_first_commit)?,
+            CheckpointAdvance::Deferred
+        ));
+        store.put(
+            crate::conversation_store::CONVERSATIONS_NAMESPACE,
+            &crate::conversation_store::ConversationDb::default(),
+        )?;
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &|| true)?,
+            CheckpointAdvance::Obsolete
+        ));
+        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        assert_eq!(db.entries[0].id, "durable-authority");
+        assert!(read_cache_bytes(&store, &db.entries[0])?.is_some());
+        Ok(())
+    }
+
     #[test]
     fn session_checkpoint_selection_is_latest_ready_exact_owner_and_profile() {
         let base = test_cache_value("base", "model-a").metadata;
@@ -3210,24 +3624,6 @@ mod tests {
             .push(0);
         assert!(!same_cache_authority(&metadata, &changed_reconstruction));
         assert!(same_cache_authority(&metadata, &metadata.clone()));
-    }
-
-    #[test]
-    fn pre_chat_checkpoint_candidates_exclude_only_the_incoming_conversation() {
-        let requests = HashMap::from([
-            ("incoming".to_owned(), "request-a".to_owned()),
-            ("older-one".to_owned(), "request-b".to_owned()),
-            ("older-two".to_owned(), "request-c".to_owned()),
-        ]);
-        let candidates = pending_session_checkpoint_candidates(&requests, Some("incoming"));
-        assert_eq!(candidates.len(), 2);
-        assert!(candidates.contains(&("older-one".to_owned(), "request-b".to_owned())));
-        assert!(candidates.contains(&("older-two".to_owned(), "request-c".to_owned())));
-        assert!(
-            !candidates
-                .iter()
-                .any(|(conversation_id, _)| conversation_id == "incoming")
-        );
     }
 
     #[test]

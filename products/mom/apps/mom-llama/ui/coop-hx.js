@@ -2963,7 +2963,7 @@
       void invoke("mom_llama_kv_cache_checkpoint_voice_session", { conversation })
         .catch((error) => console.warn("voice session checkpoint unavailable", error));
     }
-    void recoverPendingVoiceHistory().catch(() => {});
+    scheduleVoiceHistoryRecovery();
   };
 
   const setText = (id, value) => {
@@ -3416,7 +3416,7 @@
             switchToPaintMs: paintedAt - startedAt,
           },
         }).catch(() => {});
-        void recoverPendingVoiceHistory().catch(() => {});
+        scheduleVoiceHistoryRecovery();
       }));
     }
     // Sidebar and settings carry secondary state. Refresh them after the chat
@@ -7490,7 +7490,10 @@
       if (callJob) callJob.committed = true;
       return true;
     })().finally(() => {
-      if (idleJob) idleVoiceTranscriptJobs.delete(idleJob);
+      if (idleJob) {
+        idleVoiceTranscriptJobs.delete(idleJob);
+        scheduleVoiceHistoryRecovery();
+      }
     });
     if (idleJob) idleJob.task = task;
     void task.then((committed) => {
@@ -7594,6 +7597,16 @@
   let voiceHistoryRecoveryStage = "idle";
   let voiceHistoryRecoveryColdInitialization = false;
   let voiceHistoryRecoverySuspensions = 0;
+  let scheduleVoiceHistoryRecovery = () => {};
+  let cancelVoiceHistoryRecoverySchedule = () => {};
+  const voiceHistoryRecoveryRetries = new Map();
+  const voiceHistoryRetryKey = (conversation, message, attachment) =>
+    `${conversation}\u0000${message}\u0000${attachment}`;
+  const deferVoiceHistoryRetry = (key) => {
+    const attempt = (voiceHistoryRecoveryRetries.get(key)?.attempt || 0) + 1;
+    const delayMs = Math.min(60_000 * (2 ** Math.min(attempt - 1, 5)), 30 * 60_000);
+    voiceHistoryRecoveryRetries.set(key, { attempt, retryAt: Date.now() + delayMs });
+  };
   const canContinueVoiceHistoryRecovery = () => globalThis.MomVoicePipelineScheduler.canContinueVoiceHistoryRecovery({
     suspended: voiceHistoryRecoverySuspensions > 0,
     foregroundDispatch: activeDispatchConversation !== null,
@@ -7603,17 +7616,18 @@
   });
   const recoverPendingVoiceHistory = () => {
     if (!canContinueVoiceHistoryRecovery()) return Promise.resolve();
-    // Selection or call teardown can arrive while an earlier conversation is
-    // still being examined. Revisit the current selection after that pass;
-    // otherwise its recordings can remain forever on the slow media path.
+    // An earlier pass may have used an older conversation snapshot. Revisit
+    // the saved histories after it settles so newly committed turns are seen.
     if (voiceHistoryRecovery) return voiceHistoryRecovery.then(() => recoverPendingVoiceHistory());
+    const unresolvedRetryKeys = new Set();
+    let scanComplete = false;
     voiceHistoryRecovery = (async () => {
       voiceHistoryRecoveryStage = "listing";
       const listed = await invoke("mom_llama_conversation_list");
       if (!canContinueVoiceHistoryRecovery()) return;
       if (listed?.status === "blocked" || !Array.isArray(listed?.result)) return;
-      const selected = selectedConversation();
-      for (const conversation of listed.result.filter((item) => item.id === selected)) {
+      for (const conversation of listed.result) {
+        if (!conversation?.id) continue;
         const messages = new Map((conversation.messages || []).map((message) => [message.id, message]));
         const active = [];
         const seen = new Set();
@@ -7633,6 +7647,9 @@
           // holds generation or the microphone on Parakeet.
           if (voiceCallActive || voiceCallPreparing || voiceRecording) return;
           const attachment = message.attachment_ids[0];
+          const retryKey = voiceHistoryRetryKey(conversation.id, message.id, attachment);
+          unresolvedRetryKeys.add(retryKey);
+          if ((voiceHistoryRecoveryRetries.get(retryKey)?.retryAt || 0) > Date.now()) continue;
           try {
             voiceHistoryRecoveryStage = "metadata";
             markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_started", {
@@ -7643,6 +7660,7 @@
             }));
             if (!canContinueVoiceHistoryRecovery()) return;
             if (catalog.primary?.kind !== "audio") {
+              unresolvedRetryKeys.delete(retryKey);
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id, reason: "not_audio",
               });
@@ -7667,6 +7685,7 @@
             }
             if (!canContinueVoiceHistoryRecovery()) return;
             if (transcribed?.status === "blocked" || !transcribed?.result?.transcript?.trim()) {
+              deferVoiceHistoryRetry(retryKey);
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id,
                 reason: transcribed?.blocker?.code || "empty_transcript",
@@ -7683,16 +7702,19 @@
             });
             if (!canContinueVoiceHistoryRecovery()) return;
             if (recorded?.status === "blocked" || !recorded?.result) {
+              deferVoiceHistoryRetry(retryKey);
               markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_skipped", {
                 message: message.id,
                 reason: recorded?.blocker?.code || "record_failed",
               });
               continue;
             }
+            voiceHistoryRecoveryRetries.delete(retryKey);
             markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_finished", {
               message: message.id,
             });
           } catch (error) {
+            deferVoiceHistoryRetry(retryKey);
             markVoiceLatencyIn(voiceLatencyTrace, "voice_history_recovery_failed", {
               message: message.id, reason: errorMessage(error),
             });
@@ -7701,16 +7723,40 @@
           }
         }
       }
+      scanComplete = true;
     })().finally(() => {
       voiceHistoryRecovery = null;
       voiceHistoryRecoveryOperation = null;
       voiceHistoryRecoveryStage = "idle";
       voiceHistoryRecoveryColdInitialization = false;
+      // Prune stale cooldowns only after every active history branch was read.
+      // An interrupted or failed pass cannot prove that a recording disappeared.
+      if (scanComplete) {
+        for (const key of voiceHistoryRecoveryRetries.keys()) {
+          if (!unresolvedRetryKeys.has(key)) voiceHistoryRecoveryRetries.delete(key);
+        }
+      }
+      if (canContinueVoiceHistoryRecovery()) {
+        if (!scanComplete) {
+          scheduleVoiceHistoryRecovery(15_000);
+        } else {
+          const retryAt = Math.min(...[...voiceHistoryRecoveryRetries.values()].map((entry) => entry.retryAt));
+          if (Number.isFinite(retryAt)) scheduleVoiceHistoryRecovery(Math.max(0, retryAt - Date.now()));
+        }
+      }
     });
     return voiceHistoryRecovery;
   };
 
+  const idleVoiceHistoryScheduler = globalThis.MomVoicePipelineScheduler.createIdleVoiceHistoryScheduler({
+    run: () => recoverPendingVoiceHistory(),
+    onError: (error) => console.warn("Voice history recovery unavailable", errorMessage(error)),
+  });
+  scheduleVoiceHistoryRecovery = (delayMs) => idleVoiceHistoryScheduler.schedule(delayMs);
+  cancelVoiceHistoryRecoverySchedule = () => idleVoiceHistoryScheduler.cancel();
+
   const suspendVoiceHistoryRecoveryForForeground = async (reason) => {
+    cancelVoiceHistoryRecoverySchedule();
     voiceHistoryRecoverySuspensions += 1;
     try {
       const idleJobs = [...idleVoiceTranscriptJobs];
@@ -7745,6 +7791,9 @@
       }
     } catch (error) {
       voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
+      if (voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
+        scheduleVoiceHistoryRecovery();
+      }
       throw error;
     }
     let released = false;
@@ -7752,8 +7801,8 @@
       if (released) return;
       released = true;
       voiceHistoryRecoverySuspensions = Math.max(0, voiceHistoryRecoverySuspensions - 1);
-      if (resume && voiceHistoryRecoverySuspensions === 0 && canContinueVoiceHistoryRecovery()) {
-        void recoverPendingVoiceHistory().catch(() => {});
+      if (resume && voiceHistoryRecoverySuspensions === 0) {
+        scheduleVoiceHistoryRecovery();
       }
     };
   };
@@ -7777,7 +7826,7 @@
     // Keep the gesture responsive, but do not restart archival compute until
     // the cancelled model owner has acknowledged the stop.
     void Promise.resolve(cancelled).then(() => {
-      if (!recording.call) void recoverPendingVoiceHistory().catch(() => {});
+      if (!recording.call) scheduleVoiceHistoryRecovery();
     }, (error) => {
       markVoiceLatencyIn(recording.trace, "voice_capture_prefill_abort_failed", {
         message: errorMessage(error),
@@ -8994,7 +9043,7 @@
       }
       if (activeVoiceSpeculation === speculation) activeVoiceSpeculation = null;
       if (!recording.call && stillOwnsDispatch) {
-        void recoverPendingVoiceHistory().catch(() => {});
+        scheduleVoiceHistoryRecovery();
       }
     }
   };
@@ -11735,7 +11784,7 @@
         // Recovery is opportunistic and has no place on the call admission
         // critical path. The installed CPU listener can work while Gemma is
         // resident; a failed turn keeps its exact WAV for a later retry.
-        void runtimeWarmPromise.then(() => recoverPendingVoiceHistory()).catch((error) => {
+        void runtimeWarmPromise.then(() => scheduleVoiceHistoryRecovery()).catch((error) => {
           console.warn("Voice history recovery unavailable", errorMessage(error));
         });
       } catch (error) {
