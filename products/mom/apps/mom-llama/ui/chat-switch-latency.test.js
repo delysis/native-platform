@@ -123,6 +123,7 @@ test("conversation settings refresh stays idle while hidden and refreshes when v
   settings.hidden = false;
   await context.refreshConversationSettingsProjection();
   assert.equal(refreshed, 1);
+  assert.equal(oldInstructions.hidden, true, "stale instructions cannot be edited during refresh");
   assert.equal(oldInstructions.replacedWith, projectedInstructions);
   assert.equal(settings.dataset.currentConversation, currentConversation);
 });

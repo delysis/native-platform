@@ -2142,6 +2142,8 @@
   const refreshConversationSettingsProjection = async () => {
     const settings = document.getElementById("settings-sidebar");
     if (settings && !settings.hidden && settings.dataset.currentConversation !== selectedConversation()) {
+      const previousInstructions = settings.querySelector(".current-chat-settings");
+      if (previousInstructions) previousInstructions.hidden = true;
       const projection = parseFragment(await invokeMarkup("mom_llama_render_settings_fragment"));
       const instructions = projection?.querySelector(".current-chat-settings");
       if (instructions && settings === document.getElementById("settings-sidebar")
@@ -2339,6 +2341,7 @@
     switchSettingsSection(section);
     sizeComposer();
     modal.querySelector(".section-tab.active")?.focus();
+    void refreshConversationSettingsProjection().catch(reportError);
   };
 
   const closeSettings = () => {
@@ -9785,7 +9788,6 @@
       await invoke("mom_llama_settings_get");
       if (document.getElementById("settings-sidebar")?.hidden) {
         openSettings();
-        await refreshConversationSettingsProjection();
       } else closeSettings();
     },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
