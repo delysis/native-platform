@@ -330,10 +330,7 @@ impl OperationScope {
         if self.0.parent.is_some() {
             anyhow::bail!("only the root operation scope may join session checkpoints");
         }
-        self.0
-            .session_checkpoints
-            .join()
-            .map_err(anyhow::Error::from)
+        self.0.session_checkpoints.join()
     }
 
     pub(crate) fn note_committed_session_request(
@@ -1089,38 +1086,48 @@ mod tests {
             .expect("record second conversation");
 
         assert_eq!(
-            first.committed_session_request("conversation-a").unwrap(),
+            first
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
             Some("request-new".to_owned())
         );
         assert_eq!(
-            first.committed_session_requests().unwrap(),
+            first
+                .committed_session_requests()
+                .expect("runtime request registry should be available"),
             vec![
                 ("conversation-a".to_owned(), "request-new".to_owned()),
                 ("conversation-b".to_owned(), "request-b".to_owned()),
             ]
         );
         assert_eq!(
-            second.committed_session_request("conversation-a").unwrap(),
+            second
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
             None,
             "a separate runtime must not inherit another runtime's authority"
         );
         assert!(
             !first
                 .retire_committed_session_request("conversation-a", "request-old")
-                .unwrap(),
+                .expect("runtime request registry should be available"),
             "a stale worker must not retire the newer request"
         );
         assert!(
             first_child
                 .retire_committed_session_request("conversation-a", "request-new")
-                .unwrap()
+                .expect("runtime request registry should be available")
         );
         assert_eq!(
-            first.committed_session_request("conversation-a").unwrap(),
+            first
+                .committed_session_request("conversation-a")
+                .expect("runtime request registry should be available"),
             None
         );
         assert_eq!(
-            second.committed_session_requests().unwrap(),
+            second
+                .committed_session_requests()
+                .expect("runtime request registry should be available"),
             Vec::<(String, String)>::new()
         );
     }

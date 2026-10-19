@@ -465,10 +465,10 @@ pub(crate) fn schedule_committed_session_checkpoint(
     conversation_id: &str,
     request_id: &str,
 ) {
-    if let Err(error) = scope.schedule_session_checkpoint(conversation_id, request_id) {
-        if !scope.cancellation_requested() {
-            eprintln!("Unable to schedule idle checkpoint: {error:#}");
-        }
+    if let Err(error) = scope.schedule_session_checkpoint(conversation_id, request_id)
+        && !scope.cancellation_requested()
+    {
+        eprintln!("Unable to schedule idle checkpoint: {error:#}");
     }
 }
 
@@ -1855,7 +1855,7 @@ fn capture_session_checkpoint(
         }
         let Some(state) = handle
             .snapshot_conversation_for_request_if_idle(
-                &request_id,
+                request_id,
                 MAX_PERSISTENT_ENTRY_BYTES,
                 foreground_waiters,
             )
@@ -3445,7 +3445,7 @@ mod tests {
         let until_first_commit = || {
             store
                 .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
@@ -3458,7 +3458,9 @@ mod tests {
             "first committed encrypted part must survive yielding"
         );
         let reopened = RuntimeStore::open_with_key(directory.path(), [81; 32])?;
-        let db = reopened.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        let db = reopened
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("staged checkpoint test storage should be present");
         assert_eq!(db.entries.len(), 1);
         assert_eq!(
             db.entries[0].id, previous.value.metadata.id,
@@ -3471,7 +3473,7 @@ mod tests {
         assert_eq!(
             reopened
                 .get_bytes(&blob_chunk_namespace("new-staged", 0))?
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .len(),
             CACHE_BLOB_CHUNK_BYTES
         );
@@ -3481,7 +3483,9 @@ mod tests {
             CheckpointAdvance::Published
         ));
         assert_eq!(next.next_chunk, 2);
-        let db = reopened.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        let db = reopened
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("staged checkpoint test storage should be present");
         assert_eq!(db.entries.len(), 1);
         assert_eq!(db.entries[0].id, "new-staged");
         assert_eq!(
@@ -3510,7 +3514,7 @@ mod tests {
         let until_first_commit = || {
             store
                 .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
@@ -3532,7 +3536,7 @@ mod tests {
         assert!(
             store
                 .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .entries
                 .is_empty()
         );
@@ -3561,7 +3565,7 @@ mod tests {
         let until_first_commit = || {
             store
                 .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
@@ -3579,7 +3583,9 @@ mod tests {
             advance_staged_checkpoint_after_lease_contention(&mut interrupted, &|| true)?,
             CheckpointAdvance::Obsolete
         ));
-        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        let db = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("staged checkpoint test storage should be present");
         assert_eq!(db.entries[0].id, "replacement");
         assert!(read_cache_bytes(&store, &db.entries[0])?.is_some());
         Ok(())
@@ -3604,7 +3610,7 @@ mod tests {
         let until_first_commit = || {
             store
                 .get::<CacheStagingJournal>(KV_CACHE_STAGING_NAMESPACE)
-                .unwrap()
+                .expect("staged checkpoint test storage should be present")
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
@@ -3620,7 +3626,9 @@ mod tests {
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Obsolete
         ));
-        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        let db = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("staged checkpoint test storage should be present");
         assert_eq!(db.entries[0].id, "durable-authority");
         assert!(read_cache_bytes(&store, &db.entries[0])?.is_some());
         Ok(())
@@ -3647,7 +3655,9 @@ mod tests {
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Published
         ));
-        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        let db = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .expect("staged checkpoint test storage should be present");
         assert_eq!(db.entries[0].id, "lease-contention");
         Ok(())
     }
