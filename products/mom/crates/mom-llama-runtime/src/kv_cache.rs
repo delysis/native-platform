@@ -2390,7 +2390,7 @@ impl StagedCacheParts {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum CheckpointAdvance {
     Published,
     Deferred,
@@ -3266,7 +3266,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    static STAGED_CHECKPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static GLOBAL_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cancelled_startup_does_not_open_storage_or_admit_a_model() {
@@ -3428,7 +3428,7 @@ mod tests {
 
     #[test]
     fn staged_checkpoint_resumes_parts_and_atomically_publishes_after_preemption() -> Result<()> {
-        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+        let _serial = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
@@ -3449,10 +3449,10 @@ mod tests {
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
-        assert!(matches!(
+        assert_eq!(
             advance_session_checkpoint(&mut next, &until_first_commit)?,
             CheckpointAdvance::Deferred
-        ));
+        );
         assert_eq!(
             next.next_chunk, 1,
             "first committed encrypted part must survive yielding"
@@ -3478,10 +3478,10 @@ mod tests {
             CACHE_BLOB_CHUNK_BYTES
         );
         next.store = reopened.clone();
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Published
-        ));
+        );
         assert_eq!(next.next_chunk, 2);
         let db = reopened
             .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
@@ -3504,7 +3504,7 @@ mod tests {
 
     #[test]
     fn yielded_checkpoint_holds_no_publication_lock_and_clear_fences_it() -> Result<()> {
-        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+        let _serial = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
@@ -3518,10 +3518,10 @@ mod tests {
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
-        assert!(matches!(
+        assert_eq!(
             advance_session_checkpoint(&mut next, &until_first_commit)?,
             CheckpointAdvance::Deferred
-        ));
+        );
         let foreground = try_persona_cache_lease_after_contention(&store, &next.conversation_id)?;
         assert!(
             foreground.is_some(),
@@ -3529,10 +3529,10 @@ mod tests {
         );
         drop(foreground);
         clear_checkpoint_store(&store)?;
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Obsolete
-        ));
+        );
         assert!(
             store
                 .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
@@ -3548,7 +3548,7 @@ mod tests {
     #[test]
     fn abandoned_staging_is_fenced_and_reclaimed_without_replacing_a_complete_cache() -> Result<()>
     {
-        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+        let _serial = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
@@ -3569,20 +3569,20 @@ mod tests {
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
-        assert!(matches!(
+        assert_eq!(
             advance_session_checkpoint(&mut interrupted, &until_first_commit)?,
             CheckpointAdvance::Deferred
-        ));
+        );
         let mut replacement = staged_checkpoint_fixture(&store, "replacement", 128)?;
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut replacement, &|| true)?,
             CheckpointAdvance::Published
-        ));
+        );
         assert!(store.get_bytes(&blob_namespace("abandoned"))?.is_none());
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut interrupted, &|| true)?,
             CheckpointAdvance::Obsolete
-        ));
+        );
         let db = store
             .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
             .expect("staged checkpoint test storage should be present");
@@ -3593,7 +3593,7 @@ mod tests {
 
     #[test]
     fn staged_checkpoint_rechecks_conversation_authority_at_publication() -> Result<()> {
-        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+        let _serial = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
@@ -3614,18 +3614,18 @@ mod tests {
                 .and_then(|journal| journal.active)
                 .is_none_or(|stage| stage.written == 0)
         };
-        assert!(matches!(
+        assert_eq!(
             advance_session_checkpoint(&mut next, &until_first_commit)?,
             CheckpointAdvance::Deferred
-        ));
+        );
         store.put(
             crate::conversation_store::CONVERSATIONS_NAMESPACE,
             &crate::conversation_store::ConversationDb::default(),
         )?;
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Obsolete
-        ));
+        );
         let db = store
             .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
             .expect("staged checkpoint test storage should be present");
@@ -3636,7 +3636,7 @@ mod tests {
 
     #[test]
     fn staged_checkpoint_defers_while_persona_authority_is_held() -> Result<()> {
-        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+        let _serial = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
@@ -3646,15 +3646,15 @@ mod tests {
         let held =
             crate::personas::acquire_persona_cache_owner_lease(&store, &next.conversation_id)?
                 .expect("active Persona cache owner lease");
-        assert!(matches!(
+        assert_eq!(
             advance_session_checkpoint(&mut next, &|| true)?,
             CheckpointAdvance::Deferred
-        ));
+        );
         drop(held);
-        assert!(matches!(
+        assert_eq!(
             advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Published
-        ));
+        );
         let db = store
             .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
             .expect("staged checkpoint test storage should be present");
@@ -3980,6 +3980,9 @@ mod tests {
 
     #[test]
     fn memory_cache_budget_is_global_across_model_fingerprints() {
+        let _serial = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .expect("serialize global cache mutations");
         let mut state = memory_cache().lock().expect("memory cache lock");
         state.clear();
         let values = [
