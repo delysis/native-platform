@@ -1715,8 +1715,8 @@ test("voice latency exposes resumed-speech checkpoint and replay cost", () => {
 
 test("a hydrated voice reply keeps its portrait and player in one row", () => {
   assert.ok(bridge.includes("article.prepend(speakerAvatar);"));
-  assert.match(styles, /\.message-row\.voice-reply-row\.voice-reply-has-audio\s*> \.message-speaker-avatar/);
-  assert.match(styles, /\.message-row\.voice-reply-row\.voice-reply-has-audio\s*> \.message-card/);
+  assert.match(styles, /\.message-row\.voice-reply-row\s*> \.message-speaker-avatar/);
+  assert.match(styles, /\.message-row\.voice-reply-row\s*> \.message-card/);
   assert.match(
     styles,
     /\.message-row\.assistant \.message-card:has\(> \.voice-message-player\)[\s\S]*background: transparent/,

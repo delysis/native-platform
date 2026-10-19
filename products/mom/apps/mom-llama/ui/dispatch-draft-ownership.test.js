@@ -1712,7 +1712,7 @@ test("voice replies keep typing chrome until a durable voice note is complete", 
   vm.runInContext(`${source.slice(voiceStart, voiceEnd)}\nthis.makeVoiceReply = appendLiveVoiceReply;`, voiceCardContext);
   voiceCardContext.makeVoiceReply("live-mention-i-p");
   assert.deepEqual(rowClasses, ["voice-reply-row", "voice-reply-pending"]);
-  assert.equal(pendingAvatarRemoved, true, "pending voice replies must not expose an orphaned portrait");
+  assert.equal(pendingAvatarRemoved, false, "the speaker stays visible beside the pending voice bubble");
   assert.notEqual(row.hidden, true);
 
   const pendingStart = source.indexOf("  const pendingVoiceReply =");

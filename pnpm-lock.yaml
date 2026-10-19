@@ -93,6 +93,9 @@ importers:
       '@tauri-apps/cli':
         specifier: 2.11.4
         version: 2.11.4
+      playwright:
+        specifier: 1.62.1
+        version: 1.62.1
 
 packages:
 
