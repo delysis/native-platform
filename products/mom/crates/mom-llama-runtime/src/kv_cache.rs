@@ -2390,6 +2390,7 @@ impl StagedCacheParts {
     }
 }
 
+#[derive(Debug)]
 enum CheckpointAdvance {
     Published,
     Deferred,
@@ -3265,6 +3266,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    static STAGED_CHECKPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn cancelled_startup_does_not_open_storage_or_admit_a_model() {
         let scope = crate::OperationScope::detached();
@@ -3387,8 +3390,47 @@ mod tests {
         })
     }
 
+    fn advance_staged_checkpoint_after_lease_contention(
+        saved: &mut SessionCheckpointProgress,
+        admitted: &dyn Fn() -> bool,
+    ) -> Result<CheckpointAdvance> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = advance_session_checkpoint(saved, admitted)?;
+            if !matches!(result, CheckpointAdvance::Deferred) {
+                return Ok(result);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "checkpoint publication lease remained unavailable"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn try_persona_cache_lease_after_contention(
+        store: &RuntimeStore,
+        owner_id: &str,
+    ) -> Result<Option<crate::personas::PersonaCacheOwnerLease>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(lease) =
+                crate::personas::try_acquire_persona_cache_owner_lease(store, owner_id)?
+            {
+                return Ok(Some(lease));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn staged_checkpoint_resumes_parts_and_atomically_publishes_after_preemption() -> Result<()> {
+        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+            .lock()
+            .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
         let store = RuntimeStore::open_with_key(directory.path(), [81; 32])?;
         let previous = staged_checkpoint_fixture(&store, "old-complete", 128)?;
@@ -3435,7 +3477,7 @@ mod tests {
         );
         next.store = reopened.clone();
         assert!(matches!(
-            advance_session_checkpoint(&mut next, &|| true)?,
+            advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Published
         ));
         assert_eq!(next.next_chunk, 2);
@@ -3458,6 +3500,9 @@ mod tests {
 
     #[test]
     fn yielded_checkpoint_holds_no_publication_lock_and_clear_fences_it() -> Result<()> {
+        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+            .lock()
+            .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
         let store = RuntimeStore::open_with_key(directory.path(), [84; 32])?;
         let mut next =
@@ -3473,8 +3518,7 @@ mod tests {
             advance_session_checkpoint(&mut next, &until_first_commit)?,
             CheckpointAdvance::Deferred
         ));
-        let foreground =
-            crate::personas::try_acquire_persona_cache_owner_lease(&store, &next.conversation_id)?;
+        let foreground = try_persona_cache_lease_after_contention(&store, &next.conversation_id)?;
         assert!(
             foreground.is_some(),
             "yielded cache must not hold a lock needed by foreground work"
@@ -3482,7 +3526,7 @@ mod tests {
         drop(foreground);
         clear_checkpoint_store(&store)?;
         assert!(matches!(
-            advance_session_checkpoint(&mut next, &|| true)?,
+            advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Obsolete
         ));
         assert!(
@@ -3500,6 +3544,9 @@ mod tests {
     #[test]
     fn abandoned_staging_is_fenced_and_reclaimed_without_replacing_a_complete_cache() -> Result<()>
     {
+        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+            .lock()
+            .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
         let store = RuntimeStore::open_with_key(directory.path(), [82; 32])?;
         let previous = staged_checkpoint_fixture(&store, "durable", 128)?;
@@ -3524,12 +3571,12 @@ mod tests {
         ));
         let mut replacement = staged_checkpoint_fixture(&store, "replacement", 128)?;
         assert!(matches!(
-            advance_session_checkpoint(&mut replacement, &|| true)?,
+            advance_staged_checkpoint_after_lease_contention(&mut replacement, &|| true)?,
             CheckpointAdvance::Published
         ));
         assert!(store.get_bytes(&blob_namespace("abandoned"))?.is_none());
         assert!(matches!(
-            advance_session_checkpoint(&mut interrupted, &|| true)?,
+            advance_staged_checkpoint_after_lease_contention(&mut interrupted, &|| true)?,
             CheckpointAdvance::Obsolete
         ));
         let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
@@ -3540,6 +3587,9 @@ mod tests {
 
     #[test]
     fn staged_checkpoint_rechecks_conversation_authority_at_publication() -> Result<()> {
+        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+            .lock()
+            .expect("serialize staged checkpoint cache generation");
         let directory = tempfile::tempdir()?;
         let store = RuntimeStore::open_with_key(directory.path(), [83; 32])?;
         let previous = staged_checkpoint_fixture(&store, "durable-authority", 128)?;
@@ -3567,12 +3617,38 @@ mod tests {
             &crate::conversation_store::ConversationDb::default(),
         )?;
         assert!(matches!(
-            advance_session_checkpoint(&mut next, &|| true)?,
+            advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
             CheckpointAdvance::Obsolete
         ));
         let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
         assert_eq!(db.entries[0].id, "durable-authority");
         assert!(read_cache_bytes(&store, &db.entries[0])?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_checkpoint_defers_while_persona_authority_is_held() -> Result<()> {
+        let _serial = STAGED_CHECKPOINT_TEST_LOCK
+            .lock()
+            .expect("serialize staged checkpoint cache generation");
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open_with_key(directory.path(), [85; 32])?;
+        let mut next =
+            staged_checkpoint_fixture(&store, "lease-contention", CACHE_BLOB_CHUNK_BYTES + 128)?;
+        let held =
+            crate::personas::acquire_persona_cache_owner_lease(&store, &next.conversation_id)?
+                .expect("active Persona cache owner lease");
+        assert!(matches!(
+            advance_session_checkpoint(&mut next, &|| true)?,
+            CheckpointAdvance::Deferred
+        ));
+        drop(held);
+        assert!(matches!(
+            advance_staged_checkpoint_after_lease_contention(&mut next, &|| true)?,
+            CheckpointAdvance::Published
+        ));
+        let db = store.get::<KvCacheDb>(KV_CACHE_NAMESPACE)?.unwrap();
+        assert_eq!(db.entries[0].id, "lease-contention");
         Ok(())
     }
 
