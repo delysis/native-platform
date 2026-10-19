@@ -285,6 +285,59 @@ fn worker_loop(state: Arc<WorkerState>) {
             progress_conversation = Some(due.conversation_id.clone());
         }
         finish_due(&state, due, completed, retry_after, error);
+        refill_pending_from_registry(&state);
+    }
+}
+
+/// Fill newly available bounded queue slots from committed runtime state.
+/// Scope ownership is released before locking scheduler state so a last-owner
+/// drop can never happen while holding the pending mutex.
+fn refill_pending_from_registry(state: &WorkerState) {
+    let Some(scope) = state.weak_scope.upgrade() else {
+        return;
+    };
+    if scope.cancellation_requested() {
+        return;
+    }
+    let Ok(requests) = scope.committed_session_requests() else {
+        return;
+    };
+    drop(scope);
+
+    let Ok(mut pending) = state.pending.lock() else {
+        return;
+    };
+    if pending.stopped {
+        return;
+    }
+    let mut available = MAX_PENDING_CONVERSATIONS
+        .saturating_sub(pending.entries.len() + usize::from(pending.in_flight.is_some()));
+    if available == 0 {
+        return;
+    }
+    let mut inserted = false;
+    for (conversation_id, request_id) in requests {
+        if pending.entries.contains_key(&conversation_id)
+            || pending.in_flight.as_deref() == Some(conversation_id.as_str())
+        {
+            continue;
+        }
+        pending.entries.insert(
+            conversation_id,
+            PendingCheckpoint {
+                request_id,
+                deadline: Instant::now(),
+                failures: 0,
+            },
+        );
+        inserted = true;
+        available -= 1;
+        if available == 0 {
+            break;
+        }
+    }
+    if inserted {
+        state.wake.notify_one();
     }
 }
 
@@ -396,7 +449,7 @@ fn error_backoff(failures: u8) -> Duration {
 mod tests {
     use super::{
         DueCheckpoint, PendingCheckpoint, PendingState, SessionCheckpointScheduler, WorkerState,
-        error_backoff, finish_due, take_due,
+        error_backoff, finish_due, refill_pending_from_registry, take_due,
     };
     use crate::OperationScope;
     use std::sync::{Arc, Mutex, mpsc};
@@ -418,7 +471,92 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("worker invoked");
         root.request_cancellation();
-        root.join_session_checkpoints().expect("join");
+        scheduler.stop();
+        scheduler.join().expect("join test scheduler");
+    }
+
+    #[test]
+    fn worker_refills_overflow_from_committed_requests_and_never_after_stop() {
+        const REQUESTS: usize = 70;
+        let root = OperationScope::detached();
+        for index in 0..REQUESTS {
+            root.note_committed_session_request(
+                &format!("conversation-{index:03}"),
+                &format!("request-{index:03}"),
+            )
+            .expect("register committed request");
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let scheduler = SessionCheckpointScheduler::with_runner(
+            root.downgrade(),
+            move |scope, conversation, request, _| {
+                if conversation == "conversation-000" {
+                    started_tx.send(()).expect("report first attempt");
+                    release_rx
+                        .lock()
+                        .expect("release receiver")
+                        .recv()
+                        .expect("release first attempt");
+                }
+                scope
+                    .retire_committed_session_request(conversation, request)
+                    .expect("retire completed request");
+                finished_tx
+                    .send(conversation.to_owned())
+                    .expect("report completion");
+                Ok(true)
+            },
+        );
+
+        scheduler
+            .schedule_after("conversation-000", "request-000", Duration::ZERO)
+            .expect("schedule first request");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first request is in flight");
+        for index in 1..64 {
+            scheduler
+                .schedule_after(
+                    &format!("conversation-{index:03}"),
+                    &format!("request-{index:03}"),
+                    Duration::ZERO,
+                )
+                .expect("fill bounded queue");
+        }
+        for index in 64..REQUESTS {
+            assert!(
+                scheduler
+                    .schedule_after(
+                        &format!("conversation-{index:03}"),
+                        &format!("request-{index:03}"),
+                        Duration::ZERO,
+                    )
+                    .is_err(),
+                "overflow request should remain in the committed registry"
+            );
+        }
+
+        release_tx.send(()).expect("release first request");
+        let mut completed = std::collections::BTreeSet::new();
+        for _ in 0..REQUESTS {
+            completed.insert(
+                finished_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("overflow request is eventually refilled"),
+            );
+        }
+        assert_eq!(completed.len(), REQUESTS);
+
+        scheduler.stop();
+        root.note_committed_session_request("late-conversation", "late-request")
+            .expect("retain late committed identity for cancellation test");
+        refill_pending_from_registry(&scheduler.state);
+        assert_eq!(scheduler.pending_count(), 0, "stop must prevent refill");
+        scheduler.join().expect("join stopped test scheduler");
     }
 
     #[test]
