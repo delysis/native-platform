@@ -2435,7 +2435,11 @@ fn persist_session_checkpoint_value(
         &store,
         value,
         Some(authority),
-        &|| !scope.has_active_voice_call() && scope.active_operation_count() == 0,
+        &|| {
+            !scope.has_active_voice_call()
+                && scope.active_operation_count() == 0
+                && !crate::store::store_write_pending()
+        },
         || {},
     )
 }
@@ -3224,6 +3228,80 @@ mod tests {
                 .iter()
                 .any(|(conversation_id, _)| conversation_id == "incoming")
         );
+    }
+
+    #[test]
+    fn waiting_foreground_write_preempts_checkpoint_and_preserves_previous_state() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("mom-cache-navigation-{}", Uuid::new_v4()));
+        let store = RuntimeStore::open_with_key(&root, [68; 32])?;
+        let previous = test_cache_value("previous", "model");
+        assert!(persist_value_to_store(
+            &store,
+            &previous,
+            4,
+            CACHE_BLOB_CHUNK_BYTES * 2
+        )?);
+        let bytes = vec![7; CACHE_BLOB_CHUNK_BYTES + 1];
+        let (start, ready) = std::sync::mpsc::channel();
+        let foreground_store = store.clone();
+        let writer = std::thread::spawn(move || -> Result<()> {
+            ready.recv_timeout(Duration::from_secs(5))?;
+            foreground_store.put("navigation-test-selection", &"second-chat")
+        });
+        let checks = std::cell::Cell::new(0);
+        let interrupted: Result<()> = store.mutate_documents(
+            KV_CACHE_NAMESPACE,
+            KvCacheDb::default,
+            |db: &mut KvCacheDb, documents| {
+                delete_cache_bytes(documents, &previous.metadata);
+                db.entries.clear();
+                write_cache_bytes_with_admission(documents, "next", &bytes, &|| {
+                    let count = checks.get() + 1;
+                    checks.set(count);
+                    if count == 1 {
+                        return true;
+                    }
+                    start
+                        .send(())
+                        .expect("foreground writer is waiting for admission");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !crate::store::store_write_pending() && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        crate::store::store_write_pending(),
+                        "foreground write must reach the real coordinator"
+                    );
+                    !crate::store::store_write_pending()
+                })
+            },
+        );
+        writer.join().expect("foreground writer panicked")?;
+        assert!(
+            interrupted
+                .expect_err("checkpoint must yield")
+                .is::<CachePersistencePreempted>()
+        );
+        assert_eq!(checks.get(), 2);
+        assert_eq!(
+            store.get::<String>("navigation-test-selection")?.as_deref(),
+            Some("second-chat")
+        );
+        assert_eq!(
+            read_cache_bytes(&store, &previous.metadata)?.as_deref(),
+            Some(previous.sequence.bytes.as_slice())
+        );
+        assert!(store.get_bytes(&blob_chunk_namespace("next", 0))?.is_none());
+        assert!(store.get_bytes(&blob_chunk_namespace("next", 1))?.is_none());
+        assert_eq!(
+            store
+                .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+                .expect("checkpoint cache should remain stored")
+                .entries[0]
+                .id,
+            "previous"
+        );
+        Ok(())
     }
 
     #[test]

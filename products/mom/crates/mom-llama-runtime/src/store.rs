@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -43,12 +44,37 @@ const STORE_SCHEMA: &str = "CREATE TABLE encrypted_documents (
 // than making call capture, attachment import, receipts, and transcript
 // indexing race for the single WAL writer slot.
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static STORE_WRITE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Opportunistic checkpoints must yield at their next encrypted chunk when
+/// an ordinary writer is queued. Navigation and draft persistence share this
+/// writer, but do not count as native model operations.
+pub(crate) fn store_write_pending() -> bool {
+    STORE_WRITE_WAITERS.load(std::sync::atomic::Ordering::Acquire) != 0
+}
 
 fn store_write_guard() -> Result<MutexGuard<'static, ()>> {
-    STORE_WRITE_LOCK
+    struct WaitingWriter;
+    impl Drop for WaitingWriter {
+        fn drop(&mut self) {
+            STORE_WRITE_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    STORE_WRITE_WAITERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let waiting = WaitingWriter;
+    let started = Instant::now();
+    let guard = STORE_WRITE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| anyhow!("Mom store write coordinator is unavailable"))
+        .map_err(|_| anyhow!("Mom store write coordinator is unavailable"));
+    drop(waiting);
+    if started.elapsed() >= Duration::from_millis(10) {
+        eprintln!(
+            "mom-llama storage writer_wait_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+    guard
 }
 
 /// Build privately, then publish a complete database without replacing any

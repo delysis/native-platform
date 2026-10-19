@@ -730,6 +730,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_render_sidebar_fragment,
         commands::mom_llama_render_settings_fragment,
         commands::mom_llama_voice_latency_record,
+        commands::mom_llama_navigation_timing_record,
         commands::mom_llama_pick_file,
         commands::mom_llama_information_pick_alexandria,
         commands::mom_llama_information_register_alexandria,

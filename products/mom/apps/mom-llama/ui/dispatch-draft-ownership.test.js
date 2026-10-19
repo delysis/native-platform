@@ -1374,6 +1374,7 @@ test("a direct voice fallback keeps its capture through indexing and admits repl
     selectedConversationKind: () => "chat",
     formField: () => null,
     closeMentions() {}, sizeComposer() {}, appendLiveMessage() {},
+    updateComposerDraft: async () => ({ status: "passed" }),
     persistDraftNow: async (_message, ids) => persistedDrafts.push(ids),
     refreshChat: async () => {}, refreshConversationProjection: async () => {},
     refreshSidebar: async () => {}, refreshConversationSettingsProjection: async () => {},
@@ -2177,11 +2178,11 @@ test("voice and call prompts stay internal through dispatch recovery and clear s
   assert.match(submit, /if \(voiceDispatch\) \{\s*form\.querySelector\("#composer-attachments"\)\?\.remove\(\);/);
   assert.match(submit, /if \(!voiceDispatch && selectedConversation\(\) === conversation && textarea && !textarea\.value\) textarea\.value = message/);
   assert.equal(
-    (submit.match(/if \(voiceDispatch\) \{\s*await invoke\("mom_llama_draft_update", \{\s*conversation,\s*message: "",\s*attachmentIds: \[\],/g) || []).length,
+    (submit.match(/if \(voiceDispatch\) \{\s*await updateComposerDraft\(\{\s*conversation,\s*message: "",\s*attachmentIds: \[\],/g) || []).length,
     2,
     "successful or blocked results and exceptions both clear the internal voice draft",
   );
-  assert.match(submit, /if \(!voiceDispatch && result\?\.status === "blocked"[\s\S]*?\n          if \(voiceDispatch\) \{\s*await invoke\("mom_llama_draft_update"/);
+  assert.match(submit, /if \(!voiceDispatch && result\?\.status === "blocked"[\s\S]*?\n          if \(voiceDispatch\) \{\s*await updateComposerDraft\(/);
 
   const bootStart = source.indexOf("  const boot = async () => {");
   const bootEnd = source.indexOf("\n  boot();", bootStart);

@@ -1118,3 +1118,24 @@ request cancellation settlement, and Metal lease counts. A measured zero is
 not missing data. Standalone engine benchmarks may explain a component but
 cannot establish call pickup or continuity. Keep the previous candidate and
 its traces intact until the replacement has passed its actual app checks.
+
+## Navigation during checkpoint persistence
+
+Chat selection and draft retention must not perform storage waits on the native
+UI thread. Their blocking workers retain the application work lease; frontend
+selection and draft writes preserve invocation order. Hidden settings must not
+trigger model discovery during navigation. Refresh conversation settings when
+they become visible.
+
+Opportunistic session checkpoints yield at the next encrypted chunk boundary
+when an ordinary store writer is waiting. Roll back the interrupted transaction
+and preserve the previous durable checkpoint; retain the pending checkpoint for
+the existing later retry. Do not weaken encrypted-store authentication or cache
+compatibility to improve navigation latency.
+
+Packaged-app qualification records selection queue time, selection command time,
+chat rendering and switch-to-paint time, plus native worker queue/work duration
+and storage writer waits. These diagnostics contain numbers and stage names,
+never conversation identifiers or content. Measure populated chat switches both
+while idle and after hangup, when a background checkpoint can be active;
+component preemption tests alone do not establish visible navigation latency.

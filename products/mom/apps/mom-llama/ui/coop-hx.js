@@ -2141,7 +2141,7 @@
 
   const refreshConversationSettingsProjection = async () => {
     const settings = document.getElementById("settings-sidebar");
-    if (settings && settings.dataset.currentConversation !== selectedConversation()) {
+    if (settings && !settings.hidden && settings.dataset.currentConversation !== selectedConversation()) {
       const projection = parseFragment(await invokeMarkup("mom_llama_render_settings_fragment"));
       const instructions = projection?.querySelector(".current-chat-settings");
       if (instructions && settings === document.getElementById("settings-sidebar")
@@ -2158,8 +2158,18 @@
   };
 
   let conversationSwitchTimingId = 0;
-  const recordConversationSwitchPaint = (startedAt, paintedAt, timing = performance) => {
-    const id = ++conversationSwitchTimingId;
+  const recordConversationSwitchTiming = (phase, id, startedAt, finishedAt, timing = performance) => {
+    timing.measure(`mom.conversation.switch.${phase}.${id}`, {
+      start: startedAt,
+      end: finishedAt,
+    });
+  };
+  const recordConversationSwitchPaint = (
+    startedAt,
+    paintedAt,
+    timing = performance,
+    id = ++conversationSwitchTimingId,
+  ) => {
     timing.measure(`mom.conversation.switch-to-paint.${id}`, {
       start: startedAt,
       end: paintedAt,
@@ -3359,17 +3369,50 @@
   const selectConversation = async (conversation) => {
     const revision = ++conversationNavigationRevision;
     const startedAt = performance.now();
-    void retainComposerDraft().catch(reportError);
-    const result = await mutateConversationSelection(
-      () => invoke("mom_llama_conversation_select", { conversation }),
-    );
+    const timingId = ++conversationSwitchTimingId;
+    const retainedDraft = retainComposerDraft();
+    const selectionQueuedAt = performance.now();
+    let selectionQueueMs = 0;
+    let selectionCommandMs = 0;
+    let chatRenderMs = 0;
+    const result = await mutateConversationSelection(async () => {
+      const commandStartedAt = performance.now();
+      selectionQueueMs = commandStartedAt - selectionQueuedAt;
+      recordConversationSwitchTiming("select-queue", timingId, selectionQueuedAt, commandStartedAt);
+      try {
+        await retainedDraft;
+        return await invoke("mom_llama_conversation_select", { conversation });
+      } finally {
+        const commandFinishedAt = performance.now();
+        selectionCommandMs = commandFinishedAt - commandStartedAt;
+        recordConversationSwitchTiming("select-command", timingId, commandStartedAt, commandFinishedAt);
+      }
+    });
     if (revision !== conversationNavigationRevision) return result;
     report(result);
-    const replacement = await refreshChat();
+    const renderStartedAt = performance.now();
+    let replacement;
+    try {
+      replacement = await refreshChat();
+    } finally {
+      const renderFinishedAt = performance.now();
+      chatRenderMs = renderFinishedAt - renderStartedAt;
+      recordConversationSwitchTiming("chat-render", timingId, renderStartedAt, renderFinishedAt);
+    }
     if (revision === conversationNavigationRevision
       && replacement?.dataset.currentConversation === conversation) {
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        recordConversationSwitchPaint(startedAt, performance.now());
+        const paintedAt = performance.now();
+        recordConversationSwitchPaint(startedAt, paintedAt, performance, timingId);
+        void invoke("mom_llama_navigation_timing_record", {
+          timing: {
+            switchId: timingId,
+            selectionQueueMs,
+            selectionCommandMs,
+            chatRenderMs,
+            switchToPaintMs: paintedAt - startedAt,
+          },
+        }).catch(() => {});
         void recoverPendingVoiceHistory().catch(() => {});
       }));
     }
@@ -3945,6 +3988,15 @@
   const isInternalVoicePrompt = (message) =>
     message.startsWith("[Voice note]") || message.startsWith("[Phone call]");
 
+  const updateComposerDraft = (input) => {
+    const payload = {
+      conversation: input.conversation,
+      message: input.message,
+      attachmentIds: [...(input.attachmentIds || [])],
+    };
+    return mutateConversationSelection(() => invoke("mom_llama_draft_update", payload));
+  };
+
   const persistDraftNow = async (
     message,
     attachmentIds = draftAttachmentIds(),
@@ -3952,7 +4004,7 @@
   ) => {
     window.clearTimeout(draftTimer);
     draftTimer = null;
-    return invoke("mom_llama_draft_update", {
+    return updateComposerDraft({
       conversation,
       message,
       attachmentIds: [...attachmentIds],
@@ -3965,7 +4017,7 @@
     const attachmentIds = draftAttachmentIds();
     draftTimer = window.setTimeout(() => {
       draftTimer = null;
-      invoke("mom_llama_draft_update", {
+      updateComposerDraft({
         conversation,
         message,
         attachmentIds,
@@ -9545,15 +9597,24 @@
 
   const retainComposerDraft = async () => {
     const form = document.getElementById("chat-form");
-    if (form && form.dataset.busy !== "true") await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+    if (form && form.dataset.busy !== "true") {
+      const result = await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+      if (result?.status === "blocked") {
+        report(result);
+        throw new Error(result.blocker?.message || "Could not preserve the current draft.");
+      }
+      return result;
+    }
+    return null;
   };
 
   const openNewDraft = async (persona = null) => {
     const revision = ++conversationNavigationRevision;
-    void retainComposerDraft().catch(reportError);
-    const result = await mutateConversationSelection(
-      () => invoke("mom_llama_conversation_draft_open", { persona }),
-    );
+    const retainedDraft = retainComposerDraft();
+    const result = await mutateConversationSelection(async () => {
+      await retainedDraft;
+      return invoke("mom_llama_conversation_draft_open", { persona });
+    });
     if (revision !== conversationNavigationRevision) return result;
     report(result);
     if (result?.status !== "blocked") {
@@ -9722,8 +9783,10 @@
     },
     "settings-open": async () => {
       await invoke("mom_llama_settings_get");
-      if (document.getElementById("settings-sidebar")?.hidden) openSettings();
-      else closeSettings();
+      if (document.getElementById("settings-sidebar")?.hidden) {
+        openSettings();
+        await refreshConversationSettingsProjection();
+      } else closeSettings();
     },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
     "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
@@ -10198,7 +10261,6 @@
       await refreshChat();
     },
     "message-edit-cancel": async () => {
-      report(await invoke("mom_llama_conversation_select", { conversation: selectedConversation() }));
       await refreshChat();
     },
     "message-delete": async (button) => {
@@ -10256,7 +10318,7 @@
         conversation = instantiated.result.id;
         chat().dataset.currentConversation = conversation;
         chat().dataset.conversationKind = "chat";
-        await invoke("mom_llama_draft_update", {
+        await updateComposerDraft({
           conversation: sourceConversation,
           message: "",
           attachmentIds: [],
@@ -10784,7 +10846,7 @@
             await persistDraftNow(message, attachmentIds, conversation);
           }
           if (conversation !== sourceConversation && sourceConversation !== "default") {
-            await invoke("mom_llama_draft_update", {
+            await updateComposerDraft({
               conversation: sourceConversation,
               message: "",
               attachmentIds: [],
@@ -10877,7 +10939,7 @@
             // write through the renderer's possibly changed selection.
             if (!voiceDispatch && selectedConversation() === conversation && textarea && !textarea.value) textarea.value = message;
             if (voiceDispatch) {
-              await invoke("mom_llama_draft_update", {
+              await updateComposerDraft({
                 conversation,
                 message: "",
                 attachmentIds: [],
@@ -10898,7 +10960,7 @@
             textarea.value = message;
           }
           if (voiceDispatch) {
-            await invoke("mom_llama_draft_update", {
+            await updateComposerDraft({
               conversation,
               message: "",
               attachmentIds: [],
@@ -11620,7 +11682,7 @@
           || isInternalVoicePrompt(formField(bootComposer, "message")?.value || "");
         if (interruptedVoiceDispatch) {
           document.getElementById("chat-form")?.setAttribute("hidden", "");
-          const cleared = await invoke("mom_llama_draft_update", {
+          const cleared = await updateComposerDraft({
             conversation: selectedConversation(),
             message: "",
             attachmentIds: [],

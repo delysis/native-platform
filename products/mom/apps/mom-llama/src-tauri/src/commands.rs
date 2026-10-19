@@ -143,35 +143,89 @@ fn import_voice_message_with_inference(
 }
 
 #[tauri::command]
-pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
-    let scope = runtime.operation_scope();
-    let _lease = runtime.admit(command_spec("mom_llama_render_app"))?;
-    markup_response(crate::view::render_app(&scope))
-}
-
-#[tauri::command]
-pub fn mom_llama_render_chat_fragment(
-    runtime: State<'_, AppRuntimeHandle>,
-) -> Result<Response, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_render_chat_fragment"))?;
-    markup_response(crate::view::render_chat_fragment())
-}
-
-#[tauri::command]
-pub fn mom_llama_render_sidebar_fragment(
-    runtime: State<'_, AppRuntimeHandle>,
-) -> Result<Response, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_render_sidebar_fragment"))?;
-    markup_response(crate::view::render_sidebar_fragment())
-}
-
-#[tauri::command]
-pub fn mom_llama_render_settings_fragment(
+pub async fn mom_llama_render_app(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Response, String> {
     let scope = runtime.operation_scope();
-    let _lease = runtime.admit(command_spec("mom_llama_render_settings_fragment"))?;
-    markup_response(crate::view::render_settings_fragment(&scope))
+    let lease = runtime.admit(command_spec("mom_llama_render_app"))?;
+    navigation_work(lease, "render_app", move || {
+        markup_response(crate::view::render_app(&scope))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_render_chat_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_render_chat_fragment"))?;
+    navigation_work(lease, "render_chat_fragment", move || {
+        markup_response(crate::view::render_chat_fragment())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_render_sidebar_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_render_sidebar_fragment"))?;
+    navigation_work(lease, "render_sidebar_fragment", move || {
+        markup_response(crate::view::render_sidebar_fragment())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_render_settings_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let scope = runtime.operation_scope();
+    let lease = runtime.admit(command_spec("mom_llama_render_settings_fragment"))?;
+    navigation_work(lease, "render_settings_fragment", move || {
+        markup_response(crate::view::render_settings_fragment(&scope))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NavigationTiming {
+    switch_id: u64,
+    selection_queue_ms: f64,
+    selection_command_ms: f64,
+    chat_render_ms: f64,
+    switch_to_paint_ms: f64,
+}
+
+#[tauri::command]
+pub fn mom_llama_navigation_timing_record(
+    runtime: State<'_, AppRuntimeHandle>,
+    timing: NavigationTiming,
+) -> Result<(), String> {
+    let _lease = runtime.admit(command_spec("mom_llama_navigation_timing_record"))?;
+    if [
+        timing.selection_queue_ms,
+        timing.selection_command_ms,
+        timing.chat_render_ms,
+        timing.switch_to_paint_ms,
+    ]
+    .iter()
+    .any(|value| !value.is_finite() || !(0.0..=600_000.0).contains(value))
+    {
+        return Err("invalid navigation timing".to_owned());
+    }
+    // Numeric diagnostics only: never include a conversation ID, title or text,
+    // and never acquire the encrypted-store writer to record a UI measurement.
+    eprintln!(
+        "mom-llama navigation paint switch={} selection_queue_ms={:.2} selection_command_ms={:.2} chat_render_ms={:.2} switch_to_paint_ms={:.2}",
+        timing.switch_id,
+        timing.selection_queue_ms,
+        timing.selection_command_ms,
+        timing.chat_render_ms,
+        timing.switch_to_paint_ms
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1228,12 +1282,15 @@ pub async fn mom_llama_chat_continue(
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_draft_open(
+pub async fn mom_llama_conversation_draft_open(
     runtime: State<'_, AppRuntimeHandle>,
     persona: Option<String>,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_open"))?;
-    command_value(mom_llama_runtime::conversation_draft_open(persona))
+    let lease = runtime.admit(command_spec("mom_llama_conversation_draft_open"))?;
+    navigation_work(lease, "open_draft", move || {
+        command_value(mom_llama_runtime::conversation_draft_open(persona))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1293,16 +1350,20 @@ pub fn mom_llama_conversation_list(runtime: State<'_, AppRuntimeHandle>) -> Resu
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_select(
+pub async fn mom_llama_conversation_select(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_conversation_select"))?;
-    let result = mom_llama_runtime::conversation_select(&conversation).map_err(to_error)?;
-    if let Some(conversation) = result.result.as_ref() {
-        bind_precommit_voice_for_conversation(runtime.inner(), conversation)?;
-    }
-    command_value(Ok(result))
+    let lease = runtime.admit(command_spec("mom_llama_conversation_select"))?;
+    let runtime = runtime.inner().clone();
+    navigation_work(lease, "select", move || {
+        let result = mom_llama_runtime::conversation_select(&conversation).map_err(to_error)?;
+        if let Some(conversation) = result.result.as_ref() {
+            bind_precommit_voice_for_conversation(&runtime, conversation)?;
+        }
+        command_value(Ok(result))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1378,18 +1439,21 @@ pub fn mom_llama_draft_get(
 }
 
 #[tauri::command]
-pub fn mom_llama_draft_update(
+pub async fn mom_llama_draft_update(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: Option<String>,
     message: String,
     attachment_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_draft_update"))?;
-    command_value(mom_llama_runtime::draft_update(
-        conversation.as_deref(),
-        message,
-        attachment_ids.unwrap_or_default(),
-    ))
+    let lease = runtime.admit(command_spec("mom_llama_draft_update"))?;
+    navigation_work(lease, "retain_draft", move || {
+        command_value(mom_llama_runtime::draft_update(
+            conversation.as_deref(),
+            message,
+            attachment_ids.unwrap_or_default(),
+        ))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3347,6 +3411,35 @@ where
             let authoritative_cancellation = result.has_authoritative_cancellation_evidence();
             let value = command_value(Ok(result))?;
             Ok((value, authoritative_cancellation))
+        })
+        .await
+}
+
+// Navigation must never wait for storage/model discovery on the native UI
+// thread. Retain the normal application lease through the blocking worker.
+// These content-free spans separate worker scheduling from actual store/render
+// work in the packaged app log; frontend spans measure the eventual paint.
+async fn navigation_work<T, F>(
+    lease: AppWorkLease,
+    stage: &'static str,
+    operation: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let queued = Instant::now();
+    lease
+        .run_blocking(move || {
+            let started = Instant::now();
+            let result = operation();
+            eprintln!(
+                "mom-llama navigation stage={stage} queue_us={} work_us={} success={}",
+                started.duration_since(queued).as_micros(),
+                started.elapsed().as_micros(),
+                result.is_ok()
+            );
+            result
         })
         .await
 }

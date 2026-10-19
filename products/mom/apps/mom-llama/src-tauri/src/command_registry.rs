@@ -173,6 +173,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_conversation_new", true, false),
     read("mom_llama_conversation_list", true, false),
     mutation("mom_llama_conversation_select", true, false),
+    read("mom_llama_navigation_timing_record", false, false),
     read("mom_llama_conversation_search", true, false),
     mutation("mom_llama_conversation_rename", true, false),
     mutation("mom_llama_conversation_system_message_update", true, false),
