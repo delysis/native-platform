@@ -48,6 +48,48 @@ test("voice call activity guard waits for activation and clears only its own ses
   assert.ok(calls.every(([command]) => command === "mom_llama_kv_cache_set_voice_call_activity"));
 });
 
+test("a hung activity-clear acknowledgement does not block call teardown", async () => {
+  const guardStart = source.indexOf("  const createVoiceCallActivityGuard = (sessionId) => {");
+  const guardEnd = source.indexOf("\n  const sha256Hex =", guardStart);
+  const closeStart = source.indexOf("  const closeVoiceCallSurface = async () => {");
+  const closeEnd = source.indexOf("\n  const setText =", closeStart);
+  assert.ok(guardStart >= 0 && guardEnd > guardStart && closeStart >= 0 && closeEnd > closeStart);
+  let acknowledgeClear;
+  const calls = [];
+  const context = {
+    voiceCallActive: true, voiceCallEpoch: {}, voiceCallPreparing: false,
+    voiceCallConversation: null, voiceCallMicrophoneStream: null,
+    voiceCallActivityGuard: null, liveVoiceTts: null, activeCallPlayback: null,
+    activeDispatchConversation: null, callReplyConversation: null,
+    retryCallPrefillAfterTranscript: null, voiceReplyConversation: null,
+    setModalVisibility() {}, stopVoiceCapture: async () => {},
+    stopCallTranscriptForClose: async () => {}, stopSpeechPlayback: async () => {},
+    stopCallBed: async () => {}, releaseCallMicrophoneStream() {},
+    scheduleVoiceHistoryRecovery() {},
+    invoke(command, args) {
+      calls.push([command, args]);
+      if (args.active === false) return new Promise((resolve) => { acknowledgeClear = resolve; });
+      return Promise.resolve({ status: "passed" });
+    },
+    console: { warn() {} },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(guardStart, guardEnd)}\n${source.slice(closeStart, closeEnd)}\n`
+      + "this.createGuard = createVoiceCallActivityGuard; this.closeCall = closeVoiceCallSurface;",
+    context,
+  );
+  const guard = context.createGuard("hung-clear");
+  await guard.ready;
+  context.voiceCallActivityGuard = guard;
+  await context.closeCall();
+  assert.equal(typeof acknowledgeClear, "function", "teardown starts the exact native clear request");
+  assert.deepEqual(calls.map(([, args]) => [args.sessionId, args.active]), [
+    ["hung-clear", true], ["hung-clear", false],
+  ]);
+  acknowledgeClear({ status: "passed" });
+});
+
 test("unacknowledged speech preemption permanently disables call transcript admission", async () => {
   const start = source.indexOf("  const stopSpeechOperationAndWait = async (");
   const end = source.indexOf("\n  const startStreamedCallGreeting", start);
@@ -202,7 +244,7 @@ test("call persona preparation is awaited, epoch-bound, and required before gree
 
 test("failed startup warm still admits a call only after the exact conversation encoder is ready", async () => {
   const openStart = source.indexOf("  const openVoiceCallSurface = async");
-  const warmStart = source.indexOf("      await warmReady;", openStart);
+  const warmStart = source.indexOf("      await awaitStartupStage(warmReady, startupPhase);", openStart);
   const catchStart = source.indexOf("\n    } catch (error)", warmStart);
   const helperStart = source.indexOf("  const prepareVoicePersonaForCall = async");
   const helperEnd = source.indexOf("\n  const startStreamedCallGreeting", helperStart);
@@ -236,6 +278,8 @@ test("failed startup warm still admits a call only after the exact conversation 
       selectedConversation: () => "chat-frozen-profile",
       selectedConversationKind: () => "chat",
       startStreamedCallGreeting: async (...args) => greetings.push(args),
+      awaitStartupStage: async (pending) => pending,
+      startupPhase: "runtime_warm",
       invoke: async (command, args) => {
         calls.push([command, args]);
         if (prepareResponse) return prepareResponse;
@@ -309,7 +353,9 @@ test("failed startup warm still admits a call only after the exact conversation 
 
 test("the real call-open prefix shows Calling before the first ring tone paint boundary", async () => {
   const openStart = source.indexOf("  const openVoiceCallSurface = async () => {");
-  const readyBoundary = source.indexOf("      await activityGuard.ready;", openStart);
+  const readyBoundary = source.indexOf(
+    "      await awaitStartupStage(activityGuard.ready, startupPhase);", openStart,
+  );
   assert.ok(openStart >= 0 && readyBoundary > openStart);
   const prefix = source.slice(openStart, readyBoundary);
   let resolveRing;
@@ -402,6 +448,75 @@ test("the real call-open prefix shows Calling before the first ring tone paint b
   assert.equal(opened.epoch, calls.find((entry) => Array.isArray(entry) && entry[0] === "ring-start")[1]);
 });
 
+test("stalled activity readiness hits the production call-startup deadline with a durable phase", async () => {
+  const deadlineStart = source.indexOf("  const withDeadline = async (promise, milliseconds, message");
+  const deadlineEnd = source.indexOf("\n  const applyTheme =", deadlineStart);
+  const callStart = source.indexOf("  const openVoiceCallSurface = async () => {");
+  const callEnd = source.indexOf("\n  const closeVoiceCallSurface = async", callStart);
+  assert.ok(deadlineStart >= 0 && deadlineEnd > deadlineStart && callStart >= 0 && callEnd > callStart);
+  let fireDeadline;
+  const trace = { stages: [] };
+  const modal = {
+    dataset: {}, setAttribute() {},
+    querySelector: () => ({ focus() {} }),
+  };
+  const recipient = {
+    dataset: { recipientId: "contact" },
+    querySelector: (selector) => selector === ".contact-avatar" ? null : ({ textContent: "Contact" }),
+  };
+  let failureMessage = null;
+  const context = {
+    document: {
+      getElementById: () => modal,
+      querySelector: () => recipient,
+    },
+    voiceCallActive: false, voiceCallPreparing: false, voiceCallEpoch: null,
+    voiceCallConversation: null, voiceCallActivityGuard: null,
+    conversationNavigationRevision: 0,
+    voiceLatencyTrace: trace,
+    createVoiceCallActivityGuard: () => ({ ready: new Promise(() => {}), clearWhenReady: async () => {} }),
+    speechOperationToken: () => "startup-timeout-operation",
+    startCallRinging: () => new Promise(() => {}),
+    startVoiceLatency(mode, stage) { trace.mode = mode; trace.stages.push({ stage }); },
+    markVoiceLatency(stage, detail = {}) { trace.stages.push({ stage, ...detail }); },
+    markVoiceLatencyIn(target, stage, detail = {}) { target.stages.push({ stage, ...detail }); },
+    clearPersistentVoiceCallFailure() {},
+    setPersistentVoiceCallFailure: (message) => { failureMessage = message; },
+    setModalVisibility() {}, setText() {},
+    closeVoiceCallSurface: async () => {
+      context.voiceCallActive = false;
+      context.voiceCallEpoch = null;
+      context.voiceCallPreparing = false;
+    },
+    reportError() {},
+    safeVoiceFailureCode: (error) => typeof error?.code === "string" ? error.code : "startup_error",
+    errorMessage: (error) => error.message,
+    performance: { now: () => 1 },
+    window: {
+      setTimeout(callback) { fireDeadline = callback; return 1; },
+      clearTimeout() {},
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(deadlineStart, deadlineEnd)}\n${source.slice(callStart, callEnd)}\n`
+      + "this.openCall = openVoiceCallSurface;",
+    context,
+  );
+  const opening = context.openCall();
+  await Promise.resolve();
+  assert.equal(typeof fireDeadline, "function", "activity readiness is guarded by the real deadline helper");
+  fireDeadline();
+  await opening;
+  const timeout = trace.stages.find(({ stage }) => stage === "call_startup_stage_timed_out");
+  assert.equal(timeout.phase, "activity_guard");
+  assert.equal(timeout.deadline_ms, 60_000);
+  assert.equal(timeout.phase_elapsed_ms, 0);
+  assert.equal(failureMessage, "The call could not become ready during activity guard.");
+  assert.ok(trace.stages.some(({ stage, error_code }) =>
+    stage === "call_start_failed" && error_code === "voice_call_startup_timeout"));
+});
+
 test("call startup failure persists in the status surface and checkpoints only safe diagnostics", async () => {
   const statusHelperStart = source.indexOf("  const renderStatusContent = (status, label, onDismiss) => {");
   const statusHelperEnd = source.indexOf("\n  const report = (value) =>", statusHelperStart);
@@ -464,6 +579,7 @@ test("call startup failure persists in the status surface and checkpoints only s
     voiceLatencyTrace: trace,
     markVoiceLatencyIn(target, stage, detail = {}) { target.stages.push({ stage, ...detail }); },
     performance: { now: () => 1 },
+    withDeadline: (pending) => pending,
     speechOperationToken: () => "safe-operation-id",
     startCallRinging: async () => false,
     closeVoiceCallSurface: async () => {
@@ -603,6 +719,51 @@ test("late microphone permission after hangup cannot replace or release a newer 
   assert.equal(oldTrack.stopped, true, "stale permission stops its own stream");
   assert.equal(context.voiceCallMicrophoneStream, newStream, "the late result cannot replace the new owner");
   assert.equal(context.voiceCallMicrophoneEpoch, newEpoch);
+});
+
+test("the real call-startup deadline releases a microphone stream granted after timeout", async () => {
+  const deadlineStart = source.indexOf("  const withDeadline = async (promise, milliseconds, message");
+  const deadlineEnd = source.indexOf("\n  const applyTheme =", deadlineStart);
+  const microphoneStart = source.indexOf("  const prepareCallMicrophoneStream = async (epoch) => {");
+  const microphoneEnd = source.indexOf("\n  const openVoiceCallSurface =", microphoneStart);
+  assert.ok(deadlineStart >= 0 && deadlineEnd > deadlineStart
+    && microphoneStart >= 0 && microphoneEnd > microphoneStart);
+  const epoch = {};
+  let fireDeadline;
+  let grantPermission;
+  const track = { stopped: false, stop() { this.stopped = true; } };
+  const stream = { active: true, getTracks: () => [track] };
+  const context = {
+    voiceCallActive: true, voiceCallEpoch: epoch,
+    voiceCallMicrophoneStream: null, voiceCallMicrophoneEpoch: null,
+    voiceCallCaptureGraph: null,
+    performance: { now: () => 1 },
+    window: {
+      setTimeout(callback) { fireDeadline = callback; return 1; },
+      clearTimeout() {},
+    },
+    navigator: { mediaDevices: { getUserMedia: () => new Promise((resolve) => { grantPermission = resolve; }) } },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${source.slice(deadlineStart, deadlineEnd)}\n${source.slice(microphoneStart, microphoneEnd)}\n`
+      + "this.startupDeadline = withDeadline; this.prepareMicrophone = prepareCallMicrophoneStream;",
+    context,
+  );
+  const startup = context.startupDeadline(
+    context.prepareMicrophone(epoch), 60_000, "microphone startup timed out", "voice_call_startup_timeout",
+  );
+  await Promise.resolve();
+  assert.equal(typeof fireDeadline, "function");
+  fireDeadline();
+  await assert.rejects(startup, (error) => error.code === "voice_call_startup_timeout");
+  context.voiceCallActive = false;
+  context.voiceCallEpoch = null;
+  grantPermission(stream);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(track.stopped, true, "the late permission result stops its own native stream");
+  assert.equal(context.voiceCallMicrophoneStream, null);
 });
 
 test("microphone graph and resume failures release the exact stream before propagating", async () => {
@@ -984,6 +1145,8 @@ test("a stale call startup finally cannot clear a newer call's preparing state",
     releaseHistoryRecovery() {},
     releaseCallMicrophoneStream() {},
     performance: { now: () => 1 },
+    withDeadline: (pending) => pending,
+    safeVoiceFailureCode: (error) => typeof error?.code === "string" ? error.code : "startup_error",
     console,
   };
   vm.createContext(context);
@@ -1073,6 +1236,8 @@ test("a late draft-call result cannot retarget a chat after hangup and navigatio
     closeVoiceCallSurface: async () => {},
     reportError: (error) => { throw error; },
     performance: { now: () => 1 },
+    withDeadline: (pending) => pending,
+    safeVoiceFailureCode: (error) => typeof error?.code === "string" ? error.code : "startup_error",
   };
   vm.createContext(context);
   vm.runInContext(`${source.slice(start, end)}\nthis.openCall = openVoiceCallSurface;`, context);
@@ -1144,6 +1309,8 @@ test("a draft call that finishes after hangup is published for the next call", a
     report() {}, setPersistentVoiceCallFailure() {}, errorMessage: (error) => error.message,
     closeVoiceCallSurface: async () => {}, reportError: (error) => { throw error; },
     performance: { now: () => 1 },
+    withDeadline: (pending) => pending,
+    safeVoiceFailureCode: (error) => typeof error?.code === "string" ? error.code : "startup_error",
   };
   vm.createContext(context);
   vm.runInContext(`${source.slice(start, end)}\nthis.openCall = openVoiceCallSurface;`, context);
