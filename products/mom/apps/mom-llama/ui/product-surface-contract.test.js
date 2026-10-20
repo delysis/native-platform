@@ -489,10 +489,10 @@ test("call hang-up is an absolute local audio and generation boundary", () => {
   assert.ok(close.includes("stopCallBed()"));
   assert.ok(close.includes('invoke("mom_llama_chat_cancel", { conversation })'));
   const stopSettlement = close.indexOf("await Promise.allSettled(stops.filter(Boolean))");
-  const activityClear = close.indexOf("await activityGuard.clear()");
+  const activityClear = close.indexOf("await (activityGuard.clearWhenReady?.() || activityGuard.clear())");
   const checkpoint = close.indexOf('invoke("mom_llama_kv_cache_checkpoint_voice_session"');
   assert.ok(stopSettlement >= 0 && activityClear > stopSettlement && checkpoint > activityClear,
-    "the exact call activity guard must clear after all stop acknowledgements and before checkpointing");
+    "teardown starts release of its exact call activity guard before scheduling a cache checkpoint");
   assert.ok(
     close.indexOf('setModalVisibility("voice-call-modal", false)')
       < close.indexOf("stopVoiceCapture({ discard: true"),
@@ -518,13 +518,13 @@ test("call starts ringing immediately while preparation remains cancellation gua
   const call = bridge.slice(callStart, callEnd);
   const preempt = call.indexOf('suspendVoiceHistoryRecoveryForForeground("call_start")');
   const activityStart = call.indexOf("createVoiceCallActivityGuard(speechOperationToken())");
-  const activityReady = call.indexOf("await activityGuard.ready");
+  const activityReady = call.indexOf("await awaitStartupStage(activityGuard.ready, startupPhase)");
   const warm = call.indexOf('runtimeWarmPromise.then');
   const microphone = call.indexOf('prepareCallMicrophoneStream(epoch)');
   const visibleRinging = call.indexOf('modal.dataset.callState = "ringing"');
   const visibleModal = call.indexOf('setModalVisibility("voice-call-modal", true)');
   const ringStart = call.indexOf("const ringingReady = startCallRinging(epoch)");
-  const ringAwait = call.indexOf("const ringResult = await ringingReady");
+  const ringAwait = call.indexOf("const ringResult = await awaitStartupStage(ringingReady, startupPhase)");
   const cancellationGuard = call.indexOf('if (voiceCallEpoch !== epoch || !voiceCallActive) return;', preempt);
 
   assert.ok(preempt >= 0, "call pickup must suspend and settle idle voice recovery");
@@ -643,24 +643,25 @@ test("pickup uses the ordinary streamed call reply buffer", () => {
   assert.ok(open.includes("startCallRinging(epoch)"));
   assert.ok(!open.includes("await startCallRinging(epoch)"));
   assert.ok(open.includes("startStreamedCallGreeting(epoch, conversation)"));
-  assert.ok(open.includes("await prepareCallMicrophoneStream(epoch)"));
+  assert.ok(open.includes("prepareCallMicrophoneStream(epoch), startupPhase"));
   assert.ok(
     open.indexOf("const ringingReady = startCallRinging(epoch)")
-      < open.indexOf("await activityGuard.ready")
-      && open.indexOf("await activityGuard.ready") < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
+      < open.indexOf("await awaitStartupStage(activityGuard.ready, startupPhase)")
+      && open.indexOf("await awaitStartupStage(activityGuard.ready, startupPhase)")
+        < open.indexOf("await awaitStartupStage(\n        prepareCallMicrophoneStream(epoch), startupPhase"),
     "ringing starts on the user gesture while microphone and model setup remain guarded",
   );
   assert.ok(open.includes("const warmReady = runtimeWarmPromise.then((warm) => {"));
-  assert.ok(open.includes("await warmReady;"));
+  assert.ok(open.includes("await awaitStartupStage(warmReady, startupPhase);"));
   assert.ok(!/if\s*\(warm\.status/.test(open), "opportunistic startup status must not decide call admission");
   assert.ok(
     open.indexOf("const warmReady = runtimeWarmPromise.then((warm) => {")
-      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
+      < open.indexOf("await awaitStartupStage(\n        prepareCallMicrophoneStream(epoch), startupPhase"),
     "resident readiness must be observed concurrently with microphone admission",
   );
   assert.ok(
     open.indexOf("void preparePcmWorklet(24_000);")
-      < open.indexOf("await prepareCallMicrophoneStream(epoch)"),
+      < open.indexOf("await awaitStartupStage(\n        prepareCallMicrophoneStream(epoch), startupPhase"),
     "the PCM renderer must warm under the required microphone readiness wait",
   );
   assert.ok(open.includes("await prepareVoicePersonaForCall(conversation, epoch)"));
@@ -974,7 +975,8 @@ test("completed voice traces are persisted outside WebKit for latency inspection
   const checkpointEnd = bridge.indexOf("\n  ]);", checkpointStart);
   const checkpointStages = bridge.slice(checkpointStart, checkpointEnd);
   for (const stage of ["audio_prefill_begin_requested", "audio_prefill_session_ready",
-    "audio_prefill_begin_failed", "next_turn_prefill_failed"]) {
+    "audio_prefill_begin_failed", "next_turn_prefill_failed", "call_startup_stage_timed_out",
+    "read_aloud_operation_started", "tts_timed_out"]) {
     assert.ok(checkpointStages.includes(`"${stage}"`), `${stage} must persist a diagnostic checkpoint`);
   }
   assert.ok(bridge.includes('markVoiceLatency("runtime_warm_state", runtimeWarmState)'));

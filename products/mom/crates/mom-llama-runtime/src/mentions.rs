@@ -99,6 +99,10 @@ pub struct MentionTargetSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MentionTargetResult {
+    /// Retained through persistence so length-limited output stays distinguishable
+    /// from a model-emitted end marker. Older records have no terminal evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     pub target_id: String,
     pub handle: String,
     pub label: String,
@@ -1189,6 +1193,7 @@ fn mention_tool_approval_decide_supported_in_scope(
             let parsed = parse_reasoning_output(&output.text);
             (
                 MentionTargetResult {
+                    finish_reason: Some(output.finish_reason),
                     target_id: claim.snapshot.target_id.clone(),
                     handle: claim.snapshot.handle.clone(),
                     label: claim.snapshot.label.clone(),
@@ -2995,7 +3000,7 @@ pub fn mention_synthesize(
             version: 1,
             invocation_id: invocation_id.to_string(),
             target_order: completed.len(),
-            incomplete: false,
+            incomplete: output.finish_reason == "max_tokens",
         }),
         attachment_ids: Vec::new(),
     });
@@ -3191,6 +3196,7 @@ where
                 },
             )?;
             invocation.results.push(MentionTargetResult {
+                finish_reason: None,
                 target_id: snapshot.target_id.clone(),
                 handle: snapshot.handle.clone(),
                 label: snapshot.label.clone(),
@@ -3385,6 +3391,11 @@ where
                         // stops a response has still sent the invitation and seen
                         // this text; both belong in the conversation record.
                         invocation.results.push(MentionTargetResult {
+                            finish_reason: Some(if cancelled {
+                                "cancelled".to_string()
+                            } else {
+                                output.finish_reason
+                            }),
                             target_id: target.snapshot.target_id.clone(),
                             handle: target.snapshot.handle.clone(),
                             label: target.snapshot.label.clone(),
@@ -3920,7 +3931,8 @@ fn append_attributed_results(host: &mut Conversation, invocation: &mut MentionIn
                 version: snapshot.version,
                 invocation_id: invocation.id.clone(),
                 target_order: order,
-                incomplete: result.state == GenerationState::Cancelled,
+                incomplete: result.state == GenerationState::Cancelled
+                    || result.finish_reason.as_deref() == Some("max_tokens"),
             }),
             attachment_ids: Vec::new(),
         });
@@ -4077,6 +4089,7 @@ fn blocked_target_result(
     message: &str,
 ) -> MentionTargetResult {
     MentionTargetResult {
+        finish_reason: None,
         target_id: snapshot.target_id.clone(),
         handle: snapshot.handle.clone(),
         label: snapshot.label.clone(),
@@ -4450,8 +4463,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancelled_consult_serializes_sent_turn_and_marks_retained_prefix_incomplete() {
+    fn assert_consult_terminal_persistence(
+        state: GenerationState,
+        reason: Option<&str>,
+        incomplete: bool,
+    ) {
         let mut host = mention_conversation("host", "host");
         host.kind = ConversationKind::Chat;
         let user_message = Message {
@@ -4493,10 +4509,11 @@ mod tests {
             host_context: Vec::new(),
             targets: vec![target],
             results: vec![super::MentionTargetResult {
+                finish_reason: reason.map(str::to_string),
                 target_id: "persona".into(),
                 handle: "researcher".into(),
                 label: "Researcher".into(),
-                state: GenerationState::Cancelled,
+                state,
                 text: "<|channel>thought\nprivate plan<channel|>The retained partial answer".into(),
                 reasoning_content: String::new(),
                 reasoning_incomplete: false,
@@ -4521,6 +4538,9 @@ mod tests {
             &invocation.results
         ));
         super::append_attributed_results(&mut host, &mut invocation);
+        let restored: MentionInvocation =
+            serde_json::from_slice(&serde_json::to_vec(&invocation).unwrap()).unwrap();
+        assert_eq!(restored.results[0].finish_reason.as_deref(), reason);
         let persisted: ConversationDb = serde_json::from_slice(
             &serde_json::to_vec(&ConversationDb {
                 conversations: vec![host],
@@ -4541,12 +4561,13 @@ mod tests {
             messages[1].reasoning_content.as_deref(),
             Some("private plan")
         );
-        assert!(
+        assert_eq!(
             messages[1]
                 .attribution
                 .as_ref()
                 .expect("attributed partial")
-                .incomplete
+                .incomplete,
+            incomplete
         );
         assert_eq!(
             persisted.conversations[0].active_leaf_message_id.as_deref(),
@@ -4555,8 +4576,26 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_consult_serializes_sent_turn_and_marks_retained_prefix_incomplete() {
+        assert_consult_terminal_persistence(GenerationState::Cancelled, Some("cancelled"), true);
+    }
+
+    #[test]
+    fn length_limited_consult_retains_reason_and_marks_saved_reply_incomplete() {
+        assert_consult_terminal_persistence(GenerationState::Completed, Some("max_tokens"), true);
+        assert_consult_terminal_persistence(
+            GenerationState::Completed,
+            Some("end_of_generation"),
+            false,
+        );
+        // Old records carry no evidence of a length stop; do not invent one.
+        assert_consult_terminal_persistence(GenerationState::Completed, None, false);
+    }
+
+    #[test]
     fn cancellation_before_first_token_still_commits_the_sent_invitation() {
         let result = super::MentionTargetResult {
+            finish_reason: None,
             target_id: "persona".into(),
             handle: "researcher".into(),
             label: "Researcher".into(),

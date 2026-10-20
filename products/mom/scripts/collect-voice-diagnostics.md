@@ -12,7 +12,7 @@ node products/mom/scripts/collect-voice-diagnostics.mjs \
   --out "$HOME/Desktop/blessenger-voice-diagnostics-$(date +%Y%m%d-%H%M%S).json"
 ```
 
-Source may be pulled before this capture, but leave the installed app untouched until its report is saved. Use a new timestamped output name for every report so earlier evidence is preserved. If you have a built candidate bundle, pass its exact path as `--candidate-app` to record its bundle identity and executable digest beside the installed identity. If the candidate app uses a separate data or log directory, pass those exact directories instead. The report includes whether each location was explicit or discovered, but omits the path itself. Missing files are reported as missing evidence; a partial inventory is never described as ready. Model integrity is not checked.
+Source may be pulled before this capture, but leave the installed app untouched until its report is saved. Use a new timestamped output name for every report so earlier evidence is preserved. If you have a built candidate bundle, pass its exact path as `--candidate-app` to record its bundle identity and executable digest beside the installed identity. If the candidate app uses a separate data or log directory, pass those exact directories instead. The report includes whether each location was explicit or discovered, but omits the path itself. Missing files are reported as missing evidence; a partial inventory is never described as ready. Model integrity is not checked. The bundle inventory identifies files on disk; it does not establish which executable an already-running process loaded.
 
 For a daily local Codex task, use this instruction:
 

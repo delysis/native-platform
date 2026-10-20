@@ -316,6 +316,7 @@ export async function collectVoiceDiagnostics(opts) {
       ...(appStatus === "present" ? [] : ["installed_app_bundle"]),
       ...(traces.status === "not_found" ? ["voice_latency_history"] : []),
       ...(logs.status === "not_found" || logs.status === "no_allowlisted_events" ? ["allowlisted_startup_or_navigation_log_events"] : []),
+      "running_process_identity_not_inspected",
       "encrypted_model_settings_and_sampling_limit_not_read",
       "asset_integrity_not_checked",
     ],

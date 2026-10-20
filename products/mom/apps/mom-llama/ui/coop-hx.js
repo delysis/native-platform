@@ -75,7 +75,8 @@
   };
   const wait = (milliseconds) =>
     new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-  const withProgressDeadline = async (promise, idleMs, progress, message) => {
+  const withProgressDeadline = async (promise, idleMs, progress, message,
+    { maxElapsedMs = 120_000 } = {}) => {
     const started = performance.now();
     let timer = null;
     try {
@@ -83,7 +84,7 @@
         timer = window.setInterval(() => {
           if (globalThis.MomVoiceCapturePolicy.voiceProgressDeadlineExpired({
             now: performance.now(), started, lastProgress: Math.max(started, progress()),
-            idleMs, maxElapsedMs: 120_000,
+            idleMs, maxElapsedMs,
           })) {
             const error = new Error(message);
             error.code = "voice_generation_timeout";
@@ -398,28 +399,46 @@
       active = true;
       return true;
     });
+    const clear = async () => {
+      await ready.catch(() => false);
+      if (!active) return false;
+      if (!clearPromise) {
+        clearPromise = Promise.resolve().then(() => invoke("mom_llama_kv_cache_set_voice_call_activity", {
+          sessionId,
+          active: false,
+        })).then((response) => {
+          if (response?.status === "blocked") {
+            throw new Error(response?.blocker?.message || "Voice cache activity could not be cleared.");
+          }
+          active = false;
+          return true;
+        }).catch((error) => {
+          clearPromise = null;
+          throw error;
+        });
+      }
+      return clearPromise;
+    };
     return {
       sessionId,
       ready,
-      clear: async () => {
-        await ready.catch(() => false);
-        if (!active) return false;
-        if (!clearPromise) {
-          clearPromise = Promise.resolve().then(() => invoke("mom_llama_kv_cache_set_voice_call_activity", {
-            sessionId,
-            active: false,
-          })).then((response) => {
-            if (response?.status === "blocked") {
-              throw new Error(response?.blocker?.message || "Voice cache activity could not be cleared.");
-            }
-            active = false;
-            return true;
-          }).catch((error) => {
-            clearPromise = null;
-            throw error;
+      clear,
+      clearWhenReady: () => {
+        if (active) {
+          // Teardown must not leave the call surface waiting on a native
+          // authority update. The exact guard remains owned until this
+          // acknowledgement settles, with errors reported asynchronously.
+          void clear().catch((error) => {
+            console.warn("voice cache activity guard could not be cleared", error);
           });
+          return Promise.resolve(true);
         }
-        return clearPromise;
+        // Activation has no per-request cancellation command. Retain this
+        // exact owner and clear it if a late activation eventually succeeds.
+        void ready.then(() => clear()).catch((error) => {
+          console.warn("voice cache activity guard could not be cleared", error);
+        });
+        return Promise.resolve(false);
       },
     };
   };
@@ -2551,6 +2570,7 @@
         first_token_ms: output?.first_token_ms,
         prompt_tokens: output?.prompt_tokens,
         completion_tokens: output?.completion_tokens,
+        finish_reason: output?.finish_reason ?? null,
         cache_reused: output?.cache_reused === true,
         cache_metrics: output?.cache_metrics || null,
       });
@@ -2691,6 +2711,7 @@
   };
 
   const openVoiceCallSurface = async () => {
+    const CALL_STARTUP_READY_TIMEOUT_MS = 60_000;
     const modal = document.getElementById("voice-call-modal");
     const recipient = document.querySelector(".recipients-header .recipient-chip");
     if (!modal || !recipient || voiceCallActive || voiceCallPreparing) return;
@@ -2717,6 +2738,31 @@
     let releaseHistoryRecovery = null;
     startVoiceLatency("call_greeting", "call_requested");
     const startupTrace = voiceLatencyTrace;
+    const startupStartedAt = performance.now();
+    const startupDeadlineAt = performance.now() + CALL_STARTUP_READY_TIMEOUT_MS;
+    const awaitStartupStage = async (pending, phase) => {
+      const remainingMs = Math.max(0, startupDeadlineAt - performance.now());
+      const phaseStartedAt = performance.now();
+      try {
+        return await withDeadline(
+          pending,
+          remainingMs,
+          `The call could not become ready during ${phase.replaceAll("_", " ")}.`,
+          "voice_call_startup_timeout",
+        );
+      } catch (error) {
+        if (error?.code === "voice_call_startup_timeout") {
+          markVoiceLatencyIn(startupTrace, "call_startup_stage_timed_out", {
+            phase,
+            elapsed_ms: Math.max(0, Math.round(performance.now()
+              - (Number.isFinite(startupTrace?.started) ? startupTrace.started : startupStartedAt))),
+            phase_elapsed_ms: Math.max(0, Math.round(performance.now() - phaseStartedAt)),
+            deadline_ms: CALL_STARTUP_READY_TIMEOUT_MS,
+          });
+        }
+        throw error;
+      }
+    };
     let startupPhase = "activity_guard";
     let startupMicrophoneStream = null;
     const name = recipient.querySelector(":scope > span:not(.contact-avatar)")?.textContent?.trim() || "Contact";
@@ -2750,13 +2796,13 @@
     try {
       const activityGuardWaitStartedAt = performance.now();
       markVoiceLatency("call_activity_guard_wait_started");
-      await activityGuard.ready;
+      await awaitStartupStage(activityGuard.ready, startupPhase);
       markVoiceLatencyIn(startupTrace, "call_activity_guard_ready", {
         wait_ms: Math.max(0, Math.round(performance.now() - activityGuardWaitStartedAt)),
       });
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       startupPhase = "ringing";
-      const ringResult = await ringingReady;
+      const ringResult = await awaitStartupStage(ringingReady, startupPhase);
       if (ringResult.error) throw ringResult.error;
       if (!ringResult.started || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Do not admit Gemma warming or microphone setup while an idle Parakeet
@@ -2765,7 +2811,11 @@
       const recoverySuspendWaitStartedAt = performance.now();
       startupPhase = "history_recovery";
       markVoiceLatency("call_history_recovery_suspend_wait_started");
-      releaseHistoryRecovery = await suspendVoiceHistoryRecoveryForForeground("call_start");
+      const recoverySuspension = suspendVoiceHistoryRecoveryForForeground("call_start");
+      void recoverySuspension.then((release) => {
+        if (voiceCallEpoch !== epoch) release();
+      }).catch(() => {});
+      releaseHistoryRecovery = await awaitStartupStage(recoverySuspension, startupPhase);
       markVoiceLatencyIn(startupTrace, "call_history_recovery_suspend_wait_finished", {
         wait_ms: Math.max(0, Math.round(performance.now() - recoverySuspendWaitStartedAt)),
       });
@@ -2787,7 +2837,9 @@
       // Permission and a live input route are prerequisites for a call. Keep
       // this exact stream for the whole call so WebKit can continuously apply
       // acoustic echo cancellation while contact audio is playing.
-      const preparedMicrophone = await prepareCallMicrophoneStream(epoch);
+      const preparedMicrophone = await awaitStartupStage(
+        prepareCallMicrophoneStream(epoch), startupPhase,
+      );
       startupMicrophoneStream = preparedMicrophone.stream;
       if (voiceCallEpoch !== epoch || !voiceCallActive) {
         releaseCallMicrophoneStream(startupMicrophoneStream);
@@ -2798,7 +2850,7 @@
       // Keep measuring the entire request-to-playback interval; do not hide
       // initialization time by redefining the latency clock at readiness.
       startupPhase = "runtime_warm";
-      await warmReady;
+      await awaitStartupStage(warmReady, startupPhase);
       if (voiceCallEpoch !== epoch || !voiceCallActive) return;
       // Startup is opportunistic and can be superseded by foreground model
       // selection. The exact conversation preparation below owns call readiness
@@ -2806,7 +2858,7 @@
       let conversation = selectedConversation();
       startupPhase = "conversation";
       if (conversation === "default") {
-        const started = await mutateConversationSelection(() => {
+        const started = await awaitStartupStage(mutateConversationSelection(() => {
           if (voiceCallEpoch !== epoch || !voiceCallActive
               || conversationNavigationRevision !== startupNavigationRevision) return null;
           const current = selectedConversation();
@@ -2824,7 +2876,7 @@
             }
             return result;
           });
-        });
+        }), startupPhase);
         if (conversationNavigationRevision !== startupNavigationRevision) return;
         if (started?.existingConversation) {
           conversation = started.existingConversation;
@@ -2840,7 +2892,7 @@
           conversation = started.result.id;
         }
       } else if (selectedConversationKind() === "persona_template") {
-        const instantiated = await mutateConversationSelection(() => {
+        const instantiated = await awaitStartupStage(mutateConversationSelection(() => {
           if (voiceCallEpoch !== epoch || !voiceCallActive
               || conversationNavigationRevision !== startupNavigationRevision) return null;
           const current = selectedConversation();
@@ -2856,7 +2908,7 @@
             }
             return result;
           });
-        });
+        }), startupPhase);
         if (conversationNavigationRevision !== startupNavigationRevision) return;
         if (instantiated?.existingConversation) {
           conversation = instantiated.existingConversation;
@@ -2874,6 +2926,9 @@
       markVoiceLatency("call_conversation_ready", { conversation });
       // Use the actual frozen call profile. It may differ from its source contact.
       startupPhase = "persona_prepare";
+      // Native persona preparation has no cancellation/terminal-ack API.
+      // Keep its start checkpoint durable, but do not race it with a UI
+      // deadline and leave an unowned native preparation running.
       const personaPrepared = await prepareVoicePersonaForCall(conversation, epoch);
       if (!personaPrepared || voiceCallEpoch !== epoch || !voiceCallActive) return;
       // The first model reply uses the same token -> TTS -> PCM buffer as every
@@ -2951,7 +3006,7 @@
     releaseCallMicrophoneStream(microphoneStream);
     if (activityGuard) {
       try {
-        await activityGuard.clear();
+        await (activityGuard.clearWhenReady?.() || activityGuard.clear());
       } catch (error) {
         console.warn("voice cache activity guard could not be cleared", error);
       }
@@ -5380,7 +5435,8 @@
   ]);
   const VOICE_LATENCY_CHECKPOINT_STAGES = new Set([
     "call_requested", "call_start_failed", "call_ringing_started", "call_activity_guard_wait_started",
-    "call_activity_guard_ready", "call_history_recovery_suspend_wait_started",
+    "call_activity_guard_ready", "call_startup_stage_timed_out", "call_persona_prepare_started",
+    "call_history_recovery_suspend_wait_started",
     "call_history_recovery_suspend_wait_finished", "call_conversation_ready",
     "audio_prefill_begin_requested", "audio_prefill_session_ready",
     "audio_prefill_begin_failed", "audio_prefill_push_failed",
@@ -5398,6 +5454,7 @@
     "tts_segment_receipt_received", "tts_backend_complete", "tts_pcm_complete",
     "next_turn_prefill_started", "next_turn_prefill_ready", "next_turn_prefill_failed",
     "barge_in_detected", "barge_in_playback_stopped", "barge_in_playback_stop_failed",
+    "read_aloud_operation_started", "tts_timed_out",
     "playable", "playback_started", "playback_render_started",
     "playback_underrun_started", "playback_underrun_recovered", "durable_voice_audio_ready",
     "durable_voice_audio_failed", "playback_underrun", "playback_renderer",
@@ -8978,6 +9035,7 @@
         speculation: speculation.id,
         native_duration_ms: response.result.duration_ms,
         first_token_ms: response.result.first_token_ms,
+        finish_reason: response.result.finish_reason ?? null,
         cache_metrics: response.result.cache_metrics || null,
         voice_audio: response.result.voice_audio_metrics,
       });
@@ -9980,6 +10038,13 @@
         await invoke("mom_llama_speech_stop", { operation });
         return;
       }
+      // Record durable evidence before waiting for an earlier playback's
+      // shutdown. That shutdown can be delayed by native/media cleanup.
+      const trace = { id: crypto.randomUUID(), mode: "read_aloud", began_at: Date.now(),
+        started: performance.now(), stages: [] };
+      const markReadLatency = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
+      markReadLatency("read_aloud_operation_started", { conversation: selectedConversation(),
+        message: button.dataset.message || null });
       const stopped = stopSpeechPlayback();
       const epoch = speechPlaybackEpoch;
       await stopped;
@@ -9997,9 +10062,7 @@
       // but keeps its own calibration: reading a long document must not change
       // the next live call's startup policy.
       const leadController = new globalThis.MomVoicePipelineScheduler.AdaptiveVoiceLeadController();
-      const trace = { id: crypto.randomUUID(), mode: "read_aloud", began_at: Date.now(),
-        started: performance.now(), stages: [] };
-      const markReadLatency = (stage, detail = {}) => markVoiceLatencyIn(trace, stage, detail);
+      let lastProgressAt = trace.started;
       let firstPacketAt = null;
       let previousPacketAt = null;
       let audioMs = 0;
@@ -10051,6 +10114,7 @@
             const decoded = decodePcmFrame(frame);
             if (decoded.data.byteLength > 0) {
               const now = performance.now();
+              lastProgressAt = now;
               const packetMs = decoded.data.byteLength * 1000 / (2 * decoded.channels * decoded.sampleRate);
               firstPacketAt ??= now;
               audioMs += packetMs;
@@ -10067,13 +10131,58 @@
           } catch (error) { reportError(error); }
         });
         activeSpeechPlayback = { id: null, operation, controller, panel, button };
-        const response = await invoke("mom_llama_speech_read_aloud", {
+        const speechRequest = invoke("mom_llama_speech_read_aloud", {
           conversation,
           message,
           operation,
           requirePersonaVoice: false,
           pcmStream: stream,
         });
+        let timedOut = false;
+        // Cancellation can race native retention. If the operation returns a
+        // playback handle after the deadline, release that exact handle even
+        // though the row has already revoked this renderer's ownership.
+        void speechRequest.then((lateResponse) => {
+          if (!timedOut) return;
+          const latePlayback = lateResponse?.result?.playback_id;
+          if (latePlayback) {
+            void invoke("mom_llama_speech_stop", { playback: latePlayback }).catch(() => {});
+          }
+        }, () => {});
+        let response;
+        try {
+          response = await withProgressDeadline(
+            speechRequest,
+            30_000,
+            () => lastProgressAt,
+            "speech_read_aloud_timeout: Read Aloud stopped making progress.",
+            { maxElapsedMs: Number.MAX_SAFE_INTEGER },
+          );
+        } catch (error) {
+          if (error?.code !== "voice_generation_timeout") throw error;
+          timedOut = true;
+          markReadLatency("tts_timed_out", {
+            waiting_for: "mom_llama_speech_read_aloud",
+            elapsed_ms: Math.round(performance.now() - trace.started),
+          });
+          // Revoke playback ownership before cancellation; a queued PCM
+          // callback or late command result can no longer affect this row.
+          if (activeSpeechPlayback?.controller === controller && epoch === speechPlaybackEpoch) {
+            speechPlaybackEpoch = {};
+            activeSpeechPlayback = null;
+            await controller.stop();
+          }
+          const stopped = await invoke("mom_llama_speech_stop_and_wait", {
+            operation,
+            allowColdTranscriptionSettlement: false,
+          });
+          if (stopped?.status === "blocked"
+              || stopped?.result?.terminal_acknowledged !== true) {
+            throw new Error(stopped?.blocker?.message
+              || "Read Aloud timed out and native cancellation was not acknowledged.");
+          }
+          throw error;
+        }
         // A cancelled request may still finish natively and return a retained
         // playback. Capture that handle first so `finally` can release it, but
         // do not publish the cancellation response or mutate the row.
@@ -10979,6 +11088,7 @@
               markVoiceLatencyIn(voiceDispatchTrace, "generation_finished", {
                 native_duration_ms: output?.duration_ms,
                 first_token_ms: output?.first_token_ms,
+                finish_reason: output?.finish_reason ?? null,
                 cache_metrics: output?.cache_metrics || null,
                 voice_audio: output?.voice_audio_metrics,
               });

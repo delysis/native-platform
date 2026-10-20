@@ -287,6 +287,9 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSendOutput {
+    /// Native terminal reason; a token limit is not a complete model answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     pub request_id: String,
     pub conversation_id: String,
     pub user_message_id: String,
@@ -1091,6 +1094,7 @@ where
     );
     let cache_reused = prefix_cells_reused(&output.metrics.cache);
     let result = ChatSendOutput {
+        finish_reason: Some(output.finish_reason),
         request_id: session.request_id,
         conversation_id: prepared.conversation_id.clone(),
         user_message_id,
@@ -1508,6 +1512,7 @@ where
         cache_id,
         cache_reused,
         cache_metrics,
+        finish_reason,
     ) = if options.fake_fixture {
         // This deterministic branch exercises the same final-output parser as
         // native generation without loading a model.
@@ -1527,6 +1532,7 @@ where
             None,
             false,
             GenerationCacheMetrics::default(),
+            None,
         )
     } else {
         if stream.cancellation_requested() {
@@ -1683,6 +1689,7 @@ where
             attempted_cache_id.filter(|_| cache_reused),
             cache_reused,
             output.metrics.cache.clone(),
+            Some(output.finish_reason),
         )
     };
     let parsed = parse_reasoning_output(&assistant_text);
@@ -1782,6 +1789,7 @@ where
     )?;
     record_committed_session_checkpoint(scope, &conversation.id, &request_id);
     let result = ChatSendOutput {
+        finish_reason,
         request_id: request_id.clone(),
         conversation_id: conversation.id,
         user_message_id,

@@ -1218,3 +1218,31 @@ mutate global cache state must coordinate with every test that clears that state
 After a failure, preserve the receipt, repair the specific cause, and verify its
 focused gate before repeating the broader gate. A passing component result
 still does not replace the packaged quit/restart measurements above.
+
+### Diagnosing target-device speech failures
+
+`products/mom/scripts/collect-voice-diagnostics.mjs` captures installed bundle
+identity, required asset presence, and privacy-filtered startup/voice stages
+before an app update. Follow its companion Markdown instructions. Presence is
+not model integrity or synthesis qualification; installed files do not identify
+an already-running process. Keep missing target-device evidence explicit.
+
+Call readiness has a 60-second deadline across activity, ringing, recovery,
+microphone, runtime-warm, and conversation-selection waits. Late browser results
+are fenced by the call epoch; serialized conversation creation retains its
+existing navigation ordering. Activity release remains owned after UI teardown.
+Native persona preparation has no per-call cancellation acknowledgement and is
+not abandoned on a UI timer: its start is checkpointed for diagnosis. This is
+not a claim that all call preparation is bounded or that cold pickup is fast.
+
+Read Aloud checkpoints action entry before earlier playback settles. A 30-second
+absence of nonempty PCM cancels the exact synthesis operation, revokes renderer
+ownership, and releases any late native playback handle. Continuing PCM does not
+inherit the call-generation 120-second lifetime cap. Prior-playback settlement
+is still a distinct stage, and a timeout does not establish its underlying cause.
+
+Native generation finish reasons are retained in direct/audio output and
+persisted consult results. Length-limited persona replies are marked incomplete
+rather than indistinguishable from a normal model terminal. This preserves the
+reason for truncation; it does not implement automatic continuation or establish
+why a historical reply stopped when that evidence was not recorded.

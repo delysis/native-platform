@@ -519,6 +519,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const analysers = [];
   const workletNodes = [];
   const timers = [];
+  const progressIntervals = [];
   let selected = "fixture-conversation";
   let now = 1;
   const traces = [];
@@ -561,6 +562,10 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const context = {
     Blob, Uint8Array, ArrayBuffer, DataView, JSON,
     performance: { now: () => now },
+    MomVoiceCapturePolicy: { voiceProgressDeadlineExpired: ({ now: current, started, lastProgress, idleMs, maxElapsedMs }) =>
+      current - started >= maxElapsedMs || current - lastProgress >= idleMs },
+    setInterval(callback) { progressIntervals.push({ callback, active: true }); return progressIntervals.length; },
+    clearInterval(id) { if (progressIntervals[id - 1]) progressIntervals[id - 1].active = false; },
     crypto: { randomUUID: () => `fixture-trace-${++serial}` },
     MomVoicePipelineScheduler: { AdaptiveVoiceLeadController },
     markVoiceLatencyIn: (trace, stage, detail = {}) => traces.push({ id: trace.id, stage, ...detail }),
@@ -670,6 +675,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   context.__TAURI__ = { core: { Channel: class { constructor(onmessage) { this.onmessage = onmessage; } } } };
   speechVm.runInNewContext(
     "globalThis.window = globalThis;\n"
+    + block(ui, "  const withProgressDeadline = async", "  const withDeadline = async")
     + block(ui, "  const commandMetadata =", "  const DYNAMIC_CONTROL_SPECS =")
     + block(ui, "  const ipcBinaryBytes =", "  const speechOperationToken =")
     + "\nconst attachmentTranscripts = new WeakMap();\n"
@@ -739,7 +745,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
     view.setBigUint64(20, BigInt(sampleOffset), true); view.setUint32(28, samples.byteLength, true); frame.set(samples, 32);
     return frame;
   };
-  return { ...context.api, traces, advance(ms) { now += ms; }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, analysers, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
+  return { ...context.api, traces, advance(ms) { now += ms; }, fireProgressDeadline() { progressIntervals.filter(({ active }) => active).at(-1)?.callback(); }, button, transcribe, preview, transcript, card, calls, media, urls, audioContexts, analysers, workletNodes, timers, pcmFrame, take, hash, result, start, finishPlayback, respondRemainder, newReadButton, settle,
     setMediaReadyState(state) { mediaReadyState = state; },
     rejectPlaybackWith(error) { playbackResumeError = error; },
     holdSuspend() { suspendGateEnabled = true; },
@@ -777,6 +783,40 @@ test("Read Aloud buffers packet jitter through the shared adaptive renderer", as
     { backend_id: "fixture-qwen", model_id: "fixture-read-aloud-model", voice_id: "fixture-persona-voice" },
   );
   assert.equal(h.traces.find((entry) => entry.stage === "tts_pcm_complete").pcm_packets, 2);
+  h.settle();
+});
+
+test("Read Aloud timeout revokes PCM ownership and waits for native cancellation", async () => {
+  const h = speechLifetimeHarness();
+  const { task, read } = await h.start();
+  h.advance(30_001);
+  h.fireProgressDeadline();
+  const cancellation = await h.take("mom_llama_speech_stop_and_wait");
+  assert.equal(h.active(), null, "the timed-out renderer is revoked before native cancellation settles");
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(64), 0, false));
+  assert.ok(h.audioContexts.every((context) => context.sources.length === 0),
+    "late PCM cannot start playback after timeout");
+  assert.equal(cancellation.call.args.operation, read.call.args.operation);
+  assert.equal(cancellation.call.args.allowColdTranscriptionSettlement, false);
+  cancellation.reply.resolve({ status: "passed", result: { terminal_acknowledged: true } });
+  await assert.rejects(task, /Read Aloud stopped making progress/);
+  assert.ok(h.traces.some((entry) => entry.stage === "tts_timed_out"
+    && entry.waiting_for === "mom_llama_speech_read_aloud"));
+  read.reply.resolve(h.result("late-read-aloud-playback"));
+  const lateStop = await h.take("mom_llama_speech_stop");
+  assert.equal(lateStop.call.args.playback, "late-read-aloud-playback",
+    "a handle retained after timeout is released even after operation cancellation acknowledgement");
+});
+
+test("Read Aloud progress remains eligible beyond the call-generation wall-clock cap", async () => {
+  const h = speechLifetimeHarness();
+  const { task, read } = await h.start();
+  h.advance(121_000);
+  read.call.args.pcmStream.onmessage(h.pcmFrame(new Uint8Array(24_000), 0, true));
+  h.fireProgressDeadline();
+  assert.ok(h.active(), "fresh PCM progress keeps long saved-message synthesis alive");
+  read.reply.resolve(h.result());
+  await task;
   h.settle();
 });
 

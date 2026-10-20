@@ -202,6 +202,7 @@ mod tests {
             }],
             // Store-admission fixture only: these flags do not certify a model.
             results: vec![MentionTargetResult {
+                finish_reason: None,
                 target_id: "persona".into(),
                 handle: "mom".into(),
                 label: "Mom".into(),
