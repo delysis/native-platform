@@ -55,6 +55,41 @@ test("trace projection keeps allowlisted numbers and hides arbitrary fields and 
   assert.doesNotMatch(serialized, /conversation|transcript|message|arbitrary_private_field/);
 });
 
+test("Read Aloud backend, PCM, and renderer receipt fields are projected through fixed enums", () => {
+  const projected = projectTrace({
+    mode: "read_aloud",
+    summary: {
+      tts_backend_ids: [],
+      tts_model_ids: [],
+      tts_total_output_audio_ms: 1390,
+      tts_pcm_packets: 18,
+      playback_renderer_frames: 66_720,
+      playback_renderer_underruns: 0,
+    },
+    stages: [
+      { stage: "tts_backend_complete", backend_id: "qwen3-tts.mlx-swift",
+        model_id: "qwen3-tts-1.7b-base-icl-mlx-audio", backend_ms: 1398,
+        voice_id: "private-persona-id", message: secret, transcript: secret },
+      { stage: "tts_pcm_complete", output_audio_ms: 1390, pcm_packets: 18,
+        scheduler: { private_text: secret } },
+      { stage: "playback_renderer", reason: "ended", frames: 66_720,
+        underruns: 0, operation_id: secret, error: secret },
+      { stage: "playback_renderer", reason: secret, frames: 1, transcript: secret },
+    ],
+  });
+  const serialized = JSON.stringify(projected);
+  assert.deepEqual(projected.numeric_summary.tts_backend_ids, ["qwen3-tts.mlx-swift"]);
+  assert.deepEqual(projected.numeric_summary.tts_model_ids, ["qwen3-tts-1.7b-base-icl-mlx-audio"]);
+  assert.equal(projected.stages[0].backend_ms, 1398);
+  assert.equal(projected.stages[1].output_audio_ms, 1390);
+  assert.equal(projected.stages[1].pcm_packets, 18);
+  assert.equal(projected.stages[2].reason, "ended");
+  assert.equal(projected.stages[2].frames, 66_720);
+  assert.equal(projected.stages[2].underruns, 0);
+  assert.equal(projected.stages[3].reason, undefined);
+  assert.doesNotMatch(serialized, /private-persona-id|PRIVATE_SENTENCE_NEVER_REPORT_THIS|operation_id|private_text/);
+});
+
 test("log projection emits numeric setup/navigation events and fixed failure labels only", () => {
   const projected = projectLog([
     "mom-llama startup voice-cache progress: contexts=2/14 checkpoint_reused=false elapsed_ms=4500 cache_positions=120 state_bytes=8192",
