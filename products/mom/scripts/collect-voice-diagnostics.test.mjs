@@ -22,10 +22,13 @@ test("trace projection keeps allowlisted numbers and hides arbitrary fields and 
     phase: "persona_prepare",
     finish_reason: secret,
     conversation: secret,
-    summary: { first_content_to_tts_pcm_ms: 123, arbitrary_private_field: secret, error: secret },
+    summary: { first_content_to_tts_pcm_ms: 123, arbitrary_private_field: secret, error: secret,
+      tts_backend_ids: ["qwen3-tts.mlx-swift", secret],
+      tts_model_ids: ["pocket-tts-3.3.0-native-cpu", secret] },
     stages: [
-      { stage: "tts_first_pcm", elapsed_ms: 124.5, message: secret, transcript: secret },
+      { stage: "tts_first_pcm", elapsed_ms: 124.5, backend_id: "qwen3-tts.mlx-swift", model_id: "model-private-unknown", backend_ms: 25, phase_elapsed_ms: 40, deadline_ms: 60000, message: secret, transcript: secret },
       { stage: "call_start_failed", elapsed_ms: 130, phase: "persona_prepare", error_code: "voice_generation_timeout", finish_reason: "max_tokens" },
+      { stage: "tts_segment_finished", backend_id: secret, model_id: secret, elapsed_ms: 140 },
       { stage: secret, elapsed_ms: 150 },
     ],
   });
@@ -37,6 +40,15 @@ test("trace projection keeps allowlisted numbers and hides arbitrary fields and 
   assert.match(serialized, /"error_code":"voice_generation_timeout"/);
   assert.match(serialized, /"first_content_to_tts_pcm_ms":123/);
   assert.equal(projected.stages[0].stage, "tts_first_pcm");
+  assert.equal(projected.stages[0].backend_id, "qwen3-tts.mlx-swift");
+  assert.equal(projected.stages[0].backend_ms, 25);
+  assert.equal(projected.stages[0].phase_elapsed_ms, 40);
+  assert.equal(projected.stages[0].deadline_ms, 60000);
+  assert.equal(projected.stages[0].model_id, undefined, "unknown model identity is withheld");
+  assert.equal(projected.stages[2].backend_id, undefined, "unknown backend identity is withheld");
+  assert.equal(projected.stages[2].model_id, undefined, "unknown model identity is withheld");
+  assert.deepEqual(projected.numeric_summary.tts_backend_ids, ["qwen3-tts.mlx-swift"]);
+  assert.deepEqual(projected.numeric_summary.tts_model_ids, ["pocket-tts-3.3.0-native-cpu"]);
   assert.equal(projected.unknown_stage_count, 1);
   assert.equal(projected.unknown_error_code_count, 1);
   assert.doesNotMatch(serialized, new RegExp(secret));
@@ -123,6 +135,10 @@ test("end-to-end report uses explicit fixture paths without copying them or raw 
   assert.equal(managedBase.optional, true);
   assert.equal(report.startup_and_navigation.events[0].elapsed_ms, 987);
   assert.equal(report.collection.encrypted_settings_read, false);
+  assert.equal(report.system.process_memory_inspected, false);
+  assert.ok(report.system.free_memory_bytes > 0);
+  assert.ok(report.system.logical_cpu_count > 0);
+  assert.ok(Array.isArray(report.system.load_average_1m_5m_15m));
   assert.equal(report.paths.data_directory.source, "explicit");
   assert.doesNotMatch(reportText, new RegExp(secret));
   assert.doesNotMatch(reportText, /private-log-location|private-data-location|privateid|PRIVATE_SENTENCE_NEVER_REPORT_THIS|TestApp/);

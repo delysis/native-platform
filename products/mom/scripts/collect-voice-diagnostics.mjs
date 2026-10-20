@@ -14,6 +14,9 @@ const safeStages = new Set(("audio_prefill_begin_failed audio_prefill_begin_requ
 const safeErrorCodes = new Set(("audio_prefill_begin_failed audio_prefill_drain_failed audio_prefill_push_failed audio_prefill_target_failed audio_prefill_wait_expired barge_in_playback_stop_failed call_capture_start_skipped call_closed call_persona_prepare_failed call_start_failed call_startup_stage_timed_out call_transcript_slot_failed durable_voice_audio_failed generation_timeout in_memory_voice_audio_failed invalid_config mcp_platform_unsupported mention_target_not_found native_audio_finish_failed native_capture_failed native_capture_recovery_failed native_capture_unavailable next_turn_prefill_failed parakeet_not_resident parakeet_residency_check_failed persona_template_staged_attachments read_aloud_failed read_aloud_prior_playback_stop_failed record_failed runtime_warm_failed semantic_backpressure_failed speech_admission_closed speech_backend_failed speech_backend_unavailable speech_cancelled speech_descriptor_invalid speech_live_ingress_backlog speech_live_pcm_route_unavailable speech_live_sink_missing speech_live_transcription_deadline speech_live_transcription_unavailable speech_operation_duplicate speech_operation_limit speech_parakeet_model_not_ready speech_precommit_identity_lookup_failed speech_precommit_persona_binding_changed speech_precommit_stale speech_precommit_text_invalid speech_precommit_voice_bindings_poisoned speech_precommit_voice_unbound speech_provenance_mismatch speech_read_aloud_assistant_only speech_read_aloud_empty speech_read_aloud_stale speech_read_aloud_timeout speech_state_unavailable speech_stop_target_invalid speech_stop_wait_receipt_missing speech_stop_wait_state_closed speech_stop_wait_terminal_timeout speech_stream_invalid speech_transcript_too_large speech_transcription_stale speculation_handoff_failed startup_error transcript_residency_check_failed transcript_unavailable view_command_failed voice_attachment_import_lock_poisoned voice_audio_prefill_drain_timeout voice_audio_restart_prepared_in_scope voice_call_startup_timeout voice_capture_prefill_abort_failed voice_generation_timeout voice_history_recovery_failed voice_message_silent voice_note_cancelled voice_note_confirmation_failed voice_note_recording_hydration_failed voice_onset_prefill_failed voice_reply_attachment_target_conflict voice_reply_attachment_target_missing voice_speculation_preparation_identity_changed voice_transcript_blocked voice_transcript_failed voice_transcript_live_failed voice_transcript_queue_deferred_overflow voice_transcript_record_failed").split(" "));
 const safePhases = new Set(["activity_guard", "ringing", "history_recovery", "microphone", "runtime_warm", "conversation", "persona_prepare", "greeting_generation", "call_turn", "voice_note", "read_aloud"]);
 const safeFinishReasons = new Set(["end_of_generation", "stop_sequence", "max_tokens", "cancelled", "length", "stop", "first_word_choices_exhausted", "visual_token_support_exhausted"]);
+const safeTtsBackendIds = new Set(["qwen3-tts.mlx-swift", "pocket-tts.native-cpu"]);
+const safeTtsModelIds = new Set(["qwen3-tts-1.7b-base-icl-mlx-audio", "qwen3-tts-12hz-1.7b-voice-design-4bit", "pocket-tts-3.3.0-native-cpu"]);
+const numericStageKeys = ["backend_ms", "phase_elapsed_ms", "deadline_ms"];
 const numericSummaryKeys = ["runtime_warm_total_ms", "runtime_warm_settings_ms", "runtime_warm_model_acquire_ms", "call_request_to_microphone_ready_ms", "microphone_ready_to_ringing_ms", "microphone_native_first_sample_ms", "model_load_total_ms", "model_load_backend_ms", "model_load_artifact_open_ms", "model_load_weights_ms", "model_load_projector_ms", "model_load_artifact_verify_ms", "model_load_context_create_ms", "model_load_fingerprint_ms", "first_content_to_tts_pcm_ms", "tts_pcm_to_playback_ms", "playback_startup_target_ms", "playback_startup_buffered_ms", "dispatch_to_native_worker_ms", "native_worker_to_first_content_ms", "audio_first_accept_ms", "audio_first_read_ms", "generation_prompt_tokens", "generation_completion_tokens", "generation_sampled_tokens", "generation_cache_resident_prefix_tokens", "generation_cache_restored_prefix_tokens", "generation_cache_replayed_prefix_tokens", "audio_accepted_samples", "audio_consumed_samples"];
 const home = os.homedir();
 
@@ -135,6 +138,12 @@ function projectTrace(raw) {
     const entry = { stage: item.stage, elapsed_ms: safeNumber(item.elapsed_ms) };
     if (safePhases.has(item.phase)) entry.phase = item.phase;
     if (safeFinishReasons.has(item.finish_reason)) entry.finish_reason = item.finish_reason;
+    if (safeTtsBackendIds.has(item.backend_id)) entry.backend_id = item.backend_id;
+    if (safeTtsModelIds.has(item.model_id)) entry.model_id = item.model_id;
+    for (const key of numericStageKeys) {
+      const value = safeNumber(item[key]);
+      if (value !== null) entry[key] = value;
+    }
     const possibleErrors = [item.error_code, item.error, item.message].filter((value) => typeof value === "string");
     if (possibleErrors.length) {
       const safeCode = possibleErrors.map((value) => value.split(/[\s:]/, 1)[0]).find((code) => safeErrorCodes.has(code));
@@ -147,6 +156,10 @@ function projectTrace(raw) {
   for (const key of numericSummaryKeys) {
     const value = safeNumber(raw?.summary?.[key]);
     if (value !== null) summary[key] = value;
+  }
+  for (const [key, allowed] of [["tts_backend_ids", safeTtsBackendIds], ["tts_model_ids", safeTtsModelIds]]) {
+    const values = Array.isArray(raw?.summary?.[key]) ? [...new Set(raw.summary[key].filter((value) => allowed.has(value)))] : [];
+    if (values.length) summary[key] = values;
   }
   const parsedDate = typeof raw?.began_at === "string" ? Date.parse(raw.began_at)
     : typeof raw?.began_at === "number" && Number.isFinite(raw.began_at)
@@ -306,7 +319,16 @@ export async function collectVoiceDiagnostics(opts) {
     collection: { read_only: true, encrypted_settings_read: false, conversation_content_read: false, raw_logs_included: false },
     installed_app: { status: appStatus, location_source: opts["--app"] ? "explicit" : "standard_location", identity: appStatus === "present" ? await installedIdentity(selectedApp) : { status: "not_found" } },
     candidate_app: { status: candidateStatus, identity: candidateStatus === "present" ? await installedIdentity(opts["--candidate-app"]) : { status: candidateStatus } },
-    system: { platform: process.platform, architecture: process.arch, os_release: /^[A-Za-z0-9._-]{1,64}$/.test(os.release()) ? os.release() : null, total_memory_bytes: os.totalmem() },
+    system: {
+      platform: process.platform,
+      architecture: process.arch,
+      os_release: /^[A-Za-z0-9._-]{1,64}$/.test(os.release()) ? os.release() : null,
+      total_memory_bytes: os.totalmem(),
+      free_memory_bytes: os.freemem(),
+      logical_cpu_count: typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length,
+      load_average_1m_5m_15m: process.platform === "win32" ? null : os.loadavg().map((value) => Number.isFinite(value) ? value : null),
+      process_memory_inspected: false,
+    },
     paths: { data_directory: { status: await exists(dataPath) ? "present" : "not_found", source: opts["--data-dir"] ? "explicit" : "standard_location" }, log_directory: { status: await exists(logPath) ? "present" : "not_found", source: opts["--log-dir"] ? "explicit" : "standard_location" }, model_cache: { source: "huggingface_standard_cache", environment_override_used: Boolean(process.env.HF_HUB_CACHE || process.env.HUGGINGFACE_HUB_CACHE || process.env.HF_HOME || process.env.XDG_CACHE_HOME) } },
     speech_sampling: { status: "not_inspected", reason: "encrypted_settings_not_read" },
     resources: assetResults,

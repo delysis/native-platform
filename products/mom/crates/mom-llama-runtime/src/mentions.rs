@@ -4538,8 +4538,10 @@ mod tests {
             &invocation.results
         ));
         super::append_attributed_results(&mut host, &mut invocation);
-        let restored: MentionInvocation =
-            serde_json::from_slice(&serde_json::to_vec(&invocation).unwrap()).unwrap();
+        let restored: MentionInvocation = serde_json::from_slice(
+            &serde_json::to_vec(&invocation).expect("serialize invocation finish reason"),
+        )
+        .expect("deserialize invocation finish reason");
         assert_eq!(restored.results[0].finish_reason.as_deref(), reason);
         let persisted: ConversationDb = serde_json::from_slice(
             &serde_json::to_vec(&ConversationDb {

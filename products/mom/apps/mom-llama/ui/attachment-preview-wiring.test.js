@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const voicePipelineScheduler = require("./voice-pipeline-scheduler.js");
+const voiceCapturePolicy = require("./voice-capture-policy.js");
 const { AdaptiveVoiceLeadController } = voicePipelineScheduler;
 
 const ui = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
@@ -562,8 +563,7 @@ const speechLifetimeHarness = ({ worklet = false, workletPreparationGate = null,
   const context = {
     Blob, Uint8Array, ArrayBuffer, DataView, JSON,
     performance: { now: () => now },
-    MomVoiceCapturePolicy: { voiceProgressDeadlineExpired: ({ now: current, started, lastProgress, idleMs, maxElapsedMs }) =>
-      current - started >= maxElapsedMs || current - lastProgress >= idleMs },
+    MomVoiceCapturePolicy: voiceCapturePolicy,
     setInterval(callback) { progressIntervals.push({ callback, active: true }); return progressIntervals.length; },
     clearInterval(id) { if (progressIntervals[id - 1]) progressIntervals[id - 1].active = false; },
     crypto: { randomUUID: () => `fixture-trace-${++serial}` },
